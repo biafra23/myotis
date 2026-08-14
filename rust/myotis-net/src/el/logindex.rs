@@ -305,12 +305,15 @@ impl LogIndex {
     /// Swap in `config` while keeping ALL accumulated state — the additive
     /// re-apply path. Adoptable iff it subscribes exactly this index's
     /// address set under the same topic0 restrictions: then coverage still
-    /// describes every entry (re-paired by address, since order may differ),
-    /// and the only substantive change a caller can make is LOWERING a
-    /// `from_block` (a deeper walk target — the walker just keeps
-    /// descending; nothing accumulated is invalidated). Names and runtime
-    /// bits ride along. False (and untouched state) for a new/removed
-    /// address or a changed topic set — those need a re-index.
+    /// describes every entry (re-paired by address, since order may differ).
+    /// Names and runtime bits ride along. A LOWERED `from_block` adopts too:
+    /// while the walk is mid-descent that is just a deeper target, and when
+    /// it drops below an already-complete span's low (a hole the descending
+    /// walk could never reach — see [`walk_resumable`]) the cursor is
+    /// DROPPED so the appender re-seeds at the top and the walker
+    /// re-descends: coverage survives, the hole closes, nothing wedges.
+    /// False (and untouched state) for a new/removed address or a changed
+    /// topic set — those need a re-index (or a merge).
     pub fn adopt_config(&mut self, config: LogIndexConfig) -> bool {
         if config.watch.len() != self.config.watch.len() {
             return false;
@@ -328,6 +331,9 @@ impl LogIndex {
                 return false;
             }
             coverage.push(self.coverage[i]);
+        }
+        if !walk_resumable(&config.watch, &coverage, self.cursor) {
+            self.cursor = None;
         }
         self.config = config;
         self.coverage = coverage;
@@ -1052,19 +1058,18 @@ impl LogIndex {
             .into_iter()
             .map(|c| Coverage { span: c.span.filter(|(_, hi)| Some(*hi) == out_high) })
             .collect();
-        // Cursor: the deepest verified trust edge — canonical inputs put it
-        // at the merged global low. If it sits above some span's low (weird
-        // input), drop it: the appender re-seeds, the walker re-descends.
-        let cursor = sources
-            .iter()
-            .filter_map(|s| s.cursor)
-            .min_by_key(|(n, _)| *n)
-            .filter(|(n, _)| {
-                coverage.iter().all(|c| match c.span {
-                    Some((low, _)) => *n <= low,
-                    None => true,
-                })
-            });
+        // Cursor: the DEEPEST source trust edge the walk can actually resume
+        // from (see [`walk_resumable`] — every incomplete span must sit at or
+        // below it; the walk re-descends THROUGH deeper spans, it can never
+        // reach a hole above itself). When no source cursor qualifies, no
+        // cursor at all: the appender re-seeds at the top and the walker
+        // re-descends through the merged spans — headers-only where the
+        // bloom misses, and every hole closes on the way down.
+        let mut candidates: Vec<(u64, [u8; 32])> = sources.iter().filter_map(|s| s.cursor).collect();
+        candidates.sort_unstable_by_key(|(n, _)| *n);
+        let cursor = candidates
+            .into_iter()
+            .find(|c| walk_resumable(&watch, &coverage, Some(*c)));
         // Logs: only what the merged coverage can actually serve.
         let mut logs = BTreeMap::new();
         for s in &mut sources {
@@ -1085,6 +1090,44 @@ impl LogIndex {
         let ix = Self::new(config).expect("union has unique addresses");
         Ok((expected, Self { coverage, logs, cursor, ..ix }))
     }
+}
+
+/// Can the single-cursor walk, resuming from `cursor`, eventually complete
+/// every entry? The walker only DESCENDS: from `cursor - 1` down to the
+/// lowest `from_block`, extending each entry it passes. So a hole that sits
+/// ABOVE the cursor is unreachable forever, and `backfill_block`'s gap check
+/// wedges outright on an incomplete span whose low is above the walk. The
+/// resumable states are exactly:
+///
+/// - `cursor == None`: always resumable — the appender seeds the cursor at
+///   the top on its next append (extending every present span and every
+///   absent one together, so the all-highs-equal invariant holds) and the
+///   walker re-descends through everything; costly, never wrong.
+/// - `cursor == Some(n)`: every present span is either complete
+///   (`low <= from_block` — the walker skips it below its from_block) or
+///   reachable (`low <= n` — the walk passes through it on the way down),
+///   AND every ABSENT span belongs to an entry starting above the frontier
+///   (`from_block > H` — the appender's job); an absent span with
+///   `from_block <= H` has its whole range above the descending walk.
+///
+/// This is the invariant [`LogIndex::merge`] and [`LogIndex::adopt_config`]
+/// preserve; getting it backwards (cursor at/below every low) was a
+/// walk-wedging bug — the walker demands the OPPOSITE half.
+fn walk_resumable(
+    watch: &[WatchEntry],
+    coverage: &[Coverage],
+    cursor: Option<(u64, [u8; 32])>,
+) -> bool {
+    let Some((n, _)) = cursor else {
+        return true;
+    };
+    let Some(h) = coverage.iter().filter_map(|c| c.span.map(|(_, hi)| hi)).max() else {
+        return false; // a cursor with nothing covered: nothing seeded it
+    };
+    watch.iter().zip(coverage.iter()).all(|(w, c)| match c.span {
+        Some((low, _)) => low <= w.from_block || low <= n,
+        None => w.from_block > h,
+    })
 }
 
 /// A fully parsed v2 frame (tag + fingerprint + watch-table + body), before
@@ -1738,6 +1781,37 @@ mod tests {
         assert!(!ix.adopt_config(retopiced));
     }
 
+    /// Drive the (simulated) appender + walker over `ix` to completion,
+    /// panicking if either wedges: one append at the edge (which also
+    /// re-seeds a dropped cursor — exactly what the real appender does),
+    /// then the walker's descent to the lowest from_block. Hashes are
+    /// synthetic — the coverage state machine is what's under test. Ends by
+    /// asserting every entry is COMPLETE (low <= from_block): the branch's
+    /// promise that catch-up finishes every imported address.
+    fn assert_catch_up_completes(ix: &mut LogIndex) {
+        let top = ix.append_edge().unwrap_or(10_000);
+        ix.append_block(top, [1; 32], vec![])
+            .unwrap_or_else(|g| panic!("appender wedged at {top}: {g:?}"));
+        let target = ix.config().watch.iter().map(|w| w.from_block).min().expect("entries");
+        let mut steps = 0u32;
+        while let Some((n, _)) = ix.cursor {
+            if n <= target {
+                break;
+            }
+            let b = n - 1;
+            ix.backfill_block(b, [2; 32], vec![])
+                .unwrap_or_else(|g| panic!("walker wedged at {b}: {g:?}"));
+            steps += 1;
+            assert!(steps < 100_000, "walk did not terminate");
+        }
+        for (w, c) in ix.coverage_entries() {
+            let (low, _) = c.span.unwrap_or_else(|| {
+                panic!("entry 0x{:02x}.. never covered", w.address[0])
+            });
+            assert!(low <= w.from_block, "entry incomplete: low {low} > from {}", w.from_block);
+        }
+    }
+
     /// Build a canonical index over `cfg` covering `low..=high` (appender
     /// seed at the top, walker descent to the bottom — cursor ends at `low`),
     /// with `logs` inserted at their blocks along the way.
@@ -1848,6 +1922,67 @@ mod tests {
     }
 
     #[test]
+    fn merge_into_a_mid_backfill_index_resumes_and_completes() {
+        // The flagship import case that once wedged: own index mid-backfill
+        // (X from 20, covered [1000,1100], cursor at 1000) + a deep imported
+        // snapshot (Y from 50, covered [50,1100], cursor at 50). The naive
+        // "deepest cursor" (50) leaves X's hole [20,1000) ABOVE the walk —
+        // backfill_block gap-errors every tick, forever. The resumable
+        // choice is the cursor at the MAX incomplete low (X's 1000): the
+        // walk re-descends through Y's covered span and closes both holes.
+        let own = span_ix(config(vec![watch_all(addr(1), 20)]), 1000, 1100, vec![]);
+        let imported = span_ix(config(vec![watch_all(addr(2), 50)]), 50, 1100, vec![]);
+        let (_, mut m) = LogIndex::merge(vec![(tag(), own), (tag(), imported)]).unwrap();
+        assert_eq!(m.cursor.map(|(n, _)| n), Some(1000), "must resume at the max incomplete low");
+        assert_catch_up_completes(&mut m);
+    }
+
+    #[test]
+    fn merge_with_a_config_only_source_drops_the_cursor_and_completes() {
+        // A config-only source (new address, no coverage — the preset-grew
+        // case): its whole range sits above any source cursor, so NO cursor
+        // is resumable; the merge must drop it (appender re-seeds at the
+        // top, walker re-descends) rather than strand the new entry.
+        let covered = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 300, vec![]);
+        let config_only = LogIndex::new(config(vec![watch_all(addr(2), 100)])).unwrap();
+        let (_, mut m) = LogIndex::merge(vec![(tag(), config_only), (tag(), covered)]).unwrap();
+        assert_eq!(m.cursor, None, "no cursor can reach the new entry's hole");
+        // Coverage survived the union.
+        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 300)));
+        assert_catch_up_completes(&mut m);
+    }
+
+    #[test]
+    fn adopt_lowering_from_block_below_a_complete_span_drops_the_cursor() {
+        // Regression: pre-import builds re-indexed on any from_block change;
+        // the additive path must not instead wedge. Two entries, walk at
+        // 150: X1 (from 200) is COMPLETE at low 200, X2 (from 100) is
+        // mid-descent at the cursor. Lowering X1's from_block to 50 opens
+        // the hole [50,200) ABOVE the cursor — unreachable by the descent —
+        // so the adopt keeps all coverage but drops the cursor and the walk
+        // re-descends.
+        let mut ix = span_ix(
+            config(vec![watch_all(addr(1), 200), watch_all(addr(2), 100)]),
+            150,
+            300,
+            vec![],
+        );
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(150));
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 300)));
+        let lowered = config(vec![watch_all(addr(1), 50), watch_all(addr(2), 100)]);
+        assert!(ix.adopt_config(lowered));
+        assert_eq!(ix.cursor, None, "X1's hole [50,200) sits above the old cursor");
+        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 300)), "coverage kept");
+        assert_catch_up_completes(&mut ix);
+        // Mid-descent lowering (span low == cursor) keeps the cursor: the
+        // walk just runs deeper.
+        let mut mid = span_ix(config(vec![watch_all(addr(3), 150)]), 200, 300, vec![]);
+        assert!(mid.adopt_config(config(vec![watch_all(addr(3), 100)])));
+        assert_eq!(mid.cursor.map(|(n, _)| n), Some(200));
+        assert_catch_up_completes(&mut mid);
+    }
+
+    #[test]
     fn merge_output_is_canonical_and_never_fabricates_coverage() {
         // Pseudo-random source shapes (fixed LCG seed — deterministic): the
         // merged result must (a) never claim a block for an address that no
@@ -1877,17 +2012,16 @@ mod tests {
                     c
                 })
                 .collect();
-            let (_, m) = LogIndex::merge(sources.into_iter().map(|s| (tag(), s)).collect()).unwrap();
+            let (_, mut m) = LogIndex::merge(sources.into_iter().map(|s| (tag(), s)).collect()).unwrap();
             let highs: Vec<u64> =
                 m.coverage_entries().iter().filter_map(|(_, c)| c.span.map(|(_, h)| h)).collect();
             assert!(highs.windows(2).all(|w| w[0] == w[1]), "unequal highs: {highs:?}");
-            if let Some((n, _)) = m.cursor {
-                for (_, c) in m.coverage_entries() {
-                    if let Some((low, _)) = c.span {
-                        assert!(n <= low, "cursor {n} above a span low {low}");
-                    }
-                }
-            }
+            // The RESUMABILITY invariant — the walker demands every
+            // incomplete low at/below the cursor (asserting the inverted
+            // "cursor at/below every low" here is exactly the bug this
+            // branch once had).
+            let (watch, coverage): (Vec<_>, Vec<_>) = m.coverage_entries().into_iter().unzip();
+            assert!(walk_resumable(&watch, &coverage, m.cursor), "merge emitted a non-resumable state");
             for (w, c) in m.coverage_entries() {
                 if let Some((low, high)) = c.span {
                     for b in low..=high {
@@ -1898,6 +2032,9 @@ mod tests {
                     }
                 }
             }
+            // And the invariant is not just declared — the pipeline actually
+            // runs to completion from the merged state.
+            assert_catch_up_completes(&mut m);
         }
     }
 

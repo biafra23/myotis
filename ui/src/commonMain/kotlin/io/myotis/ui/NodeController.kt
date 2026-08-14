@@ -88,9 +88,10 @@ interface NodeController {
      * them with what it already holds and starts catch-up for every imported
      * address immediately. On success the host also persists the enabled
      * flag (importing is the opt-in). [onResult] gets one human-readable
-     * line — success summary or error — on the UI's thread. Returns false
-     * when this host cannot pick/import files (the Index tab hides the
-     * button; Rust engine only).
+     * line — success summary or error — and may be invoked FROM A WORKER
+     * THREAD; callers must only touch thread-safe state in it (Compose
+     * snapshot state qualifies). Returns false when this host cannot
+     * pick/import files (the Index tab hides the button; Rust engine only).
      */
     fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean = false
 

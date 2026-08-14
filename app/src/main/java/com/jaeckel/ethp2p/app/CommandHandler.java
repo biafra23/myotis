@@ -291,10 +291,11 @@ public class CommandHandler {
      * the engine's backfill build the database. The config push is ADDITIVE
      * engine-side (existing subscriptions/coverage survive) and runs at max
      * download speed, since a generator daemon exists to finish the walk.
-     * Each address gets a best-effort ENS reverse name (forward-verified by
-     * {@link EnsApi#reverseResolve}) baked in as its display name; failures
-     * just leave the entry unnamed. Poll {@code logindex-status} until
-     * complete, then {@code export-logindex <path>}. Rust engine only.
+     * Entries are written UNNAMED on purpose: display names are cosmetic,
+     * for the importing wallet's Index tab, and the wallet fills them in
+     * itself (the engine's ENS reverse-naming pass) — the generator has no
+     * naming duties. Poll {@code logindex-status} until complete, then
+     * {@code export-logindex <path>}. Rust engine only.
      *
      * <p>{@code fromBlock} is a TRUST ASSERTION, not a hint: the engine
      * serves a query once coverage reaches it, so a value LATER than the
@@ -303,12 +304,11 @@ public class CommandHandler {
      */
     private String handleBuildLogIndex(String jsonLine) {
         String addressesJson = extractArray(jsonLine, "addresses");
-        long fromBlock;
-        try {
-            fromBlock = extractLong(jsonLine, "fromBlock");
-        } catch (IllegalArgumentException e) {
-            fromBlock = 0;
-        }
+        // Absent → 0 (undershooting cannot lie). PRESENT-but-malformed must
+        // refuse, not default: a parameter that can change the answer is
+        // applied or refused, never silently replaced (CLAUDE.md §Trust) —
+        // extractLong's throw propagates to the caller's jsonError.
+        long fromBlock = jsonLine.contains("\"fromBlock\"") ? extractLong(jsonLine, "fromBlock") : 0;
         if (fromBlock < 0) return jsonError("fromBlock must be >= 0");
         java.util.List<String> addresses = new java.util.ArrayList<>();
         java.util.regex.Matcher m =
@@ -322,45 +322,17 @@ public class CommandHandler {
             return jsonError("addresses must be a non-empty array of 0x-prefixed 20-byte hex addresses");
         }
         StringBuilder watch = new StringBuilder();
-        StringBuilder named = new StringBuilder();
         for (int i = 0; i < addresses.size(); i++) {
-            String addr = addresses.get(i);
-            String name = reverseNameOrNull(addr);
-            if (i > 0) {
-                watch.append(',');
-                named.append(',');
-            }
-            watch.append("{\"address\":\"").append(addr)
-                 .append("\",\"fromBlock\":").append(fromBlock);
-            if (name != null) {
-                watch.append(",\"name\":\"").append(escapeJson(name)).append('"');
-            }
-            watch.append('}');
-            named.append("{\"address\":\"").append(addr).append('"');
-            if (name != null) {
-                named.append(",\"name\":\"").append(escapeJson(name)).append('"');
-            }
-            named.append('}');
+            if (i > 0) watch.append(',');
+            watch.append("{\"address\":\"").append(addresses.get(i))
+                 .append("\",\"fromBlock\":").append(fromBlock).append('}');
         }
         String config = "{\"enabled\":true,\"maxSpeed\":true,\"watch\":[" + watch + "]}";
         if (!handle.setLogIndexConfig(config)) {
             return jsonError("log index config rejected (is this daemon on the Rust engine? start with -Pengine=rust)");
         }
-        return "{\"ok\":true,\"building\":[" + named + "]"
+        return "{\"ok\":true,\"building\":" + addressesJson
                 + ",\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
-    }
-
-    /** Best-effort ENS reverse name (forward-verified engine-side); null on
-     *  any failure — a name must never gate indexing. */
-    private String reverseNameOrNull(String address) {
-        try {
-            EnsApi ens = handle.ens();
-            if (ens == null) return null;
-            EnsResolutionResult r = ens.reverseResolve(address);
-            return r != null ? r.name() : null;
-        } catch (RuntimeException e) {
-            return null;
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -917,8 +889,13 @@ public class CommandHandler {
         if (keyIdx < 0) throw new IllegalArgumentException("Missing field: " + field);
         int colon = json.indexOf(':', keyIdx + key.length());
         if (colon < 0) throw new IllegalArgumentException("Malformed JSON near field: " + field);
-        int open = json.indexOf('[', colon + 1);
-        if (open < 0) throw new IllegalArgumentException("Field '" + field + "' value is not an array");
+        // The bracket must be the field's own value: scanning forward past a
+        // non-array value would silently capture a LATER array in the line.
+        int open = colon + 1;
+        while (open < json.length() && Character.isWhitespace(json.charAt(open))) open++;
+        if (open >= json.length() || json.charAt(open) != '[') {
+            throw new IllegalArgumentException("Field '" + field + "' value is not an array");
+        }
         int depth = 0;
         boolean inString = false;
         for (int i = open; i < json.length(); i++) {

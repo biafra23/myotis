@@ -212,10 +212,11 @@ portable path: they name no subscription set.
     :app:run -Pargs=logindex-status                     # poll to complete
     :app:run -Pargs="export-logindex /tmp/mainnet-privacy.db"
 
-`build-logindex` takes plain addresses (no preset), subscribes them at max
-download speed, and bakes a best-effort **ENS reverse name** into each entry
-(forward-verified via `EnsApi.reverseResolve`; a failed lookup leaves the
-entry unnamed and never gates indexing). `--from` is a trust assertion:
+`build-logindex` takes plain addresses (no preset) and subscribes them at max
+download speed. Entries are written UNNAMED by design — display names are
+cosmetic, exist purely so the Index tab shows which contracts' logs are
+available, and are filled in by the importing wallet itself (see §Naming
+below); the generator has no naming duties. `--from` is a trust assertion:
 `LogIndex::query` clamps its coverage requirement to it, so overshooting the
 real deployment silently hides events; undershooting (the default 0) only
 walks further.
@@ -234,28 +235,43 @@ the hosts, never something fetched.
 topic0 sets — a span's meaning includes the restriction it was indexed under;
 `from_block` = min; name = first non-empty), coverage clamped to the MINIMUM
 of the sources' own highs and unioned per address, logs kept only inside the
-merged span, cursor = the deepest trust edge. The output is **canonical** —
-every present span shares one global high, cursor at the global low — because
-that is the only shape the appender/walker pair can resume (`append_block`
-demands each new block adjoin EVERY live entry's span; per-entry frontiers
-would wedge the appender). The min-high clamp is also what resolves
-same-address disjoint spans: the lower, deployment-anchored history survives
-and the band above re-indexes — re-fetched, never trusted from the staler
-file. Redundant sources (subset coverage, nothing new) are pruned first so a
-stale re-import cannot drag the merged high back in time. Lifting the
-canonical-shape constraint (true per-entry frontiers) is the tracked follow-up
-that would make merges lossless; it needs append/bridge machinery per entry.
+merged span, cursor = the deepest source trust edge the walk can RESUME from
+(`walk_resumable`: every incomplete span must sit at or below the cursor —
+the walker only descends, so a hole above it is unreachable forever; when no
+source cursor qualifies, the cursor is dropped and the appender re-seeds it
+at the top, making the walker re-descend through the kept spans — headers-only
+where the bloom misses — until every hole closes). The output is **canonical**
+— every present span shares one global high — because that is the only shape
+the appender/walker pair can resume (`append_block` demands each new block
+adjoin EVERY live entry's span; per-entry frontiers would wedge the appender).
+A residual gap at apply time self-heals the same way: the walker drops its
+cursor and re-descends rather than re-fetching the same batch forever. The
+min-high clamp is also what resolves same-address disjoint spans: the lower,
+deployment-anchored history survives and the band above re-indexes —
+re-fetched, never trusted from the staler file. Redundant sources (subset
+coverage, nothing new) are pruned first so a stale re-import cannot drag the
+merged high back in time. Lifting the canonical-shape constraint (true
+per-entry frontiers) is the tracked follow-up that would make merges lossless;
+it needs append/bridge machinery per entry.
 
 **Additive config (behavior change in v23):** `set_log_index_config` unions
 the pushed config with the already-subscribed set (live index, or on boot the
 portable snapshot's own watch-table). Without this, every host restart's
 preset push would fingerprint-mismatch an imported index into a full
-re-index. Coverage survives bit flips, renames, and LOWERED from_blocks; a
-genuinely new address or changed topic set still re-indexes under the union.
+re-index. Coverage survives bit flips, renames, LOWERED from_blocks (the
+cursor drops when the new hole sits above it — the walk re-descends), and
+even genuinely NEW addresses (the push merges with the existing index as a
+config-only source, so a preset that grew — or a preset pushed on top of a
+dropped-in snapshot — keeps the accumulated coverage and re-descends for the
+new entries). Only a changed topic set replaces outright: a span's meaning
+includes its restriction, nothing is mergeable.
 
-**Naming:** the generator bakes ENS reverse names at build time; for
-snapshots that arrive unnamed, a naming pass inside the appender task
-resolves one unnamed address per tick (forward-verified `EnsQuery::Reverse`,
-30s-bounded, ≤3 attempts each) and fills ONLY empty names — a baked-in or
-host-pushed name outranks a late lookup. Names are excluded from the config
+**Naming:** display names are cosmetic — they exist so the Index tab shows
+which contracts' logs are available — and they are resolved IN THE IMPORTING
+WALLET, not at generation (owner's call, 2026-08-14: the generator writes
+unnamed entries). A naming pass inside the appender task resolves one
+unnamed address per tick (forward-verified `EnsQuery::Reverse` against the
+Auto root ladder, 30s-bounded, ≤3 attempts each) and fills ONLY empty
+names — a host-pushed preset label outranks a late lookup, and a name that
+cannot resolve just stays an address. Names are excluded from the config
 fingerprint: renaming never costs a re-index.

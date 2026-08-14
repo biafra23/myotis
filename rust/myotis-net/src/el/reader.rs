@@ -833,15 +833,15 @@ impl ElReader {
                 if ix.adopt_config(eff) {
                     // Nothing accumulated was invalidated: coverage, the
                     // mapped gap and the tail record still describe this
-                    // index. Bits/names/walk-target updated in place.
+                    // index (a from_block lowered below a complete span only
+                    // drops the walk cursor — the appender re-seeds it).
                     reset_rate();
                     return true;
                 }
             }
-            // New address or topic conflict → the union (or, on conflict,
-            // the pushed config alone) REPLACES the index below, which
-            // invalidates bridge and tail: neither describes the new
-            // coverage.
+            // New address or topic conflict: the index below is REPLACED,
+            // which invalidates bridge and tail — neither describes the new
+            // coverage shape.
             self.clear_log_index_bridge();
             if let Ok(mut t) = self.log_index_tail.lock() {
                 t.clear();
@@ -857,10 +857,49 @@ impl ElReader {
                     ix.persist_clamped(&tag, p, finalized_now)
                 };
             }
-            let effective = config.union_with(&ix.config().watch).unwrap_or(config);
-            let fresh = match crate::el::logindex::LogIndex::new(effective) {
-                Ok(fresh) => fresh,
-                Err(_) => return false,
+            let effective = config.union_with(&ix.config().watch);
+            let old = slot.take().expect("checked Some above");
+            let fresh = match effective {
+                // New addresses: MERGE the union config (an empty source)
+                // with the old index, so accumulated coverage — an imported
+                // snapshot's months of backfill included — survives a preset
+                // that merely grew. The merge drops the cursor when the new
+                // entries' holes sit above it; the walker then re-descends
+                // through the kept spans and closes them.
+                Some(eff) => {
+                    let pushed = match crate::el::logindex::LogIndex::new(eff.clone()) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            *slot = Some(old);
+                            return false;
+                        }
+                    };
+                    match crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, old)]) {
+                        Ok((_, mut merged)) => {
+                            merged.set_enabled(eff.enabled);
+                            merged.set_max_speed(eff.max_speed);
+                            merged
+                        }
+                        // Unreachable in practice (union_with already vetted
+                        // the topic sets); degrade to replace semantics.
+                        Err(_) => match crate::el::logindex::LogIndex::new(config) {
+                            Ok(f) => f,
+                            Err(_) => return false,
+                        },
+                    }
+                }
+                // Topic conflict: replace with the push alone — a span's
+                // meaning includes its restriction, nothing can be kept.
+                None => {
+                    tracing::warn!(
+                        "log-index config conflicts with the live subscription's topic \
+                         restrictions; replacing — accumulated coverage re-indexes"
+                    );
+                    match crate::el::logindex::LogIndex::new(config) {
+                        Ok(f) => f,
+                        Err(_) => return false,
+                    }
+                }
             };
             *slot = Some(fresh);
             reset_rate();
@@ -882,13 +921,36 @@ impl ElReader {
                     .is_some_and(|eff| stored_ix.adopt_config(eff));
                 if adopted {
                     stored_ix
+                } else if let Some(eff) = config.union_with(&stored_ix.config().watch) {
+                    // Genuinely new addresses (e.g. a host preset pushed on
+                    // top of a dropped-in generator snapshot): MERGE instead
+                    // of discarding — the snapshot's coverage survives, the
+                    // new entries re-index via the walker's re-descent (the
+                    // merge drops the cursor for exactly that).
+                    let merged = crate::el::logindex::LogIndex::new(eff.clone())
+                        .ok()
+                        .and_then(|pushed| {
+                            crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, stored_ix)]).ok()
+                        });
+                    match merged {
+                        Some((_, mut m)) => {
+                            m.set_enabled(eff.enabled);
+                            m.set_max_speed(eff.max_speed);
+                            m
+                        }
+                        None => match crate::el::logindex::LogIndex::new(config) {
+                            Ok(fresh) => fresh,
+                            Err(_) => return false,
+                        },
+                    }
                 } else {
-                    // Conflict or a genuinely new address: re-index under
-                    // the union when there is one (keep the imported
-                    // subscriptions — they re-cover), else the push alone.
-                    let effective =
-                        config.union_with(&stored_ix.config().watch).unwrap_or(config);
-                    match crate::el::logindex::LogIndex::new(effective) {
+                    // Topic conflict with the stored subscription: replace
+                    // with the push alone (nothing mergeable to keep).
+                    tracing::warn!(
+                        "stored log-index snapshot conflicts with the pushed config's topic \
+                         restrictions; replacing — its accumulated coverage re-indexes"
+                    );
+                    match crate::el::logindex::LogIndex::new(config) {
                         Ok(fresh) => fresh,
                         Err(_) => return false,
                     }
@@ -1030,26 +1092,39 @@ impl ElReader {
         }
         let (_, mut merged) =
             crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
-        // A snapshot generated by a node further along may carry coverage
-        // above THIS node's current finality. That data is finalized on the
-        // network (the generator clamps at its own finality) — local
-        // finality just hasn't caught up — so it persists as-is under the
-        // trusted-import premise above.
         merged.set_enabled(true);
         merged.set_max_speed(max_speed);
+        // Rewound to LOCAL finality like every other checkpoint: a snapshot
+        // from a node further along may carry coverage above it, but the
+        // tail's fork scan rewinds above-finality coverage this run did not
+        // append (unknown hashes are rewound, never trusted), so keeping the
+        // band would only hold data the first tail tick discards — the
+        // rewind makes the installed index, the persisted file, and the tail
+        // rule tell one story. The appender/tail re-fetch the band promptly.
+        let finalized_now = self.finalized_block_number();
+        if finalized_now > 0 {
+            merged.rewind_above(finalized_now);
+        }
         merged
             .persist(&tag, &own_path)
             .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
-        // Install: the bridge and tail describe the OLD coverage shape.
-        self.clear_log_index_bridge();
-        if let Ok(mut t) = self.log_index_tail.lock() {
-            t.clear();
-        }
-        if let Ok(mut rate) = self.log_index_rate.lock() {
-            *rate = None;
-        }
         match self.log_index.lock() {
-            Ok(mut slot) => *slot = Some(merged),
+            Ok(mut slot) => {
+                // Bridge/tail/rate describe the OLD coverage shape. Cleared
+                // under the SAME hold that swaps the index (the order
+                // set_log_index_config uses): the tail tick appends and
+                // records while holding this lock, so no record seeded
+                // against the old index can slip in between the clear and
+                // the install.
+                self.clear_log_index_bridge();
+                if let Ok(mut t) = self.log_index_tail.lock() {
+                    t.clear();
+                }
+                if let Ok(mut rate) = self.log_index_rate.lock() {
+                    *rate = None;
+                }
+                *slot = Some(merged);
+            }
             Err(_) => return Err("log index unavailable".to_string()),
         }
         Ok(())
@@ -2495,8 +2570,26 @@ impl ElReader {
                         break; // unprocessed candidate — resume here next tick
                     }
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
-                    ix.backfill_block(n, vh.hash, logs)
-                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                    if let Err(g) = ix.backfill_block(n, vh.hash, logs) {
+                        // A gap here means the walk state cannot resume — a
+                        // shape no merge/adopt should produce (belt and
+                        // braces for `walk_resumable`). Without the reset the
+                        // walker would re-fetch and re-verify the same batch
+                        // against the same wall every tick, forever. Dropping
+                        // the cursor makes the appender re-seed at the top
+                        // and the walker re-descend through the spans —
+                        // coverage survives, the wedge cannot.
+                        tracing::warn!(
+                            block = g.block,
+                            edge = g.edge,
+                            "backfill gap; resetting the walk cursor to re-descend"
+                        );
+                        ix.cursor = None;
+                        return Err(format!(
+                            "backfill gap at {} (edge {}); walk reset",
+                            g.block, g.edge
+                        ));
+                    }
                 }
                 Ok(())
             }

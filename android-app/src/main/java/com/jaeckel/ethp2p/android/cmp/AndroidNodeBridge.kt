@@ -124,16 +124,19 @@ class AndroidNodeController(
                         return@Thread
                     }
                     // The engine reads file paths, not streams: materialize each
-                    // content: URI into app-private storage first.
-                    val temps = uris.mapIndexed { i, uri ->
-                        val f = File(appContext.cacheDir, "logindex-import-$i.db")
-                        appContext.contentResolver.openInputStream(uri).use { input ->
-                            requireNotNull(input) { "cannot read $uri" }
-                            f.outputStream().use { out -> input.copyTo(out) }
-                        }
-                        f
-                    }
+                    // content: URI into app-private storage first. Unique temp
+                    // names (imports on two networks can overlap) and cleanup
+                    // that also covers a failure mid-copy.
+                    val temps = mutableListOf<File>()
                     try {
+                        uris.forEach { uri ->
+                            val f = File.createTempFile("logindex-import-", ".db", appContext.cacheDir)
+                            temps.add(f)
+                            appContext.contentResolver.openInputStream(uri).use { input ->
+                                requireNotNull(input) { "cannot read $uri" }
+                                f.outputStream().use { out -> input.copyTo(out) }
+                            }
+                        }
                         val pathsJson = temps.joinToString(",", "[", "]") {
                             "\"${it.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                         }
