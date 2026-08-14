@@ -166,6 +166,19 @@ public class DaemonClient {
                 yield "{\"cmd\":\"resolve-ens-interface\",\"name\":\"" + esc(args[1])
                     + "\",\"interfaceId\":\"" + esc(args[2]) + "\"}";
             }
+            case "import-logindex" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: import-logindex <file> [<file> ...]");
+                StringBuilder sb = new StringBuilder("{\"cmd\":\"import-logindex\",\"paths\":[");
+                for (int i = 1; i < args.length; i++) {
+                    if (i > 1) sb.append(',');
+                    // Absolute: the daemon's working directory is not the caller's.
+                    sb.append('"')
+                      .append(esc(java.nio.file.Path.of(args[i]).toAbsolutePath().normalize().toString()))
+                      .append('"');
+                }
+                yield sb.append("]}").toString();
+            }
             default -> "{\"cmd\":\"" + esc(cmd) + "\"}";
         };
     }

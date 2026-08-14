@@ -80,6 +80,8 @@ public class CommandHandler {
                 case "resume"                  -> handleResume();
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
+                case "import-logindex"         -> handleImportLogIndex(jsonLine);
+                case "logindex-status"         -> handle.logIndexStatusJson();
                 default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
@@ -252,6 +254,21 @@ public class CommandHandler {
     private static String truncatePeerId(String peerId) {
         return peerId != null && peerId.length() > 16
                 ? peerId.substring(0, 16) + "..." : peerId;
+    }
+
+    /**
+     * Import portable log-index snapshot files
+     * ({@code {"cmd":"import-logindex","paths":["/abs/file.db",...]}}). The
+     * paths array is handed to the engine VERBATIM — it validates format and
+     * chain identity per file and merges all-or-nothing; its own
+     * {@code {"ok":...}} / {@code {"error":...}} JSON is the response. Rust
+     * engine only: the Java engine answers its stable not-supported error.
+     * (The zero-effort alternative stays available too: drop the file at
+     * {@code dataDir/logindex[-network].db} before start and the engine
+     * activates it by itself.)
+     */
+    private String handleImportLogIndex(String jsonLine) {
+        return handle.importLogIndexFiles(extractArray(jsonLine, "paths"));
     }
 
     // -------------------------------------------------------------------------
@@ -795,5 +812,36 @@ public class CommandHandler {
         while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
         if (start == end) throw new IllegalArgumentException("Field '" + field + "' is not a number");
         return Long.parseLong(json.substring(start, end));
+    }
+
+    /**
+     * Extract a JSON ARRAY value verbatim (brackets included). The scan is
+     * string-and-escape aware — a {@code ]} inside a quoted element (file
+     * paths can contain one) must not terminate the match early.
+     */
+    static String extractArray(String json, String field) {
+        String key = "\"" + field + "\"";
+        int keyIdx = json.indexOf(key);
+        if (keyIdx < 0) throw new IllegalArgumentException("Missing field: " + field);
+        int colon = json.indexOf(':', keyIdx + key.length());
+        if (colon < 0) throw new IllegalArgumentException("Malformed JSON near field: " + field);
+        int open = json.indexOf('[', colon + 1);
+        if (open < 0) throw new IllegalArgumentException("Field '" + field + "' value is not an array");
+        int depth = 0;
+        boolean inString = false;
+        for (int i = open; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (inString) {
+                if (c == '\\') i++; // skip the escaped char
+                else if (c == '"') inString = false;
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '[') {
+                depth++;
+            } else if (c == ']' && --depth == 0) {
+                return json.substring(open, i + 1);
+            }
+        }
+        throw new IllegalArgumentException("Unterminated array for field: " + field);
     }
 }

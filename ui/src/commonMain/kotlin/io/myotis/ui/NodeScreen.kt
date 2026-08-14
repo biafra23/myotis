@@ -110,13 +110,17 @@ fun NodeScreen(
     val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
-    // The Index tab only exists while the Kohaku log index reads as enabled in Settings —
-    // which is what its switch displays: the persisted per-network flags AND the Rust
-    // engine (without it the switch shows off/disabled and no engine serves the index).
-    // Both are plain settings reads, so the toggles that change them bump logIndexRev.
+    // The Index tab exists while the log index reads as enabled in Settings (the
+    // persisted per-network flags AND the Rust engine — without it the switch shows
+    // off/disabled and no engine serves the index), OR while any live engine reports
+    // an enabled index: an imported/dropped-in snapshot activates engine-side without
+    // any Settings flag ever having been touched, and hiding a running index would
+    // leave its progress unreachable. Settings are plain reads, so the toggles that
+    // change them bump logIndexRev; the engine side re-derives from `snapshots`.
     var logIndexRev by remember { mutableStateOf(0) }
-    val showIndexTab = remember(logIndexRev) {
-        settings.rustEngineEnabled() && KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) }
+    val showIndexTab = remember(logIndexRev, snapshots) {
+        (settings.rustEngineEnabled() && KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) }) ||
+            snapshots.values.any { it.logIndexJson?.contains("\"enabled\":true") == true }
     }
     val tabs = remember(showIndexTab) {
         if (showIndexTab) listOf("Status", "Query", "Logs", "Index", "Settings")
@@ -1673,26 +1677,24 @@ private fun IndexTab(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (preset == null) {
-            Text("No Kohaku contract preset for $network.")
-            return@Column
-        }
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
-        SwitchRow(
-            label = "Collect Kohaku contract logs on $network",
-            checked = collecting,
-            enabled = true,
-            onChange = { on ->
-                collecting = on
-                settings.setLogIndexEnabled(network, on)
-                controller.applyLogIndex(network)
-                onLogIndexChanged()
-            },
-        )
-        Text(
-            "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
-                "against receipt roots, backfilling to each contract's deployment block.",
-        )
+        if (preset != null) {
+            SwitchRow(
+                label = "Collect Kohaku contract logs on $network",
+                checked = collecting,
+                enabled = true,
+                onChange = { on ->
+                    collecting = on
+                    settings.setLogIndexEnabled(network, on)
+                    controller.applyLogIndex(network)
+                    onLogIndexChanged()
+                },
+            )
+            Text(
+                "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
+                    "against receipt roots, backfilling to each contract's deployment block.",
+            )
+        }
         if (collecting) {
             var maxSpeed by remember(network) { mutableStateOf(settings.logIndexMaxSpeed(network)) }
             SwitchRow(
@@ -1712,31 +1714,57 @@ private fun IndexTab(
                 else "Nice background pace — one small batch every few seconds.",
             )
         }
+        // Import: merge portable snapshot files (built by the daemon's
+        // build-logindex tool, or exported by another node) into this
+        // network's index \u2014 works with or without a preset.
+        if (controller.canImportLogIndex) {
+            var importResult by remember(network) { mutableStateOf<String?>(null) }
+            var importing by remember(network) { mutableStateOf(false) }
+            Button(
+                enabled = !importing,
+                onClick = {
+                    importing = true
+                    importResult = null
+                    val started = controller.importLogIndexSnapshots(network) { line ->
+                        importResult = line
+                        importing = false
+                        // Importing is the opt-in \u2014 reflect the flag the host persisted.
+                        collecting = settings.logIndexEnabled(network)
+                        onLogIndexChanged()
+                    }
+                    if (!started) importing = false
+                },
+            ) { Text(if (importing) "Importing\u2026" else "Import log-index snapshot\u2026") }
+            importResult?.let { Text(it) }
+        }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
-            !collecting -> Text("Collection is off.")
-            parsed == null || !parsed.enabled ->
-                Text("Waiting for the engine (start the network with the Rust engine).")
-            else -> {
+            parsed?.enabled == true -> {
                 Text("${parsed.logCount} logs collected")
                 LogIndexStatus.progressLine(parsed)?.let { Text("Backfill: $it") }
-                preset.forEach { watch ->
-                    val e = parsed.entries.firstOrNull { it.address == watch.address.lowercase() }
-                    val low = e?.coveredLow
-                    val high = e?.coveredHigh
+                // The ENGINE's entry list is authoritative \u2014 it includes
+                // imported subscriptions the preset knows nothing about.
+                // Labels prefer the engine name (imports carry baked-in
+                // names), then the preset label, then the raw address.
+                parsed.entries.forEach { e ->
+                    val label = e.name
+                        ?: preset?.firstOrNull { it.address.lowercase() == e.address }?.label
+                        ?: e.address
+                    val low = e.coveredLow
+                    val high = e.coveredHigh
                     Column {
-                        Text(watch.label)
+                        Text(label)
                         if (low == null || high == null) {
-                            Text("waiting \u2014 target block ${watch.fromBlock}")
+                            Text("waiting \u2014 target block ${e.fromBlock}")
                             LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
                         } else {
-                            val total = (high - watch.fromBlock + 1).coerceAtLeast(1)
+                            val total = (high - e.fromBlock + 1).coerceAtLeast(1)
                             val done = (high - low + 1).coerceIn(0, total)
                             val pct = done.toFloat() / total.toFloat()
-                            val complete = low <= watch.fromBlock
+                            val complete = low <= e.fromBlock
                             Text(
-                                if (complete) "complete \u2014 blocks ${watch.fromBlock}\u2013$high"
-                                else "blocks $low\u2013$high \u00b7 target ${watch.fromBlock} \u00b7 ${(pct * 100).toInt()}%"
+                                if (complete) "complete \u2014 blocks ${e.fromBlock}\u2013$high"
+                                else "blocks $low\u2013$high \u00b7 target ${e.fromBlock} \u00b7 ${(pct * 100).toInt()}%"
                             )
                             LinearProgressIndicator(
                                 progress = { if (complete) 1f else pct },
@@ -1745,7 +1773,25 @@ private fun IndexTab(
                         }
                     }
                 }
+                // Preset entries the engine hasn't picked up yet (config not
+                // pushed / engine restarting): keep their waiting rows visible.
+                preset?.filter { p -> parsed.entries.none { it.address == p.address.lowercase() } }
+                    ?.forEach { watch ->
+                        Column {
+                            Text(watch.label)
+                            Text("waiting \u2014 target block ${watch.fromBlock}")
+                            LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
+                        }
+                    }
             }
+            collecting ->
+                Text("Waiting for the engine (start the network with the Rust engine).")
+            preset == null ->
+                Text(
+                    "No contract preset for $network. Import a log-index snapshot to " +
+                        "collect and serve eth_getLogs for its contracts."
+                )
+            else -> Text("Collection is off.")
         }
     }
 }

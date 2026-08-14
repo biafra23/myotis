@@ -49,6 +49,10 @@ class AndroidNodeController(
     private val serviceProvider: () -> NodeService?,
     private val appContext: Context,
     private val onStartService: () -> Unit,
+    /** Launch the system document picker and hand back the chosen URIs (empty =
+     *  cancelled). Provided by the Activity (result launchers live there); null
+     *  on hosts without one, which hides the Index tab's Import button. */
+    private val pickFiles: (((List<android.net.Uri>) -> Unit) -> Unit)? = null,
 ) : NodeController {
 
     override val running: Boolean
@@ -101,6 +105,58 @@ class AndroidNodeController(
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
+
+    override val canImportLogIndex: Boolean get() = pickFiles != null
+
+    override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
+        val picker = pickFiles ?: return false
+        picker { uris ->
+            if (uris.isEmpty()) {
+                onResult("Import cancelled.")
+                return@picker
+            }
+            // Copy + engine merge off the UI thread (snapshots can be large).
+            Thread({
+                try {
+                    val svc = serviceProvider()
+                    if (svc == null || !NodeService.isRunning()) {
+                        onResult("Node is not running — start it first.")
+                        return@Thread
+                    }
+                    // The engine reads file paths, not streams: materialize each
+                    // content: URI into app-private storage first.
+                    val temps = uris.mapIndexed { i, uri ->
+                        val f = File(appContext.cacheDir, "logindex-import-$i.db")
+                        appContext.contentResolver.openInputStream(uri).use { input ->
+                            requireNotNull(input) { "cannot read $uri" }
+                            f.outputStream().use { out -> input.copyTo(out) }
+                        }
+                        f
+                    }
+                    try {
+                        val pathsJson = temps.joinToString(",", "[", "]") {
+                            "\"${it.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+                        }
+                        val r = svc.importLogIndex(network, pathsJson)
+                        if (r.startsWith("{\"ok\":true")) {
+                            onResult(
+                                "Imported ${uris.size} snapshot${if (uris.size == 1) "" else "s"} — catch-up started."
+                            )
+                        } else {
+                            val err = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(r)
+                                ?.groupValues?.get(1) ?: r
+                            onResult("Import failed: $err")
+                        }
+                    } finally {
+                        temps.forEach { it.delete() }
+                    }
+                } catch (e: Exception) {
+                    onResult("Import failed: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }, "log-index-import").apply { isDaemon = true }.start()
+        }
+        return true
+    }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }

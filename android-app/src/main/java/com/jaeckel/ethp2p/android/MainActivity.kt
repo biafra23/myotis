@@ -43,6 +43,17 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { _ -> startNodeService() }
 
+    // Log-index snapshot import: the SAF picker's results must land in whatever
+    // callback the shared UI's Import action registered (one pick in flight at
+    // a time — the picker is modal).
+    private var pendingFilePick: ((List<android.net.Uri>) -> Unit)? = null
+    private val openDocumentsLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        pendingFilePick?.invoke(uris ?: emptyList())
+        pendingFilePick = null
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val svc = (service as NodeService.LocalBinder).service()
@@ -70,6 +81,12 @@ class MainActivity : ComponentActivity() {
                     serviceProvider = { boundServiceState.value },
                     appContext = applicationContext,
                     onStartService = ::ensureNodeStarted,
+                    pickFiles = { onPicked ->
+                        pendingFilePick = onPicked
+                        // Snapshot files have no registered MIME type — accept
+                        // any and let the engine's format check refuse junk.
+                        openDocumentsLauncher.launch(arrayOf("*/*"))
+                    },
                 )
             }
             val settings = remember { AndroidSettings(applicationContext) }

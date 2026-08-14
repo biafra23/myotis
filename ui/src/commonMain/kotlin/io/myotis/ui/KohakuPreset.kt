@@ -68,7 +68,11 @@ object KohakuPreset {
     fun configJson(network: String, enabled: Boolean, maxSpeed: Boolean = false): String? {
         val watch = byNetwork[network] ?: return null
         val entries = watch.joinToString(",") {
-            """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
+            // Labels ride along as the entry's display name (they are fixed
+            // ASCII literals above — nothing to escape). The engine keeps
+            // names out of the config fingerprint, so they never invalidate
+            // accumulated coverage.
+            """{"address":"${it.address}","fromBlock":${it.fromBlock},"name":"${it.label}"}"""
         }
         return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"watch":[$entries]}"""
     }

@@ -261,13 +261,12 @@ public final class NodeService extends Service {
     }
 
     /** Raw log-index status JSON for a RUNNING network, or null when the
-     *  feature is off for it / the network isn't hosted (the Index tab shows
-     *  its waiting state then). */
+     *  network isn't hosted (the Index tab shows its waiting state then).
+     *  Deliberately NOT gated on the preference flag: an imported snapshot
+     *  activates engine-side without the flag ever being touched, and the
+     *  Java engine's stable disabled default keeps the call cheap. */
     public String logIndexStatusJsonOrNull(String network) {
         String net = canonicalNetwork(network);
-        if (!logIndexEnabled(this, net)) {
-            return null;
-        }
         ChainHandle handle;
         synchronized (handles) {
             handle = handles.get(net);
@@ -279,6 +278,35 @@ public final class NodeService extends Service {
             return handle.logIndexStatusJson();
         } catch (RuntimeException e) {
             return null;
+        }
+    }
+
+    /**
+     * Import portable log-index snapshots into a RUNNING network's index.
+     * {@code pathsJson} must name REAL files (the activity copies
+     * content: URIs into app storage first — the engine reads paths, not
+     * streams). Persists the enabled flag on success: importing is the
+     * opt-in, and the next start's config push must keep the index alive.
+     * Returns the engine's {@code {"ok":...}} / {@code {"error":...}} JSON.
+     */
+    public String importLogIndex(String network, String pathsJson) {
+        String net = canonicalNetwork(network);
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return "{\"error\":\"" + net + " is not running\"}";
+        }
+        try {
+            String r = handle.importLogIndexFiles(pathsJson);
+            if (r.startsWith("{\"ok\":true")) {
+                setLogIndexEnabled(this, net, true);
+            }
+            return r;
+        } catch (RuntimeException e) {
+            String msg = e.getMessage() == null ? "import failed" : e.getMessage();
+            return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
         }
     }
 

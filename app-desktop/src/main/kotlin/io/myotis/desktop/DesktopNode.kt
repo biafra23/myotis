@@ -272,10 +272,52 @@ class DesktopNodeController(
     }
 
     /** Raw log-index status JSON, fetched ONCE per snapshot (both the status
-     *  line and the Index tab derive from it), or null when off/unavailable. */
-    private fun logIndexRawFor(network: String): String? {
-        if (!settings.logIndexEnabled(network)) return null
-        return runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull()
+     *  line and the Index tab derive from it), or null when unavailable.
+     *  Deliberately NOT gated on the Settings flag: an imported or dropped-in
+     *  snapshot activates engine-side without the flag ever being touched,
+     *  and the Java engine's stable disabled default keeps this cheap. */
+    private fun logIndexRawFor(network: String): String? =
+        runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull()
+
+    override val canImportLogIndex: Boolean get() = true
+
+    override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
+        val canonical = engine.canonicalNetworkName(network)
+        // AWT file dialog wants the EDT; the import itself (engine-side merge
+        // of possibly-GB snapshots) then moves to a worker thread.
+        java.awt.EventQueue.invokeLater {
+            val dialog = java.awt.FileDialog(null as java.awt.Frame?, "Import log-index snapshots", java.awt.FileDialog.LOAD)
+            dialog.isMultipleMode = true
+            dialog.isVisible = true
+            val files = dialog.files?.toList().orEmpty()
+            if (files.isEmpty()) {
+                onResult("Import cancelled.")
+                return@invokeLater
+            }
+            Thread({
+                val handle = engine.get(canonical)
+                if (handle == null) {
+                    onResult("$canonical is not running — start it first.")
+                    return@Thread
+                }
+                val pathsJson = files.joinToString(",", "[", "]") {
+                    "\"${it.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+                }
+                val result = runCatching { handle.importLogIndexFiles(pathsJson) }
+                    .getOrElse { "{\"error\":\"${it.message}\"}" }
+                if (result.startsWith("{\"ok\":true")) {
+                    // Importing is the opt-in: persist the flag so the next
+                    // start's config push keeps the index enabled.
+                    settings.setLogIndexEnabled(canonical, true)
+                    onResult("Imported ${files.size} snapshot${if (files.size == 1) "" else "s"} — catch-up started.")
+                } else {
+                    val err = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(result)
+                        ?.groupValues?.get(1) ?: result
+                    onResult("Import failed: $err")
+                }
+            }, "log-index-import-$canonical").apply { isDaemon = true }.start()
+        }
+        return true
     }
 
     override fun applyTorMode() {
