@@ -235,11 +235,22 @@ jobs:
           path: myotis-data
           key: myotis-smoke-data-linux-${{ github.run_id }}
           restore-keys: myotis-smoke-data-linux-
+      # Exit 2 = never reached a usable peer set (environment), vs exit 1 =
+      # the engine answered and a check failed. Both still fail the job, but
+      # the annotation says which — a thin-peer runner must not read as a
+      # platform defect (#372).
       - name: Smoke — sync mainnet + verified reads
         working-directory: rust/myotis-node
         env:
           MYOTIS_SMOKE_TIMEOUT_MIN: '55'
-        run: node smoke.mjs "${{ github.workspace }}/myotis-data" "${{ github.workspace }}/myotis-node.linux-x64-gnu.node"
+        run: |
+          set +e
+          node smoke.mjs "${{ github.workspace }}/myotis-data" "${{ github.workspace }}/myotis-node.linux-x64-gnu.node"
+          code=$?
+          if [ "$code" = "2" ]; then
+            echo "::error title=Smoke: insufficient peers::Never reached the readiness gate (snap peers / discovery). This is an environment result, not an engine regression — see the unmet-conditions line above."
+          fi
+          exit $code
 
   # Full runtime validation on Windows: unit-test the workspace (green since
   # the .gitattributes LF pin for the golden vectors), then run the real smoke
@@ -274,8 +285,17 @@ jobs:
           path: myotis-data
           key: myotis-smoke-data-win-${{ github.run_id }}
           restore-keys: myotis-smoke-data-win-
+      # See the linux job: exit 2 = insufficient peers (environment), exit 1 =
+      # engine check failure. The Windows runner is the thin-peer one, so the
+      # distinction matters most here (#372).
       - name: Smoke — sync mainnet + verified reads
         working-directory: rust/myotis-node
         env:
           MYOTIS_SMOKE_TIMEOUT_MIN: '55'
-        run: node smoke.mjs ${{ github.workspace }}\myotis-data ${{ github.workspace }}\myotis-node.win32-x64-msvc.node
+        run: |
+          node smoke.mjs ${{ github.workspace }}\myotis-data ${{ github.workspace }}\myotis-node.win32-x64-msvc.node
+          $code = $LASTEXITCODE
+          if ($code -eq 2) {
+            Write-Output "::error title=Smoke: insufficient peers::Never reached the readiness gate (snap peers / discovery). This is an environment result, not an engine regression — see the unmet-conditions line above."
+          }
+          exit $code
