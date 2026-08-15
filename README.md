@@ -149,6 +149,14 @@ const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 
 This is how the [Freedom browser](https://github.com/solardev-xyz/freedom-browser) is integrating Myotis ([PR #181](https://github.com/solardev-xyz/freedom-browser/pull/181)): an invisible background node — alongside the browser's Swarm and IPFS nodes — behind an experimental tier that serves fully-P2P verified `.eth` resolution with no prover service and no RPC provider in the loop.
 
+### Embedding: iOS / Swift
+
+For Swift hosts that embed the engine **without** the Kotlin/Native `MyotisKit` framework, [`rust/build-xcframework.sh`](rust/build-xcframework.sh) packages the engine's plain C ABI as a static **`MyotisEngine.xcframework`** (device arm64 + fat simulator slice, header + Clang modulemap included — `import MyotisEngine` from Swift). Releases ship the zip + SHA256 alongside the napi addons, and CI builds the iOS targets on every `rust/` change so they stay green.
+
+The host contract is the same as everywhere else: gate on `myotis_init()` returning the header's `MYOTIS_ABI_VERSION`, run the blocking verified reads off the main thread, free every returned string with `myotis_string_free`, and treat `myotis_pause`/`myotis_resume` as the scenePhase background/foreground hooks (warm resume is ~10 s back to `SYNCED`). Wait for `statusJson` to report `beaconState == "SYNCED"` **and** `snapPeers > 0` before attempting reads — right after sync the EL side can still be hunting a snap peer and reads fail with "state unavailable".
+
+One caveat: an app that already links **another** Rust staticlib (another embedded node) must not add this xcframework next to it — two Rust staticlibs in one binary collide on the runtime/allocator. Build a single aggregator staticlib crate that depends on both engines as rlibs and re-exports their C symbols instead (one std/allocator/tokio/libp2p). That is how the Freedom iOS browser embeds Myotis alongside its Swarm and IPFS nodes: [freedom-mobile-ffi](https://github.com/solardev-xyz/freedom-mobile-ffi).
+
 ### Desktop daemon
 
 The daemon discovers peers, maintains connections, and listens for CLI commands on a Unix domain socket (`/tmp/ethp2p.sock`); it exposes the verified operations as CLI commands (`get-account`, `get-storage`, `resolve-ens`, …) alongside the same verified JSON-RPC server the apps run (mainnet on `127.0.0.1:8545`). A **client** invocation sends a single command to the running daemon and exits.
