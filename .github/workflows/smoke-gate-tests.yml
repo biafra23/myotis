@@ -1,0 +1,33 @@
+name: smoke gate tests
+
+on:
+  # Same trigger shape as mm-replay-tests: push scoped to main + tags so a
+  # branch push with an open PR doesn't run twice; pull_request unscoped.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Unit tests for the myotis-node smoke test's READINESS GATE
+# (rust/myotis-node/smoke-gate.mjs). Pure Node, no addon build, no network —
+# the gate decides whether a smoke result says anything about the engine at
+# all, so it is worth guarding on every PR rather than only when the (manual,
+# ~100-minute) smoke jobs run. The fixtures are the three real runs from #372.
+jobs:
+  test:
+    name: smoke gate unit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run gate unit tests
+        working-directory: rust/myotis-node
+        run: node --test smoke-gate.test.mjs
