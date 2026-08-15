@@ -7,7 +7,9 @@
 // platform bug that isn't there:
 //   0  all verified reads passed
 //   1  the engine answered, but a check FAILED (a real regression signal)
-//   2  never reached a usable peer set within the timeout (environment)
+//   2  never reached a usable PEER SET within the gate deadline (environment).
+//      Only when every unmet condition is peer-side: a node that never syncs,
+//      or whose EL reader is down, is an ENGINE result and still exits 1.
 //
 // The readiness gate deliberately demands MORE than "one snap peer": the
 // reader rotates over the snap set, so with a single peer one dud peer is
@@ -16,9 +18,15 @@
 //   MYOTIS_SMOKE_REQUIRE_DISCOVERY (default 1) discv5 must have actually run,
 //       so a warm start restoring a stale peer cache can't open the gate
 //   MYOTIS_SMOKE_TIMEOUT_MIN     (default 15) overall budget, unchanged
+//   MYOTIS_SMOKE_GATE_TIMEOUT_MIN (default 15, capped by the overall budget)
+//       how long to wait for the gate before reporting the shortfall — so an
+//       unreachable gate is reported in minutes, not at the end of a 55-minute
+//       run
 
 import { createRequire } from 'node:module';
-import { gateShortfall, gateConfigFromEnv } from './smoke-gate.mjs';
+import {
+  gateShortfall, gateConfigFromEnv, describeShortfall, isPeerStarvation,
+} from './smoke-gate.mjs';
 const require = createRequire(import.meta.url);
 
 const dataDir = process.argv[2] || './.smoke-data';
@@ -26,7 +34,19 @@ const addonPath = process.argv[3] || './target/debug/myotis-node.node';
 const m = require(addonPath);
 
 const SYNC_TIMEOUT_MS = (Number(process.env.MYOTIS_SMOKE_TIMEOUT_MIN) || 15) * 60 * 1000;
-const GATE = gateConfigFromEnv();
+let GATE;
+try {
+  GATE = gateConfigFromEnv();
+} catch (e) {
+  console.error(`bad gate configuration: ${e.message}`);
+  process.exit(1);
+}
+// Report an unreachable gate early instead of burning the whole budget: the
+// old gate went red in seconds on a peer-starved runner, and a slower red is
+// still a worse experience even when the label is better.
+const GATE_TIMEOUT_MS = Math.min(
+  (Number(process.env.MYOTIS_SMOKE_GATE_TIMEOUT_MIN) || 15) * 60 * 1000,
+  SYNC_TIMEOUT_MS);
 const VITALIK = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045';
 /** Exit code for "the environment never gave us a usable peer set". */
 const EXIT_INSUFFICIENT_PEERS = 2;
@@ -72,19 +92,24 @@ const poll = setInterval(() => {
   if (unmet.length === 0) {
     clearInterval(poll);
     queries(s).catch((e) => { console.error('queries failed:', e); shutdown(1); });
-  } else if (Date.now() - t0 > SYNC_TIMEOUT_MS) {
+  } else if (Date.now() - t0 > GATE_TIMEOUT_MS) {
     clearInterval(poll);
-    // Distinct code + message: this is "the environment never produced a
-    // usable peer set", NOT "the engine returned wrong data". Reporting both
-    // as exit 1 is what made a thin-peer Windows runner look like a Windows
-    // engine defect.
-    console.error(`TIMEOUT waiting for a usable peer set — unmet: ${unmet.join(', ')}`);
-    console.error('INSUFFICIENT PEERS (environment, not an engine failure); last status:',
-      JSON.stringify(s));
-    shutdown(EXIT_INSUFFICIENT_PEERS);
+    console.error(`TIMEOUT waiting for the readiness gate — unmet: ${describeShortfall(unmet)}`);
+    if (isPeerStarvation(unmet)) {
+      // Every unmet condition is peer-side: this says nothing about the code,
+      // which is what exit 2 means.
+      console.error('INSUFFICIENT PEERS (environment, not an engine failure); last status:',
+        JSON.stringify(s));
+      shutdown(EXIT_INSUFFICIENT_PEERS);
+    } else {
+      // Something engine-side is unmet (never SYNCED, EL reader down). Calling
+      // that an environment result would just invert the original misdirection.
+      console.error('ENGINE did not become ready (not a peer-availability result); last status:',
+        JSON.stringify(s));
+      shutdown(1);
+    }
   }
 }, 5000);
-
 
 async function timed(label, promise) {
   const q0 = Date.now();
