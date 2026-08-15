@@ -1,0 +1,181 @@
+name: iOS Framework (MyotisKit)
+
+# Builds MyotisKit.xcframework — the Kotlin/Native framework the iOS APP links
+# (:ui's Compose UI + the iOS host seams + IosRpcBackend), via cargo (release
+# static lib for the iOS triples) → cinterop → Kotlin/Native link. No code
+# signing / provisioning: those are only needed for a distributable signed
+# .ipa app, which this is not.
+#
+# DISTINCT from ios-xcframework.yml, which builds MyotisEngine.xcframework —
+# the raw Rust engine C ABI for Swift hosts that embed the engine directly
+# (pure rust/, via build-xcframework.sh). That workflow never compiles the
+# Kotlin :app-ios module, so this is the ONLY automated check that does: a
+# break in IosRpcBackend or a drift in the engine's C ABI header would
+# otherwise sail through green until someone built the app on a Mac (which is
+# why the revert PRs each needed a manual compileKotlinIos* run). The PR/main
+# leg is that safety net; the tag leg publishes the xcframework to the same
+# pre-release the sibling asset workflows populate.
+
+on:
+  # Scope push to main + release tags so a branch push that also has an open PR
+  # doesn't build twice (the PR is covered by pull_request below).
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-15 for a recent Xcode toolchain (the Kotlin/Native iOS link needs
+    # Xcode's clang/ld for the target). macos-14's Xcode also links a static
+    # framework, but 15 tracks closer to the dev fleet's Xcode 26.
+    name: Build MyotisKit framework
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: :ui (bundled into the framework) stamps its on-screen
+          # version from the nearest v* tag via `git describe`, which needs
+          # HEAD's history to reach that tag — same reason as the desktop dmg.
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (aarch64)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: 'aarch64'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both iOS triples the framework embeds. The runner is Apple Silicon,
+          # so device (aarch64-apple-ios) and arm64 simulator
+          # (aarch64-apple-ios-sim) are the two the module targets — there is
+          # deliberately no x86_64 simulator (Apple-Silicon-only dev fleet).
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # On a tag: the full xcframework (both triples, release) — the published
+      # artifact. Otherwise: the simulator framework only — one cargo triple,
+      # the cheaper safety-net compile that still exercises IosRpcBackend +
+      # cinterop + the C-ABI header. Retry rides out transient repo-resolution.
+      - name: Build framework
+        id: build
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            task=":app-ios:assembleMyotisKitReleaseXCFramework"
+          else
+            task=":app-ios:linkReleaseFrameworkIosSimulatorArm64"
+          fi
+          echo "task=$task"
+          for attempt in 1 2 3; do
+            ./gradlew "$task" --stacktrace && exit 0
+            echo "::warning::framework build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::framework build failed after 3 attempts"
+          exit 1
+
+      # Zip + checksum the xcframework for upload (the bundle is a directory;
+      # it survives artifact round-trips only zipped). ditto is Apple's
+      # bundle-preserving archiver — matches the sibling MyotisEngine workflow.
+      # Tag builds only — nothing to publish otherwise.
+      - name: Package xcframework
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          xc="app-ios/build/XCFrameworks/release/MyotisKit.xcframework"
+          test -d "$xc" || { echo "::error::missing $xc"; exit 1; }
+          ditto -c -k --keepParent "$xc" MyotisKit.xcframework.zip
+          shasum -a 256 MyotisKit.xcframework.zip | tee MyotisKit.xcframework.zip.sha256
+          ls -lh MyotisKit.xcframework.zip
+
+      - name: Upload xcframework artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-ios-xcframework-${{ github.sha }}
+          path: |
+            MyotisKit.xcframework.zip
+            MyotisKit.xcframework.zip.sha256
+          if-no-files-found: error
+
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
+  # Attach the xcframework to the GitHub Release for the pushed tag. Runs ONLY
+  # on v* tags, after the build + guard, and reuses the build's artifact. The
+  # desktop/android/node workflows publish to the SAME release for the same
+  # tag; whichever job runs first creates it and the others just upload — the
+  # create step tolerates that race.
+  release:
+    name: Publish xcframework to release
+    needs: [build, version-guard]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download xcframework artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myotis-ios-xcframework-${{ github.sha }}
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — gh needs the repo told explicitly or it
+          # dies with "fatal: not a git repository".
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          test -f MyotisKit.xcframework.zip \
+            || { echo "::error::missing MyotisKit.xcframework.zip"; exit 1; }
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **iOS app framework (`MyotisKit.xcframework.zip`)** — the Kotlin/Native
+          framework (device arm64 + simulator arm64) bundling the shared Compose UI
+          and the iOS host seams, embedding the Rust engine over its C ABI. Static —
+          no dyld embed at launch. Drop `MyotisKit.xcframework` into an Xcode project;
+          verify against `MyotisKit.xcframework.zip.sha256`. This is the UI framework
+          the Myotis iOS app links, distinct from `MyotisEngine.xcframework` (the raw
+          engine C ABI for Swift hosts). Not a signed app.
+          SECTION
+          # Same create-or-append race handling as the MyotisEngine and node
+          # workflows publishing to this same release: create with the master
+          # line if absent (tolerating the race), then append THIS section only
+          # if its marker isn't already present (idempotent across reruns), so
+          # neither the master notes nor any sibling's section is clobbered.
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --title "Myotis $tag" --prerelease \
+              --notes "Pre-release build of the Myotis wallet apps." || true
+          fi
+          existing=$(gh release view "$tag" --json body --jq .body)
+          if ! grep -q 'MyotisKit.xcframework.zip' <<<"$existing"; then
+            printf '%s\n\n%s\n' "$existing" "$(cat "$section")" > notes.md
+            gh release edit "$tag" --notes-file notes.md
+          fi
+          gh release upload "$tag" --clobber \
+            MyotisKit.xcframework.zip \
+            MyotisKit.xcframework.zip.sha256
