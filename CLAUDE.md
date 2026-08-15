@@ -156,6 +156,24 @@ instructions live in `.github/claude-review-prompt.md` and
 not addressed to it — and it could not follow it anyway, since `gh api` is not
 on its allowlist.
 
+**External / fork PRs are reviewed MANUALLY, never by the CI reviewer (owner's
+decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
+(`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
+run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
+tree is attacker-controlled, and an automated reviewer that reads it can be
+prompt-injected. Two inputs make that acute here — the reviewer reads
+`CLAUDE.md` and `.github/claude-review-prompt.md` from the checkout, so a fork
+could *rewrite the reviewer's own rules and prompt* in the same PR (the
+"workflow must match the default branch" guard protects only the workflow YAML,
+not these files). So do NOT wire fork PRs into the automated reviewer. Instead:
+the owner reads the diff first — watching for injection in `CLAUDE.md` /
+`.github/**` / build scripts / postinstall hooks / comments / encoded blobs —
+then, if wanted, a review is run manually from a trusted session. Nothing
+auto-merges, so an injected reviewer could at worst post a comment a human still
+acts on. If automating fork review is ever reconsidered, pin the prompt and
+CLAUDE.md to the base ref, never execute fork code, keep reviews `COMMENT`-only,
+and lock down runner egress — see the discussion that produced this note.
+
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
