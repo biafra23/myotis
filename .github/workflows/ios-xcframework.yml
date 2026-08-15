@@ -1,0 +1,109 @@
+# MyotisEngine.xcframework: the Rust engine's plain C ABI packaged as an iOS
+# static framework (device + fat simulator slices), for Swift hosts embedding
+# the engine directly — see rust/build-xcframework.sh. The build job is the
+# CI gate that keeps the iOS targets compiling on every rust/ change (a dep
+# bump with a platform-specific feature is all it takes to silently break
+# them); on `v*` tags the release job attaches the zip + SHA256 to the
+# GitHub Release next to the napi addons, with the engine ABI version in the
+# notes so hosts can gate on myotis_init().
+name: ios-xcframework
+
+on:
+  # Same scoping as the sibling asset workflows (node-binding/android-apk):
+  # builds stay green on main, `v*` tags publish the release asset. The
+  # paths filter only trims branch pushes — GitHub does not evaluate paths
+  # filters for tag pushes, so `v*` release runs always fire.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths: ['rust/**', '.github/workflows/ios-xcframework.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build MyotisEngine.xcframework
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install iOS rust targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build xcframework
+        run: rust/build-xcframework.sh
+      - name: Zip + checksum
+        run: |
+          set -eu
+          cd rust/target/ios-xcframework
+          # ditto preserves the framework bundle structure the way Xcode and
+          # SwiftPM binaryTarget consumers expect (plain zip loses resource
+          # forks / symlink layout on some setups).
+          ditto -c -k --sequesterRsrc --keepParent \
+            MyotisEngine.xcframework MyotisEngine.xcframework.zip
+          shasum -a 256 MyotisEngine.xcframework.zip | tee MyotisEngine.xcframework.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyotisEngine.xcframework.zip
+          path: |
+            rust/target/ios-xcframework/MyotisEngine.xcframework.zip
+            rust/target/ios-xcframework/MyotisEngine.xcframework.zip.sha256
+          if-no-files-found: error
+
+  # Attach to the tag's GitHub Release. The android/desktop/node workflows
+  # publish to the SAME release for the same tag; whichever job runs first
+  # creates it and the others just add their assets — the create step
+  # tolerates that race. Gated on the REF, not the event, so a
+  # workflow_dispatch targeting a tag ref is the manual republish path.
+  release:
+    name: Publish xcframework to release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Checked out because the ABI version is read from its source of truth
+      # in myotis-engine; this also gives gh its repo context.
+      - uses: actions/checkout@v4
+      - name: Download xcframework artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MyotisEngine.xcframework.zip
+          path: dist
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          abi=$(sed -n 's/^pub const ABI_VERSION: i32 = \([0-9][0-9]*\);.*$/\1/p' \
+            rust/myotis-engine/src/lib.rs)
+          [ -n "$abi" ] || { echo "::error::could not extract ABI_VERSION"; exit 1; }
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **iOS (`MyotisEngine.xcframework.zip`)** — the Rust engine's C ABI as a
+          static xcframework (device arm64 + simulator arm64/x64) for Swift hosts
+          embedding the engine directly. Verify against
+          `MyotisEngine.xcframework.zip.sha256`. Engine ABI version: **__ABI__** —
+          hosts must gate on `myotis_init()` returning exactly __ABI__.
+          SECTION
+          sed -i "s/__ABI__/$abi/g" "$section"
+          # Tolerate the create/append race with the sibling asset workflows,
+          # and keep the append idempotent for manual republish runs.
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --prerelease \
+              --notes "Pre-release build of the Myotis wallet apps." || true
+          fi
+          existing=$(gh release view "$tag" --json body --jq .body)
+          if ! grep -q 'MyotisEngine.xcframework.zip' <<<"$existing"; then
+            printf '%s\n\n%s\n' "$existing" "$(cat "$section")" > notes.md
+            gh release edit "$tag" --notes-file notes.md
+          fi
+          gh release upload "$tag" --clobber \
+            dist/MyotisEngine.xcframework.zip \
+            dist/MyotisEngine.xcframework.zip.sha256
