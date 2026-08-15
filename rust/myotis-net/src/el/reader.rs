@@ -487,6 +487,116 @@ struct TxScanState {
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
+/// How long an INTERACTIVE verified read waits on the peers already in flight
+/// before it STARTS one more alongside them. It does not abandon the ones
+/// running. The peer request timeout (`peer::REQUEST_TIMEOUT`, 15 s) is sized
+/// for background sync tolerance; a wallet flow is a CHAIN of sequential
+/// reads, so a silent peer costs the user the full 15 s per link (#320:
+/// 15 987 ms `eth_call`, 15 078 ms `eth_getTransactionCount` — each rotated
+/// afterwards and SUCCEEDED, so the wait bought nothing).
+///
+/// HEDGING rather than a per-attempt deadline, deliberately. Cancelling at a
+/// fixed deadline turns "slow but working" into "failed" whenever the peers
+/// after it are broken, and on a uniformly slow link it burns the deadline
+/// once per peer before anyone answers — worse than the stall it fixes.
+/// Racing costs one extra in-flight request and keeps the slow peer's answer
+/// if it still arrives first.
+const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cap on concurrently hedged attempts for one read: each in-flight attempt
+/// holds a snap request on a connection that background sync shares, so a
+/// slow pool must not fan one read out across every peer at once.
+const MAX_HEDGED_ATTEMPTS: usize = 3;
+
+/// What a hedged race produced: the accepted answer (with the index of the peer
+/// that gave it), the best non-accepted result as a fallback, and the indices
+/// that missed (failed, or answered without a verdict) so the caller can feed
+/// peer quality. Peers still in flight when the winner returned are in NEITHER
+/// list — they were neither good nor bad, just slower.
+struct RaceOutcome<T> {
+    accepted: Option<(usize, T)>,
+    fallback: Option<T>,
+    missed: Vec<usize>,
+    last_err: String,
+}
+
+/// Race `make(peer)` across `peers` with hedging: start the first, and every
+/// [`HEDGE_DELAY`] without an answer start one more (up to
+/// [`MAX_HEDGED_ATTEMPTS`] in flight), stopping at the first result `accept`
+/// approves. A slow peer keeps running while its hedge does, so it still wins
+/// if it answers first.
+///
+/// Pure policy — no pool bookkeeping, no peer types — so the timing invariants
+/// are unit-testable. [`ElReader::hedged_read`] wraps it for the real reads.
+///
+/// NB when a winner returns, the remaining in-flight attempts are dropped
+/// mid-request. That can leave a loser's writer marked torn, which condemns
+/// that connection (`ManagedPeer::fail_all`) — the same trade the backfill
+/// pipeline already makes, and paid only once we HAVE the answer.
+async fn hedged_race<T, P: Clone, Fut>(
+    peers: &[P],
+    mut make: impl FnMut(P) -> Fut,
+    accept: impl Fn(&T) -> bool,
+) -> RaceOutcome<T>
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let total = peers.len();
+    let mut in_flight = FuturesUnordered::new();
+    let mut next = 0usize;
+    let mut out = RaceOutcome {
+        accepted: None,
+        fallback: None,
+        missed: Vec::new(),
+        last_err: String::new(),
+    };
+    // ONE push site: two `async move` blocks are distinct anonymous types and
+    // could not share a FuturesUnordered without boxing every attempt.
+    let mut start_another = true;
+    loop {
+        if start_another && next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
+            let idx = next;
+            let fut = make(peers[idx].clone());
+            in_flight.push(async move { (idx, fut.await) });
+            next += 1;
+        }
+        start_another = false;
+        if in_flight.is_empty() {
+            break;
+        }
+        let hedge = tokio::time::sleep(HEDGE_DELAY);
+        tokio::select! {
+            Some((idx, res)) = in_flight.next() => match res {
+                Ok(value) => {
+                    if accept(&value) {
+                        out.accepted = Some((idx, value));
+                        return out;
+                    }
+                    // Answered, but without a verdict (stale head / bad proof):
+                    // a different peer can still verify.
+                    out.missed.push(idx);
+                    out.fallback.get_or_insert(value);
+                    start_another = true;
+                }
+                Err(e) => {
+                    out.missed.push(idx);
+                    out.last_err = e;
+                    start_another = true;
+                }
+            },
+            // Nobody answered in time and a candidate remains: start it
+            // ALONGSIDE the ones running, never instead of them.
+            _ = hedge, if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS => {
+                start_another = true;
+            }
+            else => break,
+        }
+    }
+    out
+}
+
 /// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
@@ -2742,33 +2852,45 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
+        // Hedged across peers: a silent peer no longer blocks the read for the
+        // full request timeout, and a slow-but-working one still wins if it
+        // answers before its hedge does. Accepted = a verdict, or a GLOBAL
+        // failure (beacon not ready — identical for every peer); a per-peer
+        // verdict failure (stale head / bad proof) becomes the fallback.
+        self.hedged_read(
+            &peers,
+            |peer| async move { self.get_account_from(&peer, address).await },
+            |r: &VerifiedAccount| r.verify_method.is_some() || is_global_fail(r.fail_reason),
+            "a verifiable account",
+        )
+        .await
+    }
+
+    /// [`hedged_race`] plus peer-quality bookkeeping: record the winner as
+    /// served and every miss as a failure (peers merely still in flight are
+    /// left alone — being slower than the winner is not a fault), then return
+    /// the accepted answer, else the fallback, else the last error.
+    async fn hedged_read<T, Fut>(
+        &self,
+        peers: &[std::sync::Arc<ManagedPeer>],
+        make: impl FnMut(std::sync::Arc<ManagedPeer>) -> Fut,
+        accept: impl Fn(&T) -> bool,
+        what: &str,
+    ) -> Result<T, String>
+    where
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
         let total = peers.len();
-        let mut fallback: Option<VerifiedAccount> = None;
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.get_account_from(peer, address).await {
-                Ok(result) => {
-                    // Verified, or a GLOBAL verdict failure (beacon not ready —
-                    // identical for every peer): this is the answer.
-                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
-                        self.pool.record_snap_served(peer.addr()).await;
-                        return Ok(result);
-                    }
-                    // A PER-PEER verdict failure (a stale/behind head or a bad
-                    // proof — a different peer can still verify): keep it as a
-                    // fallback and try the next peer.
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    fallback.get_or_insert(result);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
+        let out = hedged_race(peers, make, accept).await;
+        for idx in &out.missed {
+            self.pool.record_snap_failure(peers[*idx].addr()).await;
         }
-        // No peer verified; return the best per-peer result if we got one.
-        fallback.map(Ok).unwrap_or_else(|| {
-            Err(format!("all {total} snap peer(s) failed to serve a verifiable account: {last_err}"))
+        if let Some((idx, value)) = out.accepted {
+            self.pool.record_snap_served(peers[idx].addr()).await;
+            return Ok(value);
+        }
+        out.fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("all {total} snap peer(s) failed to serve {what}: {}", out.last_err))
         })
     }
 
@@ -3026,28 +3148,15 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut fallback: Option<VerifiedStorage> = None;
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.get_storage_from(peer, address, slot, holder, storage_key).await {
-                Ok(result) => {
-                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
-                        self.pool.record_snap_served(peer.addr()).await;
-                        return Ok(result);
-                    }
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    fallback.get_or_insert(result);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        fallback.map(Ok).unwrap_or_else(|| {
-            Err(format!("all {total} snap peer(s) failed to serve verifiable storage: {last_err}"))
-        })
+        self.hedged_read(
+            &peers,
+            |peer| async move {
+                self.get_storage_from(&peer, address, slot, holder, storage_key).await
+            },
+            |r: &VerifiedStorage| r.verify_method.is_some() || is_global_fail(r.fail_reason),
+            "verifiable storage",
+        )
+        .await
     }
 
     /// One storage-slot fetch + verdict against a single peer (no retry / cache
@@ -3174,21 +3283,18 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            match peer.snap_get_bytecode(code_hash).await {
-                Ok(code) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(code);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        Err(format!("all {total} snap peer(s) failed to serve verifiable bytecode: {last_err}"))
+        // Bytecode is content-addressed (snap_get_bytecode verifies the hash),
+        // so ANY peer's bytes are the answer — accept the first that returns.
+        self.hedged_read(
+            &peers,
+            |peer| {
+                let hash = *code_hash;
+                async move { peer.snap_get_bytecode(&hash).await }
+            },
+            |_: &Vec<u8>| true,
+            "verifiable bytecode",
+        )
+        .await
     }
 
     /// Verified `eth_call`: run a read-only call against the verified head's state.
@@ -5077,6 +5183,160 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hedging invariants (#320): a silent peer must not hold the read for the
+    /// full request timeout, and — the half a naive per-attempt deadline gets
+    /// wrong — a slow-but-working peer must still win when the peers after it
+    /// are broken. Asserted on tokio's paused clock, so the timings are exact.
+    mod hedged_reads {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// What a scripted peer does when asked.
+        #[derive(Clone, Copy)]
+        enum Peer {
+            /// Answers `value` after `delay`.
+            Answers(Duration, u32),
+            /// Fails immediately (a broken peer: stale root, bad proof).
+            FailsNow,
+            /// Answers after `delay`, but without a verdict (accept == false).
+            NoVerdict(Duration),
+        }
+
+        /// Race the scripted peers, accepting any answer except `NoVerdict`
+        /// (modelled as value 0), and report the accepted value.
+        async fn race(peers: Vec<Peer>) -> Result<u32, String> {
+            race_tracked(peers, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))).await
+        }
+
+        /// As [`race`], tracking concurrent in-flight attempts for the cap test.
+        async fn race_tracked(
+            peers: Vec<Peer>,
+            live: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        ) -> Result<u32, String> {
+            let out = hedged_race(
+                &peers,
+                |p: Peer| {
+                    let live = Arc::clone(&live);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let res = match p {
+                            Peer::Answers(d, v) => {
+                                tokio::time::sleep(d).await;
+                                Ok(v)
+                            }
+                            Peer::NoVerdict(d) => {
+                                tokio::time::sleep(d).await;
+                                Ok(0)
+                            }
+                            Peer::FailsNow => Err("peer failed".to_string()),
+                        };
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        res
+                    }
+                },
+                |v: &u32| *v != 0,
+            )
+            .await;
+            let total = peers.len();
+            if let Some((_, v)) = out.accepted {
+                return Ok(v);
+            }
+            out.fallback
+                .map(Ok)
+                .unwrap_or_else(|| Err(format!("all {total} snap peer(s) failed: {}", out.last_err)))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_peer_still_wins_when_the_others_are_broken() {
+            // THE regression a fixed per-attempt deadline introduces: peer 0
+            // answers at 4 s (past HEDGE_DELAY) while peers 1-2 fail instantly.
+            // Abandoning peer 0 would turn a working read into "all failed".
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(4), 7),
+                Peer::FailsNow,
+                Peer::FailsNow,
+            ])
+            .await;
+            assert_eq!(out, Ok(7), "a working peer must not be abandoned");
+            assert_eq!(started.elapsed(), Duration::from_secs(4));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_peer_does_not_hold_the_read() {
+            // Peer 0 never answers; peer 1 is hedged in at HEDGE_DELAY and
+            // answers quickly. The read completes then — not at REQUEST_TIMEOUT.
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(600), 1),
+                Peer::Answers(Duration::from_millis(50), 2),
+            ])
+            .await;
+            assert_eq!(out, Ok(2));
+            assert_eq!(started.elapsed(), HEDGE_DELAY + Duration::from_millis(50));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_uniformly_slow_pool_answers_at_the_first_completion() {
+            // Every peer slow but working: hedging must not multiply the wait
+            // the way a per-attempt deadline would (3 s burned per peer first).
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(4), 1),
+                Peer::Answers(Duration::from_secs(4), 2),
+                Peer::Answers(Duration::from_secs(4), 3),
+            ])
+            .await;
+            assert_eq!(out, Ok(1));
+            assert_eq!(started.elapsed(), Duration::from_secs(4));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_sole_slow_peer_is_never_abandoned() {
+            let out = race(vec![Peer::Answers(Duration::from_secs(9), 5)]).await;
+            assert_eq!(out, Ok(5));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_non_verdict_answer_is_kept_only_as_a_fallback() {
+            // Peer 0 answers without a verdict, peer 1 verifies: the verdict wins.
+            assert_eq!(
+                race(vec![Peer::NoVerdict(Duration::ZERO), Peer::Answers(Duration::ZERO, 4)]).await,
+                Ok(4)
+            );
+            // With nobody verifying, the non-verdict answer is still returned.
+            assert_eq!(race(vec![Peer::NoVerdict(Duration::ZERO), Peer::FailsNow]).await, Ok(0));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_peer_failing_reports_the_last_error() {
+            let out = race(vec![Peer::FailsNow, Peer::FailsNow]).await;
+            assert!(out.unwrap_err().contains("all 2 snap peer(s) failed"));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn concurrency_is_capped() {
+            // Six silent peers: the cap bounds how many requests one read may
+            // hold across the pool at once (background sync shares them).
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let peers = vec![Peer::Answers(Duration::from_secs(30), 1); 6];
+            let _ = tokio::time::timeout(
+                Duration::from_secs(120),
+                race_tracked(peers, live, Arc::clone(&peak)),
+            )
+            .await;
+            assert!(peak.load(Ordering::SeqCst) <= MAX_HEDGED_ATTEMPTS,
+                "peak {} exceeded the cap", peak.load(Ordering::SeqCst));
+            assert!(peak.load(Ordering::SeqCst) > 1, "hedging should overlap attempts");
+        }
+    }
 
     struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);
     impl myotis_evm::EthCaller for ScriptedCaller {
