@@ -795,14 +795,21 @@ impl ElReader {
         })
     }
 
-    /// Install (or replace) the eth_getLogs watch-list config: reload the
-    /// persisted index when it matches the config's fingerprint, else start
-    /// empty (re-index). See docs/eth-getlogs-design.md.
+    /// Install the eth_getLogs watch-list config — ADDITIVELY: the pushed
+    /// config is unioned with what this node already subscribes (the live
+    /// index, or on boot the persisted snapshot's own watch-table), so a
+    /// host re-applying its shipped preset EXTENDS an imported subscription
+    /// instead of replacing it. Without this, every restart's preset push
+    /// would fingerprint-mismatch the imported index into a full re-index
+    /// (see docs/eth-getlogs-design.md §import).
+    ///
+    /// Accumulated coverage survives whenever the union changes nothing an
+    /// index can't absorb in place (bit flips, renames, a LOWERED
+    /// from_block). A genuinely new address or changed topic set still
+    /// checkpoints the old index and re-indexes under the union — per-entry
+    /// frontiers at different heights would wedge the appender.
     /// Returns false (and installs nothing) for an invalid config
-    /// (duplicate watch addresses). Re-applying a config whose watch-list
-    /// fingerprint matches the installed one only updates the enabled bit —
-    /// in-memory progress survives settings pokes; a genuinely changed
-    /// watch-list checkpoints the old index before replacing it.
+    /// (duplicate watch addresses).
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
         let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
@@ -814,22 +821,27 @@ impl ElReader {
                 *rate = None;
             }
         };
+        let tag = self.chain_tag();
         let Ok(mut slot) = self.log_index.lock() else {
             return false;
         };
         if let Some(ix) = slot.as_mut() {
-            if ix.config().fingerprint() == config.fingerprint() {
-                // Same watch-list: the index (and so the mapped gap and the
-                // tail record) still describes this coverage. Toggling enable
-                // or max-speed must not cost a full re-descent and a tail
-                // rewind back to finality.
-                ix.set_enabled(config.enabled);
-                ix.set_max_speed(config.max_speed);
-                reset_rate();
-                return true;
+            // Union against the LIVE watch-list. The live set always
+            // contains the persisted file's set (it was built from it), so
+            // no disk read is needed on a settings poke.
+            if let Some(eff) = config.union_with(&ix.config().watch) {
+                if ix.adopt_config(eff) {
+                    // Nothing accumulated was invalidated: coverage, the
+                    // mapped gap and the tail record still describe this
+                    // index (a from_block lowered below a complete span only
+                    // drops the walk cursor — the appender re-seeds it).
+                    reset_rate();
+                    return true;
+                }
             }
-            // A different watch-list REPLACES the index below, which
-            // invalidates both: neither describes the new coverage.
+            // New address or topic conflict: the index below is REPLACED,
+            // which invalidates bridge and tail — neither describes the new
+            // coverage shape.
             self.clear_log_index_bridge();
             if let Ok(mut t) = self.log_index_tail.lock() {
                 t.clear();
@@ -840,26 +852,324 @@ impl ElReader {
                 // finality means no anchor (so nothing optimistic exists) —
                 // clamping there would erase the file.
                 let _ = if finalized_now == 0 {
-                    ix.persist(p)
+                    ix.persist(&tag, p)
                 } else {
-                    ix.persist_clamped(p, finalized_now)
+                    ix.persist_clamped(&tag, p, finalized_now)
                 };
             }
+            let effective = config.union_with(&ix.config().watch);
+            let old = slot.take().expect("checked Some above");
+            let fresh = match effective {
+                // New addresses: MERGE the union config (an empty source)
+                // with the old index, so accumulated coverage — an imported
+                // snapshot's months of backfill included — survives a preset
+                // that merely grew. The merge drops the cursor when the new
+                // entries' holes sit above it; the walker then re-descends
+                // through the kept spans and closes them.
+                Some(eff) => {
+                    let pushed = match crate::el::logindex::LogIndex::new(eff.clone()) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            *slot = Some(old);
+                            return false;
+                        }
+                    };
+                    match crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, old)]) {
+                        Ok((_, mut merged)) => {
+                            merged.set_enabled(eff.enabled);
+                            merged.set_max_speed(eff.max_speed);
+                            merged
+                        }
+                        // Unreachable in practice (union_with already vetted
+                        // the topic sets); degrade to replace semantics.
+                        Err(_) => match crate::el::logindex::LogIndex::new(config) {
+                            Ok(f) => f,
+                            Err(_) => return false,
+                        },
+                    }
+                }
+                // Topic conflict: replace with the push alone — a span's
+                // meaning includes its restriction, nothing can be kept.
+                None => {
+                    tracing::warn!(
+                        "log-index config conflicts with the live subscription's topic \
+                         restrictions; replacing — accumulated coverage re-indexes"
+                    );
+                    match crate::el::logindex::LogIndex::new(config) {
+                        Ok(f) => f,
+                        Err(_) => return false,
+                    }
+                }
+            };
+            *slot = Some(fresh);
+            reset_rate();
+            return true;
         }
-        let loaded = self
+        // Boot: no live index yet. A portable (v2) snapshot on disk names
+        // its own subscription set — union the push with it and adopt its
+        // coverage; imports survive restarts this way. A legacy v1 file
+        // (config-keyed, pre-import builds) still loads the old way.
+        let stored = self
             .log_index_path
             .as_deref()
-            .and_then(|p| crate::el::logindex::LogIndex::load(&config, p));
-        let ix = match loaded {
-            Some(ix) => ix,
-            None => match crate::el::logindex::LogIndex::new(config) {
-                Ok(ix) => ix,
-                Err(_) => return false,
-            },
+            .and_then(crate::el::logindex::LogIndex::load_portable)
+            .filter(|(t, _)| *t == tag);
+        let ix = match stored {
+            Some((_, mut stored_ix)) => {
+                let adopted = config
+                    .union_with(&stored_ix.config().watch)
+                    .is_some_and(|eff| stored_ix.adopt_config(eff));
+                if adopted {
+                    stored_ix
+                } else if let Some(eff) = config.union_with(&stored_ix.config().watch) {
+                    // Genuinely new addresses (e.g. a host preset pushed on
+                    // top of a dropped-in generator snapshot): MERGE instead
+                    // of discarding — the snapshot's coverage survives, the
+                    // new entries re-index via the walker's re-descent (the
+                    // merge drops the cursor for exactly that).
+                    let merged = crate::el::logindex::LogIndex::new(eff.clone())
+                        .ok()
+                        .and_then(|pushed| {
+                            crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, stored_ix)]).ok()
+                        });
+                    match merged {
+                        Some((_, mut m)) => {
+                            m.set_enabled(eff.enabled);
+                            m.set_max_speed(eff.max_speed);
+                            m
+                        }
+                        None => match crate::el::logindex::LogIndex::new(config) {
+                            Ok(fresh) => fresh,
+                            Err(_) => return false,
+                        },
+                    }
+                } else {
+                    // Topic conflict with the stored subscription: replace
+                    // with the push alone (nothing mergeable to keep).
+                    tracing::warn!(
+                        "stored log-index snapshot conflicts with the pushed config's topic \
+                         restrictions; replacing — its accumulated coverage re-indexes"
+                    );
+                    match crate::el::logindex::LogIndex::new(config) {
+                        Ok(fresh) => fresh,
+                        Err(_) => return false,
+                    }
+                }
+            }
+            None => {
+                let loaded = self
+                    .log_index_path
+                    .as_deref()
+                    .and_then(|p| crate::el::logindex::LogIndex::load(&config, &tag, p));
+                match loaded {
+                    Some(ix) => ix,
+                    None => match crate::el::logindex::LogIndex::new(config) {
+                        Ok(ix) => ix,
+                        Err(_) => return false,
+                    },
+                }
+            }
         };
         *slot = Some(ix);
         reset_rate();
         true
+    }
+
+    /// Activate a portable log-index snapshot found at this reader's own
+    /// path (the drop-in path, docs/eth-getlogs-design.md): a
+    /// self-describing file in the data dir IS an opt-in — someone put it
+    /// there deliberately, and the daemon has no settings surface to say so
+    /// otherwise. Enabled on activation; a host's config push right after
+    /// start unions with this and applies the host's own runtime bits (a
+    /// disabled toggle wins). No-op without a path, without a portable file
+    /// (legacy v1 files activate only through a config push — they name no
+    /// subscription set), for a foreign chain's file, or once a config has
+    /// already arrived.
+    pub fn activate_log_index_from_disk(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let Some(path) = self.log_index_path.as_deref() else {
+            return;
+        };
+        let Some((t, mut ix)) = crate::el::logindex::LogIndex::load_portable(path) else {
+            return;
+        };
+        if t != self.chain_tag() {
+            tracing::warn!(
+                path = %path.display(),
+                file_network = t.network_id,
+                own_network = self.eth_cfg.network_id,
+                "log-index snapshot on disk belongs to another chain; ignoring it"
+            );
+            return;
+        }
+        {
+            let Ok(mut slot) = self.log_index.lock() else {
+                return;
+            };
+            if slot.is_some() {
+                return; // a config already arrived — it wins
+            }
+            ix.set_enabled(true);
+            *slot = Some(ix);
+        }
+        tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
+        self.ensure_log_index_appender(rt);
+    }
+
+    /// Export the current index as a portable snapshot at `path` — the
+    /// generator's output. Clamped at finality like every checkpoint
+    /// (optimistic coverage is only verifiable against this run's tail
+    /// record); the v2 frame carries the watch-table + chain tag, so the file
+    /// imports anywhere on the same chain. Partial coverage exports honestly
+    /// — the importer's catch-up finishes the walk. Display names are
+    /// STRIPPED from the export: naming is the importing wallet's job, and
+    /// the naming pass runs wherever an index is enabled — a long-running
+    /// generator daemon must not bake its own resolutions into a file whose
+    /// importers would then never re-resolve (`set_name` fills only empty
+    /// names).
+    pub fn export_log_index(&self, path: &std::path::Path) -> Result<(), String> {
+        let tag = self.chain_tag();
+        let finalized = self.finalized_block_number();
+        match self.log_index.lock() {
+            Ok(slot) => match slot.as_ref() {
+                Some(ix) => ix
+                    .export_unnamed(&tag, path, (finalized > 0).then_some(finalized))
+                    .map_err(|e| format!("could not write {}: {e}", path.display())),
+                None => Err("no log index is configured".to_string()),
+            },
+            Err(_) => Err("log index unavailable".to_string()),
+        }
+    }
+
+    /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
+    /// every file must be a v2 self-describing snapshot of THIS chain; they
+    /// merge with the node's current index (checkpointed first so nothing
+    /// in-memory is lost), the merged result is persisted and installed, and
+    /// the ordinary appender/bridge/walker machinery catches the union up —
+    /// new lows via the walker, the band above the merged high via bridge +
+    /// appender. All-or-nothing: any unreadable or foreign file fails the
+    /// whole import with nothing changed.
+    ///
+    /// Trust: an imported file is DATA CLAIMED VERIFIED by whoever generated
+    /// it (the same standing as the node's own snapshot — both were verified
+    /// at index time, neither is re-verified at load). Import is therefore a
+    /// deliberate, user-initiated act on the hosts, never something fetched.
+    ///
+    /// Importing enables the index (it is the opt-in, explicitly) and leaves
+    /// the pacing bit as it was.
+    pub fn import_log_index(&self, paths: &[std::path::PathBuf]) -> Result<(), String> {
+        let Some(own_path) = self.log_index_path.clone() else {
+            return Err("this node runs without a log-index path (no data dir)".to_string());
+        };
+        let tag = self.chain_tag();
+        let mut sources = Vec::new();
+        for p in paths {
+            let (t, ix) = crate::el::logindex::LogIndex::load_portable(p)
+                .ok_or_else(|| format!("{}: not a portable log-index snapshot", p.display()))?;
+            if t != tag {
+                return Err(format!(
+                    "{}: belongs to another chain (network id {}, this node is {})",
+                    p.display(),
+                    t.network_id,
+                    tag.network_id
+                ));
+            }
+            sources.push((t, ix));
+        }
+        if sources.is_empty() {
+            return Err("no files given".to_string());
+        }
+        // Checkpoint the live index (finality-clamped, v2) and merge THROUGH
+        // THE FILE rather than cloning the live store: the store is fully
+        // resident and can be GBs — a clone would double it under the lock.
+        // STRICTLY, unlike the periodic best-effort checkpoints: a swallowed
+        // write failure here would merge from a stale file, install the
+        // result, and silently drop the live index's recent coverage — on
+        // the one path whose contract says nothing changes on failure.
+        {
+            let finalized = self.finalized_block_number();
+            let Ok(slot) = self.log_index.lock() else {
+                return Err("log index unavailable".to_string());
+            };
+            if let Some(ix) = slot.as_ref() {
+                let r = if finalized == 0 {
+                    ix.persist(&tag, &own_path)
+                } else {
+                    ix.persist_clamped(&tag, &own_path, finalized)
+                };
+                r.map_err(|e| {
+                    format!("could not checkpoint the current index before merging: {e}")
+                })?;
+            }
+        }
+        let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
+        if own_path.exists() {
+            match crate::el::logindex::LogIndex::load_portable(&own_path) {
+                Some((t, ix)) if t == tag => sources.push((t, ix)),
+                Some(_) => {
+                    // A file for another chain at OUR canonical path — never
+                    // merge it, never overwrite it: someone put it there.
+                    return Err(format!(
+                        "{}: existing snapshot belongs to another chain; refusing to touch it",
+                        own_path.display()
+                    ));
+                }
+                // A legacy v1 checkpoint that nothing upgraded yet (no
+                // config push this run — the drop-in path skips v1, so
+                // the strict checkpoint above had nothing to write).
+                // Overwriting it would silently destroy its accumulated
+                // coverage; upgrading it needs the config only a push
+                // carries.
+                None if crate::el::logindex::LogIndex::is_legacy_snapshot(&own_path) => {
+                    return Err(format!(
+                        "{}: existing checkpoint predates the portable format (v1); \
+                         apply the log-index config once (host toggle / preset push) to \
+                         upgrade it, then re-import",
+                        own_path.display()
+                    ));
+                }
+                // Corrupt/unreadable: dead bytes — a load would discard them
+                // just the same; the merged result may replace them.
+                None => {}
+            }
+        }
+        let (_, mut merged) =
+            crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
+        merged.set_enabled(true);
+        merged.set_max_speed(max_speed);
+        // Rewound to LOCAL finality like every other checkpoint: a snapshot
+        // from a node further along may carry coverage above it, but the
+        // tail's fork scan rewinds above-finality coverage this run did not
+        // append (unknown hashes are rewound, never trusted), so keeping the
+        // band would only hold data the first tail tick discards — the
+        // rewind makes the installed index, the persisted file, and the tail
+        // rule tell one story. The appender/tail re-fetch the band promptly.
+        let finalized_now = self.finalized_block_number();
+        if finalized_now > 0 {
+            merged.rewind_above(finalized_now);
+        }
+        merged
+            .persist(&tag, &own_path)
+            .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
+        match self.log_index.lock() {
+            Ok(mut slot) => {
+                // Bridge/tail/rate describe the OLD coverage shape. Cleared
+                // under the SAME hold that swaps the index (the order
+                // set_log_index_config uses): the tail tick appends and
+                // records while holding this lock, so no record seeded
+                // against the old index can slip in between the clear and
+                // the install.
+                self.clear_log_index_bridge();
+                if let Ok(mut t) = self.log_index_tail.lock() {
+                    t.clear();
+                }
+                if let Ok(mut rate) = self.log_index_rate.lock() {
+                    *rate = None;
+                }
+                *slot = Some(merged);
+            }
+            Err(_) => return Err("log index unavailable".to_string()),
+        }
+        Ok(())
     }
 
     /// The beacon-anchored head block number, if the anchor is ready — the
@@ -912,6 +1222,8 @@ impl ElReader {
             let mut since_persist = 0u32;
             let mut ticks = 0u64;
             let mut backfill_ok = 0u64;
+            let mut name_attempts: std::collections::HashMap<[u8; 20], (u8, u64)> =
+                std::collections::HashMap::new();
             loop {
                 tick.tick().await;
                 let Some(reader) = weak.upgrade() else {
@@ -929,9 +1241,83 @@ impl ElReader {
                     reader.log_index_append_tick(&mut since_persist, ticks).await;
                 }
                 reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                reader.log_index_name_tick(&mut name_attempts, ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
         }));
+    }
+
+    /// Best-effort ENS reverse naming for UNNAMED watch entries — imports
+    /// carry no names by design (the generator strips them; naming is the
+    /// importing wallet's job). Runs inside the appender task so it dies
+    /// with it at teardown (the Arc::try_unwrap discipline). Forward-verified
+    /// engine-side ([`EnsQuery::Reverse`]) and never gating indexing: an
+    /// address whose name cannot resolve just stays unnamed. Up to 3
+    /// attempts per address, re-eligible every ~10 minutes — the first
+    /// attempts often predate a usable EVM state and must not be the last.
+    ///
+    /// THROTTLED so cosmetics cannot starve indexing (this loop is also the
+    /// appender + backfill): one address per 5th tick (~30s cadence) and an
+    /// 8s bound per attempt — a cold resolution that needs longer just gets
+    /// retried once the EVM state is warm. Worst case the naming pass costs
+    /// the pipeline 8s in 30, instead of 30s per 6s tick.
+    async fn log_index_name_tick(
+        &self,
+        attempts: &mut std::collections::HashMap<[u8; 20], (u8, u64)>,
+        ticks: u64,
+    ) {
+        if ticks % 5 != 0 {
+            return;
+        }
+        if !self.with_log_index(|ix| ix.config().enabled).unwrap_or(false) {
+            return;
+        }
+        // Nothing can resolve before the anchor serves EVM reads at all.
+        if self.head_block_number().is_none() {
+            return;
+        }
+        let unnamed = self
+            .with_log_index(|ix| {
+                ix.config()
+                    .watch
+                    .iter()
+                    .filter(|w| w.name.is_empty())
+                    .map(|w| w.address)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(address) = unnamed.into_iter().find(|a| match attempts.get(a) {
+            None => true,
+            Some((n, last)) => *n < 3 && ticks.saturating_sub(*last) >= 100,
+        }) else {
+            return;
+        };
+        let entry = attempts.entry(address).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = ticks;
+        // network_id == chain id on every hosted network (1 / 11155111 / 100).
+        let chain_id = self.eth_cfg.network_id;
+        // Tightly bounded (see the throttle note above): this shares the
+        // appender loop, and a stalled resolution must not starve appends.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.resolve_ens_query(EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto),
+        )
+        .await;
+        if let Ok(Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. })) = out {
+            if let Ok(mut slot) = self.log_index.lock() {
+                if let Some(ix) = slot.as_mut() {
+                    if ix.set_name(&address, &name) {
+                        tracing::info!(
+                            name = %name,
+                            "log index: named an imported watch entry via ENS reverse lookup"
+                        );
+                    }
+                }
+            }
+        }
+        // NoRecord / Offchain / errors: leave unnamed (attempt bookkeeping
+        // above bounds the churn).
     }
 
     /// One appender tick: record finalized blocks from the append edge up to
@@ -1368,17 +1754,28 @@ impl ElReader {
     fn persist_log_index(&self, finalized: u64) {
         if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
             if let Some(ix) = slot.as_ref() {
+                let tag = self.chain_tag();
                 if finalized == 0 {
                     // No beacon anchor yet. There is no optimistic coverage to
                     // clamp either (the tail only runs below a real finality),
                     // and clamping AT ZERO would rewind the whole index and
                     // rename an empty file over a good checkpoint — losing, on
                     // a phone, months of backfill. Write it as it stands.
-                    let _ = ix.persist(path);
+                    let _ = ix.persist(&tag, path);
                 } else {
-                    let _ = ix.persist_clamped(path, finalized);
+                    let _ = ix.persist_clamped(&tag, path, finalized);
                 }
             }
+        }
+    }
+
+    /// The chain identity stamped into (and demanded of) every log-index
+    /// snapshot: this reader's own network, straight from its eth Status
+    /// config — never a filename convention.
+    pub fn chain_tag(&self) -> crate::el::logindex::ChainTag {
+        crate::el::logindex::ChainTag {
+            network_id: self.eth_cfg.network_id,
+            genesis_hash: self.eth_cfg.genesis_hash,
         }
     }
 
@@ -2223,8 +2620,26 @@ impl ElReader {
                         break; // unprocessed candidate — resume here next tick
                     }
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
-                    ix.backfill_block(n, vh.hash, logs)
-                        .map_err(|g| format!("backfill gap at {} (edge {})", g.block, g.edge))?;
+                    if let Err(g) = ix.backfill_block(n, vh.hash, logs) {
+                        // A gap here means the walk state cannot resume — a
+                        // shape no merge/adopt should produce (belt and
+                        // braces for `walk_resumable`). Without the reset the
+                        // walker would re-fetch and re-verify the same batch
+                        // against the same wall every tick, forever. Dropping
+                        // the cursor makes the appender re-seed at the top
+                        // and the walker re-descend through the spans —
+                        // coverage survives, the wedge cannot.
+                        tracing::warn!(
+                            block = g.block,
+                            edge = g.edge,
+                            "backfill gap; resetting the walk cursor to re-descend"
+                        );
+                        ix.cursor = None;
+                        return Err(format!(
+                            "backfill gap at {} (edge {}); walk reset",
+                            g.block, g.edge
+                        ));
+                    }
                 }
                 Ok(())
             }

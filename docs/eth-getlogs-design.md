@@ -1,10 +1,12 @@
 # eth_getLogs: scoped, verified log index (design)
 
-Status: accepted design, implementation in progress on `feat/eth-getlogs`.
+Status: accepted design, implemented (iteration 1 on `feat/eth-getlogs`;
+generic build/import/export on `feat/logindex-import` — see §Import below).
 Scope decision (2026-08-01): **iteration 1 sources everything from EL/CL peers**;
-shipping pre-built index seeds with an app is a later optimization layered on the
-same store. The feature is **opt-in** per network and scoped to a configured
-**watch-list** of contracts (kohaku's privacy contracts are the motivating set).
+scope extension (2026-08-14): the index is **generic** — any address set can be
+indexed (`build-logindex`), exported as a portable snapshot, and imported on
+any host of the same chain. The feature is **opt-in** per network; the shipped
+**watch-list** preset (kohaku's privacy contracts) is one config among many.
 
 ## Why
 
@@ -187,6 +189,98 @@ router/API changes in this design already accommodate it.
 4. Backfill walker (batch header walk, bloom skip, peer rotation/backoff,
    checkpointing) + Sepolia end-to-end run against the kohaku preset.
 5. Hosts: settings plumbing + opt-in UI + kohaku preset data.
-6. Follow-ups (separate): index-seed import/export (the bundling
-   optimization), Unchained-Index-assisted discovery, JVM twin, `watch`-channel
-   head notifications, EIP-7745 alignment.
+6. Generic build / import / export — DONE (2026-08-14), see §Import below.
+7. Follow-ups (separate): Unchained-Index-assisted discovery, JVM twin,
+   `watch`-channel head notifications, EIP-7745 alignment, per-entry
+   frontiers (see §Import, canonical-shape note), snapshot provenance
+   (imported-coverage marker / signed snapshots) and an explicit
+   unsubscribe surface (see §Import, trust notes).
+
+## Import: generic build, portable snapshots, merge (v2 format)
+
+The snapshot format is **self-describing** (`MLIX` v2): the frame carries a
+**chain tag** (network id + EL genesis hash, checked on every load — logs are
+keyed by block-global `(block, log_index)`, so a foreign chain's file would
+silently collide keys and fabricate coverage) and the full **watch-table**
+(address, from_block, topic0s, display name), so a file can be imported on a
+host that has never seen its config. v1 files (fingerprint-keyed) still load
+for upgrade — the next checkpoint rewrites them as v2 — but are refused on the
+portable path: they name no subscription set.
+
+**Generator (daemon, Rust engine):**
+
+    ./gradlew :app:run -Pengine=rust                    # generator daemon
+    :app:run -Pargs="build-logindex 0xAAA… 0xBBB… --from 14173129"
+    :app:run -Pargs=logindex-status                     # poll to complete
+    :app:run -Pargs="export-logindex /tmp/mainnet-privacy.db"
+
+`build-logindex` takes plain addresses (no preset) and subscribes them at max
+download speed. Entries are written UNNAMED by design — display names are
+cosmetic, exist purely so the Index tab shows which contracts' logs are
+available, and are filled in by the importing wallet itself (see §Naming
+below); the generator has no naming duties. `--from` is a trust assertion:
+`LogIndex::query` clamps its coverage requirement to it, so overshooting the
+real deployment silently hides events; undershooting (the default 0) only
+walks further.
+
+**Import** (`import_log_index_files`, ABI v24): hosts pick snapshot files
+(desktop AWT dialog / Android SAF / iOS document picker; the daemon has
+`import-logindex <file>…` plus the zero-effort drop-in — a portable file at
+`dataDir/logindex[-net].db` activates itself at start). The engine merges
+all-or-nothing with its current index and starts catch-up immediately for
+every imported address via the existing walker/bridge/appender. Trust: an
+imported file is data CLAIMED VERIFIED by whoever generated it — the same
+standing as the node's own snapshot — so import is a deliberate user act on
+the hosts, never something fetched. Two properties to state plainly
+(review, 2026-08-14): served logs do not distinguish locally-verified from
+imported coverage (a provenance marker in the status JSON, or a signed
+snapshot format, is tracked follow-up hardening); and subscriptions are
+currently ADD-ONLY — config pushes union and imports merge, so an address
+can only leave the index via a topic-conflict replace or a cache wipe. An
+explicit unsubscribe/replace surface is follow-up work; until then, note
+that an imported subscription is sticky.
+
+**Merge rules** (`LogIndex::merge`): watch union (same address requires equal
+topic0 sets — a span's meaning includes the restriction it was indexed under;
+`from_block` = min; name = first non-empty), coverage clamped to the MINIMUM
+of the sources' own highs and unioned per address, logs kept only inside the
+merged span, cursor = the deepest source trust edge the walk can RESUME from
+(`walk_resumable`: every incomplete span must sit at or below the cursor —
+the walker only descends, so a hole above it is unreachable forever; when no
+source cursor qualifies, the cursor is dropped and the appender re-seeds it
+at the top, making the walker re-descend through the kept spans — headers-only
+where the bloom misses — until every hole closes). The output is **canonical**
+— every present span shares one global high — because that is the only shape
+the appender/walker pair can resume (`append_block` demands each new block
+adjoin EVERY live entry's span; per-entry frontiers would wedge the appender).
+A residual gap at apply time self-heals the same way: the walker drops its
+cursor and re-descends rather than re-fetching the same batch forever. The
+min-high clamp is also what resolves same-address disjoint spans: the lower,
+deployment-anchored history survives and the band above re-indexes —
+re-fetched, never trusted from the staler file. Redundant sources (subset
+coverage, nothing new) are pruned first so a stale re-import cannot drag the
+merged high back in time. Lifting the canonical-shape constraint (true
+per-entry frontiers) is the tracked follow-up that would make merges lossless;
+it needs append/bridge machinery per entry.
+
+**Additive config (behavior change in v23):** `set_log_index_config` unions
+the pushed config with the already-subscribed set (live index, or on boot the
+portable snapshot's own watch-table). Without this, every host restart's
+preset push would fingerprint-mismatch an imported index into a full
+re-index. Coverage survives bit flips, renames, LOWERED from_blocks (the
+cursor drops when the new hole sits above it — the walk re-descends), and
+even genuinely NEW addresses (the push merges with the existing index as a
+config-only source, so a preset that grew — or a preset pushed on top of a
+dropped-in snapshot — keeps the accumulated coverage and re-descends for the
+new entries). Only a changed topic set replaces outright: a span's meaning
+includes its restriction, nothing is mergeable.
+
+**Naming:** display names are cosmetic — they exist so the Index tab shows
+which contracts' logs are available — and they are resolved IN THE IMPORTING
+WALLET, not at generation (owner's call, 2026-08-14: the generator writes
+unnamed entries). A naming pass inside the appender task resolves one
+unnamed address per tick (forward-verified `EnsQuery::Reverse` against the
+Auto root ladder, 30s-bounded, ≤3 attempts each) and fills ONLY empty
+names — a host-pushed preset label outranks a late lookup, and a name that
+cannot resolve just stays an address. Names are excluded from the config
+fingerprint: renaming never costs a re-index.

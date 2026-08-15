@@ -1044,6 +1044,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         return gated(() -> RustEngineNative.nativeLogIndexStatusJson(handle));
     }
 
+    /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */
+    @Override
+    public String importLogIndexFiles(String pathsJson) {
+        return gated(() -> RustEngineNative.nativeImportLogIndexFiles(handle, pathsJson));
+    }
+
+    /** Export the log index as a portable snapshot ({"ok":true} / {"error":...}). */
+    @Override
+    public String exportLogIndex(String path) {
+        return gated(() -> RustEngineNative.nativeExportLogIndex(handle, path));
+    }
+
     /**
      * Verified eth_getBlockReceipts: the receipts ARRAY JSON, the literal
      * {@code "null"} (verified unknown/future block or a never-verified hash),

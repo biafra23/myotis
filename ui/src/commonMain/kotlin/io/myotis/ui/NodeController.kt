@@ -83,6 +83,23 @@ interface NodeController {
     fun applyLogIndex(network: String) {}
 
     /**
+     * Let the user pick portable log-index snapshot files (the host's native
+     * file picker) and import them into [network]'s index — the engine merges
+     * them with what it already holds and starts catch-up for every imported
+     * address immediately. On success the host also persists the enabled
+     * flag (importing is the opt-in). [onResult] gets one human-readable
+     * line — success summary or error — and may be invoked FROM A WORKER
+     * THREAD; callers must only touch thread-safe state in it (Compose
+     * snapshot state qualifies). Returns false when this host cannot
+     * pick/import files (the Index tab hides the button; Rust engine only).
+     */
+    fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean = false
+
+    /** Whether [importLogIndexSnapshots] can work on this host (shows the
+     *  Index tab's Import button). Default false. */
+    val canImportLogIndex: Boolean get() = false
+
+    /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
      * not the network is currently running.

@@ -297,3 +297,19 @@ pub fn set_log_index_config(handle: i64, config_json: String) -> bool {
 pub fn log_index_status_json(handle: i64) -> String {
     crate::host::log_index_status_json(handle)
 }
+
+/// Import portable log-index snapshots (JSON array of absolute file paths;
+/// each file must be a self-describing snapshot of this handle's chain).
+/// All-or-nothing merge into the node's index; importing is the opt-in, so
+/// catch-up starts immediately. `{"ok":true,"status":…}` or `{"error":…}`.
+#[uniffi::export]
+pub fn import_log_index_files(handle: i64, paths_json: String) -> String {
+    crate::host::import_log_index_files(handle, &paths_json)
+}
+
+/// Export the current log index as a portable snapshot file (the generator's
+/// output; finality-clamped, self-describing). `{"ok":true}` or `{"error":…}`.
+#[uniffi::export]
+pub fn export_log_index(handle: i64, path: String) -> String {
+    crate::host::export_log_index(handle, &path)
+}

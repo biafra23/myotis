@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 23; // 23: estimateGas JSON gained {"status":"revert","dataHex"}
+    static final int EXPECTED_ABI_VERSION = 24; // 24: + importLogIndexFiles (portable snapshot import)
 
     private static final boolean AVAILABLE = load();
 
@@ -337,6 +337,16 @@ final class RustEngineNative {
     /** Log-index status JSON (enabled, counts, coverage per entry). */
     static String nativeLogIndexStatusJson(long handle) {
         return Myotis_engineKt.logIndexStatusJson(handle);
+    }
+
+    /** Import portable log-index snapshots ({"ok":true,...} / {"error":...}). */
+    static String nativeImportLogIndexFiles(long handle, String pathsJson) {
+        return Myotis_engineKt.importLogIndexFiles(handle, nz(pathsJson));
+    }
+
+    /** Export the log index as a portable snapshot ({"ok":true} / {"error":...}). */
+    static String nativeExportLogIndex(long handle, String path) {
+        return Myotis_engineKt.exportLogIndex(handle, nz(path));
     }
 
     /** Verified {@code eth_feeHistory} (feeHistory JSON / error). */

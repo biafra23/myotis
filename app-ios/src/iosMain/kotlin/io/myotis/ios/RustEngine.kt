@@ -18,6 +18,7 @@ import io.myotis.engine.capi.myotis_get_code_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
+import io.myotis.engine.capi.myotis_import_log_index_files
 import io.myotis.engine.capi.myotis_log_index_status_json
 import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
@@ -139,6 +140,13 @@ object RustEngine {
     fun logIndexStatusJson(handle: Long): String {
         requireAbi()
         return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
+    }
+
+    /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */
+    fun importLogIndexFiles(handle: Long, pathsJson: String): String {
+        requireAbi()
+        return take(myotis_import_log_index_files(handle, pathsJson))
+            ?: """{"error":"engine returned no result"}"""
     }
 
     fun statusJson(handle: Long): String {

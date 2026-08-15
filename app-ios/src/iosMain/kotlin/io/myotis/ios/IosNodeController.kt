@@ -192,6 +192,45 @@ class IosNodeController(
         }
     }
 
+    override val canImportLogIndex: Boolean get() = true
+
+    override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
+        val net = canonical(network)
+        // Picker on the main thread (we're in a Compose click handler); the
+        // engine-side merge then moves to the lifecycle lane like every other
+        // mutating op.
+        IosFilePicker.pickFiles { paths ->
+            if (paths.isEmpty()) {
+                onResult("Import cancelled.")
+                return@pickFiles
+            }
+            scope.launch(lifecycleLane) {
+                val handle = locked { handles[net] }
+                if (handle == null) {
+                    onResult("$net is not running — start it first.")
+                    return@launch
+                }
+                val pathsJson = paths.joinToString(",", "[", "]") {
+                    "\"${it.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+                }
+                val r = RustEngine.importLogIndexFiles(handle, pathsJson)
+                if (r.startsWith("{\"ok\":true")) {
+                    // Importing is the opt-in: persist the flag so the next
+                    // start's config push keeps the index enabled.
+                    settings.setLogIndexEnabled(net, true)
+                    onResult(
+                        "Imported ${paths.size} snapshot${if (paths.size == 1) "" else "s"} — catch-up started."
+                    )
+                } else {
+                    val err = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(r)
+                        ?.groupValues?.get(1) ?: r
+                    onResult("Import failed: $err")
+                }
+            }
+        }
+        return true
+    }
+
 
     /** Blocking create+start; caller holds [bootMutex] and runs on IO. */
     private fun boot(net: String) {
@@ -469,7 +508,10 @@ class IosNodeController(
             }
         }
 
-        val logIndexRaw = if (settings.logIndexEnabled(network)) RustEngine.logIndexStatusJson(handle) else null
+        // NOT gated on the Settings flag: an imported snapshot activates
+        // engine-side without the flag ever being touched, and the engine's
+        // stable disabled default keeps the call cheap.
+        val logIndexRaw = RustEngine.logIndexStatusJson(handle)
         return NodeSnapshot(
             running = running,
             lifecycle = if (running) "RUNNING" else if (paused) "PAUSED" else "STOPPED",

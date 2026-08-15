@@ -13,6 +13,8 @@ object LogIndexStatus {
         val fromBlock: Long,
         val coveredLow: Long?,
         val coveredHigh: Long?,
+        /** Display name (ENS reverse name or host label); null when unnamed. */
+        val name: String? = null,
     )
 
     data class Parsed(
@@ -41,13 +43,15 @@ object LogIndexStatus {
         val logCount = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
         val entries = Regex(
             "\\{\"address\":\"(0x[0-9a-fA-F]{40})\",\"fromBlock\":(\\d+)" +
+                "(?:,\"name\":\"((?:[^\"\\\\]|\\\\.)*)\")?" +
                 "(?:,\"coveredLow\":(\\d+),\"coveredHigh\":(\\d+))?\\}"
         ).findAll(json).map { m ->
             Entry(
                 address = m.groupValues[1].lowercase(),
                 fromBlock = m.groupValues[2].toLongOrNull() ?: 0L,
-                coveredLow = m.groupValues[3].takeIf { it.isNotEmpty() }?.toLongOrNull(),
-                coveredHigh = m.groupValues[4].takeIf { it.isNotEmpty() }?.toLongOrNull(),
+                coveredLow = m.groupValues[4].takeIf { it.isNotEmpty() }?.toLongOrNull(),
+                coveredHigh = m.groupValues[5].takeIf { it.isNotEmpty() }?.toLongOrNull(),
+                name = m.groupValues[3].takeIf { it.isNotEmpty() }?.let(::unescapeJson),
             )
         }.toList()
         val targetLow = Regex("\"targetLow\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
@@ -100,6 +104,39 @@ object LogIndexStatus {
             return "${grouped(done)} / ${grouped(total)} blocks"
         }
         return "${grouped(remaining)} blocks remaining"
+    }
+
+    /** Minimal JSON string unescape for display names (\" \\ and the rare
+     *  \uXXXX from serde's escaping; anything else passes through). */
+    private fun unescapeJson(s: String): String {
+        if ('\\' !in s) return s
+        val out = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '\\' && i + 1 < s.length) {
+                when (val n = s[i + 1]) {
+                    'u' -> {
+                        val hex = s.drop(i + 2).take(4)
+                        val cp = hex.takeIf { it.length == 4 }?.toIntOrNull(16)
+                        if (cp != null) {
+                            out.append(cp.toChar())
+                            i += 6
+                            continue
+                        }
+                        out.append(n); i += 2; continue
+                    }
+                    'n' -> out.append('\n')
+                    't' -> out.append('\t')
+                    else -> out.append(n)
+                }
+                i += 2
+            } else {
+                out.append(c)
+                i++
+            }
+        }
+        return out.toString()
     }
 
     /** One decimal below 10 (a slow walk must not read as "0 blk/s"),

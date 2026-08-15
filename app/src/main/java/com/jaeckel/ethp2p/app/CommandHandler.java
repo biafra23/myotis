@@ -80,6 +80,10 @@ public class CommandHandler {
                 case "resume"                  -> handleResume();
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
+                case "import-logindex"         -> handleImportLogIndex(jsonLine);
+                case "export-logindex"         -> handleExportLogIndex(jsonLine);
+                case "build-logindex"          -> handleBuildLogIndex(jsonLine);
+                case "logindex-status"         -> handle.logIndexStatusJson();
                 default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
@@ -252,6 +256,97 @@ public class CommandHandler {
     private static String truncatePeerId(String peerId) {
         return peerId != null && peerId.length() > 16
                 ? peerId.substring(0, 16) + "..." : peerId;
+    }
+
+    /**
+     * Import portable log-index snapshot files
+     * ({@code {"cmd":"import-logindex","paths":["/abs/file.db",...]}}). The
+     * paths array is handed to the engine VERBATIM — it validates format and
+     * chain identity per file and merges all-or-nothing; its own
+     * {@code {"ok":...}} / {@code {"error":...}} JSON is the response. Rust
+     * engine only: the Java engine answers its stable not-supported error.
+     * (The zero-effort alternative stays available too: drop the file at
+     * {@code dataDir/logindex[-network].db} before start and the engine
+     * activates it by itself.)
+     */
+    private String handleImportLogIndex(String jsonLine) {
+        return handle.importLogIndexFiles(extractArray(jsonLine, "paths"));
+    }
+
+    /**
+     * Export the current log index as a portable snapshot
+     * ({@code {"cmd":"export-logindex","path":"/abs/out.db"}}) — the
+     * generator's output step. Finality-clamped and self-describing;
+     * partial coverage exports honestly (check {@code logindex-status} for
+     * "complete" first if that matters). Engine JSON is the response.
+     */
+    private String handleExportLogIndex(String jsonLine) {
+        return handle.exportLogIndex(extractString(jsonLine, "path"));
+    }
+
+    /**
+     * The generic log-index GENERATOR
+     * ({@code {"cmd":"build-logindex","fromBlock":N,"addresses":["0x..",...]}}):
+     * subscribe the given contract addresses — no preset involved — and let
+     * the engine's backfill build the database. The config push is ADDITIVE
+     * engine-side (existing subscriptions/coverage survive) and runs at max
+     * download speed, since a generator daemon exists to finish the walk.
+     * Entries are written UNNAMED on purpose: display names are cosmetic,
+     * for the importing wallet's Index tab, and the wallet fills them in
+     * itself (the engine's ENS reverse-naming pass) — the generator has no
+     * naming duties. Poll {@code logindex-status} until complete, then
+     * {@code export-logindex <path>}. Rust engine only.
+     *
+     * <p>{@code fromBlock} is a TRUST ASSERTION, not a hint: the engine
+     * serves a query once coverage reaches it, so a value LATER than the
+     * real deployment makes earlier events vanish without an error.
+     * Undershooting (the default 0) cannot lie — it only walks further.
+     */
+    private String handleBuildLogIndex(String jsonLine) {
+        String addressesJson = extractArray(jsonLine, "addresses");
+        // Absent → 0 (undershooting cannot lie). PRESENT-but-malformed must
+        // refuse, not default: a parameter that can change the answer is
+        // applied or refused, never silently replaced (CLAUDE.md §Trust) —
+        // extractLong's throw propagates to the caller's jsonError.
+        long fromBlock = jsonLine.contains("\"fromBlock\"") ? extractLong(jsonLine, "fromBlock") : 0;
+        if (fromBlock < 0) return jsonError("fromBlock must be >= 0");
+        java.util.List<String> addresses = new java.util.ArrayList<>();
+        java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("\"(0x[0-9a-fA-F]{40})\"").matcher(addressesJson);
+        while (m.find()) addresses.add(m.group(1));
+        // Count the raw elements too: a malformed address must be an error,
+        // never silently dropped from the subscription (a well-formed result
+        // for a different question — the rule from CLAUDE.md §Trust).
+        int rawElements = addressesJson.replaceAll("[^\"]", "").length() / 2;
+        if (addresses.isEmpty() || addresses.size() != rawElements) {
+            return jsonError("addresses must be a non-empty array of 0x-prefixed 20-byte hex addresses");
+        }
+        // De-duplicate (case-insensitively — hex casing is display-only): a
+        // repeated address in a build command is harmless intent, but the
+        // engine's LogIndex::new rejects duplicate watch entries, and the
+        // resulting false would be misblamed on the engine choice below.
+        java.util.LinkedHashMap<String, String> unique = new java.util.LinkedHashMap<>();
+        for (String a : addresses) unique.putIfAbsent(a.toLowerCase(), a);
+        StringBuilder watch = new StringBuilder();
+        StringBuilder building = new StringBuilder();
+        for (String a : unique.values()) {
+            if (watch.length() > 0) {
+                watch.append(',');
+                building.append(',');
+            }
+            watch.append("{\"address\":\"").append(a)
+                 .append("\",\"fromBlock\":").append(fromBlock).append('}');
+            building.append('"').append(a).append('"');
+        }
+        String config = "{\"enabled\":true,\"maxSpeed\":true,\"watch\":[" + watch + "]}";
+        if (!handle.setLogIndexConfig(config)) {
+            // False has several causes; name them all rather than misdirect.
+            return jsonError("log index config rejected — not the Rust engine "
+                    + "(start with -Pengine=rust), engine not running, or the config "
+                    + "conflicts with the existing subscription's topic restrictions");
+        }
+        return "{\"ok\":true,\"building\":[" + building
+                + "],\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
     }
 
     // -------------------------------------------------------------------------
@@ -795,5 +890,41 @@ public class CommandHandler {
         while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
         if (start == end) throw new IllegalArgumentException("Field '" + field + "' is not a number");
         return Long.parseLong(json.substring(start, end));
+    }
+
+    /**
+     * Extract a JSON ARRAY value verbatim (brackets included). The scan is
+     * string-and-escape aware — a {@code ]} inside a quoted element (file
+     * paths can contain one) must not terminate the match early.
+     */
+    static String extractArray(String json, String field) {
+        String key = "\"" + field + "\"";
+        int keyIdx = json.indexOf(key);
+        if (keyIdx < 0) throw new IllegalArgumentException("Missing field: " + field);
+        int colon = json.indexOf(':', keyIdx + key.length());
+        if (colon < 0) throw new IllegalArgumentException("Malformed JSON near field: " + field);
+        // The bracket must be the field's own value: scanning forward past a
+        // non-array value would silently capture a LATER array in the line.
+        int open = colon + 1;
+        while (open < json.length() && Character.isWhitespace(json.charAt(open))) open++;
+        if (open >= json.length() || json.charAt(open) != '[') {
+            throw new IllegalArgumentException("Field '" + field + "' value is not an array");
+        }
+        int depth = 0;
+        boolean inString = false;
+        for (int i = open; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (inString) {
+                if (c == '\\') i++; // skip the escaped char
+                else if (c == '"') inString = false;
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '[') {
+                depth++;
+            } else if (c == ']' && --depth == 0) {
+                return json.substring(open, i + 1);
+            }
+        }
+        throw new IllegalArgumentException("Unterminated array for field: " + field);
     }
 }
