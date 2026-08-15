@@ -503,9 +503,19 @@ const TIP_SUGGEST_BLOCKS: u64 = 3;
 /// if it still arrives first.
 const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Cap on concurrently hedged attempts for one read: each in-flight attempt
-/// holds a snap request on a connection that background sync shares, so a
-/// slow pool must not fan one read out across every peer at once.
+/// Cap on concurrently hedged attempts for one read. Two reasons to keep it
+/// small, load AND privacy:
+///  - each in-flight attempt holds a snap request on a connection that
+///    background sync shares, so a slow pool must not fan one read out across
+///    every peer at once;
+///  - a snap query for an ADDRESS-carrying read (`get_account`/`get_storage`)
+///    discloses `keccak(address)` to whichever peers it reaches — the §1 "core
+///    leak" in docs/privacy-and-tor.md. Sequential rotation disclosed to a new
+///    peer only on FAILURE; hedging discloses to up to this many peers whenever
+///    the first is slower than `HEDGE_DELAY` (the mobile/congested case #320 is
+///    about), even if that first peer then answers. This cap bounds the widened
+///    disclosure set; the Tor path (which is what actually closes the leak) is
+///    unaffected — `get_account` routes to Tor before hedging.
 const MAX_HEDGED_ATTEMPTS: usize = 3;
 
 /// What a hedged race produced: the accepted answer (with the index of the peer
@@ -2836,10 +2846,12 @@ impl ElReader {
 
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     ///
-    /// Tries each live snap peer in turn (newest first) and returns the first
-    /// that serves — twin of the Java `RLPxConnector.trySnapPeer` retry loop, so
-    /// a single hung/dead peer doesn't fail the query. A serving peer is marked
-    /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
+    /// HEDGED across live snap peers (see [`ElReader::hedged_read`]): starts the
+    /// first peer, races in another every [`HEDGE_DELAY`], and returns the first
+    /// result that carries a verdict — so a hung/dead peer neither fails the
+    /// query nor holds it for the full request timeout. The winner is marked
+    /// CONFIRMED; peers that fail or answer without a verdict record a strike
+    /// (→ deprioritized), while peers merely still in flight are left untouched.
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
         // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
@@ -2895,8 +2907,8 @@ impl ElReader {
     }
 
     /// One account fetch + verdict against a single peer (no retry, no cache
-    /// bookkeeping — the caller loop owns those). Any transport/proof error
-    /// propagates so the loop can move to the next peer.
+    /// bookkeeping — the hedged race owns those). Any transport/proof error
+    /// propagates so the race records the miss and lets another peer answer.
     async fn get_account_from(
         &self,
         peer: &ManagedPeer,
@@ -2963,9 +2975,8 @@ impl ElReader {
                 }
                 // Transport-shaped failure (timeout/disconnect): a second
                 // query against the same peer would pay the same timeout
-                // again — propagate so the outer loop moves to the next peer.
-                // (Without this, a dead peer costs up to three timeouts per
-                // read instead of one.)
+                // again — propagate so the hedged race records the miss and
+                // another peer's attempt (already running) can answer.
                 Err(e) => return Err(e),
             }
         }
@@ -3133,10 +3144,13 @@ impl ElReader {
         self.get_storage_keyed(address, 0, None, position).await
     }
 
-    /// The cross-peer retry loop shared by `get_storage` / `get_storage_at`, keyed
-    /// on the precomputed 32-byte storage key. Verification-aware: returns on the
-    /// first peer that produces a verdict (or a global failure); a per-peer failure
-    /// (stale head / bad proof) moves to the next peer, keeping the best as fallback.
+    /// The hedged cross-peer read shared by `get_storage` / `get_storage_at`,
+    /// keyed on the precomputed 32-byte storage key. Verification-aware: returns
+    /// the first result that carries a verdict (or a global failure); a per-peer
+    /// failure (stale head / bad proof) becomes the fallback. NB with hedging the
+    /// fallback is whichever non-verdict answer COMPLETES first, not a fixed
+    /// peer-rank order — immaterial to correctness (a non-verdict answer is only
+    /// ever returned when NO peer verifies, and each is independently checked).
     async fn get_storage_keyed(
         &self,
         address: [u8; 20],
@@ -3160,7 +3174,8 @@ impl ElReader {
     }
 
     /// One storage-slot fetch + verdict against a single peer (no retry / cache
-    /// bookkeeping — the caller loop owns those). Errors propagate for retry.
+    /// bookkeeping — the hedged race owns those). Errors propagate so the race
+    /// records the miss and another peer can answer.
     async fn get_storage_from(
         &self,
         peer: &ManagedPeer,
@@ -5321,20 +5336,33 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn concurrency_is_capped() {
-            // Six silent peers: the cap bounds how many requests one read may
-            // hold across the pool at once (background sync shares them).
+        async fn concurrency_is_capped_including_the_refill_path() {
+            // Every peer answers WITHOUT a verdict after a delay longer than the
+            // hedge, so: the race ramps up by hedging (proving overlap), then
+            // MISSES on each completion — which sends it back to the loop top,
+            // where `in_flight.len() < MAX_HEDGED_ATTEMPTS` is the ONLY thing
+            // holding the cap while it refills. Slow *accepted* answers would
+            // have let peer 0 win and never exercised refill (the old bug).
             let live = Arc::new(AtomicUsize::new(0));
             let peak = Arc::new(AtomicUsize::new(0));
-            let peers = vec![Peer::Answers(Duration::from_secs(30), 1); 6];
-            let _ = tokio::time::timeout(
-                Duration::from_secs(120),
-                race_tracked(peers, live, Arc::clone(&peak)),
+            let peers = vec![Peer::NoVerdict(Duration::from_secs(30)); 6];
+            // Assert on the result, don't swallow a hang: expect the fallback
+            // (no peer verified → value 0), and a paused-clock deadline that,
+            // if the race ever hung, fails loudly instead of passing.
+            let out = tokio::time::timeout(
+                Duration::from_secs(600),
+                race_tracked(peers, Arc::clone(&live), Arc::clone(&peak)),
             )
-            .await;
-            assert!(peak.load(Ordering::SeqCst) <= MAX_HEDGED_ATTEMPTS,
-                "peak {} exceeded the cap", peak.load(Ordering::SeqCst));
-            assert!(peak.load(Ordering::SeqCst) > 1, "hedging should overlap attempts");
+            .await
+            .expect("hedged race hung")
+            .expect("no-verdict pool returns its fallback, not an error");
+            assert_eq!(out, 0, "no peer produced a verdict, so the fallback wins");
+            // The cap was REACHED (so the refill path really ran at the limit)…
+            assert_eq!(peak.load(Ordering::SeqCst), MAX_HEDGED_ATTEMPTS,
+                "expected the cap to be reached during ramp + refill");
+            // …and never exceeded, and every attempt that started also finished
+            // (all six are misses — nothing is cancelled, so `live` returns to 0).
+            assert_eq!(live.load(Ordering::SeqCst), 0, "an attempt leaked");
         }
     }
 
