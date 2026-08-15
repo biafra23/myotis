@@ -15,13 +15,14 @@
 // reader rotates over the snap set, so with a single peer one dud peer is
 // indistinguishable from a broken engine. Tunable for constrained runners:
 //   MYOTIS_SMOKE_MIN_SNAP_PEERS  (default 2)  rotation needs somewhere to go
-//   MYOTIS_SMOKE_REQUIRE_DISCOVERY (default 1) discv5 must have actually run,
+//   MYOTIS_SMOKE_REQUIRE_DISCOVERY (default 1) discovery must have produced
+//       candidates — the CL discv5 table OR the EL's discovered-peer count —
 //       so a warm start restoring a stale peer cache can't open the gate
 //   MYOTIS_SMOKE_TIMEOUT_MIN     (default 15) overall budget, unchanged
 //   MYOTIS_SMOKE_GATE_TIMEOUT_MIN (default 15, capped by the overall budget)
-//       how long to wait for the gate before reporting the shortfall — so an
-//       unreachable gate is reported in minutes, not at the end of a 55-minute
-//       run
+//       how long to wait before calling a PEER-STARVED gate early. Engine-side
+//       shortfalls always get the full MYOTIS_SMOKE_TIMEOUT_MIN — a cold
+//       checkpoint catch-up takes 30-40 min and must not be cut short
 
 import { createRequire } from 'node:module';
 import {
@@ -33,7 +34,6 @@ const dataDir = process.argv[2] || './.smoke-data';
 const addonPath = process.argv[3] || './target/debug/myotis-node.node';
 const m = require(addonPath);
 
-const SYNC_TIMEOUT_MS = (Number(process.env.MYOTIS_SMOKE_TIMEOUT_MIN) || 15) * 60 * 1000;
 let GATE;
 try {
   GATE = gateConfigFromEnv();
@@ -41,12 +41,14 @@ try {
   console.error(`bad gate configuration: ${e.message}`);
   process.exit(1);
 }
-// Report an unreachable gate early instead of burning the whole budget: the
-// old gate went red in seconds on a peer-starved runner, and a slower red is
-// still a worse experience even when the label is better.
-const GATE_TIMEOUT_MS = Math.min(
-  (Number(process.env.MYOTIS_SMOKE_GATE_TIMEOUT_MIN) || 15) * 60 * 1000,
-  SYNC_TIMEOUT_MS);
+const SYNC_TIMEOUT_MS = GATE.overallMinutes * 60 * 1000;
+// PEER-STARVATION deadline only. It reports a peer-starved runner in minutes
+// instead of at the end of the budget — but it must never shorten the wait for
+// an engine-side condition: a COLD checkpoint catch-up legitimately takes
+// 30-40 min, and cutting it off at 15 would call a healthy engine broken (and,
+// because actions/cache only saves on success, would never warm the cache
+// again — permanently red with an engine label).
+const GATE_TIMEOUT_MS = Math.min(GATE.gateMinutes * 60 * 1000, SYNC_TIMEOUT_MS);
 const VITALIK = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045';
 /** Exit code for "the environment never gave us a usable peer set". */
 const EXIT_INSUFFICIENT_PEERS = 2;
@@ -92,22 +94,23 @@ const poll = setInterval(() => {
   if (unmet.length === 0) {
     clearInterval(poll);
     queries(s).catch((e) => { console.error('queries failed:', e); shutdown(1); });
-  } else if (Date.now() - t0 > GATE_TIMEOUT_MS) {
+  } else if (isPeerStarvation(unmet) && Date.now() - t0 > GATE_TIMEOUT_MS) {
+    // ONLY pure peer starvation exits early: nothing about the node is in
+    // question, so more waiting cannot change the verdict.
     clearInterval(poll);
-    console.error(`TIMEOUT waiting for the readiness gate — unmet: ${describeShortfall(unmet)}`);
-    if (isPeerStarvation(unmet)) {
-      // Every unmet condition is peer-side: this says nothing about the code,
-      // which is what exit 2 means.
-      console.error('INSUFFICIENT PEERS (environment, not an engine failure); last status:',
-        JSON.stringify(s));
-      shutdown(EXIT_INSUFFICIENT_PEERS);
-    } else {
-      // Something engine-side is unmet (never SYNCED, EL reader down). Calling
-      // that an environment result would just invert the original misdirection.
-      console.error('ENGINE did not become ready (not a peer-availability result); last status:',
-        JSON.stringify(s));
-      shutdown(1);
-    }
+    console.error(`TIMEOUT waiting for a usable peer set — unmet: ${describeShortfall(unmet)}`);
+    console.error('INSUFFICIENT PEERS (environment, not an engine failure); last status:',
+      JSON.stringify(s));
+    shutdown(EXIT_INSUFFICIENT_PEERS);
+  } else if (Date.now() - t0 > SYNC_TIMEOUT_MS) {
+    // The full budget elapsed with something engine-side still unmet (never
+    // SYNCED, EL reader down). Calling that an environment result would invert
+    // the misdirection this gate exists to remove — it is an engine verdict.
+    clearInterval(poll);
+    console.error(`TIMEOUT waiting for readiness — unmet: ${describeShortfall(unmet)}`);
+    console.error('ENGINE did not become ready (not a peer-availability result); last status:',
+      JSON.stringify(s));
+    shutdown(1);
   }
 }, 5000);
 

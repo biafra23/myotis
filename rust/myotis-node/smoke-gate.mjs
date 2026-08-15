@@ -28,6 +28,22 @@ export const GATE_DEFAULTS = {
 /** Env values that turn a boolean knob off (anything else leaves it on). */
 const FALSEY = new Set(['0', 'false', 'no', 'off']);
 
+/** Default minutes: overall budget, and how long to wait before calling a
+ *  PEER-STARVED gate early (engine-side shortfalls always get the full
+ *  budget — a cold checkpoint catch-up legitimately takes 30-40 min). */
+export const TIMEOUT_DEFAULTS = { overallMinutes: 15, gateMinutes: 15 };
+
+/** Parse a set-but-nonsense minute knob loudly rather than silently. */
+function minutesFromEnv(env, name, fallback) {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be an integer >= 1 (minutes), got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
 /**
  * Read the gate config from the environment (see smoke.mjs's header).
  * Throws on a set-but-nonsense numeric value: `Number('')` is 0 and
@@ -50,6 +66,10 @@ export function gateConfigFromEnv(env = process.env) {
     requireDiscovery: discovery === undefined || discovery === ''
       ? GATE_DEFAULTS.requireDiscovery
       : !FALSEY.has(discovery.toLowerCase()),
+    overallMinutes: minutesFromEnv(
+      env, 'MYOTIS_SMOKE_TIMEOUT_MIN', TIMEOUT_DEFAULTS.overallMinutes),
+    gateMinutes: minutesFromEnv(
+      env, 'MYOTIS_SMOKE_GATE_TIMEOUT_MIN', TIMEOUT_DEFAULTS.gateMinutes),
   };
 }
 

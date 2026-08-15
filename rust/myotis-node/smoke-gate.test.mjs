@@ -9,17 +9,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  gateShortfall, gateConfigFromEnv, describeShortfall, isPeerStarvation, GATE_DEFAULTS,
+  gateShortfall, gateConfigFromEnv, describeShortfall, isPeerStarvation,
+  GATE_DEFAULTS, TIMEOUT_DEFAULTS,
 } from './smoke-gate.mjs';
 
 const DEFAULTS = { ...GATE_DEFAULTS };
+const TIMEOUTS = { overallMinutes: TIMEOUT_DEFAULTS.overallMinutes,
+  gateMinutes: TIMEOUT_DEFAULTS.gateMinutes };
 const messages = (unmet) => unmet.map((u) => u.message).join(' ');
 
 test('run A (linux, warm) — snapPeers=2, the run that passed — opens the gate', () => {
-  // Recorded: snapPeers 2, peerCount 9, attemptedDials 19.
-  assert.deepEqual(gateShortfall(
-    { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2, discoveredPeers: 30 },
-    DEFAULTS), []);
+  // Recorded: snapPeers 2, peerCount 9, attemptedDials 19. The discovery
+  // counters are NOT recorded, so assert both readings rather than inventing
+  // one: with any discovery signal the historically-passing run still opens
+  // the gate, and in the cache-only case it is deliberately held back (a run
+  // that discovered nothing cannot vouch for the engine either).
+  const base = { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2 };
+  assert.deepEqual(gateShortfall({ ...base, discoveredPeers: 30 }, DEFAULTS), []);
+  const cacheOnly = gateShortfall(
+    { ...base, discv5TableSize: 0, discoveredPeers: 0 }, DEFAULTS);
+  assert.equal(cacheOnly.length, 1);
+  assert.ok(isPeerStarvation(cacheOnly));
 });
 
 test('run B (windows, cold) — snapPeers=1 — is gated on rotation headroom either way', () => {
@@ -104,21 +114,39 @@ test('a constrained runner can relax the gate explicitly, never by accident', ()
     relaxed), []);
   assert.deepEqual(
     gateConfigFromEnv({ MYOTIS_SMOKE_MIN_SNAP_PEERS: '1', MYOTIS_SMOKE_REQUIRE_DISCOVERY: '0' }),
-    relaxed);
+    { ...relaxed, ...TIMEOUTS });
   for (const off of ['false', 'NO', 'Off']) {
     assert.equal(gateConfigFromEnv({ MYOTIS_SMOKE_REQUIRE_DISCOVERY: off }).requireDiscovery, false);
   }
   // Defaults stay strict when the env says nothing OR says empty string (an
   // unset Actions input expands to '' — that must not delete the peer floor).
-  assert.deepEqual(gateConfigFromEnv({}), { minSnapPeers: 2, requireDiscovery: true });
+  assert.deepEqual(gateConfigFromEnv({}), { minSnapPeers: 2, requireDiscovery: true, ...TIMEOUTS });
   assert.deepEqual(
     gateConfigFromEnv({ MYOTIS_SMOKE_MIN_SNAP_PEERS: '', MYOTIS_SMOKE_REQUIRE_DISCOVERY: '' }),
-    { minSnapPeers: 2, requireDiscovery: true });
+    { minSnapPeers: 2, requireDiscovery: true, ...TIMEOUTS });
 });
 
 test('a nonsense peer floor fails loudly at startup, not silently for 55 minutes', () => {
   for (const bad of ['abc', '0', '-1', '1.5']) {
     assert.throws(() => gateConfigFromEnv({ MYOTIS_SMOKE_MIN_SNAP_PEERS: bad }),
       /must be an integer >= 1/, `expected ${bad} to be rejected`);
+  }
+});
+
+test('timeout knobs are read and validated like the peer floor', () => {
+  const cfg = gateConfigFromEnv({
+    MYOTIS_SMOKE_TIMEOUT_MIN: '55', MYOTIS_SMOKE_GATE_TIMEOUT_MIN: '10',
+  });
+  assert.equal(cfg.overallMinutes, 55);
+  assert.equal(cfg.gateMinutes, 10);
+  // Unset/empty keep the defaults; nonsense is refused rather than accepted
+  // and ignored (the same rule the peer floor follows).
+  assert.equal(gateConfigFromEnv({ MYOTIS_SMOKE_TIMEOUT_MIN: '' }).overallMinutes,
+    TIMEOUT_DEFAULTS.overallMinutes);
+  for (const bad of ['abc', '0', '-5', '2.5']) {
+    assert.throws(() => gateConfigFromEnv({ MYOTIS_SMOKE_TIMEOUT_MIN: bad }),
+      /MYOTIS_SMOKE_TIMEOUT_MIN must be an integer >= 1/);
+    assert.throws(() => gateConfigFromEnv({ MYOTIS_SMOKE_GATE_TIMEOUT_MIN: bad }),
+      /MYOTIS_SMOKE_GATE_TIMEOUT_MIN must be an integer >= 1/);
   }
 });
