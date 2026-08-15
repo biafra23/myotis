@@ -18,11 +18,27 @@ name: iOS Framework (MyotisKit)
 
 on:
   # Scope push to main + release tags so a branch push that also has an open PR
-  # doesn't build twice (the PR is covered by pull_request below).
+  # doesn't build twice (the PR is covered by pull_request below). Paths gate
+  # both push-to-main and PRs to the inputs that can change MyotisKit — a
+  # docs-only PR shouldn't pay a 10x-billed macOS build. The set is everything
+  # the framework compiles from: rust/ (the C ABI + engine), :app-ios and the
+  # modules it bundles (:ui, :jsonrpc-server), and the Gradle build inputs.
+  # Path filters are ignored for TAG pushes (GitHub behaviour, same as the
+  # sibling ios-xcframework.yml), so releases still fire regardless.
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
+    paths: &fw_paths
+      - 'rust/**'
+      - 'app-ios/**'
+      - 'ui/**'
+      - 'jsonrpc-server/**'
+      - '**/build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle/libs.versions.toml'
+      - '.github/workflows/ios-framework.yml'
   pull_request:
+    paths: *fw_paths
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -73,26 +89,52 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      # On a tag: the full xcframework (both triples, release) — the published
-      # artifact. Otherwise: the simulator framework only — one cargo triple,
-      # the cheaper safety-net compile that still exercises IosRpcBackend +
-      # cinterop + the C-ABI header. Retry rides out transient repo-resolution.
+      # On a tag: the full xcframework (both triples, RELEASE) — the published
+      # artifact. Otherwise: the DEBUG simulator framework only — one cargo
+      # triple, no whole-program optimization, the fast Kotlin/Native link that
+      # still fully exercises IosRpcBackend + cinterop + the C-ABI header (the
+      # task CLAUDE.md documents as the iOS check). cargo is --release either
+      # way (the cinterop -libraryPath is pinned to target/$triple/release), so
+      # only the KN link mode changes.
+      #
+      # Retry ONLY on resolution-shaped failures: this job's purpose is to
+      # surface a compile break, so a genuine one must fail on the FIRST build,
+      # not after 3 cold macOS runs. Dependency-resolution flakes still retry.
       - name: Build framework
-        id: build
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             task=":app-ios:assembleMyotisKitReleaseXCFramework"
           else
-            task=":app-ios:linkReleaseFrameworkIosSimulatorArm64"
+            task=":app-ios:linkDebugFrameworkIosSimulatorArm64"
           fi
-          echo "task=$task"
+          echo "building $task"
           for attempt in 1 2 3; do
-            ./gradlew "$task" --stacktrace && exit 0
-            echo "::warning::framework build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
-            sleep 25
+            if ./gradlew "$task" --stacktrace 2>&1 | tee /tmp/gradle.log; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ] && grep -qE "Could not resolve|Could not GET|Connection reset|Read timed out|502 |503 |Premature end of Content-Length" /tmp/gradle.log; then
+              echo "::warning::attempt $attempt hit a dependency-resolution flake; retrying in 25s"
+              sleep 25
+              continue
+            fi
+            echo "::error::framework build failed (not a resolution flake — see the log above)"
+            exit 1
           done
-          echo "::error::framework build failed after 3 attempts"
+          echo "::error::framework build failed after 3 resolution retries"
           exit 1
+
+      # A DISABLED :app-ios (the cargo/rustup iOS-target probe came back false)
+      # reports the requested task SKIPPED and exits 0 — so the build step above
+      # can go green having compiled nothing, silently disarming the safety net.
+      # Assert the framework was actually produced. Tag builds are covered by
+      # the `test -d "$xc"` in the packaging step below.
+      - name: Verify the framework was actually linked
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: |
+          set -eu
+          fw="app-ios/build/bin/iosSimulatorArm64/debugFramework/MyotisKit.framework"
+          test -d "$fw"             || { echo "::error::$fw missing — :app-ios was disabled (no cargo/rustup iOS targets on the runner?), so NOTHING was compiled"; exit 1; }
+          echo "linked $fw"
 
       # Zip + checksum the xcframework for upload (the bundle is a directory;
       # it survives artifact round-trips only zipped). ditto is Apple's
@@ -104,7 +146,7 @@ jobs:
           set -eu
           xc="app-ios/build/XCFrameworks/release/MyotisKit.xcframework"
           test -d "$xc" || { echo "::error::missing $xc"; exit 1; }
-          ditto -c -k --keepParent "$xc" MyotisKit.xcframework.zip
+          ditto -c -k --sequesterRsrc --keepParent "$xc" MyotisKit.xcframework.zip
           shasum -a 256 MyotisKit.xcframework.zip | tee MyotisKit.xcframework.zip.sha256
           ls -lh MyotisKit.xcframework.zip
 
@@ -117,6 +159,10 @@ jobs:
             MyotisKit.xcframework.zip
             MyotisKit.xcframework.zip.sha256
           if-no-files-found: error
+          # Artifacts are immutable per run; without this, "Re-run all jobs" on
+          # a tag 409s here and the release job never runs — the button reached
+          # for after the version guard (in this job's needs) fails.
+          overwrite: true
 
   version-guard:
     name: Release version guard
@@ -162,19 +208,46 @@ jobs:
           the Myotis iOS app links, distinct from `MyotisEngine.xcframework` (the raw
           engine C ABI for Swift hosts). Not a signed app.
           SECTION
-          # Same create-or-append race handling as the MyotisEngine and node
-          # workflows publishing to this same release: create with the master
-          # line if absent (tolerating the race), then append THIS section only
-          # if its marker isn't already present (idempotent across reruns), so
-          # neither the master notes nor any sibling's section is clobbered.
-          if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "Myotis $tag" --prerelease \
-              --notes "Pre-release build of the Myotis wallet apps." || true
+          # Master notes for the case where THIS job creates the release (same
+          # text the android/desktop/node workflows carry) — so a release this
+          # job wins the create race for still documents every sibling's asset.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          Pre-release build of the Myotis wallet apps.
+
+          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
+          "Install unknown apps". Not a signed release build.
+
+          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          printf '\n' >> "$notes"
+          cat "$section" >> "$notes"
+          # Create with the full master body if absent; a sibling may win the
+          # race — on create failure re-check with `view` so a GENUINE failure
+          # still surfaces (matches the node/desktop idiom, not a bare `|| true`).
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
           fi
-          existing=$(gh release view "$tag" --json body --jq .body)
-          if ! grep -q 'MyotisKit.xcframework.zip' <<<"$existing"; then
-            printf '%s\n\n%s\n' "$existing" "$(cat "$section")" > notes.md
-            gh release edit "$tag" --notes-file notes.md
+          # Whether we created it or a sibling did: ensure the MyotisKit section
+          # is present exactly once (idempotent across reruns; appends when a
+          # sibling's notes won the create race). Never clobbers other sections.
+          body=$(mktemp)
+          gh release view "$tag" --json body --jq .body > "$body"
+          if ! grep -q 'MyotisKit.xcframework.zip' "$body"; then
+            printf '\n' >> "$body"
+            cat "$section" >> "$body"
+            gh release edit "$tag" --notes-file "$body"
           fi
           gh release upload "$tag" --clobber \
             MyotisKit.xcframework.zip \
