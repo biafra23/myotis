@@ -118,6 +118,64 @@ genuinely cannot serve a range, coverage simply never reaches it and getLogs
 for that range keeps erroring — honest by construction. (This is exactly the
 case where a bundled seed becomes the necessary optimization.)
 
+**Peer choice is a throughput decision, not just an availability one.** A
+byte-budget-truncated batch is deliberately a success (it applies above the cut
+and the next round resumes at it), so "served 62 blocks" and "served 1023
+blocks" are both `Ok`. The round therefore cannot pick a peer by success alone:
+taking the first success pins the walk to whatever the pool happens to list
+first. Observed on gnosis (2026-08-15): one peer held the backfill at ~62
+blocks/batch (~50 blk/s) for hours while eleven other live peers were never
+tried — a ~15x throughput loss with no error anywhere and no dishonest
+coverage, which is why nothing else surfaced it. The round now ranks peers by
+the THROUGHPUT of their last batch — blocks the cursor actually advanced,
+divided by how long the batch took (`rank_backfill_peers` — pure and
+unit-tested). The rate, not the block count, is the metric that matters: a peer
+serving 1023 blocks slowly is worse than one serving 300 quickly, and a peer
+that fully serves the inherently short final batch near the walk's target must
+not read as having truncated.
+
+Around that metric:
+
+- **Unmeasured peers are sampled first**, so a better server can be discovered
+  at all. "No score" means "not measured" — never sampled, or pruned when the
+  peer left the pool (the score map is bounded by the live pool, so a score
+  never outlives the connection it describes).
+- **A peer-attributable failure scores zero** rather than staying unscored, so a
+  peer that cannot serve the range stops costing a round-trip ahead of every
+  good one. A failure of *ours* — a config swapped mid-batch, our own gap reset
+  — does not score the peer at all; charging it would let our own bookkeeping
+  demote a good server, and the ranking is sticky between exploration rounds.
+- **Every `RESAMPLE_EVERY`-th round is an exploration round**: scores are
+  ignored and a rotating pool position leads. Truncation depends on the RANGE as
+  much as the peer, so a peer demoted on a candidate-dense stretch must be able
+  to climb back. The rotation is load-bearing — the round stops at the first
+  peer that serves, so leaving pool order alone would only ever re-measure
+  position 0 (in the incident above, exactly the stingy peer) and a peer demoted
+  deeper in the pool could never recover. The clock is a dedicated round
+  counter, not the success counter, which freezes during precisely the stall
+  that exploration exists to escape.
+- **Ranking never *excludes* a peer** — the round still tries the whole pool,
+  because the peer that fails one range may be the only one holding the next.
+
+Known limitation, accepted: the scores are not strictly commensurable. A
+batch's elapsed time also covers our own root recomputation, contention on the
+index lock, the candidate density of that particular range, and the global
+pipeline depth — so a peer measured on a dense range at depth 1 can rate below
+one measured on a sparse range at depth 4. Only the round's winner is
+re-measured each ordinary round, so the losers' scores go stale. The
+exploration round is what bounds the damage; a decaying or re-measured score
+would be the fix if this proves to matter, and it would be measurable as a walk
+that stays slow while a faster peer sits idle in the pool.
+
+Known property, accepted: this makes the walk's concentration on a single peer
+deterministic where it was previously incidental, and a peer can deliberately
+win the rank by serving well. That is bounded by the trust model rather than by
+the ranking — everything served is verified against the parent-hash chain and
+the receipts root before it is applied, so a peer that wins the rank still
+cannot forge a log or hide one. It can only withhold, which is the liveness
+attack CLAUDE.md already treats as detected-not-silent: coverage stops
+advancing, and getLogs keeps erroring honestly for the range it never reached.
+
 **Tracked follow-up (upward bridging):** after node downtime longer than the
 appender's window guard (~128 blocks), the coverage gap sits ABOVE the walk
 cursor and neither component closes it — the appender waits, the walker only
@@ -195,6 +253,17 @@ router/API changes in this design already accommodate it.
    frontiers (see §Import, canonical-shape note), snapshot provenance
    (imported-coverage marker / signed snapshots) and an explicit
    unsubscribe surface (see §Import, trust notes).
+8. Follow-up (observability, found 2026-08-15 while building the Bee/Swarm
+   index): the daemon's `peers` IPC command reads the engine-routed
+   `ChainHandle`, and `RustChainHandle` stubs both `discoveredPeers()` and
+   `connectedPeers()` to an empty list — so on a `-Pengine=rust` daemon it
+   always answers `{"count":0,"peers":[]}` while the Rust pool is in fact
+   serving a dozen peers. That is the shape
+   this document warns about everywhere else — an empty result that reads as
+   "none exist" when it means "not measured here" — and it cost real time
+   during the backfill investigation by making peer scarcity look like the
+   bottleneck. It should report the Rust pool, or say the table is
+   unavailable for this engine; it must not answer a confident zero.
 
 ## Import: generic build, portable snapshots, merge (v2 format)
 
