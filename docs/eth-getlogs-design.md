@@ -111,6 +111,42 @@ From the first anchored block downward to `min(watch.from_block)`:
 4. Checkpoint cursor + coverage after each batch; restart is idempotent from
    the checkpoint (any await may be the last).
 
+**Request sizing (adaptive).** Candidate blocks are fetched in chunks, and a
+peer answers `get_block_bodies`/`get_receipts` up to a soft BYTE budget — a
+chunk that exceeds it comes back short. A truncated chunk ends the whole batch
+(everything above the cut is still applied; coverage never claims more than was
+verified), so the batch advances the cursor only as far as the first truncated
+chunk, having already paid for a full ~1023-header window. On a candidate-dense
+range where peers cut at ~15 blocks, a fixed 64-block chunk truncates *every*
+time — measured on Gnosis, that walk spent ~a quarter of its bandwidth
+re-downloading the same header window to advance ~15 blocks (1023 × ~600 B of
+headers per batch against ~1.3 MiB/s total, at ~0.55 batches/s).
+
+So the chunk width tracks what peers in the current range actually serve:
+
+- **Down** toward the observed serve width on truncation, but floored at a
+  quarter of the current width. `served` describes the blocks in *that* chunk,
+  not the range — one fat block, or one degenerate peer, can report 1 where the
+  range serves 40, and the width is shared across peers. Unfloored, a single
+  such observation costs ~70 batches of probing to climb back from.
+- **Up** only as a periodic probe, on the Nth consecutive untruncated batch that
+  actually exercised the full width (a bloom-sparse window that asked for 5
+  blocks and got 5 says nothing about 64). Never as a reflex after each clean
+  batch: growth overshoots by construction, so growing on every clean batch
+  settles into a stable truncate-every-*other*-batch limit cycle — the same
+  pathology, re-entered through the back door.
+
+Chunks that come back full also leave the request pipeline at full depth. A
+truncation the probe itself provoked is excluded from that signal, so a probe
+costs one short batch rather than one short batch plus a full window run at
+depth 1.
+
+Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
+the limit-cycle bound and the floor are pinned by test. The width is *not*
+persisted — the walk resumes at a checkpointed cursor that may be in a
+different density regime, and re-learning costs one truncated batch per step
+down the ladder (at most three, since the floor bounds each step to a quarter).
+
 Peers that cannot serve deep history (EIP-4444 rollout) make this **stall, not
 fail**: track per-peer "history depth" refusals the same way snap-capability is
 tracked, rotate peers, back off, surface progress via status. If the network

@@ -620,6 +620,9 @@ pub struct ElReader {
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
     log_index_pipeline_full: std::sync::atomic::AtomicBool,
+    /// How many candidate blocks to ask for per bodies/receipts request, sized
+    /// to what peers in THIS range actually serve. See [`ChunkSizer`].
+    log_index_chunk_sizer: ChunkSizer,
     /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
     /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
     /// the rate is measured against WALL CLOCK between progress points (idle
@@ -789,6 +792,7 @@ impl ElReader {
             log_index_tail: std::sync::Mutex::new(Vec::new()),
             log_index_last_persist: std::sync::Mutex::new(None),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
+            log_index_chunk_sizer: ChunkSizer::new(),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
@@ -2470,7 +2474,12 @@ impl ElReader {
         // the writer's torn marker then fails the peer at its next send
         // rather than let it write MAC-garbage; see peer.rs `GuardedWriter`).
         const CHUNK_PIPELINE: usize = 4;
-        const CHUNK_LEN: usize = 64;
+        // ADAPTIVE width, sized to what peers in this range actually serve —
+        // see [`next_chunk_len`] for why a truncated chunk is so much more
+        // expensive than a small one. Read once so every chunk of this batch is
+        // cut the same way (the consumer re-derives slices by index, which only
+        // matches if the width is stable across the batch).
+        let chunk_len = self.log_index_chunk_sizer.width();
         // ADAPTIVE depth: pipelining only pays where chunks come back FULL
         // (sequential RTTs dominate); in budget-truncated ranges the batch
         // ends at the first chunk and any prefetched chunks are pure wasted
@@ -2491,7 +2500,7 @@ impl ElReader {
         // spawned appender task); the consumer re-derives each chunk slice by
         // index for verification.
         let chunk_hashes: Vec<Vec<[u8; 32]>> = candidates
-            .chunks(CHUNK_LEN)
+            .chunks(chunk_len)
             .map(|c| c.iter().map(|h| h.hash).collect())
             .collect();
         let mut fetches = futures::StreamExt::buffered(
@@ -2511,7 +2520,7 @@ impl ElReader {
             futures::StreamExt::next(&mut fetches).await
         {
             let chunk = candidates
-                .chunks(CHUNK_LEN)
+                .chunks(chunk_len)
                 .nth(chunk_idx)
                 .ok_or("chunk index out of range")?;
             let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
@@ -2575,13 +2584,25 @@ impl ElReader {
                 }
             }
             if let Some(stop) = chunk_stop {
-                self.log_index_pipeline_full
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // The peer just told us roughly what its budget fits for THIS
+                // range; narrow toward it so the next batch's chunks come back
+                // full and the batch runs the window instead of ending here.
+                // The sizer also decides whether this truncation is evidence
+                // that the RANGE punishes pipelining, or merely a probe of its
+                // own finding a ceiling — see [`ChunkSizer::note_truncated`].
+                if self
+                    .log_index_chunk_sizer
+                    .note_truncated(usable, chunk.len(), chunk_len)
+                {
+                    self.log_index_pipeline_full
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 stop_below = Some(stop);
                 tracing::debug!(
                     served = usable,
                     requested = chunk.len(),
                     resume_at = stop,
+                    next_chunk_len = self.log_index_chunk_sizer.width(),
                     "backfill chunk truncated by peer response budget; applying partial batch"
                 );
                 break 'chunks;
@@ -2593,6 +2614,10 @@ impl ElReader {
             // batch is no evidence either way and leaves the depth alone.)
             self.log_index_pipeline_full
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // For the WIDTH this only counts as evidence if the width was
+            // actually exercised — see [`ChunkSizer::note_clean_batch`].
+            self.log_index_chunk_sizer
+                .note_clean_batch(candidates.len(), chunk_len);
         }
         // Apply top-down (the response is already descending) so every block
         // adjoins the low edge; the trust edge advances with each block. A
@@ -5510,6 +5535,236 @@ fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
     !stop_below.is_some_and(|stop| n <= stop)
 }
 
+/// Largest chunk we will ever request, and the value the sizer converges back
+/// to once a range stops truncating. 64 candidate blocks was the fixed size
+/// before the sizer existed.
+const CHUNK_LEN_MAX: usize = 64;
+/// Smallest chunk. A single block's bodies+receipts always fit a peer's
+/// response budget, so 1 is the floor at which truncation stops being a
+/// request-shaping problem and becomes a data-availability one (which
+/// `truncation_plan` already reports as `None` → rotate peers).
+const CHUNK_LEN_MIN: usize = 1;
+/// The sizer probes a wider request on the Nth consecutive untruncated batch.
+/// See [`next_chunk_len`] — this is what keeps the width off a truncate-every-
+/// other-batch limit cycle. In steady state the cycle is `N + 1` batches with
+/// exactly one truncation in it — the batch AFTER the probe, which is the one
+/// that runs at the guessed width — so a wrong guess costs 1 batch in 9,
+/// against a walk that would otherwise never widen at all.
+const CHUNK_PROBE_AFTER: usize = 8;
+/// A truncation may not cut the width by more than this factor in one step.
+/// See [`next_chunk_len`].
+const CHUNK_SHRINK_LIMIT: usize = 4;
+
+/// Pick the next bodies/receipts chunk size from what the last chunk actually
+/// yielded.
+///
+/// THE POINT, and why this is worth a tuned control loop rather than a
+/// constant: a chunk that comes back TRUNCATED ends the whole batch
+/// (`break 'chunks`), so the batch advances the cursor only as far as the first
+/// truncated chunk — while having already paid for a full ~1023-header window.
+/// On a candidate-dense range where peers cut at ~15 blocks, a 64-block chunk
+/// therefore truncates every single time. Measured on Gnosis: ~0.55 batches/s
+/// at ~1.3 MiB/s total, of which 1023 × ~600 B per batch — roughly a QUARTER of
+/// all bandwidth — was re-downloading the same header window to advance ~15
+/// blocks. Ask for ~15 instead and the chunks come back full, the batch runs
+/// the whole window, and the header cost amortizes over ~1000 blocks instead of
+/// 15. (Full chunks also leave `log_index_pipeline_full` set, so the pipeline
+/// depth stops being pinned at 1 — the two adaptations reinforce each other.)
+///
+/// Shape: decrease toward the OBSERVED serve width, and increase only as an
+/// occasional PROBE — never as a reflex after each clean batch.
+///
+/// The decrease is floored at `current / CHUNK_SHRINK_LIMIT` rather than
+/// dropping straight to `served`, because `served` is a property of the blocks
+/// in THAT chunk, not of the range: a single fat block (full gas, heavy logs)
+/// can cut a response at 1 where the surrounding range comfortably serves 40.
+/// Unfloored, one such observation drops the width straight to 1 and costs ~70
+/// batches of probing to climb back from; floored, converging to a genuinely
+/// small width costs at most a couple of extra truncated batches (each step is
+/// still a strict decrease, so it terminates).
+///
+/// The floor bounds ONE observation, not a persistent adversary: a peer that
+/// truncates every chunk still walks the shared width down a step per batch —
+/// see [`ChunkSizer`] for why the width is shared and why that is a throughput
+/// concern rather than a correctness one.
+///
+/// The probe rule is the part that is easy to get wrong, and it is not
+/// cosmetic. Growth overshoots BY CONSTRUCTION: the width that just worked is
+/// the largest width known to work, so any increase is a guess that the range
+/// got cheaper. When the guess is wrong, the probing batch truncates on its
+/// FIRST chunk and yields one chunk's worth of blocks instead of a full window.
+/// Grown after every clean batch, a steady range therefore settles into a
+/// permanent 12 → 19 → 12 → 19 limit cycle that truncates every OTHER batch —
+/// the very pathology this sizer exists to remove, re-entered through the back
+/// door. Probing once per [`CHUNK_PROBE_AFTER`] clean batches bounds the cost of
+/// a wrong guess to ~1 short batch in that many, while still letting a range
+/// that genuinely got cheaper climb back to [`CHUNK_LEN_MAX`].
+///
+/// `served` is the count the peer actually delivered (`usable` from
+/// [`truncation_plan`]), `requested` what we asked for; `served >= requested`
+/// means untruncated. `clean_streak` counts consecutive untruncated batches
+/// INCLUDING this one.
+fn next_chunk_len(current: usize, served: usize, requested: usize, clean_streak: usize) -> usize {
+    let current = current.clamp(CHUNK_LEN_MIN, CHUNK_LEN_MAX);
+    if served < requested {
+        // Truncated: aim at what fit, but not below `current / SHRINK_LIMIT`.
+        // Capped at `current` because `served > current` means the peer
+        // over-served, which is not evidence about anyone's byte budget.
+        let floor = (current / CHUNK_SHRINK_LIMIT).max(CHUNK_LEN_MIN);
+        return served.clamp(CHUNK_LEN_MIN, current).max(floor);
+    }
+    if clean_streak < CHUNK_PROBE_AFTER {
+        return current;
+    }
+    // Probe. The `+ 1` matters independently of the ratio: without it the floor
+    // is an absorbing state and a range that ever hit 1 could never recover.
+    (current + current / 2 + 1).min(CHUNK_LEN_MAX)
+}
+
+/// The full sizer state machine: fold one observation into `(width, streak)`.
+///
+/// Split out from [`ElReader::log_index_note_chunk_served`] so the streak rules
+/// — in particular the reset that stops a saturated width from probing on every
+/// batch — are pinned by tests directly rather than by a simulator that copies
+/// them. `clean_streak` counts consecutive untruncated observations INCLUDING
+/// this one.
+fn fold_chunk_observation(
+    current: usize,
+    clean_streak: usize,
+    served: usize,
+    requested: usize,
+) -> (usize, usize) {
+    // Truncation breaks the run outright — the next clean batch starts counting
+    // from one, so a range that truncates intermittently never accumulates its
+    // way to a probe.
+    let streak = if served < requested {
+        0
+    } else {
+        // Saturating: the streak is reset every CHUNK_PROBE_AFTER observations
+        // so it cannot climb here, but this is a pure function and a panic in
+        // the sizer would take down a backfill that is otherwise fine.
+        clean_streak.saturating_add(1)
+    };
+    let next = next_chunk_len(current, served, requested, streak);
+    // A fired probe restarts the clock whether it widened or was already at MAX;
+    // otherwise the streak stays past the threshold and every subsequent clean
+    // batch would probe again — the limit cycle back.
+    if next != current || streak >= CHUNK_PROBE_AFTER {
+        (next, 0)
+    } else {
+        (next, streak)
+    }
+}
+
+/// The adaptive bodies/receipts request width and the rules for updating it.
+///
+/// Policy is the pure [`next_chunk_len`] / [`fold_chunk_observation`]; this owns
+/// the state and — importantly — the two rules about WHICH observations count,
+/// which is where the sizer is easiest to get quietly wrong. Kept as one small
+/// struct rather than three loose atomics on `ElReader` so those rules can be
+/// exercised by tests directly instead of only through a live backfill.
+///
+/// Deliberately shared across peers rather than kept per-peer: the byte budget
+/// being probed is a property of the RANGE (how fat the blocks are down here)
+/// at least as much as of the peer, and the walk stays with one serving peer
+/// across many batches rather than cycling, so a per-peer table would re-learn
+/// the same width for every peer it meets. The cost of sharing is real and
+/// bounded: a peer that truncates hard drags the shared width down a step per
+/// batch (three batches to reach the floor from the ceiling), and its successor
+/// inherits that until the probe clock climbs back. That is a throughput
+/// griefing vector, not a correctness one — the width only shapes REQUESTS, and
+/// every block is verified on arrival regardless of how many were asked for.
+#[derive(Debug)]
+struct ChunkSizer {
+    width: std::sync::atomic::AtomicUsize,
+    /// Consecutive untruncated batches THAT EXERCISED the full width — the
+    /// probe clock. A bloom-sparse batch never asks for a full chunk, so it is
+    /// not evidence and does not tick this.
+    clean_streak: std::sync::atomic::AtomicUsize,
+    /// Set when the last observation GREW the width, i.e. the next batch is a
+    /// speculative probe. Read once, by the next truncation. It means "the
+    /// current width is unvalidated speculation", which is why every batch that
+    /// ends without exercising the width (fetch error, verification failure,
+    /// bloom-sparse window, index changed mid-batch) correctly leaves it set:
+    /// none of those validated anything. The cost is that if the probe batch
+    /// dies for an unrelated reason, one later truncation is misattributed to
+    /// the probe and does not degrade the depth — one batch, self-healing.
+    probing: std::sync::atomic::AtomicBool,
+}
+
+impl ChunkSizer {
+    fn new() -> Self {
+        Self {
+            width: std::sync::atomic::AtomicUsize::new(CHUNK_LEN_MAX),
+            clean_streak: std::sync::atomic::AtomicUsize::new(0),
+            probing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The width to cut this batch's chunks at. Read ONCE per batch by the
+    /// caller: the consumer re-derives each chunk slice by index, which only
+    /// matches the producer if the width is stable across the batch.
+    fn width(&self) -> usize {
+        self.width
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(CHUNK_LEN_MIN, CHUNK_LEN_MAX)
+    }
+
+    /// Fold one observation into the width. Returns whether it GREW (i.e.
+    /// whether the next batch is a probe).
+    fn fold(&self, served: usize, requested: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cur = self.width.load(Relaxed);
+        let (next, streak) =
+            fold_chunk_observation(cur, self.clean_streak.load(Relaxed), served, requested);
+        self.width.store(next, Relaxed);
+        self.clean_streak.store(streak, Relaxed);
+        next > cur
+    }
+
+    /// A chunk came back short. `chunk_len` is the width of THAT chunk, `width`
+    /// the batch's. Returns whether the pipeline depth should be degraded.
+    ///
+    /// Two rules, both about what this is evidence OF:
+    ///
+    /// - It is evidence about the width only if the chunk was full-width. The
+    ///   last chunk of a batch is `candidates.len() % width` blocks, so a batch
+    ///   of 66 candidates at width 64 ends with a 2-block chunk; letting one fat
+    ///   block in that tail cut the width would discard the 64-block chunk that
+    ///   just succeeded in the same batch. Same rule as the clean side: only a
+    ///   full-width request says anything about the full width.
+    /// - It is evidence that the RANGE punishes pipelining only if the sizer did
+    ///   not provoke it. A probe truncating is the probe finding its ceiling,
+    ///   and the width is about to drop back to one that was already working;
+    ///   degrading the depth on it would make every probe cost a second bad
+    ///   batch — its own short one, then a full window run at depth 1.
+    fn note_truncated(&self, served: usize, chunk_len: usize, width: usize) -> bool {
+        let provoked = self
+            .probing
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if chunk_len >= width {
+            self.fold(served, chunk_len);
+        }
+        !provoked
+    }
+
+    /// A whole batch came back untruncated.
+    ///
+    /// "Untruncated" only counts as evidence if the width was actually
+    /// exercised. The widest chunk a batch requests is
+    /// `candidates.min(width)`, so a bloom-sparse window that asked for 5
+    /// blocks and got 5 says nothing about whether 64 would have fit. Counting
+    /// it would ratchet the width up on fabricated evidence and hand the next
+    /// dense stretch a width it has to re-learn from a truncation.
+    fn note_clean_batch(&self, candidates: usize, width: usize) {
+        if candidates >= width {
+            let grew = self.fold(width, width);
+            self.probing
+                .store(grew, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tail_reorg_tests {
     use super::{tail_fork_point, tail_vouches_for, tail_window_floor};
@@ -5744,3 +5999,300 @@ mod backfill_truncation_tests {
     }
 }
 
+#[cfg(test)]
+mod backfill_chunk_sizing_tests {
+    use super::{
+        fold_chunk_observation, next_chunk_len, truncation_plan, ChunkSizer, CHUNK_LEN_MAX,
+        CHUNK_LEN_MIN, CHUNK_PROBE_AFTER, CHUNK_SHRINK_LIMIT,
+    };
+
+    /// A clean observation that is NOT a probe (the common case).
+    fn clean(current: usize) -> usize {
+        next_chunk_len(current, current, current, 1)
+    }
+    /// A clean observation that IS the probe.
+    fn probe(current: usize) -> usize {
+        next_chunk_len(current, current, current, CHUNK_PROBE_AFTER)
+    }
+
+    #[test]
+    fn a_truncated_chunk_narrows_toward_what_the_peer_served() {
+        // The whole point: peers on a candidate-dense range cut a 64-block
+        // request at ~15, so ask for ~15 next time. Streak is irrelevant here.
+        assert_eq!(next_chunk_len(64, 15, 64, 0), 16); // floored at 64/4
+        assert_eq!(next_chunk_len(16, 15, 16, 0), 15); // floor not binding
+        assert_eq!(next_chunk_len(64, 15, 64, CHUNK_PROBE_AFTER), 16);
+        assert_eq!(next_chunk_len(15, 4, 15, 3), 4);
+    }
+
+    #[test]
+    fn one_outlier_block_cannot_pin_the_width_at_the_floor() {
+        // `served` describes the blocks in ONE chunk. A single fat block (or a
+        // degenerate peer) reporting `served = 1` must not cost the ~70 batches
+        // of probing it would take to climb back from CHUNK_LEN_MIN.
+        assert_eq!(
+            next_chunk_len(64, 1, 64, 0),
+            CHUNK_LEN_MAX / CHUNK_SHRINK_LIMIT
+        );
+        // But a range that really is that expensive still converges there, and
+        // does so quickly — every step is a strict decrease, so it terminates.
+        let mut w = CHUNK_LEN_MAX;
+        let mut steps = 0;
+        while w > CHUNK_LEN_MIN {
+            let next = next_chunk_len(w, 1, w, 0);
+            assert!(next < w, "width {w} did not decrease on truncation");
+            w = next;
+            steps += 1;
+        }
+        assert!(
+            steps <= 4,
+            "took {steps} truncated batches to reach the floor"
+        );
+    }
+
+    #[test]
+    fn a_clean_batch_alone_does_not_widen() {
+        // THE regression this rule exists for. If a clean batch widened, a
+        // steady range would oscillate width -> wider -> truncate -> width and
+        // lose every other batch to a first-chunk truncation.
+        for n in [1, 12, 15, 32, 63] {
+            assert_eq!(clean(n), n, "width {n} widened without a probe");
+        }
+        for s in 0..CHUNK_PROBE_AFTER {
+            assert_eq!(
+                next_chunk_len(12, 12, 12, s),
+                12,
+                "streak {s} widened early"
+            );
+        }
+    }
+
+    #[test]
+    fn the_streak_resets_after_a_probe_even_at_the_ceiling() {
+        // The subtle half of the state machine. At CHUNK_LEN_MAX a probe cannot
+        // widen, so `next == current`; without the explicit reset the streak
+        // would stay above the threshold and EVERY later batch would count as a
+        // probe — which, via the probe-provoked-truncation rule, would suppress
+        // the pipeline-depth signal forever.
+        let (w, s) = fold_chunk_observation(CHUNK_LEN_MAX, CHUNK_PROBE_AFTER - 1, 64, 64);
+        assert_eq!((w, s), (CHUNK_LEN_MAX, 0));
+        // Same for a probe that DID widen.
+        let (w, s) = fold_chunk_observation(12, CHUNK_PROBE_AFTER - 1, 12, 12);
+        assert!(w > 12);
+        assert_eq!(s, 0);
+        // A truncation resets it outright, so intermittent truncation never
+        // accumulates its way to a probe.
+        // Note the input: width 4 truncating at 4-of-8 leaves the width
+        // UNCHANGED (the shrink floor holds it at 4), so the reset can only come
+        // from the truncation arm. An input that also moves the width would pass
+        // whether or not that arm exists.
+        assert_eq!(
+            fold_chunk_observation(4, CHUNK_PROBE_AFTER - 1, 4, 8),
+            (4, 0)
+        );
+        assert_eq!(
+            fold_chunk_observation(12, CHUNK_PROBE_AFTER - 1, 3, 12).1,
+            0
+        );
+        // And an ordinary clean observation just ticks.
+        assert_eq!(fold_chunk_observation(12, 2, 12, 12), (12, 3));
+    }
+
+    #[test]
+    fn a_steady_range_truncates_at_most_once_per_probe_interval() {
+        // The limit-cycle guard, end-to-end: the real state machine driven
+        // against the real truncation arithmetic. A peer serves exactly 12
+        // blocks per response, forever. Converged, the ONLY truncations left
+        // are the periodic probes.
+        const BUDGET: usize = 12;
+        const BATCHES: usize = 200;
+        const WARMUP: usize = 40;
+        let mut width = CHUNK_LEN_MAX;
+        let mut streak = 0usize;
+        let mut converged_truncations = 0;
+        let mut widths_after_warmup = Vec::new();
+        for i in 0..BATCHES {
+            let served = width.min(BUDGET);
+            let numbers: Vec<u64> = (0..width as u64).map(|n| 1000 - n).collect();
+            let (usable, stop) = truncation_plan(&numbers, served, served).expect("nonempty serve");
+            if stop.is_some() && i >= WARMUP {
+                converged_truncations += 1;
+            }
+            (width, streak) = fold_chunk_observation(width, streak, usable, width);
+            if i >= WARMUP {
+                widths_after_warmup.push(width);
+            }
+        }
+        // Converged, the width sits at the budget and steps at most one probe
+        // above it — overshoot is what a probe IS, so asserting `<= BUDGET`
+        // would be asserting against the design (and would depend on which
+        // phase of the cycle BATCHES happens to land in).
+        let ceiling = next_chunk_len(BUDGET, BUDGET, BUDGET, CHUNK_PROBE_AFTER);
+        assert!(
+            widths_after_warmup.iter().all(|&w| w <= ceiling),
+            "width exceeded one probe above the budget: {widths_after_warmup:?}"
+        );
+        assert!(
+            widths_after_warmup.contains(&BUDGET),
+            "width never settled at the budget: {widths_after_warmup:?}"
+        );
+        // Steady-state truncation rate must be ~1 per (PROBE_AFTER + 1) batches,
+        // not the 1-in-2 a reflexive grow produces.
+        let steady = BATCHES - WARMUP;
+        let worst_case = steady / (CHUNK_PROBE_AFTER + 1) + 3;
+        assert!(
+            converged_truncations <= worst_case,
+            "steady-state truncations {converged_truncations} exceed {worst_case} (limit cycle regression)"
+        );
+    }
+
+    #[test]
+    fn a_range_that_got_cheaper_climbs_back_to_the_max_promptly() {
+        // The probe must not be so timid that the width is effectively a
+        // ratchet: a walk that leaves a dense stretch has to recover, and the
+        // recovery cost is what makes the decrease floor worth having, so pin
+        // the step count and not just the endpoint.
+        let mut n = CHUNK_LEN_MIN;
+        let mut probes = 0;
+        while n < CHUNK_LEN_MAX {
+            n = probe(n);
+            probes += 1;
+            assert!(probes < 40, "did not converge");
+        }
+        assert_eq!(n, CHUNK_LEN_MAX);
+        assert!(probes <= 10, "recovery from the floor took {probes} probes");
+    }
+
+    #[test]
+    fn a_probe_is_strictly_monotone_so_the_floor_is_not_absorbing() {
+        // `current + current/2 + 1` — the +1 is what makes 1 -> 2 rather than
+        // 1 -> 1. Without it a range that ever hit 1 could never recover.
+        for n in CHUNK_LEN_MIN..CHUNK_LEN_MAX {
+            assert!(probe(n) > n, "width {n} did not grow on a probe");
+        }
+    }
+
+    #[test]
+    fn the_width_never_leaves_its_bounds() {
+        assert_eq!(probe(CHUNK_LEN_MAX), CHUNK_LEN_MAX);
+        // Defensive, not reachable from the call site: `truncation_plan`
+        // returns None on a 0-length serve, so the caller rotates peers rather
+        // than reporting it here. Pinned because a 0 width would panic
+        // `slice::chunks`, which is a far worse failure than a small request.
+        assert_eq!(
+            next_chunk_len(16, 0, 16, 0),
+            CHUNK_LEN_MIN.max(16 / CHUNK_SHRINK_LIMIT)
+        );
+        assert!(next_chunk_len(CHUNK_LEN_MIN, 0, CHUNK_LEN_MIN, 0) >= CHUNK_LEN_MIN);
+        // Absurd stored values are clamped rather than trusted.
+        assert!(next_chunk_len(usize::MAX, 4, 8, 0) <= CHUNK_LEN_MAX);
+        assert!(next_chunk_len(0, 0, 8, 0) >= CHUNK_LEN_MIN);
+        assert!(next_chunk_len(usize::MAX, 99, 99, CHUNK_PROBE_AFTER) <= CHUNK_LEN_MAX);
+        // Every reachable fold keeps the width in range.
+        for current in [0, 1, 7, 12, 64, usize::MAX] {
+            for served in [0, 1, 11, 64, usize::MAX] {
+                for streak in [0, CHUNK_PROBE_AFTER, usize::MAX] {
+                    let (w, _) = fold_chunk_observation(current, streak, served, 64);
+                    assert!(
+                        (CHUNK_LEN_MIN..=CHUNK_LEN_MAX).contains(&w),
+                        "width {w} out of range"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_full_width_request_is_evidence_about_the_width() {
+        // A bloom-sparse batch asks for `candidates` blocks, not `width`, so a
+        // clean result says nothing about `width`. Counting it would ratchet the
+        // width up on evidence nobody produced.
+        let s = ChunkSizer::new();
+        for _ in 0..(CHUNK_PROBE_AFTER * 4) {
+            s.note_clean_batch(5, 20);
+        }
+        assert_eq!(s.width(), CHUNK_LEN_MAX, "sparse batches moved the width");
+        // Exercising the width really does tick the clock, so the gate is not
+        // just disabling the sizer.
+        let s = ChunkSizer::new();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(64, CHUNK_LEN_MAX);
+        }
+        assert_eq!(s.width(), CHUNK_LEN_MAX); // already at the ceiling
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64);
+        let narrowed = s.width();
+        assert!(narrowed < CHUNK_LEN_MAX);
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, narrowed);
+        }
+        assert!(s.width() > narrowed, "a full-width clean run never probed");
+    }
+
+    #[test]
+    fn a_short_tail_chunk_cannot_shrink_a_width_the_same_batch_proved() {
+        // 66 candidates at width 64 => chunks [64, 2]. The 64-block chunk came
+        // back full; one fat block in the 2-block tail must not discard that.
+        let s = ChunkSizer::new();
+        s.note_truncated(1, 2, 64);
+        assert_eq!(s.width(), CHUNK_LEN_MAX, "a 2-block sample moved the width");
+        // A full-width chunk truncating IS evidence and does narrow it.
+        s.note_truncated(12, 64, 64);
+        assert!(s.width() < CHUNK_LEN_MAX);
+    }
+
+    #[test]
+    fn a_probe_provoked_truncation_does_not_also_degrade_the_pipeline() {
+        // The sizer asked for more than it knew would fit; the truncation is its
+        // own doing, not a property of the range. Degrading the depth on it
+        // would make every probe cost a second bad batch.
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64); // converge to a working width
+        let w = s.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, w);
+        }
+        let probed = s.width();
+        assert!(probed > w, "the probe did not widen");
+        assert!(
+            !s.note_truncated(w, probed, probed),
+            "a probe-provoked truncation degraded the pipeline depth"
+        );
+        // The flag is consumed, so the NEXT truncation — which the range
+        // imposed, not the sizer — does degrade it.
+        assert!(
+            s.note_truncated(4, s.width(), s.width()),
+            "an unprovoked truncation failed to degrade the pipeline depth"
+        );
+    }
+
+    #[test]
+    fn a_clean_batch_that_is_not_evidence_leaves_the_probe_flag_alone() {
+        // The flag means "the current width is unvalidated speculation". A batch
+        // that never exercised the width neither validates nor invalidates it,
+        // and must not clear a pending probe.
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64);
+        let w = s.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, w);
+        }
+        assert!(s.width() > w, "the probe did not widen");
+        s.note_clean_batch(2, s.width()); // sparse batch, no evidence
+        assert!(
+            !s.note_truncated(w, s.width(), s.width()),
+            "a sparse batch cleared a pending probe"
+        );
+    }
+
+    #[test]
+    fn an_over_serving_peer_cannot_widen_the_request() {
+        // `served > requested` is not reachable today — `truncation_plan` caps
+        // the count at the chunk length before the sizer ever sees it — but the
+        // sizer must not become a way to grow the request without a probe if a
+        // future caller reports raw peer counts. Capped at `current` on the
+        // truncated path, gated by the probe clock on the clean one.
+        assert_eq!(next_chunk_len(8, 40, 64, 0), 8);
+        assert_eq!(fold_chunk_observation(8, 0, 40, 8).0, 8);
+    }
+}
