@@ -180,3 +180,25 @@ interface RpcStatusSource {
     fun statusJson(uptimeSeconds: Long): JsonObject
     fun beaconStatusJson(uptimeSeconds: Long): JsonObject
 }
+
+/**
+ * The lifecycle-control seam behind `myotis_pause` / `myotis_wakeup` — the
+ * JSON-RPC counterpart of the daemon's `pause` / `resume` IPC commands. Hosts
+ * wire the same node object they wire for [RpcStatusSource]; on the JVM the
+ * adapter delegates to [io.myotis.api.NodeLifecycle], on iOS to the engine's
+ * pause/resume FFI. Both verbs BLOCK (they tear down / rebuild networking) and
+ * may cross an FFI, so the router runs them off its event loop.
+ */
+interface RpcLifecycle {
+    /** Idle-pause: quiesce P2P (sockets + periodic timers) while the RPC listener
+     *  keeps listening. Returns the resulting transition. Blocking. */
+    fun pause(): RpcLifecycleResult
+    /** Wake a paused stack, recorded as the IPC/RPC wake reason. Returns the
+     *  resulting transition. Blocking (seconds). */
+    fun wakeUp(): RpcLifecycleResult
+}
+
+/** The outcome of an [RpcLifecycle] verb: [ok] is whether the target state was
+ *  reached, [lifecycle] the coarse state now in effect ("RUNNING" | "PAUSED" |
+ *  "STOPPED"). Mirrors the IPC command's `{"ok":…, "lifecycle":…}` shape. */
+class RpcLifecycleResult(val ok: Boolean, val lifecycle: String)

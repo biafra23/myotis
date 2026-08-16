@@ -56,7 +56,7 @@ import static io.myotis.api.LifecycleState.STOPPED;
  * <p>{@link #start()} is fault-isolated: any failure closes only this stack's resources
  * and returns {@code false}; it never affects sibling stacks or the host process.
  */
-public final class ChainStack {
+public final class ChainStack implements io.myotis.api.NodeLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(ChainStack.class);
 
@@ -595,6 +595,13 @@ public final class ChainStack {
         return servingPeers == 0 && zeroActive && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
     }
     public LifecycleState lifecycle() { return phase.get(); }
+
+    // ---- io.myotis.api.NodeLifecycle (the myotis_pause / myotis_wakeup RPC seam) ----
+    // pause() above already satisfies NodeLifecycle.pause(). wakeUp() is the RPC/IPC
+    // wake — resume tagged WakeReason.IPC, exactly like the daemon's `resume` command.
+    @Override public boolean wakeUp() { return resume(io.myotis.api.WakeReason.IPC); }
+    @Override public String lifecycleName() { return lifecycle().name(); }
+
     public RLPxConnector connector() { return connector; }
 
     /** Inbound-serve counters for the status surfaces. */
@@ -1001,7 +1008,7 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
+                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads, this);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;

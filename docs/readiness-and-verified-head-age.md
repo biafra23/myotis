@@ -160,6 +160,13 @@ success, an ordered `failReason` token (`beaconNotSynced`, `noPeerStateRoot`,
 `eth_*` methods return `-32000` while any readiness gate is unmet — wallets
 should treat it as retryable.
 
+An out-of-process wallet that idle-pauses the node with `myotis_pause` should
+call `myotis_wakeup` and then poll these two status methods back through the
+readiness gate (`myotis_status.state == "RUNNING"` with `snapPeers > 0`, and
+`myotis_beaconStatus.state == "SYNCED"`) **before** its first `eth_*` read —
+`myotis_wakeup` returns when the rebuild *starts*, not when the node is ready
+again (see disk-and-network-usage.md §4.1).
+
 ## Code pointers
 
 - Java sync states + criteria: `consensus/.../BeaconSyncState.java`

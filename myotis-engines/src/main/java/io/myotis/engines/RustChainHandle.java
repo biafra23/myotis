@@ -54,7 +54,7 @@ import java.util.List;
  * {@code WakeGate} the Java engine uses — a request on a paused stack wakes it and
  * is held (bounded, ~90 s) until the node can answer.
  */
-final class RustChainHandle implements ChainHandle, NodeStatusReads {
+final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api.NodeLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(RustChainHandle.class);
 
@@ -223,6 +223,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         return s.paused() ? LifecycleState.PAUSED : LifecycleState.STOPPED;
     }
 
+    // ---- io.myotis.api.NodeLifecycle (the myotis_pause / myotis_wakeup RPC seam) ----
+    // pause() above already satisfies NodeLifecycle.pause(). wakeUp() is the RPC/IPC
+    // wake — resume tagged WakeReason.IPC, matching the daemon's `resume` command.
+    @Override public boolean wakeUp() { return resume(io.myotis.api.WakeReason.IPC); }
+    @Override public String lifecycleName() { return lifecycle().name(); }
+
     @Override
     public long lastActivityEpochMillis() {
         // Epoch millis of the last gated verified read / operator query; 0 if none.
@@ -341,7 +347,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this);
+                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",

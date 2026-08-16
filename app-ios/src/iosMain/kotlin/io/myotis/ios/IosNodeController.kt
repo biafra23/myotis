@@ -285,6 +285,9 @@ class IosNodeController(
                     handleProvider = { locked { handles[net] } },
                     startMarkProvider = { locked { startMarks[net] } },
                 ),
+                lifecycle = IosRpcLifecycle(
+                    handleProvider = { locked { handles[net] } },
+                ),
             )
             // Deterministic up-front bind probe (JVM hosts' ServerSocket probe
             // twin): Ktor CIO surfaces bind failures ASYNCHRONOUSLY inside its

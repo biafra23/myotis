@@ -221,12 +221,13 @@ Two planned paths give other hosts the same escape:
   when queries can occur and can pause/resume the engine around its own lifecycle —
   the Android idle-pause model generalized. The engine API already supports this
   (`ChainStack.pause()` quiesces every socket and timer; a read wakes it).
-- **A pause/wake JSON-RPC surface.** The server could expose `myotis_pause` and
+- **A pause/wake JSON-RPC surface.** The server exposes `myotis_pause` and
   `myotis_wakeup` (alongside the existing `myotis_status`/`myotis_beaconStatus`), so a
   Myotis-aware wallet — even an out-of-process one — can put the node to sleep when its
   UI goes to the background and wake it (and poll status until ready) before the next burst
-  of queries. Not implemented yet; unaware wallets would keep today's always-warm
-  behavior.
+  of queries. See [§4.1](#41-lifecycle-control-myotis_pause--myotis_wakeup) for the exact
+  semantics. Unaware wallets keep today's always-warm behavior — the methods are opt-in and
+  nothing calls them on the wallet's behalf.
 
 With either in place, the desktop profile converges on the Android one in §3.3:
 per-minute rates only while a wallet is actually active, near-zero otherwise.
@@ -245,6 +246,47 @@ the desktop app and daemon are always-on (§3.2) unless paused.
 | `eth_call` / `eth_estimateGas` (EVM over snap proofs) | ~5 KB per cold account/slot touched + contract bytecode (tens of KB, up to 128 KB/response); repeated calls hit the state-root-keyed cache |
 | `eth_getBlockByNumber` | headers only, ~700 B each |
 | `eth_feeHistory` (cold, with percentiles) | up to 10 blocks × (body ~100 KB + receipts ~80 KB) ≈ **~1–2 MB**; normally served from the warm fee snapshot (§3.2) |
+
+### 4.1 Lifecycle control (`myotis_pause` / `myotis_wakeup`)
+
+Two Myotis-namespaced JSON-RPC methods let an **out-of-process** wallet drive the
+node's lifecycle over the same loopback endpoint it already uses for reads — the
+JSON-RPC counterpart of the daemon's `pause` / `resume` IPC commands, and of what
+the Android `NodeService` does in-process from its own idle/foreground callbacks.
+Like `myotis_status` / `myotis_beaconStatus`, they are **local control that bypasses
+the verified backend**, so they answer even when the node is not synced / has no
+peers.
+
+| Method | Params | Effect | Result |
+|---|---|---|---|
+| `myotis_pause` | `[]` | **Idle-pause**: tear down all P2P — every socket and periodic timer, so the radio can sleep — while the JSON-RPC listener keeps listening and the warm verified state (light-client store, sync-committee roots, peer caches) stays in memory. Exactly the transition the Android idle controller performs. Blocking (~a few seconds); idempotent. | `{"ok":true,"lifecycle":"PAUSED"}` |
+| `myotis_wakeup` | `[]` | Rebuild P2P after a pause (recorded as the `ipc` wake reason), skipping the cold DNS walk. Blocking (seconds). A no-op success when already `RUNNING`; on a failed rebuild returns `ok:false` and stays `PAUSED` (retryable). | `{"ok":true,"lifecycle":"RUNNING"}` |
+
+`lifecycle` is the coarse state reached (`RUNNING` | `PAUSED` | `STOPPED`), and `ok`
+is whether the requested target state was reached — so a caller can tell a real
+transition from a well-formed refusal rather than being handed a misleading success.
+
+**Intended use — pair `myotis_wakeup` with the status methods, never fire-and-forget.**
+`myotis_wakeup` only *starts* the rebuild; it returns as soon as the stack is
+`RUNNING`, which is **before** the beacon light client has re-anchored and a snap peer
+is in the serving pool. A wallet resuming from background should therefore:
+
+1. call `myotis_wakeup` as its UI comes to the foreground (overlapping the rebuild
+   with the user's unlock), then
+2. poll `myotis_status` until `state == "RUNNING"` **and** `snapPeers > 0`, and
+   `myotis_beaconStatus` until `state == "SYNCED"`, **before** issuing verified reads —
+   the same readiness gate the hosts apply (see
+   [readiness-and-verified-head-age.md](readiness-and-verified-head-age.md)).
+
+Skipping the wake entirely still works — the first verified read on a paused stack
+wakes it on its own and is held (bounded, ~90 s) until the node can answer — but an
+explicit `myotis_wakeup` + status poll overlaps the multi-second rebuild with the UI
+transition instead of stalling the first read. When the seam isn't wired (a host that
+didn't provide a lifecycle source) both methods return `-32601`.
+
+Availability: the daemon, the desktop, and the iOS listener wire these; the Android
+app doesn't need them (it drives pause/resume in-process from its own lifecycle
+callbacks — §3.3). Loopback-only and unauthenticated like the rest of the endpoint.
 
 ---
 
