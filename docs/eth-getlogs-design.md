@@ -136,10 +136,33 @@ So the chunk width tracks what peers in the current range actually serve:
   settles into a stable truncate-every-*other*-batch limit cycle — the same
   pathology, re-entered through the back door.
 
+A truncation counts as evidence about the width when the chunk was **the widest
+one that batch could have asked for** — `min(width, candidates)`, not `width`.
+A bloom-sparse window with 30 candidates at width 64 yields a single 30-block
+chunk, and a peer cutting it at 15 is the only budget measurement such a batch
+can produce; ignoring it left every window with `budget < candidates < width`
+permanently stuck (the width never moved, and the truncation ended the batch
+before the clean path could run). What is excluded is a batch's short *tail*
+chunk, which exists only when `candidates > width` and therefore always follows
+a full-width chunk that already succeeded.
+
 Chunks that come back full also leave the request pipeline at full depth. A
 truncation the probe itself provoked is excluded from that signal, so a probe
 costs one short batch rather than one short batch plus a full window run at
-depth 1.
+depth 1. Only an observation that is evidence about the width may spend a
+pending probe — otherwise the probe survives untested and the next truncation,
+quite plausibly that same probe hitting its ceiling, is misattributed to the
+range.
+
+The width is shared across peers on purpose (the byte budget is a property of
+the range as much as of the peer), which makes it a throughput/latency griefing
+vector but not a correctness one — every block is verified on arrival however
+many were requested. The latency side is the sharper one: chunks per batch is
+`ceil(candidates / width)` at pipeline depth 4, so a floored width turns a full
+window from ~4 requests into ~1023, overrunning the walker's tick budget (only
+checked between rounds) and delaying the head-follow appender that shares the
+task. Self-heals over the probe ladder; a hard chunks-per-batch bound is the
+natural pairing for the width floor if it ever shows up in practice.
 
 Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
 the limit-cycle bound and the floor are pinned by test. The width is *not*
