@@ -573,6 +573,63 @@ impl LogIndex {
 // yields None and the caller re-indexes. Never correctness-critical.
 // ---------------------------------------------------------------------------
 
+/// The scratch path one [`write_atomic`] call writes through before renaming
+/// it into place. Distinct for every CALL, not merely every process: two
+/// writers in one process aiming at the same `path` would otherwise share a
+/// temp file, and the loser's `File::create` truncates the winner's mid-write —
+/// or worse, the winner renames the shared temp out from under the loser, whose
+/// still-open fd then keeps writing into the LIVE `.db` that readers are
+/// reading. That was invisible while every caller happened to hold the index
+/// mutex across the whole write; it stops being invisible the moment one of
+/// them doesn't. Separate from `write_atomic` so the distinctness can be
+/// asserted directly instead of only being raced for.
+fn next_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
+
+/// Write `bytes` to `path` atomically: private temp file, fsync, rename, then
+/// fsync the parent directory so the rename itself survives a power loss.
+/// The one place the log-index snapshot pattern lives, so every writer of an
+/// index `.db` gets the same durability, and so a caller can serialize under
+/// whatever lock owns the index and then do the slow part — the fsync —
+/// without holding it. (Other snapshot writers in the tree — `sync.rs`, roost
+/// — keep their own; this is not a repo-wide primitive.)
+///
+/// The temp name comes from [`next_tmp_path`] — see there for why a per-call
+/// counter, and not just the pid, is what makes two concurrent writers safe.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = next_tmp_path(path);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        // A partial temp is dead weight at full snapshot size, and the likely
+        // trigger is ENOSPC — leaving it behind is what keeps the disk full.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Same reasoning, and here the temp is FULL size: a failed rename
+        // (EACCES, EROFS, a dataDir symlinked across filesystems) would
+        // otherwise leave a whole snapshot behind on every attempt.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Best-effort: a rename is not durable until the directory entry is. If
+    // this fails the old checkpoint is still what a crash would find, which is
+    // the same safe degradation as no checkpoint at all.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 const MAGIC: &[u8; 4] = b"MLIX";
 /// v1: config-keyed blob (fingerprint only — unreadable without the exact
 ///     watch-list that produced it; still LOADED for upgrade, never written).
@@ -657,13 +714,7 @@ impl LogIndex {
 
     /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
     pub fn persist_clamped(&self, tag: &ChainTag, path: &Path, max_block: u64) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize_clamped(tag, max_block))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize_clamped(tag, max_block))
     }
 
     pub fn serialize(&self, tag: &ChainTag) -> Vec<u8> {
@@ -684,13 +735,7 @@ impl LogIndex {
         path: &Path,
         clamp: Option<u64>,
     ) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize_impl(tag, clamp, true))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize_impl(tag, clamp, true))
     }
 
     fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
@@ -895,17 +940,11 @@ impl LogIndex {
         header[..4] == *MAGIC && u32::from_le_bytes([header[4], header[5], header[6], header[7]]) == VERSION_LEGACY
     }
 
-    /// Atomic best-effort persist: temp file (pid-suffixed) + rename, the
-    /// `persist_snapshot` pattern. A failed write costs a re-index on the
-    /// affected range, never correctness.
+    /// Atomic best-effort persist: temp file (named per CALL — see
+    /// `next_tmp_path`) + rename, the `persist_snapshot` pattern. A failed
+    /// write costs a re-index on the affected range, never correctness.
     pub fn persist(&self, tag: &ChainTag, path: &Path) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize(tag))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize(tag))
     }
 
     /// Load a persisted index for `config`; None on absence or any mismatch.
@@ -1430,6 +1469,103 @@ mod tests {
         // Nothing above the clamp → byte-identical to a plain serialize.
         assert_eq!(ix.serialize_clamped(&tag(), 14), ix.serialize(&tag()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_writes_to_one_path_never_share_a_scratch_file() {
+        // THE invariant that keeps two concurrent checkpoints apart, asserted
+        // directly rather than raced for: `concurrent_writers_never_leave_a_
+        // spliced_file` below exercises the same property, but only detects a
+        // violation when the threads happen to interleave inside the write
+        // window, so it cannot be the only guard. Here a regression to a
+        // per-process name fails every run, on any scheduler.
+        let path = std::path::Path::new("/tmp/whatever/index.db");
+        let names: std::collections::HashSet<_> = (0..64).map(|_| next_tmp_path(path)).collect();
+        assert_eq!(names.len(), 64, "two calls chose the same temp path");
+        // Still per-process, still beside the target, still not the target.
+        for n in &names {
+            assert_eq!(
+                n.parent(),
+                path.parent(),
+                "temp must be renameable onto path"
+            );
+            assert_ne!(n, path, "temp must not BE the target");
+            assert!(
+                n.to_string_lossy()
+                    .contains(&format!(".tmp.{}.", std::process::id())),
+                "temp must stay identifiable as this process's: {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_never_leave_a_spliced_file() {
+        // The checkpoint write no longer happens under the index lock, so the
+        // temp path is what keeps two writers apart. With a per-PROCESS temp
+        // name they share one file: the second `File::create` truncates the
+        // first mid-write and the reader gets a splice of both — which, on a
+        // real index, means a checksum failure and a full re-walk of months of
+        // backfill. Distinct payload bytes make a splice detectable.
+        let dir = std::env::temp_dir().join(format!("logindex-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("racing.db");
+        const LEN: usize = 1 << 20; // big enough that the writes genuinely overlap
+        const WRITERS: u8 = 8;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A reader running throughout: `path` must NEVER be observable in a
+        // partial state. That is what the rename buys, and it is the property
+        // a caller relies on when it reloads a checkpoint after a crash.
+        let watcher = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut torn = None;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(got) = std::fs::read(&path) {
+                        if got.len() != LEN || got.iter().any(|b| *b != got[0]) {
+                            torn = Some(got.len());
+                            break;
+                        }
+                    }
+                }
+                torn
+            })
+        };
+        let writers: Vec<std::thread::JoinHandle<()>> = (1..=WRITERS)
+            .map(|k| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        write_atomic(&path, &vec![k; LEN]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().unwrap(),
+            None,
+            "a reader saw a partial file: the swap is not atomic"
+        );
+        // Whatever landed must be exactly ONE writer's payload, whole.
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), LEN, "file is not one writer's payload");
+        let first = got[0];
+        assert!(
+            (1..=WRITERS).contains(&first),
+            "byte from no writer: {first}"
+        );
+        assert!(got.iter().all(|b| *b == first), "spliced payloads");
+        // And no temp files are left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
