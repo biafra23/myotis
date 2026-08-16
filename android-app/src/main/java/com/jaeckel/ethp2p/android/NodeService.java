@@ -584,6 +584,7 @@ public final class NodeService extends Service {
         stackStartNano.remove(n);
         lastResumeMs.remove(n);
         reachedSynced.remove(n);   // a re-enable cold-starts the SYNCED-once gate again
+        lastObservedLifecycle.remove(n);
     }
 
     /** True if any network is still enabled (incl. the seeded default). */
@@ -726,6 +727,16 @@ public final class NodeService extends Service {
      *  gate again); a stack that briefly falls out of sync after its first SYNCED still pauses on
      *  the normal idle rules. */
     private static final java.util.Set<String> reachedSynced = ConcurrentHashMap.newKeySet();
+    /** Per-network lifecycle observed on the previous idle tick, so the ticker can spot a
+     *  wake it did NOT initiate — an out-of-process {@code myotis_wakeup} (Walleth and other
+     *  same-device wallets driving the shared node), an {@code ipc resume}, or the engine's
+     *  own wake on a verified read. Such a wake bumps none of the host-side idle stamps, so
+     *  without this the idle ticker would re-pause a node a client just asked to wake. On a
+     *  observed PAUSED/STOPPED→RUNNING transition the ticker grants a full idle window via
+     *  {@link #lastResumeMs} (our own resumes already stamped it, so this only fires for the
+     *  ones that bypassed the host). STATIC, like the stamps above; cleared on teardown. */
+    private static final Map<String, io.myotis.api.LifecycleState> lastObservedLifecycle =
+            new ConcurrentHashMap<>();
     /** Backstop for the SYNCED-once gate: if a fresh stack has been trying to reach SYNCED for
      *  this long (measured from its boot stamp) without success — no peers, a wedged sync, a
      *  perpetually-throwing status() — stop keeping it awake and let the idle controller pause it.
@@ -846,6 +857,17 @@ public final class NodeService extends Service {
                 if (idleMs <= 0) break; // auto-pause disabled
                 io.myotis.api.LifecycleState ls;
                 try { ls = h.lifecycle(); } catch (Throwable t) { continue; }
+                // A wake this host did not initiate — an out-of-process myotis_wakeup, an ipc
+                // resume, or the engine's own wake on a verified read — bumps none of the idle
+                // stamps below. Detect the PAUSED/STOPPED→RUNNING transition and grant a full
+                // idle window so the ticker doesn't re-pause a node a client just woke. Our own
+                // resumes (onAppForeground / dailyCatchUp) already stamped lastResumeMs≈now, so
+                // the max leaves those unchanged and only lifts an externally-driven wake.
+                io.myotis.api.LifecycleState prev = lastObservedLifecycle.put(n, ls);
+                if (ls == io.myotis.api.LifecycleState.RUNNING
+                        && prev != null && prev != io.myotis.api.LifecycleState.RUNNING) {
+                    lastResumeMs.merge(n, now, Math::max);
+                }
                 if (ls != io.myotis.api.LifecycleState.RUNNING) continue;
                 long lastActivity = Math.max(
                         Math.max(h.lastActivityEpochMillis(), uiActivityMs),

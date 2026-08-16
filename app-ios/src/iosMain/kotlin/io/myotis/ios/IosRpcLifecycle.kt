@@ -24,14 +24,23 @@ class IosRpcLifecycle(
 
     override fun pause(): RpcLifecycleResult {
         val handle = handleProvider() ?: return RpcLifecycleResult(false, "STOPPED")
-        RustEngine.pause(handle)
+        // A native RUNNING→PAUSED transition is definitive: report PAUSED without a
+        // status re-read, so a transient status-read failure right after can't
+        // misreport a just-paused node as STOPPED. Only the no-transition case
+        // (already PAUSED = idempotent success, or STOPPED/failed) needs a read to
+        // disambiguate — mirrors RustChainHandle.pause().
+        if (RustEngine.pause(handle)) return RpcLifecycleResult(true, "PAUSED")
         val lc = lifecycleName(handle)
         return RpcLifecycleResult(lc == "PAUSED", lc)
     }
 
     override fun wakeUp(): RpcLifecycleResult {
         val handle = handleProvider() ?: return RpcLifecycleResult(false, "STOPPED")
-        RustEngine.resume(handle)
+        // A native resume that rebuilt networking is definitive: report RUNNING
+        // without a re-read. The no-transition case (already RUNNING = idempotent
+        // success, or a failed rebuild that stays PAUSED) needs a read to tell them
+        // apart — mirrors RustChainHandle.resume().
+        if (RustEngine.resume(handle)) return RpcLifecycleResult(true, "RUNNING")
         val lc = lifecycleName(handle)
         return RpcLifecycleResult(lc == "RUNNING", lc)
     }

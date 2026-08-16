@@ -118,10 +118,23 @@ class NodeStatusSource(private val sr: io.myotis.api.NodeStatusReads) : RpcStatu
         StatusJson.beaconStatus(sr.beaconStatus(), uptimeSeconds)
 }
 
-/** [RpcLifecycle] over the api contract — pure delegation. The resulting
- *  lifecycle name is read AFTER the transition so `{ok, lifecycle}` reflects the
- *  state actually reached (mirrors the daemon's pause/resume IPC response). */
+/** [RpcLifecycle] over the api contract — pure delegation.
+ *
+ *  On success the lifecycle name is the target state BY DEFINITION
+ *  (`NodeLifecycle.pause` returns true iff PAUSED on return, `wakeUp` iff RUNNING),
+ *  so it is NOT re-read: reading `lifecycleName()` in a second call would let a
+ *  concurrent transition (the idle controller, another client) return an
+ *  internally contradictory `{ok:true, lifecycle:"RUNNING"}` for a pause — a
+ *  well-formed but misleading success (CLAUDE.md §Trust). Only the failure path,
+ *  where `ok` already says the target was not reached, reads the current state as
+ *  a best-effort diagnostic. */
 class NodeLifecycleSource(private val lc: io.myotis.api.NodeLifecycle) : RpcLifecycle {
-    override fun pause(): RpcLifecycleResult = RpcLifecycleResult(lc.pause(), lc.lifecycleName())
-    override fun wakeUp(): RpcLifecycleResult = RpcLifecycleResult(lc.wakeUp(), lc.lifecycleName())
+    override fun pause(): RpcLifecycleResult {
+        val ok = lc.pause()
+        return RpcLifecycleResult(ok, if (ok) "PAUSED" else lc.lifecycleName())
+    }
+    override fun wakeUp(): RpcLifecycleResult {
+        val ok = lc.wakeUp()
+        return RpcLifecycleResult(ok, if (ok) "RUNNING" else lc.lifecycleName())
+    }
 }

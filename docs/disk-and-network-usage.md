@@ -260,7 +260,7 @@ peers.
 | Method | Params | Effect | Result |
 |---|---|---|---|
 | `myotis_pause` | `[]` | **Idle-pause**: tear down all P2P — every socket and periodic timer, so the radio can sleep — while the JSON-RPC listener keeps listening and the warm verified state (light-client store, sync-committee roots, peer caches) stays in memory. Exactly the transition the Android idle controller performs. Blocking (~a few seconds); idempotent. | `{"ok":true,"lifecycle":"PAUSED"}` |
-| `myotis_wakeup` | `[]` | Rebuild P2P after a pause (recorded as the `ipc` wake reason), skipping the cold DNS walk. Blocking (seconds). A no-op success when already `RUNNING`; on a failed rebuild returns `ok:false` and stays `PAUSED` (retryable). | `{"ok":true,"lifecycle":"RUNNING"}` |
+| `myotis_wakeup` | `[]` | Rebuild P2P after a pause (tagged the `ipc` wake reason on the JVM hosts; the iOS native resume takes no reason), skipping the cold DNS walk. Blocking (seconds). A no-op success when already `RUNNING`; on a failed rebuild returns `ok:false` and stays `PAUSED` (retryable). | `{"ok":true,"lifecycle":"RUNNING"}` |
 
 `lifecycle` is the coarse state reached (`RUNNING` | `PAUSED` | `STOPPED`), and `ok`
 is whether the requested target state was reached — so a caller can tell a real
@@ -284,9 +284,17 @@ explicit `myotis_wakeup` + status poll overlaps the multi-second rebuild with th
 transition instead of stalling the first read. When the seam isn't wired (a host that
 didn't provide a lifecycle source) both methods return `-32601`.
 
-Availability: the daemon, the desktop, and the iOS listener wire these; the Android
-app doesn't need them (it drives pause/resume in-process from its own lifecycle
-callbacks — §3.3). Loopback-only and unauthenticated like the rest of the endpoint.
+Availability: every host that serves the JSON-RPC endpoint wires these — the daemon,
+the desktop, the iOS listener, **and the Android node service**. The Myotis Android
+app doesn't call them for its own UI (it drives pause/resume in-process from its own
+lifecycle callbacks — §3.3), but the node it hosts serves them on `127.0.0.1` so a
+**separate** same-device wallet app (e.g. Walleth) that points at the endpoint can
+pause/wake the shared node tied to *its* foreground/background. The Android idle
+controller cooperates: a wake it did not itself initiate (an out-of-process
+`myotis_wakeup`, or the engine's own wake on a verified read) is granted a full idle
+window, so the controller won't re-pause a node a client just woke out from under it
+(`NodeService.idleTick`). Loopback-only and unauthenticated like the rest of the
+endpoint.
 
 ---
 

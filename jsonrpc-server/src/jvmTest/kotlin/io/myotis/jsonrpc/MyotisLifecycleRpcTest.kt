@@ -66,6 +66,22 @@ class MyotisLifecycleRpcTest {
         assertEquals("STOPPED", result["lifecycle"]!!.jsonPrimitive.content)
     }
 
+    @Test fun successResult_ignoresLifecycleName_soNoContradiction() {
+        // On success the lifecycle is the target state BY DEFINITION, so the adapter must NOT
+        // re-read lifecycleName() — a concurrent transition there could otherwise return a
+        // contradictory {ok:true, lifecycle:"RUNNING"} for a pause (CLAUDE.md §Trust). This
+        // stub reports a CONTRADICTORY name to prove it is ignored on the success path.
+        val contradictory = object : NodeLifecycle {
+            override fun pause(): Boolean = true
+            override fun wakeUp(): Boolean = true
+            override fun lifecycleName(): String = "RUNNING" // would contradict a successful pause
+        }
+        val resp = route(contradictory, """{"jsonrpc":"2.0","id":1,"method":"myotis_pause","params":[]}""")
+        val result = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertTrue(result["ok"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals("PAUSED", result["lifecycle"]!!.jsonPrimitive.content) // target state, not the stub's name
+    }
+
     @Test fun lifecycle_unwired_errorsMethodNotSupported() {
         // No lifecycle seam injected (e.g. a host that didn't wire it) → -32601, not a crash.
         for (m in listOf("myotis_pause", "myotis_wakeup")) {

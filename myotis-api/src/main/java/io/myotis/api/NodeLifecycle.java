@@ -34,8 +34,10 @@ public interface NodeLifecycle {
     boolean pause();
 
     /**
-     * Rebuild P2P after {@link #pause()}, recorded as {@link WakeReason#IPC} (the
-     * IPC/RPC wake). Blocking (seconds; skips the cold DNS walk). A verified read
+     * Rebuild P2P after {@link #pause()}. On hosts that record a wake reason (the
+     * JVM engines, via {@link ChainHandle#resume(String)}) this is tagged
+     * {@link WakeReason#IPC} — the IPC/RPC wake; the iOS native resume FFI takes no
+     * reason and doesn't tag it. Blocking (seconds; skips the cold DNS walk). A verified read
      * arriving while paused already wakes the stack on its own, so an explicit
      * wakeup is the optimization a Myotis-aware wallet issues — alongside polling
      * {@code myotis_status} / {@code myotis_beaconStatus} — to overlap the rebuild
