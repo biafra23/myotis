@@ -296,6 +296,29 @@ window, so the controller won't re-pause a node a client just woke out from unde
 (`NodeService.idleTick`). Loopback-only and unauthenticated like the rest of the
 endpoint.
 
+**Multi-client caveat — `myotis_pause` is unconditional (last-writer-wins).** The
+pause verb does **not** consult the engine's in-flight-request counter (only the host
+idle timer does, via `lastActivityEpochMillis()` reporting "now" while a request is in
+flight). So on a node shared by more than one client:
+
+- A background client's `myotis_pause` tears the connector down **under another
+  client's in-flight read** — say a foreground wallet's multi-second confirm-screen
+  sweep. Integrity is unaffected (the read fails transiently or re-enters the wake gate
+  and is held ~90 s until the node can answer), but a background client can degrade a
+  foreground one.
+- Two Myotis-aware wallets both following the guidance above will pause the node out
+  from under each other on every background transition. The idle-controller cooperation
+  above protects external *wakes*; nothing arbitrates competing *pauses*.
+
+`myotis_pause` is therefore only polite when the caller is the node's **sole active
+consumer** (the embedded-library case: one app hosts the engine and is its only
+client). A wallet that can't assume that should prefer letting the node idle-pause
+itself (skip `myotis_pause`, keep `myotis_wakeup`) — a wake is always one verified read
+away regardless. (Making `pause` refuse while requests are in flight — returning
+`{ok:false, lifecycle:"RUNNING"}`, which the result shape already expresses — would
+also change the IPC `pause` command's semantics, so that is an owner decision, tracked
+separately.)
+
 ---
 
 ## 5. Creating and sending a transaction

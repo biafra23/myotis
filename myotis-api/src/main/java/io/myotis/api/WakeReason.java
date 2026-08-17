@@ -23,7 +23,8 @@ public final class WakeReason {
     /** The daily WorkManager maintenance pass resumed the stack to catch up + persist. */
     public static final String CATCH_UP = "catch-up";
 
-    /** The daemon's {@code resume} IPC command. */
+    /** The daemon's {@code resume} IPC command, and the {@code myotis_wakeup} JSON-RPC
+     *  method on the JVM engines (both route through {@link ChainHandle#resume(String)}). */
     public static final String IPC = "ipc";
 
     /** A plain {@link ChainHandle#resume()} with no reason given. */

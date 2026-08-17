@@ -252,6 +252,7 @@ class RpcRouter(
             }
             // Isolate the transition like the status reads / IPC command do: a throw
             // becomes a JSON-RPC error envelope, never a raw Ktor 500.
+            val tLc = TimeSource.Monotonic.markNow()
             return try {
                 // pause()/wakeUp() tear down / rebuild networking (seconds) and can
                 // cross a JNI boundary into the native engine — run them on the IO
@@ -260,7 +261,9 @@ class RpcRouter(
                 val r = withContext(rpcIoDispatcher) {
                     if (method == "myotis_pause") lc.pause() else lc.wakeUp()
                 }
-                logger.record(method, idStr, "LOCAL", 0)
+                // Unlike the status reads (hardcoded 0), record the REAL elapsed time:
+                // a pause/wakeup takes seconds, and the access log is where that shows.
+                logger.record(method, idStr, "LOCAL", elapsedMs(tLc))
                 resultEnvelope(id, buildJsonObject {
                     put("ok", r.ok)
                     put("lifecycle", r.lifecycle)
