@@ -107,10 +107,32 @@ weighs. The counter says *there is work to record*; the throttle says *when*,
 and is not cleared when it defers (that would drop the checkpoint rather than
 delay it). Two once-per-event writes are deliberately exempt: `ElReader::stop`
 (the last write before the index goes away) and a head bridge's FINAL slice.
-The bridge still *consults* the throttle so that write stamps the clock —
-short-circuiting past it would let a phone that wakes repeatedly from sleep
-complete a bridge, write off-budget, and leave the next tick free to
-checkpoint again immediately behind it.
+
+The clock those intervals are measured from (`PersistClock`) obeys one rule:
+**only a write ends an interval, and the decision to write is taken where the
+write happens.** `PersistClock::is_due` is a pure read — asking never consumes
+anything — and `persist_log_index` consults it *under the checkpoint lock*,
+not the caller before calling. Both halves are load-bearing. A predicate that
+stamped would charge a full interval (up to 600 s of re-walked work on a crash)
+to a checkpoint that may never be written, since a writer skips when another
+holds the lock; and a decision taken outside the lock is not a claim — two
+writers genuinely race here (the backfill step runs outside `log_index_drive`,
+and a host thread can drive the tail on the `getLogs` path), so a "yes" read
+before the other's write would be honoured after it, rewriting the whole file
+back to back.
+
+Everything that makes the file current starts an interval, so an off-budget
+write can never be followed seconds later by a throttled one measuring from a
+stale stamp — a phone waking repeatedly from sleep completing a bridge, or an
+import that just wrote a multi-GB merge and would otherwise see the very next
+appender tick rewrite it. That covers the throttled checkpoints, the two
+exempt ones, the wholesale replacements (config push, import merge — which
+stamp only if the write actually landed), and, distinctly, *adoption*: loading
+a snapshot writes nothing but the file already describes the index installed
+from it. Adoption credits all but the 10 s floor of the interval, so a launch
+does not rewrite hundreds of MB byte-identical but for the header, while a
+session shorter than the interval — routine on Android, where the platform
+restarts the process — still banks its progress once.
 
 A failed checkpoint is logged, not swallowed. It stays best-effort — the
 previous snapshot is what a crash finds, which is safe — but a *permanently*
