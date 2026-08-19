@@ -94,16 +94,56 @@ B.3's fork schedule — build it once, in config, and let B consume it.
 
 Re-pin the cross-engine golden conformance bytes for the fork-ID values.
 
-### A.2 Explicit "unsupported fork" surfacing
+### A.2 Fork detection & upgrade advisory (schedule-known AND schedule-unknown)
 
-`BeaconLightClient` knows only one fork version (`acceptedForkVersions()`
-returns the configured singleton). Once the chain crosses the Gloas epoch,
-every new update fails and the node sits in a permanent stale/OPTIMISTIC
-limbo that is indistinguishable from a network problem. Add: when the head
-slot crosses a configured Gloas epoch that the client does not support,
-`beacon-status` reports it (e.g. a `reason: "unsupportedFork(gloas)"` next to
-the state) and verified-read errors say so too. This is the trust rule from
-CLAUDE.md applied to time: refuse loudly, never degrade silently.
+Without this, an un-updated client past the fork is a wallet that looks
+"stuck syncing" — indistinguishable from a network outage. Safety already
+holds (misparsed post-fork objects produce wrong roots and fail BLS/Merkle
+verification; nothing verifies wrong), but the liveness failure is mute.
+Two cases:
+
+**Schedule known (this binary carries the A.1 entries):** when the head
+crosses a configured fork epoch the client does not implement,
+`beacon-status` reports it (`reason: "unsupportedFork(gloas)"`) and
+verified-read errors name it too — the CLAUDE.md trust rule applied to
+time: refuse loudly, never degrade silently.
+
+**Schedule unknown (the binary shipped before the date was announced):**
+detect the fork from the wire — the network announces it, and both raw
+signals are ALREADY decoded today, just unused:
+
+- *EL, pre-fork:* upgraded peers put `forkNext = activation time` in their
+  eth `Status` weeks ahead (EIP-2124's stale-software mechanism).
+  `StatusMessage` already decodes it ("for debug"). Trigger: ≥N distinct
+  peers announce a `forkNext` not in our `NetworkConfig` schedule →
+  advisory "unknown fork scheduled at T, upgrade before then".
+- *CL, post-fork:* every req/resp response carries 4 context bytes (fork
+  digest), already extracted by `ReqRespCodec`. An unknown digest — while
+  data keeps arriving but the finalized head froze at a specific epoch —
+  is the unambiguous "a fork I don't know is live" signature,
+  distinguishable from a plain outage.
+
+The advisory is NOT a trust decision: a lying peer can at most cause a
+false warning, never wrong data — verification is untouched. Use a
+multi-peer threshold + hysteresis against single-peer noise.
+
+**Surfacing** (one implementation, all hosts):
+
+- `myotis-api`: a flat, FFI-portable field on the status shape (e.g.
+  `UpgradeAdvisory(source, activatesAt, observedPeers)` on
+  `BeaconStatus`/`StatusSnapshot`), so it crosses UniFFI/C-ABI identically
+  — daemon, Android, iOS, desktop all read the same seam.
+- `:ui` via the `NetworkStatus` seam: pre-fork banner "network upgrade at
+  ~T — app update required"; post-fork "this version can no longer verify
+  the network" instead of an eternal spinner.
+- `:app` daemon: advisory in `status`/`beacon-status` JSON + a WARN log.
+- RPC/query surface: no proactive warning channel — queries already fail
+  honestly; only upgrade the error reason from generic `beaconNotSynced`
+  to `upgradeRequired`/`unsupportedFork` where the advisory is active.
+
+Ship this generic (no fork date baked in): it only protects binaries that
+carry it, field apps update slowly, and built this way it covers Hegotá
+and every fork after — one detector, forever.
 
 ### A.3 Confirm the EL path is genuinely inert
 
