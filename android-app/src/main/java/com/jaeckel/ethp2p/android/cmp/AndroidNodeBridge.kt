@@ -104,6 +104,8 @@ class AndroidNodeController(
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
+    override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
+    override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 
     override val canImportLogIndex: Boolean get() = pickFiles != null
@@ -291,6 +293,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     elHunting = elHunting(),
     rpcPort = rpcPort(),
     rpcServing = rpcServing(),
+    wsBoundPeriods = wsBoundPeriods(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */
@@ -310,6 +313,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
     override fun setServedBlockWindow(v: Int) = NodeService.setServedBlockWindowPref(ctx, v)
+    override fun wsBoundPeriods(): Int = NodeService.wsBoundPeriods(ctx)
+    override fun setWsBoundPeriods(v: Int) = NodeService.setWsBoundPeriodsPref(ctx, v)
 
     override fun displayName(network: String): String = NodeService.displayName(network)
     override fun defaultRpcPort(network: String): Int = NodeService.defaultRpcPort(network)

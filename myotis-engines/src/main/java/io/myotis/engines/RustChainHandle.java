@@ -394,7 +394,20 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
             long peerBodyRequests,
             long peerBodyRequestsServed,
             boolean lcHunting,
-            boolean elHunting) {
+            boolean elHunting,
+            long wsBoundPeriods) {
+
+        /** {@code beaconState} tolerant of a NEWER .so than this wrapper: an
+         *  unrecognized value maps to STARTING (not-ready, fail closed) instead of
+         *  the whole status parse throwing — the same skew hygiene as the missing
+         *  targetPeriod fallback. */
+        private static BeaconState beaconStateOf(String name) {
+            try {
+                return BeaconState.valueOf(name);
+            } catch (IllegalArgumentException e) {
+                return BeaconState.STARTING;
+            }
+        }
 
         static ParsedStatus parse(String json) {
             if (json == null || json.isBlank()) return notRunning();
@@ -405,7 +418,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getBoolean("running", false),
                         o.getBoolean("paused", false),
                         o.getBoolean("elReaderAvailable", false),
-                        BeaconState.valueOf(o.getString("beaconState", "STARTING")),
+                        beaconStateOf(o.getString("beaconState", "STARTING")),
                         o.getBoolean("bootstrapped", false),
                         o.getLong("finalizedSlot", 0L),
                         o.getLong("optimisticSlot", 0L),
@@ -427,7 +440,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                         o.getLong("peerBodyRequests", 0L),
                         o.getLong("peerBodyRequestsServed", 0L),
                         o.getBoolean("lcHunting", false),
-                        o.getBoolean("elHunting", false));
+                        o.getBoolean("elHunting", false),
+                        // Older .so vintages don't emit it; 0 = "bound unknown".
+                        o.getLong("wsBoundPeriods", 0L));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -436,7 +451,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L);
         }
     }
 
@@ -530,6 +545,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
                 targetPeriod,   // wallClockPeriod == the catch-up target
                 verifiedHeadAgeMs,
+                s.wsBoundPeriods(),
                 List.<PeerInfo>of(),
                 // Idle-sleep metrics, accounted Java-side across the native
                 // pause/resume transitions (same SleepMetrics as the Java engine).
@@ -583,6 +599,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
                 0L,                    // executionBlockNumber
                 0,                     // knownStateRoots
                 0,                     // fillThreshold
+                s.wsBoundPeriods(),
                 List.<ClPeerInfo>of());
     }
 
@@ -642,6 +659,23 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads {
         // a silently dropped Settings value is the bug this path used to have.
         if (!RustEngineNative.nativeSetServedBlockWindow(handle, blocks)) {
             log.warn("[engines] setServedBlockWindow({}) dropped: unknown handle {}", blocks, handle);
+        }
+    }
+
+    @Override
+    public void setWsBoundPeriods(long periods) {
+        // Applied live through the engine's shared WsPolicy — a STALE_ANCHOR park
+        // re-evaluates within a second. False only for an unknown handle; log it,
+        // since a silently dropped Settings value is the bug this path used to have.
+        if (!RustEngineNative.nativeSetWsBoundPeriods(handle, periods)) {
+            log.warn("[engines] setWsBoundPeriods({}) dropped: unknown handle {}", periods, handle);
+        }
+    }
+
+    @Override
+    public void acceptStaleAnchor() {
+        if (!RustEngineNative.nativeAcceptStaleAnchor(handle)) {
+            log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
         }
     }
 

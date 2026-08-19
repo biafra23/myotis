@@ -26,6 +26,13 @@ import java.util.List;
  * @param executionBlockNumber  finalized execution block number
  * @param knownStateRoots       beacon-attested state roots currently held
  * @param fillThreshold         the engine's known-roots threshold for serving verified reads
+ * @param wsBoundPeriods        the weak-subjectivity bound (in sync-committee periods) the
+ *                              engine is enforcing for this network — host override if set,
+ *                              else the network default. While {@code state} is
+ *                              {@link BeaconState#STALE_ANCHOR}, {@code currentPeriod} is the
+ *                              refused anchor's period and {@code targetPeriod} the wall-clock
+ *                              period, so {@code targetPeriod - currentPeriod} is the anchor age
+ *                              the bound was compared against
  * @param peers                 per-peer CL detail
  */
 public record BeaconStatus(
@@ -45,5 +52,6 @@ public record BeaconStatus(
         long executionBlockNumber,
         int knownStateRoots,
         int fillThreshold,
+        long wsBoundPeriods,
         List<ClPeerInfo> peers) {
 }

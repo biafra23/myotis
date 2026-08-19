@@ -247,6 +247,41 @@ class RustStatusJsonTest {
         assertEquals(0L, bs.executionBlockNumber());
     }
 
+    /** The weak-subjectivity park: STALE_ANCHOR maps through BOTH surfaces with the
+     *  refused anchor as currentPeriod and the enforced bound alongside. */
+    private static final String STALE_ANCHOR_JSON =
+            "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"STALE_ANCHOR\","
+            + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
+            + "\"currentPeriod\":1825,\"targetPeriod\":1845,\"peerCount\":0,"
+            + "\"discv5TableSize\":3,\"syncStartPeriod\":-1,\"wsBoundPeriods\":13}";
+
+    @Test
+    void staleAnchorMapsThroughBothSurfaces() {
+        BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", STALE_ANCHOR_JSON);
+        assertEquals(BeaconState.STALE_ANCHOR, bs.state());
+        assertFalse(bs.bootstrapped());
+        assertEquals(1825L, bs.currentPeriod());
+        assertEquals(1845L, bs.targetPeriod());
+        assertEquals(13L, bs.wsBoundPeriods());
+
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", STALE_ANCHOR_JSON);
+        assertEquals(BeaconState.STALE_ANCHOR, s.beaconState());
+        assertEquals(13L, s.wsBoundPeriods());
+        // Not serveable while parked: no verified head.
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void unknownBeaconStateFromNewerNativeReadsAsStarting() {
+        // A NEWER .so than this wrapper may emit a state this enum doesn't know:
+        // the whole parse must not throw — it degrades to STARTING (fail closed).
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet",
+                "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"SOME_FUTURE_STATE\","
+                + "\"currentPeriod\":5,\"targetPeriod\":6}");
+        assertEquals(BeaconState.STARTING, s.beaconState());
+        assertEquals(5L, s.syncCurrentPeriod());
+    }
+
     /** The pre-targetPeriod shape an older native library emits (no "targetPeriod"
      *  key). Kept as a fixture so the missing-key default path stays covered. */
     private static final String OLD_SHAPE_CATCHING_UP_JSON =

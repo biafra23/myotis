@@ -330,6 +330,15 @@ the app uses to check a peer-claimed EL state root against a beacon-attested one
 
 ```
 Phase 0   discover CL peers (HTTP debug only) — production seeds from discv5 + cache + multiaddrs
+Phase 0b  awaitAnchorFreshness() — the WEAK-SUBJECTIVITY GATE (cold starts only):
+          judge the BEST anchor (embedded checkpoint vs persisted snapshot, whichever
+          period is newer) against the network's ws bound (lightclient/WeakSubjectivity;
+          NetworkConfig.wsBoundPeriods defaults). Older → park in STALE_ANCHOR,
+          fail closed, re-evaluating 1/s until the bound covers it (raised live via
+          setWsBoundPeriods), acceptStaleAnchor() consents (per-run, never persisted),
+          or the client stops. A port MUST gate the resume AND every bootstrap path,
+          including a re-bootstrap after a discarded/poisoned resume — the fallback
+          anchor (the checkpoint) can be older than the one the start-time gate passed.
 Phase 1   tryResumeFromSnapshot()  →  preConnectAndIdentify()  →  bootstrap() if not resumed
 Phase 1b  catchUpSyncCommittee()   +  fill the chain-state-root window from any peer
 Phase 2   steady-state: every secondsPerSlot, pollFinalityUpdate()
@@ -456,5 +465,9 @@ lists. See companion 03 §2 for the algorithm; the security invariant — **`sto
 8. Period rotation: finality across a period boundary rotates current←next; a finality update with
    no held next committee after a boundary fails until a `LightClientUpdate` is fetched.
 9. Snapshot round-trips and is rejected when the gvr doesn't match.
+9b. Weak-subjectivity gate: an anchor `bound+1` periods old parks (STALE_ANCHOR), age ==
+    bound does not, a backwards wall clock reads fresh; the override precedence is
+    host override > network default > fallback; and a re-bootstrap after a poisoned
+    resume re-faces the gate with the (older) checkpoint anchor.
 10. SSZ uses SHA-256/little-endian; the `proof/` MPT uses keccak/big-endian — cross-checked against
     known roots.

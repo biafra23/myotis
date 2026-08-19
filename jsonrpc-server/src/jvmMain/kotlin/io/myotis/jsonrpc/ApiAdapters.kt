@@ -37,6 +37,7 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         io.myotis.api.SyncState.SYNCED -> RpcSyncState.SYNCED
         io.myotis.api.SyncState.CATCHING_UP -> RpcSyncState.CATCHING_UP
         io.myotis.api.SyncState.SYNCING -> RpcSyncState.SYNCING
+        io.myotis.api.SyncState.STALE_ANCHOR -> RpcSyncState.STALE_ANCHOR
     }
     override fun call(from: ByteArray?, to: ByteArray?, data: ByteArray, valueWei: String?, block: String): ByteArray? =
         v.call(from, to, data, valueWei, block)

@@ -672,6 +672,8 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_myotis_engine_checksum_func_accept_stale_anchor(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_available_networks_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
@@ -736,6 +738,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_ws_bound_periods(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_status_json(
@@ -757,6 +761,8 @@ internal object UniffiLib {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "myotis_engine"))
         
     }
+    external fun uniffi_myotis_engine_fn_func_accept_stale_anchor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -820,6 +826,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_ws_bound_periods(`handle`: Long,`periods`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_start_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -948,6 +956,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_myotis_engine_checksum_func_accept_stale_anchor() != 5742) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_myotis_engine_checksum_func_available_networks_json() != 49639) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1042,6 +1053,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() != 6098) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_start_handle() != 14110) {
@@ -1306,6 +1320,21 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         }
     }
 }
+        /**
+         * One-shot consent to sync forward from a stale anchor (this run only) —
+         * releases a STALE_ANCHOR park.
+         */ fun `acceptStaleAnchor`(`handle`: kotlin.Long): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_accept_stale_anchor(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
+}
+    )
+    }
+    
+
         /**
          * The embedded network catalog as a JSON array of NetworkInfo objects
          * (camelCase keys, display order).
@@ -1824,6 +1853,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterBoolean.lower(`on`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+         * network default. Applied live — a STALE_ANCHOR park re-evaluates.
+         */ fun `setWsBoundPeriods`(`handle`: kotlin.Long, `periods`: kotlin.Long): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_ws_bound_periods(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterLong.lower(`periods`),_status)
 }
     )
     }

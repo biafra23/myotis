@@ -30,6 +30,9 @@ import java.util.List;
  * @param finalizedPeriod       period of the finalized slot
  * @param wallClockPeriod       wall-clock period (== syncTargetPeriod; kept for
  *                              diagnostics parity with the daemon's beacon-status)
+ * @param wsBoundPeriods        weak-subjectivity bound (sync-committee periods) the engine
+ *                              enforces for this network — host override if set, else the
+ *                              network default (see {@link BeaconState#STALE_ANCHOR})
  * @param verifiedHeadAgeMs     age of the last verified RPC head context;
  *                              {@code Long.MAX_VALUE} = none built yet
  * @param readyPeerList         per-peer detail for the READY peers, snap-capable first
@@ -82,6 +85,7 @@ public record StatusSnapshot(
         long finalizedPeriod,
         long wallClockPeriod,
         long verifiedHeadAgeMs,
+        long wsBoundPeriods,
         List<PeerInfo> readyPeerList,
         int pauseCount,
         long totalPausedMs,

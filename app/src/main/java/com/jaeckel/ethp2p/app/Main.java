@@ -322,6 +322,18 @@ public final class Main {
                     null);
 
             ChainHandle handle = engine.create(config, ports);
+            // Weak-subjectivity knobs (documented operator properties, mirroring the
+            // strictStateFreshness pattern): a bound override in periods, and a
+            // pre-consent for a knowingly-stale anchor (e.g. re-syncing an archived
+            // data dir on an airgapped box). Both land BEFORE start() so the cold-start
+            // gate judges with them.
+            long wsBound = Long.getLong("myotis.beacon.wsBoundPeriods", 0L);
+            if (wsBound > 0) handle.setWsBoundPeriods(wsBound);
+            if (Boolean.getBoolean("myotis.beacon.acceptStaleAnchor")) {
+                log.warn("[{}] -Dmyotis.beacon.acceptStaleAnchor=true: a stale sync anchor "
+                        + "will be accepted WITHOUT the interactive warning", network);
+                handle.acceptStaleAnchor();
+            }
             if (!handle.start()) {
                 System.err.println("Failed to start " + network + " node stack");
                 engine.shutdownAll();

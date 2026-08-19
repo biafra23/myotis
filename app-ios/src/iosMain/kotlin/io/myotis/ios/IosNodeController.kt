@@ -246,6 +246,9 @@ class IosNodeController(
             locked { startMarks.remove(net) }
             return
         }
+        // Weak-subjectivity bound override lands BEFORE start() so the cold-start
+        // gate judges with it (0 = the network default, applied engine-side).
+        RustEngine.setWsBoundPeriods(handle, settings.wsBoundPeriods().toLong())
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
@@ -341,6 +344,17 @@ class IosNodeController(
     // JNI RustChainHandle no-ops these too, so the iOS host matches it.
     override fun setTargetSnapPeers(target: Int) {}
     override fun setServedBlockWindow(blocks: Int) {}
+
+    override fun setWsBoundPeriods(periods: Int) {
+        locked { handles.values.toList() }.forEach {
+            RustEngine.setWsBoundPeriods(it, periods.toLong())
+        }
+    }
+
+    override fun acceptStaleAnchor(network: String) {
+        val net = canonical(network)
+        locked { handles[net] }?.let { RustEngine.acceptStaleAnchor(it) }
+    }
 
     // blst is compiled into the engine and the Rust engine is the only engine
     // on iOS — both toggles are inert (see IosSettings).
@@ -558,6 +572,7 @@ class IosNodeController(
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
             elHunting = o.engineBoolean("elHunting"),
+            wsBoundPeriods = o.engineLong("wsBoundPeriods", 0L),
         )
     }
 }

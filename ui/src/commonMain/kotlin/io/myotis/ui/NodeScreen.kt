@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -194,6 +195,31 @@ fun NodeScreen(
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
                 // selected chain. Uses the configurable deep-pool threshold from Settings.
                 ReadinessStrip(current, settings.deepPoolThreshold())
+
+                // Stale-anchor consent. The engines park fail-closed (beaconState
+                // STALE_ANCHOR) when a network's sync anchor is older than the
+                // weak-subjectivity bound; this dialog is the "ask the user" half of
+                // that contract. Dismissals are remembered only WHILE the network
+                // stays parked, so a later, separate park asks again.
+                var staleDismissed by remember { mutableStateOf(setOf<String>()) }
+                staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
+                    snapshots[it]?.beaconState == "STALE_ANCHOR"
+                }
+                val staleNet = snapshots.entries.firstOrNull {
+                    it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
+                }?.key
+                val staleSnap = staleNet?.let { snapshots[it] }
+                if (staleNet != null && staleSnap != null) {
+                    StaleAnchorDialog(
+                        network = staleNet,
+                        s = staleSnap,
+                        onAccept = {
+                            controller.acceptStaleAnchor(staleNet)
+                            staleDismissed = staleDismissed + staleNet
+                        },
+                        onDismiss = { staleDismissed = staleDismissed + staleNet },
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
 
                 TabRow(selectedTabIndex = tab) {
@@ -259,6 +285,9 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        s.beaconState == "STALE_ANCHOR" ->
+            Triple(Color(0xFFD32F2F), 3.dp,
+                "Node readiness: sync anchor too old — paused awaiting your consent")
         s.beaconState != "SYNCED" ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
@@ -276,6 +305,48 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             .height(height)
             .background(color)
             .semantics { contentDescription = label },
+    )
+}
+
+/**
+ * The stale-anchor consent dialog — the interactive half of the weak-subjectivity
+ * gate. Shown while a network is parked in STALE_ANCHOR: the engine refuses to
+ * sync from an anchor older than the bound until the user updates the app,
+ * raises the bound (Settings), or accepts the risk here. "Sync anyway" applies
+ * to THIS RUN only; the engine never persists the consent.
+ */
+@Composable
+private fun StaleAnchorDialog(
+    network: String,
+    s: NodeSnapshot,
+    onAccept: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
+    // Rough period length per chain, for a human-scale age (exact math stays in
+    // periods — this is display only): mainnet preset ~27.3 h, Gnosis ~11.4 h.
+    val hoursPerPeriod = if (network == "gnosis") 11.4 else 27.3
+    val ageDays = ((agePeriods * hoursPerPeriod) / 24.0).toInt()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Sync anchor too old — ${network.replaceFirstChar { it.uppercase() }}") },
+        text = {
+            Text(
+                "The newest trust anchor this node has (its built-in checkpoint or last " +
+                    "verified sync state) is $agePeriods sync-committee periods old" +
+                    (if (ageDays > 0) " (~$ageDays days)" else "") +
+                    ", past the weak-subjectivity bound of ${s.wsBoundPeriods} periods.\n\n" +
+                    "Beyond this window, validators who have since exited could sign a fake " +
+                    "chain continuation (a long-range attack), and signature verification " +
+                    "alone cannot tell it from the real chain. Syncing is paused, and " +
+                    "verified reads stay unavailable, until you decide.\n\n" +
+                    "Safest: update the app (a fresh build carries a fresh checkpoint). " +
+                    "Alternatively raise the bound in Settings, or sync anyway if you " +
+                    "trust your network and peers — for this run only.",
+            )
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Sync anyway (accept risk)") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Stay paused") } },
     )
 }
 
@@ -328,6 +399,7 @@ private fun SettingsTab(
     }
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
     var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
+    var wsBound by remember { mutableStateOf(settings.wsBoundPeriods().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
@@ -399,6 +471,22 @@ private fun SettingsTab(
             value = deepPool,
             onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
             label = { Text("Readiness \"deep pool\" threshold (default 16)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = wsBound,
+            onValueChange = { wsBound = it.filter(Char::isDigit).take(4) },
+            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
+            supportingText = {
+                Text(
+                    "How old the sync anchor may be before the node refuses to sync and " +
+                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
+                        "it weakens the long-range-attack protection — leave 0 unless you " +
+                        "know why.",
+                )
+            },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
@@ -544,9 +632,13 @@ private fun SettingsTab(
                 val snap = snapTarget.toIntOrNull() ?: 32
                 val window = servedWindow.toIntOrNull() ?: 32
                 val deep = deepPool.toIntOrNull() ?: 16
+                // Blank/invalid keeps the CURRENT value (0 would silently restore the
+                // default bound — a security knob must not change on a stray edit).
+                val ws = wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
                 settings.setSnapTarget(snap)          // persist
                 settings.setServedBlockWindow(window) // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                settings.setWsBoundPeriods(ws)        // persist
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
                 // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
@@ -555,6 +647,7 @@ private fun SettingsTab(
                 }
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 controller.setServedBlockWindow(window) // live-apply to running stacks
+                controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,
@@ -691,6 +784,20 @@ private fun HuntBanner(s: NodeSnapshot) {
 @Composable
 private fun SyncProgressBar(s: NodeSnapshot) {
     if (!s.running || s.beaconState == "SYNCED" || s.beaconState == "STOPPED") return
+    if (s.beaconState == "STALE_ANCHOR") {
+        // Parked, not progressing: a progress bar would promise motion. The strip,
+        // the Beacon status row, and the consent dialog carry this state.
+        Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+            Text(
+                "Sync paused — trust anchor older than the weak-subjectivity bound " +
+                    "(${(s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)} periods; " +
+                    "bound ${s.wsBoundPeriods}). Waiting for your decision.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        return
+    }
     val start = s.syncStartPeriod
     val current = s.syncCurrentPeriod
     val target = s.syncTargetPeriod

@@ -13,7 +13,11 @@ import kotlinx.serialization.json.JsonObject
  */
 /** `io.myotis.api.SyncState`'s pure-Kotlin mirror (same three values, same
  *  meaning); the jvmMain adapter maps 1:1. */
-enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED }
+/** `io.myotis.api.SyncState`'s pure-Kotlin mirror. `STALE_ANCHOR`: syncing is
+ *  refused because the trust anchor is past the weak-subjectivity bound and the
+ *  user hasn't consented — like SYNCING it gates every verified read closed, but
+ *  unlike SYNCING it will not progress on its own. */
+enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
 
 /**
  * `io.myotis.api.CallResult`'s pure-Kotlin mirror: the three-way outcome of a

@@ -98,6 +98,10 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override public void setServedBlockWindow(int blocks) { stack.setServedBlockWindow(blocks); }
 
+    @Override public void setWsBoundPeriods(long periods) { stack.setWsBoundPeriods(periods); }
+
+    @Override public void acceptStaleAnchor() { stack.acceptStaleAnchor(); }
+
     @Override
     public void clearPeerState() {
         stack.backoff().clear();
@@ -158,11 +162,17 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 bss != null ? bss.getFinalizedSlot() : 0L,
                 bss != null ? bss.getFinalizedExecution().blockNumber() : 0L,
                 bss != null ? bss.getCatchUpStartPeriod() : -1L,
-                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                // While parked in STALE_ANCHOR the store holds no committee yet, so
+                // "current" is the refused anchor's period — target minus current is
+                // the anchor age the bound was compared against.
+                beaconState == BeaconState.STALE_ANCHOR
+                        ? bss.getStaleAnchorPeriod()
+                        : bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
                 wallClockPeriod,
                 bss != null ? bss.getFinalizedPeriod() : 0L,
                 wallClockPeriod,
                 backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE,
+                bss != null ? bss.getWsBoundPeriods() : 0L,
                 readyRows,
                 stack.pauseCount(),
                 stack.totalPausedMs(),
@@ -236,7 +246,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         return new io.myotis.api.BeaconStatus(
                 state,
                 blc != null && blc.isBootstrapped(),
-                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                // Parked in STALE_ANCHOR: report the refused anchor's period (see
+                // BeaconStatus.wsBoundPeriods javadoc).
+                state == io.myotis.api.BeaconState.STALE_ANCHOR
+                        ? bss.getStaleAnchorPeriod()
+                        : bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
                 BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
                 stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
                 peers.size(),
@@ -250,6 +264,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 bss != null ? bss.getExecutionBlockNumber() : 0L,
                 bss != null ? bss.getKnownStateRootCount() : 0,
                 BeaconSyncState.FILL_THRESHOLD,
+                bss != null ? bss.getWsBoundPeriods() : 0L,
                 peers);
     }
 

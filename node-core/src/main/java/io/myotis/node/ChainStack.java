@@ -243,6 +243,26 @@ public final class ChainStack {
         if (conn != null) conn.servedWindow().setMaxWindow(clamped);
     }
 
+    /** Host override for the weak-subjectivity anchor-age bound (periods); 0 = the
+     *  network default. Stashed for the next beacon (re)build and applied live —
+     *  a stack parked in STALE_ANCHOR re-evaluates against the new bound. */
+    private volatile long wsBoundOverridePeriods = 0L;
+
+    /** Live-update the weak-subjectivity bound override (0 restores the default). */
+    public void setWsBoundPeriods(long periods) {
+        long sane = Math.max(0L, periods);
+        this.wsBoundOverridePeriods = sane;
+        BeaconLightClient blc = beaconLightClient;
+        if (blc != null) blc.setWsBoundPeriods(sane);
+    }
+
+    /** One-shot consent to sync from a stale anchor: releases a STALE_ANCHOR park
+     *  for the rest of this run. No-op when the beacon client isn't up or parked. */
+    public void acceptStaleAnchor() {
+        BeaconLightClient blc = beaconLightClient;
+        if (blc != null) blc.acceptStaleAnchor();
+    }
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -954,6 +974,10 @@ public final class ChainStack {
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
         blc.setGossipsubEnabled(gossipsubEnabled);
+        // Weak-subjectivity anchor-age bound: network default + any host override
+        // (must land before start() so the cold-start gate judges with them).
+        blc.setWsBoundDefaultPeriods(network.wsBoundPeriods());
+        if (wsBoundOverridePeriods > 0) blc.setWsBoundPeriods(wsBoundOverridePeriods);
         // LC hunt: when the light client is starved of servers it flips this
         // and the CL discv5 service runs extra lookup rounds per tick. Read
         // the field at call time — discv5 (re)starts independently of the

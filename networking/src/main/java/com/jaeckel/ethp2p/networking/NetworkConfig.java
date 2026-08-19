@@ -631,6 +631,37 @@ public record NetworkConfig(
         return networkId == 100 ? 16 : 32;
     }
 
+    /**
+     * Default weak-subjectivity bound, in sync-committee periods: how old the sync
+     * anchor (embedded checkpoint or persisted snapshot, whichever is newer) may be
+     * before the light client refuses to sync forward from it and parks in
+     * {@code STALE_ANCHOR} awaiting explicit user consent. Overridable per host via
+     * {@code ChainHandle.setWsBoundPeriods}; enforced by both engines (the Rust
+     * mirror lives in {@code rust/myotis-net}'s {@code ChainConfig} constructors —
+     * keep them in lockstep).
+     *
+     * <ul>
+     *   <li><b>mainnet: 13</b> (~14.7 days). The consensus-spec formula
+     *       ({@code SAFETY_DECAY=10}) plateaus at 3532 epochs ≈ 15.7 days for any
+     *       validator count ≥ 262 144; Electra's 256-ETH exit-churn cap only
+     *       lengthens it, so 3532/256 = 13.8 → 13 is the conservative floor.</li>
+     *   <li><b>sepolia: 13.</b> The spec formula with Sepolia's tiny validator set
+     *       gives barely over one period, but its validator set is permissioned
+     *       (EF-operated, deposit-gated), so outsiders cannot mount a long-range
+     *       attack at all; the mainnet-preset bound is kept as hygiene.</li>
+     *   <li><b>gnosis: 3</b> (~34 h). Gnosis has 80-second epochs and a
+     *       CHURN_LIMIT_QUOTIENT of 4096, which collapses the spec formula to well
+     *       under one 512-epoch period in the worst case; 3 periods is a pragmatic
+     *       floor above the committee-rotation cadence so routine restarts stay
+     *       quiet while multi-day-old anchors still require consent. Deliberately
+     *       conservative — raise it via the Settings override if it gets in the
+     *       way, knowingly.</li>
+     * </ul>
+     */
+    public long wsBoundPeriods() {
+        return networkId == 100 ? 3L : 13L;
+    }
+
     // -------------------------------------------------------------------------
     // Per-network default ports. Pinned per network (not index-allocated) so a
     // wallet pointed at a given RPC port always reaches the same chain regardless

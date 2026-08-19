@@ -326,6 +326,106 @@ public class BeaconLightClient implements AutoCloseable {
         this.snapshotFile = file;
     }
 
+    // ---- Weak-subjectivity age bound (see lightclient/WeakSubjectivity) ----
+    // The anchor a cold sync starts from (embedded checkpoint or persisted snapshot,
+    // whichever is newer) must be younger than the bound; otherwise the sync loop
+    // parks in STALE_ANCHOR until the bound is raised or the user accepts the risk.
+
+    /** Per-network default bound (periods); 0 → WeakSubjectivity.DEFAULT_BOUND_PERIODS. */
+    private volatile long wsBoundDefaultPeriods = 0L;
+    /** Host/user override (periods); 0 → use the default. Live: a parked loop re-reads it. */
+    private volatile long wsBoundOverridePeriods = 0L;
+    /** One-shot consent to sync from a stale anchor; per-run, never persisted. */
+    private volatile boolean staleAnchorAccepted = false;
+
+    /** The network's default weak-subjectivity bound. Set before {@link #start()}. */
+    public void setWsBoundDefaultPeriods(long periods) {
+        this.wsBoundDefaultPeriods = Math.max(0L, periods);
+    }
+
+    /** Host override for the weak-subjectivity bound; 0 restores the default.
+     *  Applied live — a stack parked in STALE_ANCHOR re-evaluates within a second. */
+    public void setWsBoundPeriods(long periods) {
+        this.wsBoundOverridePeriods = Math.max(0L, periods);
+        syncState.setWsBoundPeriods(effectiveWsBound());
+    }
+
+    /** User consent to sync forward from a stale anchor (this run only). */
+    public void acceptStaleAnchor() {
+        this.staleAnchorAccepted = true;
+    }
+
+    private long effectiveWsBound() {
+        return com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
+                .effectiveBound(wsBoundOverridePeriods, wsBoundDefaultPeriods);
+    }
+
+    /** Period of the persisted snapshot if present/valid for this chain, else -1.
+     *  Read-only peek — does NOT restore (tryResumeFromSnapshot does that later,
+     *  and stays the single place the strictly-newer resume rule lives). */
+    private long peekSnapshotPeriod() {
+        java.nio.file.Path file = snapshotFile;
+        if (file == null) return -1L;
+        try {
+            if (!java.nio.file.Files.exists(file)) return -1L;
+            byte[] data = java.nio.file.Files.readAllBytes(file);
+            LightClientStore.Snapshot snap =
+                    LightClientStoreSnapshot.deserialize(data, genesisValidatorsRoot);
+            return snap != null ? snap.currentSyncCommitteePeriod() : -1L;
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * The weak-subjectivity gate, run once per cold sync start (store not yet
+     * initialized). Judges the BEST anchor available — the embedded checkpoint or
+     * the persisted snapshot, whichever period is newer (the resume rule later
+     * picks the same winner: a snapshot at or below the checkpoint period is
+     * never resumed). If that anchor is older than the bound, park in
+     * STALE_ANCHOR and re-evaluate every second until the bound covers it (the
+     * user raised it), the user accepts the risk, or the client is stopped.
+     * Fail-closed while parked: no bootstrap, no verification, queries refuse.
+     */
+    private void awaitAnchorFreshness() {
+        long checkpointPeriod = BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot);
+        long anchorPeriod = Math.max(checkpointPeriod, peekSnapshotPeriod());
+        syncState.setWsBoundPeriods(effectiveWsBound());
+        boolean parked = false;
+        while (running) {
+            long bound = effectiveWsBound();
+            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
+            if (staleAnchorAccepted
+                    || !com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
+                            .isStale(anchorPeriod, wallPeriod, bound)) {
+                break;
+            }
+            if (!parked) {
+                parked = true;
+                log.warn("[beacon] STALE ANCHOR: best trust anchor is period {} but wall clock is "
+                                + "period {} — {} periods old, past the weak-subjectivity bound of {}. "
+                                + "Refusing to sync: a forged chain signed by since-exited committee "
+                                + "members would be indistinguishable. Update the app / refresh the "
+                                + "checkpoint, raise the bound, or accept the risk explicitly.",
+                        anchorPeriod, wallPeriod, wallPeriod - anchorPeriod, bound);
+                syncState.markStaleAnchor(anchorPeriod);
+                syncState.setWsBoundPeriods(bound);
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (parked && running) {
+            log.warn("[beacon] Stale anchor released ({}) — syncing forward from period {}",
+                    staleAnchorAccepted ? "user accepted the risk" : "bound now covers the anchor",
+                    anchorPeriod);
+        }
+        syncState.clearStaleAnchor();
+    }
+
     /**
      * Restore the store from a persisted snapshot if one exists, is for this chain,
      * and is newer than the embedded checkpoint. Returns true if we resumed (and a
@@ -796,6 +896,18 @@ public class BeaconLightClient implements AutoCloseable {
         // An already-initialized store means this loop is re-entered by resume()
         // after a pause: the live in-memory state is strictly newer than (or equal
         // to) the snapshot pause() just wrote — restoring over it would go backward.
+        //
+        // Weak-subjectivity gate first, cold starts only: judge the best available
+        // anchor's age BEFORE resuming or bootstrapping from it, and park in
+        // STALE_ANCHOR (fail closed) when it's past the bound. A store re-entered
+        // by resume() was already vetted at its own cold start and has only moved
+        // forward under BLS verification since.
+        if (!store.isInitialized()) {
+            awaitAnchorFreshness();
+            if (!running) return;
+        } else {
+            syncState.setWsBoundPeriods(effectiveWsBound());
+        }
         boolean resumed = store.isInitialized() || tryResumeFromSnapshot();
 
         // Pre-connect to peers and query Identify to learn protocol support.

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 24; // 24: + importLogIndexFiles (portable snapshot import)
+    static final int EXPECTED_ABI_VERSION = 25; // 25: + setWsBoundPeriods/acceptStaleAnchor (weak-subjectivity gate)
 
     private static final boolean AVAILABLE = load();
 
@@ -209,6 +209,24 @@ final class RustEngineNative {
      */
     static boolean nativeSetServedBlockWindow(long handle, int blocks) {
         return Myotis_engineKt.setServedBlockWindow(handle, blocks);
+    }
+
+    /**
+     * Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+     * network default. Applied live — a handle parked in STALE_ANCHOR
+     * re-evaluates within a second. False only for an unknown handle.
+     */
+    static boolean nativeSetWsBoundPeriods(long handle, long periods) {
+        return Myotis_engineKt.setWsBoundPeriods(handle, periods);
+    }
+
+    /**
+     * One-shot consent to sync forward from a stale anchor — releases a
+     * STALE_ANCHOR park for the rest of this run; never persisted. False only
+     * for an unknown handle.
+     */
+    static boolean nativeAcceptStaleAnchor(long handle) {
+        return Myotis_engineKt.acceptStaleAnchor(handle);
     }
 
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */

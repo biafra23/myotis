@@ -80,6 +80,7 @@ public class CommandHandler {
                 case "resume"                  -> handleResume();
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
+                case "accept-stale-anchor"     -> handleAcceptStaleAnchor();
                 case "import-logindex"         -> handleImportLogIndex(jsonLine);
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
@@ -197,6 +198,30 @@ public class CommandHandler {
         return sb.toString();
     }
 
+    /**
+     * One-shot consent to sync forward from an anchor older than the
+     * weak-subjectivity bound. Applied ONLY while the client is actually parked in
+     * {@code STALE_ANCHOR}: arming the (run-sticky) consent while not parked would
+     * silently pre-approve a later, possibly older anchor — the property
+     * {@code -Dmyotis.beacon.acceptStaleAnchor} exists for deliberate pre-consent.
+     */
+    private String handleAcceptStaleAnchor() {
+        BeaconStatus bs = handle.beaconStatus();
+        if (bs.state() != BeaconState.STALE_ANCHOR) {
+            return "{\"ok\":true,\"applied\":false"
+                    + ",\"note\":\"not parked on a stale anchor (state "
+                    + bs.state().name() + ") — nothing to accept\"}";
+        }
+        handle.acceptStaleAnchor();
+        return "{\"ok\":true,\"applied\":true"
+                + ",\"anchorPeriod\":" + bs.currentPeriod()
+                + ",\"anchorAgePeriods\":" + (bs.targetPeriod() - bs.currentPeriod())
+                + ",\"wsBoundPeriods\":" + bs.wsBoundPeriods()
+                + ",\"note\":\"syncing forward from the stale anchor for THIS RUN — the"
+                + " long-range-attack guarantee is weakened until the store catches up"
+                + " under BLS verification\"}";
+    }
+
     private String handleBeaconStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         BeaconStatus bs = handle.beaconStatus();
@@ -208,6 +233,21 @@ public class CommandHandler {
         String peersJson = buildBeaconPeersJson(bs.peers());
         String periodProgress = "\"currentPeriod\":" + bs.currentPeriod()
                 + ",\"targetPeriod\":" + bs.targetPeriod();
+        if (bs.state() == BeaconState.STALE_ANCHOR) {
+            long age = bs.targetPeriod() - bs.currentPeriod();
+            return "{\"ok\":true,\"state\":\"STALE_ANCHOR\","
+                    + periodProgress + ","
+                    + "\"anchorPeriod\":" + bs.currentPeriod()
+                    + ",\"anchorAgePeriods\":" + age
+                    + ",\"wsBoundPeriods\":" + bs.wsBoundPeriods()
+                    + ",\"warning\":\"trust anchor is " + age + " sync-committee periods old,"
+                    + " past the weak-subjectivity bound of " + bs.wsBoundPeriods() + ";"
+                    + " syncing refused. Refresh the checkpoint / update the binary, raise the"
+                    + " bound (-Dmyotis.beacon.wsBoundPeriods=N), or send accept-stale-anchor"
+                    + " to sync anyway at your own risk\","
+                    + peerStats
+                    + ",\"peers\":" + peersJson + "}";
+        }
         if (bs.state() == BeaconState.SYNCING || bs.state() == BeaconState.STARTING) {
             return "{\"ok\":true,\"state\":\"SYNCING\","
                     + periodProgress + ","
@@ -231,6 +271,7 @@ public class CommandHandler {
                 + ",\"executionBlockNumber\":" + bs.executionBlockNumber()
                 + ",\"knownStateRoots\":" + bs.knownStateRoots()
                 + ",\"fillThreshold\":" + bs.fillThreshold()
+                + ",\"wsBoundPeriods\":" + bs.wsBoundPeriods()
                 + ",\"peers\":" + peersJson + "}";
     }
 

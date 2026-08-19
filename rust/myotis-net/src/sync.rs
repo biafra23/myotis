@@ -11,7 +11,7 @@
 //! `myotis-consensus` clock-free.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,29 @@ use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
 // -------------------------------------------------------------------------
 // Chain configuration
 // -------------------------------------------------------------------------
+
+/// Live weak-subjectivity knobs, shared between the host FFI and the running
+/// sync loop: `ChainConfig` is deep-cloned into the loop at start, but this
+/// sits behind an `Arc`, so a host-side write reaches a loop already parked in
+/// `StaleAnchor` (the park re-reads both every second). Mirrors the Java
+/// engine's `BeaconLightClient` volatiles.
+/// Whether an anchor is past the weak-subjectivity bound. Saturating: a wall
+/// clock BEHIND the anchor (skew) reads as fresh — a backwards clock can only
+/// make the check more permissive, and the device clock is outside this
+/// threat model.
+pub fn ws_anchor_stale(anchor_period: u64, wall_clock_period: u64, bound_periods: u64) -> bool {
+    wall_clock_period.saturating_sub(anchor_period) > bound_periods
+}
+
+#[derive(Debug, Default)]
+pub struct WsPolicy {
+    /// Host override for the anchor-age bound (periods); 0 = use the network
+    /// default (`ChainConfig::ws_bound_periods`).
+    pub bound_override_periods: AtomicU64,
+    /// One-shot consent to sync forward from a stale anchor. Per-run: never
+    /// persisted, so a restart with a still-stale anchor parks again.
+    pub accept_stale_anchor: AtomicBool,
+}
 
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
@@ -76,6 +99,16 @@ pub struct ChainConfig {
     /// CL peer cache path (`cl-peers[-net].cache`) — same file/format as the
     /// Java hosts' caches. None = no persistence.
     pub cl_peer_cache_path: Option<std::path::PathBuf>,
+    /// Default weak-subjectivity bound (sync-committee periods): how old the
+    /// sync anchor (embedded checkpoint or persisted snapshot, whichever is
+    /// newer) may be before the sync loop refuses it and parks in
+    /// `SyncState::StaleAnchor` awaiting explicit consent. Keep in lockstep
+    /// with the Java `NetworkConfig.wsBoundPeriods()` (the derivations are
+    /// documented there).
+    pub ws_bound_periods: u64,
+    /// Live host overrides for the bound + the stale-anchor consent (see
+    /// [`WsPolicy`]). Shared across config clones.
+    pub ws_policy: Arc<WsPolicy>,
 }
 
 impl ChainConfig {
@@ -177,6 +210,8 @@ impl ChainConfig {
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
+            ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
+            ws_policy: Arc::new(WsPolicy::default()),
         }
         .with_env_overrides()
     }
@@ -224,6 +259,8 @@ impl ChainConfig {
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
+            ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
+            ws_policy: Arc::new(WsPolicy::default()),
         }
         .with_env_overrides()
     }
@@ -275,6 +312,8 @@ impl ChainConfig {
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
+            ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
+            ws_policy: Arc::new(WsPolicy::default()),
         }
         .with_env_overrides()
     }
@@ -326,6 +365,17 @@ impl ChainConfig {
             self.current_slot_estimate(),
             self.slots_per_period(),
         )
+    }
+
+    /// The weak-subjectivity bound actually enforced: the live host override
+    /// when set (> 0), else this network's default.
+    pub fn effective_ws_bound_periods(&self) -> u64 {
+        let overridden = self.ws_policy.bound_override_periods.load(Ordering::Relaxed);
+        if overridden > 0 {
+            overridden
+        } else {
+            self.ws_bound_periods
+        }
     }
 
     /// Wall-clock slot estimate — THE clock read of this crate.
@@ -579,6 +629,12 @@ pub enum SyncState {
     Bootstrapping,
     CatchingUp,
     Synced,
+    /// Syncing is REFUSED: the best available trust anchor (embedded checkpoint
+    /// or persisted snapshot, whichever is newer) is older than the
+    /// weak-subjectivity bound, so a forged continuation signed by since-exited
+    /// committee members would verify. Parked awaiting a raised bound or
+    /// explicit consent (`WsPolicy`); fail-closed meanwhile.
+    StaleAnchor,
 }
 
 impl std::fmt::Display for SyncState {
@@ -588,6 +644,7 @@ impl std::fmt::Display for SyncState {
             Self::Bootstrapping => "BOOTSTRAPPING",
             Self::CatchingUp => "CATCHING_UP",
             Self::Synced => "SYNCED",
+            Self::StaleAnchor => "STALE_ANCHOR",
         };
         write!(f, "{s}")
     }
@@ -615,6 +672,11 @@ pub struct SyncStatus {
     pub sync_start_period: i64,
     /// LC hunt engaged (starved of light-client servers — see hunt_due).
     pub hunting: bool,
+    /// The weak-subjectivity bound (periods) currently enforced — host override
+    /// if set, else the network default. While `state == StaleAnchor`, `period`
+    /// is the refused anchor's period, so the wall-clock target minus `period`
+    /// is the anchor age the bound was compared against.
+    pub ws_bound_periods: u64,
 }
 
 impl SyncStatus {
@@ -632,6 +694,7 @@ impl SyncStatus {
             discv5_table_size: 0,
             sync_start_period: -1,
             hunting: false,
+            ws_bound_periods: 0,
         }
     }
 }
@@ -1318,29 +1381,82 @@ async fn run_sync(
     // checkpoint are worth writing.
     let mut last_persisted_period = checkpoint_period;
     let mut resume = ResumeGuard::fresh();
+    // Deserialize the snapshot ONCE, up front: the weak-subjectivity gate below
+    // must judge the BEST available anchor (embedded checkpoint vs persisted
+    // snapshot) BEFORE anything is restored from it, and the strictly-newer
+    // resume rule further down reuses the same parse.
+    let mut persisted_snap = None;
     if let Some(path) = &config.snapshot_path {
         if let Ok(bytes) = std::fs::read(path) {
-            match myotis_consensus::snapshot::deserialize(&bytes, &config.genesis_validators_root) {
-                Some(snap) if snap.current_sync_committee_period > checkpoint_period => {
-                    last_persisted_period = snap.current_sync_committee_period;
-                    tracing::info!(period = snap.current_sync_committee_period,
-                        finalized_slot = snap.finalized_slot,
-                        "resumed from persisted snapshot — skipping bootstrap");
-                    processor.store.restore(snap);
-                    resume = ResumeGuard::resumed();
-                    // Publish the restored state IMMEDIATELY: without this the
-                    // status watch holds SyncStatus::initial() (period 0 — 
-                    // indistinguishable from a fresh bootstrap) until the first
-                    // catch-up apply, hiding the resume from the UI and from
-                    // on-device forensics.
-                    refresh_local_status(&config, &processor, &local_status);
-                    publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
-                }
-                Some(_) => tracing::info!(
-                    "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh"),
-                None => tracing::warn!(
-                    "persisted snapshot unreadable/foreign — bootstrapping fresh"),
+            persisted_snap =
+                myotis_consensus::snapshot::deserialize(&bytes, &config.genesis_validators_root);
+            if persisted_snap.is_none() {
+                tracing::warn!("persisted snapshot unreadable/foreign — bootstrapping fresh");
             }
+        }
+    }
+
+    // Weak-subjectivity gate (mirrors the Java BeaconLightClient.awaitAnchorFreshness).
+    // The forward walk is only as trustworthy as the anchor it starts from: past the
+    // bound, a forged continuation signed by since-exited committee members would
+    // BLS-verify. So judge the best anchor's age and, when it's past the bound, park
+    // in StaleAnchor — fail closed, publishing status once per second — until the
+    // bound covers it (host raised it live), consent arrives
+    // (WsPolicy::accept_stale_anchor), or the task is aborted (stop/pause).
+    {
+        let snap_period = persisted_snap
+            .as_ref()
+            .map(|s| s.current_sync_committee_period)
+            .unwrap_or(0);
+        let anchor_period = checkpoint_period.max(snap_period);
+        let mut parked = false;
+        loop {
+            let bound = config.effective_ws_bound_periods();
+            let wall_period = config.wall_clock_period();
+            let stale = ws_anchor_stale(anchor_period, wall_period, bound);
+            if !stale || config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed) {
+                break;
+            }
+            if !parked {
+                parked = true;
+                tracing::warn!(anchor_period, wall_period, bound,
+                    age = wall_period - anchor_period,
+                    "STALE ANCHOR: best trust anchor is past the weak-subjectivity bound — \
+                     refusing to sync (a forged chain signed by since-exited committee members \
+                     would be indistinguishable) until the bound is raised or the risk is \
+                     explicitly accepted");
+            }
+            let mut status = SyncStatus::initial();
+            status.state = SyncState::StaleAnchor;
+            status.period = anchor_period;
+            status.ws_bound_periods = bound;
+            let _ = status_tx.send(status);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if parked {
+            tracing::warn!(anchor_period,
+                "stale anchor released (bound raised or risk accepted) — syncing forward");
+        }
+    }
+
+    if let Some(snap) = persisted_snap {
+        if snap.current_sync_committee_period > checkpoint_period {
+            last_persisted_period = snap.current_sync_committee_period;
+            tracing::info!(period = snap.current_sync_committee_period,
+                finalized_slot = snap.finalized_slot,
+                "resumed from persisted snapshot — skipping bootstrap");
+            processor.store.restore(snap);
+            resume = ResumeGuard::resumed();
+            // Publish the restored state IMMEDIATELY: without this the
+            // status watch holds SyncStatus::initial() (period 0 —
+            // indistinguishable from a fresh bootstrap) until the first
+            // catch-up apply, hiding the resume from the UI and from
+            // on-device forensics.
+            refresh_local_status(&config, &processor, &local_status);
+            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
+        } else {
+            tracing::info!(
+                "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh");
         }
     }
 
@@ -1410,6 +1526,24 @@ async fn run_sync(
         }
 
         if !processor.store.is_initialized() {
+            // Weak-subjectivity re-check for THIS bootstrap's anchor, the embedded
+            // checkpoint. Reachable when a vetted-but-poisoned snapshot resume was
+            // discarded mid-run: the checkpoint can be older than the anchor the
+            // start-time gate approved, so falling back to it silently would dodge
+            // the gate. Same fail-closed park, released by the same knobs.
+            let ws_bound = config.effective_ws_bound_periods();
+            let wall_period = config.wall_clock_period();
+            if ws_anchor_stale(checkpoint_period, wall_period, ws_bound)
+                && !config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed)
+            {
+                let mut status = SyncStatus::initial();
+                status.state = SyncState::StaleAnchor;
+                status.period = checkpoint_period;
+                status.ws_bound_periods = ws_bound;
+                let _ = status_tx.send(status);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
             // Hunting widens the bootstrap fan-out and prefers hunt-confirmed
             // LC servers (a peer that answered ANY light-client request is the
             // best bootstrap bet in a starved pool).
@@ -2619,6 +2753,7 @@ async fn publish_status(
             .load(std::sync::atomic::Ordering::Relaxed),
         sync_start_period: pool.sync_start_period,
         hunting,
+        ws_bound_periods: config.effective_ws_bound_periods(),
     };
     let _ = status_tx.send(status);
 }
@@ -2648,6 +2783,32 @@ mod tests {
             },
             execution_branch: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ws_gate_staleness_and_bound_precedence() {
+        // Fresh: age == bound is NOT stale (the bound is inclusive headroom).
+        assert!(!ws_anchor_stale(1800, 1813, 13));
+        // Stale: one period past the bound.
+        assert!(ws_anchor_stale(1800, 1814, 13));
+        // Clock skew (wall behind anchor) reads as fresh, never underflows.
+        assert!(!ws_anchor_stale(1800, 1700, 13));
+
+        // Effective bound: network default until the host override is set (> 0),
+        // then the override wins; 0 restores the default. Judged through the
+        // SHARED WsPolicy so a clone of the config sees the same live values.
+        let config = ChainConfig::mainnet();
+        assert_eq!(config.effective_ws_bound_periods(), 13);
+        let clone = config.clone();
+        config.ws_policy.bound_override_periods.store(40, Ordering::Relaxed);
+        assert_eq!(config.effective_ws_bound_periods(), 40);
+        assert_eq!(clone.effective_ws_bound_periods(), 40, "clones share the policy");
+        config.ws_policy.bound_override_periods.store(0, Ordering::Relaxed);
+        assert_eq!(config.effective_ws_bound_periods(), 13);
+
+        // Per-network defaults stay in lockstep with NetworkConfig.wsBoundPeriods().
+        assert_eq!(ChainConfig::sepolia().effective_ws_bound_periods(), 13);
+        assert_eq!(ChainConfig::gnosis().effective_ws_bound_periods(), 3);
     }
 
     #[test]

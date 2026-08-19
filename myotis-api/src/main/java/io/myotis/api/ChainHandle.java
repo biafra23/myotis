@@ -83,6 +83,25 @@ public interface ChainHandle {
     void setServedBlockWindow(int blocks);
 
     /**
+     * Override the weak-subjectivity bound (in sync-committee periods) used to judge
+     * whether the sync anchor — embedded checkpoint or persisted snapshot, whichever
+     * is newer — is too old to be trusted. {@code 0} restores the network's built-in
+     * default. Applied live: a stack parked in {@link BeaconState#STALE_ANCHOR}
+     * re-evaluates and resumes syncing if the raised bound now covers the anchor's
+     * age. Larger values weaken the long-range-attack guarantee — this is an
+     * explicit operator knob, not a tuning parameter.
+     */
+    void setWsBoundPeriods(long periods);
+
+    /**
+     * One-shot consent to sync forward from an anchor older than the
+     * weak-subjectivity bound. Releases a stack parked in
+     * {@link BeaconState#STALE_ANCHOR} for the rest of this run; not persisted —
+     * a restart with a still-stale anchor parks again. No-op when not parked.
+     */
+    void acceptStaleAnchor();
+
+    /**
      * Clear the live dial bookkeeping — backoff entries and this session's
      * blacklist — so discovery re-dials from a fresh slate. On-disk peer-cache
      * FILES are host-owned; deleting those is the host's job.
