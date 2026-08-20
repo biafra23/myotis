@@ -35,11 +35,6 @@ use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
 // Chain configuration
 // -------------------------------------------------------------------------
 
-/// Live weak-subjectivity knobs, shared between the host FFI and the running
-/// sync loop: `ChainConfig` is deep-cloned into the loop at start, but this
-/// sits behind an `Arc`, so a host-side write reaches a loop already parked in
-/// `StaleAnchor` (the park re-reads both every second). Mirrors the Java
-/// engine's `BeaconLightClient` volatiles.
 /// Whether an anchor is past the weak-subjectivity bound. Saturating: a wall
 /// clock BEHIND the anchor (skew) reads as fresh — a backwards clock can only
 /// make the check more permissive, and the device clock is outside this
@@ -48,6 +43,11 @@ pub fn ws_anchor_stale(anchor_period: u64, wall_clock_period: u64, bound_periods
     wall_clock_period.saturating_sub(anchor_period) > bound_periods
 }
 
+/// Live weak-subjectivity knobs, shared between the host FFI and the running
+/// sync loop: `ChainConfig` is deep-cloned into the loop at start, but this
+/// sits behind an `Arc`, so a host-side write reaches a loop already parked in
+/// `StaleAnchor` (the park re-reads both every second). Mirrors the Java
+/// engine's `BeaconLightClient` volatiles.
 #[derive(Debug, Default)]
 pub struct WsPolicy {
     /// Host override for the anchor-age bound (periods); 0 = use the network
@@ -1436,6 +1436,11 @@ async fn run_sync(
         if parked {
             tracing::warn!(anchor_period,
                 "stale anchor released (bound raised or risk accepted) — syncing forward");
+            // Replace the lingering StaleAnchor on the status watch IMMEDIATELY:
+            // bootstrap can take a while (or keep failing peer-starved), and until
+            // the next publish the UI would keep saying "awaiting your consent"
+            // about a consent that was just given.
+            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
         }
     }
 
@@ -1567,6 +1572,12 @@ async fn run_sync(
                         .await;
                     clcache.flush();
                 }
+                // Publish on FAILED rounds too: this is what replaces a lingering
+                // StaleAnchor after the in-loop guard is released (consent given /
+                // bound raised) — without it the watch keeps the park on display
+                // until the first SUCCESSFUL bootstrap, however long that takes —
+                // and it keeps peer/discovery counts moving during long stalls.
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }

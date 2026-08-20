@@ -11,12 +11,11 @@ import kotlinx.serialization.json.JsonObject
  * string, the literal `"null"` (verified not-found, a valid result), or `null`.
  * Wei values cross as decimal strings (the FFI-neutral form).
  */
-/** `io.myotis.api.SyncState`'s pure-Kotlin mirror (same three values, same
- *  meaning); the jvmMain adapter maps 1:1. */
-/** `io.myotis.api.SyncState`'s pure-Kotlin mirror. `STALE_ANCHOR`: syncing is
- *  refused because the trust anchor is past the weak-subjectivity bound and the
- *  user hasn't consented — like SYNCING it gates every verified read closed, but
- *  unlike SYNCING it will not progress on its own. */
+/** `io.myotis.api.SyncState`'s pure-Kotlin mirror; the jvmMain adapter maps 1:1.
+ *  `STALE_ANCHOR`: syncing is refused because the trust anchor is past the
+ *  weak-subjectivity bound and the user hasn't consented — like SYNCING it gates
+ *  every verified read closed, but unlike SYNCING it will not progress on its
+ *  own. */
 enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
 
 /**

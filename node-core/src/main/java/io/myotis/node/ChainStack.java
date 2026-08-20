@@ -256,9 +256,15 @@ public final class ChainStack {
         if (blc != null) blc.setWsBoundPeriods(sane);
     }
 
-    /** One-shot consent to sync from a stale anchor: releases a STALE_ANCHOR park
-     *  for the rest of this run. No-op when the beacon client isn't up or parked. */
+    /** One-shot consent to sync from a stale anchor, run-sticky for this stack's
+     *  lifetime. Stashed when the beacon client isn't built yet (the daemon's
+     *  -Dmyotis.beacon.acceptStaleAnchor pre-consent arrives before start()) and
+     *  armed at every beacon (re)build; applied live when it is up — a parameter
+     *  accepted pre-start must be APPLIED, never silently dropped. */
+    private volatile boolean staleAnchorAccepted = false;
+
     public void acceptStaleAnchor() {
+        staleAnchorAccepted = true;
         BeaconLightClient blc = beaconLightClient;
         if (blc != null) blc.acceptStaleAnchor();
     }
@@ -974,10 +980,12 @@ public final class ChainStack {
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
         blc.setGossipsubEnabled(gossipsubEnabled);
-        // Weak-subjectivity anchor-age bound: network default + any host override
-        // (must land before start() so the cold-start gate judges with them).
+        // Weak-subjectivity anchor-age bound: network default + any host override,
+        // plus a pre-start stale-anchor consent — all must land before start() so
+        // the cold-start gate judges with them.
         blc.setWsBoundDefaultPeriods(network.wsBoundPeriods());
         if (wsBoundOverridePeriods > 0) blc.setWsBoundPeriods(wsBoundOverridePeriods);
+        if (staleAnchorAccepted) blc.acceptStaleAnchor();
         // LC hunt: when the light client is starved of servers it flips this
         // and the CL discv5 service runs extra lookup rounds per tick. Read
         // the field at call time — discv5 (re)starts independently of the

@@ -45,6 +45,7 @@ class IosRpcBackend(
         return when (statusOrNull(handle)?.engineString("beaconState")) {
             "SYNCED" -> io.myotis.jsonrpc.RpcSyncState.SYNCED
             "CATCHING_UP" -> io.myotis.jsonrpc.RpcSyncState.CATCHING_UP
+            "STALE_ANCHOR" -> io.myotis.jsonrpc.RpcSyncState.STALE_ANCHOR
             else -> io.myotis.jsonrpc.RpcSyncState.SYNCING // STARTING / SYNCING / unreadable
         }
     }

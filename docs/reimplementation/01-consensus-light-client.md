@@ -330,15 +330,22 @@ the app uses to check a peer-claimed EL state root against a beacon-attested one
 
 ```
 Phase 0   discover CL peers (HTTP debug only) — production seeds from discv5 + cache + multiaddrs
-Phase 0b  awaitAnchorFreshness() — the WEAK-SUBJECTIVITY GATE (cold starts only):
-          judge the BEST anchor (embedded checkpoint vs persisted snapshot, whichever
-          period is newer) against the network's ws bound (lightclient/WeakSubjectivity;
-          NetworkConfig.wsBoundPeriods defaults). Older → park in STALE_ANCHOR,
-          fail closed, re-evaluating 1/s until the bound covers it (raised live via
-          setWsBoundPeriods), acceptStaleAnchor() consents (per-run, never persisted),
-          or the client stops. A port MUST gate the resume AND every bootstrap path,
-          including a re-bootstrap after a discarded/poisoned resume — the fallback
-          anchor (the checkpoint) can be older than the one the start-time gate passed.
+Phase 0b  awaitAnchorFreshness(anchor) — the WEAK-SUBJECTIVITY GATE, on EVERY loop
+          entry: cold starts judge the BEST anchor (embedded checkpoint vs persisted
+          snapshot, whichever period is newer; the snapshot is parsed ONCE and the
+          resume below reuses the parse), warm re-entries via resume() judge the
+          store's held committee period (a pause longer than the bound ages it like
+          a cold snapshot). Bound: lightclient/WeakSubjectivity +
+          NetworkConfig.wsBoundPeriods defaults. Older → park in STALE_ANCHOR, fail
+          closed, re-evaluating 1/s until the bound covers it (raised live via
+          setWsBoundPeriods), acceptStaleAnchor() consents (run-sticky, never
+          persisted), or the client stops. Additionally, bootstrap() itself opens
+          with wsGateAllowsBootstrap(): every attempt — initial, the poll loop's
+          retry, the fallback after a failed resume — re-faces the gate against the
+          EMBEDDED CHECKPOINT, which can be older than the anchor the start-time
+          gate approved (a fresh snapshot masks a stale checkpoint until its resume
+          fails; a peer-starved node crosses the bound while retrying). A port MUST
+          replicate both layers.
 Phase 1   tryResumeFromSnapshot()  →  preConnectAndIdentify()  →  bootstrap() if not resumed
 Phase 1b  catchUpSyncCommittee()   +  fill the chain-state-root window from any peer
 Phase 2   steady-state: every secondsPerSlot, pollFinalityUpdate()
