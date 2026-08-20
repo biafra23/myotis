@@ -649,17 +649,21 @@ public record NetworkConfig(
      *       gives barely over one period, but its validator set is permissioned
      *       (EF-operated, deposit-gated), so outsiders cannot mount a long-range
      *       attack at all; the mainnet-preset bound is kept as hygiene.</li>
-     *   <li><b>gnosis: 3</b> (~34 h). Gnosis has 80-second epochs and a
-     *       CHURN_LIMIT_QUOTIENT of 4096, which collapses the spec formula to well
-     *       under one 512-epoch period in the worst case — so, unlike mainnet's
-     *       floored-below-the-spec-window 13, this default is PERMISSIVE relative
-     *       to the formula (worst-case churn assumes maximal hostile exits) and
-     *       conservative only relative to convenience: 3 periods keeps routine
-     *       restarts quiet while multi-day-old anchors still require consent.
-     *       Tightening to 1 period (~11.4 h) is the strict option — a regularly
-     *       running node persists its snapshot each applied period, so its anchor
-     *       age stays under one period anyway. Owner's call either way; raise or
-     *       lower via the Settings override knowingly.</li>
+     *   <li><b>gnosis: 3</b> (~34 h). Two churn regimes matter here. Pre-Pectra,
+     *       Gnosis's CHURN_LIMIT_QUOTIENT of 4096 (with 80-second epochs)
+     *       collapsed the spec formula to under one 512-epoch period in the worst
+     *       case. The LIVE config (gnosischain/configs mainnet/config.yaml)
+     *       additionally caps Electra-era exit churn at
+     *       MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT = 64e9 Gwei-units = 2
+     *       validators/epoch, which dominates for any active set ≥ ~8k — so the
+     *       REAL window today is ~S/(20·64) + 256 epochs ≈ 2.6 days (~5 periods)
+     *       at 100k validators, ~4.9 days (~10) at 200k, scaling linearly with
+     *       stake. 3 periods therefore sits INSIDE the practical window at
+     *       current set sizes while keeping weekend-off restarts quiet; it would
+     *       only turn permissive again if Gnosis raised the exit cap or the set
+     *       shrank below ~65k. Tightening to 1 period (~11.4 h) remains the
+     *       strict option. Owner's call either way; raise or lower via the
+     *       Settings override knowingly.</li>
      * </ul>
      */
     public long wsBoundPeriods() {
