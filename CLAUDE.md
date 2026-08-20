@@ -161,18 +161,28 @@ decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
 (`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
 run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
 tree is attacker-controlled, and an automated reviewer that reads it can be
-prompt-injected. Two inputs make that acute here — the reviewer reads
-`CLAUDE.md` and `.github/claude-review-prompt.md` from the checkout, so a fork
-could *rewrite the reviewer's own rules and prompt* in the same PR (the
-"workflow must match the default branch" guard protects only the workflow YAML,
-not these files). So do NOT wire fork PRs into the automated reviewer. Instead:
-the owner reads the diff first — watching for injection in `CLAUDE.md` /
-`.github/**` / build scripts / postinstall hooks / comments / encoded blobs —
-then, if wanted, a review is run manually from a trusted session. Nothing
-auto-merges, so an injected reviewer could at worst post a comment a human still
-acts on. If automating fork review is ever reconsidered, pin the prompt and
-CLAUDE.md to the base ref, never execute fork code, keep reviews `COMMENT`-only,
-and lock down runner egress — see the discussion that produced this note.
+prompt-injected. The clearest vector is verified: the "Assemble review prompt"
+step `cat`s `.github/claude-review-prompt.md` straight from the PR checkout with
+no pinning (`claude-review.yml:77`), so a fork that edits the prompt file
+*rewrites the reviewer's own instructions*. The reviewer prompt also opens "Read
+CLAUDE.md first", so `CLAUDE.md` is an attacker-controlled input by the same
+route — though current `claude-code-action` appears to restore the base
+`CLAUDE.md` over the checkout before the review runs (observed, not documented),
+so don't rely on that either way. And the diff itself is always attacker text.
+The "workflow must match the default branch" guard protects only the workflow
+YAML, not the prompt file or CLAUDE.md. So do NOT wire fork PRs into the
+automated reviewer. Instead: the owner reads the diff first — watching for
+injection in `CLAUDE.md` / `.github/**` / build scripts / postinstall hooks /
+comments / encoded blobs — then, if wanted, a review is run manually from a
+trusted session **restricted to read/diff/comment tools, never building or
+running the fork tree** (merely `./gradlew …` executes fork-controlled build
+scripts locally; CI already builds fork PRs via unscoped `pull_request` in
+`ci.yml`, but secretless and sandboxed — a local session is neither). Held to
+that, nothing auto-merges and an injected reviewer's worst case is a comment a
+human still acts on. If automating fork review is ever reconsidered, pin the
+prompt and CLAUDE.md to the base ref, never execute fork code, keep reviews
+`COMMENT`-only, and lock down runner egress — see PR #375 for the discussion
+that produced this note.
 
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
