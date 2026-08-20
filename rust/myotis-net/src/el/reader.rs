@@ -303,7 +303,14 @@ pub struct VerifiedBlock {
 /// How far below the beacon head a block pin may be and still verify cheaply
 /// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
 /// [target..head] is fetched in one request, so this bounds its size.
-const BLOCK_LOOKBACK_MAX: u64 = 256;
+///
+/// 512, not 256: Swarm's bee reads the previous redistribution round's start
+/// header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
+/// whatever skew bee's cached block number has against our anchored head at
+/// serve time. 256 made that call fail for the tail of every round; 512 covers
+/// it with margin and keeps the window one ~300 KB fetch, still within the eth
+/// response soft limit.
+const BLOCK_LOOKBACK_MAX: u64 = 512;
 
 /// First-ever receipt scan for a tx hash looks back this many blocks below the
 /// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
@@ -4237,7 +4244,7 @@ impl ElReader {
         full_transactions: bool,
     ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
-        // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
+        // request. back < BLOCK_LOOKBACK_MAX (512) bounds this to ~300 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
         // the anchored-window length check and is skipped (fails closed — the caller
         // tries the next peer), so deep pins carry a slightly higher liveness risk
