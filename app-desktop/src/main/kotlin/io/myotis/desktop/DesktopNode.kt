@@ -13,7 +13,7 @@ import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
-import io.myotis.ui.KohakuPreset
+import io.myotis.ui.LogIndexWatch
 import io.myotis.engines.SelectorEngine
 import io.myotis.engines.Tor
 import io.myotis.txhistory.TxHistoryEvent
@@ -49,8 +49,9 @@ import kotlin.io.path.createDirectories
 /**
  * The Desktop actual of [NodeController]: drives the SAME engine the daemon and Android
  * use — through the engine API ([MyotisEngine]/[ChainHandle]) only. The composition-root
- * default is the [Engines] selector (Java engine unless `myotis.engine`/the Settings
- * toggle says otherwise); everything else this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
+ * default is the [Engines] selector (`auto`: the Rust engine where it can serve, Java
+ * fallback — unless `myotis.engine`/the Settings toggle says otherwise); everything else
+ * this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
  * gateway from `:app` as its port implementations.
  */
 class DesktopNodeController(
@@ -244,11 +245,11 @@ class DesktopNodeController(
     }
 
     override fun applyEngineChoice() {
-        // auto (not rust): the Rust engine is catalog-only for now, so a hard `rust` would
-        // refuse to boot networks; auto prefers Rust where it can serve and falls back to
-        // Java with a log. Applies to networks (re)started afterwards — live ones keep
-        // their engine (reboot the network from Settings to switch it).
-        Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
+        // auto (not rust) as the default: auto prefers Rust where it can serve and falls
+        // back to Java with a log, so a host without the native library still boots.
+        // Applies to networks (re)started afterwards — live ones keep their engine
+        // (reboot the network from Settings to switch it).
+        Engines.select(if (settings.preferJavaEngine()) "java" else "auto")
     }
 
     override fun applyLogIndex(network: String) {
@@ -262,9 +263,10 @@ class DesktopNodeController(
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
         val maxSpeed = settings.logIndexMaxSpeed(network)
-        // No preset for this network -> never push; the engine keeps
-        // eth_getLogs in its honest not-configured state.
-        val json = KohakuPreset.configJson(network, enabled, maxSpeed) ?: return
+        // Nothing to say (no watched contracts, not enabled) -> never push; the
+        // engine keeps eth_getLogs in its honest not-configured state.
+        val json = LogIndexWatch.configJson(settings.logIndexWatchJson(network), enabled, maxSpeed)
+            ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
@@ -617,15 +619,18 @@ class DesktopSettings(
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
     // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
     private var nativeBls = false
-    // The Rust engine is experimental — off by default everywhere.
-    private var rustEngine = false
+    // Default off = the selector's `auto` mode (Rust engine where it can serve, Java
+    // fallback). On = force the Java engine — the opt-out, now that Rust is primary.
+    private var preferJava = false
     // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
-    // Per-network opt-in for the eth_getLogs Kohaku-preset index (Rust engine only).
+    // Per-network opt-in for the eth_getLogs watch-list index (Rust engine only).
     private val logIndexOn = HashMap<String, Boolean>()
     // Per-network backfill pacing (true = max download speed); see Settings.logIndexMaxSpeed.
     private val logIndexMax = HashMap<String, Boolean>()
+    // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
+    private val logIndexWatch = HashMap<String, String>()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -667,6 +672,10 @@ class DesktopSettings(
     override fun logIndexMaxSpeed(network: String): Boolean =
         synchronized(this) { logIndexMax[network] ?: false }
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
+    override fun logIndexWatchJson(network: String): String =
+        synchronized(this) { logIndexWatch[network] ?: "[]" }
+    override fun setLogIndexWatchJson(network: String, json: String) =
+        mutate { logIndexWatch[network] = json }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -678,8 +687,8 @@ class DesktopSettings(
     override fun setStrictStateFreshness(v: Boolean) = mutate { strict = v }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
     override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
-    override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
-    override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
+    override fun preferJavaEngine(): Boolean = synchronized(this) { preferJava }
+    override fun setPreferJavaEngine(v: Boolean) = mutate { preferJava = v }
     override fun torEnabled(): Boolean = synchronized(this) { torRouting }
     override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
 
@@ -706,14 +715,26 @@ class DesktopSettings(
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
-        p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+        p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexMax[k.removePrefix(K_LOG_INDEX_SPEED_PREFIX)] = it }
         }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_WATCH_PREFIX) }.forEach { k ->
+            // Round-trip through the parser so a hand-edited value degrades to the
+            // entries that do parse rather than reaching the engine raw.
+            p.getProperty(k)?.let {
+                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] =
+                    LogIndexWatch.serialize(LogIndexWatch.parse(it))
+            }
+        }
         p.stringPropertyNames()
-            .filter { it.startsWith(K_LOG_INDEX_PREFIX) && !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }
+            .filter {
+                it.startsWith(K_LOG_INDEX_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_WATCH_PREFIX)
+            }
             .forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
@@ -755,10 +776,11 @@ class DesktopSettings(
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
-        p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        p.setProperty(K_PREFER_JAVA, preferJava.toString())
         p.setProperty(K_TOR, torRouting.toString())
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
+        logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
         return p
     }
 
@@ -793,12 +815,15 @@ class DesktopSettings(
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"
-        const val K_RUST_ENGINE = "rustEngine"
+        // Replaces the pre-auto-default "rustEngine" key; that key is simply ignored
+        // now (its true meant "auto", which is the default — nothing to migrate).
+        const val K_PREFER_JAVA = "engine.preferJava"
         const val K_TOR = "torRouting"
         const val K_LOG_INDEX_PREFIX = "logIndex."
-        // Distinct prefix nested under logIndex.* so the enable-loader's
-        // startsWith filter must exclude it (see load()).
+        // Distinct prefixes nested under logIndex.* so the enable-loader's
+        // startsWith filter must exclude them (see load()).
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
+        const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
     }
 }
 

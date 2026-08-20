@@ -22,8 +22,9 @@ internal data class IosNetworkInfo(
  * embedded catalog — the only engine on this host.
  *
  * The BLS and engine toggles are inert here: blst is compiled INTO the engine
- * static lib and the Rust engine is the only engine, so nativeBls/rustEngine
- * read as fixed `true` and the setters drop the write.
+ * static lib and the Rust engine is the only engine, so nativeBls reads as a
+ * fixed `true`, preferJavaEngine keeps its inert default `false` (there is no
+ * Java engine to prefer), and the setters drop the write.
  */
 class IosSettings : Settings {
 
@@ -97,20 +98,24 @@ class IosSettings : Settings {
         getBool("$K_LOG_INDEX_SPEED_PREFIX$network", false)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) =
         defaults.setBool(on, "$K_LOG_INDEX_SPEED_PREFIX$network")
+    override fun logIndexWatchJson(network: String): String =
+        defaults.stringForKey("$K_LOG_INDEX_WATCH_PREFIX$network") ?: "[]"
+    override fun setLogIndexWatchJson(network: String, json: String) =
+        defaults.setObject(json, "$K_LOG_INDEX_WATCH_PREFIX$network")
 
     // blst is statically linked into the engine — there is nothing to toggle.
     override fun nativeBlsEnabled(): Boolean = true
     override fun setNativeBlsEnabled(v: Boolean) {}
 
-    // The Rust engine is the only engine on iOS.
-    override fun rustEngineEnabled(): Boolean = true
-    override fun setRustEngineEnabled(v: Boolean) {}
+    // The Rust engine is the only engine on iOS: [Settings]' inert defaults for
+    // preferJavaEngine (false / drop-the-write) are exactly this host's semantics.
 
     private companion object {
         const val K_ENABLED = "networks.enabled"
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_LOG_INDEX_PREFIX = "logIndex."
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
+        const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_DEEP = "deepPool"

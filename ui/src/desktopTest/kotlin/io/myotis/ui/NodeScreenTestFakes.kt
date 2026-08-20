@@ -51,6 +51,4 @@ internal class FakeSettings : Settings {
     override fun setStrictStateFreshness(v: Boolean) {}
     override fun nativeBlsEnabled(): Boolean = false
     override fun setNativeBlsEnabled(v: Boolean) {}
-    override fun rustEngineEnabled(): Boolean = false
-    override fun setRustEngineEnabled(v: Boolean) {}
 }

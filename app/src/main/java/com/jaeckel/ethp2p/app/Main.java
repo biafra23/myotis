@@ -185,8 +185,8 @@ public final class Main {
         String[] cmdArgs = remaining.toArray(new String[0]);
 
         // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
-        // -Dmyotis.engine=java|rust|auto picks the engine (default java; `./gradlew
-        // :app:run -Pengine=rust` passes it through).
+        // -Dmyotis.engine=java|rust|auto picks the engine (default auto — Rust where it
+        // can serve, Java fallback; `./gradlew :app:run -Pengine=java` passes it through).
         MyotisEngine engine = Engines.engine();
 
         // Client commands / purge target a single network — the first listed. Canonicalize

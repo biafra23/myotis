@@ -24,7 +24,7 @@ class DesktopSettingsPersistenceTest {
     fun `every setting round-trips across a restart`(@TempDir dir: Path) {
         val file = dir.resolve("settings.properties")
         val first = DesktopSettings(nets, file)
-        first.setRustEngineEnabled(true)
+        first.setPreferJavaEngine(true)
         first.setNetworkEnabled("gnosis", true)
         first.setNetworkEnabled("mainnet", false)
         first.setRpcPort("gnosis", 9999)
@@ -33,10 +33,14 @@ class DesktopSettingsPersistenceTest {
         first.setDeepPool(8)
         first.setStrictStateFreshness(false)
         first.setNativeBlsEnabled(true)
+        first.setLogIndexWatchJson(
+            "gnosis",
+            """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":31305656}]""",
+        )
 
         // Fresh instance over the same file = app restart.
         val second = DesktopSettings(nets, file)
-        assertTrue(second.rustEngineEnabled(), "engine choice must be sticky")
+        assertTrue(second.preferJavaEngine(), "engine choice must be sticky")
         assertEquals(listOf("gnosis"), second.enabledNetworks(), "network selection must be sticky")
         assertFalse(second.isNetworkEnabled("mainnet"))
         assertEquals(9999, second.rpcPortFor("gnosis"))
@@ -45,6 +49,12 @@ class DesktopSettingsPersistenceTest {
         assertEquals(8, second.deepPoolThreshold())
         assertFalse(second.strictStateFreshness())
         assertTrue(second.nativeBlsEnabled())
+        assertEquals(
+            """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":31305656}]""",
+            second.logIndexWatchJson("gnosis"),
+            "the watch list must be sticky",
+        )
+        assertEquals("[]", second.logIndexWatchJson("mainnet"))
     }
 
     @Test
@@ -59,7 +69,7 @@ class DesktopSettingsPersistenceTest {
     fun `missing file keeps the defaults`(@TempDir dir: Path) {
         val s = DesktopSettings(nets, dir.resolve("does-not-exist.properties"))
         assertEquals(listOf("mainnet"), s.enabledNetworks())
-        assertFalse(s.rustEngineEnabled())
+        assertFalse(s.preferJavaEngine())
         assertTrue(s.strictStateFreshness())
         assertEquals(32, s.snapTarget())
         assertEquals(32, s.servedBlockWindow())
@@ -78,7 +88,8 @@ class DesktopSettingsPersistenceTest {
             snapTarget=100000
             servedBlockWindow=-7
             deepPool=zero
-            rustEngine=yes-please
+            engine.preferJava=yes-please
+            logIndex.watch.gnosis=[{"address":"0xbad","fromBlock":1},{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":7}]
             strictStateFreshness=false
             """.trimIndent(),
         )
@@ -92,15 +103,20 @@ class DesktopSettingsPersistenceTest {
         assertEquals(128, s.snapTarget())
         assertEquals(1, s.servedBlockWindow())
         assertEquals(16, s.deepPoolThreshold())
-        assertFalse(s.rustEngineEnabled())
+        assertFalse(s.preferJavaEngine())
         assertFalse(s.strictStateFreshness())
+        // The bad watch entry is dropped at load; the good one survives.
+        assertEquals(
+            """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":7}]""",
+            s.logIndexWatchJson("gnosis"),
+        )
     }
 
     @Test
     fun `null file keeps the store in-memory`(@TempDir dir: Path) {
         val s = DesktopSettings(nets, null)
-        s.setRustEngineEnabled(true)
-        assertTrue(s.rustEngineEnabled())
+        s.setPreferJavaEngine(true)
+        assertTrue(s.preferJavaEngine())
         assertEquals(0, Files.list(dir).use { it.count() }, "no file must be written")
     }
 }

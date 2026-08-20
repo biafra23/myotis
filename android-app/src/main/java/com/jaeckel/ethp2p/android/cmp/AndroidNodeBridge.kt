@@ -306,6 +306,9 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
     override fun logIndexMaxSpeed(network: String): Boolean = NodeService.logIndexMaxSpeed(ctx, network)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = NodeService.setLogIndexMaxSpeed(ctx, network, on)
+    override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
+    override fun setLogIndexWatchJson(network: String, json: String) =
+        NodeService.setLogIndexWatchJson(ctx, network, json)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
@@ -321,8 +324,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
-    override fun rustEngineEnabled(): Boolean = NodeService.rustEngineEnabled(ctx)
-    override fun setRustEngineEnabled(v: Boolean) = NodeService.setRustEngineEnabled(ctx, v)
+    override fun preferJavaEngine(): Boolean = NodeService.preferJavaEngine(ctx)
+    override fun setPreferJavaEngine(v: Boolean) = NodeService.setPreferJavaEngine(ctx, v)
 
     override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
     override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)
