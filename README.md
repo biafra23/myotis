@@ -102,7 +102,7 @@ cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
   -destination 'platform=iOS Simulator,name=<device>' build
 ```
 
-On iOS the app form is a development host more than an integration point: iOS suspends backgrounded apps, so the app's loopback JSON-RPC listener (foreground-only) can't serve a separate wallet app the way the Android and desktop nodes can. The supported iOS integration is **embedding** — a wallet links the `MyotisKit` framework (or the engine's C ABI directly) and runs the node in its own process.
+On iOS the app form is a development host more than an integration point: iOS suspends backgrounded apps, so the app's loopback JSON-RPC listener (foreground-only) can't serve a separate wallet app the way the Android and desktop nodes can. The supported iOS integration is **embedding** — a wallet links the `MyotisKit` framework (or the engine's C ABI directly) and runs the node in its own process. Releases ship a prebuilt **`MyotisKit.xcframework.zip`** (device arm64 + arm64 simulator, `+ .sha256`) so a host can drop it in without a local Kotlin/Native build.
 
 ### Desktop app (GUI)
 
