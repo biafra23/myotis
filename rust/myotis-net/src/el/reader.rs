@@ -620,6 +620,36 @@ pub struct ElReader {
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
     log_index_pipeline_full: std::sync::atomic::AtomicBool,
+    /// Backfill THROUGHPUT of each peer's most recent batch, in milliblocks per
+    /// second (blocks applied × 1000 / seconds elapsed), keyed by dial address —
+    /// the walk's own record of who actually moves the cursor fastest.
+    ///
+    /// Written on peer-attributable failure too (as 0), never on a failure of
+    /// ours, so "absent" means "not measured": never sampled, pruned because
+    /// the peer left the pool, or dropped because a success could not be
+    /// measured. All are treated the same way — sample it — because all mean
+    /// there is no measurement to rank on.
+    /// See [`Self::log_index_backfill_peer_order`].
+    ///
+    /// A budget-truncated batch is deliberately `Ok` (partial progress beats a
+    /// hard failure), so the batch loop cannot tell a peer that served 62
+    /// blocks from one that served 1023: both "succeed", and the loop takes the
+    /// FIRST success. Without this, whichever peer `snap_peers()` happens to
+    /// list first monopolizes the walk however little it serves — observed on
+    /// gnosis 2026-08-15, where one peer pinned the backfill at ~62 blocks/batch
+    /// (~50 blk/s) for hours while eleven other live peers were never tried.
+    ///
+    /// The metric is a RATE, not a block count: a peer that serves 1023 blocks
+    /// slowly is not better than one that serves 300 quickly, and scoring raw
+    /// blocks would have ranked it so — and would also have demoted a peer that
+    /// fully served an inherently short final batch near the walk's target.
+    log_index_peer_serve:
+        std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, PeerServeScore>>,
+    /// Backfill rounds attempted (every round with a non-empty pool, whether or
+    /// not any peer served). This is the clock [`RESAMPLE_EVERY`] is counted
+    /// against; the success counter cannot be, because it freezes exactly
+    /// during a stall — the condition re-sampling exists to escape.
+    log_index_backfill_rounds: std::sync::atomic::AtomicU64,
     /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
     /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
     /// the rate is measured against WALL CLOCK between progress points (idle
@@ -789,6 +819,8 @@ impl ElReader {
             log_index_tail: std::sync::Mutex::new(Vec::new()),
             log_index_last_persist: std::sync::Mutex::new(None),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
+            log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
+            log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
@@ -2310,6 +2342,94 @@ impl ElReader {
         }
     }
 
+    /// Order this round's peers so the walk prefers the fastest servers.
+    ///
+    /// Ranking, applied to the pool's list (which is newest-dialed first):
+    ///   1. peers with NO measurement — never sampled, pruned when they left
+    ///      the pool, or dropped because a success could not be measured —
+    ///      first, because the ranking cannot mean anything until they are
+    ///      measured (that is how a better peer is ever discovered);
+    ///   2. then by last-batch throughput, descending.
+    ///
+    /// Every [`RESAMPLE_EVERY`]-th round promotes the peer whose measurement is
+    /// STALEST over its score, so every demoted peer — not just the newest dial
+    /// — is periodically re-measured and can climb back. Only that one peer
+    /// jumps the queue; the rest stays ranked.
+    /// The ranking itself is pure and unit-tested — see [`rank_backfill_peers`].
+    /// Record that `addr` had its turn this round without yielding a usable
+    /// measurement, because the failure was OURS.
+    ///
+    /// The rate must not change — charging our own bookkeeping to a peer is
+    /// exactly what `blames_peer` exists to prevent — but the staleness clock
+    /// must, or the peer is frozen as permanently "stalest" and captures every
+    /// exploration round from then on. That starves every other demoted peer of
+    /// the re-measurement the rotation exists to guarantee, and when the frozen
+    /// peer also holds the best rate it is already at the front, so the
+    /// promotion is a no-op and the exploration round is spent doing nothing.
+    /// Reachable in a self-sustaining loop: a chunk fetch that fails at
+    /// pipeline depth > 1 is classified `ours`, and any other peer's clean
+    /// batch restores the depth for the next round.
+    ///
+    /// Absent entries stay absent: "unmeasured" already sorts first, so such a
+    /// peer is tried every ordinary round anyway, and inventing a rate here
+    /// would be a measurement we never took.
+    fn log_index_note_peer_tried(&self, addr: std::net::SocketAddr, round: u64) {
+        if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+            if let Some(score) = scores.get_mut(&addr) {
+                score.round = round;
+            }
+        }
+    }
+
+    fn log_index_backfill_peer_order(
+        &self,
+        peers: Vec<std::sync::Arc<crate::el::peer::ManagedPeer>>,
+        round: u64,
+    ) -> Vec<std::sync::Arc<crate::el::peer::ManagedPeer>> {
+        let addrs: Vec<std::net::SocketAddr> = peers.iter().map(|p| p.addr()).collect();
+        let order = {
+            let Ok(mut scores) = self.log_index_peer_serve.lock() else {
+                return peers; // poisoned: ordering is an optimization, never a gate
+            };
+            // Bound the map by the LIVE pool, on EVERY round — INCLUDING the
+            // single-peer rounds that skip the ranking below. Peers churn (the
+            // gnosis pool dialed 12 distinct addresses in one session), and a
+            // score for a peer we no longer hold is dead weight that never
+            // expires on its own; pruning only on ranked rounds would let a
+            // long-lived one-peer pool grow an entry per address ever dialed,
+            // which is the exact case the bound exists for.
+            //
+            // Consequence, accepted: a peer absent from one `snap_peers()` call
+            // loses its score and is re-sampled on return. That costs one
+            // round-trip and keeps the map strictly bounded by the pool, which
+            // beats holding a measurement of a connection that may be gone.
+            let live: std::collections::HashSet<std::net::SocketAddr> =
+                addrs.iter().copied().collect();
+            scores.retain(|addr, _| live.contains(addr));
+            if peers.len() < 2 {
+                return peers;
+            }
+            rank_backfill_peers(&addrs, &scores, round)
+        };
+        let n = peers.len();
+        let mut slots: Vec<Option<std::sync::Arc<crate::el::peer::ManagedPeer>>> =
+            peers.into_iter().map(Some).collect();
+        let mut ordered: Vec<std::sync::Arc<crate::el::peer::ManagedPeer>> = order
+            .into_iter()
+            .filter_map(|i| slots.get_mut(i).and_then(|s| s.take()))
+            .collect();
+        // `rank_backfill_peers` returns a permutation, so this drops nothing.
+        // Belt and braces anyway, and NOT only under `debug_assert`: release is
+        // where a silently shrunken pool would actually bite, and it would
+        // starve the walk of peers with no error and no log — the "quietly
+        // wrong rather than loudly refused" shape this codebase refuses
+        // elsewhere. Appending the leftovers keeps every peer reachable
+        // whatever the ranking returns.
+        debug_assert_eq!(ordered.len(), n, "peer ranking must be a permutation");
+        ordered.extend(slots.into_iter().flatten());
+        ordered
+    }
+
     /// One backfill round: try every pooled peer for one batch at the current
     /// cursor. Returns (progressed, max_speed_configured).
     async fn log_index_backfill_round(&self, ticks: u64, backfill_ok: &mut u64) -> (bool, bool) {
@@ -2341,19 +2461,55 @@ impl ElReader {
             }
             return (false, max_speed);
         }
+        // Prefer peers whose last batch was fastest (see the fn's docs): a
+        // truncated batch is `Ok`, so without this the first-listed peer
+        // monopolizes the walk no matter how little it serves. The clock is a
+        // dedicated round counter, NOT `backfill_ok` — a success counter
+        // freezes during a stall, which is exactly when exploration must keep
+        // running.
+        let round = self
+            .log_index_backfill_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let peers = self.log_index_backfill_peer_order(peers, round);
         for peer in &peers {
+            let started = std::time::Instant::now();
             match self
                 .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
                 .await
             {
                 Ok(()) => {
+                    let elapsed = started.elapsed();
+                    let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
+                    // Score this peer by the THROUGHPUT the batch achieved —
+                    // pure and unit-tested, see `backfill_batch_rate`.
+                    match backfill_batch_rate(cur_n, new_cursor.map(|(n, _)| n), count, elapsed) {
+                        Some(rate) => {
+                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                                scores.insert(peer.addr(), PeerServeScore { rate, round });
+                            }
+                        }
+                        // The measurement is void — the cursor moved under the
+                        // batch (a concurrent reorg rewind, config swap or
+                        // snapshot import), so the delta is not this peer's
+                        // throughput. DROP any stale entry rather than keep
+                        // one: the map also holds 0 to mean "failed
+                        // attributably", which sorts dead last, and this peer
+                        // just demonstrated it can serve the range. Keeping
+                        // that 0 would demote a proven server until an
+                        // exploration round rescued it. Absent means "not
+                        // measured", which is exactly the honest state here.
+                        None => {
+                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                                scores.remove(&peer.addr());
+                            }
+                        }
+                    }
                     // Count SUCCESSES, not ticks: with intermittent failures a
                     // ticks-modulo log can systematically miss the successful
                     // ticks and stay silent while progressing. First success
                     // logs immediately, then every 50th (~5 min when healthy).
                     *backfill_ok += 1;
                     if *backfill_ok % 50 == 1 {
-                        let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
                         tracing::info!(
                             cursor = new_cursor.map(|(n, _)| n).unwrap_or(cur_n),
                             target = target_low,
@@ -2366,7 +2522,25 @@ impl ElReader {
                     return (true, max_speed);
                 }
                 Err(e) => {
-                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                    // Score a peer-attributable failure as zero rather than
+                    // leaving it unscored: unscored means "not measured" and
+                    // sorts FIRST, so a peer that always fails (pruned history,
+                    // say) would otherwise cost a full round-trip ahead of every
+                    // good peer, forever. The exploration round is what gives it
+                    // another chance.
+                    //
+                    // A failure of OURS (config swapped mid-batch, gap reset)
+                    // says nothing about the peer, so it must not score at all —
+                    // otherwise our own bookkeeping demotes a good server. Its
+                    // TURN still counts, though: see `log_index_note_peer_tried`.
+                    if e.blames_peer {
+                        if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                            scores.insert(peer.addr(), PeerServeScore { rate: 0, round });
+                        }
+                    } else {
+                        self.log_index_note_peer_tried(peer.addr(), round);
+                    }
+                    tracing::debug!(from, count, blames_peer = e.blames_peer, error = %e, "log index backfill batch failed; trying next peer");
                 }
             }
         }
@@ -2402,16 +2576,47 @@ impl ElReader {
         cur_hash: [u8; 32],
         config: &crate::el::logindex::LogIndexConfig,
         fingerprint: u64,
-    ) -> Result<(), String> {
-        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+    ) -> Result<(), BackfillBatchError> {
+        // The `?` blames the peer (see `impl From<String> for
+        // BackfillBatchError`), INCLUDING on a 15s request timeout. That is
+        // deliberate, and unlike the chunk-fetch site below it is not made
+        // conditional on pipeline depth: a timeout here may occasionally be our
+        // own cancelled prefetches from a previous truncated batch still
+        // occupying the peer's serving queue, but withholding blame would leave
+        // a peer that ALWAYS times out permanently unscored — and unscored
+        // sorts FIRST, so it would cost a full 15s round-trip ahead of every
+        // good peer, every round, forever. That is the exact pathology the
+        // zero-on-failure rule exists to prevent, reintroduced through its most
+        // expensive door. A peer wrongly blamed here is not stranded: the
+        // exploration round promotes the STALEST measurement, so it is
+        // re-measured within a bounded number of rounds (see `RESAMPLE_EVERY`).
+        let window = peer
+            .get_block_headers_by_number(cur_n, count + 1, 0, true)
+            .await?;
+        // The PEER does not get to choose the batch size. `max_headers` is a
+        // request field an honest peer honours (geth caps at 1024, which is why
+        // `BATCH` sits at 1023), not something the wire format enforces:
+        // `decode_block_headers` imposes no element cap, so the only bound is
+        // the 10 MiB frame ceiling — ~18k headers. Left unclamped, an
+        // over-serving peer would (a) decide how many candidates this batch
+        // bloom-scans and fetches bodies/receipts for, and (b) push `applied`
+        // past `requested`, which `backfill_batch_rate` reads as a void
+        // measurement — leaving that peer permanently "unmeasured", the rank
+        // that sorts FIRST. It would monopolize the walk exactly as the stingy
+        // peer did. Same clamp the head-window fetch above already applies.
+        let window = &window[..window.len().min(count as usize + 1)];
         let Some((top, rest)) = window.split_first() else {
-            return Err("peer returned no headers".to_string());
+            return Err(BackfillBatchError::peer("peer returned no headers"));
         };
         if top.header.number != cur_n || top.hash != cur_hash {
-            return Err("peer window does not start at the trusted cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer window does not start at the trusted cursor block",
+            ));
         }
         if rest.is_empty() {
-            return Err("peer served only the cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer served only the cursor block",
+            ));
         }
         // Descending parent-hash chain: each header's parent is the next one.
         // Only the verified prefix is used, so a mid-response break just
@@ -2419,7 +2624,9 @@ impl ElReader {
         let mut verified = 0usize;
         for pair in window.windows(2) {
             let [upper, lower] = pair else {
-                return Err("header window pairing failed".to_string());
+                // Unreachable: `windows(2)` always yields pairs. Ours, not the
+                // peer's, so an impossible internal case cannot demote a peer.
+                return Err(BackfillBatchError::ours("header window pairing failed"));
             };
             if upper.header.parent_hash != lower.hash
                 || lower.header.number != upper.header.number.wrapping_sub(1)
@@ -2429,9 +2636,16 @@ impl ElReader {
             verified += 1;
         }
         if verified == 0 {
-            return Err("peer response does not chain to the cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer response does not chain to the cursor block",
+            ));
         }
-        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Ours (and unreachable: `verified` counts pairs of `window`), so the
+        // blanket peer-blaming `From` must not apply — same rule as the
+        // pairing case above.
+        let new_blocks = rest
+            .get(..verified)
+            .ok_or_else(|| BackfillBatchError::ours("verified prefix out of range"))?;
         // Bloom-filter candidates among the NEW blocks. A miss is a
         // definitive skip; a hit needs verified receipts.
         let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
@@ -2510,10 +2724,11 @@ impl ElReader {
         'chunks: while let Some((chunk_idx, bodies, receipt_blocks)) =
             futures::StreamExt::next(&mut fetches).await
         {
+            // Ours (and unreachable: `chunk_idx` came from our own enumerate).
             let chunk = candidates
                 .chunks(CHUNK_LEN)
                 .nth(chunk_idx)
-                .ok_or("chunk index out of range")?;
+                .ok_or_else(|| BackfillBatchError::ours("chunk index out of range"))?;
             let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
                 (Ok(b), Ok(r)) => (b, r),
                 (b, r) => {
@@ -2527,7 +2742,21 @@ impl ElReader {
                     // restores full depth.
                     self.log_index_pipeline_full
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    return Err(b.err().or(r.err()).unwrap_or_else(|| "chunk fetch failed".into()));
+                    let cause = b.err().or(r.err());
+                    let cause = cause.unwrap_or_else(|| "chunk fetch failed".into());
+                    // Blame follows the same reasoning as the degrade above: at
+                    // depth > 1 the failure may well be OUR prefetch racing the
+                    // peer's own serving queue, so charging the peer's score for
+                    // it would demote a good server for our choice of depth.
+                    // Once depth is 1 there is no prefetch left to blame and a
+                    // failure is genuinely the peer's. The degrade is what makes
+                    // this converge: the retry happens at depth 1, where a peer
+                    // that really is broken does get scored.
+                    return Err(if depth > 1 {
+                        BackfillBatchError::ours(cause)
+                    } else {
+                        BackfillBatchError::peer(cause)
+                    });
                 }
             };
             // Served items are an in-order prefix of the request (the per-block
@@ -2544,21 +2773,21 @@ impl ElReader {
                 // an empty serve is a data-availability signal, and retrying
                 // the whole batch against a peer that HAS the range beats
                 // committing a shortened batch sourced from one that doesn't.
-                return Err(format!(
+                return Err(BackfillBatchError::peer(format!(
                     "peer served no bodies/receipts for candidate chunk starting at block {}",
                     chunk_numbers.first().copied().unwrap_or_default()
-                ));
+                )));
             };
             for ((vh, body), receipts) in
                 chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {
                 verify_body_transactions(&vh.header, body)?;
                 if receipts.len() != body.transactions.len() {
-                    return Err(format!(
+                    return Err(BackfillBatchError::peer(format!(
                         "block {}: {} receipts for {} transactions",
                         vh.header.number,
                         receipts.len(),
                         body.transactions.len()
-                    ));
+                    )));
                 }
                 verify_block_receipts(&vh.header, receipts)?;
                 let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
@@ -2601,7 +2830,7 @@ impl ElReader {
         match self.log_index.lock() {
             Ok(mut slot) => {
                 let Some(ix) = slot.as_mut() else {
-                    return Err("log index uninstalled mid-batch".to_string());
+                    return Err(BackfillBatchError::ours("log index uninstalled mid-batch"));
                 };
                 // The batch ran across several awaits; a concurrent
                 // set_log_index_config may have replaced the index (fresh
@@ -2612,7 +2841,11 @@ impl ElReader {
                 // unless both the trust edge and the config are the ones this
                 // batch was computed against.
                 if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
-                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                    // OURS: we swapped the config or moved the edge under the
+                    // batch. The peer served fine; do not score it for this.
+                    return Err(BackfillBatchError::ours(
+                        "index changed mid-batch; recomputing next tick",
+                    ));
                 }
                 for vh in new_blocks {
                     let n = vh.header.number;
@@ -2635,15 +2868,15 @@ impl ElReader {
                             "backfill gap; resetting the walk cursor to re-descend"
                         );
                         ix.cursor = None;
-                        return Err(format!(
+                        return Err(BackfillBatchError::ours(format!(
                             "backfill gap at {} (edge {}); walk reset",
                             g.block, g.edge
-                        ));
+                        )));
                     }
                 }
                 Ok(())
             }
-            Err(_) => Err("log index lock poisoned".to_string()),
+            Err(_) => Err(BackfillBatchError::ours("log index lock poisoned")),
         }
     }
 
@@ -5484,6 +5717,195 @@ fn bridge_candidate_chunk(
     out
 }
 
+/// Why a backfill batch failed — and, crucially, whose fault it was.
+///
+/// The peer ranking scores a failure as zero throughput, so a failure WE caused
+/// (a concurrent config swap, our own gap-reset) must not be charged to
+/// whichever peer happened to be in flight: that would demote a good server for
+/// our own bookkeeping, and — since the ranking is sticky between exploration
+/// rounds — keep it demoted.
+#[derive(Debug)]
+struct BackfillBatchError {
+    message: String,
+    /// True when the peer's response (or its absence) is what failed.
+    blames_peer: bool,
+}
+
+impl BackfillBatchError {
+    /// The peer's response was missing, malformed, unverifiable, or too slow.
+    fn peer(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blames_peer: true,
+        }
+    }
+
+    /// Our own state moved under the batch; the peer is not implicated.
+    fn ours(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blames_peer: false,
+        }
+    }
+}
+
+impl std::fmt::Display for BackfillBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+// Bare `?`/`ok_or` sites in the batch are peer-response failures; the handful
+// that are ours are constructed explicitly with `BackfillBatchError::ours`.
+impl From<String> for BackfillBatchError {
+    fn from(message: String) -> Self {
+        Self::peer(message)
+    }
+}
+
+impl From<&str> for BackfillBatchError {
+    fn from(message: &str) -> Self {
+        Self::peer(message)
+    }
+}
+
+/// Pure scoring arithmetic for one backfill batch: given the cursor before the
+/// batch, the cursor after it, the block count the batch REQUESTED, and how
+/// long it took, return the peer's throughput in milliblocks per second — or
+/// `None` when the measurement is void and must not be scored.
+///
+/// The cursor delta is the only honest numerator: it advances exactly by the
+/// verified, receipt-checked blocks that were committed, which is what a
+/// truncated serve shortens. Dividing by elapsed time is what makes scores
+/// comparable across peers, and what stops a fully-served but inherently SHORT
+/// final batch from reading as a truncation.
+///
+/// A batch runs across awaits, so a concurrent config swap or snapshot import
+/// can move the cursor either way, and neither direction is the peer's
+/// throughput: upward underflows (scoring a good batch as a failure), downward
+/// yields a delta of millions (pinning the rank to that address). A batch can
+/// never apply more than it requested, so `applied > requested` is the tell.
+/// Rejecting it also restores the bound the multiply below relies on.
+fn backfill_batch_rate(
+    cursor_before: u64,
+    cursor_after: Option<u64>,
+    requested: u64,
+    elapsed: std::time::Duration,
+) -> Option<u64> {
+    let applied = cursor_before.checked_sub(cursor_after?)?;
+    if applied > requested {
+        return None;
+    }
+    // Milliblocks per second: integer math with enough resolution to separate
+    // peers (applied ≤ requested ≤ 1023, so ×1e6 cannot overflow), and a floor
+    // of 1ms so a sub-millisecond batch cannot divide by zero.
+    let ms = (elapsed.as_millis() as u64).max(1);
+    Some(applied.saturating_mul(1_000_000) / ms)
+}
+
+/// One peer's last backfill measurement: what it achieved, and when it last
+/// had a turn.
+///
+/// The `round` is not bookkeeping — it is what makes the exploration round's
+/// recovery guarantee per-PEER rather than per-pool-position. See
+/// [`rank_backfill_peers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerServeScore {
+    /// Last batch throughput in milliblocks/sec. A peer-attributable failure
+    /// (see `BackfillBatchError::blames_peer`) records 0; note the converse
+    /// does not hold — an extremely slow success rounds to 0 as well. Both
+    /// rank the same (dead last), which is the honest answer for both.
+    rate: u64,
+    /// The backfill round this peer was last TRIED in — the staleness clock the
+    /// exploration round promotes on. Updated on every attempt that reaches a
+    /// verdict about this peer, INCLUDING one that failed for reasons of ours
+    /// (which leaves `rate` alone — see
+    /// [`ElReader::log_index_note_peer_tried`]); a frozen clock would let one
+    /// peer capture every exploration round.
+    round: u64,
+}
+
+/// How often the backfill promotes the stalest measurement over the scores.
+///
+/// Truncation is a property of the peer AND the range — a peer that truncated
+/// on a candidate-dense stretch may serve the next stretch in full — so a
+/// purely greedy order would strand a peer on one bad batch forever. 16 keeps
+/// the exploration cost at 1 round in 16 (~6%).
+///
+/// Recovery is per-PEER: each exploration round promotes the STALEST
+/// measurement, so a demoted peer's wait is bounded by how many peers carry an
+/// older measurement than it — at worst `RESAMPLE_EVERY × pool_len` rounds. For
+/// the 12-peer gnosis pool that is ~192 rounds — a few minutes in max-speed
+/// mode, ~19 minutes at the nice-mode 6s tick. Lowering the constant buys faster
+/// recovery at a proportional throughput cost; it is deliberately tuned for the
+/// max-speed backfill, which is the mode that does the long walks.
+const RESAMPLE_EVERY: u64 = 16;
+
+/// Pure ranking for [`ElReader::log_index_backfill_peer_order`]: given the
+/// pool's peer addresses (in pool order) and the last-batch score for each,
+/// return the indices to try, best first.
+///
+/// Order: never-sampled peers first (a fresh dial must be tried before the
+/// ranking can mean anything — that is how a better peer is discovered), then
+/// by throughput descending, ties keeping pool order.
+///
+/// Every [`RESAMPLE_EVERY`]-th round is an EXPLORATION round: the peer whose
+/// measurement is STALEST is promoted over its score, so a demoted peer gets a
+/// turn on a range that may suit it. The round loop stops at the first peer
+/// that serves, so an exploration round only ever re-measures whichever peer it
+/// puts in front — leaving the ranking alone would re-measure only the current
+/// best, and a demoted peer could never recover.
+///
+/// Staleness is keyed on the ADDRESS, not on a pool position. Rotating
+/// positions instead is what an earlier revision did, and it cannot deliver the
+/// per-peer guarantee: `snap_peers()` returns the pool newest-dialed first, so
+/// every dial or drop shifts the peers below it by one and `% n` changes
+/// modulus with the pool size — over the ~192 rounds it takes to cycle a
+/// 12-peer pool, the peer at a given position is not the peer that was there
+/// when the cycle started. Keyed on the address, a demoted peer is re-measured
+/// no matter how the pool churns around it. (Ties on the clock still break by
+/// pool index, so co-measured peers — every peer one round touched shares a
+/// clock — are ordered by a position that churn can move. That only reorders
+/// peers that are equally fresh, so it cannot starve one.)
+///
+/// Unmeasured peers are never PROMOTED — there is nothing to refresh — but the
+/// promotion does move one measured peer in front of them for that round.
+fn rank_backfill_peers(
+    addrs: &[std::net::SocketAddr],
+    scores: &std::collections::HashMap<std::net::SocketAddr, PeerServeScore>,
+    round: u64,
+) -> Vec<usize> {
+    let n = addrs.len();
+    if n < 2 {
+        return (0..n).collect();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    // Stable sort: equal keys keep pool order, so this is a refinement of the
+    // existing behavior rather than a reshuffle.
+    order.sort_by_key(|&i| match scores.get(&addrs[i]) {
+        None => (0u8, 0u64, i),
+        Some(s) => (1u8, u64::MAX - s.rate, i),
+    });
+    if round % RESAMPLE_EVERY == 0 {
+        // Only the LEAD ignores the scores — the tail stays ranked, so if the
+        // promoted peer fails, the round falls back to the best remaining peer
+        // instead of walking pool order through known-bad ones.
+        //
+        // Ties on `round` break by pool index, so the choice is deterministic.
+        let stalest = order
+            .iter()
+            .copied()
+            .filter_map(|i| scores.get(&addrs[i]).map(|s| (s.round, i)))
+            .min();
+        if let Some((_, lead)) = stalest {
+            if let Some(at) = order.iter().position(|&i| i == lead) {
+                order[..=at].rotate_right(1);
+            }
+        }
+    }
+    order
+}
+
 /// Pure truncation arithmetic for one backfill candidate chunk: given the
 /// chunk's block numbers (descending) and how many bodies/receipts the peer
 /// actually served, return `(usable, stop_below)` — the verified-prefix
@@ -5700,6 +6122,428 @@ mod bridge_plan_tests {
         assert!(bridge_candidate_chunk(&p, 2, 64, 64).is_empty());
         assert!(bridge_candidate_chunk(&p, 9, 64, 64).is_empty());
         assert!(bridge_candidate_chunk(&[], 0, 64, 64).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backfill_peer_rank_tests {
+    use super::{rank_backfill_peers, PeerServeScore, RESAMPLE_EVERY};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    fn addr(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:30303").parse().unwrap()
+    }
+
+    /// A measurement taken in round 0 — for the tests where only the rate is
+    /// under test, so every peer is equally stale.
+    fn sc(rate: u64) -> PeerServeScore {
+        PeerServeScore { rate, round: 0 }
+    }
+
+    /// A measurement with an explicit staleness clock.
+    fn sc_at(rate: u64, round: u64) -> PeerServeScore {
+        PeerServeScore { rate, round }
+    }
+
+    /// A non-resample round, so the ranking is actually applied.
+    const R: u64 = 1;
+
+    #[test]
+    fn unscored_peers_are_sampled_before_scored_ones() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(1), sc(1023));
+        scores.insert(addr(3), sc(62));
+        // #2 has never been tried: it must be tried first, even though #1 is a
+        // known-generous server. Otherwise a better peer is never discovered.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn faster_peers_outrank_slower_ones() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // The observed gnosis failure: the pool lists the stingy peer FIRST
+        // (newest dial), and it "succeeds" every round with a truncated batch.
+        scores.insert(addr(1), sc(62_000));
+        scores.insert(addr(2), sc(1_023_000));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+    }
+
+    /// The scores are RATES, so a peer that serves fewer blocks per batch but
+    /// serves them faster must win. Scoring raw block counts got this backwards
+    /// — the whole point of the change is throughput, not generosity.
+    #[test]
+    fn a_small_fast_batch_outranks_a_large_slow_one() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // 1023 blocks in 40s = ~25 blk/s.
+        scores.insert(addr(1), sc(1023 * 1_000_000 / 40_000));
+        // 300 blocks in 1s = 300 blk/s.
+        scores.insert(addr(2), sc(300 * 1_000_000 / 1_000));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+    }
+
+    #[test]
+    fn failed_peers_sort_last_but_are_not_dropped() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(1), sc(0)); // failed last round
+        scores.insert(addr(2), sc(500_000));
+        scores.insert(addr(3), sc(900_000));
+        // Sorted worst-last, and the failed peer is still IN the list: ranking
+        // never gates a peer out, because a peer that fails one range may be
+        // the only one holding the next.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![2, 1, 0]);
+    }
+
+    /// Equal scores must not reshuffle the pool: the ranking is a refinement of
+    /// the pool's own order, so an all-equal pool is a no-op. Written against a
+    /// pool whose ranked order would differ from pool order if the sort were
+    /// unstable or the tie-break inverted.
+    #[test]
+    fn ties_keep_pool_order() {
+        let addrs = [addr(7), addr(3), addr(9), addr(1)];
+        let mut scores = HashMap::new();
+        for a in &addrs {
+            scores.insert(*a, sc(1_023_000));
+        }
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn exploration_rounds_ignore_scores_so_a_demoted_peer_can_recover() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // The demoted peer's measurement is the older one — nobody has
+        // re-tried it since, which is precisely why it is still demoted.
+        scores.insert(addr(1), sc_at(62_000, 3));
+        scores.insert(addr(2), sc_at(1_023_000, 9));
+        // Ranked on ordinary rounds...
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+        // ...but every RESAMPLE_EVERY-th round promotes the stalest measurement
+        // over its score, so the demoted peer gets a turn on a range that may
+        // suit it — an order the score-based ranking would never produce.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![0, 1]
+        );
+    }
+
+    /// The round loop stops at the FIRST peer that serves, so an exploration
+    /// round only ever re-measures whichever peer it puts in front. Leaving the
+    /// ranking alone would re-measure only the current best, and a demoted peer
+    /// could never recover. Driving the loop the way the backfill does — the
+    /// promoted peer gets measured, so its clock becomes current — every peer
+    /// must get a turn, and no peer may be starved.
+    #[test]
+    fn every_demoted_peer_is_eventually_re_measured() {
+        let addrs: Vec<SocketAddr> = (1..=5).map(addr).collect();
+        let mut scores = HashMap::new();
+        for (i, a) in addrs.iter().enumerate() {
+            // All demoted, all stale: only exploration can rescue them.
+            scores.insert(*a, sc_at(1, i as u64));
+        }
+        let mut leads = Vec::new();
+        for k in 1..=addrs.len() as u64 {
+            let round = k * RESAMPLE_EVERY;
+            let lead = rank_backfill_peers(&addrs, &scores, round)[0];
+            leads.push(lead);
+            // The backfill measures whoever led, which refreshes its clock —
+            // so the NEXT exploration round must pick somebody else.
+            scores.insert(addrs[lead], sc_at(1, round));
+        }
+        // Every peer led exactly once: nobody is starved, and nobody is
+        // re-measured twice while another peer is still waiting.
+        leads.sort_unstable();
+        assert_eq!(leads, (0..addrs.len()).collect::<Vec<_>>());
+    }
+
+    /// Pins the obligation the ranking places on its CALLER: a promoted peer's
+    /// clock must be refreshed on every attempt that reaches a verdict about
+    /// it, including one that failed for reasons of ours. Left frozen, that
+    /// peer stays `min()` forever and captures every exploration round, so no
+    /// other demoted peer is ever re-measured — the guarantee the rotation
+    /// exists to provide. `log_index_note_peer_tried` is what discharges this;
+    /// this test is what says why it may not be deleted.
+    #[test]
+    fn a_frozen_clock_would_capture_every_exploration_round() {
+        let addrs: Vec<SocketAddr> = (1..=4).map(addr).collect();
+        let mut scores = HashMap::new();
+        for (i, a) in addrs.iter().enumerate() {
+            scores.insert(*a, sc_at(1, 10 + i as u64));
+        }
+        // addr(1) is the stalest and its clock is never refreshed.
+        let frozen = 0;
+        for k in 1..=4u64 {
+            let lead = rank_backfill_peers(&addrs, &scores, k * RESAMPLE_EVERY)[0];
+            assert_eq!(lead, frozen, "round {k}: the frozen peer must keep winning");
+            // Refresh EVERY OTHER peer, as a served or attributably-failed
+            // round would; only the frozen one is skipped.
+            for (i, a) in addrs.iter().enumerate() {
+                if i != frozen {
+                    scores.insert(*a, sc_at(1, k * RESAMPLE_EVERY));
+                }
+            }
+        }
+        // Refreshing it — what the caller must do — hands the turn on.
+        scores.insert(addrs[frozen], sc_at(1, 5 * RESAMPLE_EVERY));
+        let lead = rank_backfill_peers(&addrs, &scores, 6 * RESAMPLE_EVERY)[0];
+        assert_ne!(lead, frozen, "a refreshed clock must release the promotion");
+    }
+
+    /// The staleness clock is keyed on the ADDRESS, so the guarantee above is
+    /// per-PEER and survives pool churn. Rotating pool POSITIONS — what an
+    /// earlier revision did — cannot: `snap_peers()` lists newest-dialed first,
+    /// so a single dial or drop shifts every peer below it and silently hands
+    /// the promotion to a different peer than the cycle was walking toward.
+    #[test]
+    fn the_promoted_peer_follows_the_address_not_the_pool_position() {
+        let stale = addr(9);
+        let mut scores = HashMap::new();
+        scores.insert(stale, sc_at(1, 0)); // stalest
+        scores.insert(addr(1), sc_at(900_000, 7));
+        scores.insert(addr(2), sc_at(500_000, 8));
+        // Same three peers, three different pool orders (a dial or a drop
+        // reorders them). The promoted peer must be `stale` every time.
+        for pool in [
+            [stale, addr(1), addr(2)],
+            [addr(1), stale, addr(2)],
+            [addr(1), addr(2), stale],
+        ] {
+            let lead = rank_backfill_peers(&pool, &scores, RESAMPLE_EVERY)[0];
+            assert_eq!(pool[lead], stale, "pool {pool:?} promoted the wrong peer");
+        }
+    }
+
+    #[test]
+    fn is_a_permutation_of_the_pool_for_any_score_shape() {
+        let addrs: Vec<SocketAddr> = (1..=8).map(addr).collect();
+        for shape in 0..64u64 {
+            let mut scores = HashMap::new();
+            for (i, a) in addrs.iter().enumerate() {
+                if shape >> (i % 6) & 1 == 1 {
+                    // Vary the staleness clock too, so exploration rounds are
+                    // exercised against every shape of tie and gap.
+                    scores.insert(
+                        *a,
+                        sc_at((shape * 7 + i as u64) % 1024, (shape + i as u64) % 5),
+                    );
+                }
+            }
+            for round in 0..(RESAMPLE_EVERY + 2) {
+                let mut order = rank_backfill_peers(&addrs, &scores, round);
+                order.sort_unstable();
+                // No peer dropped, none duplicated — the round still tries the
+                // whole pool, only the order changes.
+                assert_eq!(order, (0..addrs.len()).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// An exploration round promotes ONE peer; the rest stays ranked, so a
+    /// failing lead falls back to the best remaining peer rather than walking
+    /// pool order through known-bad ones.
+    #[test]
+    fn exploration_keeps_the_tail_ranked_behind_the_promoted_peer() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        // Best, failed-last-round (and stalest), and middling respectively.
+        scores.insert(addr(1), sc_at(900_000, 5));
+        scores.insert(addr(2), sc_at(0, 2));
+        scores.insert(addr(3), sc_at(500_000, 6));
+        // Ordinary round: ranked, best first.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 2, 1]);
+        // Exploration round promotes the failed peer (its measurement is the
+        // stalest): it leads, but the remainder is still ranked — 0 before 2,
+        // NOT pool order.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![1, 0, 2]
+        );
+    }
+
+    /// An exploration round with nothing measured must not misfire — there is
+    /// no measurement to promote. Guards the `.min()` / rotate path against a
+    /// panic or an accidental reshuffle on an all-unmeasured pool.
+    #[test]
+    fn an_exploration_round_with_no_measurements_is_a_no_op() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let scores = HashMap::new();
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// The discriminator between "promote the stalest" and "promote the worst".
+    /// Every other exploration test has its stalest peer ALSO holding the worst
+    /// rate, so they all pass under either rule. Here the stalest peer is the
+    /// FASTEST one: promoting by rate would leave it where the ranking already
+    /// put it and re-measure the slowest peer instead, so a stale best-rate
+    /// score could never be refreshed and would pin the ranking indefinitely.
+    #[test]
+    fn exploration_promotes_the_stalest_even_when_it_is_the_fastest() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        // middling/fresh, worst/freshest, and BEST/stalest respectively.
+        scores.insert(addr(1), sc_at(500_000, 40));
+        scores.insert(addr(2), sc_at(10_000, 41));
+        scores.insert(addr(3), sc_at(900_000, 2));
+        // Ordinary round ranks by rate: best (2), middling (0), worst (1).
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![2, 0, 1]);
+        // The exploration round must promote the stale best (index 2), not the
+        // worst (index 1). Here that coincides with the ranking's own lead, so
+        // assert the whole order is untouched rather than just the head.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![2, 0, 1]
+        );
+        // Make the stale-best peer sort LAST on rate, so promotion is visible:
+        // it must still lead, ahead of two better-rated but fresher peers.
+        scores.insert(addr(3), sc_at(1, 2));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1, 2]);
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![2, 0, 1]
+        );
+    }
+
+    /// A measured peer's promotion outranks an unmeasured one for that round.
+    /// Documented rather than incidental: an unmeasured peer normally sorts
+    /// first, and exploration is the one round where it does not.
+    #[test]
+    fn exploration_promotes_a_measured_peer_ahead_of_an_unmeasured_one() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(2), sc_at(900_000, 0));
+        // Ordinary round: the unmeasured peer leads.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1]);
+        // Exploration round: the stale measurement is refreshed first. The
+        // unmeasured peer is not dropped — it is next, and leads again the very
+        // next round.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn degenerate_pools_are_returned_untouched() {
+        let scores = HashMap::new();
+        assert_eq!(rank_backfill_peers(&[], &scores, R), Vec::<usize>::new());
+        assert_eq!(rank_backfill_peers(&[addr(1)], &scores, R), vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod backfill_batch_rate_tests {
+    use super::backfill_batch_rate;
+    use std::time::Duration;
+
+    /// The walk descends, so the cursor DROPS by the blocks applied.
+    #[test]
+    fn scores_blocks_applied_per_second() {
+        // 1000 blocks in 2s = 500 blk/s = 500_000 milliblocks/s.
+        let r = backfill_batch_rate(1_000_000, Some(999_000), 1023, Duration::from_secs(2));
+        assert_eq!(r, Some(500_000));
+    }
+
+    /// The point of the rate: fewer blocks served faster must win. Scoring raw
+    /// block counts ranked these the wrong way round.
+    #[test]
+    fn a_short_fast_batch_outscores_a_long_slow_one() {
+        let slow = backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(40));
+        let fast = backfill_batch_rate(1_000_000, Some(999_700), 1023, Duration::from_secs(1));
+        assert!(fast > slow, "fast={fast:?} should outscore slow={slow:?}");
+    }
+
+    /// A short FINAL batch, fully served, must not read as a truncation — the
+    /// rate is what makes it comparable to a full-size batch.
+    #[test]
+    fn a_fully_served_short_final_batch_scores_like_a_fast_peer() {
+        // 40 blocks requested, all 40 served, in 100ms = 400 blk/s.
+        let r = backfill_batch_rate(31_305_696, Some(31_305_656), 40, Duration::from_millis(100));
+        assert_eq!(r, Some(400_000));
+        // Comfortably ahead of a full 1023-block batch that took 40s (~25 blk/s).
+        let slow = backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(40));
+        assert!(r > slow);
+    }
+
+    /// A concurrent config swap can install a HIGHER cursor. Saturating that to
+    /// zero would score a peer that just served a full batch as a failure.
+    #[test]
+    fn an_upward_cursor_move_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(1_000_000, Some(1_200_000), 1023, Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// A snapshot import installs its own cursor wholesale, which can be far
+    /// BELOW the walk's. That delta is not throughput — unrejected it would be
+    /// orders of magnitude above any real score and pin the rank to whichever
+    /// peer happened to be in flight.
+    #[test]
+    fn an_implausible_delta_beyond_the_request_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(35_000_000, Some(31_305_656), 1023, Duration::from_secs(1)),
+            None
+        );
+        // The boundary itself is legitimate: a batch may apply exactly what it
+        // requested.
+        assert_eq!(
+            backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(1)),
+            Some(1_023_000)
+        );
+    }
+
+    #[test]
+    fn a_missing_cursor_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(1_000_000, None, 1023, Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// Sub-millisecond batches must not divide by zero.
+    #[test]
+    fn a_sub_millisecond_batch_does_not_divide_by_zero() {
+        let r = backfill_batch_rate(1_000_000, Some(999_900), 1023, Duration::from_nanos(1));
+        assert_eq!(r, Some(100 * 1_000_000));
+    }
+}
+
+#[cfg(test)]
+mod backfill_batch_error_tests {
+    use super::BackfillBatchError;
+
+    /// The ranking scores a failure as zero, so misfiling one of OUR failures
+    /// as the peer's demotes a good server for our own bookkeeping.
+    #[test]
+    fn blame_is_explicit_in_both_directions() {
+        assert!(BackfillBatchError::peer("peer returned no headers").blames_peer);
+        assert!(!BackfillBatchError::ours("index changed mid-batch").blames_peer);
+    }
+
+    /// The blanket `From` impls exist so bare `?` sites in the batch stay
+    /// terse. They default to PEER, which is right for peer-response failures
+    /// but is exactly why our own failures must be constructed explicitly.
+    #[test]
+    fn bare_conversions_default_to_blaming_the_peer() {
+        let from_owned: BackfillBatchError = String::from("peer timed out").into();
+        let from_borrowed: BackfillBatchError = "peer timed out".into();
+        assert!(from_owned.blames_peer);
+        assert!(from_borrowed.blames_peer);
+    }
+
+    #[test]
+    fn display_is_the_message() {
+        assert_eq!(
+            BackfillBatchError::ours("walk reset").to_string(),
+            "walk reset"
+        );
     }
 }
 
