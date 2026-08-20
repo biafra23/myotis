@@ -613,9 +613,19 @@ pub struct ElReader {
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
-    /// Last backfill checkpoint write — throttles the full-index persist
-    /// (see the step's PERSIST_MIN_INTERVAL).
-    log_index_last_persist: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Throttles the full-index checkpoint: when the file on disk last became
+    /// current, and what it weighed. See [`PersistClock`].
+    log_index_persist: PersistClock,
+    /// Serializes CHECKPOINT WRITES to `log_index_path` against each other,
+    /// spanning serialize→rename. `log_index` used to do this by accident:
+    /// every writer held it across the whole write. Now that the fsync happens
+    /// outside it, something has to keep two checkpoints from interleaving —
+    /// otherwise the bytes that land last are not necessarily the newest, and
+    /// an older snapshot silently renames over a newer one.
+    ///
+    /// LOCK ORDER: acquired BEFORE `log_index`, never after. Every site that
+    /// writes the canonical `.db` takes it at the top of the function.
+    log_index_write: std::sync::Mutex<()>,
     /// Adaptive chunk-pipeline depth signal: true after an untruncated batch
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
@@ -820,7 +830,8 @@ impl ElReader {
             log_index_rate: std::sync::Mutex::new(None),
             log_index_bridge: std::sync::Mutex::new(None),
             log_index_tail: std::sync::Mutex::new(Vec::new()),
-            log_index_last_persist: std::sync::Mutex::new(None),
+            log_index_persist: PersistClock::new(),
+            log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
             log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
@@ -846,6 +857,12 @@ impl ElReader {
     /// frontiers at different heights would wedge the appender.
     /// Returns false (and installs nothing) for an invalid config
     /// (duplicate watch addresses).
+    ///
+    /// BLOCKS while another writer holds the checkpoint lock — an import
+    /// merging GBs is the worst case, and it is unbounded from here. That
+    /// covers even the fast path that writes nothing, because the branch
+    /// decision needs the index lock and taking the checkpoint lock after it
+    /// would invert the order. Hosts should not call this on a UI thread.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
         let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
@@ -858,6 +875,12 @@ impl ElReader {
             }
         };
         let tag = self.chain_tag();
+        // This path checkpoints the outgoing index below; take the checkpoint
+        // lock BEFORE the index lock so it can never race (or invert) with a
+        // periodic checkpoint. See `log_index_write` for the ordering rule.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return false;
+        };
         let Ok(mut slot) = self.log_index.lock() else {
             return false;
         };
@@ -882,17 +905,34 @@ impl ElReader {
             if let Ok(mut t) = self.log_index_tail.lock() {
                 t.clear();
             }
-            if let Some(p) = self.log_index_path.as_deref() {
+            // Whether the file on disk now holds this checkpoint. Best-effort
+            // like the periodic ones, but NOT silent, and not assumed: the
+            // clock below may only start an interval for a write that landed
+            // — crediting a failed one would leave the incoming index's
+            // progress unprotected for a whole interval while the file on
+            // disk is stale or missing.
+            let checkpointed = match self.log_index_path.as_deref() {
                 // Clamped like every other checkpoint: optimistic coverage is
                 // only verifiable against this run's tail record. A zero
                 // finality means no anchor (so nothing optimistic exists) —
                 // clamping there would erase the file.
-                let _ = if finalized_now == 0 {
-                    ix.persist(&tag, p)
-                } else {
-                    ix.persist_clamped(&tag, p, finalized_now)
-                };
-            }
+                Some(p) => {
+                    let r = if finalized_now == 0 {
+                        ix.persist(&tag, p)
+                    } else {
+                        ix.persist_clamped(&tag, p, finalized_now)
+                    };
+                    if let Err(e) = &r {
+                        tracing::warn!(
+                            error = %e,
+                            path = %p.display(),
+                            "could not checkpoint the outgoing log index before replacing it"
+                        );
+                    }
+                    r.is_ok()
+                }
+                None => false,
+            };
             let effective = config.union_with(&ix.config().watch);
             let old = slot.take().expect("checked Some above");
             let fresh = match effective {
@@ -937,7 +977,29 @@ impl ElReader {
                     }
                 }
             };
+            let installed_is_empty = fresh.log_count() == 0;
             *slot = Some(fresh);
+            // The checkpoint above put a full-size file on disk, so it starts
+            // an interval — without one the next appender tick would rewrite
+            // it immediately. Only if it actually landed, though.
+            if checkpointed {
+                if installed_is_empty {
+                    // Size the cadence off the index that is now INSTALLED,
+                    // not off the 238 MB just written. Two branches above
+                    // replace the old index with an EMPTY one (a failed merge,
+                    // a topic conflict), and recording the outgoing size would
+                    // make the first window of a walk that restarted from
+                    // scratch checkpoint every ~238 s — backwards, since a
+                    // small index is exactly when progress is cheapest to
+                    // protect. Zero reads back as the FLOOR, so the interval
+                    // this stamp starts is 10 s; that is the point, not an
+                    // oversight to "fix" into the outgoing file's size.
+                    self.log_index_persist
+                        .wrote(std::time::Instant::now(), Some(0));
+                } else if let Some(p) = self.log_index_path.as_deref() {
+                    self.note_checkpoint_written(p);
+                }
+            }
             reset_rate();
             return true;
         }
@@ -1006,7 +1068,23 @@ impl ElReader {
                 }
             }
         };
+        let installed_is_empty = ix.log_count() == 0;
         *slot = Some(ix);
+        // Boot path: ADOPT the snapshot on disk — it already describes the
+        // index just installed from it, so the first checkpoint of a restarted
+        // daemon is sized, and does not rewrite hundreds of MB byte-identical
+        // but for the header within a tick of launching. See
+        // [`PersistClock::adopted`] for why it still checkpoints at the floor
+        // rather than a full interval later.
+        //
+        // Only when the installed index came off that file: an EMPTY one means
+        // nothing on disk describes it (no snapshot, or one discarded as
+        // foreign/conflicting), so its first coverage must checkpoint promptly.
+        if !installed_is_empty {
+            if let Some(p) = self.log_index_path.as_deref() {
+                self.note_checkpoint_adopted(p);
+            }
+        }
         reset_rate();
         true
     }
@@ -1047,6 +1125,11 @@ impl ElReader {
             ix.set_enabled(true);
             *slot = Some(ix);
         }
+        // Same reason as the boot path in `set_log_index_config`: this installs
+        // an index straight off disk, so without adopting it the first
+        // checkpoint would rewrite the whole file before the cadence learned
+        // what it weighs.
+        self.note_checkpoint_adopted(path);
         tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
         self.ensure_log_index_appender(rt);
     }
@@ -1062,9 +1145,21 @@ impl ElReader {
     /// generator daemon must not bake its own resolutions into a file whose
     /// importers would then never re-resolve (`set_name` fills only empty
     /// names).
+    ///
+    /// BLOCKS while another writer holds the checkpoint lock (an import
+    /// merging GBs is the worst case) — not a UI-thread call.
     pub fn export_log_index(&self, path: &std::path::Path) -> Result<(), String> {
         let tag = self.chain_tag();
         let finalized = self.finalized_block_number();
+        // Nothing stops a caller aiming an export at our own checkpoint path,
+        // and an export STRIPS display names. While the periodic checkpoint
+        // held the index lock across its whole write these two were mutually
+        // exclusive by accident; now that it doesn't, take the checkpoint lock
+        // explicitly — BEFORE the index lock, per `log_index_write` — so the
+        // two writers stay totally ordered instead of renaming over each other.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return Err("log index unavailable".to_string());
+        };
         match self.log_index.lock() {
             Ok(slot) => match slot.as_ref() {
                 Some(ix) => ix
@@ -1092,6 +1187,10 @@ impl ElReader {
     ///
     /// Importing enables the index (it is the opt-in, explicitly) and leaves
     /// the pacing bit as it was.
+    ///
+    /// BLOCKS for the whole checkpoint→merge→write sequence — GBs, on the
+    /// checkpoint lock and then the index lock — so it is not a UI-thread
+    /// call, and neither an export nor a config push can proceed during it.
     pub fn import_log_index(&self, paths: &[std::path::PathBuf]) -> Result<(), String> {
         let Some(own_path) = self.log_index_path.clone() else {
             return Err("this node runs without a log-index path (no data dir)".to_string());
@@ -1114,6 +1213,14 @@ impl ElReader {
         if sources.is_empty() {
             return Err("no files given".to_string());
         }
+        // Held for the whole checkpoint→read→merge→write sequence, BEFORE the
+        // index lock (see `log_index_write`). Without it a periodic checkpoint
+        // can land between the checkpoint below and the merged write, and the
+        // merge would silently drop whatever it recorded — or rename over the
+        // merged result afterwards, discarding the import from disk entirely.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return Err("log index unavailable".to_string());
+        };
         // Checkpoint the live index (finality-clamped, v2) and merge THROUGH
         // THE FILE rather than cloning the live store: the store is fully
         // resident and can be GBs — a clone would double it under the lock.
@@ -1186,6 +1293,7 @@ impl ElReader {
         merged
             .persist(&tag, &own_path)
             .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
+        self.note_checkpoint_written(&own_path);
         match self.log_index.lock() {
             Ok(mut slot) => {
                 // Bridge/tail/rate describe the OLD coverage shape. Cleared
@@ -1361,8 +1469,7 @@ impl ElReader {
     async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
-        if *since_persist >= 64 {
-            self.persist_log_index(self.finalized_block_number());
+        if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
@@ -1441,11 +1548,25 @@ impl ElReader {
             if !appended {
                 return;
             }
-            *since_persist += 1;
+            *since_persist = since_persist.saturating_add(1);
         }
-        // Checkpoint roughly every 64 appended blocks (best-effort).
-        if *since_persist >= 64 {
-            self.persist_log_index(self.finalized_block_number());
+        // Checkpoint roughly every 64 appended blocks (best-effort) — but on
+        // the SAME size-aware throttle as the walker and the bridge. The block
+        // count alone is not a bound on the write rate: catching up after a
+        // gap applies 16 blocks per 6 s tick, so 64 blocks arrive every ~24 s
+        // whatever the index weighs — a full rewrite of a 238 MB file at
+        // ~10 MiB/s, which is the exact pathology `persist_interval` exists to
+        // stop. The counter is NOT reset unless a checkpoint actually LANDED:
+        // it is the "there is work to record" flag, and both ways a checkpoint
+        // can be dropped — the throttle deferring it, and `persist_log_index`
+        // skipping on write-lock contention — must delay it, not discard it.
+        // A discarded one waits for the next 64 blocks — ~24 s while catching
+        // up, but as long as ~13 minutes at 12 s blocks once the append edge
+        // is at the head and each tick applies one block. (The tail tick
+        // checkpoints on the same throttle, so a head-following node is
+        // covered in practice; the counter still must not be cleared for a
+        // write that did not happen.)
+        if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
     }
@@ -1762,9 +1883,7 @@ impl ElReader {
         }
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
-            if self.log_index_persist_due() {
-                self.persist_log_index(finalized);
-            }
+            self.persist_log_index(finalized, true);
         }
     }
 
@@ -1787,22 +1906,133 @@ impl ElReader {
     /// coverage it can never re-check — and once finality moves past those
     /// blocks, nothing would ever rewind them (they would look immutable
     /// while possibly being orphaned).
-    fn persist_log_index(&self, finalized: u64) {
-        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-            if let Some(ix) = slot.as_ref() {
-                let tag = self.chain_tag();
-                if finalized == 0 {
-                    // No beacon anchor yet. There is no optimistic coverage to
-                    // clamp either (the tail only runs below a real finality),
-                    // and clamping AT ZERO would rewind the whole index and
-                    // rename an empty file over a good checkpoint — losing, on
-                    // a phone, months of backfill. Write it as it stands.
-                    let _ = ix.persist(&tag, path);
-                } else {
-                    let _ = ix.persist_clamped(&tag, path, finalized);
-                }
-            }
+    ///
+    /// Returns whether a checkpoint was actually WRITTEN. Callers use it to
+    /// decide whether their "there is work to record" flag may be cleared —
+    /// clearing it for a checkpoint that never happened drops the work rather
+    /// than deferring it.
+    ///
+    /// OWNS THE THROTTLE, decision and write together: with
+    /// `respect_throttle`, [`PersistClock::is_due`] is consulted HERE, under
+    /// the checkpoint lock, never by the caller. Two writers genuinely race —
+    /// the backfill step runs outside `log_index_drive`, and a host thread can
+    /// drive the tail on the getLogs path — and a caller that asked "is it
+    /// due?" before the other one wrote would get its "yes" honoured after,
+    /// rewriting the whole file back to back. The lock is what makes the
+    /// decision and the write it authorizes inseparable; a pure read outside
+    /// it is not a claim.
+    ///
+    /// Pass `false` for the two once-per-event writes that are exempt by
+    /// design (`stop`, a head bridge's FINAL slice).
+    ///
+    /// The clock advances on the two outcomes that actually cost a write — a
+    /// successful checkpoint and a failed one — and on nothing else, so "a
+    /// full-size write resets the interval" holds whichever path forced it.
+    /// The paths that replace the file wholesale (config push, import merge)
+    /// and the ones that adopt a file already on disk stamp the same clock via
+    /// [`Self::note_checkpoint_written`] / [`Self::note_checkpoint_adopted`].
+    fn persist_log_index(&self, finalized: u64, respect_throttle: bool) -> bool {
+        let Some(path) = self.log_index_path.as_deref() else {
+            return false;
+        };
+        // Held across serialize→rename so checkpoints are totally ordered:
+        // the bytes that land last are the newest. Taken BEFORE the index
+        // lock — see `log_index_write`.
+        //
+        // TRY-lock, because the other holders are slow and this one is
+        // best-effort: an import merges GBs under it, and blocking here would
+        // stall the appender tick and every getLogs that needs a head advance
+        // for the whole merge — the exact stall this change exists to remove,
+        // moved rather than fixed. Skipping instead costs nothing: the writer
+        // holding the lock is writing a NEWER snapshot than this one would.
+        let Ok(_writing) = self.log_index_write.try_lock() else {
+            // Clock deliberately UNTOUCHED: nothing was written, so no interval
+            // started, so the next tick is due again immediately. Writing to it
+            // here — in either direction — is the bug: stamping would charge a
+            // full interval for a checkpoint that never happened, and clearing
+            // would race the holder that is stamping it as we look (it may be
+            // finishing its write right now), discarding a fresh interval and
+            // forcing the duplicate full rewrite this whole change removes.
+            return false;
+        };
+        // The throttle, consulted under the lock — see this function's doc.
+        // Before any serialize: a deferred checkpoint must cost nothing.
+        if respect_throttle && !self.log_index_persist.is_due() {
+            return false;
         }
+        // Serialize under the index lock — it reads the whole store — but do
+        // the write and the FSYNC outside it. On a multi-hundred-MB index the
+        // fsync dominates the checkpoint by orders of magnitude, and holding
+        // the index mutex across it stalls the appender, the backfill walker
+        // and every getLogs query for the whole duration.
+        let bytes = {
+            let Ok(slot) = self.log_index.lock() else {
+                return false;
+            };
+            let Some(ix) = slot.as_ref() else {
+                return false;
+            };
+            checkpoint_bytes(ix, &self.chain_tag(), finalized)
+        };
+        // Best-effort, but not SILENT. A checkpoint that fails every time —
+        // ENOSPC is the likely cause, and the one this size-aware cadence
+        // makes rarer but not impossible — now costs up to PERSIST_MAX_INTERVAL
+        // of walk per crash instead of ten seconds, and would otherwise leave
+        // no trace of why. Same reasoning as the tail: a silently broken
+        // checkpoint is the wrong failure shape.
+        if let Err(e) = crate::el::logindex::write_atomic(path, &bytes) {
+            tracing::warn!(
+                error = %e,
+                bytes = bytes.len(),
+                path = %path.display(),
+                "log index checkpoint failed; a crash now costs the walk since the last good one"
+            );
+            // Both halves of the clock advance on failure too: the serialize
+            // and the write attempt cost the same as a successful one, and
+            // leaving it alone would turn a persistent failure (ENOSPC) into a
+            // retry every tick — 238 MB serialized and pushed at the disk
+            // every 6 s, which is worse than the pathology being fixed. It
+            // retries on the ordinary cadence instead.
+            self.log_index_persist
+                .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
+            return false;
+        }
+        // The bytes are on disk — start the next interval HERE, whatever made
+        // this write happen, and size it by what this one cost. The
+        // unthrottled writers (a completing head bridge, `stop`) go through
+        // this same line, so one of them can no longer be followed immediately
+        // by a throttled checkpoint that is measuring from a stale stamp.
+        self.log_index_persist
+            .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
+        true
+    }
+
+    /// A full-size file was just WRITTEN to `path` by a path that does not go
+    /// through [`Self::persist_log_index`] — the config push and the import
+    /// merge, which write through `LogIndex::persist` (it serializes
+    /// internally, so the size has to be read back off the file).
+    ///
+    /// Both halves matter. Without the size, the first checkpoint after
+    /// importing a multi-GB snapshot would fire at the small index's interval.
+    /// Without the stamp, the write just done would not start an interval, so
+    /// the very next appender tick would rewrite the same multi-GB file — the
+    /// "two full rewrites back to back" this throttle exists to stop, on the
+    /// path where the file is largest.
+    ///
+    /// Only call this for a write that LANDED: crediting a failed one leaves
+    /// the installed index unprotected for a whole interval while the file on
+    /// disk is stale or missing.
+    fn note_checkpoint_written(&self, path: &std::path::Path) {
+        self.log_index_persist
+            .wrote(std::time::Instant::now(), file_len(path));
+    }
+
+    /// An index was installed straight off the file at `path`, which therefore
+    /// already describes it — nothing was written. See
+    /// [`PersistClock::adopted`].
+    fn note_checkpoint_adopted(&self, path: &std::path::Path) {
+        self.log_index_persist
+            .adopted(std::time::Instant::now(), file_len(path));
     }
 
     /// The chain identity stamped into (and demanded of) every log-index
@@ -1823,21 +2053,6 @@ impl ElReader {
         self.with_log_index(|ix| ix.append_edge())
             .flatten()
             .map(|edge| edge.saturating_sub(1))
-    }
-
-    /// True when a full-index checkpoint is due (and claims the slot). The
-    /// persist is a whole-file rewrite under the index lock, so both the
-    /// backfill and the bridge share this throttle.
-    fn log_index_persist_due(&self) -> bool {
-        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        self.log_index_last_persist.lock().is_ok_and(|mut t| {
-            if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
-                *t = Some(std::time::Instant::now());
-                true
-            } else {
-                false
-            }
-        })
     }
 
     /// Drop any in-progress bridge plan (the gap closed, or the premises it
@@ -2178,9 +2393,19 @@ impl ElReader {
             let done = plan.applied >= total;
             // Checkpoint on the same throttle the backfill uses — the persist
             // is a full-index rewrite, and bridging can apply thousands of
-            // blocks per tick. Always checkpoint the final slice.
-            if applied_this_tick > 0 && (done || self.log_index_persist_due()) {
-                self.persist_log_index(self.finalized_block_number());
+            // blocks per tick. The FINAL slice always writes (`!done` waives
+            // the throttle): head-follow resumes after it, and the plan is
+            // dropped, so nothing else would record it.
+            //
+            // That write is off-budget, but it stamps the clock like every
+            // other, so the next throttled checkpoint measures its interval
+            // from THIS write. It used to measure from the last throttled one,
+            // which let a bridge completing late in an interval be followed
+            // seconds later by a second full rewrite — the write amplification
+            // this change removes, back again on exactly the
+            // phone-waking-from-sleep path.
+            if applied_this_tick > 0 {
+                self.persist_log_index(self.finalized_block_number(), !done);
             }
             if done {
                 tracing::info!(to = anchor_n, "log index head bridge complete; head-follow resumes");
@@ -2308,11 +2533,12 @@ impl ElReader {
             tokio::task::yield_now().await;
         }
         // Checkpoint at most once per throttle window of progressing steps
-        // (not per batch, not even per step) — see log_index_persist_due; a
-        // crash now costs at most ~10s of batches.
-        let persist_due = any_progress && self.log_index_persist_due();
-        if persist_due {
-            self.persist_log_index(self.finalized_block_number());
+        // (not per batch, not even per step) — `persist_log_index` applies the
+        // throttle itself. The window SCALES WITH THE FILE (10s..600s, see
+        // persist_interval), so a crash costs whatever the walker produced
+        // during one window.
+        if any_progress {
+            self.persist_log_index(self.finalized_block_number(), true);
         }
         // Rolling throughput for the status ETA, measured against WALL CLOCK
         // between progress observations (the anchor persists across idle
@@ -4828,7 +5054,10 @@ impl ElReader {
         }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
-        self.persist_log_index(self.finalized_block_number());
+        // OFF-BUDGET (`respect_throttle = false`) — it is the last write
+        // before the index goes away, and on Android a graceful teardown is
+        // what banks a session whose interval had not elapsed.
+        self.persist_log_index(self.finalized_block_number(), false);
         self.pool.stop().await;
         self.discovery.stop().await;
     }
@@ -6224,6 +6453,175 @@ impl ChunkSizer {
     }
 }
 
+/// Sustained bytes/sec the log-index checkpoints are allowed to write.
+const PERSIST_WRITE_BUDGET_BPS: u64 = 1 << 20; // 1 MiB/s
+/// Never checkpoint more often than this, however small the index.
+const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Never go longer than this between checkpoints, however large. Past this
+/// point the budget is already blown and the only thing left to protect is how
+/// much of the walk a crash would cost.
+const PERSIST_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long to wait between full-index checkpoints, given what the last one
+/// cost to write.
+///
+/// The store is a FULL-REWRITE format: a checkpoint costs its entire size in
+/// bytes written, every time. A FIXED interval therefore makes the write RATE
+/// grow without bound as the index does, which is the wrong quantity to hold
+/// constant. Measured on the Gnosis backfill: a 238 MB index on a flat 10 s
+/// cadence wrote 366 GB across one 6h22m run — a measured 17.8 MiB/s sustained
+/// over the sampled window — for an index that ended at 238 MB. (The flat 10 s
+/// interval is not even the binding constraint at that size: a 238 MB write
+/// takes longer than 10 s, so the next checkpoint was due the moment the
+/// previous one finished and the daemon wrote essentially continuously, at
+/// whatever the disk would take.) On a phone that is not merely I/O, it is
+/// flash wear, and it is why this is worth a policy rather than a constant.
+///
+/// So scale the interval with the size and let the RATE be what stays bounded.
+/// The trade is self-balancing: a longer interval costs a crash more re-walked
+/// blocks, but the amount re-walked is exactly what the walker produced during
+/// one interval — the same work the checkpoint would have been recording.
+///
+/// This bounds the constant. The asymptotics — O(n²) total bytes across a walk
+/// that grows the index linearly — are inherent to full-rewrite checkpoints and
+/// are fixed by the segmented/delta store already recorded as required before
+/// mainnet-scale mobile backfill (docs/eth-getlogs-design.md §Store).
+fn persist_interval(last_bytes: u64) -> std::time::Duration {
+    // div_ceil, not truncating division: rounding the interval DOWN puts the
+    // sustained rate over the budget for every size that isn't a whole
+    // multiple of it (11.5 MiB → 11 s → ~4.5% over). Rounding up is the side
+    // that keeps the invariant the budget names.
+    std::time::Duration::from_secs(last_bytes.div_ceil(PERSIST_WRITE_BUDGET_BPS))
+        .clamp(PERSIST_MIN_INTERVAL, PERSIST_MAX_INTERVAL)
+}
+
+/// A file's size, or None if it cannot be stated. Never a guess: a missing
+/// size must leave the last known one standing, not reset the cadence to the
+/// floor and un-throttle the next write.
+fn file_len(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Whether a checkpoint is due, given when the last one ran and what it cost.
+/// Split out from [`PersistClock`] so the decision — not just the interval it
+/// consults — is testable without a live reader.
+fn persist_due(prev: Option<std::time::Instant>, now: std::time::Instant, last_bytes: u64) -> bool {
+    prev.is_none_or(|p| now.saturating_duration_since(p) >= persist_interval(last_bytes))
+}
+
+/// When the log-index file on disk last became a current checkpoint, and what
+/// it weighed then — the whole state the size-aware throttle runs on.
+///
+/// A checkpoint is a WHOLE-FILE rewrite, so the two live together: the cost of
+/// the next write is what the last one cost, and the interval it earns scales
+/// with it (see [`persist_interval`]).
+///
+/// The one rule: **only a write ends an interval.** [`Self::is_due`] is a pure
+/// read — asking does not consume anything — because the caller may not get to
+/// write (another writer holds the checkpoint lock), and charging a
+/// checkpoint that never happened a full interval throws away up to
+/// [`PERSIST_MAX_INTERVAL`] of walk on a crash. There is no way to un-stamp:
+/// `None` means *nothing has been written or adopted this process*, and once
+/// that stops being true it never becomes true again.
+#[derive(Debug)]
+struct PersistClock {
+    last: std::sync::Mutex<Option<std::time::Instant>>,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl PersistClock {
+    fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// True when a checkpoint is due. PURE — see the type doc. A node with no
+    /// index path never stamps, so this stays permanently true there; the
+    /// writer's own early return, not the clock, is what stops it.
+    fn is_due(&self) -> bool {
+        self.is_due_at(std::time::Instant::now())
+    }
+
+    fn is_due_at(&self, now: std::time::Instant) -> bool {
+        let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        self.last.lock().is_ok_and(|t| persist_due(*t, now, bytes))
+    }
+
+    /// A checkpoint of `bytes` landed at `at` (or cost what one costs —
+    /// a failed write has already paid the serialize and the write attempt,
+    /// so it starts an interval too; otherwise a persistent `ENOSPC` retries
+    /// every tick). `None` bytes means the size could not be read — keep the
+    /// last known one rather than forfeit the interval this write earned.
+    fn wrote(&self, at: std::time::Instant, bytes: Option<u64>) {
+        self.note_bytes(bytes);
+        self.stamp(at);
+    }
+
+    /// A file already on disk describes the index just installed from it — no
+    /// write happened, and none is needed to make the file current.
+    ///
+    /// Credits the interval all but [`PERSIST_MIN_INTERVAL`] of its length:
+    /// the first checkpoint of the session lands at the FLOOR rather than a
+    /// size-derived 238–600 s. Both halves matter on the platform that drove
+    /// this — Android restarts the process routinely. Without the credit a
+    /// session shorter than the interval would bank nothing at all (and a
+    /// device whose sessions are consistently short would never advance the
+    /// file); without the stamp the first tick would rewrite hundreds of MB
+    /// byte-identical but for the header, every launch, which is the flash
+    /// wear this throttle exists to stop.
+    fn adopted(&self, at: std::time::Instant, bytes: Option<u64>) {
+        self.note_bytes(bytes);
+        let credit = persist_interval(self.bytes.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(PERSIST_MIN_INTERVAL);
+        // `checked_sub` returns None below the monotonic epoch — on a host
+        // whose uptime is under one interval. Falling back to `at` merely
+        // grants the full interval, which is the pre-credit behaviour.
+        self.stamp(at.checked_sub(credit).unwrap_or(at));
+    }
+
+    /// Size the NEXT interval without touching the clock: for the index that
+    /// was just installed, not the file that was just written. A push that
+    /// swaps a 238 MB index for a fresh empty one must not leave the new
+    /// walk's first window checkpointing every ~238 s — a small index is
+    /// exactly when progress is cheapest to protect.
+    fn note_bytes(&self, bytes: Option<u64>) {
+        if let Some(b) = bytes {
+            self.bytes.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn stamp(&self, at: std::time::Instant) {
+        if let Ok(mut t) = self.last.lock() {
+            *t = Some(at);
+        }
+    }
+}
+
+/// The bytes one checkpoint of `ix` should contain at the given finality.
+///
+/// Split out so BOTH branches are testable: the choice is trust-relevant, and
+/// getting it wrong is invisible from the outside — a checkpoint that skipped
+/// the clamp claims coverage the next run cannot re-verify, and one that
+/// clamped at zero finality would rename an empty file over a good snapshot.
+fn checkpoint_bytes(
+    ix: &crate::el::logindex::LogIndex,
+    tag: &crate::el::logindex::ChainTag,
+    finalized: u64,
+) -> Vec<u8> {
+    if finalized == 0 {
+        // No beacon anchor yet. There is no optimistic coverage to clamp
+        // either (the tail only runs below a real finality), and clamping AT
+        // ZERO would rewind the whole index and rename an empty file over a
+        // good checkpoint — losing, on a phone, months of backfill. Write it
+        // as it stands.
+        ix.serialize(tag)
+    } else {
+        ix.serialize_clamped(tag, finalized)
+    }
+}
+
 #[cfg(test)]
 mod tail_reorg_tests {
     use super::{tail_fork_point, tail_vouches_for, tail_window_floor};
@@ -7231,5 +7629,293 @@ mod backfill_chunk_sizing_tests {
         // truncated path, gated by the probe clock on the clean one.
         assert_eq!(next_chunk_len(8, 40, 64, 0), 8);
         assert_eq!(fold_chunk_observation(8, 0, 40, 8).0, 8);
+    }
+}
+
+#[cfg(test)]
+mod persist_cadence_tests {
+    use super::{
+        checkpoint_bytes, persist_due, persist_interval, PersistClock, PERSIST_MAX_INTERVAL,
+        PERSIST_MIN_INTERVAL, PERSIST_WRITE_BUDGET_BPS,
+    };
+    use std::time::Duration;
+
+    const MIB: u64 = 1 << 20;
+
+    /// Bytes/sec a walk sustains if it checkpoints `bytes` every
+    /// `persist_interval(bytes)`.
+    fn sustained_bps(bytes: u64) -> u64 {
+        bytes / persist_interval(bytes).as_secs()
+    }
+
+    /// The literal schedule, written out rather than expressed in terms of the
+    /// constants under test — otherwise every assertion below would hold for
+    /// any value of them and the numbers would be unpinned.
+    #[test]
+    fn the_schedule_is_exactly_this() {
+        assert_eq!(persist_interval(0), Duration::from_secs(10));
+        assert_eq!(persist_interval(1), Duration::from_secs(10));
+        assert_eq!(persist_interval(10 * MIB), Duration::from_secs(10));
+        // Just past the floor the interval must start tracking the size — and
+        // must round UP, or the sustained rate exceeds the budget for every
+        // size that is not a whole multiple of it.
+        assert_eq!(persist_interval(10 * MIB + 1), Duration::from_secs(11));
+        assert_eq!(persist_interval(11 * MIB), Duration::from_secs(11));
+        assert_eq!(persist_interval(238 * MIB), Duration::from_secs(238));
+        assert_eq!(persist_interval(600 * MIB), Duration::from_secs(600));
+        // ...and stops tracking it at the cap.
+        assert_eq!(persist_interval(600 * MIB + 1), Duration::from_secs(600));
+        assert_eq!(persist_interval(u64::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_write_rate_is_what_stays_bounded_not_the_interval() {
+        // THE regression this exists for: on the measured 238 MB Gnosis index a
+        // flat 10 s cadence meant a full rewrite every 10 s — 366 GB over one
+        // 6h22m backfill. Assert against the OLD policy directly, so this fails
+        // if the old behaviour ever comes back.
+        const MEASURED: u64 = 238 * MIB;
+        let flat_10s = MEASURED / 10;
+        assert!(
+            flat_10s > 20 * MIB,
+            "the pathology being fixed no longer reproduces: {flat_10s} B/s"
+        );
+        // Every size where the budget is achievable at all (i.e. up to the cap)
+        // holds the RATE, not the interval, constant. Deliberately includes
+        // non-multiples of the budget, where truncating division would break it.
+        let cap = PERSIST_WRITE_BUDGET_BPS * PERSIST_MAX_INTERVAL.as_secs();
+        for bytes in [
+            1,
+            MIB,
+            8 * MIB + 3,
+            11 * MIB + 512 * 1024,
+            64 * MIB,
+            MEASURED,
+            cap,
+        ] {
+            assert!(bytes <= cap, "test input above the cap says nothing");
+            assert!(
+                sustained_bps(bytes) <= PERSIST_WRITE_BUDGET_BPS,
+                "{bytes} B index sustains {} B/s, over budget",
+                sustained_bps(bytes)
+            );
+        }
+        // Above the cap the budget is knowingly abandoned — the point of the
+        // cap is that a crash cannot cost the whole walk.
+        assert!(sustained_bps(cap * 4) > PERSIST_WRITE_BUDGET_BPS);
+    }
+
+    #[test]
+    fn a_small_index_still_checkpoints_briskly() {
+        // The budget must not make a fresh or tiny index checkpoint rarely —
+        // early in a walk the file is small and losing progress is the only
+        // cost that matters. 10 s, not "whatever PERSIST_MIN_INTERVAL says".
+        assert_eq!(PERSIST_MIN_INTERVAL, Duration::from_secs(10));
+        for bytes in [0, 1, 4096, 5 * MIB] {
+            assert_eq!(persist_interval(bytes), Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn a_huge_index_is_capped_so_a_crash_cannot_cost_the_whole_walk() {
+        assert_eq!(PERSIST_MAX_INTERVAL, Duration::from_secs(600));
+        // The cap must bite strictly ABOVE the largest size the budget can
+        // still serve, and never below it.
+        assert_eq!(persist_interval(599 * MIB), Duration::from_secs(599));
+        assert_eq!(persist_interval(1024 * MIB), Duration::from_secs(600));
+        assert_eq!(persist_interval(u64::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_interval_is_monotone_in_size() {
+        // A bigger file may never checkpoint MORE often than a smaller one —
+        // otherwise growth could speed the cadence up and the rate would run
+        // away. Walks well past the cap so the plateau is covered too.
+        let mut prev = persist_interval(0);
+        for step in 0..1600u64 {
+            let cur = persist_interval(step * MIB / 2);
+            assert!(cur >= prev, "interval shrank at {step} half-MB");
+            prev = cur;
+        }
+        assert_eq!(prev, PERSIST_MAX_INTERVAL, "never reached the plateau");
+    }
+
+    #[test]
+    fn the_decision_consults_the_size_not_a_fixed_window() {
+        // Pins the WIRING, not just the policy: a checkpoint is due when the
+        // size-aware interval has elapsed. Reverting the consumer to a fixed
+        // 10 s window (the bug) makes the 238 MB case fire at 60 s.
+        //
+        // Moves the OBSERVATION time forward rather than the stamp backward:
+        // `Instant::checked_sub` returns None below the epoch (boot, on
+        // CLOCK_MONOTONIC), and on a host whose uptime is under 238 s — a
+        // freshly started CI container is the realistic case — every `ago(..)`
+        // would collapse to None, which `persist_due` answers `true` to by its
+        // first rule. The negative assertions would then fail and the positive
+        // ones would pass for the wrong reason. `Instant + Duration` has no
+        // such edge.
+        let base = std::time::Instant::now();
+        let after = |s: u64| base + Duration::from_secs(s);
+        assert!(persist_due(None, base, 238 * MIB), "first ever must fire");
+        assert!(
+            !persist_due(Some(base), after(60), 238 * MIB),
+            "fired on a fixed window"
+        );
+        assert!(!persist_due(Some(base), after(237), 238 * MIB));
+        assert!(persist_due(Some(base), after(238), 238 * MIB));
+        // ...and the same clock on a small index still fires briskly, so this
+        // is genuinely reading the size and not just a longer constant.
+        assert!(persist_due(Some(base), after(10), 1024));
+        assert!(!persist_due(Some(base), after(9), 1024));
+    }
+
+    #[test]
+    fn a_checkpoint_clamps_at_finality_but_never_at_a_missing_anchor() {
+        use crate::el::logindex::{ChainTag, LogIndex, LogIndexConfig, StoredLog, WatchEntry};
+        let tag = ChainTag {
+            network_id: 1,
+            genesis_hash: [0xd4; 32],
+        };
+        let cfg = LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            watch: vec![WatchEntry {
+                address: [1u8; 20],
+                from_block: 0,
+                topic0s: vec![],
+                name: String::new(),
+            }],
+        };
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10u64..=14 {
+            ix.append_block(
+                b,
+                [b as u8; 32],
+                vec![StoredLog {
+                    block_number: b,
+                    block_hash: [b as u8; 32],
+                    tx_hash: [0xcc; 32],
+                    tx_index: 0,
+                    log_index: 0,
+                    address: [1u8; 20],
+                    topics: vec![],
+                    data: vec![],
+                }],
+            )
+            .unwrap();
+        }
+        // Finality at 12: 13-14 are optimistic. They are verifiable only
+        // against THIS run's in-memory tail record, so a checkpoint carrying
+        // them would leave the next run holding coverage it can never
+        // re-check — and once finality passes them nothing would rewind them.
+        let clamp = std::env::temp_dir().join(format!("ckpt-clamp-{}.db", std::process::id()));
+        crate::el::logindex::write_atomic(&clamp, &checkpoint_bytes(&ix, &tag, 12)).unwrap();
+        let clamped = LogIndex::load(&cfg, &tag, &clamp).unwrap();
+        assert_eq!(
+            clamped.coverage_of(&[1u8; 20]).unwrap().span,
+            Some((10, 12))
+        );
+        let _ = std::fs::remove_file(&clamp);
+        // Zero finality means NO anchor, not "finality is at block zero":
+        // clamping there would rewind everything and rename an empty file over
+        // a good checkpoint. Write it as it stands instead — which does record
+        // 13-14 unclamped, so the first half's rule is not universal. What
+        // makes that safe is that finality never REGRESSES to zero:
+        // `AnchorState::execution_state_root` is set once and never cleared,
+        // and the tail tick returns early while it is unset, so the only run
+        // that can write this file is one that has not yet had an anchor at
+        // all — and it appended those blocks under its own tail record.
+        let nofin = std::env::temp_dir().join(format!("ckpt-nofin-{}.db", std::process::id()));
+        crate::el::logindex::write_atomic(&nofin, &checkpoint_bytes(&ix, &tag, 0)).unwrap();
+        let unclamped = LogIndex::load(&cfg, &tag, &nofin).unwrap();
+        assert_eq!(
+            unclamped.coverage_of(&[1u8; 20]).unwrap().span,
+            Some((10, 14))
+        );
+        let _ = std::fs::remove_file(&nofin);
+    }
+
+    #[test]
+    fn a_zero_size_gets_the_floor_not_a_zero_interval() {
+        // A lost recorded size reads back as 0. That must degrade to the FLOOR
+        // — the old cadence, which was merely wasteful — and never to a zero
+        // interval, which is an unthrottled write loop. (What it cannot catch
+        // is the loss itself; every writer stores the size at its own write,
+        // `persist_log_index` inline and the config/import/load paths through
+        // `note_checkpoint_on_disk`.)
+        assert_eq!(persist_interval(0), PERSIST_MIN_INTERVAL);
+        assert!(persist_interval(0) > Duration::ZERO);
+        assert_ne!(persist_interval(238 * MIB), persist_interval(0));
+    }
+
+    // Below: the CLOCK, not just the policy. Same forward-time discipline as
+    // `the_decision_consults_the_size_not_a_fixed_window` — never `ago(..)`.
+
+    #[test]
+    fn asking_whether_a_checkpoint_is_due_does_not_consume_the_interval() {
+        // THE regression this guards: while the predicate stamped the clock,
+        // one decider's "yes" made the other's "no" — which reads like mutual
+        // exclusion but is not (the two are not synchronized), and charged a
+        // full interval to a checkpoint that may never be written at all.
+        // Both deciders must see "due"; `persist_log_index` settles which one
+        // writes, under the checkpoint lock.
+        let clock = PersistClock::new();
+        clock.note_bytes(Some(238 * MIB));
+        assert!(clock.is_due(), "a never-written index must checkpoint now");
+        assert!(clock.is_due(), "asking consumed the interval");
+        assert!(clock.is_due());
+    }
+
+    #[test]
+    fn only_a_write_ends_an_interval() {
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        assert!(clock.is_due_at(base));
+        clock.wrote(base, Some(238 * MIB));
+        assert!(!clock.is_due_at(base + Duration::from_secs(237)));
+        assert!(clock.is_due_at(base + Duration::from_secs(238)));
+        // The size travels with the write, so the NEXT interval is sized by
+        // what the last checkpoint actually cost — not by whatever was last
+        // asked about.
+        clock.wrote(base + Duration::from_secs(238), Some(1024));
+        assert!(clock.is_due_at(base + Duration::from_secs(248)));
+    }
+
+    #[test]
+    fn adopting_a_file_still_leaves_one_cheap_checkpoint_in_the_session() {
+        // A load is not a write: the file is already current, so it starts an
+        // interval — but crediting the WHOLE interval means an Android session
+        // shorter than 238 s banks nothing, and a device whose sessions are
+        // consistently short never advances the file at all. Adoption credits
+        // all but the floor, so the first checkpoint lands at 10 s.
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        clock.adopted(base, Some(238 * MIB));
+        assert!(
+            !clock.is_due_at(base + Duration::from_secs(9)),
+            "adoption must still suppress the immediate byte-identical rewrite"
+        );
+        assert!(
+            clock.is_due_at(base + PERSIST_MIN_INTERVAL),
+            "a whole interval was credited; a short session banks nothing"
+        );
+        // ...and the size is adopted too, so the checkpoint that follows is
+        // paced by the real file, not by the floor.
+        clock.wrote(base + PERSIST_MIN_INTERVAL, Some(238 * MIB));
+        assert!(!clock.is_due_at(base + PERSIST_MIN_INTERVAL + Duration::from_secs(237)));
+    }
+
+    #[test]
+    fn a_size_that_cannot_be_read_keeps_the_last_one() {
+        // `file_len` returns None when the file is gone or unstattable. That
+        // must not reset the cadence to the floor — the next write still costs
+        // what the last one cost, and pacing it at 10 s is the unthrottled
+        // rewrite loop this whole change removes.
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        clock.wrote(base, Some(238 * MIB));
+        clock.wrote(base + Duration::from_secs(238), None);
+        assert!(!clock.is_due_at(base + Duration::from_secs(238 + 237)));
+        assert!(clock.is_due_at(base + Duration::from_secs(238 + 238)));
     }
 }

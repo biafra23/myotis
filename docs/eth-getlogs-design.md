@@ -79,6 +79,104 @@ streaming serialization + delta checkpoints) before slice 4 backfills
 mainnet on mobile hosts. Full-rewrite checkpoints across a long backfill are
 also O(n²) write amplification; the segmented store fixes both.
 
+**Checkpoint cadence (size-aware).** Until the segmented store lands, every
+checkpoint rewrites the whole file, so a fixed interval makes the write RATE
+grow with the index. Measured on the Gnosis Bee backfill: with a flat 10 s
+cadence and an index that reached 238 MB, the daemon wrote **366 GB over a
+6 h 22 m walk** (~15 MiB/s averaged; ~17.8 MiB/s sustained over the sampled
+window). At that size the 10 s interval is not even the binding constraint —
+one 238 MB write takes longer than 10 s, so the next checkpoint was due the
+moment the previous finished and the process wrote essentially continuously,
+at whatever the disk would take. On a phone that is flash wear, not just
+noise.
+
+What is bounded is therefore the sustained write rate, not the interval:
+`persist_interval(last_snapshot_bytes) = ceil(bytes / 1 MiB/s)` clamped to
+`[10 s, 600 s]` (rounded *up* — rounding down puts every non-multiple size
+over budget). The lower clamp keeps a small or freshly-started index
+checkpointing briskly, since when the file is small lost progress is the only
+cost that matters; the upper clamp bounds how much of a walk a crash re-does
+once the budget is unachievable anyway. The same index (238 MB = 227 MiB):
+~227 s between checkpoints, ~22 GiB per walk instead of 366 GB.
+
+Every *periodic* checkpoint path shares this throttle — walker, head bridge,
+tail, and the appender's 64-block checkpoint. The appender's block counter is
+not on its own a bound on the write rate: catching up after a gap applies 16
+blocks per 6 s tick, so 64 blocks arrive every ~24 s whatever the index
+weighs. The counter says *there is work to record*; the throttle says *when*,
+and is not cleared when it defers (that would drop the checkpoint rather than
+delay it). Two once-per-event writes are deliberately exempt: `ElReader::stop`
+(the last write before the index goes away) and a head bridge's FINAL slice.
+
+The clock those intervals are measured from (`PersistClock`) obeys one rule:
+**only a write ends an interval, and the decision to write is taken where the
+write happens.** `PersistClock::is_due` is a pure read — asking never consumes
+anything — and `persist_log_index` consults it *under the checkpoint lock*,
+not the caller before calling. Both halves are load-bearing. A predicate that
+stamped would charge a full interval (up to 600 s of re-walked work on a crash)
+to a checkpoint that may never be written, since a writer skips when another
+holds the lock; and a decision taken outside the lock is not a claim — two
+writers genuinely race here (the backfill step runs outside `log_index_drive`,
+and a host thread can drive the tail on the `getLogs` path), so a "yes" read
+before the other's write would be honoured after it, rewriting the whole file
+back to back.
+
+Everything that makes the file current starts an interval, so an off-budget
+write can never be followed seconds later by a throttled one measuring from a
+stale stamp — a phone waking repeatedly from sleep completing a bridge, or an
+import that just wrote a multi-GB merge and would otherwise see the very next
+appender tick rewrite it. That covers the throttled checkpoints, the two
+exempt ones, the wholesale replacements (config push, import merge — which
+stamp only if the write actually landed), and, distinctly, *adoption*: loading
+a snapshot writes nothing but the file already describes the index installed
+from it. Adoption credits all but the 10 s floor of the interval, so a launch
+does not rewrite hundreds of MB byte-identical but for the header, while a
+session shorter than the interval — routine on Android, where the platform
+restarts the process — still banks its progress once.
+
+A failed checkpoint is logged, not swallowed. It stays best-effort — the
+previous snapshot is what a crash finds, which is safe — but a *permanently*
+failing one (`ENOSPC` being the realistic cause) now costs up to 600 s of walk
+per crash rather than 10 s, so it must not be invisible.
+
+This bounds the constant — the O(n²) asymptotics still need the segmented
+store above.
+
+**Serialize under the lock, fsync outside it.** A checkpoint reads the whole
+store, so serialization has to hold the index mutex; the write and the `fsync`
+must not. On a multi-hundred-MB index the fsync dominates the checkpoint by
+orders of magnitude, and holding the mutex across it stalls the appender, the
+backfill walker and every `getLogs` query for the whole duration. This applies
+to the PERIODIC checkpoint; the config push, the export and the import merge
+still serialize and fsync under the index lock, which is fine because they run
+once per user action, not on a clock.
+
+Dropping the index lock before the write means it can no longer be what keeps
+two checkpoints apart, and it was: every writer used to hold it across the
+whole create→write→fsync→rename. Two mechanisms replace it.
+
+- `write_atomic` (`logindex.rs`) names its temp file with a per-**call**
+  counter, not just the pid (`next_tmp_path`). Two writers aiming at one path
+  would otherwise share a temp file: the loser's `File::create` truncates the
+  winner's mid-write, or the winner renames the shared temp out from under the
+  loser, whose still-open fd then writes into the LIVE `.db` that readers are
+  reading. It removes the temp on failure of either the write or the rename —
+  the likely trigger is `ENOSPC`, and after a successful write the leftover is
+  a *full-size* snapshot, which is exactly what keeps a disk full — and fsyncs
+  the parent directory so the rename itself is durable. This is the log
+  index's primitive, not a repo-wide one — `sync.rs` and roost keep their own.
+- `ElReader::log_index_write` is a dedicated mutex held across
+  serialize→rename by every site that writes an index `.db` (the periodic
+  checkpoint, the config-push checkpoint, the export and the import merge).
+  Without it the rename order need not match the serialize order, and an older
+  snapshot can silently land on top of a newer one — or an export, which
+  strips display names, can land on the canonical file. **Lock order: acquired
+  before `log_index`, never after.** The periodic checkpoint takes it with
+  `try_lock` and skips on contention: an import merges GBs under it, the
+  checkpoint is best-effort, and whoever holds it is writing a newer snapshot
+  anyway. A skip un-stamps the clock so the next tick retries rather than
+  waiting out a whole interval.
+
 ### 2. Head-follow appender (forward, cheap, always-on while enabled)
 
 A tokio task owned by `ElReader` (so `ElReader::stop`/pause aborts it —
