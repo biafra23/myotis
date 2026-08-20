@@ -87,11 +87,6 @@ public final class NodeService extends Service {
     // that discovery signal without serving unverified data. Flip to false only for
     // local debugging against an injected upstream.
     private static final boolean STRICT_NO_PROXY = true;
-    // Max blocks below the verified head we'll fetch+verify headers for to answer
-    // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
-    // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
-    private static final int BLOCK_LOOKBACK_MAX = 256;
-
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
     // service process (and this flag) outlive it.
