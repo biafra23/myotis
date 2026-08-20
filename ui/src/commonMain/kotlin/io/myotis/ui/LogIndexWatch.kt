@@ -62,23 +62,24 @@ object LogIndexWatch {
     }
 
     /**
-     * The engine config JSON for a push, or null when there is nothing to say
-     * (no entries, not enabled, and the network was never configured — the
-     * caller then skips the push entirely, so an engine without a config keeps
-     * eth_getLogs in its honest not-configured state). With entries but
-     * disabled the push still goes out: that is how an active index is turned
-     * off. With no entries but enabled (an imported snapshot is the
-     * subscription — the engine's config union keeps its baked-in watch-table)
-     * the push carries the empty list and only re-asserts enabled/maxSpeed on
-     * restart.
+     * The engine config JSON for a push, or null when the user has expressed
+     * nothing to disable with: a disable ships ONLY when the host holds an
+     * explicit persisted flag ([configured] — [Settings.logIndexConfigured]).
+     * The cases:
      *
-     * [configured] = the host has an explicit persisted enabled/disabled flag
-     * for this network ([Settings.logIndexConfigured]). It matters for exactly
-     * one case: entries empty AND disabled. On a virgin network that is
-     * "nothing to say" (null) — but after an import-then-disable it is the
-     * DISABLE push, and skipping it would let the engine's boot-time
-     * activate-from-disk re-enable the index on every restart. A disabled
-     * toggle must win, so a configured network always pushes.
+     * - Enabled: always a push (with the entries; or with `watch:[]` when an
+     *   imported snapshot is the subscription — the engine's config union
+     *   keeps its baked-in watch-table, and the push re-asserts
+     *   enabled/maxSpeed on restart).
+     * - Disabled AND configured: the DISABLE push. Skipping it would let the
+     *   engine's boot-time activate-from-disk re-enable an imported index on
+     *   every restart — a disabled toggle must win.
+     * - Disabled, NOT configured: null, EVEN WITH ENTRIES. Entries alone are
+     *   an additive act (typed on the Index tab without ever touching
+     *   Collect); turning them into an `enabled:false` push would kill a
+     *   dropped-in snapshot the engine activated at boot — a disable the
+     *   user never expressed. On every host the enable toggle and import both
+     *   persist the flag, so a real turn-off always has [configured] = true.
      *
      * No names: display names are resolved by the receiving engine (ENS
      * reverse lookup in its naming pass), never entered here.
@@ -91,8 +92,8 @@ object LogIndexWatch {
         maxSpeed: Boolean = false,
         configured: Boolean = false,
     ): String? {
+        if (!enabled && !configured) return null
         val entries = parse(watchJson)
-        if (entries.isEmpty() && !enabled && !configured) return null
         val watch = entries.joinToString(",") {
             """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
         }

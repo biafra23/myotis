@@ -116,9 +116,15 @@ class LogIndexWatchTest {
         assertTrue(importOnly.contains("\"enabled\":true"))
         assertTrue(importOnly.contains("\"watch\":[]"))
 
-        // Entries + disabled: the push goes out — that is how an active index
-        // is turned off.
-        val off = LogIndexWatch.configJson(watch, enabled = false)!!
+        // Entries + disabled + CONFIGURED: the push goes out — that is how an
+        // active index is turned off (a real turn-off always has the flag
+        // persisted: the toggle and import both set it).
+        val off = LogIndexWatch.configJson(watch, enabled = false, configured = true)!!
         assertTrue(off.contains("\"enabled\":false"))
+
+        // Entries + disabled + NEVER configured: null. Typing entries without
+        // ever touching Collect is an additive act — it must not become an
+        // enabled:false push that kills a dropped-in snapshot at boot.
+        assertNull(LogIndexWatch.configJson(watch, enabled = false, configured = false))
     }
 }

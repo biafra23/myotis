@@ -495,32 +495,36 @@ private fun SettingsTab(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
-        // while the Java engine is forced above. Applies on the next network (re)start.
-        SwitchRow(
-            label = "Route reads over Tor (experimental)",
-            checked = torRouting && !preferJava,
-            enabled = !preferJava,
-            onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
-        )
-        Text(
-            if (preferJava) {
-                "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
-            } else {
-                "Off (default): reads use the peer pool directly from your IP. On: route " +
-                    "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
-                    "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
-                    "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
-                    "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
-                    "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
-                    "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
-                    "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                    "fail-closed while this is on. Takes effect immediately — the next read on a " +
-                    "running Rust-engine network routes over Tor (no restart needed)."
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        // Tor routing — shown only on hosts that can actually route over Tor
+        // (controller.supportsTor; a privacy switch that flips ON while reads keep
+        // leaving from the real IP would be accepted-and-ignored). Where shown, the
+        // row is disabled while the Java engine is forced above.
+        if (controller.supportsTor) {
+            SwitchRow(
+                label = "Route reads over Tor (experimental)",
+                checked = torRouting && !preferJava,
+                enabled = !preferJava,
+                onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+            )
+            Text(
+                if (preferJava) {
+                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
+                } else {
+                    "Off (default): reads use the peer pool directly from your IP. On: route " +
+                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
+                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
+                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
+                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
+                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
+                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
+                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
+                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
+                        "running Rust-engine network routes over Tor (no restart needed)."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Text(
             "An RPC-port change reboots that chain; the snap-peer target and served-block " +
                 "window apply live to every running chain, and the readiness threshold persists " +

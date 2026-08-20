@@ -326,6 +326,12 @@ class DesktopNodeController(
         return true
     }
 
+    // Answered from the loaded engine build: only a -PtorEngine dylib links Arti,
+    // and RustMyotisEngine.isAvailable() is already resolved by the time the UI
+    // renders (Main.kt loads the lib before composition). Cached — the answer
+    // cannot change within a process, and the row reads it on every recomposition.
+    override val supportsTor: Boolean by lazy { runCatching { Tor.supported() }.getOrDefault(false) }
+
     override fun applyTorMode() {
         // Push the persisted Tor preference to the process-global Rust-engine flag
         // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select

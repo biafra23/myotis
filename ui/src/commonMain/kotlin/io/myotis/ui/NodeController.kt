@@ -78,6 +78,17 @@ interface NodeController {
      */
     fun applyTorMode() {}
 
+    /**
+     * Whether this host can actually route reads over Tor — the Settings row is
+     * shown only when true (the [canImportLogIndex] precedent). Default false:
+     * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
+     * the write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
+     * while reads keep leaving from the real IP would be accepted-and-ignored —
+     * the exact failure mode the trust rules forbid. The desktop actual answers
+     * from the loaded engine build (only a `-PtorEngine` dylib links Arti).
+     */
+    val supportsTor: Boolean get() = false
+
     /** Push the (persisted) log-index preference for [network] down to the
      *  engine — called from the settings toggle and at network (re)start.
      *  Default no-op for hosts without the Rust engine's log index. */
