@@ -5,10 +5,15 @@ package com.jaeckel.ethp2p.consensus.lightclient;
  *
  * <p><b>Why:</b> the light client's forward walk is only as trustworthy as the anchor
  * it starts from (embedded checkpoint or persisted snapshot). Validators exit over
- * time; once enough of the anchor-era sync committee has exited and withdrawn, an
- * attacker who acquired those keys could sign a validly-verifying forged
- * continuation (a long-range attack), and BLS verification alone cannot tell it
- * from the honest chain. The weak-subjectivity period is how long an anchor stays
+ * time; once enough of the anchor-era sync committee has exited, an attacker who
+ * acquired those keys could sign a validly-verifying forged continuation (a
+ * long-range attack), and BLS verification alone cannot tell it from the honest
+ * chain. Note the deterrent is <i>attribution</i>, not slashing: sync-committee
+ * signatures carry no slashing condition on any Ethereum chain (only proposer and
+ * attester equivocation are slashable), so what a recent anchor really buys is
+ * that its committee is still held by identifiable, staked validators, and the
+ * exit-churn limit caps how fast old keys become freely acquirable and
+ * consequence-free. The weak-subjectivity period is how long an anchor stays
  * safe; syncing forward from anything older must be an explicit, informed user
  * decision — never silent.
  *
