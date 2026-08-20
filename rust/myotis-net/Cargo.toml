@@ -59,6 +59,10 @@ tor = ["dep:arti-client", "dep:tor-rtcompat"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# test-util only: `#[tokio::test(start_paused = true)]` drives the interactive
+# read HEDGING on the paused clock, so the timing invariants are asserted
+# exactly and instantly instead of by sleeping in real time.
+tokio = { version = "=1.52.3", features = ["test-util", "macros", "rt-multi-thread", "time"] }
 
 [[example]]
 name = "live_sync"
