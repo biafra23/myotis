@@ -30,6 +30,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Manages outbound RLPx TCP connections to Ethereum peers.
@@ -346,50 +348,122 @@ public final class RLPxConnector implements AutoCloseable {
         });
     }
 
+    /** How many READY peers a bodies/receipts request rotates across before giving
+     *  up. Bounds worst-case latency (x {@link #BODY_RECEIPT_TIMEOUT_MS}) while making
+     *  an all-empty outcome astronomically unlikely: at the ~35% single-peer empty
+     *  rate observed in #359, 8 tries is 0.35^8 ~= 0.02%. Mirrors the snap side's
+     *  {@code SNAP_ORACLE_MAX_ATTEMPTS}. */
+    private static final int BODY_RECEIPT_MAX_PEERS = 8;
+    /** Per-peer deadline for a bodies/receipts fetch. Short so a silent peer costs
+     *  seconds, not the caller's whole budget; 8 x this stays under the 60 s the RPC
+     *  bodies path allots (HEADER_CHAIN_TIMEOUT_SEC). */
+    private static final long BODY_RECEIPT_TIMEOUT_MS = 5_000;
+
     /**
-     * Request block bodies from any active READY peer.
+     * Request block bodies, ROTATING across active READY peers (#359). The
+     * bodies path previously took the first ready peer and treated its empty
+     * reply as terminal, so a peer that simply didn't hold the block failed the
+     * whole call (~1-in-3 on mainnet); the header path already rotates, and this
+     * brings bodies in line.
      *
-     * @return a future that completes with the bodies, or a failed future if no peer is available
+     * @return the first peer's COMPLETE reply; an empty list when every tried
+     *     peer replied-but-empty (so the caller's stale/again fallback fires,
+     *     exactly as a single empty reply did before, only now after rotation);
+     *     a failed future when there is no READY peer, or when every attempt
+     *     errored without a clean reply (a transport problem -> the caller's -32000).
      */
     public CompletableFuture<List<BlockBodiesMessage.BlockBody>> requestBlockBodies(
             Bytes32... hashes) {
-        Iterator<EthHandler> it = activeHandlers.iterator();
-        while (it.hasNext()) {
-            EthHandler handler = it.next();
-            if (!handler.isReady()) continue;
-            CompletableFuture<List<BlockBodiesMessage.BlockBody>> future =
-                    handler.requestBlockBodiesAsync(hashes);
-            if (future != null) {
-                log.info("[rlpx] Routed GetBlockBodies({} hashes) to active peer", hashes.length);
-                return future;
-            }
-            it.remove();
-        }
-        return CompletableFuture.failedFuture(
-                new IllegalStateException("No active peer with completed eth handshake"));
+        return rotateRequest("GetBlockBodies(" + hashes.length + ")", hashes.length,
+                h -> h.requestBlockBodiesAsync(hashes));
     }
 
     /**
-     * Request consensus-encoded receipts for the given block hashes from any active READY
-     * peer. The future completes with one receipt list per block (request order). Callers
-     * MUST verify the result against a trusted {@code header.receiptsRoot} before use.
-     *
-     * @return a future, or a failed future if no peer is available
+     * Request consensus-encoded receipts for the given block hashes, ROTATING
+     * across active READY peers (#359) — same shape as {@link #requestBlockBodies},
+     * so {@code eth_getTransactionReceipt} (polled right after a send) no longer
+     * rides on a single peer's reply. Callers MUST verify the result against a
+     * trusted {@code header.receiptsRoot} before use.
      */
     public CompletableFuture<List<List<Bytes>>> requestReceipts(Bytes32... hashes) {
-        Iterator<EthHandler> it = activeHandlers.iterator();
-        while (it.hasNext()) {
-            EthHandler handler = it.next();
-            if (!handler.isReady()) continue;
-            CompletableFuture<List<List<Bytes>>> future = handler.requestReceiptsAsync(hashes);
-            if (future != null) {
-                log.info("[rlpx] Routed GetReceipts({} hashes) to active peer", hashes.length);
-                return future;
-            }
-            it.remove();
+        return rotateRequest("GetReceipts(" + hashes.length + ")", hashes.length,
+                h -> h.requestReceiptsAsync(hashes));
+    }
+
+    /** Build a per-peer attempt supplier list from the current READY peers (capped
+     *  at {@link #BODY_RECEIPT_MAX_PEERS}) and run them through {@link #rotate}. Each
+     *  supplier calls {@code async} lazily and logs when the attempt actually starts;
+     *  a peer that dropped between snapshot and invocation yields a null future,
+     *  which {@link #rotate} skips without counting. */
+    private <T> CompletableFuture<List<T>> rotateRequest(
+            String what, int expected,
+            java.util.function.Function<EthHandler, CompletableFuture<List<T>>> async) {
+        List<EthHandler> ready = new ArrayList<>();
+        for (EthHandler h : activeHandlers) {
+            if (h.isReady()) ready.add(h);
         }
-        return CompletableFuture.failedFuture(
-                new IllegalStateException("No active peer with completed eth handshake"));
+        if (ready.isEmpty()) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("No active peer with completed eth handshake"));
+        }
+        int cap = Math.min(ready.size(), BODY_RECEIPT_MAX_PEERS);
+        List<Supplier<CompletableFuture<List<T>>>> attempts = new ArrayList<>(cap);
+        for (int i = 0; i < cap; i++) {
+            EthHandler h = ready.get(i);
+            int idx = i + 1;
+            attempts.add(() -> {
+                CompletableFuture<List<T>> fut = async.apply(h);
+                if (fut == null) return null;
+                log.info("[rlpx] {} -> {} ({}/{})", what, h.getRemoteAddress(), idx, cap);
+                return fut;
+            });
+        }
+        return rotate(what, expected, attempts, BODY_RECEIPT_TIMEOUT_MS);
+    }
+
+    /**
+     * Pure rotation policy (no EthHandler, unit-testable): try each attempt in
+     * order until one returns a reply of at least {@code expected} size.
+     * <ul>
+     *   <li>A clean but short/empty reply -> rotate, and remember a clean empty was
+     *       seen (the block just isn't being served by that peer).</li>
+     *   <li>An exception (incl. the per-attempt timeout) -> rotate, remember it.</li>
+     *   <li>A null future (peer gone) -> skip, not counted as an attempt.</li>
+     * </ul>
+     * On exhaustion: an empty list if any clean empty was seen (so the caller's
+     * existing empty-reply fallback fires, only now after genuine rotation), else
+     * the last error (a pure-transport failure the caller surfaces as -32000).
+     */
+    static <T> CompletableFuture<List<T>> rotate(
+            String what, int expected,
+            List<Supplier<CompletableFuture<List<T>>>> attempts, long perAttemptTimeoutMs) {
+        return rotateFrom(what, expected, attempts, 0, false, null, perAttemptTimeoutMs);
+    }
+
+    private static <T> CompletableFuture<List<T>> rotateFrom(
+            String what, int expected, List<Supplier<CompletableFuture<List<T>>>> attempts,
+            int i, boolean sawCleanEmpty, Throwable lastEx, long perAttemptTimeoutMs) {
+        if (i >= attempts.size()) {
+            if (sawCleanEmpty) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            return CompletableFuture.failedFuture(lastEx != null ? lastEx
+                    : new IllegalStateException("all peer(s) failed to serve " + what));
+        }
+        CompletableFuture<List<T>> f = attempts.get(i).get();
+        if (f == null) {
+            return rotateFrom(what, expected, attempts, i + 1, sawCleanEmpty, lastEx, perAttemptTimeoutMs);
+        }
+        return f.orTimeout(perAttemptTimeoutMs, TimeUnit.MILLISECONDS)
+                .handle((list, ex) -> {
+                    if (ex == null && list != null && list.size() >= expected) {
+                        return CompletableFuture.completedFuture(list);
+                    }
+                    boolean cleanEmpty = (ex == null);
+                    return rotateFrom(what, expected, attempts, i + 1,
+                            sawCleanEmpty || cleanEmpty, cleanEmpty ? lastEx : ex, perAttemptTimeoutMs);
+                })
+                .thenCompose(x -> x);
     }
 
     /**
