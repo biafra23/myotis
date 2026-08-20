@@ -14,18 +14,21 @@ object MyotisRpc {
      * unless [upstreamUrl] is set, backed by the api contracts.
      */
     @JvmStatic
+    @JvmOverloads
     fun server(
         port: Int,
         upstreamUrl: String?,
         host: String,
         backend: io.myotis.api.VerifiedReads?,
         statusReads: io.myotis.api.NodeStatusReads?,
+        lifecycle: io.myotis.api.NodeLifecycle? = null,
     ): MyotisRpcServer = MyotisRpcServer(
         port,
         upstreamUrl,
         host,
         backend?.let { VerifiedReadsBackend(it) },
         statusReads?.let { NodeStatusSource(it) },
+        lifecycle?.let { NodeLifecycleSource(it) },
     )
 }
 
@@ -113,4 +116,25 @@ class NodeStatusSource(private val sr: io.myotis.api.NodeStatusReads) : RpcStatu
     override fun statusJson(uptimeSeconds: Long): JsonObject = StatusJson.status(sr.status(), uptimeSeconds)
     override fun beaconStatusJson(uptimeSeconds: Long): JsonObject =
         StatusJson.beaconStatus(sr.beaconStatus(), uptimeSeconds)
+}
+
+/** [RpcLifecycle] over the api contract — pure delegation.
+ *
+ *  On success the lifecycle name is the target state BY DEFINITION
+ *  (`NodeLifecycle.pause` returns true iff PAUSED on return, `wakeUp` iff RUNNING),
+ *  so it is NOT re-read: reading `lifecycleName()` in a second call would let a
+ *  concurrent transition (the idle controller, another client) return an
+ *  internally contradictory `{ok:true, lifecycle:"RUNNING"}` for a pause — a
+ *  well-formed but misleading success (CLAUDE.md §Trust). Only the failure path,
+ *  where `ok` already says the target was not reached, reads the current state as
+ *  a best-effort diagnostic. */
+class NodeLifecycleSource(private val lc: io.myotis.api.NodeLifecycle) : RpcLifecycle {
+    override fun pause(): RpcLifecycleResult {
+        val ok = lc.pause()
+        return RpcLifecycleResult(ok, if (ok) "PAUSED" else lc.lifecycleName())
+    }
+    override fun wakeUp(): RpcLifecycleResult {
+        val ok = lc.wakeUp()
+        return RpcLifecycleResult(ok, if (ok) "RUNNING" else lc.lifecycleName())
+    }
 }

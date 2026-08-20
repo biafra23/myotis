@@ -147,6 +147,27 @@ Key Gradle modules:
   `RustEngineNative`; same JSON shapes, pinned by the same golden tests) and
   never touches engine internals either.
 
+## Workflow — the mandatory steps for EVERY work item
+
+Every change to this repository goes through this sequence, in order, with **no
+step skipped and none treated as optional or "only if asked"**:
+
+1. **Code** — make the change on the designated branch.
+2. **Review** — run the internal code review on the diff (the `code-review`
+   skill / `/code-review`) and address what it finds before going further.
+3. **PR** — open a pull request. This is the default next step after review, not
+   a separate request the user has to make. (Follow the PR-template and
+   attribution rules below.)
+4. **Wait for review comments** — subscribe to the PR and wait for CI + review
+   feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
+5. **Address the PR comments** — drive the PR to green and answer every review
+   comment per the rules below, then keep watching until it is merged or closed.
+
+Short form: **code → review → PR → wait for review comments → address them.**
+Do not stop at "pushed" and do not ask whether to open the PR or run the review —
+they are part of the work item. The only time to skip the PR is when the user
+explicitly says not to open one.
+
 ## Pull requests and code review
 
 These rules are for the **PR author** answering a review. The reviewer's own

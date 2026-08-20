@@ -31,6 +31,7 @@ class RpcRouter(
     private val logger: MethodLogger,
     private val backend: RpcBackend? = null,
     private val statusReads: RpcStatusSource? = null,
+    private val lifecycle: RpcLifecycle? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -236,6 +237,43 @@ class RpcRouter(
                 logger.record(method, idStr, "ERROR", 0, -32603)
                 val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
                 errorEnvelope(id, -32603, "status read failed: $detail")
+            }
+        }
+        // Local lifecycle control — the JSON-RPC counterpart of the daemon's pause /
+        // resume IPC commands. Like the status methods these bypass the verified
+        // backend: a Myotis-aware wallet pauses the node when its UI backgrounds and
+        // wakes it (then polls myotis_status / myotis_beaconStatus until ready) before
+        // its next burst of queries. -32601 when the host didn't wire a control seam.
+        if (method == "myotis_pause" || method == "myotis_wakeup") {
+            val lc = lifecycle
+            if (lc == null) {
+                logger.record(method, idStr, "ERROR", 0, -32601)
+                return errorEnvelope(id, -32601, "method '$method' is not supported by this node")
+            }
+            // Isolate the transition like the status reads / IPC command do: a throw
+            // becomes a JSON-RPC error envelope, never a raw Ktor 500.
+            val tLc = TimeSource.Monotonic.markNow()
+            return try {
+                // pause()/wakeUp() tear down / rebuild networking (seconds) and can
+                // cross a JNI boundary into the native engine — run them on the IO
+                // dispatcher rather than blocking the Ktor CIO event loop, same as
+                // the status handler and the verified handlers below.
+                val r = withContext(rpcIoDispatcher) {
+                    if (method == "myotis_pause") lc.pause() else lc.wakeUp()
+                }
+                // Unlike the status reads (hardcoded 0), record the REAL elapsed time:
+                // a pause/wakeup takes seconds, and the access log is where that shows.
+                logger.record(method, idStr, "LOCAL", elapsedMs(tLc))
+                resultEnvelope(id, buildJsonObject {
+                    put("ok", r.ok)
+                    put("lifecycle", r.lifecycle)
+                })
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
+            } catch (e: Exception) {
+                logger.record(method, idStr, "ERROR", 0, -32603)
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
+                errorEnvelope(id, -32603, "lifecycle op failed: $detail")
             }
         }
         val t0 = TimeSource.Monotonic.markNow()

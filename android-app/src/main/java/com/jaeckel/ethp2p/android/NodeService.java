@@ -847,10 +847,22 @@ public final class NodeService extends Service {
                 io.myotis.api.LifecycleState ls;
                 try { ls = h.lifecycle(); } catch (Throwable t) { continue; }
                 if (ls != io.myotis.api.LifecycleState.RUNNING) continue;
+                // The engine's own timestamp of the most recent DEMAND wake (ipc / request /
+                // catch-up — SleepMetrics.onResume). An out-of-process myotis_wakeup resumes
+                // through the engine and bumps NONE of the host stamps below, so without this
+                // the ticker would re-pause a node a client just woke, mid-rebuild, before its
+                // first verified read. Reading the engine's exact resume instant closes that
+                // window race-free — unlike sampling lifecycle() at 30 s ticks, which misses a
+                // wake landing between two RUNNING samples. FOREGROUND wakes don't stamp it, but
+                // those are host-initiated and already covered by lastResumeMs.
+                long engineResumeMs;
+                try { engineResumeMs = h.status().lastResumeEpochMs(); }
+                catch (Throwable t) { engineResumeMs = 0L; }
                 long lastActivity = Math.max(
                         Math.max(h.lastActivityEpochMillis(), uiActivityMs),
-                        Math.max(lastResumeMs.getOrDefault(n, 0L),
-                                 stackStartMs.getOrDefault(n, 0L)));
+                        Math.max(Math.max(lastResumeMs.getOrDefault(n, 0L),
+                                          stackStartMs.getOrDefault(n, 0L)),
+                                 engineResumeMs));
                 if (now - lastActivity <= idleMs) continue;
                 if (skipWhileCharging) continue; // plugged in: keep awake and synced
                 // SYNCED-once gate: don't pause a stack still doing its initial sync — unless

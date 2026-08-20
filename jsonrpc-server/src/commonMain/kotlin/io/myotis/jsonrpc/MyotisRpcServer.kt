@@ -43,6 +43,7 @@ class MyotisRpcServer(
     private val host: String = "127.0.0.1",
     private val backend: RpcBackend? = null,
     private val statusReads: RpcStatusSource? = null,
+    private val lifecycle: RpcLifecycle? = null,
 ) {
     private companion object {
         const val LOGGER = "io.myotis.jsonrpc.MyotisRpcServer"
@@ -59,7 +60,7 @@ class MyotisRpcServer(
 
     private val proxy: UpstreamProxy? = upstreamUrl?.takeIf { it.isNotBlank() }?.let { UpstreamProxy(it) }
     private val logger = MethodLogger()
-    private val router = RpcRouter(proxy, logger, backend, statusReads)
+    private val router = RpcRouter(proxy, logger, backend, statusReads, lifecycle)
 
     /**
      * Optional request/response capture for debugging + replay (JVM-only —
