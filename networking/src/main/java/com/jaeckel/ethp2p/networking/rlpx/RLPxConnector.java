@@ -356,7 +356,10 @@ public final class RLPxConnector implements AutoCloseable {
     private static final int BODY_RECEIPT_MAX_PEERS = 8;
     /** Per-peer deadline for a bodies/receipts fetch. Short so a silent peer costs
      *  seconds, not the caller's whole budget; 8 x this stays under the 60 s the RPC
-     *  bodies path allots (HEADER_CHAIN_TIMEOUT_SEC). */
+     *  bodies path allots (HEADER_CHAIN_TIMEOUT_SEC). NB {@code EthHandler}'s async
+     *  methods already self-bound at the same deadline (and clean their pending-map
+     *  entry on it); this is the rotation policy's own per-attempt bound, which also
+     *  covers the unit tests' un-bounded fake suppliers. */
     private static final long BODY_RECEIPT_TIMEOUT_MS = 5_000;
 
     /**
