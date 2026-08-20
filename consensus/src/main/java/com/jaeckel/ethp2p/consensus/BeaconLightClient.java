@@ -378,35 +378,58 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
-     * The weak-subjectivity re-check guarding EVERY bootstrap attempt — the initial
-     * one, the steady-state poll's retry, and the fallback after a failed snapshot
-     * resume. The anchor here is always the embedded checkpoint, which can be OLDER
-     * than the anchor the start-time gate approved: a fresh snapshot masks a stale
-     * checkpoint until its resume fails, and a peer-starved node can cross the bound
-     * while retrying for weeks. Refuses by flagging STALE_ANCHOR (the poll loop is
-     * the retry cadence) and clears the flag once released — the bound raised live,
-     * or consent given. Mirrors the Rust engine's in-loop bootstrap guard.
+     * The recurring weak-subjectivity re-check behind both in-run guards below:
+     * marks STALE_ANCHOR and refuses while {@code anchorPeriod} is past the bound
+     * (unless consent arrived), clears the mark once released — the bound raised
+     * live, or consent given. The callers are the retry cadence; this never
+     * blocks.
      */
-    private boolean wsGateAllowsBootstrap() {
-        long checkpointPeriod = BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot);
+    private boolean wsGateAllows(long anchorPeriod, String anchorKind) {
         long bound = effectiveWsBound();
         long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
         syncState.setWsBoundPeriods(bound);
         if (!staleAnchorAccepted
                 && com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
-                        .isStale(checkpointPeriod, wallPeriod, bound)) {
+                        .isStale(anchorPeriod, wallPeriod, bound)) {
             if (syncState.getStaleAnchorPeriod() < 0) {
-                log.warn("[beacon] STALE ANCHOR: refusing to bootstrap from checkpoint period {} "
+                log.warn("[beacon] STALE ANCHOR: refusing to sync forward from {} period {} "
                                 + "({} periods old, past the weak-subjectivity bound of {})",
-                        checkpointPeriod, wallPeriod - checkpointPeriod, bound);
+                        anchorKind, anchorPeriod, wallPeriod - anchorPeriod, bound);
             }
-            syncState.markStaleAnchor(checkpointPeriod);
+            syncState.markStaleAnchor(anchorPeriod);
             return false;
         }
         if (syncState.getStaleAnchorPeriod() >= 0) {
             syncState.clearStaleAnchor();
         }
         return true;
+    }
+
+    /**
+     * Guard on EVERY bootstrap attempt — the initial one, the steady-state poll's
+     * retry, and the fallback after a failed snapshot resume. The anchor here is
+     * always the embedded checkpoint, which can be OLDER than the anchor the
+     * start-time gate approved: a fresh snapshot masks a stale checkpoint until its
+     * resume fails, and a peer-starved node can cross the bound while retrying for
+     * weeks. Mirrors the Rust engine's in-loop bootstrap guard.
+     */
+    private boolean wsGateAllowsBootstrap() {
+        return wsGateAllows(
+                BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot), "checkpoint");
+    }
+
+    /**
+     * Guard on every steady-state poll cycle once the store IS initialized — the
+     * awake twin of the entry gate. An initialized store's committee ages in
+     * memory exactly like a snapshot of the same vintage ages on disk: a node
+     * that stays running while peer-starved (or eclipsed — starvation is
+     * inducible) for longer than the bound must NOT hand off through past-bound
+     * committees when connectivity returns, when the identical vintage arriving
+     * via restart would require consent. Without this, restart-vs-stay-running
+     * decided whether the gate applied.
+     */
+    private boolean wsGateAllowsForwardSync() {
+        return wsGateAllows(store.getCurrentSyncCommitteePeriod(), "held committee");
     }
 
     /**
@@ -1000,6 +1023,16 @@ public class BeaconLightClient implements AutoCloseable {
                 // LC hunt trigger check — widens this cycle's fan-outs and
                 // flips the host's discovery boost on transitions.
                 updateHunting(syncStartNanos);
+                // In-run weak-subjectivity re-check (see wsGateAllowsForwardSync):
+                // park this cycle — no finality poll, no catch-up — while the HELD
+                // committee is past the bound and unconsented. Fail closed; the
+                // 1-slot sleep is the re-evaluation cadence, so a raised bound or
+                // consent releases within seconds. The uninitialized case is
+                // covered by the bootstrap guard inside pollFinalityUpdate.
+                if (store.isInitialized() && !wsGateAllowsForwardSync()) {
+                    Thread.sleep(pollIntervalMs);
+                    continue;
+                }
                 pollFinalityUpdate();
                 // Background classification of untried pool peers (fire-and-forget;
                 // never blocks the cycle) — drains the cache's untried bucket.

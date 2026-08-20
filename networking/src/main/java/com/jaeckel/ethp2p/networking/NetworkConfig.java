@@ -651,11 +651,15 @@ public record NetworkConfig(
      *       attack at all; the mainnet-preset bound is kept as hygiene.</li>
      *   <li><b>gnosis: 3</b> (~34 h). Gnosis has 80-second epochs and a
      *       CHURN_LIMIT_QUOTIENT of 4096, which collapses the spec formula to well
-     *       under one 512-epoch period in the worst case; 3 periods is a pragmatic
-     *       floor above the committee-rotation cadence so routine restarts stay
-     *       quiet while multi-day-old anchors still require consent. Deliberately
-     *       conservative — raise it via the Settings override if it gets in the
-     *       way, knowingly.</li>
+     *       under one 512-epoch period in the worst case — so, unlike mainnet's
+     *       floored-below-the-spec-window 13, this default is PERMISSIVE relative
+     *       to the formula (worst-case churn assumes maximal hostile exits) and
+     *       conservative only relative to convenience: 3 periods keeps routine
+     *       restarts quiet while multi-day-old anchors still require consent.
+     *       Tightening to 1 period (~11.4 h) is the strict option — a regularly
+     *       running node persists its snapshot each applied period, so its anchor
+     *       age stays under one period anyway. Owner's call either way; raise or
+     *       lower via the Settings override knowingly.</li>
      * </ul>
      */
     public long wsBoundPeriods() {

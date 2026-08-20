@@ -325,7 +325,27 @@ class RpcRouter(
             val code = if (m in VERIFIED_METHODS) -32000 else -32601
             logger.record(m, idStr, "ERROR", elapsedMs(t0), code)
             return if (m in VERIFIED_METHODS) {
-                errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
+                // A STALE_ANCHOR park deserves its own message: unlike ordinary
+                // not-synced it will NOT progress on its own — a human must raise
+                // the weak-subjectivity bound or accept the risk — and the generic
+                // "no peer / not synced" text would send an operator chasing peers.
+                // The code stays -32000 (retryable): the state CAN change without
+                // the caller acting, once the user decides. Same off-event-loop
+                // discipline as eth_syncing for the (non-blocking, but
+                // FFI-crossing) syncState probe.
+                val be = backend
+                val staleAnchor = be != null && withContext(rpcIoDispatcher) {
+                    be.syncState() == RpcSyncState.STALE_ANCHOR
+                }
+                if (staleAnchor) {
+                    errorEnvelope(id, -32000,
+                        "method '$m' refused: the node's trust anchor is past the " +
+                            "weak-subjectivity bound and syncing is paused awaiting user " +
+                            "consent — raise the bound or accept the risk (Settings / " +
+                            "accept-stale-anchor; details via myotis_beaconStatus)")
+                } else {
+                    errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
+                }
             } else {
                 errorEnvelope(id, -32601, "method '$m' is not supported by this permissionless node")
             }

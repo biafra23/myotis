@@ -1583,6 +1583,39 @@ async fn run_sync(
             }
         }
 
+        // In-run weak-subjectivity re-check, the awake twin of the entry gate: an
+        // initialized store's committee ages in memory exactly like a snapshot of
+        // the same vintage ages on disk, so a node that stays running while
+        // peer-starved (or eclipsed — starvation is inducible) for longer than
+        // the bound must NOT hand off through past-bound committees when peers
+        // return, when the identical vintage arriving via restart would require
+        // consent. Park the cycle — no catch-up, no finality poll — publishing
+        // the held committee as the refused anchor; a raised bound or consent
+        // releases within one 5 s cycle. Mirrors the Java wsGateAllowsForwardSync.
+        if processor.store.is_initialized() {
+            let held_period = processor.store.current_period();
+            let ws_bound = config.effective_ws_bound_periods();
+            let wall = config.wall_clock_period();
+            if ws_anchor_stale(held_period, wall, ws_bound)
+                && !config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed)
+            {
+                if status_tx.borrow().state != SyncState::StaleAnchor {
+                    tracing::warn!(held_period, wall_period = wall, bound = ws_bound,
+                        age = wall - held_period,
+                        "STALE ANCHOR: held committee aged past the weak-subjectivity \
+                         bound while running — refusing to sync forward until the bound \
+                         is raised or the risk is explicitly accepted");
+                }
+                let mut status = SyncStatus::initial();
+                status.state = SyncState::StaleAnchor;
+                status.period = held_period;
+                status.ws_bound_periods = ws_bound;
+                let _ = status_tx.send(status);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        }
+
         let wall_period = config.wall_clock_period();
         if wall_period > processor.store.current_period() {
             // Baseline the progress bar at every catch-up ENTRY (not just
