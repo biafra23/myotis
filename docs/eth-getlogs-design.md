@@ -111,6 +111,65 @@ From the first anchored block downward to `min(watch.from_block)`:
 4. Checkpoint cursor + coverage after each batch; restart is idempotent from
    the checkpoint (any await may be the last).
 
+**Request sizing (adaptive).** Candidate blocks are fetched in chunks, and a
+peer answers `get_block_bodies`/`get_receipts` up to a soft BYTE budget — a
+chunk that exceeds it comes back short. A truncated chunk ends the whole batch
+(everything above the cut is still applied; coverage never claims more than was
+verified), so the batch advances the cursor only as far as the first truncated
+chunk, having already paid for a full ~1023-header window. On a candidate-dense
+range where peers cut at ~15 blocks, a fixed 64-block chunk truncates *every*
+time — measured on Gnosis, that walk spent ~a quarter of its bandwidth
+re-downloading the same header window to advance ~15 blocks (1023 × ~600 B of
+headers per batch against ~1.3 MiB/s total, at ~0.55 batches/s).
+
+So the chunk width tracks what peers in the current range actually serve:
+
+- **Down** toward the observed serve width on truncation, but floored at a
+  quarter of the current width. `served` describes the blocks in *that* chunk,
+  not the range — one fat block, or one degenerate peer, can report 1 where the
+  range serves 40, and the width is shared across peers. Unfloored, a single
+  such observation costs ~70 batches of probing to climb back from.
+- **Up** only as a periodic probe, on the Nth consecutive untruncated batch that
+  actually exercised the full width (a bloom-sparse window that asked for 5
+  blocks and got 5 says nothing about 64). Never as a reflex after each clean
+  batch: growth overshoots by construction, so growing on every clean batch
+  settles into a stable truncate-every-*other*-batch limit cycle — the same
+  pathology, re-entered through the back door.
+
+A truncation counts as evidence about the width when the chunk was **the widest
+one that batch could have asked for** — `min(width, candidates)`, not `width`.
+A bloom-sparse window with 30 candidates at width 64 yields a single 30-block
+chunk, and a peer cutting it at 15 is the only budget measurement such a batch
+can produce; ignoring it left every window with `budget < candidates < width`
+permanently stuck (the width never moved, and the truncation ended the batch
+before the clean path could run). What is excluded is a batch's short *tail*
+chunk, which exists only when `candidates > width` and therefore always follows
+a full-width chunk that already succeeded.
+
+Chunks that come back full also leave the request pipeline at full depth. A
+truncation the probe itself provoked is excluded from that signal, so a probe
+costs one short batch rather than one short batch plus a full window run at
+depth 1. Only an observation that is evidence about the width may spend a
+pending probe — otherwise the probe survives untested and the next truncation,
+quite plausibly that same probe hitting its ceiling, is misattributed to the
+range.
+
+The width is shared across peers on purpose (the byte budget is a property of
+the range as much as of the peer), which makes it a throughput/latency griefing
+vector but not a correctness one — every block is verified on arrival however
+many were requested. The latency side is the sharper one: chunks per batch is
+`ceil(candidates / width)` at pipeline depth 4, so a floored width turns a full
+window from ~4 requests into ~1023, overrunning the walker's tick budget (only
+checked between rounds) and delaying the head-follow appender that shares the
+task. Self-heals over the probe ladder; a hard chunks-per-batch bound is the
+natural pairing for the width floor if it ever shows up in practice.
+
+Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
+the limit-cycle bound and the floor are pinned by test. The width is *not*
+persisted — the walk resumes at a checkpointed cursor that may be in a
+different density regime, and re-learning costs one truncated batch per step
+down the ladder (at most three, since the floor bounds each step to a quarter).
+
 Peers that cannot serve deep history (EIP-4444 rollout) make this **stall, not
 fail**: track per-peer "history depth" refusals the same way snap-capability is
 tracked, rotate peers, back off, surface progress via status. If the network
