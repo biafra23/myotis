@@ -110,7 +110,7 @@ public final class NodeService extends Service {
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
-    private static final String K_RUST_ENGINE = "rustEngine";
+    private static final String K_PREFER_JAVA = "engine.preferJava";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
@@ -242,9 +242,44 @@ public final class NodeService extends Service {
         return rpcPortFor(c, primaryNetwork(c));
     }
     /** Persist the JSON-RPC port for a specific network (ports are per-network — see {@link #rpcPortKey}). */
-    /** Opt-in eth_getLogs Kohaku-preset index for one network (Rust engine only). */
+    /** Opt-in eth_getLogs watch-list index for one network (Rust engine only). */
     public static boolean logIndexEnabled(android.content.Context c, String network) {
         return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
+    }
+
+    /** Whether an explicit log-index enabled/disabled flag is persisted for one network
+     *  (see {@code Settings.logIndexConfigured}): a configured network always pushes its
+     *  config — a disable must reach the engine or its boot-time activate-from-disk
+     *  re-enables an imported index. */
+    public static boolean logIndexConfigured(android.content.Context c, String network) {
+        return prefs(c).contains("logIndex." + canonicalNetwork(network));
+    }
+
+    /** The user's watched contracts for one network's log index, as
+     *  {@code io.myotis.ui.LogIndexWatch}'s JSON array (same key scheme as the desktop).
+     *  MIGRATION on first read: a user who had the retired built-in Kohaku preset toggle
+     *  on has the enabled flag persisted but NO watch entries (the preset lived in code) —
+     *  seed from the legacy preset so the next config push does not silently drop their
+     *  subscriptions. */
+    public static String logIndexWatchJson(android.content.Context c, String network) {
+        String net = canonicalNetwork(network);
+        String key = "logIndex.watch." + net;
+        String v = prefs(c).getString(key, null);
+        if (v != null) {
+            return v;
+        }
+        if (logIndexEnabled(c, net)) {
+            String legacy = io.myotis.ui.LogIndexWatch.legacyKohakuWatchJson(net);
+            if (legacy != null) {
+                prefs(c).edit().putString(key, legacy).apply();
+                return legacy;
+            }
+        }
+        return "[]";
+    }
+
+    public static void setLogIndexWatchJson(android.content.Context c, String network, String json) {
+        prefs(c).edit().putString("logIndex.watch." + canonicalNetwork(network), json).apply();
     }
 
     /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
@@ -331,9 +366,11 @@ public final class NodeService extends Service {
 
     private void pushLogIndexConfig(String net, ChainHandle handle) {
         boolean enabled = logIndexEnabled(this, net);
-        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled, logIndexMaxSpeed(this, net));
+        String json = io.myotis.ui.LogIndexWatch.configJson(
+                logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
+                logIndexConfigured(this, net));
         if (json == null) {
-            return; // no preset for this network — engine stays honestly unconfigured
+            return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
         }
         boolean ok = handle.setLogIndexConfig(json);
         if (enabled && !ok) {
@@ -440,21 +477,31 @@ public final class NodeService extends Service {
     public static String blsBackendChoice(android.content.Context c) {
         return nativeBlsEnabled(c) ? "auto" : "milagro";
     }
-    /** Settings toggle: prefer the (experimental) Rust engine for newly started networks.
-     *  Default off — the Java engine is the proven path. */
-    public static boolean rustEngineEnabled(android.content.Context c) {
-        return prefs(c).getBoolean(K_RUST_ENGINE, false);
+    /** Settings toggle: force the Java engine for newly started networks. Default off —
+     *  the selector's {@code auto} mode (Rust engine where it can serve — it alone serves
+     *  the log index and Tor routing — Java fallback otherwise) is the default. Replaces
+     *  the pre-auto-default "rustEngine" preference. MIGRATION: rustEngine=true meant
+     *  "auto", which is the new default — nothing to carry. But a PRESENT rustEngine=false
+     *  is a user who touched the toggle and deliberately ended on the Java engine — an
+     *  expressed opt-out this seeds into the new key rather than silently discarding. */
+    public static boolean preferJavaEngine(android.content.Context c) {
+        android.content.SharedPreferences p = prefs(c);
+        if (!p.contains(K_PREFER_JAVA) && p.contains("rustEngine") && !p.getBoolean("rustEngine", true)) {
+            p.edit().putBoolean(K_PREFER_JAVA, true).apply();
+            return true;
+        }
+        return p.getBoolean(K_PREFER_JAVA, false);
     }
-    public static void setRustEngineEnabled(android.content.Context c, boolean v) {
-        prefs(c).edit().putBoolean(K_RUST_ENGINE, v).apply();
+    public static void setPreferJavaEngine(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_PREFER_JAVA, v).apply();
     }
-    /** Apply the Rust-engine setting to the process-wide {@code Engines} selector. Maps
-     *  enabled → {@code auto} (prefer Rust where it can serve, fall back to Java with a
-     *  log — the Rust engine is catalog-only today), disabled → {@code java}. Unlike the
-     *  BLS toggle this is NOT live: networks keep the engine that created them; the new
-     *  choice applies on the next network (re)start. Returns the applied choice. */
+    /** Apply the engine setting to the process-wide {@code Engines} selector. Maps the
+     *  default → {@code auto} (prefer Rust where it can serve, fall back to Java with a
+     *  log), prefer-Java → {@code java}. Unlike the BLS toggle this is NOT live: networks
+     *  keep the engine that created them; the new choice applies on the next network
+     *  (re)start. Returns the applied choice. */
     public static String applyEngineChoice(android.content.Context c) {
-        String choice = rustEngineEnabled(c) ? "auto" : "java";
+        String choice = preferJavaEngine(c) ? "java" : "auto";
         System.setProperty(io.myotis.engines.Engines.PROP, choice);
         io.myotis.engines.Engines.select(choice);
         return choice;

@@ -60,22 +60,34 @@ interface NodeController {
 
     /**
      * Re-apply the engine choice (Java ⇄ Rust) to the process-global selector after
-     * [Settings.setRustEngineEnabled] flips the preference. Unlike the BLS toggle this is
+     * [Settings.setPreferJavaEngine] flips the preference. Unlike the BLS toggle this is
      * NOT live: networks keep the engine that created them — the new choice applies when a
-     * network is (re)started. The Rust engine is experimental (catalog-only today), so the
-     * enabled state maps to the selector's `auto` mode, which falls back to Java per
-     * network until the Rust engine can host it.
+     * network is (re)started. The default maps to the selector's `auto` mode — the Rust
+     * engine where it can serve (it alone serves the log index and Tor routing), Java
+     * fallback otherwise; preferring Java maps to a hard `java`.
      */
     fun applyEngineChoice()
 
     /**
      * Re-apply Tor verified-read routing to the process-global selector after
-     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is a
-     * Rust-engine-only, experimental capability, so hosts that don't support it (Android/iOS
-     * for now) keep the default no-op; the desktop actual pushes the flag to `Tor.select`.
-     * Like the engine toggle it is NOT live: it applies to networks (re)started afterwards.
+     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is an
+     * experimental capability of the Rust engine only, so hosts that don't support it
+     * (Android/iOS for now) keep the default no-op; the desktop actual pushes the flag to
+     * `Tor.select`. Like the engine toggle it is NOT live: it applies to networks
+     * (re)started afterwards.
      */
     fun applyTorMode() {}
+
+    /**
+     * Whether this host can actually route reads over Tor — the Settings row is
+     * shown only when true (the [canImportLogIndex] precedent). Default false:
+     * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
+     * the write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
+     * while reads keep leaving from the real IP would be accepted-and-ignored —
+     * the exact failure mode the trust rules forbid. The desktop actual answers
+     * from the loaded engine build (only a `-PtorEngine` dylib links Arti).
+     */
+    val supportsTor: Boolean get() = false
 
     /** Push the (persisted) log-index preference for [network] down to the
      *  engine — called from the settings toggle and at network (re)start.
@@ -206,9 +218,15 @@ interface Settings {
     /** true = use bundled native blst (default on Android); false = pure-Java Milagro. */
     fun nativeBlsEnabled(): Boolean
     fun setNativeBlsEnabled(v: Boolean)
-    /** true = prefer the (experimental) Rust engine for newly started networks; default false. */
-    fun rustEngineEnabled(): Boolean
-    fun setRustEngineEnabled(v: Boolean)
+    /**
+     * true = force the Java engine for newly started networks; default false = the
+     * selector's `auto` mode (Rust engine where it can serve — it alone serves the log
+     * index and Tor routing — Java fallback otherwise). Defaults keep hosts without an
+     * engine choice compiling: iOS has only the Rust engine, so the inert defaults are
+     * exactly its semantics.
+     */
+    fun preferJavaEngine(): Boolean = false
+    fun setPreferJavaEngine(v: Boolean) {}
 
     /**
      * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
@@ -219,12 +237,33 @@ interface Settings {
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
 
-    /** Opt-in eth_getLogs watch-list index (the shipped Kohaku preset), per
-     *  network. Defaults keep hosts without the feature compiling; the
-     *  desktop/iOS actuals persist it and [NodeController.applyLogIndex]
-     *  pushes the preset config down to the Rust engine. */
+    /** Opt-in eth_getLogs watch-list index, per network. Defaults keep hosts
+     *  without the feature compiling; the host actuals persist it and
+     *  [NodeController.applyLogIndex] pushes the config — built from
+     *  [logIndexWatchJson]'s entries — down to the Rust engine. */
     fun logIndexEnabled(network: String): Boolean = false
     fun setLogIndexEnabled(network: String, on: Boolean) {}
+
+    /**
+     * Whether an explicit enabled/disabled flag is PERSISTED for [network] —
+     * i.e. [setLogIndexEnabled] has ever run (import sets it too). Distinct
+     * from [logIndexEnabled]'s value: a disabled-but-configured network still
+     * pushes its (disable) config, because the engine's boot-time
+     * activate-from-disk would otherwise re-enable an imported index the user
+     * turned off. A virgin network (never configured) pushes nothing.
+     */
+    fun logIndexConfigured(network: String): Boolean = false
+
+    /**
+     * The user's watched contracts for [network]'s log index, as the JSON array
+     * [LogIndexWatch] serializes (`[{"address":"0x…","fromBlock":N},…]`). The
+     * Index tab edits this list; [NodeController.applyLogIndex] turns it into
+     * the engine config. Removing an entry only stops FUTURE subscriptions —
+     * the engine's config union never drops a live one (the Index tab says so).
+     * Defaults keep hosts without the feature compiling.
+     */
+    fun logIndexWatchJson(network: String): String = "[]"
+    fun setLogIndexWatchJson(network: String, json: String) {}
 
     /** Backfill pacing for the log index, per network: true = max download
      *  speed (multi-batch ticks), false = nice background pace (one batch

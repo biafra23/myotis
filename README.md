@@ -17,7 +17,7 @@ A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API ove
 
 Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, byte utilities; via a Kotlin-rewrite fork), with in-house SSZ and Merkle-Patricia verification, a pure-Java BLS verifier, and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
 
-There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `java`; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
+There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
 
 ## Documentation
 
@@ -767,12 +767,12 @@ The light client syncs from the **beacon chain P2P network** (libp2p) -- fully d
 
 ## Engines: Java and Rust
 
-Myotis is mid-migration from a single Java implementation to a **Rust engine** that reimplements the whole verification stack natively. Both engines live behind the same contract and are interchangeable per network at (re)start:
+Myotis ships **two engines** behind one contract: the original **Java engine** and the **Rust engine**, which reimplements the whole verification stack natively and is the primary engine — the default selection, and ahead of the Java engine on features (the eth_getLogs **log index** and Tor verified-read routing run on the Rust engine only). Both are interchangeable per network at (re)start:
 
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
 - **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides. The same engine's plain C ABI also serves the two non-JVM hosts: the iOS app (Kotlin/Native cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — identical JSON shapes, pinned by the same golden tests.
-- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
+- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `auto` (default: the Rust engine where it can serve, Java fallback otherwise), `java`, or `rust` (hard — error when unavailable). On run tasks use `-Pengine=java` to opt out; in the apps it's the "Prefer Java engine" Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
 **rustc/cargo are NOT required to build or run the JVM hosts (daemon + desktop).**
@@ -780,8 +780,8 @@ That build is pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings 
 committed source (no bindgen step for a JVM-host build), JNA comes from Maven Central
 like any other dependency, and every `cargo*` Gradle task self-skips with a single
 note when cargo is missing. On a cargo-less machine the JVM hosts' engine selector
-simply reports the Rust engine as unavailable and everything runs on the Java engine
-(the default, `myotis.engine=java`) — there is nothing to configure or disable. The
+simply reports the Rust engine as unavailable and the default `auto` selection
+falls back to the Java engine — there is nothing to configure or disable. The
 **Android app** is the exception: it builds the Rust engine from source by default
 (cargo + cargo-ndk + NDK + the Android rustup targets; its `preBuild` runs
 `cargoNdkAndroid` and regenerates the bindings). There is no committed `.so`, so
@@ -807,9 +807,57 @@ To actually build the Rust engine and bundle it, per target:
 ./gradlew cargoTest            # cargo test --workspace (part of `check`)
 ./gradlew cargoNdkAndroid      # Android jniLibs (needs cargo-ndk + NDK)
 ./gradlew uniffiGenerateKotlin # regenerate the committed Kotlin bindings after ffi.rs changes
-./gradlew :app:run -Pengine=rust          # daemon on the Rust engine
-./gradlew :app-desktop:run -Pengine=rust  # desktop GUI on the Rust engine
+./gradlew :app:run -Pengine=rust          # daemon on the Rust engine (hard; default auto)
+./gradlew :app-desktop:run -Pengine=java  # desktop GUI forced onto the Java engine
 ```
+
+## Log index: verified eth_getLogs
+
+The **log index** is an opt-in, per-network index of the event logs of contracts *you choose*
+— every log verified against receipt roots on the devp2p network (no RPC provider), backfilled
+to each contract's deployment block, then kept current at the head. Queries outside what the
+index has covered are refused with an error, never answered with a misleading `[]`.
+**Rust engine only** (the default `auto` selection serves it; forcing the Java engine gives it up).
+
+### Create an index in the app
+
+Open the **Index** tab (desktop, Android, iOS), enter each contract's address and the block
+to index back to — its deployment block; when unsure, choose an *earlier* block: later
+silently hides the earlier events, earlier merely walks further — then flip **Collect logs**
+on. The backfill runs in the background ("Max download speed" trades battery/bandwidth for
+speed) and the tab shows per-contract progress. Display names resolve automatically via
+verified reverse-ENS where a name exists.
+
+### Create a portable index with the daemon
+
+For a big backfill (months of history), build the index once on a machine that can run
+around the clock, then hand the file to the apps:
+
+```bash
+# 1. Start the daemon on the target network (the Rust engine serves the index).
+./gradlew :app:run -Pnetwork=gnosis
+
+# 2. Tell it what to index: one or more addresses, and how far back.
+./gradlew :app:run -Pnetwork=gnosis -Pargs="build-logindex 0x45a1502382541cd610cc9068e88727426b696293 --from 31305656"
+
+# 3. Watch the backfill (cursor walks DOWN to the target; maxSpeed is on for build-logindex).
+./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status
+
+# 4. When backfillCursor has reached the target: export a portable snapshot.
+./gradlew :app:run -Pnetwork=gnosis -Pargs="export-logindex /tmp/my-index.db"
+```
+
+The exported `.db` is **self-describing and chain-tagged** (network id + genesis hash), so it
+can only be imported into a node on the same chain. Import it via the Index tab's
+"Import log-index snapshot…" button — the receiving node merges it with whatever it already
+holds and immediately starts catch-up for every imported address, so the file does not need
+to be fresh. One bound: the head-gap bridge spans at most **500,000 blocks** (~29 days on
+Gnosis, ~10 weeks on mainnet), so import a snapshot within that window of its export — or
+re-export a fresh one, which costs seconds on a node whose index is current.
+
+Display names are deliberately NOT part of the file: the importing wallet resolves them
+itself (verified reverse-ENS), so a generated file cannot lie about who a contract is.
+
 
 ## Architecture
 

@@ -39,7 +39,7 @@ class SelectorEngineTest {
 
     @AfterEach
     void resetChoice() {
-        Engines.select("java");
+        Engines.select("auto");
         // The engine is a process-global singleton: if an assertion fired between a
         // test's create() and its stop(), the network would stay hosted and poison
         // later tests. shutdownAll() clears every hosted network on both engines.
@@ -84,17 +84,17 @@ class SelectorEngineTest {
     }
 
     @Test
-    void defaultChoiceIsJavaAndCatalogAnswers() {
-        assertEquals("java", Engines.choice());
+    void defaultChoiceIsAutoAndCatalogAnswers() {
+        assertEquals("auto", Engines.choice());
         MyotisEngine e = Engines.engine();
         assertEquals(3, e.availableNetworks().size());
         assertEquals("gnosis", e.canonicalNetworkName("xdai"));
     }
 
     @Test
-    void invalidChoiceFallsBackToJava() {
+    void invalidChoiceFallsBackToAuto() {
         Engines.select("cobol");
-        assertEquals("java", Engines.choice());
+        assertEquals("auto", Engines.choice());
     }
 
     @Test
@@ -117,6 +117,7 @@ class SelectorEngineTest {
 
     @Test
     void createRoutesAndOwnershipTracksAcrossStopAndSwitch() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         MyotisEngine e = Engines.engine();
         // java-owned create; get() routes through recorded ownership.
         assertNull(e.get("mainnet"));
@@ -135,6 +136,7 @@ class SelectorEngineTest {
 
     @Test
     void engineKindForReportsOwnerAndNullWhenNotHosted() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         assertNull(Engines.engineKindFor("mainnet"));
         Engines.engine().create(config("mainnet"), ports());
         assertEquals("java", Engines.engineKindFor("mainnet"));
@@ -147,6 +149,7 @@ class SelectorEngineTest {
 
     @Test
     void engineKindForResolvesAliases() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         Engines.engine().create(config("gnosis"), ports());
         assertEquals("java", Engines.engineKindFor("xdai"));
     }

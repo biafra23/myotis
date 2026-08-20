@@ -123,7 +123,7 @@ Key Gradle modules:
 - **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
   paths in the daemon, desktop, and Android don't import engine internals
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
-  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
+  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
   Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
   single `Engines.engine()` line at each composition root; the TrueBlocks

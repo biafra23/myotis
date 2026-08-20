@@ -185,8 +185,10 @@ class IosNodeController(
     }
 
     private fun pushLogIndexConfig(net: String, handle: Long) {
-        val json = io.myotis.ui.KohakuPreset.configJson(
-            net, settings.logIndexEnabled(net), settings.logIndexMaxSpeed(net)) ?: return
+        val json = io.myotis.ui.LogIndexWatch.configJson(
+            settings.logIndexWatchJson(net), settings.logIndexEnabled(net),
+            settings.logIndexMaxSpeed(net),
+            configured = settings.logIndexConfigured(net)) ?: return
         if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
             logs.append("WARN log index config rejected for $net")
         }

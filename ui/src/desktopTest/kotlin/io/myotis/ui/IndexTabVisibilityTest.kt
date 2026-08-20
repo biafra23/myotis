@@ -1,7 +1,6 @@
 package io.myotis.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.isToggleable
@@ -13,78 +12,65 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * Pins the Index tab's visibility rule: the tab exists only while the Kohaku log
- * index reads as enabled in Settings — the persisted per-network flags AND the
- * Rust engine (without it the Settings switch shows off/disabled and no engine
- * serves the index) — and reacts live to the toggles that change either.
+ * Pins the Index tab's visibility rule: the tab is the log-index feature's home
+ * (contracts are added and snapshots imported THERE), so it shows whenever the
+ * engine choice can serve the feature — anything but a forced Java engine, the
+ * log index being Rust-engine-only — and reacts live to the Settings toggle.
  */
 class IndexTabVisibilityTest {
+
+    /** [FakeSettings] with the knob the visibility rule reads made real. */
+    private class IndexSettings(
+        private var preferJava: Boolean = false,
+    ) : Settings by FakeSettings() {
+        private val logIndex = mutableMapOf<String, Boolean>()
+        private val watch = mutableMapOf<String, String>()
+        override fun preferJavaEngine(): Boolean = preferJava
+        override fun setPreferJavaEngine(v: Boolean) { preferJava = v }
+        override fun logIndexEnabled(network: String): Boolean = logIndex[network] == true
+        override fun setLogIndexEnabled(network: String, on: Boolean) { logIndex[network] = on }
+        override fun logIndexWatchJson(network: String): String = watch[network] ?: "[]"
+        override fun setLogIndexWatchJson(network: String, json: String) { watch[network] = json }
+    }
 
     @get:Rule
     val rule = createComposeRule()
 
-    /** [FakeSettings] with the two knobs the visibility rule reads made real. */
-    private class IndexSettings(
-        private var rust: Boolean,
-        kohakuOn: Set<String> = emptySet(),
-    ) : Settings by FakeSettings() {
-        private val logIndex = kohakuOn.associateWith { true }.toMutableMap()
-        override fun rustEngineEnabled(): Boolean = rust
-        override fun setRustEngineEnabled(v: Boolean) { rust = v }
-        override fun logIndexEnabled(network: String): Boolean = logIndex[network] == true
-        override fun setLogIndexEnabled(network: String, on: Boolean) { logIndex[network] = on }
-    }
-
     @Test
-    fun indexTabHiddenByDefault() {
-        show(IndexSettings(rust = false))
+    fun indexTabVisibleByDefault() {
+        // auto is the default engine choice, so the feature's home is reachable
+        // out of the box — that is where a user discovers it.
+        show(IndexSettings())
         tab("Settings").assertIsDisplayed()
-        tab("Index").assertDoesNotExist()
-    }
-
-    @Test
-    fun indexTabHiddenWhenKohakuFlagsSetButRustEngineOff() {
-        // Persisted flags survive a Rust-engine opt-out; the Settings switch then
-        // reads off/disabled, so the tab must read the same.
-        show(IndexSettings(rust = false, kohakuOn = KohakuPreset.byNetwork.keys))
-        tab("Index").assertDoesNotExist()
-    }
-
-    @Test
-    fun indexTabVisibleWhenKohakuEnabledInSettings() {
-        show(IndexSettings(rust = true, kohakuOn = setOf("mainnet")))
         tab("Index").assertIsDisplayed()
     }
 
     @Test
-    fun togglingKohakuOnInSettingsRevealsTheIndexTab() {
-        show(IndexSettings(rust = true))
+    fun indexTabHiddenWhenJavaEngineForced() {
+        // The log index is Rust-engine-only: forcing Java gives the feature up,
+        // and a tab whose every control would be inert should not be offered.
+        show(IndexSettings(preferJava = true))
         tab("Index").assertDoesNotExist()
-
-        tab("Settings").performClick()
-        toggle("Log index — Kohaku contracts (experimental)")
-        tab("Index").assertIsDisplayed()
     }
 
     @Test
-    fun turningOffTheLastCollectingNetworkHidesTheTabAndFallsBackToStatus() {
-        show(IndexSettings(rust = true, kohakuOn = setOf("mainnet")))
-        tab("Index").performClick()
-
-        toggle("Collect Kohaku contract logs on mainnet")
-        tab("Index").assertDoesNotExist()
-        // The vanished selection falls back to the Status tab (selected, not merely present).
-        tab("Status").assertIsSelected()
-    }
-
-    @Test
-    fun togglingRustEngineOffInSettingsHidesTheIndexTabImmediately() {
-        show(IndexSettings(rust = true, kohakuOn = setOf("mainnet")))
+    fun forcingJavaInSettingsHidesTheIndexTabImmediately() {
+        show(IndexSettings())
         tab("Index").assertIsDisplayed()
 
         tab("Settings").performClick()
-        toggle("Rust engine (experimental)")
+        toggle("Prefer Java engine")
         tab("Index").assertDoesNotExist()
+    }
+
+    @Test
+    fun turningJavaPreferenceBackOffRevealsTheTabAgain() {
+        show(IndexSettings(preferJava = true))
+        tab("Index").assertDoesNotExist()
+
+        tab("Settings").performClick()
+        toggle("Prefer Java engine")
+        tab("Index").assertIsDisplayed()
     }
 
     private fun show(settings: Settings) {
