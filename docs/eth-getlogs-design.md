@@ -401,8 +401,10 @@ post-create call rather than a `create_handle` signature break:
   (`capi.rs` + `rust/include/myotis_engine.h`), `ABI_VERSION` bump with a
   changelog line (`lib.rs:34`).
 - Config JSON: `{ "enabled": bool, "watch": [{"address": "0x…",
-  "fromBlock": n, "topic0s": ["0x…", …]? }, …] }`. Presets (the kohaku
-  contract set per network) live host-side as data, not in the engine.
+  "fromBlock": n, "topic0s": ["0x…", …]? }, …] }`. Watch lists live host-side
+  as data, not in the engine — originally a built-in preset (the kohaku
+  contract set per network), since 2026-08-20 the user's own entries
+  (`LogIndexWatch`, entered on the Index tab and persisted per network).
 - Hosts: `NodeController` gains logIndex getters/setters next to
   `servedBlockWindow` (`ui/.../NodeController.kt:158`); persisted by each
   host's `Settings` actual; applied on (re)start via `RustChainHandle` right
@@ -412,7 +414,16 @@ post-create call rather than a `create_handle` signature break:
   `tryVerified`, backed by a new `RpcBackend.getLogs(filterJson)`; tri-state
   string convention like `getBlockReceipts` (`VerifiedReads.java:76`).
 
-### Kohaku preset (per network, from kohaku's configs)
+### Kohaku preset (RETIRED 2026-08-20 — now migration seed data)
+
+The original built-in preset (tornado-cash registries, railgun proxy,
+privacy-pools + its sepolia pools, per network from kohaku's configs) was
+replaced by user-entered watch lists. The data survives ONLY as
+`LogIndexWatch.legacyKohakuWatchJson`: a user who had the preset toggle on has
+the enabled flag persisted but no watch entries (the preset lived in code), so
+each host seeds its watch store from the legacy table on first read — without
+that, the first post-upgrade config push would silently drop the user's
+subscriptions.
 
 | Contract | Mainnet from | Sepolia from |
 |---|---|---|

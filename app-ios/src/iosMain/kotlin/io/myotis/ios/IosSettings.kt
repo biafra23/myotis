@@ -98,8 +98,21 @@ class IosSettings : Settings {
         getBool("$K_LOG_INDEX_SPEED_PREFIX$network", false)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) =
         defaults.setBool(on, "$K_LOG_INDEX_SPEED_PREFIX$network")
-    override fun logIndexWatchJson(network: String): String =
-        defaults.stringForKey("$K_LOG_INDEX_WATCH_PREFIX$network") ?: "[]"
+    override fun logIndexConfigured(network: String): Boolean =
+        defaults.objectForKey("$K_LOG_INDEX_PREFIX$network") != null
+    override fun logIndexWatchJson(network: String): String {
+        defaults.stringForKey("$K_LOG_INDEX_WATCH_PREFIX$network")?.let { return it }
+        // MIGRATION: the retired built-in Kohaku preset's enabled flag without
+        // watch entries — seed from the legacy preset so the next config push
+        // does not silently drop the user's subscriptions.
+        if (logIndexEnabled(network)) {
+            io.myotis.ui.LogIndexWatch.legacyKohakuWatchJson(network)?.let {
+                defaults.setObject(it, "$K_LOG_INDEX_WATCH_PREFIX$network")
+                return it
+            }
+        }
+        return "[]"
+    }
     override fun setLogIndexWatchJson(network: String, json: String) =
         defaults.setObject(json, "$K_LOG_INDEX_WATCH_PREFIX$network")
 

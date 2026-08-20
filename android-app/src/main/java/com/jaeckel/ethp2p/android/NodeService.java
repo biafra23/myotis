@@ -247,11 +247,35 @@ public final class NodeService extends Service {
         return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
     }
 
+    /** Whether an explicit log-index enabled/disabled flag is persisted for one network
+     *  (see {@code Settings.logIndexConfigured}): a configured network always pushes its
+     *  config — a disable must reach the engine or its boot-time activate-from-disk
+     *  re-enables an imported index. */
+    public static boolean logIndexConfigured(android.content.Context c, String network) {
+        return prefs(c).contains("logIndex." + canonicalNetwork(network));
+    }
+
     /** The user's watched contracts for one network's log index, as
-     *  {@code io.myotis.ui.LogIndexWatch}'s JSON array (same key scheme as the desktop). */
+     *  {@code io.myotis.ui.LogIndexWatch}'s JSON array (same key scheme as the desktop).
+     *  MIGRATION on first read: a user who had the retired built-in Kohaku preset toggle
+     *  on has the enabled flag persisted but NO watch entries (the preset lived in code) —
+     *  seed from the legacy preset so the next config push does not silently drop their
+     *  subscriptions. */
     public static String logIndexWatchJson(android.content.Context c, String network) {
-        String v = prefs(c).getString("logIndex.watch." + canonicalNetwork(network), "[]");
-        return v == null ? "[]" : v;
+        String net = canonicalNetwork(network);
+        String key = "logIndex.watch." + net;
+        String v = prefs(c).getString(key, null);
+        if (v != null) {
+            return v;
+        }
+        if (logIndexEnabled(c, net)) {
+            String legacy = io.myotis.ui.LogIndexWatch.legacyKohakuWatchJson(net);
+            if (legacy != null) {
+                prefs(c).edit().putString(key, legacy).apply();
+                return legacy;
+            }
+        }
+        return "[]";
     }
 
     public static void setLogIndexWatchJson(android.content.Context c, String network, String json) {
@@ -343,9 +367,10 @@ public final class NodeService extends Service {
     private void pushLogIndexConfig(String net, ChainHandle handle) {
         boolean enabled = logIndexEnabled(this, net);
         String json = io.myotis.ui.LogIndexWatch.configJson(
-                logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net));
+                logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
+                logIndexConfigured(this, net));
         if (json == null) {
-            return; // nothing to say (no entries, not enabled) — engine stays honestly unconfigured
+            return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
         }
         boolean ok = handle.setLogIndexConfig(json);
         if (enabled && !ok) {
@@ -455,10 +480,17 @@ public final class NodeService extends Service {
     /** Settings toggle: force the Java engine for newly started networks. Default off —
      *  the selector's {@code auto} mode (Rust engine where it can serve — it alone serves
      *  the log index and Tor routing — Java fallback otherwise) is the default. Replaces
-     *  the pre-auto-default "rustEngine" preference, which is simply ignored now (its
-     *  true meant "auto", which is the default — nothing to migrate). */
+     *  the pre-auto-default "rustEngine" preference. MIGRATION: rustEngine=true meant
+     *  "auto", which is the new default — nothing to carry. But a PRESENT rustEngine=false
+     *  is a user who touched the toggle and deliberately ended on the Java engine — an
+     *  expressed opt-out this seeds into the new key rather than silently discarding. */
     public static boolean preferJavaEngine(android.content.Context c) {
-        return prefs(c).getBoolean(K_PREFER_JAVA, false);
+        android.content.SharedPreferences p = prefs(c);
+        if (!p.contains(K_PREFER_JAVA) && p.contains("rustEngine") && !p.getBoolean("rustEngine", true)) {
+            p.edit().putBoolean(K_PREFER_JAVA, true).apply();
+            return true;
+        }
+        return p.getBoolean(K_PREFER_JAVA, false);
     }
     public static void setPreferJavaEngine(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_PREFER_JAVA, v).apply();

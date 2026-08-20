@@ -306,6 +306,7 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
     override fun logIndexMaxSpeed(network: String): Boolean = NodeService.logIndexMaxSpeed(ctx, network)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = NodeService.setLogIndexMaxSpeed(ctx, network, on)
+    override fun logIndexConfigured(network: String): Boolean = NodeService.logIndexConfigured(ctx, network)
     override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
     override fun setLogIndexWatchJson(network: String, json: String) =
         NodeService.setLogIndexWatchJson(ctx, network, json)

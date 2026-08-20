@@ -96,9 +96,11 @@ its deployment block:
   WebSocket endpoint and no `eth_newFilter`/`eth_subscribe` family; Bee's
   default HTTP polling mode works, a subscription-configured Bee does not.
 - **Coverage is explicit.** A query outside the indexed contracts or below
-  their fromBlocks errors out (`-32602`-class, permanent) instead of returning
-  `[]`. That is deliberate: an honest refusal is retryable, a fabricated empty
-  answer is corruption.
+  their fromBlocks errors out (`-32000`, the **retryable** class — backfill may
+  cover the range later, so a client should retry, not give up) instead of
+  returning `[]`. That is deliberate: an honest refusal can be retried, a
+  fabricated empty answer is silent corruption. Only a malformed request gets
+  the permanent `-32602`.
 - **Historical state pins are rejected.** Reads pinned to old blocks answer
   from the verified head or refuse — a light client cannot prove deep
   historical state.

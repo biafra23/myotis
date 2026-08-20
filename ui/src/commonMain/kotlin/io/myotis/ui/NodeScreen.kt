@@ -485,10 +485,12 @@ private fun SettingsTab(
                 "falling back to the Java engine otherwise. The Rust engine is the " +
                 "primary engine — the log index (Index tab) and Tor routing run on it " +
                 "only. On: force the original Java engine everywhere, giving up those " +
-                "features. Applies when a network is (re)started, not to already-running " +
-                "networks. Note: Rust-hosted networks do NOT idle-sleep yet — they stay " +
-                "always-on regardless of the idle-sleep setting (the Status screen's " +
-                "Sleep row says so per network).",
+                "features — currently the only way to use the Query tab's " +
+                "transaction-history scan (mainnet, Java engine only). Applies when a " +
+                "network is (re)started, not to already-running networks. Note: " +
+                "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
+                "regardless of the idle-sleep setting (the Status screen's Sleep row " +
+                "says so per network).",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1733,14 +1735,18 @@ private fun IndexTab(
             "Earlier is safer for the from-block: the index only answers queries for " +
                 "ranges it has covered, so a from-block AFTER the real deployment silently " +
                 "hides the earlier events, while an earlier one merely walks further. " +
-                "Removing a contract stops future sessions from indexing it, but the " +
-                "running index keeps serving it until the watch list changes enough to " +
-                "rebuild.",
+                "Removing a contract here does NOT unsubscribe an existing index — the " +
+                "engine keeps every subscription its index file names. It only stops the " +
+                "entry from being added where no index exists yet; to truly drop a " +
+                "contract, turn collection off and delete the network's index file.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        if (watch.isNotEmpty()) {
+        // `collecting` keeps the row visible even with an empty watch list: an
+        // imported snapshot enables collection without any local entries, and
+        // hiding the switch then would leave the index with no off switch.
+        if (watch.isNotEmpty() || collecting) {
             SwitchRow(
                 label = "Collect logs on $network",
                 checked = collecting,

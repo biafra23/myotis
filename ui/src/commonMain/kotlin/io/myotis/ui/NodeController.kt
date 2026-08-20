@@ -234,6 +234,16 @@ interface Settings {
     fun setLogIndexEnabled(network: String, on: Boolean) {}
 
     /**
+     * Whether an explicit enabled/disabled flag is PERSISTED for [network] —
+     * i.e. [setLogIndexEnabled] has ever run (import sets it too). Distinct
+     * from [logIndexEnabled]'s value: a disabled-but-configured network still
+     * pushes its (disable) config, because the engine's boot-time
+     * activate-from-disk would otherwise re-enable an imported index the user
+     * turned off. A virgin network (never configured) pushes nothing.
+     */
+    fun logIndexConfigured(network: String): Boolean = false
+
+    /**
      * The user's watched contracts for [network]'s log index, as the JSON array
      * [LogIndexWatch] serializes (`[{"address":"0x…","fromBlock":N},…]`). The
      * Index tab edits this list; [NodeController.applyLogIndex] turns it into

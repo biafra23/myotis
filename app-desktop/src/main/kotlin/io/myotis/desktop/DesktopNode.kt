@@ -263,10 +263,14 @@ class DesktopNodeController(
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
         val maxSpeed = settings.logIndexMaxSpeed(network)
-        // Nothing to say (no watched contracts, not enabled) -> never push; the
-        // engine keeps eth_getLogs in its honest not-configured state.
-        val json = LogIndexWatch.configJson(settings.logIndexWatchJson(network), enabled, maxSpeed)
-            ?: return
+        // Nothing to say (no watched contracts, never configured) -> never push;
+        // the engine keeps eth_getLogs in its honest not-configured state. A
+        // CONFIGURED network always pushes — a disable must reach the engine or
+        // its boot-time activate-from-disk re-enables an imported index.
+        val json = LogIndexWatch.configJson(
+            settings.logIndexWatchJson(network), enabled, maxSpeed,
+            configured = settings.logIndexConfigured(network),
+        ) ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
@@ -672,6 +676,8 @@ class DesktopSettings(
     override fun logIndexMaxSpeed(network: String): Boolean =
         synchronized(this) { logIndexMax[network] ?: false }
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
+    override fun logIndexConfigured(network: String): Boolean =
+        synchronized(this) { logIndexOn.containsKey(network) }
     override fun logIndexWatchJson(network: String): String =
         synchronized(this) { logIndexWatch[network] ?: "[]" }
     override fun setLogIndexWatchJson(network: String, json: String) =
@@ -738,6 +744,16 @@ class DesktopSettings(
             .forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
+        }
+        // MIGRATION: a user who had the retired built-in Kohaku preset toggle on
+        // has the enabled flag persisted but NO watch entries — the preset lived
+        // in code. Seed the watch list from the legacy preset so the next config
+        // push does not silently drop their subscriptions (in-memory here; the
+        // next mutate() persists it).
+        logIndexOn.filterValues { it }.keys.forEach { net ->
+            if (net !in logIndexWatch) {
+                LogIndexWatch.legacyKohakuWatchJson(net)?.let { logIndexWatch[net] = it }
+            }
         }
     }
 

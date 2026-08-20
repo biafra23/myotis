@@ -37,6 +37,51 @@ class LogIndexWatchTest {
     }
 
     @Test
+    fun parse_dedupes_case_variant_addresses_keeping_the_first() {
+        // The engine rejects a config with a duplicate address OUTRIGHT
+        // (addresses compare as bytes, so case variants collide) — one
+        // hand-edited duplicate must not turn eth_getLogs off for the network.
+        val dup = """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":7},""" +
+            """{"address":"0x45A1502382541CD610CC9068E88727426B696293","fromBlock":9}]"""
+        assertEquals(
+            listOf(LogIndexWatch.Entry("0x45a1502382541cD610CC9068e88727426b696293", 7)),
+            LogIndexWatch.parse(dup),
+        )
+    }
+
+    @Test
+    fun parse_accepts_fields_in_either_order() {
+        // A hand-edited entry must not be silently dropped (and then destroyed
+        // by the next save's re-serialization) just for reordering its fields.
+        val reordered = """[{"fromBlock":7,"address":"0x45a1502382541cD610CC9068e88727426b696293"}]"""
+        assertEquals(
+            listOf(LogIndexWatch.Entry("0x45a1502382541cD610CC9068e88727426b696293", 7)),
+            LogIndexWatch.parse(reordered),
+        )
+    }
+
+    @Test
+    fun a_configured_network_always_pushes_so_a_disable_can_reach_the_engine() {
+        // Import-then-disable: no local entries, enabled false — but the flag
+        // IS persisted. Skipping the push would let the engine's boot-time
+        // activate-from-disk re-enable the imported index on every restart.
+        val disable = LogIndexWatch.configJson("[]", enabled = false, configured = true)!!
+        assertTrue(disable.contains("\"enabled\":false"))
+        // A virgin network (never configured) still pushes nothing.
+        assertNull(LogIndexWatch.configJson("[]", enabled = false, configured = false))
+    }
+
+    @Test
+    fun the_legacy_kohaku_seed_parses_and_covers_its_networks() {
+        // Migration data for pre-generic users: must itself survive the parser
+        // (it feeds straight into config pushes) and exist exactly where the
+        // preset existed.
+        assertEquals(4, LogIndexWatch.parse(LogIndexWatch.legacyKohakuWatchJson("mainnet")!!).size)
+        assertEquals(7, LogIndexWatch.parse(LogIndexWatch.legacyKohakuWatchJson("sepolia")!!).size)
+        assertNull(LogIndexWatch.legacyKohakuWatchJson("gnosis"))
+    }
+
+    @Test
     fun parse_drops_invalid_entries_and_survives_garbage() {
         // A hand-edited settings file must not reach the engine raw: the good
         // entry survives, the bad address is dropped, and non-JSON yields [].

@@ -113,6 +113,28 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `a kohaku-preset user's enabled flag seeds the legacy watch list`(@TempDir dir: Path) {
+        // Pre-generic users have logIndex.<net>=true persisted but NO watch
+        // entries (the preset lived in code). Without the seed, their first
+        // post-upgrade config push would silently drop every subscription.
+        val file = dir.resolve("settings.properties")
+        Files.writeString(file, "logIndex.mainnet=true\n")
+        val s = DesktopSettings(nets, file)
+        val seeded = io.myotis.ui.LogIndexWatch.parse(s.logIndexWatchJson("mainnet"))
+        assertEquals(4, seeded.size, "the four mainnet Kohaku contracts must be seeded")
+        assertTrue(s.logIndexConfigured("mainnet"))
+        // A network without the flag stays virgin: no seed, not configured.
+        assertEquals("[]", s.logIndexWatchJson("gnosis"))
+        assertFalse(s.logIndexConfigured("gnosis"))
+        // An explicit OFF flag is configured too (the disable push must go out)
+        // but does not seed a watch list for an index the user turned off.
+        Files.writeString(file, "logIndex.mainnet=false\n")
+        val off = DesktopSettings(nets, file)
+        assertTrue(off.logIndexConfigured("mainnet"))
+        assertEquals("[]", off.logIndexWatchJson("mainnet"))
+    }
+
+    @Test
     fun `null file keeps the store in-memory`(@TempDir dir: Path) {
         val s = DesktopSettings(nets, null)
         s.setPreferJavaEngine(true)
