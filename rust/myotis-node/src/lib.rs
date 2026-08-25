@@ -34,10 +34,11 @@ use napi_derive::napi;
 // ABI_VERSION), called by Rust path — linking the rlib does not reliably
 // resolve `extern "C"` imports of its no_mangle symbols.
 use myotis_engine::capi::{
-    myotis_available_networks_json, myotis_canonical_network_name, myotis_create,
-    myotis_drain_logs, myotis_ens_record_json, myotis_estimate_gas_json, myotis_eth_call_json,
-    myotis_fee_estimate_json, myotis_init, myotis_pause, myotis_request_account_json,
-    myotis_resolve_ens_json, myotis_resume, myotis_send_raw_transaction_json, myotis_start,
+    myotis_accept_stale_anchor, myotis_available_networks_json, myotis_canonical_network_name,
+    myotis_create, myotis_drain_logs, myotis_ens_record_json, myotis_estimate_gas_json,
+    myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
+    myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
+    myotis_send_raw_transaction_json, myotis_set_ws_bound_periods, myotis_start,
     myotis_status_json, myotis_stop, myotis_string_free,
 };
 
@@ -94,8 +95,11 @@ fn blocking(f: impl FnOnce() -> String + Send + 'static) -> AsyncTask<BlockingJs
 // ---------------------------------------------------------------------------
 
 /// ABI handshake; also installs the engine's log-ring subscriber (idempotent).
-/// Callers must refuse to proceed if this differs from the version the JS
-/// wrapper was written against (19).
+/// Returns the engine's `ABI_VERSION` — this addon is built from the same tree,
+/// so it is always the tree's current value. A host loading a PREBUILT addon
+/// must refuse to proceed unless this equals the version pinned in the notes of
+/// the release it built against; the JSON shapes below are guaranteed only for
+/// that version.
 #[napi]
 pub fn init() -> i32 {
     unsafe { myotis_init() }
@@ -171,6 +175,41 @@ pub fn resume(handle: i64) -> bool {
 #[napi]
 pub fn stop(handle: i64) {
     unsafe { myotis_stop(handle) }
+}
+
+// ---------------------------------------------------------------------------
+// Weak-subjectivity gate controls (synchronous — a host policy decision)
+// ---------------------------------------------------------------------------
+//
+// When the anchor (embedded checkpoint or persisted snapshot, whichever is
+// newer) is older than the network's WS bound, the engine refuses to walk
+// forward from it — that anchor is old enough that its sync committee could
+// have exited, so BLS verification alone cannot tell a forged continuation
+// (a long-range attack) from the honest chain. It parks in `STALE_ANCHOR`
+// (`statusJson().beaconState`) and verified reads fail closed. The bound is
+// small on some networks (~34 h on gnosis), so an embedding must decide, on
+// its users' behalf or by exposing the choice, how to handle a parked node.
+// Both controls below are the host's decision; the engine never persists them.
+
+/// Override the weak-subjectivity anchor-age bound, in sync-committee periods;
+/// `0` restores the network default (`statusJson().wsBoundPeriods` reports the
+/// effective value). Raising it widens the anchor age this node will accept.
+/// Applied live over the shared policy, so a parked handle re-evaluates within
+/// ~1 s. Per-host, never persisted. Returns `false` for an unknown handle.
+#[napi]
+pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    unsafe { myotis_set_ws_bound_periods(handle, periods) }
+}
+
+/// Accept the current over-age anchor and let sync proceed past a
+/// `STALE_ANCHOR` park — the informed-consent escape hatch a host puts behind
+/// its own UI (or an experimental tier). Run-sticky: it releases the park
+/// (current or subsequent) for the rest of THIS run and is never persisted, so
+/// a fresh `create()` starts gated again. Returns `false` for an unknown
+/// handle.
+#[napi]
+pub fn accept_stale_anchor(handle: i64) -> bool {
+    unsafe { myotis_accept_stale_anchor(handle) }
 }
 
 // ---------------------------------------------------------------------------

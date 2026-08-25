@@ -76,6 +76,20 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   for `snapPeers >= 2` — the reader rotates over the snap set, and with a
   single peer there is nowhere to rotate to (this is what `smoke.mjs` gates
   on; see #372).
+- **Weak-subjectivity gate**: `statusJson().beaconState` can be `STALE_ANCHOR`
+  — the engine refused to walk forward from an anchor (embedded checkpoint or
+  persisted snapshot) older than the network's WS bound, because from that far
+  back a forged continuation is BLS-indistinguishable from the honest chain
+  (a long-range attack). While parked, verified reads fail closed and
+  `statusJson().wsBoundPeriods` reports the effective bound. The bound is small
+  on some networks (~34 h on gnosis, vs. ~2 weeks on mainnet), so an embedding
+  must decide how a parked node behaves. Two host-owned controls (neither is
+  persisted by the engine): `setWsBoundPeriods(h, periods)` raises the accepted
+  anchor age (`0` restores the network default), applied live; and
+  `acceptStaleAnchor(h)` gives run-sticky consent to sync past the park for the
+  rest of this run. Put them behind your own UI or set a policy on your users'
+  behalf — the durable alternative on short-window chains is a fresher anchor
+  (ship/refresh the checkpoint), not a wider gate.
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but
