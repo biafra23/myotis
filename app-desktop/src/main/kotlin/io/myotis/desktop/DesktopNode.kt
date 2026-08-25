@@ -169,6 +169,9 @@ class DesktopNodeController(
                     // would be overwritten, leaving the live window one Save behind settings.
                     synchronized(servedWindowApplyLock) {
                         handle.setServedBlockWindow(settings.servedBlockWindow())
+                        // Weak-subjectivity bound override rides the same pre-start
+                        // apply + lock: the cold-start gate must judge with it.
+                        handle.setWsBoundPeriods(settings.wsBoundPeriods().toLong())
                     }
                     handle.start()
                 } catch (t: Throwable) {
@@ -236,6 +239,19 @@ class DesktopNodeController(
         synchronized(servedWindowApplyLock) {
             engine.hostedNetworks().forEach { engine.get(it)?.setServedBlockWindow(blocks) }
         }
+    }
+
+    override fun setWsBoundPeriods(periods: Int) {
+        // Same lock discipline as the served-window fan-out (the boot path applies
+        // this knob pre-start under the same lock). A STALE_ANCHOR park re-evaluates
+        // against the new bound within a second.
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setWsBoundPeriods(periods.toLong()) }
+        }
+    }
+
+    override fun acceptStaleAnchor(network: String) {
+        engine.get(network)?.acceptStaleAnchor()
     }
 
     override fun applyBlsBackend() {
@@ -583,6 +599,7 @@ class DesktopNodeController(
             tor = torModeFor(Engines.engineKindFor(s.network())),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            wsBoundPeriods = s.wsBoundPeriods(),
         )
     }
 
@@ -624,6 +641,8 @@ class DesktopSettings(
     private val ports = HashMap<String, Int>()
     private var snap = 32
     private var servedWindow = 32
+    // Weak-subjectivity bound override (periods); 0 = each network's default.
+    private var wsBound = 0
     private var deep = 16
     private var strict = true
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
@@ -676,6 +695,9 @@ class DesktopSettings(
     override fun servedBlockWindow(): Int = synchronized(this) { servedWindow }
     // Clamp like ChainStack.setServedBlockWindow (1..4096) so live and reloaded values agree.
     override fun setServedBlockWindow(v: Int) = mutate { servedWindow = v.coerceIn(1, 4096) }
+    override fun wsBoundPeriods(): Int = synchronized(this) { wsBound }
+    // 0 = per-network default; cap keeps a typo from storing an absurd bound.
+    override fun setWsBoundPeriods(v: Int) = mutate { wsBound = v.coerceIn(0, 9999) }
     override fun logIndexEnabled(network: String): Boolean =
         synchronized(this) { logIndexOn[network] ?: false }
     override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
@@ -724,6 +746,7 @@ class DesktopSettings(
         }
         p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
         p.getProperty(K_SERVED_WINDOW)?.toIntOrNull()?.let { servedWindow = it.coerceIn(1, 4096) }
+        p.getProperty(K_WS_BOUND)?.toIntOrNull()?.let { wsBound = it.coerceIn(0, 9999) }
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
@@ -795,6 +818,7 @@ class DesktopSettings(
         ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
         p.setProperty(K_SNAP, snap.toString())
         p.setProperty(K_SERVED_WINDOW, servedWindow.toString())
+        p.setProperty(K_WS_BOUND, wsBound.toString())
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
@@ -834,6 +858,7 @@ class DesktopSettings(
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
+        const val K_WS_BOUND = "wsBoundPeriods"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"

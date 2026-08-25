@@ -57,6 +57,7 @@ class MyotisStatusRpcTest {
         /* finalizedPeriod */ 15L,
         /* wallClockPeriod */ 1000L,
         /* verifiedHeadAgeMs */ 0L,
+        /* wsBoundPeriods */ 13L,
         /* readyPeerList */ listOf(PeerInfo("1.2.3.4:30303", true, "geth/v1")),
         /* pauseCount */ 7,
         /* totalPausedMs */ 1000L,
@@ -94,6 +95,7 @@ class MyotisStatusRpcTest {
         /* executionBlockNumber */ 123L,
         /* knownStateRoots */ 10,
         /* fillThreshold */ 4,
+        /* wsBoundPeriods */ 13L,
         peers,
     )
 
@@ -125,9 +127,22 @@ class MyotisStatusRpcTest {
                 """"lightClientPeers":2,"servedPeersLastMinute":3,"finalizedSlot":500,""" +
                 """"optimisticSlot":501,"finalizedPeriod":15,"syncCommitteePeriod":1000,""" +
                 """"wallClockPeriod":1000,"executionStateRoot":"0xabc","executionBlockNumber":123,""" +
-                """"knownStateRoots":10,"fillThreshold":4,"peers":[]}""",
+                """"knownStateRoots":10,"fillThreshold":4,"wsBoundPeriods":13,"peers":[]}""",
             encode(StatusJson.beaconStatus(beaconStatus(BeaconState.SYNCED), 42L)),
         )
+    }
+
+    @Test fun beaconStatusJson_staleAnchor_carriesAgeBoundAndWarning() {
+        // STALE_ANCHOR keeps its own name, reports the refused anchor (currentPeriod),
+        // its age and the enforced bound, plus a human-readable warning — and OMITS
+        // the synced-only fields (nothing is verified yet). Mirrors the daemon branch.
+        val out = encode(StatusJson.beaconStatus(beaconStatus(BeaconState.STALE_ANCHOR), 42L))
+        assertTrue(out.contains(""""state":"STALE_ANCHOR""""))
+        assertTrue(out.contains(""""anchorPeriod":1000"""))
+        assertTrue(out.contains(""""anchorAgePeriods":0"""))
+        assertTrue(out.contains(""""wsBoundPeriods":13"""))
+        assertTrue(out.contains(""""warning":"""))
+        assertFalse(out.contains(""""finalizedPeriod""""))
     }
 
     @Test fun beaconStatusJson_syncing_collapsesToSyncingBranch() {

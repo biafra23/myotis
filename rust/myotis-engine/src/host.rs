@@ -627,6 +627,53 @@ pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
     }
 }
 
+/// `nativeSetWsBoundPeriods`: override the weak-subjectivity anchor-age bound
+/// (periods); 0 restores the network default. No stash map needed: the knob
+/// lives in the config's shared `Arc<WsPolicy>`, which every entry state
+/// (Created/Running/Paused) and the running sync loop's config clone all point
+/// at — a loop parked in STALE_ANCHOR re-reads it within a second. False only
+/// for an unknown handle.
+pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    let Some(engine) = engine() else { return false };
+    let sane = periods.max(0) as u64;
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
+        | Some(ChainEntry::Paused(c, _)) => {
+            c.ws_policy
+                .bound_override_periods
+                .store(sane, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `nativeAcceptStaleAnchor`: one-shot consent to sync forward from an anchor
+/// older than the weak-subjectivity bound — releases a STALE_ANCHOR park for
+/// the rest of this run (same shared-`WsPolicy` reach as the bound setter).
+/// Never persisted. False only for an unknown handle.
+pub fn accept_stale_anchor(handle: i64) -> bool {
+    let Some(engine) = engine() else { return false };
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
+        | Some(ChainEntry::Paused(c, _)) => {
+            c.ws_policy
+                .accept_stale_anchor
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Verified account query as JSON (`AccountProofResult` shape / an
 /// `{"error": ...}` object) — `nativeRequestAccountJson`.
 pub fn request_account_json(handle: i64, address_hex: &str) -> String {
@@ -1686,6 +1733,7 @@ fn beacon_state(state: SyncState) -> &'static str {
         SyncState::Bootstrapping => "SYNCING",
         SyncState::CatchingUp => "CATCHING_UP",
         SyncState::Synced => "SYNCED",
+        SyncState::StaleAnchor => "STALE_ANCHOR",
     }
 }
 
@@ -1755,6 +1803,10 @@ fn status_object(
     // LC hunt engaged (starved of light-client servers) — drives the hosts'
     // hunt banner on the Status screen.
     obj.insert("lcHunting".into(), s.hunting.into());
+    // Weak-subjectivity bound (periods) the engine enforces. While beaconState
+    // is STALE_ANCHOR, currentPeriod is the refused anchor's period, so
+    // targetPeriod - currentPeriod is the anchor age judged against this.
+    obj.insert("wsBoundPeriods".into(), s.ws_bound_periods.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
@@ -1793,7 +1845,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"paused":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
-    r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"#,
+    r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
     r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
@@ -1939,6 +1991,7 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let el = ElCounts {
             reader_available: true,
@@ -1979,6 +2032,7 @@ mod tests {
         assert_eq!(synced["servedPeersLastMinute"], 3);
         assert_eq!(synced["discv5TableSize"], 12);
         assert_eq!(synced["syncStartPeriod"], 1777);
+        assert_eq!(synced["wsBoundPeriods"], 13);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
         // readyPeers, since the pool holds only snap-capable READY peers).
@@ -2027,6 +2081,7 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Paused,
@@ -2106,6 +2161,7 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
@@ -2117,6 +2173,39 @@ mod tests {
         .unwrap();
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1777);
+    }
+
+    #[test]
+    fn stale_anchor_state_maps_and_carries_the_bound() {
+        // A parked handle: beaconState STALE_ANCHOR (NOT bootstrapped), period =
+        // the refused anchor's period, wsBoundPeriods = the enforced bound — so a
+        // host can render "anchor is (target - current) periods old, bound N".
+        let s = SyncStatus {
+            state: SyncState::StaleAnchor,
+            finalized_slot: 0,
+            finalized_root: [0u8; 32],
+            optimistic_slot: 0,
+            period: 1825,
+            peer_count: 0,
+            served_peers_last_min: 0,
+            discv5_table_size: 0,
+            sync_start_period: -1,
+            hunting: false,
+            ws_bound_periods: 13,
+        };
+        let v: serde_json::Value = serde_json::from_str(&status_object(
+            Lifecycle::Running,
+            "mainnet",
+            Some(s),
+            1845,
+            ElCounts::default(),
+        ))
+        .unwrap();
+        assert_eq!(v["beaconState"], "STALE_ANCHOR");
+        assert_eq!(v["bootstrapped"], false);
+        assert_eq!(v["currentPeriod"], 1825);
+        assert_eq!(v["targetPeriod"], 1845);
+        assert_eq!(v["wsBoundPeriods"], 13);
     }
 
     #[test]

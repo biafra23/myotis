@@ -301,7 +301,7 @@ Returns beacon chain light client sync state.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `state` | string | `"SYNCING"` (no trust anchor yet), `"CATCHING_UP"` (anchor present, but the state-root window is still sparse or the held sync committee lags wall clock), or `"SYNCED"` (verification-ready; can regress to `CATCHING_UP` if the node falls behind) |
+| `state` | string | `"SYNCING"` (no trust anchor yet), `"CATCHING_UP"` (anchor present, but the state-root window is still sparse or the held sync committee lags wall clock), `"SYNCED"` (verification-ready; can regress to `CATCHING_UP` if the node falls behind), or `"STALE_ANCHOR"` (syncing refused: the best available anchor is older than the weak-subjectivity bound — see §Weak-subjectivity age bound; the response carries `anchorPeriod`, `anchorAgePeriods`, `wsBoundPeriods`, and a `warning`) |
 | `currentPeriod` | long | Sync-committee period the store currently holds (0 before bootstrap) |
 | `targetPeriod` | long | Wall-clock sync-committee period being caught up to |
 | `uptimeSeconds` | long | Daemon uptime |
@@ -328,6 +328,19 @@ Returns beacon chain light client sync state.
 | `clientId` | string | Client identification string (if available) |
 | `lightClient` | boolean | Whether peer supports the light client protocol |
 | `protocols` | int | Number of advertised protocols |
+
+### Accept a stale anchor
+
+```bash
+./gradlew :app:run -Pargs=accept-stale-anchor
+```
+
+One-shot consent to sync forward from a trust anchor older than the weak-subjectivity
+bound (see README §Weak-subjectivity age bound). Applies **only** while `beacon-status`
+reports `"state":"STALE_ANCHOR"` — sent at any other time it answers
+`"applied":false` without arming anything. Consent lasts for the current run only and
+is never persisted; a restart with a still-stale anchor parks again. Prefer refreshing
+the checkpoint (`./gradlew refreshCheckpoint`) over accepting.
 
 ### Get block headers
 
@@ -720,7 +733,7 @@ The only trust anchors are **sync committee BLS signatures** and the embedded hi
 
 The bootstrap trust anchor is a 32-byte mainnet block root hardcoded in `NetworkConfig.MAINNET.checkpointRoot`. Every `LightClientBootstrap` response is rejected unless `hash_tree_root(response.header)` equals this committed value, so the pin is cryptographic: no peer (libp2p or HTTP checkpoint endpoint) can substitute a different anchor, even an internally-consistent one, without finding a SHA-256 preimage.
 
-Ethereum's weak-subjectivity window is only ~28 hours of stake-weighted safety, so the committed root needs to be refreshed periodically or binaries eventually age past the safety envelope. The repo ships with a Gradle task that fetches a current finalized root, cross-validates it against multiple independent providers, and rewrites the `@checkpoint:mainnet` region of `NetworkConfig.java`:
+Ethereum's weak-subjectivity period — how old a trust anchor may be before validators who have since exited could sign a competing "finalized" history (a long-range attack) that a light client cannot distinguish from the real one — is roughly **two weeks** on mainnet at current stake levels (the consensus-spec formula with `SAFETY_DECAY=10` plateaus at 3532 epochs ≈ 15.7 days; Electra's exit-churn cap only lengthens it). It is *not* the ~27-hour sync-committee period, though the two are easy to conflate because `MIN_VALIDATOR_WITHDRAWABILITY_DELAY` happens to be 256 epochs too. What a fresh anchor buys is **attribution, not a slashing penalty**: sync-committee signatures are *not* a slashable offense on any Ethereum chain (bonded or not — the beacon chain slashes only proposer and attester equivocation), so the real protection is that a recent anchor's committee is still held by identifiable, staked validators who would be publicly implicated by a forged signature, and the exit-churn limit caps how fast those keys turn into freely-acquirable, consequence-free ones. So the committed root needs to be refreshed periodically or binaries eventually age past the safety envelope — and refreshing every sync-committee period, as the tasks below encourage, keeps the anchor ~13× fresher than the strict bound requires. The repo ships with a Gradle task that fetches a current finalized root, cross-validates it against multiple independent providers, and rewrites the `@checkpoint:mainnet` region of `NetworkConfig.java`:
 
 ```bash
 # Preview the diff without writing
@@ -737,7 +750,17 @@ The task queries `/eth/v2/beacon/blocks/finalized` on four independent mainnet e
 
 The same task serves every network — `-Pnetwork=sepolia` and `-Pnetwork=gnosis` refresh the `@checkpoint:sepolia` and `@checkpoint:gnosis` regions, and a bare `./gradlew refreshCheckpoint` does all three. It refuses to write a root fewer than two operators agree on; `-PallowSingleSource` is the explicit opt-out, which Gnosis sometimes needs and the other two do not.
 
-Each run rewrites **both engines** from one fetch — `NetworkConfig.java` and the Rust `ChainConfig` in `rust/myotis-net/src/sync.rs` — because a hand-mirrored anchor is a split anchor waiting to happen. The `java_and_rust_checkpoints_agree` test fails if they ever diverge. Use `-Pperiod=<n>` to anchor at a chosen sync-committee period rather than at head (an anchor at head leaves a wallet nothing to walk, and goes stale as soon as the period rolls), or `-Pslot=<n>` to pin an exact slot — needed when the target is a specific retained state on the serving node, such as the oldest bootstrap it can still answer; both require naming the chain with `-Pnetwork` and refuse otherwise. Historical slots may need a full node, named with `-PextraEndpoint=<url>` and checked against the pinned `genesis_validators_root` before it counts.
+Each run rewrites **both engines** from one fetch — `NetworkConfig.java` and the Rust `ChainConfig` in `rust/myotis-net/src/sync.rs` — because a hand-mirrored anchor is a split anchor waiting to happen. The `java_and_rust_checkpoints_agree` test fails if they ever diverge.
+
+### Weak-subjectivity age bound
+
+Both engines enforce the window above at every **sync start** — cold, and on a warm resume from idle-pause (a pause longer than the bound ages the held committee exactly like a cold snapshot) — re-face it at **every bootstrap attempt** (the poll loop's retry and the fallback after a failed snapshot resume judge the embedded checkpoint, which can be older than the anchor the start-time gate approved), and re-check it **continuously while running**: a node that stays awake but peer-starved (or eclipsed) past the bound parks the same way before catching up, so restart-vs-stay-running never decides whether the gate applies. Before resuming or bootstrapping, the client judges the age of the **best anchor it has** — the embedded checkpoint or the persisted sync snapshot, whichever is newer (when the checkpoint is the newer of the two, the snapshot is discarded and the sync restarts from the checkpoint's period, as it always has). If that anchor is older than the network's bound — **mainnet 13 periods (~14.7 days), sepolia 13, gnosis 3** — the client **refuses to sync** and parks in `STALE_ANCHOR`, failing closed: no bootstrap, no verification, verified queries keep erroring. Nothing is deleted; the client is waiting for a decision:
+
+- **Update the binary / refresh the checkpoint** (`./gradlew refreshCheckpoint`) — the recommended fix; the wallet cannot fetch a fresh anchor itself (devp2p/libp2p only, no trusted RPCs).
+- **Raise the bound** — Settings → "Weak-subjectivity bound" in the apps (0 = network default; applied live, a parked chain re-evaluates within a second), or `-Dmyotis.beacon.wsBoundPeriods=N` on the daemon. Raising it weakens the long-range-attack guarantee, knowingly.
+- **Accept the risk for this run** — the apps show a dialog explaining the age and the risk ("Sync anyway"); the daemon takes `./gradlew :app:run -Pargs=accept-stale-anchor` (only applies while actually parked), or `-Dmyotis.beacon.acceptStaleAnchor=true` at start for deliberate pre-consent (e.g. re-syncing an archived data dir). Consent is never persisted — a restart with a still-stale anchor parks, and asks, again.
+
+Why this exists: the forward walk is only as trustworthy as the anchor it starts from. Past the weak-subjectivity period, an attacker who acquired keys of since-exited committee members could serve a validly-signed forged continuation, and BLS verification alone cannot tell it from the honest chain — so an over-age anchor must be an explicit, informed user decision, never a silent default. Per-network derivations are documented at `NetworkConfig.wsBoundPeriods()`; the Rust mirror lives in the `ChainConfig` constructors and is covered by tests on both sides. Use `-Pperiod=<n>` to anchor at a chosen sync-committee period rather than at head (an anchor at head leaves a wallet nothing to walk, and goes stale as soon as the period rolls), or `-Pslot=<n>` to pin an exact slot — needed when the target is a specific retained state on the serving node, such as the oldest bootstrap it can still answer; both require naming the chain with `-Pnetwork` and refuse otherwise. Historical slots may need a full node, named with `-PextraEndpoint=<url>` and checked against the pinned `genesis_validators_root` before it counts.
 
 ### Verification flow
 

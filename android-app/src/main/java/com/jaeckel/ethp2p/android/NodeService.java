@@ -107,6 +107,7 @@ public final class NodeService extends Service {
     private static final String K_RPC_PORT = "rpcPort";
     private static final String K_SNAP_TARGET = "snapTarget";
     private static final String K_SERVED_WINDOW = "servedBlockWindow";
+    private static final String K_WS_BOUND = "wsBoundPeriods";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
@@ -403,6 +404,15 @@ public final class NodeService extends Service {
     public static void setServedBlockWindowPref(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_SERVED_WINDOW, clampInt(v, 1, 4096, 32)).apply();
     }
+    /** Weak-subjectivity anchor-age bound override in sync-committee periods
+     *  (0 = each network's built-in default; capped so a typo can't store an
+     *  absurd bound). Raising it weakens the long-range-attack guarantee. */
+    public static int wsBoundPeriods(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_WS_BOUND, 0), 0, 9999, 0);
+    }
+    public static void setWsBoundPeriodsPref(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_WS_BOUND, clampInt(v, 0, 9999, 0)).apply();
+    }
     /** UI readiness "deep pool" threshold (1–128, default 16). */
     public static int deepPoolThreshold(android.content.Context c) {
         return clampInt(prefs(c).getInt(K_DEEP_POOL, DEFAULT_DEEP_POOL), 1, 128, DEFAULT_DEEP_POOL);
@@ -521,6 +531,28 @@ public final class NodeService extends Service {
         // Same monitor as buildAndStart's read-apply-publish: see the comment there.
         synchronized (handles) {
             for (ChainHandle h : handles.values()) h.setServedBlockWindow(c);
+        }
+    }
+
+    /** Live-update the weak-subjectivity bound override (0 = network default) on every
+     *  live stack and persist it. A stack parked in STALE_ANCHOR re-evaluates within
+     *  a second, so raising the bound from Settings releases it without a restart. */
+    public void setWsBoundPeriods(int v) {
+        int c = clampInt(v, 0, 9999, 0);
+        setWsBoundPeriodsPref(this, c);
+        // Same monitor as buildAndStart's read-apply-publish: see the comment there.
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) h.setWsBoundPeriods(c);
+        }
+    }
+
+    /** One-shot consent to sync {@code network} forward from a stale anchor — releases
+     *  its STALE_ANCHOR park for the rest of this run; never persisted (a restart with
+     *  a still-stale anchor parks, and asks, again). */
+    public void acceptStaleAnchor(String network) {
+        synchronized (handles) {
+            ChainHandle h = handles.get(network);
+            if (h != null) h.acceptStaleAnchor();
         }
     }
 
@@ -1304,7 +1336,10 @@ public final class NodeService extends Service {
             boolean lcHunting,            // LC hunt engaged (starved of light-client servers)
             boolean elHunting,            // EL hunt engaged (snap serving pool empty past stall)
             int rpcPort,                  // configured JSON-RPC port (0 = none)
-            boolean rpcServing) {}        // listener bound and live on 127.0.0.1:rpcPort
+            boolean rpcServing,           // listener bound and live on 127.0.0.1:rpcPort
+            long wsBoundPeriods) {}       // weak-subjectivity bound (periods) the engine enforces;
+                                          // with beaconState STALE_ANCHOR, syncTargetPeriod -
+                                          // syncCurrentPeriod is the refused anchor's age
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -1751,6 +1786,9 @@ public final class NodeService extends Service {
                 // would leave the live window one Save behind the pref.
                 synchronized (handles) {
                     handle.setServedBlockWindow(servedBlockWindow(this));
+                    // Weak-subjectivity bound override rides the same pre-start apply
+                    // + monitor: the cold-start gate must judge with it.
+                    handle.setWsBoundPeriods(wsBoundPeriods(this));
                     handles.put(n, handle);
                 }
 
@@ -2041,7 +2079,7 @@ public final class NodeService extends Service {
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
+                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -2057,7 +2095,7 @@ public final class NodeService extends Service {
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing());
+                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

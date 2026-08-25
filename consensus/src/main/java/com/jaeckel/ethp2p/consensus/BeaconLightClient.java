@@ -326,19 +326,171 @@ public class BeaconLightClient implements AutoCloseable {
         this.snapshotFile = file;
     }
 
+    // ---- Weak-subjectivity age bound (see lightclient/WeakSubjectivity) ----
+    // The anchor a cold sync starts from (embedded checkpoint or persisted snapshot,
+    // whichever is newer) must be younger than the bound; otherwise the sync loop
+    // parks in STALE_ANCHOR until the bound is raised or the user accepts the risk.
+
+    /** Per-network default bound (periods); 0 → WeakSubjectivity.DEFAULT_BOUND_PERIODS. */
+    private volatile long wsBoundDefaultPeriods = 0L;
+    /** Host/user override (periods); 0 → use the default. Live: a parked loop re-reads it. */
+    private volatile long wsBoundOverridePeriods = 0L;
+    /** One-shot consent to sync from a stale anchor; per-run, never persisted. */
+    private volatile boolean staleAnchorAccepted = false;
+
+    /** The network's default weak-subjectivity bound. Set before {@link #start()}. */
+    public void setWsBoundDefaultPeriods(long periods) {
+        this.wsBoundDefaultPeriods = Math.max(0L, periods);
+    }
+
+    /** Host override for the weak-subjectivity bound; 0 restores the default.
+     *  Applied live — a stack parked in STALE_ANCHOR re-evaluates within a second. */
+    public void setWsBoundPeriods(long periods) {
+        this.wsBoundOverridePeriods = Math.max(0L, periods);
+        syncState.setWsBoundPeriods(effectiveWsBound());
+    }
+
+    /** User consent to sync forward from a stale anchor (this run only). */
+    public void acceptStaleAnchor() {
+        this.staleAnchorAccepted = true;
+    }
+
+    private long effectiveWsBound() {
+        return com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
+                .effectiveBound(wsBoundOverridePeriods, wsBoundDefaultPeriods);
+    }
+
+    /** Read + deserialize the persisted snapshot ONCE per sync start, or null when
+     *  absent/corrupt/foreign. The weak-subjectivity gate judges its age and the
+     *  strictly-newer resume rule reuses the SAME parse — two independent reads
+     *  would open a window where the gate vets one file and the resume loads
+     *  another. */
+    private LightClientStore.Snapshot readSnapshot() {
+        java.nio.file.Path file = snapshotFile;
+        if (file == null) return null;
+        try {
+            if (!java.nio.file.Files.exists(file)) return null;
+            byte[] data = java.nio.file.Files.readAllBytes(file);
+            return LightClientStoreSnapshot.deserialize(data, genesisValidatorsRoot);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * The recurring weak-subjectivity re-check behind both in-run guards below:
+     * marks STALE_ANCHOR and refuses while {@code anchorPeriod} is past the bound
+     * (unless consent arrived), clears the mark once released — the bound raised
+     * live, or consent given. The callers are the retry cadence; this never
+     * blocks.
+     */
+    private boolean wsGateAllows(long anchorPeriod, String anchorKind) {
+        long bound = effectiveWsBound();
+        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
+        syncState.setWsBoundPeriods(bound);
+        if (!staleAnchorAccepted
+                && com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
+                        .isStale(anchorPeriod, wallPeriod, bound)) {
+            if (syncState.getStaleAnchorPeriod() < 0) {
+                log.warn("[beacon] STALE ANCHOR: refusing to sync forward from {} period {} "
+                                + "({} periods old, past the weak-subjectivity bound of {})",
+                        anchorKind, anchorPeriod, wallPeriod - anchorPeriod, bound);
+            }
+            syncState.markStaleAnchor(anchorPeriod);
+            return false;
+        }
+        if (syncState.getStaleAnchorPeriod() >= 0) {
+            syncState.clearStaleAnchor();
+        }
+        return true;
+    }
+
+    /**
+     * Guard on EVERY bootstrap attempt — the initial one, the steady-state poll's
+     * retry, and the fallback after a failed snapshot resume. The anchor here is
+     * always the embedded checkpoint, which can be OLDER than the anchor the
+     * start-time gate approved: a fresh snapshot masks a stale checkpoint until its
+     * resume fails, and a peer-starved node can cross the bound while retrying for
+     * weeks. Mirrors the Rust engine's in-loop bootstrap guard.
+     */
+    private boolean wsGateAllowsBootstrap() {
+        return wsGateAllows(
+                BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot), "checkpoint");
+    }
+
+    /**
+     * Guard on every steady-state poll cycle once the store IS initialized — the
+     * awake twin of the entry gate. An initialized store's committee ages in
+     * memory exactly like a snapshot of the same vintage ages on disk: a node
+     * that stays running while peer-starved (or eclipsed — starvation is
+     * inducible) for longer than the bound must NOT hand off through past-bound
+     * committees when connectivity returns, when the identical vintage arriving
+     * via restart would require consent. Without this, restart-vs-stay-running
+     * decided whether the gate applied.
+     */
+    private boolean wsGateAllowsForwardSync() {
+        return wsGateAllows(store.getCurrentSyncCommitteePeriod(), "held committee");
+    }
+
+    /**
+     * The weak-subjectivity gate, run once per sync-loop entry BEFORE anything is
+     * trusted: cold starts judge the best available anchor (embedded checkpoint or
+     * persisted snapshot, whichever period is newer — the resume rule later picks
+     * the same winner), warm re-entries the store's held committee period. If the
+     * anchor is older than the bound, park in STALE_ANCHOR and re-evaluate every
+     * second until the bound covers it (the user raised it), the user accepts the
+     * risk, or the client is stopped. Fail-closed while parked: no bootstrap, no
+     * verification, queries refuse.
+     */
+    private void awaitAnchorFreshness(long anchorPeriod) {
+        syncState.setWsBoundPeriods(effectiveWsBound());
+        boolean parked = false;
+        while (running) {
+            long bound = effectiveWsBound();
+            long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
+            if (staleAnchorAccepted
+                    || !com.jaeckel.ethp2p.consensus.lightclient.WeakSubjectivity
+                            .isStale(anchorPeriod, wallPeriod, bound)) {
+                break;
+            }
+            if (!parked) {
+                parked = true;
+                log.warn("[beacon] STALE ANCHOR: best trust anchor is period {} but wall clock is "
+                                + "period {} — {} periods old, past the weak-subjectivity bound of {}. "
+                                + "Refusing to sync: a forged chain signed by since-exited committee "
+                                + "members would be indistinguishable. Update the app / refresh the "
+                                + "checkpoint, raise the bound, or accept the risk explicitly.",
+                        anchorPeriod, wallPeriod, wallPeriod - anchorPeriod, bound);
+                syncState.markStaleAnchor(anchorPeriod);
+                syncState.setWsBoundPeriods(bound);
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (parked && running) {
+            log.warn("[beacon] Stale anchor released ({}) — syncing forward from period {}",
+                    staleAnchorAccepted ? "user accepted the risk" : "bound now covers the anchor",
+                    anchorPeriod);
+        }
+        syncState.clearStaleAnchor();
+    }
+
     /**
      * Restore the store from a persisted snapshot if one exists, is for this chain,
      * and is newer than the embedded checkpoint. Returns true if we resumed (and a
      * fresh bootstrap should be skipped).
      */
-    private boolean tryResumeFromSnapshot() {
+    private boolean tryResumeFromSnapshot(LightClientStore.Snapshot snap) {
         java.nio.file.Path file = snapshotFile;
         if (file == null) return false;
         try {
-            if (!java.nio.file.Files.exists(file)) return false;
-            byte[] data = java.nio.file.Files.readAllBytes(file);
-            LightClientStore.Snapshot snap =
-                    LightClientStoreSnapshot.deserialize(data, genesisValidatorsRoot);
+            // The snapshot was parsed ONCE by readSnapshot() and already judged by
+            // the weak-subjectivity gate — resuming a re-read here could load a
+            // different file than the one the gate vetted.
             if (snap == null) {
                 log.info("[beacon] Ignoring sync snapshot (absent/corrupt/foreign) — bootstrapping fresh");
                 return false;
@@ -796,7 +948,30 @@ public class BeaconLightClient implements AutoCloseable {
         // An already-initialized store means this loop is re-entered by resume()
         // after a pause: the live in-memory state is strictly newer than (or equal
         // to) the snapshot pause() just wrote — restoring over it would go backward.
-        boolean resumed = store.isInitialized() || tryResumeFromSnapshot();
+        //
+        // Weak-subjectivity gate first, on BOTH entry paths: judge the anchor's age
+        // BEFORE resuming or bootstrapping from it, and park in STALE_ANCHOR (fail
+        // closed) when it's past the bound. Cold start: the best available anchor
+        // (embedded checkpoint vs persisted snapshot, whichever is newer; the
+        // snapshot is parsed ONCE and the strictly-newer resume rule below reuses
+        // the parse). Warm re-entry via resume(): the committee the store already
+        // holds — a pause LONGER than the bound ages it exactly like a cold
+        // snapshot of the same vintage, so it faces the same gate (parity with the
+        // Rust engine, whose start-time gate re-runs on every resume).
+        boolean resumed;
+        if (!store.isInitialized()) {
+            LightClientStore.Snapshot persistedSnap = readSnapshot();
+            long checkpointPeriod = BeaconChainSpec.computeSyncCommitteePeriod(checkpointSlot);
+            long anchorPeriod = Math.max(checkpointPeriod,
+                    persistedSnap != null ? persistedSnap.currentSyncCommitteePeriod() : -1L);
+            awaitAnchorFreshness(anchorPeriod);
+            if (!running) return;
+            resumed = tryResumeFromSnapshot(persistedSnap);
+        } else {
+            awaitAnchorFreshness(store.getCurrentSyncCommitteePeriod());
+            if (!running) return;
+            resumed = true;
+        }
 
         // Pre-connect to peers and query Identify to learn protocol support.
         // This lets bootstrap() prioritize peers advertising light_client protocols.
@@ -848,6 +1023,16 @@ public class BeaconLightClient implements AutoCloseable {
                 // LC hunt trigger check — widens this cycle's fan-outs and
                 // flips the host's discovery boost on transitions.
                 updateHunting(syncStartNanos);
+                // In-run weak-subjectivity re-check (see wsGateAllowsForwardSync):
+                // park this cycle — no finality poll, no catch-up — while the HELD
+                // committee is past the bound and unconsented. Fail closed; the
+                // 1-slot sleep is the re-evaluation cadence, so a raised bound or
+                // consent releases within seconds. The uninitialized case is
+                // covered by the bootstrap guard inside pollFinalityUpdate.
+                if (store.isInitialized() && !wsGateAllowsForwardSync()) {
+                    Thread.sleep(pollIntervalMs);
+                    continue;
+                }
                 pollFinalityUpdate();
                 // Background classification of untried pool peers (fire-and-forget;
                 // never blocks the cycle) — drains the cache's untried bucket.
@@ -1410,6 +1595,10 @@ public class BeaconLightClient implements AutoCloseable {
      * Logs a warning if all peers fail.
      */
     private void bootstrap() {
+        // Weak-subjectivity guard on EVERY attempt (initial, poll retry, failed-
+        // resume fallback): the checkpoint this bootstraps from can be older than
+        // what the start-time gate approved — see wsGateAllowsBootstrap.
+        if (!wsGateAllowsBootstrap()) return;
         // Try HTTP API first — much more reliable than P2P
         if (bootstrapFromBeaconApi()) return;
 

@@ -51,6 +51,23 @@ interface NodeController {
     fun setServedBlockWindow(blocks: Int)
 
     /**
+     * Live-update the weak-subjectivity anchor-age bound override on all running
+     * stacks (0 = each network's built-in default). A stack parked in the
+     * STALE_ANCHOR state re-evaluates against the new bound within a second.
+     * Raising it weakens the long-range-attack guarantee — the Settings row says
+     * so. Default no-op keeps hosts compiling until they wire it.
+     */
+    fun setWsBoundPeriods(periods: Int) {}
+
+    /**
+     * One-shot consent to sync [network] forward from an anchor older than the
+     * weak-subjectivity bound — releases its STALE_ANCHOR park for the rest of
+     * this run. Never persisted: a restart with a still-stale anchor parks (and
+     * asks) again. The stale-anchor dialog's "Sync anyway" action.
+     */
+    fun acceptStaleAnchor(network: String) {}
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
@@ -200,6 +217,13 @@ interface Settings {
      *  advertises as servable to peers (EIP-7642 Status range). */
     fun servedBlockWindow(): Int
     fun setServedBlockWindow(v: Int)
+    /** Weak-subjectivity anchor-age bound override, in sync-committee periods;
+     *  0 = each network's built-in default (mainnet 13 ≈ two weeks). How old the
+     *  sync anchor may be before the node refuses to sync and asks for consent.
+     *  Larger values weaken the long-range-attack guarantee — an explicit
+     *  operator knob, not a tuning parameter. Defaults keep hosts compiling. */
+    fun wsBoundPeriods(): Int = 0
+    fun setWsBoundPeriods(v: Int) {}
 
     // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
     /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
@@ -375,6 +399,11 @@ data class NodeSnapshot(
     // Raw engine status JSON for the Index tab (null when the feature is off
     // or the engine is unavailable); parsed via [LogIndexStatus.parse].
     val logIndexJson: String? = null,
+    // Weak-subjectivity bound (periods) the engine enforces; 0 = host didn't say.
+    // While beaconState == "STALE_ANCHOR", syncCurrentPeriod is the refused
+    // anchor's period and syncTargetPeriod the wall clock, so target - current is
+    // the anchor age the stale-anchor dialog explains.
+    val wsBoundPeriods: Long = 0,
 )
 
 /** One connected READY peer, for the Status peer list. */

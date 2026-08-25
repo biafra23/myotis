@@ -27,6 +27,8 @@ import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
 import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resume
+import io.myotis.engine.capi.myotis_accept_stale_anchor
+import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_start
 import io.myotis.engine.capi.myotis_status_json
 import io.myotis.engine.capi.myotis_stop
@@ -127,6 +129,19 @@ object RustEngine {
     fun resume(handle: Long): Boolean {
         requireAbi()
         return myotis_resume(handle)
+    }
+
+    /** Override the weak-subjectivity anchor-age bound (periods; 0 = network
+     *  default). Applied live — a STALE_ANCHOR park re-evaluates within a second. */
+    fun setWsBoundPeriods(handle: Long, periods: Long): Boolean {
+        requireAbi()
+        return myotis_set_ws_bound_periods(handle, periods)
+    }
+
+    /** One-shot consent to sync forward from a stale anchor (this run only). */
+    fun acceptStaleAnchor(handle: Long): Boolean {
+        requireAbi()
+        return myotis_accept_stale_anchor(handle)
     }
 
     /** Status JSON object; `"{}"` for an unknown handle. */

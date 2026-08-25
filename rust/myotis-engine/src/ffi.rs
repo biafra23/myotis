@@ -101,6 +101,20 @@ pub fn pause_handle(handle: i64) -> bool {
     crate::host::pause(handle)
 }
 
+/// Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+/// network default. Applied live — a STALE_ANCHOR park re-evaluates.
+#[uniffi::export]
+pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    crate::host::set_ws_bound_periods(handle, periods)
+}
+
+/// One-shot consent to sync forward from a stale anchor (this run only) —
+/// releases a STALE_ANCHOR park.
+#[uniffi::export]
+pub fn accept_stale_anchor(handle: i64) -> bool {
+    crate::host::accept_stale_anchor(handle)
+}
+
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
 /// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
 /// the next spin_up when the handle isn't running. False only for an unknown

@@ -88,9 +88,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned mainnet block root (slot 14954528, 2026-08-09, period 1825)
-            Bytes.fromHexString("be4ab798de3dce15ec3602dad3d27bb4af5d3b70524b90dce627ef5e372e9f89").toArrayUnsafe(),
-            14954528L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15033920, 2026-08-20, period 1835)
+            Bytes.fromHexString("c5c2d3bc4c7b43bc4e810c171e4cd6c092807844164b986410e3fe925a7e78ae").toArrayUnsafe(),
+            15033920L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
             new byte[]{0x06, 0x00, 0x00, 0x00},
@@ -204,9 +204,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned sepolia block root (slot 10838080, 2026-08-03, period 1323)
-            Bytes.fromHexString("a00884e558ff8a4b721ab7ab4b2e3452a1cc45b4212c60de39d033bdcf75c5de").toArrayUnsafe(),
-            10838080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 10958144, 2026-08-20, period 1337)
+            Bytes.fromHexString("188f5e3607eac3c38b10514819324ab53822c7b866413a75c7e825ebe3f1d00f").toArrayUnsafe(),
+            10958144L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // current fork version: Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14)
             new byte[]{(byte) 0x90, 0x00, 0x00, 0x75},
@@ -325,9 +325,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned gnosis block root (slot 29458656, 2026-08-09, period 3596)
-            Bytes.fromHexString("5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954").toArrayUnsafe(),
-            29458656L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 29647728, 2026-08-20, period 3619)
+            Bytes.fromHexString("9701ad5fdc737d56efd166922d027461fa127310e41b2c4fcfbb07773a9cf676").toArrayUnsafe(),
+            29647728L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
             new byte[]{0x06, 0x00, 0x00, 0x64},
@@ -629,6 +629,45 @@ public record NetworkConfig(
      */
     public int slotsPerEpoch() {
         return networkId == 100 ? 16 : 32;
+    }
+
+    /**
+     * Default weak-subjectivity bound, in sync-committee periods: how old the sync
+     * anchor (embedded checkpoint or persisted snapshot, whichever is newer) may be
+     * before the light client refuses to sync forward from it and parks in
+     * {@code STALE_ANCHOR} awaiting explicit user consent. Overridable per host via
+     * {@code ChainHandle.setWsBoundPeriods}; enforced by both engines (the Rust
+     * mirror lives in {@code rust/myotis-net}'s {@code ChainConfig} constructors —
+     * keep them in lockstep).
+     *
+     * <ul>
+     *   <li><b>mainnet: 13</b> (~14.7 days). The consensus-spec formula
+     *       ({@code SAFETY_DECAY=10}) plateaus at 3532 epochs ≈ 15.7 days for any
+     *       validator count ≥ 262 144; Electra's 256-ETH exit-churn cap only
+     *       lengthens it, so 3532/256 = 13.8 → 13 is the conservative floor.</li>
+     *   <li><b>sepolia: 13.</b> The spec formula with Sepolia's tiny validator set
+     *       gives barely over one period, but its validator set is permissioned
+     *       (EF-operated, deposit-gated), so outsiders cannot mount a long-range
+     *       attack at all; the mainnet-preset bound is kept as hygiene.</li>
+     *   <li><b>gnosis: 3</b> (~34 h). Two churn regimes matter here. Pre-Pectra,
+     *       Gnosis's CHURN_LIMIT_QUOTIENT of 4096 (with 80-second epochs)
+     *       collapsed the spec formula to under one 512-epoch period in the worst
+     *       case. The LIVE config (gnosischain/configs mainnet/config.yaml)
+     *       additionally caps Electra-era exit churn at
+     *       MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT = 64e9 Gwei-units = 2
+     *       validators/epoch, which dominates for any active set ≥ ~8k — so the
+     *       REAL window today is ~S/(20·64) + 256 epochs ≈ 2.6 days (~5 periods)
+     *       at 100k validators, ~4.9 days (~10) at 200k, scaling linearly with
+     *       stake. 3 periods therefore sits INSIDE the practical window at
+     *       current set sizes while keeping weekend-off restarts quiet; it would
+     *       only turn permissive again if Gnosis raised the exit cap or the set
+     *       shrank below ~65k. Tightening to 1 period (~11.4 h) remains the
+     *       strict option. Owner's call either way; raise or lower via the
+     *       Settings override knowingly.</li>
+     * </ul>
+     */
+    public long wsBoundPeriods() {
+        return networkId == 100 ? 3L : 13L;
     }
 
     // -------------------------------------------------------------------------

@@ -330,6 +330,26 @@ the app uses to check a peer-claimed EL state root against a beacon-attested one
 
 ```
 Phase 0   discover CL peers (HTTP debug only) — production seeds from discv5 + cache + multiaddrs
+Phase 0b  awaitAnchorFreshness(anchor) — the WEAK-SUBJECTIVITY GATE, on EVERY loop
+          entry: cold starts judge the BEST anchor (embedded checkpoint vs persisted
+          snapshot, whichever period is newer; the snapshot is parsed ONCE and the
+          resume below reuses the parse), warm re-entries via resume() judge the
+          store's held committee period (a pause longer than the bound ages it like
+          a cold snapshot). Bound: lightclient/WeakSubjectivity +
+          NetworkConfig.wsBoundPeriods defaults. Older → park in STALE_ANCHOR, fail
+          closed, re-evaluating 1/s until the bound covers it (raised live via
+          setWsBoundPeriods), acceptStaleAnchor() consents (run-sticky, never
+          persisted), or the client stops. Additionally, bootstrap() itself opens
+          with wsGateAllowsBootstrap(): every attempt — initial, the poll loop's
+          retry, the fallback after a failed resume — re-faces the gate against the
+          EMBEDDED CHECKPOINT, which can be older than the anchor the start-time
+          gate approved (a fresh snapshot masks a stale checkpoint until its resume
+          fails; a peer-starved node crosses the bound while retrying). And the
+          steady-state loop re-checks the HELD committee's age every cycle
+          (wsGateAllowsForwardSync): an awake node ages in memory exactly like a
+          snapshot ages on disk, so staying running while starved past the bound
+          parks the same way instead of silently handing off through past-bound
+          committees when peers return. A port MUST replicate all three layers.
 Phase 1   tryResumeFromSnapshot()  →  preConnectAndIdentify()  →  bootstrap() if not resumed
 Phase 1b  catchUpSyncCommittee()   +  fill the chain-state-root window from any peer
 Phase 2   steady-state: every secondsPerSlot, pollFinalityUpdate()
@@ -456,5 +476,11 @@ lists. See companion 03 §2 for the algorithm; the security invariant — **`sto
 8. Period rotation: finality across a period boundary rotates current←next; a finality update with
    no held next committee after a boundary fails until a `LightClientUpdate` is fetched.
 9. Snapshot round-trips and is rejected when the gvr doesn't match.
+9b. Weak-subjectivity gate: an anchor `bound+1` periods old parks (STALE_ANCHOR), age ==
+    bound does not, a backwards wall clock reads fresh; the override precedence is
+    host override > network default > fallback; a re-bootstrap after a poisoned
+    resume re-faces the gate with the (older) checkpoint anchor; and an INITIALIZED
+    store whose held committee ages past the bound while the node runs parks at the
+    next poll cycle (the in-run guard) instead of catching up unconsented.
 10. SSZ uses SHA-256/little-endian; the `proof/` MPT uses keccak/big-endian — cross-checked against
     known roots.

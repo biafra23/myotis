@@ -80,6 +80,10 @@ class IosSettings : Settings {
     override fun setServedBlockWindow(v: Int) =
         defaults.setInteger(v.coerceIn(1, 4096).toLong(), K_SERVED_WINDOW)
 
+    override fun wsBoundPeriods(): Int = getInt(K_WS_BOUND, 0)
+    override fun setWsBoundPeriods(v: Int) =
+        defaults.setInteger(v.coerceIn(0, 9999).toLong(), K_WS_BOUND)
+
     override fun displayName(network: String): String = info(network)?.displayName ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns ?: false
@@ -131,6 +135,7 @@ class IosSettings : Settings {
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
+        const val K_WS_BOUND = "wsBoundPeriods"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
     }

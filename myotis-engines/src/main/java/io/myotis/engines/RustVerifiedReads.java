@@ -90,6 +90,7 @@ final class RustVerifiedReads implements VerifiedReads {
                 case SYNCED -> SyncState.SYNCED;
                 case CATCHING_UP -> SyncState.CATCHING_UP;
                 case STARTING, SYNCING -> SyncState.SYNCING;
+                case STALE_ANCHOR -> SyncState.STALE_ANCHOR;
             };
         } catch (RuntimeException e) {
             // Never throw from the read surface: an unreadable status reads as

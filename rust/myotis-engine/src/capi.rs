@@ -157,6 +157,22 @@ pub extern "C" fn myotis_resume(handle: i64) -> bool {
     crate::host::resume(handle)
 }
 
+/// Override the weak-subjectivity anchor-age bound (`nativeSetWsBoundPeriods`
+/// twin); 0 restores the network default. Applied live — a handle parked in
+/// STALE_ANCHOR re-evaluates within a second. False only for an unknown handle.
+#[no_mangle]
+pub extern "C" fn myotis_set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    crate::host::set_ws_bound_periods(handle, periods)
+}
+
+/// One-shot consent to sync forward from a stale anchor (`nativeAcceptStaleAnchor`
+/// twin) — releases a STALE_ANCHOR park for the rest of this run; never
+/// persisted. False only for an unknown handle.
+#[no_mangle]
+pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
+    crate::host::accept_stale_anchor(handle)
+}
+
 /// Verified account read (`nativeRequestAccountJson` twin). Blocking — may take
 /// up to ~90 s for a header-chain walk; never call from the UI thread.
 ///
