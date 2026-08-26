@@ -86,11 +86,11 @@ class IosRpcStatusSource(
                 put("finalizedPeriod", o.engineLong("finalizedSlot") / 8192L)
                 put("syncCommitteePeriod", currentPeriod)
                 put("wallClockPeriod", targetPeriod)
-                // The Rust engine doesn't expose the EL anchor / state-root cache
-                // introspection over the FFI (JNI parity: RustChainHandle reports
-                // the same empties).
+                // The Rust engine doesn't expose the EL state-root cache
+                // introspection over the FFI, but its status does carry the
+                // finalized payload's execution block number.
                 put("executionStateRoot", JsonNull)
-                put("executionBlockNumber", 0)
+                put("executionBlockNumber", o.engineLong("finalizedBlockNumber"))
                 put("knownStateRoots", 0)
                 put("fillThreshold", 0)
             }
