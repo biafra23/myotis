@@ -7,7 +7,15 @@
 tuweni = "2.7.2"
 # biafra23/discovery fork of ConsenSys discovery 26.4.0, branch 26.4.0-android,
 # published via JitPack. Tag 26.4.0-android.1 = fork commit e6168beb7374 — if
-# the tag ever points elsewhere, treat the served artifact as compromised.
+# the tag ever points elsewhere, treat the served artifact as compromised — and
+# SHA-256 of the files JitPack serves for it (recheck offline against
+# ~/.gradle/caches/modules-2/files-2.1/com.github.biafra23/discovery/ or a
+# fresh download; the jar's class files are byte-identical to a local
+# `./gradlew publishToMavenLocal` build of the fork commit, though the jar's
+# own hash differs per build — compare per-class or against these):
+#   discovery-26.4.0-android.1.jar    e4bd2172727b90281849accac1b5f2b963eca2d8f12abca97b86a592873880fc
+#   discovery-26.4.0-android.1.pom    2d9424ba346823f826a801495859421494a74aa558296375ea2a4597c38eb548
+#   discovery-26.4.0-android.1.module 7a8b39a453fd16b36da88c6833d9b89e7766ba2c315fcfb0f06e7fbb151e928f
 # CANONICAL doc for the swap (other comments point here). Patches ONLY the
 # post-minSdk-29 JDK API calls that crash Android 10/11 (no ART backports
 # there): KBucket's List.addFirst/getLast (SequencedCollection, API 35) and
