@@ -1,5 +1,7 @@
 package io.myotis.evm;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
+
 import java.util.Objects;
 
 /**
@@ -40,7 +42,7 @@ public final class Address {
     }
 
     public String toHex() {
-        return "0x" + Hex.formatHex(bytes);
+        return Hex.formatHexPrefixed(bytes);
     }
 
     @Override

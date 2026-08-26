@@ -31,6 +31,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.concurrent.TimeUnit;
 
@@ -623,7 +624,16 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetStorageRanges for {} to peer {} ({}/{})",
             storageKeyHash.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return Futures.exceptionallyCompose(future.thenCompose(result -> {
+        // One decision point on THIS peer's outcome, with the retry recursion outside
+        // it: wrapping the recursion in the failure handler (the previous shape)
+        // replayed the remaining peer list once per level — up to 2^n snap requests
+        // on a fully-failing pool instead of n.
+        return future.handle((result, ex) -> {
+            if (ex != null) {
+                log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
+                    handler.getRemoteAddress(), ex.getMessage());
+                return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
+            }
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
@@ -631,11 +641,7 @@ public final class RLPxConnector implements AutoCloseable {
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
             return CompletableFuture.completedFuture(result);
-        }), ex -> {
-            log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
-            return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
-        });
+        }).thenCompose(Function.identity());
     }
 
     /** Bench a peer that failed to serve — unless it is the last un-benched serving

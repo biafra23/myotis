@@ -105,9 +105,13 @@ class ManifestCidResolver(
         return if (v in 0..Int.MAX_VALUE) v.toInt() else null
     }
 
+    // Files.readAllBytes/write, not readString/writeString: the String variants are
+    // Android API 33 and neither desugar_jdk_libs nor D8 backports cover them —
+    // minSdk is 29 (same constraint NodeKey.java documents).
     private fun readCache(): Pair<Long, String>? = try {
         if (!Files.exists(cacheFile)) null
-        else Files.readString(cacheFile).trim().split('\t').takeIf { it.size == 2 }
+        else String(Files.readAllBytes(cacheFile), StandardCharsets.UTF_8)
+            .trim().split('\t').takeIf { it.size == 2 }
             ?.let { (ts, cid) -> ts.toLongOrNull()?.let { it to cid } }
     } catch (e: Exception) {
         null
@@ -123,7 +127,7 @@ class ManifestCidResolver(
             // cache dir can't interleave writes to the same tmp before the atomic move.
             val tmp = Files.createTempFile(parent, cacheFile.fileName.toString(), ".tmp")
             try {
-                Files.writeString(tmp, "$now\t$cid")
+                Files.write(tmp, "$now\t$cid".toByteArray(StandardCharsets.UTF_8))
                 Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE)
             } finally {

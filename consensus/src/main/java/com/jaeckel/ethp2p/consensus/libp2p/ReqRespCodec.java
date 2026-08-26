@@ -229,7 +229,17 @@ public final class ReqRespCodec {
     static byte[] snappyDecompress(byte[] input) throws IOException {
         try (SnappyFramedInputStream snappyIn = new SnappyFramedInputStream(
                 new ByteArrayInputStream(input), true)) {
-            return snappyIn.readAllBytes();
+            // Manual drain, not InputStream.readAllBytes(): that method is Android
+            // API 33 (not desugared/backported at minSdk 29), and here it would
+            // resolve through the snappy subclass — the first beacon response on an
+            // Android 10-12 device would die with NoSuchMethodError.
+            ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, input.length * 2));
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = snappyIn.read(buf)) != -1) {
+                out.write(buf, 0, n);
+            }
+            return out.toByteArray();
         }
     }
 }

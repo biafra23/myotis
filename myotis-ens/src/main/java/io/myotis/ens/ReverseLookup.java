@@ -1,7 +1,7 @@
 package io.myotis.ens;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
 import io.myotis.evm.Address;
-import io.myotis.evm.Hex;
 
 /**
  * Builds the reverse-lookup namehash input for an Ethereum address per

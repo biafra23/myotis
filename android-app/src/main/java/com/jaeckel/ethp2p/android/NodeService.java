@@ -13,7 +13,6 @@ import android.os.Binder;
 import android.os.IBinder;
 import com.jaeckel.ethp2p.android.diag.ProcessHealthDiag;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
-import com.jaeckel.ethp2p.core.concurrent.Futures;
 
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
@@ -1387,7 +1386,9 @@ public final class NodeService extends Service {
     // CompletableFuture.failedFuture/orTimeout exist only from Android API 31 and
     // are NOT covered by desugar_jdk_libs or D8 backports at minSdk 29 (verified
     // against R8's BackportedMethodList; an earlier note here claimed otherwise —
-    // lint's NewApi was right). Use com.jaeckel.ethp2p.core.concurrent.Futures.
+    // lint's NewApi was right). Engine modules use core's Futures helper; this
+    // host inlines the two lines instead (hosts talk only to :myotis-api), the
+    // same way the key-store below hand-rolls its hex.
     /** Back-compat: query against the primary enabled network. */
     public CompletableFuture<AccountQueryResult> requestAccount(String hexAddress) {
         return requestAccount(primaryNetwork(this), hexAddress);
@@ -1397,7 +1398,9 @@ public final class NodeService extends Service {
         noteUiActivity();
         ChainHandle handle = handles.get(canonicalNetwork(network));
         if (handle == null) {
-            return Futures.failedFuture(new IllegalStateException("Node is not running"));
+            CompletableFuture<AccountQueryResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("Node is not running"));
+            return failed;
         }
         // The engine call is blocking (snap fetch + verification ladder, internally
         // timeout-bounded) — run it on the query pool and expose the future the UI expects.

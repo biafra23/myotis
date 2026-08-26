@@ -1092,7 +1092,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             hash.toShortHexString(), reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
         return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
-            .whenComplete((r, ex) -> pendingRequests.remove(reqId))
+            .whenComplete((r, ex) -> { pendingRequests.remove(reqId); pendingHeaderReqs.remove(reqId); })
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
                     throw new RuntimeException("Peer returned no header for its own best hash");
@@ -1136,7 +1136,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             fromNumber, window, reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
         return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
-            .whenComplete((r, ex) -> pendingRequests.remove(reqId))
+            .whenComplete((r, ex) -> { pendingRequests.remove(reqId); pendingHeaderReqs.remove(reqId); })
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
                     throw new RuntimeException(
@@ -1280,12 +1280,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         CompletableFuture<AccountRangeMessage.DecodeResult> result = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
-        pendingRequests.put(reqId, headerFut);
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
+            // Guard BEFORE registering the request: an early return here used to
+            // leave the pendingRequests entry behind for the life of the connection.
             return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
+        pendingRequests.put(reqId, headerFut);
         pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header (hash={}) from peer {} before snap query",
@@ -1320,7 +1322,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 });
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed: {}", remoteAddress, ex.getMessage());
-            pendingRequests.remove(reqId); // clean up
+            pendingRequests.remove(reqId); // clean up (both maps — a timeout never reaches
+            pendingHeaderReqs.remove(reqId); // the response-side removal in handleBlockHeaders)
             result.completeExceptionally(ex);
             return null;
         });
@@ -1393,12 +1396,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         CompletableFuture<StorageRangesMessage.DecodeResult> result = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
-        pendingRequests.put(reqId, headerFut);
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
+            // Guard BEFORE registering the request — same leak shape as the account path.
             return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
+        pendingRequests.put(reqId, headerFut);
         pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header for storage query from peer {}", remoteAddress);
@@ -1430,6 +1434,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed for storage query: {}", remoteAddress, ex.getMessage());
             pendingRequests.remove(reqId);
+            pendingHeaderReqs.remove(reqId);
             result.completeExceptionally(ex);
             return null;
         });

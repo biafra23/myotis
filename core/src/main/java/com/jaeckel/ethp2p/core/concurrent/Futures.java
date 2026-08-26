@@ -33,10 +33,14 @@ public final class Futures {
      * Equivalent of {@code future.orTimeout(timeout, unit)} (API 31+): completes
      * {@code future} exceptionally with a {@link TimeoutException} if it is not
      * done within the timeout, and returns the same future. Like the JDK, the
-     * timer task is cancelled as soon as the future completes.
+     * timer task is cancelled as soon as the future completes — and, also like
+     * the JDK's internal delayer, dependents of a future completed BY the
+     * timeout run on the single shared timer thread, so keep timeout
+     * continuations light (hand heavy work to an executor).
      */
     public static <T> CompletableFuture<T> orTimeout(
             CompletableFuture<T> future, long timeout, TimeUnit unit) {
+        java.util.Objects.requireNonNull(unit, "unit");
         if (!future.isDone()) {
             ScheduledFuture<?> timer = Delayer.SCHEDULER.schedule(
                     () -> future.completeExceptionally(new TimeoutException()), timeout, unit);

@@ -1158,15 +1158,6 @@ public class BeaconP2PService implements AutoCloseable {
         }
 
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
-        if (timeoutMs > 0L) {
-            // Start the deadline now so it matches the caller's intent (X ms total),
-            // not "X ms from when the muxer happened to open a stream". When the
-            // timer fires it completes responseFuture exceptionally, which triggers
-            // the stream-close whenComplete registered after the stream opens
-            // (see below) — without that, channelRead0 would keep buffering bytes
-            // from a silent peer.
-            Futures.orTimeout(responseFuture, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-        }
 
         QueuedReqRespBinding binding = bindings.get(protocolId);
         if (binding == null) {
@@ -1195,6 +1186,19 @@ public class BeaconP2PService implements AutoCloseable {
                                     + remaining + "ms"));
                 }
                 goodbyeUntilMs.remove(peerId.toString());
+            }
+
+            if (timeoutMs > 0L) {
+                // Arm the deadline (in place, on responseFuture) after the cheap
+                // synchronous validation above but before any network step, so it
+                // still spans the caller's full X ms — not "X ms from when the muxer
+                // happened to open a stream" — while the early-return paths above
+                // never park an orphaned timer task for a future nobody completes.
+                // When the timer fires it completes responseFuture exceptionally,
+                // which triggers the stream-close whenComplete registered after the
+                // stream opens (see below) — without that, channelRead0 would keep
+                // buffering bytes from a silent peer.
+                Futures.orTimeout(responseFuture, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
 
             log.debug("[beacon-p2p] Opening stream {} to {}", protocolId, peerMultiaddr);

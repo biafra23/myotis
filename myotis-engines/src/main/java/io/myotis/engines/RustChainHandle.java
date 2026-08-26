@@ -1277,25 +1277,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     /** 0x-hex (or null/"0x"/empty) → bytes; null/empty → an empty array.
-     *  Hand-rolled: {@code java.util.HexFormat} needs Android API 34 (minSdk is 29). */
+     *  core's Hex, not {@code java.util.HexFormat}: HexFormat needs Android
+     *  API 34 (minSdk is 29), and Hex keeps its strict ASCII parse contract. */
     private static byte[] hexToBytes(String hexOrNull) {
         if (hexOrNull == null) return new byte[0];
         String h = (hexOrNull.startsWith("0x") || hexOrNull.startsWith("0X"))
                 ? hexOrNull.substring(2) : hexOrNull;
-        if (h.isEmpty()) return new byte[0];
-        if ((h.length() & 1) != 0) {
-            throw new IllegalArgumentException("hex string has odd length: " + h.length());
-        }
-        byte[] out = new byte[h.length() / 2];
-        for (int i = 0; i < out.length; i++) {
-            int hi = Character.digit(h.charAt(2 * i), 16);
-            int lo = Character.digit(h.charAt(2 * i + 1), 16);
-            if (hi < 0 || lo < 0) {
-                throw new IllegalArgumentException("not a hex string: " + h);
-            }
-            out[i] = (byte) ((hi << 4) | lo);
-        }
-        return out;
+        return com.jaeckel.ethp2p.core.encoding.Hex.parseHex(h);
     }
 
     /** Left-pad a big-endian value to a 32-byte word (a storage value is ≤ 32 bytes). */

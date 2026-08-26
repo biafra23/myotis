@@ -2,7 +2,9 @@ package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.core.encoding.Hex;
 import com.jaeckel.ethp2p.core.enr.Enr;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
@@ -938,7 +940,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                 int n = mismatchesLogged.incrementAndGet();
                 if (n <= 5) {
                     log.info("[{}][discv5] eth2 fork_digest=0x{} not accepted — rejected{}",
-                            network.name(), io.myotis.evm.Hex.formatHex(peerDigest),
+                            network.name(), Hex.formatHex(peerDigest),
                             n == 5 ? " [further mismatch logs suppressed]" : "");
                 }
                 return;
@@ -1153,8 +1155,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             if (plan == null) return;
             var future = conn.backfillHeaders(plan.from(), plan.count());
             if (future == null) return; // no ready peer this tick
-            com.jaeckel.ethp2p.core.concurrent.Futures.orTimeout(future, 10, TimeUnit.SECONDS)
-                    .whenComplete((headers, ex) -> {
+            Futures.orTimeout(future, 10, TimeUnit.SECONDS).whenComplete((headers, ex) -> {
                 if (ex != null || headers == null) {
                     log.debug("[{}] header backfill fetch failed: {}", network.name(),
                             ex != null ? ex.toString() : "null");

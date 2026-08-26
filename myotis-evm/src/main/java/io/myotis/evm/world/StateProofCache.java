@@ -1,6 +1,6 @@
 package io.myotis.evm.world;
 
-import io.myotis.evm.Hex;
+import com.jaeckel.ethp2p.core.encoding.Hex;
 
 import java.math.BigInteger;
 import java.util.Collections;

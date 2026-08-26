@@ -1,5 +1,7 @@
 package io.myotis.evm;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
+
 import java.util.List;
 
 /**
@@ -87,6 +89,6 @@ public sealed interface EvmExecutionError {
 
     /** Content-aware hex formatter for error log lines. */
     static String toHex(byte[] bytes) {
-        return bytes == null ? "<null>" : "0x" + Hex.formatHex(bytes);
+        return bytes == null ? "<null>" : Hex.formatHexPrefixed(bytes);
     }
 }

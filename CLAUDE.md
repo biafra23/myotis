@@ -255,14 +255,21 @@ that produced this note.
   backports + desugaring: `List/Set/Map.of`/`copyOf`, `Map.entry`,
   `String.strip/isBlank/repeat`, `Collection.toArray(IntFunction)`,
   `Optional.isEmpty`, `Predicate.not`, `Collectors.toUnmodifiable*`, and (from
-  desugar_jdk_libs 2.1.5) `Stream.toList()`. NOT covered — use the in-repo
+  desugar_jdk_libs 2.1.5) `Stream.toList()`. NOT covered — use the `:core`
   replacements: `CompletableFuture.failedFuture/orTimeout/exceptionallyCompose`
-  → `com.jaeckel.ethp2p.core.concurrent.Futures`; `java.util.HexFormat` →
-  `io.myotis.evm.Hex` (or a local helper where `:myotis-evm` isn't a dep);
-  `Path.of` → `Paths.get`; `BigInteger.intValueExact/longValueExact` → a
-  bit-length guard + `intValue()/longValue()`. When in doubt, check the method
-  in `$ANDROID_HOME/platforms/android-*/data/api-versions.xml` — a `since`
-  above 29 needs desugar/backport coverage or a replacement.
+  → `core.concurrent.Futures`; `java.util.HexFormat` → `core.encoding.Hex`;
+  `BigInteger.intValueExact/longValueExact` → `core.math.BigIntegers`;
+  `Path.of` → `Paths.get`; `InputStream.readAllBytes/readNBytes/transferTo`
+  and `Files.readString/writeString` → a manual drain loop /
+  `Files.readAllBytes` + `Files.write`. Hosts (android-app/app/app-desktop)
+  don't import the `:core` helpers — they inline the few lines instead (hosts
+  talk only to `:myotis-api`). The ENFORCEMENT is
+  `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
+  built APK's dex — the post-desugaring ground truth. It also resolves calls
+  that reach a JDK method through a third-party subclass, which lint-style
+  source checks and a naive api-versions.xml lookup both miss (that is exactly
+  how `SnappyFramedInputStream.readAllBytes()` once slipped through), and
+  api-versions.xml itself has gaps (`Files.readString` has no entry at all).
 - **JVM 17 is the default source/target.** New modules should compile to
   Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
   `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from
