@@ -5,7 +5,15 @@
 # already (discv5). Replaces the tuweni-kotlin KMP fork: multiplatform now comes from
 # the Rust engine, not from Kotlin-transpiled Java deps.
 tuweni = "2.7.2"
-discovery = "26.4.0"
+# biafra23/discovery fork of ConsenSys discovery 26.4.0 (branch 26.4.0-android,
+# published via JitPack). Patches ONLY the post-minSdk-29 JDK API calls that
+# crash Android 10/11 (no ART backports there): KBucket's List.addFirst/getLast
+# (SequencedCollection, API 35) and Stream.takeWhile (API 34), plus
+# CompletableFuture.failedFuture/orTimeout (API 31) in RecursiveLookupTasks/
+# NettyDiscoveryServerImpl/AsyncPinger — none covered by desugaring. Same
+# besu-fork playbook (besu-android-fork/README.md); bump = new <base>-android.N
+# tag on the fork, re-applied on upstream upgrades.
+discovery = "26.4.0-android.1"
 # Upstream Netty (NIO-only usage; Android-safe). Replaces the netty-kotlin
 # transpile PoC — same io.netty.* FQCNs, so this is a coordinate swap.
 netty = "4.2.10.Final"  # matches jvm-libp2p 1.3.2's netty constraint (one netty everywhere)
@@ -109,7 +117,7 @@ trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", versio
 # resolves transitively (0.86.0 today).
 kethereum-model     = { module = "com.github.komputing.kethereum:model",   version = "0.86.0" }
 dnsjava             = { module = "dnsjava:dnsjava",                       version.ref = "dnsjava" }
-discovery           = { module = "io.consensys.protocols:discovery",       version.ref = "discovery" }
+discovery           = { module = "com.github.biafra23:discovery",         version.ref = "discovery" }
 besu-evm            = { module = "org.hyperledger.besu:besu-evm",         version.ref = "besu" }
 besu-datatypes      = { module = "org.hyperledger.besu:besu-datatypes",   version.ref = "besu" }
 

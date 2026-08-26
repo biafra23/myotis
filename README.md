@@ -892,7 +892,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
   - `discv4` -- UDP peer discovery (ping/pong/findnode/neighbors)
-  - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`)
+  - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`, consumed as the `com.github.biafra23:discovery` Android fork so it runs at minSdk 29 -- see `gradle/libs.versions.toml`)
   - `rlpx` -- TCP transport with EIP-8 ECIES handshake and AES-256-CTR framed channel
   - `eth` -- eth/66-69 sub-protocol (hello, status, block headers/bodies, receipts, transaction gossip)
   - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
