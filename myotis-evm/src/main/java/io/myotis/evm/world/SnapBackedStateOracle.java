@@ -5,6 +5,7 @@ import io.myotis.evm.Address;
 import io.myotis.evm.CryptoProviders;
 import io.myotis.evm.EvmExecutionError;
 import io.myotis.evm.EvmExecutionException;
+import io.myotis.evm.Hex;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
@@ -15,7 +16,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -310,8 +310,8 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                                 new EvmExecutionError.InvalidProof(
                                         new byte[32], Address.ZERO,
                                         "bytecode hash mismatch: expected 0x"
-                                                + HexFormat.of().formatHex(codeHash)
-                                                + " got 0x" + HexFormat.of().formatHex(actualHash)));
+                                                + Hex.formatHex(codeHash)
+                                                + " got 0x" + Hex.formatHex(actualHash)));
                     }
                     bytecodeCache.put(codeHash, code);
                     return code;

@@ -15,6 +15,7 @@ import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.SECP256K1;
 
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -96,7 +97,7 @@ public final class JavaMyotisEngine implements MyotisEngine {
                 ports.httpGateway() != null
                         ? PortBridges.toCcipGateway(ports.httpGateway(), httpExecutor)
                         : null,
-                config.syncSnapshotPath() != null ? Path.of(config.syncSnapshotPath()) : null,
+                config.syncSnapshotPath() != null ? Paths.get(config.syncSnapshotPath()) : null,
                 config.gossipsubEnabled());
         if (config.targetSnapPeers() > 0) {
             stack.configureSnapMaintainer(config.targetSnapPeers(),

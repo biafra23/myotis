@@ -1,6 +1,5 @@
 package com.jaeckel.ethp2p.android;
 
-import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -14,6 +13,7 @@ import android.os.Binder;
 import android.os.IBinder;
 import com.jaeckel.ethp2p.android.diag.ProcessHealthDiag;
 import com.jaeckel.ethp2p.android.log.LogBuffer;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
@@ -1384,24 +1384,20 @@ public final class NodeService extends Service {
      * The shortcut is checked first so that when it does fire we save a
      * round-trip; otherwise we fall through to the headerChain path.
      */
-    // CompletableFuture.failedFuture (Java 9, hidden behind Android API 31)
-    // and orTimeout (also gated to API 31) are backported to minSdk 29 via
-    // desugar_jdk_libs 2.1.3 — see android-app/build.gradle.kts. Lint flags
-    // them anyway because its API database doesn't track desugar coverage
-    // for every CF method. Suppress at the method level rather than file —
-    // a future use of a *genuinely* unbackported API should still trip.
+    // CompletableFuture.failedFuture/orTimeout exist only from Android API 31 and
+    // are NOT covered by desugar_jdk_libs or D8 backports at minSdk 29 (verified
+    // against R8's BackportedMethodList; an earlier note here claimed otherwise —
+    // lint's NewApi was right). Use com.jaeckel.ethp2p.core.concurrent.Futures.
     /** Back-compat: query against the primary enabled network. */
     public CompletableFuture<AccountQueryResult> requestAccount(String hexAddress) {
         return requestAccount(primaryNetwork(this), hexAddress);
     }
 
-    @SuppressLint("NewApi") // CompletableFuture.failedFuture (API 31) is backported to
-                            // minSdk 29 via desugar_jdk_libs — see the comment block above.
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
         noteUiActivity();
         ChainHandle handle = handles.get(canonicalNetwork(network));
         if (handle == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         // The engine call is blocking (snap fetch + verification ladder, internally
         // timeout-bounded) — run it on the query pool and expose the future the UI expects.
@@ -1558,7 +1554,6 @@ public final class NodeService extends Service {
         return resolveEns(primaryNetwork(this), name);
     }
 
-    @SuppressLint("NewApi") // CompletableFuture.failedFuture — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String network, String name) {
         noteUiActivity();
         final String trimmed = name == null ? "" : name.trim();

@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.atomic.AtomicLong
 
@@ -184,7 +185,8 @@ class UnchainedIndexStore(
     private inline fun atomicWrite(target: Path, write: (Path) -> Unit) {
         try {
             // Fall back to the working dir when a flat (parent-less) path is supplied.
-            val parent = target.parent ?: Path.of(".")
+            // Paths.get, not Path.of: the latter needs Android API 34 (minSdk is 29).
+            val parent = target.parent ?: Paths.get(".")
             Files.createDirectories(parent)
             val tmp = Files.createTempFile(parent, target.fileName.toString(), ".tmp")
             try {

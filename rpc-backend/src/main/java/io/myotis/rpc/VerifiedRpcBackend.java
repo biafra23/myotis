@@ -3,6 +3,7 @@ package io.myotis.rpc;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
@@ -1048,8 +1049,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         trimmed, null, call.blockNumber(), verified,
                         "ENS not available on chain id " + connector.getNetwork().networkId()), false));
             }
-            return call.resolver().resolveAddress(trimmed, call.blockCtx())
-                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+            return Futures.orTimeout(call.resolver().resolveAddress(trimmed, call.blockCtx()),
+                            ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                     .handle((opt, ex) -> {
                         final boolean usedOffchain = call.offchainExecutor().usedOffchain();
                         if (ex != null) {
@@ -1226,8 +1227,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         "ENS not available on chain id " + connector.getNetwork().networkId()),
                         false));
             }
-            return call.apply(ctx.resolver(), ctx.blockCtx())
-                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+            return Futures.orTimeout(call.apply(ctx.resolver(), ctx.blockCtx()),
+                            ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                     .handle((opt, ex) -> {
                         final boolean usedOffchain = ctx.offchainExecutor().usedOffchain();
                         if (ex != null) {
@@ -2256,7 +2257,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // The warm has no waiter to give up on it, so bound the BOOKKEEPING
                 // explicitly — otherwise a dropped queue slot would leave the
                 // inflightCalls entry and the per-shape warm flag stuck forever.
-                exec.orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                Futures.orTimeout(exec, HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         .whenComplete((out, ex) -> {
                             try {
                                 if (ex != null) {
@@ -3404,8 +3405,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         int total = (int) totalLong;
         log.info("[verify] Fetching " + total + " headers from #"
                 + finalizedBlock + " to #" + peerBlock);
-        return conn.requestBlockHeadersBatched(finalizedBlock, total)
-                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+        return Futures.orTimeout(conn.requestBlockHeadersBatched(finalizedBlock, total),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
                     boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
                     log.info("[verify] Full header chain (" + headers.size()
@@ -3535,11 +3536,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (conn == null) return null;
         BlockHeader h = vh.header();
         CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
-                conn.requestBlockBodies(vh.hash())
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+                Futures.orTimeout(conn.requestBlockBodies(vh.hash()),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
         CompletableFuture<List<List<Bytes>>> rcptF = needGasWeights
-                ? conn.requestReceipts(vh.hash())
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                ? Futures.orTimeout(conn.requestReceipts(vh.hash()),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 : CompletableFuture.completedFuture(null);
         return bodiesF.thenCombine(rcptF, (bodies, rcptBlocks) ->
                 decodeBlockTips(h, bodies, rcptBlocks, needGasWeights));

@@ -1,8 +1,7 @@
 package io.myotis.ens;
 
 import io.myotis.evm.Address;
-
-import java.util.HexFormat;
+import io.myotis.evm.Hex;
 
 /**
  * Builds the reverse-lookup namehash input for an Ethereum address per
@@ -31,7 +30,7 @@ public final class ReverseLookup {
      * {@code Namehash.of(...)}.
      */
     public static String nameFor(Address address) {
-        String hex = HexFormat.of().formatHex(address.toByteArray());
+        String hex = Hex.formatHex(address.toByteArray());
         return hex + "." + PARENT;
     }
 }

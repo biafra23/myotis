@@ -80,7 +80,7 @@ public final class EvmFactory {
         java.util.Objects.requireNonNull(ctx, "ctx");
         final long chainId;
         try {
-            chainId = ctx.chainId().longValueExact();
+            chainId = longValueExact(ctx.chainId());
         } catch (ArithmeticException e) {
             // Same friendly type as the unknown-id path — never leak the raw
             // ArithmeticException (module convention, see AbiDecoder).
@@ -99,6 +99,12 @@ public final class EvmFactory {
         throw new IllegalArgumentException(
                 "unsupported chain id " + chainId + " (no fork table — failing closed, "
                         + "never silently applying mainnet fork rules)");
+    }
+
+    /** {@code BigInteger.longValueExact} (Android API 31) replacement — minSdk is 29. */
+    private static long longValueExact(java.math.BigInteger v) {
+        if (v.bitLength() > 63) throw new ArithmeticException("BigInteger out of long range");
+        return v.longValue();
     }
 
     /** Mainnet: pre-merge forks by block number, post-merge by timestamp. */

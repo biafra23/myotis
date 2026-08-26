@@ -115,7 +115,13 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        // Sugar for java.time, java.nio.file etc. missing from Android's stdlib
+        // Core-library desugaring. At minSdk 29 this supplies the Java 9-11 API
+        // backports (List.of, String.strip, Collection.toArray(IntFunction),
+        // Collectors.toUnmodifiable*, …) and — from desugar_jdk_libs 2.1.5 —
+        // Stream.toList(), for our modules AND third-party jars alike. It does
+        // NOT cover CompletableFuture.failedFuture/orTimeout/exceptionallyCompose,
+        // java.util.HexFormat, Path.of, or BigInteger.int/longValueExact — those
+        // are avoided in source instead (core's Futures, evm's Hex, Paths.get).
         isCoreLibraryDesugaringEnabled = true
     }
 
@@ -235,7 +241,10 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
+    // 2.1.5 is the first release whose config desugars Stream.toList() (via an
+    // emulated Stream interface at minSdk ≤ 33) — earlier 2.1.x left it as a raw
+    // API-34 call that crashes on Android 10-13 devices.
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 
     implementation(project(":core"))
     implementation(project(":networking"))

@@ -81,14 +81,14 @@ public final class EthTxDecoder {
             Bytes signing = null;
             int recId = -1;
             if (v.equals(BigInteger.valueOf(27)) || v.equals(BigInteger.valueOf(28))) {
-                recId = v.intValueExact() - 27; // pre-155: sign over the 6 tx fields
+                recId = intValueExact(v) - 27; // pre-155: sign over the 6 tx fields
                 signing = RLP.encodeList(w -> {
                     w.writeLong(nonce); w.writeBigInteger(gasPrice); w.writeLong(gas);
                     w.writeValue(to); w.writeBigInteger(value); w.writeValue(input);
                 });
             } else if (v.compareTo(BigInteger.valueOf(35)) >= 0) {
                 BigInteger vMinus35 = v.subtract(BigInteger.valueOf(35));
-                long cid = vMinus35.shiftRight(1).longValueExact(); // EIP-155; < 2^63
+                long cid = longValueExact(vMinus35.shiftRight(1)); // EIP-155; < 2^63
                 chainId = cid;
                 recId = vMinus35.testBit(0) ? 1 : 0;
                 final long fcid = cid;
@@ -127,7 +127,7 @@ public final class EthTxDecoder {
                 w.writeLong(gas); w.writeValue(to); w.writeBigInteger(value);
                 w.writeValue(input); w.writeRLP(accessList);
             }));
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
+            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, intValueExact(yParity));
             return new DecodedTx(1, chainId, nonce, gasPrice, null, null, gas, to, value,
                     input, yParity, sigR, sigS, from);
         });
@@ -154,7 +154,7 @@ public final class EthTxDecoder {
                 w.writeBigInteger(maxFee); w.writeLong(gas); w.writeValue(to);
                 w.writeBigInteger(value); w.writeValue(input); w.writeRLP(accessList);
             }));
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
+            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, intValueExact(yParity));
             return new DecodedTx(2, chainId, nonce, null, maxPriority, maxFee, gas, to, value,
                     input, yParity, sigR, sigS, from);
         });
@@ -185,7 +185,7 @@ public final class EthTxDecoder {
                 w.writeBigInteger(value); w.writeValue(input); w.writeRLP(accessList);
                 w.writeBigInteger(maxFeePerBlobGas); w.writeRLP(blobHashes);
             }));
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
+            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, intValueExact(yParity));
             return new DecodedTx(3, chainId, nonce, null, maxPriority, maxFee, gas, to, value,
                     input, yParity, sigR, sigS, from);
         });
@@ -216,7 +216,7 @@ public final class EthTxDecoder {
                 w.writeBigInteger(value); w.writeValue(input); w.writeRLP(accessList);
                 w.writeRLP(authList);
             }));
-            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, yParity.intValueExact());
+            Bytes from = recover(Hash.keccak256(signing), sigR, sigS, intValueExact(yParity));
             return new DecodedTx(4, chainId, nonce, null, maxPriority, maxFee, gas, to, value,
                     input, yParity, sigR, sigS, from);
         });
@@ -254,5 +254,18 @@ public final class EthTxDecoder {
 
     private static BigInteger toBig(Bytes b) {
         return b.isEmpty() ? BigInteger.ZERO : b.toUnsignedBigInteger();
+    }
+
+    // BigInteger.intValueExact/longValueExact (Android API 31) replacements —
+    // minSdk is 29. Same contract: ArithmeticException on overflow, so a
+    // malformed wire value still fails the whole decode.
+    private static int intValueExact(BigInteger v) {
+        if (v.bitLength() > 31) throw new ArithmeticException("BigInteger out of int range");
+        return v.intValue();
+    }
+
+    private static long longValueExact(BigInteger v) {
+        if (v.bitLength() > 63) throw new ArithmeticException("BigInteger out of long range");
+        return v.longValue();
     }
 }

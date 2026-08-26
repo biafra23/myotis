@@ -1,5 +1,7 @@
 package io.myotis.evm;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
+
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -69,7 +71,7 @@ public interface EvmExecutor {
      * {@link UnsupportedOperationException} via the default implementation.
      */
     default CompletableFuture<Long> estimateGas(UnsignedTransaction tx, BlockContext blockContext) {
-        return CompletableFuture.failedFuture(
+        return Futures.failedFuture(
                 new UnsupportedOperationException("estimateGas is a Phase 5 deliverable"));
     }
 }

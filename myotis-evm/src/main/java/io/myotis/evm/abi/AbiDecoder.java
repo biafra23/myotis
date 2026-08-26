@@ -98,6 +98,7 @@ public final class AbiDecoder {
             throw new IllegalArgumentException(
                     name + " exceeds MAX_INDEX (" + MAX_INDEX + "): " + v);
         }
-        return v.intValueExact();
+        // The guard above proves the value fits; intValueExact needs Android API 31.
+        return v.intValue();
     }
 }

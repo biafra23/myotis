@@ -1,6 +1,5 @@
 package io.myotis.evm;
 
-import java.util.HexFormat;
 import java.util.List;
 
 /**
@@ -88,6 +87,6 @@ public sealed interface EvmExecutionError {
 
     /** Content-aware hex formatter for error log lines. */
     static String toHex(byte[] bytes) {
-        return bytes == null ? "<null>" : "0x" + HexFormat.of().formatHex(bytes);
+        return bytes == null ? "<null>" : "0x" + Hex.formatHex(bytes);
     }
 }

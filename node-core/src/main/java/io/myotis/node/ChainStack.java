@@ -938,7 +938,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                 int n = mismatchesLogged.incrementAndGet();
                 if (n <= 5) {
                     log.info("[{}][discv5] eth2 fork_digest=0x{} not accepted — rejected{}",
-                            network.name(), java.util.HexFormat.of().formatHex(peerDigest),
+                            network.name(), io.myotis.evm.Hex.formatHex(peerDigest),
                             n == 5 ? " [further mismatch logs suppressed]" : "");
                 }
                 return;
@@ -1153,7 +1153,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             if (plan == null) return;
             var future = conn.backfillHeaders(plan.from(), plan.count());
             if (future == null) return; // no ready peer this tick
-            future.orTimeout(10, TimeUnit.SECONDS).whenComplete((headers, ex) -> {
+            com.jaeckel.ethp2p.core.concurrent.Futures.orTimeout(future, 10, TimeUnit.SECONDS)
+                    .whenComplete((headers, ex) -> {
                 if (ex != null || headers == null) {
                     log.debug("[{}] header backfill fetch failed: {}", network.name(),
                             ex != null ? ex.toString() : "null");

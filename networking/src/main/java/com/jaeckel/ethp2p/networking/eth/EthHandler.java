@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking.eth;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.ConnectionErrors;
@@ -1074,12 +1075,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> requestFreshHeadHeaderAsync() {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("EthHandler not READY"));
         }
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
         long reqId = requestId.getAndIncrement();
@@ -1090,7 +1091,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
             hash.toShortHexString(), reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
-        return headerFut.orTimeout(5, TimeUnit.SECONDS)
+        return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingRequests.remove(reqId))
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
@@ -1123,7 +1124,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             long fromNumber, int window) {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("EthHandler not READY"));
         }
         long reqId = requestId.getAndIncrement();
@@ -1134,7 +1135,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockHeaders (live head probe from #{} window={}) reqId={}",
             fromNumber, window, reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
-        return headerFut.orTimeout(5, TimeUnit.SECONDS)
+        return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingRequests.remove(reqId))
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
@@ -1254,7 +1255,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         }
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
@@ -1269,7 +1270,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes address) {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
@@ -1282,7 +1283,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         pendingRequests.put(reqId, headerFut);
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
         pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
@@ -1291,7 +1292,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             hash.toShortHexString(), remoteAddress);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
         // 5-second timeout: if this peer doesn't respond, fail fast so RLPxConnector tries the next
-        headerFut.orTimeout(5, TimeUnit.SECONDS).thenAccept(headers -> {
+        Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS).thenAccept(headers -> {
             if (headers.isEmpty()) {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
@@ -1311,8 +1312,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 freshStateRoot = headers.get(0).header().stateRoot;
             log.info("[snap] Using fresh stateRoot={} from block #{}", freshStateRoot.toShortHexString(),
                 blockNum);
-            sendGetAccountRange(ctx, accountHash, freshStateRoot)
-                .orTimeout(10, TimeUnit.SECONDS)
+            Futures.orTimeout(sendGetAccountRange(ctx, accountHash, freshStateRoot),
+                    10, TimeUnit.SECONDS)
                 .whenComplete((r, ex) -> {
                     if (ex != null) result.completeExceptionally(ex);
                     else result.complete(r.withStateRoot(freshStateRoot, blockNum));
@@ -1363,7 +1364,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         // pendingSnapRequests entry on any terminal outcome — completion,
         // exception, or timeout. Without this, an orTimeout firing while the
         // peer stays connected would leak the entry until channelInactive.
-        return future.orTimeout(10, TimeUnit.SECONDS)
+        return Futures.orTimeout(future, 10, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingSnapRequests.remove(reqId));
     }
 
@@ -1382,7 +1383,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 storageKeyHash) {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
@@ -1395,7 +1396,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         pendingRequests.put(reqId, headerFut);
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
         pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
@@ -1403,7 +1404,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] Fetching fresh header for storage query from peer {}", remoteAddress);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
 
-        headerFut.orTimeout(5, TimeUnit.SECONDS).thenAccept(headers -> {
+        Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS).thenAccept(headers -> {
             if (headers.isEmpty()) {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
@@ -1420,8 +1421,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 freshStateRoot = headers.get(0).header().stateRoot;
             log.info("[snap] Using fresh stateRoot={} for storage query from block #{}",
                 freshStateRoot.toShortHexString(), blockNum);
-            sendGetStorageRanges(ctx, accountHash, storageKeyHash, freshStateRoot)
-                .orTimeout(10, TimeUnit.SECONDS)
+            Futures.orTimeout(sendGetStorageRanges(ctx, accountHash, storageKeyHash, freshStateRoot),
+                    10, TimeUnit.SECONDS)
                 .whenComplete((r, ex) -> {
                     if (ex != null) result.completeExceptionally(ex);
                     else result.complete(r);
@@ -1447,7 +1448,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         }
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
@@ -1479,7 +1480,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         // Same pattern as sendGetAccountRange: timeout + cleanup keyed on the
         // reqId we just allocated, so timeouts don't leak pendingStorageRequests
         // entries on a still-connected peer.
-        return future.orTimeout(10, TimeUnit.SECONDS)
+        return Futures.orTimeout(future, 10, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingStorageRequests.remove(reqId));
     }
 
@@ -1496,9 +1497,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public CompletableFuture<ByteCodesMessage.DecodeResult> requestByteCodesAsync(
             java.util.List<org.apache.tuweni.bytes.Bytes32> hashes) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+        if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         long reqId = requestId.getAndIncrement();
@@ -1507,7 +1508,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         byte[] payload = GetByteCodesMessage.encode(reqId, hashes, 128 * 1024L);
         log.info("[snap] GetByteCodes reqId={} hashes={}", reqId, hashes.size());
         rlpxHandler.sendMessage(ctx, snapGetByteCodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS)
+        return Futures.orTimeout(future, 10, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingByteCodeRequests.remove(reqId));
     }
 
@@ -1527,9 +1528,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 accountHash,
             org.apache.tuweni.bytes.Bytes32 stateRoot) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+        if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
         return sendGetAccountRange(ctx, accountHash, stateRoot);
     }
@@ -1548,9 +1549,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 slotHash,
             org.apache.tuweni.bytes.Bytes32 stateRoot) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+        if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
         return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot);
     }
@@ -1578,9 +1579,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes32 stateRoot,
             java.util.List<GetTrieNodesMessage.PathSet> paths) {
         ChannelHandlerContext ctx = readyCtx;
-        if (ctx == null || state != State.READY) return CompletableFuture.failedFuture(
+        if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
-        if (!snapNegotiated) return CompletableFuture.failedFuture(
+        if (!snapNegotiated) return Futures.failedFuture(
             new UnsupportedOperationException("snap/1 not negotiated with this peer"));
 
         long reqId = requestId.getAndIncrement();
@@ -1590,7 +1591,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetTrieNodes reqId={} root={} paths={}",
             reqId, stateRoot.toShortHexString(), paths.size());
         rlpxHandler.sendMessage(ctx, snapGetTrieNodes, payload);
-        return future.orTimeout(10, TimeUnit.SECONDS)
+        return Futures.orTimeout(future, 10, TimeUnit.SECONDS)
             .whenComplete((r, ex) -> pendingTrieNodeRequests.remove(reqId));
     }
 

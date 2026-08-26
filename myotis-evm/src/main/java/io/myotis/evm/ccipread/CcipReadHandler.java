@@ -1,10 +1,11 @@
 package io.myotis.evm.ccipread;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.myotis.evm.EvmExecutionError;
 import io.myotis.evm.EvmExecutionException;
+import io.myotis.evm.Hex;
 
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -81,30 +82,30 @@ public final class CcipReadHandler {
     private CompletableFuture<byte[]> tryUrlsSerially(
             OffchainLookupRevert lookup, int idx, List<String> reasons) {
         if (idx >= lookup.urls().size()) {
-            return CompletableFuture.failedFuture(new EvmExecutionException(
+            return Futures.failedFuture(new EvmExecutionException(
                     new EvmExecutionError.CcipGatewayFailed(
                             List.copyOf(lookup.urls()), List.copyOf(reasons))));
         }
         String urlTemplate = lookup.urls().get(idx);
-        return tryUrlAsync(urlTemplate, lookup)
+        CompletableFuture<byte[]> attempt = tryUrlAsync(urlTemplate, lookup)
                 .thenCompose(response -> {
                     if (response != null) {
                         return CompletableFuture.completedFuture(response);
                     }
                     reasons.add("non-200 or unparseable response from " + urlTemplate);
                     return tryUrlsSerially(lookup, idx + 1, reasons);
-                })
-                .exceptionallyCompose(t -> {
-                    Throwable cause = unwrap(t);
-                    reasons.add(urlTemplate + ": " + cause.getClass().getSimpleName()
-                            + ": " + cause.getMessage());
-                    return tryUrlsSerially(lookup, idx + 1, reasons);
                 });
+        return Futures.exceptionallyCompose(attempt, t -> {
+            Throwable cause = unwrap(t);
+            reasons.add(urlTemplate + ": " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            return tryUrlsSerially(lookup, idx + 1, reasons);
+        });
     }
 
     private CompletableFuture<byte[]> tryUrlAsync(String urlTemplate, OffchainLookupRevert lookup) {
         String senderHex = lookup.sender().toHex();
-        String dataHex = "0x" + HexFormat.of().formatHex(lookup.callData());
+        String dataHex = "0x" + Hex.formatHex(lookup.callData());
 
         // ERC-3668 §6.1: route is GET if the URL template contains {data}
         // (so the entire request fits in the path/query), POST otherwise.
@@ -188,7 +189,7 @@ public final class CcipReadHandler {
         String hex = m.group(1);
         if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
         if (hex.isEmpty()) return new byte[0];
-        return HexFormat.of().parseHex(hex);
+        return Hex.parseHex(hex);
     }
 
     private static Throwable unwrap(Throwable t) {

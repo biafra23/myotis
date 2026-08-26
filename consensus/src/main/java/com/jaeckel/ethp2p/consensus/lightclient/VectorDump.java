@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -44,7 +45,7 @@ public final class VectorDump {
                 // Per-run subdirectory: SEQ restarts at 1 in every JVM, so dumping runs
                 // into one flat dir would overwrite/interleave sessions — a curation
                 // footgun for the committed corpus. Each run gets its own dir instead.
-                p = Path.of(dir).resolve("run-" + (System.currentTimeMillis() / 1000L));
+                p = Paths.get(dir).resolve("run-" + (System.currentTimeMillis() / 1000L));
                 Files.createDirectories(p);
                 log.info("[lc-dump] capturing light-client SSZ vectors to {}", p.toAbsolutePath());
             } catch (Exception e) {

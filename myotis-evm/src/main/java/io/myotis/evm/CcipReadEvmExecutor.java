@@ -1,5 +1,6 @@
 package io.myotis.evm;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.myotis.evm.abi.AbiEncoder;
 import io.myotis.evm.ccipread.CcipReadHandler;
 import io.myotis.evm.ccipread.OffchainLookupRevert;
@@ -92,8 +93,9 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
     private CompletableFuture<byte[]> tryWithCcipRead(
             Address sender, Address target, byte[] calldata, java.math.BigInteger value,
             BlockContext ctx, int depth) {
-        return delegate.callView(sender, target, calldata, value, ctx)
-                .exceptionallyCompose(t -> handleException(sender, value, t, ctx, depth));
+        return Futures.exceptionallyCompose(
+                delegate.callView(sender, target, calldata, value, ctx),
+                t -> handleException(sender, value, t, ctx, depth));
     }
 
     private CompletableFuture<byte[]> handleException(Address sender, java.math.BigInteger value,
@@ -102,13 +104,13 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
         Optional<OffchainLookupRevert> lookup = extractLookup(cause);
         if (lookup.isEmpty()) {
             // Not a CCIP-Read revert; rethrow whatever the delegate produced.
-            return CompletableFuture.failedFuture(cause);
+            return Futures.failedFuture(cause);
         }
 
         if (depth >= CcipReadHandler.MAX_RECURSION_DEPTH) {
             log.warn("[ccip] recursion depth {} exceeds cap {}; failing",
                     depth, CcipReadHandler.MAX_RECURSION_DEPTH);
-            return CompletableFuture.failedFuture(new EvmExecutionException(
+            return Futures.failedFuture(new EvmExecutionException(
                     new EvmExecutionError.CcipGatewayFailed(
                             List.copyOf(lookup.get().urls()),
                             List.of("CCIP-Read recursion depth " + depth

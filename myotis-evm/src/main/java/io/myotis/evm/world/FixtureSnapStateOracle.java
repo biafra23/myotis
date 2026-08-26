@@ -1,5 +1,6 @@
 package io.myotis.evm.world;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.myotis.evm.Address;
 import io.myotis.evm.CryptoProviders;
 import io.myotis.evm.EvmExecutionError;
@@ -72,7 +73,7 @@ public final class FixtureSnapStateOracle implements SnapStateOracle {
     public CompletableFuture<byte[]> fetchBytecode(byte[] codeHash) {
         byte[] code = bytecodeByHash.get(Bytes.wrap(codeHash));
         if (code == null) {
-            return CompletableFuture.failedFuture(new EvmExecutionException(
+            return Futures.failedFuture(new EvmExecutionException(
                     new EvmExecutionError.BytecodeUnavailable(codeHash.clone())));
         }
         return CompletableFuture.completedFuture(code.clone());

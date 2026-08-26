@@ -250,6 +250,19 @@ that produced this note.
   the Android runtime / `coreLibraryDesugaring` can't cover, mind APK / DEX
   size, and prefer libraries with known Android support. `java.net.http` is
   not desugared and is not available below API 33 — do not use it.
+- **minSdk 29 JDK-API budget (verified empirically against R8's backport list
+  and the desugar_jdk_libs 2.1.5 config, 2026-08).** Safe at minSdk 29 via D8
+  backports + desugaring: `List/Set/Map.of`/`copyOf`, `Map.entry`,
+  `String.strip/isBlank/repeat`, `Collection.toArray(IntFunction)`,
+  `Optional.isEmpty`, `Predicate.not`, `Collectors.toUnmodifiable*`, and (from
+  desugar_jdk_libs 2.1.5) `Stream.toList()`. NOT covered — use the in-repo
+  replacements: `CompletableFuture.failedFuture/orTimeout/exceptionallyCompose`
+  → `com.jaeckel.ethp2p.core.concurrent.Futures`; `java.util.HexFormat` →
+  `io.myotis.evm.Hex` (or a local helper where `:myotis-evm` isn't a dep);
+  `Path.of` → `Paths.get`; `BigInteger.intValueExact/longValueExact` → a
+  bit-length guard + `intValue()/longValue()`. When in doubt, check the method
+  in `$ANDROID_HOME/platforms/android-*/data/api-versions.xml` — a `since`
+  above 29 needs desugar/backport coverage or a replacement.
 - **JVM 17 is the default source/target.** New modules should compile to
   Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
   `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from

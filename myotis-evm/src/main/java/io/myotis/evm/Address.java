@@ -1,6 +1,5 @@
 package io.myotis.evm;
 
-import java.util.HexFormat;
 import java.util.Objects;
 
 /**
@@ -33,7 +32,7 @@ public final class Address {
         if (s.length() != SIZE * 2) {
             throw new IllegalArgumentException("Address hex must be " + (SIZE * 2) + " chars, got " + s.length());
         }
-        return new Address(HexFormat.of().parseHex(s));
+        return new Address(Hex.parseHex(s));
     }
 
     public byte[] toByteArray() {
@@ -41,7 +40,7 @@ public final class Address {
     }
 
     public String toHex() {
-        return "0x" + HexFormat.of().formatHex(bytes);
+        return "0x" + Hex.formatHex(bytes);
     }
 
     @Override

@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
 
 /**
@@ -115,7 +116,8 @@ class ManifestCidResolver(
     private fun writeCache(now: Long, cid: String) {
         try {
             // Fall back to the working dir when a flat (parent-less) path is supplied.
-            val parent = cacheFile.parent ?: Path.of(".")
+            // Paths.get, not Path.of: the latter needs Android API 34 (minSdk is 29).
+            val parent = cacheFile.parent ?: Paths.get(".")
             Files.createDirectories(parent)
             // Unique temp file (not a fixed "<name>.tmp") so a daemon + desktop sharing the
             // cache dir can't interleave writes to the same tmp before the atomic move.
