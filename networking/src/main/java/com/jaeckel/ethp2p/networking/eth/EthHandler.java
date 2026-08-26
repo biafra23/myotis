@@ -237,8 +237,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      *  the same self-cleaning idiom the snap methods use. Without it, a timeout
      *  firing while the peer stays connected leaks the entry until channelInactive
      *  (up to a 128-wide receipt scan's worth on one hanging peer). The value is
-     *  the per-peer bound the RLPxConnector rotation (#359) relies on. */
-    private static final long BODY_RECEIPT_REQUEST_TIMEOUT_MS = 5_000L;
+     *  also the per-peer bound the RLPxConnector rotation (#359) aliases as its
+     *  per-attempt deadline (public for that one reference). 10 s matches the
+     *  repo's other per-peer fetch bounds (snap ranges, header batches) — not
+     *  shorter, because the deadline also caps total transfer time per attempt,
+     *  and when the LOCAL downlink is the bottleneck (large calldata-heavy body
+     *  on a slow mobile link) rotation can't rescue a too-tight bound: every
+     *  peer hits the same wall. */
+    public static final long BODY_RECEIPT_REQUEST_TIMEOUT_MS = 10_000L;
 
     /** Set the gossip observer (idempotent; the connector calls this on every handler). */
     public void setTxGossipObserver(TxGossipObserver observer) {
