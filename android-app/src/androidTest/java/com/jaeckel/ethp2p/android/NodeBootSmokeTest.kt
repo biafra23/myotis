@@ -112,6 +112,10 @@ class NodeBootSmokeTest {
             outcome == null ->
                 "no boot verdict was recorded — the boot worker never finished " +
                     "(service running=${NodeService.isRunning()})"
+            // A failure verdict recorded between the last poll and this re-read:
+            // without this arm it would be misreported as an RPC problem below.
+            outcome != NodeService.BOOT_STARTED ->
+                "boot FAILED between the last poll and this re-read: $outcome"
             snapshot?.rpcServing() != true ->
                 "the stack started but the RPC listener never came up — ChainStack " +
                     "treats that bind as best-effort; look for \"continuing without " +

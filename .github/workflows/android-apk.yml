@@ -274,11 +274,16 @@ jobs:
             --stacktrace
 
       # Results + per-test logcat — the boot verdict/diagnostics live here when
-      # the test fails. Only on failure: a green run's bundle is dead weight.
-      # if-no-files-found stays on the default `warn`: a failure that produced
-      # no results at all (died before the device) should say so, not vanish.
+      # the test fails. Not on green runs: that bundle is dead weight.
+      # `|| cancelled()`: a job that hits timeout-minutes is CANCELLED, not
+      # failed, and failure() alone would skip this exact step on the hang
+      # scenario the timeout exists for — the run most in need of the partial
+      # UTP/emulator logs. (Superseded runs cancelled by concurrency also hit
+      # this; their partial upload is harmless.) if-no-files-found stays on the
+      # default `warn`: a failure that produced no results at all (died before
+      # the device) should say so, not vanish.
       - name: Upload managed-device test results
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: api29-boot-smoke-results-${{ github.sha }}
@@ -291,9 +296,10 @@ jobs:
 
       # continue-on-error keeps the WORKFLOW green on a failure here; this
       # annotation makes the red job hard to miss from the run summary too.
+      # `|| cancelled()` for the same timeout-cancellation reason as the upload.
       - name: Surface the failure as an annotation
-        if: failure()
-        run: echo "::warning title=API-29 boot smoke failed::the boot smoke test failed (non-blocking) — see the api29-boot-smoke-results artifact and this job's log"
+        if: failure() || cancelled()
+        run: echo "::warning title=API-29 boot smoke did not pass::the boot smoke test failed, timed out, or was cancelled (non-blocking) — see the api29-boot-smoke-results artifact and this job's log"
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the asset name below comes from the tag, the versionName inside the apk
