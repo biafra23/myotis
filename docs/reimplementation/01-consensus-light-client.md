@@ -26,7 +26,7 @@ epochs) and an **optimistic** head.
 | BLS12-381 | **Pluggable `BlsBackend` seam** — `MilagroBlsBackend` (pure-Java AMCL, default/fallback) or `NativeBlsBackend` (Rust **`blst`** via JNI, `rust/myotis-bls`), selected by `BlsBackends.active()` | A port should use **`blst`** (Rust/Go) or `gnark-crypto` (Go) and call their `FastAggregateVerify` + RFC-9380 hash-to-G2 directly. See §8.0 and [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md): native blst is **4–15× faster** than Milagro on real verifies (far more on ART), so a port should make it the primary backend, not the fallback. |
 | hash-to-curve | **hand-rolled RFC 9380** (`bls/HashToCurve.java`) | Not needed if you use `blst`/`gnark` (they implement it) — but you must pass the exact DST. |
 | libp2p | `io.libp2p:jvm-libp2p` (TCP, Noise-XX, yamux/mplex, gossip) | `rust-libp2p` / `go-libp2p`. |
-| discv5 | ConsenSys `io.consensys.protocols:discovery` (in the `networking` module, not here) | `discv5` crate / go-ethereum v5. |
+| discv5 | ConsenSys `io.consensys.protocols:discovery`, via the `com.github.biafra23:discovery` Android fork (in the `networking` module, not here) | `discv5` crate / go-ethereum v5. |
 | Snappy | iq80 snappy (framed) | `snap` / `golang/snappy`. |
 | SHA-256 | JDK `MessageDigest` | All SSZ hashing + fork digest. |
 | keccak + RLP | Tuweni | **Only** for the execution-layer MPT bridge (`proof/`), never for SSZ. |

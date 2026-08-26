@@ -5,14 +5,27 @@
 # already (discv5). Replaces the tuweni-kotlin KMP fork: multiplatform now comes from
 # the Rust engine, not from Kotlin-transpiled Java deps.
 tuweni = "2.7.2"
-# biafra23/discovery fork of ConsenSys discovery 26.4.0 (branch 26.4.0-android,
-# published via JitPack). Patches ONLY the post-minSdk-29 JDK API calls that
-# crash Android 10/11 (no ART backports there): KBucket's List.addFirst/getLast
-# (SequencedCollection, API 35) and Stream.takeWhile (API 34), plus
-# CompletableFuture.failedFuture/orTimeout (API 31) in RecursiveLookupTasks/
-# NettyDiscoveryServerImpl/AsyncPinger — none covered by desugaring. Same
-# besu-fork playbook (besu-android-fork/README.md); bump = new <base>-android.N
-# tag on the fork, re-applied on upstream upgrades.
+# biafra23/discovery fork of ConsenSys discovery 26.4.0, branch 26.4.0-android,
+# published via JitPack. Tag 26.4.0-android.1 = fork commit e6168beb7374 — if
+# the tag ever points elsewhere, treat the served artifact as compromised.
+# CANONICAL doc for the swap (other comments point here). Patches ONLY the
+# post-minSdk-29 JDK API calls that crash Android 10/11 (no ART backports
+# there): KBucket's List.addFirst/getLast (SequencedCollection, API 35) and
+# Stream.takeWhile (API 34), KBuckets' Stream.toList (API 34, dormant — no
+# myotis caller, and desugar_jdk_libs 2.1.5 covers it — patched for the fork's
+# standalone completeness), plus CompletableFuture.failedFuture/orTimeout
+# (API 31) in RecursiveLookupTasks/NettyDiscoveryServerImpl/AsyncPinger — the
+# rest not covered by desugaring. Fork + JitPack mechanics follow the besu
+# playbook (besu-android-fork/README.md), but UNLIKE besu the swap is deliberately
+# repo-wide via this catalog entry, not an :android-app-only substitution: the
+# patches are behavior-preserving, one shared artifact means the JVM daemon and
+# test suite exercise exactly the bytes Android ships, and daemon/Android can't
+# skew. Accepted cost: a daemon-side discovery bump also goes through
+# re-tagging the fork (new <base>-android.N tag, patches re-applied — playbook
+# in the fork branch's README). If a future dependency ever pulls upstream
+# io.consensys.protocols:discovery transitively, add a dependencySubstitution
+# at the hosts — different GAs don't conflict-resolve, so duplicate
+# org.ethereum.beacon.discovery classes would land on the classpath.
 discovery = "26.4.0-android.1"
 # Upstream Netty (NIO-only usage; Android-safe). Replaces the netty-kotlin
 # transpile PoC — same io.netty.* FQCNs, so this is a coordinate swap.
