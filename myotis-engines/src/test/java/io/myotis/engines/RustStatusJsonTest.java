@@ -241,10 +241,12 @@ class RustStatusJsonTest {
         assertEquals(14560032L, bs.optimisticSlot());
         assertEquals(5, bs.connectedPeers());
         assertEquals(5L, bs.lightClientPeers());
-        // EL fields empty on the CL-only engine.
+        // The finalized payload's block flows from the beacon anchor (same status-JSON
+        // field statusSnapshot() maps); the exec state root / block hash are not in
+        // the status JSON, so they stay null on this surface.
         assertNull(bs.executionStateRootHex());
         assertNull(bs.executionBlockHashHex());
-        assertEquals(0L, bs.executionBlockNumber());
+        assertEquals(20999000L, bs.executionBlockNumber());
     }
 
     /** The weak-subjectivity park: STALE_ANCHOR maps through BOTH surfaces with the
@@ -301,6 +303,8 @@ class RustStatusJsonTest {
         assertEquals(1777L, s.wallClockPeriod());
         BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", OLD_SHAPE_CATCHING_UP_JSON);
         assertEquals(1777L, bs.targetPeriod());
+        // No finalizedBlockNumber key in the old shape → 0, never a throw.
+        assertEquals(0L, bs.executionBlockNumber());
     }
 
     @Test
