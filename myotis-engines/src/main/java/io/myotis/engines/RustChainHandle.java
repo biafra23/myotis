@@ -600,9 +600,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                                             // slot (SLOTS_PER_SYNC_COMMITTEE_PERIOD),
                                             // consistent with StatusSnapshot — not the
                                             // committee's currentPeriod.
-                null,                  // executionStateRootHex (EL)
-                null,                  // executionBlockHashHex (EL)
-                0L,                    // executionBlockNumber
+                null,                  // executionStateRootHex (not in the status JSON)
+                null,                  // executionBlockHashHex (not in the status JSON)
+                s.finalizedBlockNumber(),  // executionBlockNumber (== finalized payload's block)
                 0,                     // knownStateRoots
                 0,                     // fillThreshold
                 s.wsBoundPeriods(),
