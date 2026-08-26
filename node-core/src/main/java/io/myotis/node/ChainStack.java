@@ -345,7 +345,10 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             if (!started) { startedAtNs = startRequestNs; started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
-            log.error("[{}] stack failed to start: {}", network.name(), t.toString());
+            // Pass the throwable itself so the full stack + cause chain reach the log
+            // (Android's boot smoke test prints the log tail on failure — a bare
+            // toString() left a linkage Error undiagnosable from CI).
+            log.error("[{}] stack failed to start", network.name(), t);
             shutdown();
             return false;
         }

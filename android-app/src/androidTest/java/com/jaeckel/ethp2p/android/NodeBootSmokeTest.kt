@@ -10,44 +10,61 @@ import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.util.concurrent.TimeUnit
 
 /**
  * On-device boot smoke test, aimed at the minSdk emulator (the `api29` Gradle managed
  * device — see the managedDevices block in build.gradle.kts): launch the real
- * [MainActivity], let its fresh-launch path auto-start [NodeService], and wait until
- * the primary network's engine stack reports a COMPLETED start.
+ * [MainActivity], let its fresh-launch path auto-start [NodeService], and wait for the
+ * primary network's boot verdict.
  *
  * The point is runtime linkage, not sync: `ChainStack.start()` synchronously walks the
  * whole networking + consensus init sequence — EIP-1459 DNS discovery, the RLPx
  * connector and initial dials, discv4, discv5 + the beacon light client (libp2p, BLS,
- * SSZ), the Ktor JSON-RPC server, the snap-peer maintainer — so reaching "started"
- * proves that code actually EXECUTES on this API level. That covers what the static
- * APK scan (scripts/check_apk_min_api.py) deliberately cannot:
+ * SSZ), the Ktor JSON-RPC server, the snap-peer maintainer — so a recorded
+ * [NodeService.BOOT_STARTED] proves that code actually EXECUTED on this API level.
+ * That is coverage a static bytecode scan cannot give: `android.*` framework APIs
+ * above minSdk (`SDK_INT` guards are invisible to a dex scan — only running on real
+ * API-29 ART checks they work), `java.*` members the SDK's api-versions.xml has no
+ * entry for, and anything that only breaks when class init actually runs (provider
+ * lookups, reflective access, native-lib fallbacks). It is the runtime complement to
+ * the static minSdk dex gate (scripts/check_apk_min_api.py, from the parallel
+ * minSdk-29 JDK-API work).
  *
- *  - `android.*` framework APIs above minSdk in startup code — out of the dex gate's
- *    scope, because `SDK_INT` guards are invisible to a bytecode scan (lint's NewApi
- *    owns the source side; only running on real API-29 ART checks the guards work);
- *  - `java.*` members the SDK's api-versions.xml has no entry for (the gate must skip
- *    what it cannot resolve);
- *  - anything that only breaks when class init actually runs (provider lookups,
- *    reflective access, native-lib fallbacks).
+ * How a startup `NoClassDefFoundError` / `NoSuchMethodError` surfaces here:
+ *  - thrown in host/service code or `ENGINE.create()`: the boot worker catches only
+ *    `Exception`, so the `Error` crashes the app process and the instrumentation
+ *    report carries the crash stack;
+ *  - thrown inside `ChainStack.start()`: its internal `catch (Throwable)` converts it
+ *    to a `false` return (no crash, stack trace in the log), which [NodeService]
+ *    records as a failed boot outcome — this test then FAILS FAST with the app log's
+ *    error lines instead of burning the whole deadline.
  *
- * A [NoClassDefFoundError] / [NoSuchMethodError] anywhere on the boot path crashes the
- * app process — NodeService's boot workers catch `Exception`, not `Error` — which
- * fails this test with the crash stack in the instrumentation report. A boot that dies
- * with a plain Exception is also caught: the stack never reports started and the
- * timeout failure below prints the in-app log tail, which includes the boot error.
+ * Success additionally requires [NodeService.Snapshot.rpcServing]: ChainStack treats
+ * the JSON-RPC bring-up as best-effort (an init failure there is swallowed with
+ * "continuing without JSON-RPC" and the stack still reports started), so without this
+ * condition a linkage error inside the Ktor/RPC stack would pass silently. On a fresh
+ * emulator nothing else holds the RPC port, so the extra condition adds no flake in
+ * practice.
  *
- * The test needs no peers and no internet: "started" means local binds and threads are
- * up, before any peer answers. It is engine-agnostic — under `-PskipRustEngine` (how
- * CI runs it) the selector serves the Java engine, exactly the fallback an APK without
- * the Rust jniLibs uses at runtime.
+ * Deliberate scope choices:
+ *  - The boot is triggered by MainActivity's fresh-launch auto-start — the real
+ *    cold-launch path. If that auto-start is ever gated (onboarding, a setting), this
+ *    test must start the service itself instead of timing out.
+ *  - Engine-agnostic, but under `-PskipRustEngine` (how CI runs it) the selector
+ *    serves the Java engine — exactly the fallback an APK without the Rust jniLibs
+ *    uses at runtime. The Rust engine's own load path is NOT covered here.
+ *  - Needs no peers and no internet: "started" means local binds and threads are up.
  */
 @RunWith(AndroidJUnit4::class)
 class NodeBootSmokeTest {
 
+    // 60 s, not the rule's 5 s default: the bind callback queues on the main looper
+    // behind NodeService.onCreate/onStartCommand (startForeground, notification
+    // channel, engine class init) on a cold, software-rendered emulator — 5 s there
+    // is a flake that would fail the run before the boot path is exercised at all.
     @get:Rule
-    val serviceRule = ServiceTestRule()
+    val serviceRule: ServiceTestRule = ServiceTestRule.withTimeout(60, TimeUnit.SECONDS)
 
     @Test
     fun mainActivityLaunches_andNodeServiceBootsTheEngineStack() {
@@ -64,40 +81,75 @@ class NodeBootSmokeTest {
             val service = (binder as NodeService.LocalBinder).service()
 
             val deadline = System.currentTimeMillis() + BOOT_DEADLINE_MS
-            var last: NodeService.Snapshot? = null
-            while (System.currentTimeMillis() < deadline) {
-                // Polling snapshot() is itself part of the smoke: it runs the engine's
-                // status surfaces (status(), beaconStatus(), the cache-file stats).
-                last = service.snapshot()
-                // "RUNNING + RPC serving" is the start-completed signal: ChainStack
-                // flips its lifecycle to RUNNING on ENTRY to start(), but binds the
-                // RPC listener as the last-but-one init step — so a live listener
-                // means the whole init sequence above it has already executed.
-                if (last != null && last.lifecycle() == "RUNNING" && last.rpcServing()) {
-                    return
-                }
+            while (true) {
+                if (startedCompletely(service)) return
+                if (System.currentTimeMillis() >= deadline) break
+                // The loop shape guarantees one more check after the final sleep, so
+                // a boot landing right at the deadline can't be misreported.
                 Thread.sleep(POLL_INTERVAL_MS)
             }
-
-            val logTail = LogBuffer.snapshot()
-                .takeLast(LOG_TAIL_LINES)
-                .joinToString("\n") { e -> "${e.level()}/${e.tag()}: ${e.message()}" }
-            fail(
-                "NodeService did not report a fully started stack within " +
-                    "${BOOT_DEADLINE_MS / 1000}s (service running=${NodeService.isRunning()}, " +
-                    "last snapshot=$last).\nRecent app log:\n$logTail"
-            )
+            failTimedOut(service)
         }
     }
 
+    /** One poll: fail the test immediately on a recorded boot failure; true when the
+     *  boot verdict is in AND the (best-effort) RPC listener is live. */
+    private fun startedCompletely(service: NodeService): Boolean {
+        val outcome = NodeService.bootOutcome(NETWORK)
+        // Polling the snapshot is itself part of the smoke: it drives the engine's
+        // status surfaces (status(), beaconStatus(), cache-file stats) on this ART.
+        val snapshot = service.snapshot()
+        if (outcome != null && outcome != NodeService.BOOT_STARTED) {
+            fail("NodeService boot FAILED: $outcome\n${diagnostics(snapshot)}")
+        }
+        return outcome == NodeService.BOOT_STARTED && snapshot?.rpcServing() == true
+    }
+
+    private fun failTimedOut(service: NodeService) {
+        val outcome = NodeService.bootOutcome(NETWORK)
+        val snapshot = service.snapshot()
+        val hint = when {
+            outcome == null ->
+                "no boot verdict was recorded — the boot worker never finished " +
+                    "(service running=${NodeService.isRunning()})"
+            snapshot?.rpcServing() != true ->
+                "the stack started but the RPC listener never came up — ChainStack " +
+                    "treats that bind as best-effort; look for \"continuing without " +
+                    "JSON-RPC\" in the log"
+            // Fully started between the final poll and this diagnostic re-read: a pass.
+            else -> return
+        }
+        fail(
+            "Not fully started after ${BOOT_DEADLINE_MS / 1000}s: $hint\n" +
+                diagnostics(snapshot)
+        )
+    }
+
+    /** Error lines are collected separately from the tail: on the timeout path the
+     *  buffer keeps filling after an early failure (idle ticker, heartbeat), and a
+     *  plain tail would have scrolled the one interesting stack trace away. */
+    private fun diagnostics(snapshot: NodeService.Snapshot?): String {
+        val all = LogBuffer.snapshot()
+        fun fmt(e: LogBuffer.Entry) = "${e.level()}/${e.tag()}: ${e.message()}"
+        val errors = all.filter { it.level() == 'E' }.takeLast(ERROR_LINES)
+        val tail = all.takeLast(TAIL_LINES)
+        return "last snapshot=$snapshot\n" +
+            "--- error log lines (up to $ERROR_LINES) ---\n" +
+            errors.joinToString("\n", transform = ::fmt) +
+            "\n--- log tail (last $TAIL_LINES) ---\n" +
+            tail.joinToString("\n", transform = ::fmt)
+    }
+
     private companion object {
-        /** Generous: cold ART + a software-GPU emulator boot the stack in well under a
-         *  minute, but CI runners are slow and the DNS probes may each eat their 10 s
-         *  deadline offline. Well below any outer per-run timeout, so the timeout path
-         *  fails with our diagnostics instead of a bare hang. */
-        const val BOOT_DEADLINE_MS = 300_000L
-        const val POLL_INTERVAL_MS = 500L
-        /** Enough to include the boot banner and any boot failure with its cause chain. */
-        const val LOG_TAIL_LINES = 150
+        /** The default-enabled network on a fresh install (NodeService.enabledNetworks). */
+        const val NETWORK = "mainnet"
+        /** The boot normally lands well under a minute; 240 s absorbs a slow CI runner
+         *  (each DNS probe may eat its 10 s deadline offline) while staying under the
+         *  job's outer timeout. Boot FAILURES don't wait for this — they fail fast via
+         *  the recorded boot outcome. */
+        const val BOOT_DEADLINE_MS = 240_000L
+        const val POLL_INTERVAL_MS = 2_000L
+        const val ERROR_LINES = 40
+        const val TAIL_LINES = 100
     }
 }

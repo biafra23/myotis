@@ -95,6 +95,25 @@ public final class NodeService extends Service {
         return RUNNING.get();
     }
 
+    /** {@link #bootOutcome} value for a fully successful boot. */
+    public static final String BOOT_STARTED = "started";
+    /** Terminal verdict of each network's most recent boot attempt: absent while an
+     *  attempt is in flight (or none was made), {@link #BOOT_STARTED} once
+     *  {@code buildAndStart} ran the engine's whole start sequence to completion,
+     *  otherwise a failure description. ChainStack.start() catches {@code Throwable}
+     *  internally (a linkage Error there returns {@code false} instead of crashing the
+     *  process), so without this record a boot failure is observable only as
+     *  "the handle never appears". STATIC like {@link #RUNNING}/{@link #ENGINE}:
+     *  per-network-stack state that outlives service instances. Consumed by the
+     *  API-29 boot smoke test (androidTest); available to the UI as well. */
+    private static final Map<String, String> BOOT_OUTCOMES = new ConcurrentHashMap<>();
+
+    /** The most recent boot attempt's terminal verdict for {@code network} — null
+     *  while no attempt has finished, {@link #BOOT_STARTED}, or a failure summary. */
+    public static String bootOutcome(String network) {
+        return BOOT_OUTCOMES.get(canonicalNetwork(network));
+    }
+
     // ----- Settings (SharedPreferences "ethp2p"), shared by the service + Compose UI -----
     private static final String PREFS_NAME = "ethp2p";
     private static final String K_NETWORK = "network";
@@ -1670,6 +1689,9 @@ public final class NodeService extends Service {
      */
     private void buildAndStart(String netName, long gen) {
         String n = canonicalNetwork(netName);
+        // A new attempt voids the previous verdict; the deliberate-bail paths below
+        // (stop/disable raced the boot) record nothing — absent means "no verdict".
+        BOOT_OUTCOMES.remove(n);
         ChainHandle created = null;
         try {
             int rpcPort = rpcPortFor(this, n);
@@ -1710,6 +1732,7 @@ public final class NodeService extends Service {
                     LogBuffer.i(TAG, "[" + n + "] boot skipped: already hosted by the engine");
                     ChainHandle existing = ENGINE.get(n);
                     if (existing != null) handles.putIfAbsent(n, existing);
+                    BOOT_OUTCOMES.put(n, BOOT_STARTED); // a live stack is a started stack
                     return;
                 }
 
@@ -1785,6 +1808,10 @@ public final class NodeService extends Service {
 
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
+                    // ChainStack.start() caught the real cause (Throwable, stack
+                    // trace in its log line) and returned false; record the verdict.
+                    BOOT_OUTCOMES.put(n, "engine start() returned false — see the "
+                            + "\"stack failed to start\" log line for the cause");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
@@ -1801,10 +1828,12 @@ public final class NodeService extends Service {
                 // the index install / appender spin-up.
                 pushLogIndexConfig(n, handle);
             }
+            BOOT_OUTCOMES.put(n, BOOT_STARTED);
             updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
         } catch (Exception e) {
             LogBuffer.e(TAG, "[" + n + "] node boot failed", e);
+            BOOT_OUTCOMES.put(n, unwrap(e));
             // Clean up ONLY this attempt's state, under the lock. The exception released
             // the bootLock, so a racing enable may already have registered a fresh healthy
             // instance — an unconditional forgetStack here would wipe that instance's
