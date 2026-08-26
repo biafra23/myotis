@@ -186,6 +186,85 @@ jobs:
           # fix since it hit exactly that.)
           overwrite: true
 
+  # Boot the actual app on a minSdk (API 29) emulator — the runtime complement to
+  # the static minSdk-29 JDK-API dex gate (scripts/check_apk_min_api.py): the gate
+  # proves every java.*/javax.* reference in the dex resolves at API 29, but it
+  # deliberately skips android.* framework APIs (SDK_INT guards are invisible to a
+  # bytecode scan) and any member api-versions.xml has no entry for — and no scan
+  # proves the app actually BOOTS. This job launches MainActivity and runs
+  # NodeService through a full engine-stack start (networking + consensus init) on
+  # an API-29 AOSP image via the `api29` Gradle Managed Device (NodeBootSmokeTest),
+  # so a startup-path NoClassDefFoundError/NoSuchMethodError fails here instead of
+  # on a user's phone.
+  #
+  # -PskipRustEngine: runs on the Java engine. The minSdk-linkage risk this job
+  # hunts lives entirely in the JVM code (the Rust .so has no JDK/ART surface), it
+  # spares this job the whole Android Rust toolchain, and it is exactly the
+  # fallback an APK without the jniLibs uses at runtime.
+  boot-smoke-api29:
+    name: API-29 boot smoke (emulator)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # NON-BLOCKING for now, deliberately: this is the repo's first emulator job,
+    # and hosted-runner emulators are notoriously flaky (boot hangs, adb drops)
+    # even with KVM. A red job here stays visible on the PR but neither fails the
+    # workflow nor gates the merge; once it has proven stable for a few weeks,
+    # promote it to blocking by deleting this line.
+    continue-on-error: true
+    steps:
+      # Shallow on purpose (no fetch-depth: 0): the build job needs full history
+      # for the version stamp; here the stamp is irrelevant, and :ui's version
+      # probe degrades to its fallback label instead of failing without it.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The emulator needs hardware virtualization; ubuntu-latest runners expose
+      # /dev/kvm but root-only by default. This is the standard "enable KVM" udev
+      # rule from the android-emulator-runner docs.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # AGP's managed-device setup downloads the emulator + the API-29 system
+      # image (several hundred MB, a couple of minutes) into the runner's
+      # preinstalled SDK by itself — no sdkmanager steps needed, licenses are
+      # pre-accepted on the runner image. swiftshader_indirect: the runner has no
+      # GPU, so render in software (the documented GMD-on-CI setting).
+      - name: Run the boot smoke test on the API-29 managed device
+        run: |
+          ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine \
+            -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect \
+            --stacktrace
+
+      # Results + per-test logcat — the crash stack lives here when the test fails.
+      - name: Upload managed-device test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api29-boot-smoke-results-${{ github.sha }}
+          path: |
+            android-app/build/outputs/androidTest-results/managedDevice/
+            android-app/build/reports/androidTests/managedDevice/
+          if-no-files-found: ignore
+          retention-days: 14
+          # Same re-run rationale as the APK artifact above.
+          overwrite: true
+
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the asset name below comes from the tag, the versionName inside the apk
   # comes from project.version. See release-version-guard.yml. Runs in parallel

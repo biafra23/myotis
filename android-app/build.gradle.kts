@@ -110,6 +110,7 @@ android {
         versionCode = 8
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -151,6 +152,36 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+    }
+
+    testOptions {
+        // No UI interactions in the smoke test, but system animations still cost
+        // main-thread time on a software-rendered emulator — keep them off.
+        animationsDisabled = true
+        // Gradle Managed Device pinned to minSdk (API 29): the one API level where
+        // "it dexes" is weakest evidence of "it runs" — Android 10/11 never get ART
+        // module updates, so a post-29 java.* reference throws NoSuchMethod/
+        // NoClassDefFoundError with no backport safety net, and android.* framework
+        // APIs are checkable only by executing on the real API level (SDK_INT guards
+        // are invisible to any bytecode scan). NodeBootSmokeTest (androidTest) boots
+        // MainActivity + NodeService on it far enough to run the networking/consensus
+        // init paths. Run with:
+        //   ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine
+        // (CI does exactly that — see .github/workflows/android-apk.yml; without the
+        // flag the device also gets the Rust engine, which the toolchain gate then
+        // requires). "aosp", not "aosp-atd": the leaner ATD images only exist for
+        // API 30+. x86/x86_64 hosts only — Google never published an API-29 arm64
+        // emulator image, so an Apple-Silicon Mac can't run this device locally;
+        // the CI job on an x86_64 runner is the enforcement point.
+        managedDevices {
+            localDevices {
+                create("api29") {
+                    device = "Pixel 2"
+                    apiLevel = 29
+                    systemImageSource = "aosp"
+                }
+            }
         }
     }
 
@@ -245,6 +276,13 @@ dependencies {
     // emulated Stream interface at minSdk ≤ 33) — earlier 2.1.x left it as a raw
     // API-34 call that crashes on Android 10-13 devices.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+
+    // On-device boot smoke test (the api29 managed device above). Test APK only.
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation(libs.androidx.test.core)      // ActivityScenario / ApplicationProvider
+    androidTestImplementation(libs.androidx.test.runner)    // AndroidJUnitRunner (testInstrumentationRunner)
+    androidTestImplementation(libs.androidx.test.rules)     // ServiceTestRule
+    androidTestImplementation(libs.androidx.test.ext.junit) // AndroidJUnit4
 
     implementation(project(":core"))
     implementation(project(":networking"))
