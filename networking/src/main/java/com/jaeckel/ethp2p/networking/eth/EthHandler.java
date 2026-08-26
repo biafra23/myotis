@@ -231,6 +231,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /** Hard cap on hashes decoded per gossip message — bounds event-loop work even if a
      *  peer announces a huge batch while we happen to be watching. */
     private static final int MAX_GOSSIP_HASHES_PER_MSG = 256;
+    /** Per-request deadline for an async bodies/receipts fetch. Applied HERE (where
+     *  the reqId is in scope) with a whenComplete that clears the pending-request
+     *  entry on ANY terminal outcome — completion, exception, or this timeout —
+     *  the same self-cleaning idiom the snap methods use. Without it, a timeout
+     *  firing while the peer stays connected leaks the entry until channelInactive
+     *  (up to a 128-wide receipt scan's worth on one hanging peer). The value is
+     *  also the per-peer bound the RLPxConnector rotation (#359) aliases as its
+     *  per-attempt deadline (public for that one reference). 10 s matches the
+     *  repo's other per-peer fetch bounds (snap ranges, header batches) — not
+     *  shorter, because the deadline also caps total transfer time per attempt,
+     *  and when the LOCAL downlink is the bottleneck (large calldata-heavy body
+     *  on a slow mobile link) rotation can't rescue a too-tight bound: every
+     *  peer hits the same wall. */
+    public static final long BODY_RECEIPT_REQUEST_TIMEOUT_MS = 10_000L;
 
     /** Set the gossip observer (idempotent; the connector calls this on every handler). */
     public void setTxGossipObserver(TxGossipObserver observer) {
@@ -1197,7 +1211,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockBodies (async) hashes={} reqId={}", hashes.length, reqId);
         byte[] payload = GetBlockBodiesMessage.encode(reqId, hashes);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_BODIES, payload);
-        return future;
+        return future.orTimeout(BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .whenComplete((r, ex) -> pendingBodyRequests.remove(reqId));
     }
 
     /**
@@ -1217,7 +1232,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetReceipts (async) hashes={} reqId={}", hashes.length, reqId);
         byte[] payload = GetReceiptsMessage.encode(reqId, hashes);
         rlpxHandler.sendMessage(ctx, ETH_GET_RECEIPTS, payload);
-        return future;
+        return future.orTimeout(BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .whenComplete((r, ex) -> pendingReceiptRequests.remove(reqId));
     }
 
     /**

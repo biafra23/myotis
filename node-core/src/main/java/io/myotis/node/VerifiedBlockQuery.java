@@ -1,6 +1,7 @@
 package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
@@ -34,6 +35,9 @@ public final class VerifiedBlockQuery {
     /** The Merge block — first PoS block on mainnet (Sep 15 2022). */
     private static final long MERGE_BLOCK = 15_537_394L;
     private static final int MAX_HEADER_CHAIN_GAP = VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP;
+    /** keccak256(RLP([])) — the ommersHash of every uncle-free (so every post-Merge) block. */
+    private static final Bytes32 EMPTY_OMMERS_HASH = Bytes32.fromHexString(
+            "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347");
 
     private VerifiedBlockQuery() {}
 
@@ -63,6 +67,29 @@ public final class VerifiedBlockQuery {
                 return errorResult("No body returned for block " + blockNumber);
             }
             BlockBodiesMessage.BlockBody body = bodies.get(0);
+            // The body is raw peer data until tied to the header: rebuild the tx trie
+            // and require it to root at transactionsRoot, so the reported txCount
+            // can't be a byzantine peer's junk riding a "headerChain" badge. Like the
+            // empty reply above, a mismatch is a FETCH failure (this peer failed to
+            // produce the block's body) rather than a header-verification verdict,
+            // hence error() and not failReason.
+            if (!OrderedTrieRoot.verify(body.transactions(), h.transactionsRoot)) {
+                return errorResult("Body for block " + blockNumber
+                        + " failed transactionsRoot verification");
+            }
+            // uncleCount/withdrawalCount: the wire decoder keeps only counts, not the
+            // raw uncle/withdrawal RLP a full ommersHash/withdrawalsRoot rebuild would
+            // need — but the EMPTY cases pin them exactly, and every post-Merge block
+            // (all this path verifies) has the empty ommersHash.
+            if (EMPTY_OMMERS_HASH.equals(h.ommersHash) && body.uncleCount() != 0) {
+                return errorResult("Body for block " + blockNumber
+                        + " reports uncles for an empty ommersHash");
+            }
+            if (OrderedTrieRoot.EMPTY_ROOT.equals(h.withdrawalsRoot)
+                    && body.withdrawalCount() != 0) {
+                return errorResult("Body for block " + blockNumber
+                        + " reports withdrawals for an empty withdrawalsRoot");
+            }
 
             // Step 3: beacon verification.
             Verdict v = verifyAgainstBeacon(connector, beaconSyncState, h, blockNumber);
