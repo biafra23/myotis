@@ -303,7 +303,14 @@ pub struct VerifiedBlock {
 /// How far below the beacon head a block pin may be and still verify cheaply
 /// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
 /// [target..head] is fetched in one request, so this bounds its size.
-const BLOCK_LOOKBACK_MAX: u64 = 256;
+///
+/// 512, not 256: Swarm's bee reads the previous redistribution round's start
+/// header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
+/// whatever skew bee's cached block number has against our anchored head at
+/// serve time. 256 made that call fail for the tail of every round; 512 covers
+/// it with margin and keeps the window one ~300 KB fetch, still within the eth
+/// response soft limit.
+const BLOCK_LOOKBACK_MAX: u64 = 512;
 
 /// First-ever receipt scan for a tx hash looks back this many blocks below the
 /// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
@@ -4237,7 +4244,7 @@ impl ElReader {
         full_transactions: bool,
     ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. head] (back + 1 headers), in one
-        // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
+        // request. back < BLOCK_LOOKBACK_MAX (512) bounds this to ~300 KB, within the
         // eth response soft limit; a peer that caps its response below back+1 fails
         // the anchored-window length check and is skipped (fails closed — the caller
         // tries the next peer), so deep pins carry a slightly higher liveness risk
@@ -5853,6 +5860,53 @@ mod tests {
             // (all six are misses — nothing is cancelled, so `live` returns to 0).
             assert_eq!(live.load(Ordering::SeqCst), 0, "an attempt leaked");
         }
+    }
+
+    /// The Java engine's `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX` and this
+    /// file's [`BLOCK_LOOKBACK_MAX`] are two copies of one serving policy:
+    /// the engines must answer the same pinned block request identically, so
+    /// a lone bump on either side would open a window of pins the two answer
+    /// differently. Same shape as `sync.rs`'s `java_and_rust_checkpoints_agree`:
+    /// parse the Java source and compare, skipping only outside a repo checkout
+    /// (a vendored crate has no Java engine to disagree with).
+    #[test]
+    fn java_and_rust_block_lookback_agree() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let java =
+            repo_root.join("rpc-backend/src/main/java/io/myotis/rpc/VerifiedRpcBackend.java");
+        let src = match std::fs::read_to_string(&java) {
+            Ok(s) => s,
+            Err(e) => {
+                // Inside a checkout an unreadable path means the Java file MOVED —
+                // skipping there would silently disarm this guard forever.
+                if repo_root.join("settings.gradle.kts").exists() {
+                    panic!(
+                        "this is a repo checkout (settings.gradle.kts present) but {} is \
+                         unreadable ({e}) — VerifiedRpcBackend.java moved; update this \
+                         test's path",
+                        java.display()
+                    );
+                }
+                eprintln!("skipping: not a repo checkout ({} unreadable: {e})", java.display());
+                return;
+            }
+        };
+        let needle = "BLOCK_LOOKBACK_MAX = ";
+        let at = src
+            .find(needle)
+            .expect("no `BLOCK_LOOKBACK_MAX = ` assignment in VerifiedRpcBackend.java");
+        let digits: String = src[at + needle.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let java_value: u64 = digits.parse().unwrap_or_else(|_| {
+            panic!("unparseable BLOCK_LOOKBACK_MAX in VerifiedRpcBackend.java: {digits:?}")
+        });
+        assert_eq!(
+            java_value, BLOCK_LOOKBACK_MAX,
+            "Java VerifiedRpcBackend.BLOCK_LOOKBACK_MAX ({java_value}) and Rust \
+             BLOCK_LOOKBACK_MAX ({BLOCK_LOOKBACK_MAX}) have drifted — bump both together"
+        );
     }
 
     struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);

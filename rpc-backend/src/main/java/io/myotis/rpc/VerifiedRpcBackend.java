@@ -77,7 +77,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Max blocks below the verified head we'll fetch+verify headers for to answer
     // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
     // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
-    private static final int BLOCK_LOOKBACK_MAX = 256;
+    // 512, not 256: Swarm's bee reads the previous redistribution round's start
+    // header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
+    // whatever skew bee's cached block number has against our anchored head at
+    // serve time. 256 made that call fail for the tail of every round; 512 covers
+    // it with margin and stays one modest header-range fetch (~300 KB).
+    // Mirrored by the Rust engine's BLOCK_LOOKBACK_MAX (el/reader.rs) — keep in sync.
+    private static final int BLOCK_LOOKBACK_MAX = 512;
 
     private static final long ENS_TIMEOUT_SEC = 60;
 

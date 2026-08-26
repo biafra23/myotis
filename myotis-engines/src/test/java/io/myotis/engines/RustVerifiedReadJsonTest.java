@@ -581,7 +581,7 @@ class RustVerifiedReadJsonTest {
     @Test
     void feeHistoryErrorObjectBecomesEngineException() {
         assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(
-                "{\"error\":\"oldest block 20 is beyond the 256-block verify window\"}"));
+                "{\"error\":\"oldest block 20 is beyond the 512-block verify window\"}"));
     }
 
     @Test
