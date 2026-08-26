@@ -602,7 +602,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                                             // committee's currentPeriod.
                 null,                  // executionStateRootHex (EL)
                 null,                  // executionBlockHashHex (EL)
-                0L,                    // executionBlockNumber
+                s.finalizedBlockNumber(), // executionBlockNumber (finalized payload)
                 0,                     // knownStateRoots
                 0,                     // fillThreshold
                 s.wsBoundPeriods(),

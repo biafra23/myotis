@@ -241,9 +241,16 @@ class RustStatusJsonTest {
         assertEquals(14560032L, bs.optimisticSlot());
         assertEquals(5, bs.connectedPeers());
         assertEquals(5L, bs.lightClientPeers());
-        // EL fields empty on the CL-only engine.
+        // The Rust status carries the finalized execution block used by verified
+        // consumers even though the remaining EL beacon fields are unavailable.
         assertNull(bs.executionStateRootHex());
         assertNull(bs.executionBlockHashHex());
+        assertEquals(20999000L, bs.executionBlockNumber());
+    }
+
+    @Test
+    void beaconStatusWithoutFinalizedBlockKeepsZero() {
+        BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", NOT_STARTED_JSON);
         assertEquals(0L, bs.executionBlockNumber());
     }
 
