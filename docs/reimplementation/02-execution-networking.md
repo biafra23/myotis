@@ -103,8 +103,9 @@ The table is behind a single lock.
 ## 3. discv5 (consensus-layer discovery)
 
 discv5 is **not hand-rolled** — the reference wraps the ConsenSys `io.consensys.protocols:discovery`
-library (the same one Teku uses). A port should use the `discv5` crate (Rust) or go-ethereum's v5
-discovery (Go) rather than re-implementing the wire.
+library (the same one Teku uses), consumed as the `com.github.biafra23:discovery` Android fork
+(minSdk-29 patches; see `gradle/libs.versions.toml`). A port should use the `discv5` crate (Rust)
+or go-ethereum's v5 discovery (Go) rather than re-implementing the wire.
 
 Behavior the wrapper adds: build a `NodeRecord` signed with the node key, seed from
 `clDiscv5Bootnodes`, poll `streamLiveNodes()` on a 15 s timer, diff against a seen-set, convert

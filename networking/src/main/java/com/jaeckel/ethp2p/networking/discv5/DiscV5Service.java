@@ -22,7 +22,9 @@ import java.util.function.Consumer;
 /**
  * discv5 peer discovery service.
  *
- * <p>Thin wrapper around {@code io.consensys.protocols:discovery} that exposes
+ * <p>Thin wrapper around ConsenSys' discv5 library (consumed as the
+ * {@code com.github.biafra23:discovery} Android fork of
+ * {@code io.consensys.protocols:discovery} — see gradle/libs.versions.toml) that exposes
  * the same callback shape as {@link com.jaeckel.ethp2p.networking.discv4.DiscV4Service}:
  * the caller hands in a {@link Consumer<Enr>} and receives every newly-observed
  * ENR exactly once. The library itself is pull-based ({@link DiscoverySystem#streamLiveNodes()});
