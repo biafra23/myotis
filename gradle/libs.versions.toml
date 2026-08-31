@@ -131,6 +131,9 @@ jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   versi
 # (replaces the old hand-JNI). :android-app additionally pins the @aar variant so
 # the packaged natives come from JNA's Android artifact.
 jna                 = { module = "net.java.dev.jna:jna",                   version.ref = "jna" }
+# JitPack-served coordinates (this and kethereum below): the group must be
+# allowed by the JitPack content filter in settings.gradle.kts — a cold
+# resolve's "Could not find" error will not mention that filter.
 trueblocks-kotlin   = { module = "com.github.biafra23:trueblocks-kotlin", version.ref = "trueblocks-kotlin" }
 # trueblocks-kotlin's own dependency, made explicit so :tx-history can call
 # Bloom.isMemberBytes(Address) at compile time (the JitPack POM exposes kethereum
