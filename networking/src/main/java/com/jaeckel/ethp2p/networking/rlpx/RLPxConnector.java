@@ -463,7 +463,7 @@ public final class RLPxConnector implements AutoCloseable {
      * holds (junk never verifies); availability of the path is what such a peer
      * controls. Rotating on verification failure would need the trusted roots (or a
      * verify callback) at this layer — deferred with the peer-quality scoring
-     * follow-up (#359 point 3).
+     * follow-up (#400).
      */
     static <T> CompletableFuture<List<T>> rotate(
             String what, int expected,
