@@ -110,6 +110,7 @@ android {
         versionCode = 8
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -151,6 +152,44 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+    }
+
+    testOptions {
+        // No UI interactions in the smoke test, but system animations still cost
+        // main-thread time on a software-rendered emulator — keep them off.
+        animationsDisabled = true
+        // Gradle Managed Device pinned to minSdk (API 29) for NodeBootSmokeTest
+        // (androidTest — its KDoc carries the full why: real-ART boot coverage the
+        // static dex scan cannot give). Run it with
+        //   ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine
+        // (CI adds -Pandroid.testoptions.manageddevices.emulator.gpu=
+        // swiftshader_indirect for its GPU-less runners — see
+        // .github/workflows/android-apk.yml; without -PskipRustEngine the device
+        // also gets the Rust engine, which the toolchain gate then requires).
+        // "aosp", not "aosp-atd": the leaner ATD images only exist for API 30+.
+        // x86_64 hosts only — Google never published an API-29 arm64 emulator
+        // image, so an Apple-Silicon Mac can't run this device locally; the CI
+        // job is the enforcement point.
+        managedDevices {
+            localDevices {
+                create("api29") {
+                    device = "Pixel 2"
+                    apiLevel = 29
+                    systemImageSource = "aosp"
+                    // REQUIRED, not a preference: the APK always carries native
+                    // libs for exactly arm64-v8a + x86_64 (extractJnaAndroidNatives
+                    // packages libjnidispatch.so even under -PskipRustEngine), and
+                    // an APK with native libs installs only on a device offering a
+                    // matching ABI. Left false, AGP resolves this device to the
+                    // 32-BIT image (verified against AGP 8.7.3: aosp images get
+                    // x86_64 only for apiLevel 26 and 30 — a two-element set, not
+                    // a range — and everything else <= 30 falls through to x86),
+                    // and the install dies with INSTALL_FAILED_NO_MATCHING_ABIS
+                    // before any test runs.
+                    require64Bit = true
+                }
+            }
         }
     }
 
@@ -240,11 +279,18 @@ kotlin {
 // Java. That is what shipped in v0.1.3 and v0.1.4.
 
 dependencies {
-    testImplementation("junit:junit:4.13.2")
+    testImplementation(libs.junit4)
     // 2.1.5 is the first release whose config desugars Stream.toList() (via an
     // emulated Stream interface at minSdk ≤ 33) — earlier 2.1.x left it as a raw
     // API-34 call that crashes on Android 10-13 devices.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+
+    // On-device boot smoke test (the api29 managed device above). Test APK only.
+    androidTestImplementation(libs.junit4)
+    androidTestImplementation(libs.androidx.test.core)      // ActivityScenario / ApplicationProvider
+    androidTestImplementation(libs.androidx.test.runner)    // AndroidJUnitRunner (testInstrumentationRunner)
+    androidTestImplementation(libs.androidx.test.rules)     // ServiceTestRule
+    androidTestImplementation(libs.androidx.test.ext.junit) // AndroidJUnit4
 
     implementation(project(":core"))
     implementation(project(":networking"))

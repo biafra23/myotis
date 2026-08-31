@@ -155,6 +155,16 @@ androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling
 androidx-compose-material3        = { module = "androidx.compose.material3:material3" }
 # Java-only Worker (no -ktx needed): the daily beacon catch-up job while the node sleeps.
 androidx-work-runtime             = { module = "androidx.work:work-runtime", version = "2.9.1" }
+# Instrumented-test stack for :android-app's minSdk boot smoke test (androidTest
+# only — never in the APK). Versions from the same androidx.test release train.
+androidx-test-core                = { module = "androidx.test:core",       version = "1.6.1" }
+androidx-test-runner              = { module = "androidx.test:runner",     version = "1.6.2" }
+androidx-test-rules               = { module = "androidx.test:rules",      version = "1.6.1" }
+androidx-test-ext-junit           = { module = "androidx.test.ext:junit",  version = "1.2.1" }
+# JUnit 4 for :android-app's local AND instrumented tests (the JVM modules use
+# JUnit 5 via `junit` above; androidx.test is JUnit-4-based). One alias so the
+# two classpaths can't drift onto different JUnit 4 versions.
+junit4                            = { module = "junit:junit",              version = "4.13.2" }
 
 # JSON-RPC server (:jsonrpc-server) — all Android-safe (no java.net.http).
 ktor-server-core           = { module = "io.ktor:ktor-server-core",  version.ref = "ktor" }

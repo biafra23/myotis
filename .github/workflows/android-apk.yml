@@ -123,10 +123,16 @@ jobs:
       # Retry to ride out transient external-repo resolution blips. NOT --offline:
       # offline turns a single cache miss (e.g. a changed build file) into a hard
       # failure, which is what broke this job before.
-      - name: Build debug APK
+      #
+      # assembleDebugAndroidTest rides along so the boot smoke test's sources
+      # (androidTest) are compiled by a BLOCKING job: AGP wires androidTest into
+      # neither `assemble` nor `check`, and the emulator job below is
+      # continue-on-error — without this, a broken NodeBootSmokeTest.kt could sit
+      # green in CI indefinitely.
+      - name: Build debug APK (+ compile the androidTest APK)
         run: |
           for attempt in 1 2 3; do
-            ./gradlew :android-app:assembleDebug --stacktrace && exit 0
+            ./gradlew :android-app:assembleDebug :android-app:assembleDebugAndroidTest --stacktrace && exit 0
             echo "::warning::APK build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
             sleep 25
           done
@@ -185,6 +191,154 @@ jobs:
           # path must not wedge the release. (node-binding.yml has carried this
           # fix since it hit exactly that.)
           overwrite: true
+
+  # Boot the actual app on a minSdk (API 29) emulator. The static bytecode gate
+  # (scripts/check_apk_min_api.py — the build job above runs it) proves
+  # java.*/javax.* references resolve at API 29, but android.*
+  # framework APIs are out of any dex scan's reach (SDK_INT guards are invisible
+  # to it), api-versions.xml has gaps, and no scan proves the app actually
+  # BOOTS. This job launches MainActivity and runs NodeService through a full
+  # engine-stack start (networking + consensus init) on an API-29 AOSP image via
+  # the `api29` Gradle Managed Device (NodeBootSmokeTest), so a startup-path
+  # NoClassDefFoundError/NoSuchMethodError fails here instead of on a user's
+  # phone.
+  #
+  # -PskipRustEngine: runs on the Java engine. The minSdk-linkage risk this job
+  # hunts lives entirely in the JVM code (the Rust .so has no JDK/ART surface),
+  # it spares this job the whole Android Rust toolchain, and it is exactly the
+  # fallback an APK without the jniLibs uses at runtime. Known gap, accepted:
+  # the Rust engine's own on-device load path (JNA/UniFFI) is not exercised by
+  # any boot test yet.
+  boot-smoke-api29:
+    name: API-29 boot smoke (emulator)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Skip on release tags: nothing consumes this job's result there (release
+    # needs only build + version-guard), and the tagged commit already ran it on
+    # its way through main/PR.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # The in-test deadline only bounds the test body — NOT the system-image
+    # download, AVD creation, or an emulator/adb hang (the failure modes named
+    # below), which would otherwise run to GitHub's 6-hour default on a job
+    # whose failure nothing surfaces.
+    timeout-minutes: 45
+    # NON-BLOCKING for now, deliberately: this is the repo's first emulator job,
+    # and hosted-runner emulators are notoriously flaky (boot hangs, adb drops)
+    # even with KVM. Job-level continue-on-error semantics: a failure still
+    # shows as a red check on the PR, but the WORKFLOW run passes, so it gates
+    # nothing (do NOT add this job to required checks while this line is here —
+    # a required check blocks merge on red regardless of continue-on-error).
+    # Once it has proven stable for a few weeks, promote it to blocking by
+    # deleting this line. (No retry loop around gradle here, unlike the build
+    # job: a retry would also re-run a genuinely failing boot test into the
+    # job timeout.)
+    continue-on-error: true
+    steps:
+      # Shallow on purpose (no fetch-depth: 0): the build job needs full history
+      # for the version stamp; here the stamp is irrelevant, and :ui's version
+      # probe degrades to its fallback label instead of failing without it.
+      # (No `chmod +x gradlew` either — the executable bit is committed.)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The emulator needs hardware virtualization; ubuntu-latest runners expose
+      # /dev/kvm but root-only by default. This is the standard "enable KVM" udev
+      # rule from the android-emulator-runner docs.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # AGP's managed-device setup downloads the emulator + the API-29 system
+      # image (several hundred MB, a couple of minutes) into the runner's
+      # preinstalled SDK by itself — no sdkmanager steps needed, licenses are
+      # pre-accepted on the runner image. Follow-up once the job proves stable:
+      # cache the system image + AVD to shave those minutes. swiftshader_indirect:
+      # the runner has no GPU, so render in software (the documented GMD-on-CI
+      # setting).
+      # STEP-level continue-on-error, adjudicated by the next step — not
+      # success-blind: both of this job's first PR runs hit a known AGP/UTP
+      # results-TRANSPORT bug (issuetracker.google.com/issues/335857362) where
+      # the device-side test finishes and its verdict is written to disk, but
+      # UTP's gRPC stream back to Gradle dies ("SEVERE: recordTestResultEvent
+      # ... UNAVAILABLE: io exception" in utp.0.log) and Gradle fails the task
+      # with "Failed to receive the UTP test results" — a false red over a
+      # PASSED run. The verdict file UTP writes is the ground truth either way,
+      # so the next step reads THAT: genuine failures stay red (verdict FAILED,
+      # or no verdict written at all), and the transport bug alone becomes a
+      # loud warning on a green job.
+      - name: Run the boot smoke test on the API-29 managed device
+        id: gmd
+        continue-on-error: true
+        run: |
+          ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine \
+            -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect \
+            --stacktrace
+
+      - name: Adjudicate the device-side test verdict
+        run: |
+          set -eu
+          mapfile -t protos < <(find android-app/build/outputs/androidTest-results/managedDevice \
+            -name 'test-result.textproto' 2>/dev/null)
+          if [ "${#protos[@]}" -eq 0 ]; then
+            echo "::error::no test-result.textproto was written — the run produced no device-side verdict (infra/build failure; see the gradle step above)"
+            exit 1
+          fi
+          for p in "${protos[@]}"; do
+            if grep -qE 'test_status: (FAILED|ERROR|ABORTED|CANCELLED)' "$p"; then
+              echo "::error::device-side verdict is a failure in $p:"
+              grep -m1 -A12 'error_message' "$p" || true
+              exit 1
+            fi
+          done
+          # An empty or foreign suite must not pass as "our test was fine".
+          grep -q 'NodeBootSmokeTest' "${protos[@]}" \
+            || { echo "::error::NodeBootSmokeTest is missing from the device-side results"; exit 1; }
+          grep -q 'test_status: PASSED' "${protos[@]}" \
+            || { echo "::error::no PASSED verdict recorded"; exit 1; }
+          if [ "${{ steps.gmd.outcome }}" != "success" ]; then
+            echo "::warning title=UTP results transport failed::the gradle task failed only in the UTP results stream (known AGP/UTP gRPC bug, issue 335857362); the device-side verdict is PASSED"
+          fi
+          echo "device-side verdict: PASSED"
+
+      # Results + per-test logcat — the boot verdict/diagnostics live here when
+      # the test fails. Not on green runs: that bundle is dead weight.
+      # `|| cancelled()`: a job that hits timeout-minutes is CANCELLED, not
+      # failed, and failure() alone would skip this exact step on the hang
+      # scenario the timeout exists for — the run most in need of the partial
+      # UTP/emulator logs. (Superseded runs cancelled by concurrency also hit
+      # this; their partial upload is harmless.) if-no-files-found stays on the
+      # default `warn`: a failure that produced no results at all (died before
+      # the device) should say so, not vanish.
+      - name: Upload managed-device test results
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api29-boot-smoke-results-${{ github.sha }}
+          path: |
+            android-app/build/outputs/androidTest-results/managedDevice/
+            android-app/build/reports/androidTests/managedDevice/
+          retention-days: 14
+          # Same re-run rationale as the APK artifact above.
+          overwrite: true
+
+      # continue-on-error keeps the WORKFLOW green on a failure here; this
+      # annotation makes the red job hard to miss from the run summary too.
+      # `|| cancelled()` for the same timeout-cancellation reason as the upload.
+      - name: Surface the failure as an annotation
+        if: failure() || cancelled()
+        run: echo "::warning title=API-29 boot smoke did not pass::the boot smoke test failed, timed out, or was cancelled (non-blocking) — see the api29-boot-smoke-results artifact and this job's log"
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # — the asset name below comes from the tag, the versionName inside the apk

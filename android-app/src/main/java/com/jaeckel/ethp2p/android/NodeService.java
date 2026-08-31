@@ -95,6 +95,30 @@ public final class NodeService extends Service {
         return RUNNING.get();
     }
 
+    /** {@link #bootOutcome} value for a fully successful boot. */
+    public static final String BOOT_STARTED = "started";
+    /** Terminal verdict of each network's most recent boot attempt:
+     *  {@link #BOOT_STARTED} once {@code buildAndStart} ran the engine's whole start
+     *  sequence to completion, a failure description on a failed attempt, absent while
+     *  the current attempt hasn't recorded one (a deliberately bailed attempt — a
+     *  stop/disable raced the boot — leaves it absent). ChainStack.start() catches
+     *  {@code Throwable} internally (a linkage Error there returns {@code false}
+     *  instead of crashing the process), so without this record a boot failure is
+     *  observable only as "the handle never appears". Verdict lifecycle rides
+     *  {@link #bootLock}: cleared at the top of each attempt's locked boot region and
+     *  written terminally under the same hold, so attempts serialized by the lock
+     *  can't interleave their verdicts (a brief pre-lock window still shows the
+     *  previous attempt's verdict). STATIC like {@link #RUNNING}/{@link #ENGINE}:
+     *  per-network-stack state that outlives service instances. Consumed by the
+     *  API-29 boot smoke test (androidTest); available to the UI as well. */
+    private static final Map<String, String> BOOT_OUTCOMES = new ConcurrentHashMap<>();
+
+    /** The most recent boot attempt's terminal verdict for {@code network} — null
+     *  while no attempt has finished, {@link #BOOT_STARTED}, or a failure summary. */
+    public static String bootOutcome(String network) {
+        return BOOT_OUTCOMES.get(canonicalNetwork(network));
+    }
+
     // ----- Settings (SharedPreferences "ethp2p"), shared by the service + Compose UI -----
     private static final String PREFS_NAME = "ethp2p";
     private static final String K_NETWORK = "network";
@@ -1696,6 +1720,11 @@ public final class NodeService extends Service {
             // start() too, since start() blocks and the race window spans it. spawnBoot's worker fires
             // the service-stop check after every bail/return path.
             synchronized (bootLock(n)) {
+                // A new attempt voids the previous verdict — INSIDE the lock, so
+                // verdict transitions serialize with the attempts they describe
+                // (see the BOOT_OUTCOMES javadoc). The bail paths below record
+                // nothing: absent means "no verdict".
+                BOOT_OUTCOMES.remove(n);
                 if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; skipping");
                     forgetStack(n);
@@ -1710,6 +1739,7 @@ public final class NodeService extends Service {
                     LogBuffer.i(TAG, "[" + n + "] boot skipped: already hosted by the engine");
                     ChainHandle existing = ENGINE.get(n);
                     if (existing != null) handles.putIfAbsent(n, existing);
+                    BOOT_OUTCOMES.put(n, BOOT_STARTED); // a live stack is a started stack
                     return;
                 }
 
@@ -1785,6 +1815,10 @@ public final class NodeService extends Service {
 
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
+                    // ChainStack.start() caught the real cause (Throwable, stack
+                    // trace in its log line) and returned false; record the verdict.
+                    BOOT_OUTCOMES.put(n, "engine start() returned false — see the "
+                            + "\"stack failed to start\" log line for the cause");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
@@ -1800,6 +1834,7 @@ public final class NodeService extends Service {
                 // the raced-stop guard, so a condemned stack never pays for
                 // the index install / appender spin-up.
                 pushLogIndexConfig(n, handle);
+                BOOT_OUTCOMES.put(n, BOOT_STARTED);
             }
             updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
@@ -1814,6 +1849,17 @@ public final class NodeService extends Service {
             // bookkeeping from this attempt can remain).
             synchronized (bootLock(n)) {
                 ChainHandle current = handles.get(n);
+                // Failure verdict under the lock, and only while this attempt is
+                // still the one the network's state reflects: a racing NEWER attempt
+                // that already registered its own healthy handle owns the verdict —
+                // an unconditional put here would stamp a failure over a live stack.
+                // (current == created also covers the adopted-broken-handle edge:
+                // an "already hosted" adopter that raced this thrower stamped
+                // BOOT_STARTED on the handle we're about to tear down; this write,
+                // ordered after it by the lock, corrects the record.)
+                if (current == created || current == null) {
+                    BOOT_OUTCOMES.put(n, unwrap(e));
+                }
                 if (created != null ? current == created : current == null) {
                     forgetStack(n);
                     if (created != null && ENGINE.get(n) == created) {
