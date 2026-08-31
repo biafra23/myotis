@@ -202,6 +202,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
     interface Params : ValueSourceParameters {
         val command: ListProperty<String>
         val workingDir: Property<File>
+        val path: Property<String> // optional PATH override (see rustToolchainPath)
     }
 
     @get:Inject abstract val execOperations: ExecOperations
@@ -211,6 +212,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
         val result = execOperations.exec {
             commandLine(parameters.command.get())
             workingDir = parameters.workingDir.get()
+            parameters.path.orNull?.let { environment("PATH", it) }
             standardOutput = out
             errorOutput = ByteArrayOutputStream()
             isIgnoreExitValue = true
@@ -221,14 +223,54 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
     }
 }
 
+// GUI-launched IDEs inherit launchd's minimal PATH on macOS (no ~/.cargo/bin),
+// so a Rust toolchain that works from a terminal "vanishes" when the same build
+// runs inside Android Studio — requireAndroidRustEngine then fails claiming
+// cargo is missing. When the bare name is NOT on the daemon's PATH but the
+// standard rustup install dir ($CARGO_HOME/bin, default ~/.cargo/bin) has it,
+// every Rust probe and cargo* task runs with that dir prepended to PATH.
+// A PATH override — not absolute tool paths in each commandLine — so the fix
+// reaches the whole process tree: cargo's own rustc/rustup shims, `cargo ndk`
+// subcommand resolution, and the bare `cargo` call inside build-android.sh.
+// null when bare `cargo` already resolves (a terminal build: zero change) or
+// when the fallback dir has no cargo either (the toolchain is really missing).
+val isWindowsHost = System.getProperty("os.name").lowercase().contains("win")
+val rustToolBinDir: File? = run {
+    val exe = if (isWindowsHost) "cargo.exe" else "cargo"
+    val envPath = System.getenv("PATH") ?: ""
+    val onPath = envPath.split(File.pathSeparator).any { it.isNotEmpty() && File(it, exe).canExecute() }
+    if (onPath) return@run null
+    listOfNotNull(System.getenv("CARGO_HOME")?.let { File(it) }, File(System.getProperty("user.home"), ".cargo"))
+        .map { it.resolve("bin") }
+        .firstOrNull { it.resolve(exe).canExecute() }
+}
+val rustToolchainPath: String? = rustToolBinDir?.let {
+    "${it.absolutePath}${File.pathSeparator}${System.getenv("PATH") ?: ""}"
+}
+
+// The PATH override alone is not enough for direct invocations: Java resolves a
+// bare command name against the PARENT JVM's PATH, not the child's environment
+// map, so `commandLine("cargo", …)` would still miss the fallback dir. Every
+// direct cargo/rustup invocation therefore goes through this resolver; the PATH
+// override still matters for everything those processes spawn (cargo → rustc,
+// `cargo ndk` subcommand lookup, the bare `cargo` inside build-android.sh —
+// shells and cargo DO search the child PATH).
+fun rustTool(name: String): String {
+    val exe = if (isWindowsHost) "$name.exe" else name
+    return rustToolBinDir?.resolve(exe)?.takeIf { it.canExecute() }?.absolutePath ?: name
+}
+
 // Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
 // reports — probing the repo root would measure the rustup DEFAULT toolchain,
 // not the one the builds actually run. (If rustup has no stable installed,
 // the probe exits non-zero → "" → Rust is skipped, not downloaded.)
 fun probeTool(vararg cmd: String): String =
     providers.of(ToolProbe::class) {
-        parameters.command.set(cmd.toList())
+        // rustTool resolves the executable itself; the PATH override covers
+        // what it spawns (the cargo shim re-execs via rustup, for one).
+        parameters.command.set(listOf(rustTool(cmd.first())) + cmd.drop(1))
         parameters.workingDir.set(file("rust"))
+        rustToolchainPath?.let { parameters.path.set(it) }
     }.get()
 
 val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
@@ -327,9 +369,10 @@ tasks.register<Exec>("cargoBuildHost") {
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
     onlyIf { rustAvailable }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         buildList {
-            addAll(listOf("cargo", "build", "--release", "--workspace"))
+            addAll(listOf(rustTool("cargo"), "build", "--release", "--workspace"))
             // Enable Tor only on the engine crate (package/feature form — a bare
             // `--features tor` with `--workspace` would try every member).
             if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
@@ -358,8 +401,9 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     onlyIf { rustAvailable }
     dependsOn(tasks.named("cargoBuildHost"))
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        "cargo", "run", "--release", "-p", "uniffi-bindgen", "--",
+        rustTool("cargo"), "run", "--release", "-p", "uniffi-bindgen", "--",
         "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
         "--language", "kotlin", "--no-format",
         "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
@@ -377,7 +421,8 @@ val cargoTest = tasks.register<Exec>("cargoTest") {
     description = "cargo test --workspace (self-skips when cargo is missing)"
     onlyIf { rustAvailable }
     workingDir = file("rust")
-    commandLine("cargo", "test", "--workspace")
+    rustToolchainPath?.let { environment("PATH", it) }
+    commandLine(rustTool("cargo"), "test", "--workspace")
     // No declared outputs: cargo's own incrementalism makes a no-change rerun
     // cheap, and test verdicts aren't files Gradle could fingerprint.
 }
@@ -403,8 +448,9 @@ val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     description = "cargo check -p myotis-consensus -p myotis-core for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
     onlyIf { rustAvailable && wasmTargetInstalled && clangAvailable }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        "cargo", "check", "--target", "wasm32-unknown-unknown",
+        rustTool("cargo"), "check", "--target", "wasm32-unknown-unknown",
         "-p", "myotis-consensus", "-p", "myotis-core",
     )
     // No declared outputs, same rationale as cargoTest: cargo's own
@@ -442,6 +488,7 @@ tasks.register<Exec>("cargoNdkAndroid") {
     description = "Cross-compile the Android jniLibs (the Rust engine + native BLS) from source via rust/build-android.sh; skipped by -PskipRustEngine"
     onlyIf { androidRustToolchainReady && !skipRustEngine }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
     // through bash there (Git for Windows ships one alongside git itself).
@@ -593,13 +640,14 @@ fun registerCargoBuildIos(taskName: String, triple: String) =
         description = "cargo build --release -p myotis-engine for $triple (self-skips without cargo + the rustup target on macOS)"
         onlyIf { rustAvailable && isMacHost && triple in installedRustupTargets }
         workingDir = file("rust")
+        rustToolchainPath?.let { environment("PATH", it) }
         // `cargo rustc --crate-type staticlib` (not `cargo build`): only the .a is
         // consumed on iOS, and building the crate's cdylib type too would fail the
         // device link — rustc doesn't link compiler-rt builtins for iOS dylibs, so
         // blst's ___chkstk_darwin stays undefined there. In the staticlib the symbol
         // simply stays unresolved until the app link, where Xcode's clang provides it.
         commandLine(
-            "cargo", "rustc", "--release", "--target", triple, "-p", "myotis-engine",
+            rustTool("cargo"), "rustc", "--release", "--target", triple, "-p", "myotis-engine",
             "--crate-type", "staticlib",
         )
         inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
