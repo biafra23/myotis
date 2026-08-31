@@ -3,36 +3,53 @@
 
 The dex files in a built APK are the post-desugaring ground truth: everything
 D8 backports or desugar_jdk_libs rewrites is already gone, so any remaining
-reference to a java.* / javax.* method or field whose `since` in the SDK's
-api-versions.xml is above minSdk WILL throw NoSuchMethod/FieldError the first
-time it executes on a device running that API level (Android 10/11 never get
-ART module updates, so there is no backport safety net there).
+reference to a java.* / javax.* class, method, or field whose `since` in the
+SDK's api-versions.xml is above minSdk WILL throw NoClassDefFoundError /
+NoSuchMethod/FieldError the first time it executes on a device running that
+API level (Android 10/11 never get ART module updates, so there is no
+backport safety net there).
 
-Two failure modes source-level checks miss are covered here:
+Coverage that source-level checks miss:
   * calls that reach a JDK method through a THIRD-PARTY SUBCLASS — e.g.
     `snappyIn.readAllBytes()` where the receiver type is snappy's stream class:
     the dex owner is the subclass, so the checker walks the app's own class
     hierarchy (parsed from the same dexdump output) up into java.* and resolves
     the member there;
+  * CLASS-level references — extends/implements of a java.* type, and
+    checkcast/instanceof/const-class/new-instance type refs — which crash at
+    class load/use even when no individual member is new; a member ref's OWNER
+    class is checked too (a since-34 class can inherit a since-1 member);
   * everything in third-party bytecode, which no source lint ever sees.
 
 This is the enforcement for the "minSdk 29 JDK-API budget" rule in CLAUDE.md.
 Known third-party residue lives in the allowlist next to this script, each
-entry with its reviewed rationale; a first-party violation never belongs there.
+entry with its reviewed rationale. A first-party referrer (com/jaeckel/*,
+io/myotis/*) can NEVER be allowlisted: entries with such a prefix are refused,
+and a first-party violation fails the gate even when an entry would match it.
 
 android.* framework APIs are deliberately OUT of scope: those are routinely
 guarded with Build.VERSION.SDK_INT checks that a bytecode scan cannot see —
-Android lint's NewApi check owns that side. Note also that api-versions.xml
-has gaps (e.g. no entry at all for Files.readString) — a member this script
-cannot resolve is skipped, so the scan is sound only for APIs the database
-actually records.
+Android lint's NewApi check owns that side.
+
+Fail-closed design: a member this script cannot resolve in the database is
+skipped (api-versions.xml only records the platform's own surface), so the
+scan is sound only for APIs the database records — therefore the script
+REFUSES to run when the database cannot resolve a canary set of known
+post-29 APIs (an old SDK yields exit 2, never a vacuous OK), when dexdump
+fails or yields no refs, or when most of the allowlist goes stale at once
+(the signature of a dexdump output-format change).
 
 Usage:
   python3 scripts/check_apk_min_api.py --apk path/to/app.apk \
-      [--min-api 29] [--allowlist scripts/min-api-allowlist.txt] [--sdk <dir>]
+      [--min-api N] [--allowlist scripts/min-api-allowlist.txt] [--sdk <dir>]
 
-Needs: an Android SDK with at least one platforms/android-N/data/api-versions.xml
-and one build-tools/*/dexdump (any recent version of either).
+--min-api defaults to the APK's own manifest minSdkVersion (via aapt), so the
+gate follows android-app/build.gradle.kts automatically; pass it explicitly
+only to scan for a different floor. --allowlist must exist if passed
+(/dev/null works for regenerating candidates); --sdk must be a directory.
+
+Needs: an Android SDK with a platforms/android-N/data/api-versions.xml new
+enough to know the canary APIs below, and build-tools (dexdump + aapt).
 Exit codes: 0 clean, 1 new violations, 2 environment/usage error.
 """
 
@@ -45,10 +62,35 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from typing import NamedTuple
+
+# Referrers under these prefixes are first-party: never allowlistable.
+FIRST_PARTY_PREFIXES = ("com/jaeckel/", "io/myotis/")
+
+# The database must resolve these, or the whole scan would be vacuously green
+# exactly where it matters (each is an API this repo's budget polices; the
+# last has no entry before the android-36.1 database).
+DB_CANARIES = [
+    ("java/util/HexFormat", "of()Ljava/util/HexFormat;", "method"),
+    ("java/lang/Math", "unsignedMultiplyHigh(JJ)J", "method"),
+    ("java/util/concurrent/CompletableFuture",
+     "orTimeout(JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/CompletableFuture;", "method"),
+    ("java/nio/file/Files", "readString(Ljava/nio/file/Path;)Ljava/lang/String;", "method"),
+]
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(2)
 
 
 def find_sdk(explicit):
-    candidates = [explicit, os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")]
+    if explicit is not None:
+        if not os.path.isdir(explicit):
+            die(f"--sdk is not a directory: {explicit}")
+        return explicit
+    candidates = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")]
     lp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local.properties")
     if os.path.exists(lp):
         for line in open(lp):
@@ -57,7 +99,7 @@ def find_sdk(explicit):
     for c in candidates:
         if c and os.path.isdir(c):
             return c
-    sys.exit("error: Android SDK not found (pass --sdk or set ANDROID_HOME)")
+    die("Android SDK not found (pass --sdk or set ANDROID_HOME)")
 
 
 def newest(dirpath, pattern):
@@ -72,23 +114,48 @@ def newest(dirpath, pattern):
     return os.path.join(dirpath, best) if best else None
 
 
+def parse_level(s, default=None):
+    """api-versions levels are usually ints but minor releases exist ("36.1")."""
+    if s is None:
+        return default
+    return float(s) if "." in s else int(s)
+
+
+def fmt_level(lv):
+    return str(int(lv)) if float(lv).is_integer() else str(lv)
+
+
+class ApiClass(NamedTuple):
+    since: float
+    supers: list
+    methods: dict
+    fields: dict
+
+
 def load_api_versions(sdk):
-    plat = newest(os.path.join(sdk, "platforms"), r"android-\d+")
+    # android-36.1-style minor platforms sort AFTER their base release and are
+    # the ones that carry minor-release `since` values (e.g. Files.readString).
+    plat = newest(os.path.join(sdk, "platforms"), r"android-\d+(\.\d+)?")
     xml = plat and os.path.join(plat, "data", "api-versions.xml")
     if not xml or not os.path.exists(xml):
-        sys.exit("error: no platforms/android-N/data/api-versions.xml in SDK")
+        die("no platforms/android-N/data/api-versions.xml in SDK")
     classes = {}
     for c in ET.parse(xml).getroot().iter("class"):
-        since = int(c.get("since", "1"))
+        since = parse_level(c.get("since"), 1)
         supers, methods, fields = [], {}, {}
         for ch in c:
             if ch.tag in ("extends", "implements"):
                 supers.append(ch.get("name"))
             elif ch.tag == "method":
-                methods[ch.get("name")] = int(ch.get("since", str(since)))
+                methods[ch.get("name")] = parse_level(ch.get("since"), since)
             elif ch.tag == "field":
-                fields[ch.get("name")] = int(ch.get("since", str(since)))
-        classes[c.get("name")] = (since, supers, methods, fields)
+                fields[ch.get("name")] = parse_level(ch.get("since"), since)
+        classes[c.get("name")] = ApiClass(since, supers, methods, fields)
+    for owner, member, kind in DB_CANARIES:
+        if resolve_api(classes, owner, member, kind == "field") is None:
+            die(f"api-versions.xml at {xml} cannot resolve {owner}#{member} — "
+                f"the SDK's platform database is too old for this gate; install "
+                f"a current platforms/android-N (see DB_CANARIES in this script)")
     return classes
 
 
@@ -98,31 +165,63 @@ IFACE_RE = re.compile(r"^\s+#\d+\s+:\s+'L([\w/$\-]+);'")
 DEF_NAME_RE = re.compile(r"^\s+name\s+:\s+'([^']+)'")
 DEF_TYPE_RE = re.compile(r"^\s+type\s+:\s+'([^']+)'")
 MEMBER_RE = re.compile(r" L([\w/$\-]+);\.([\w$<>-]+):(\S+?)(?:;)?\s*//\s*(method|field)@")
+TYPE_RE = re.compile(r" \[*L([\w/$\-]+);\s*//\s*type@")
 
 
 class DexModel:
     def __init__(self):
         self.supers = {}          # class -> [superclass + interfaces]
-        self.defined = defaultdict(set)  # class -> {"name:type", ...}
-        self.refs = set()         # (referrer, owner, member, kind)
+        self.defined = defaultdict(set)   # class -> {"name:type", ...}
+        self.defined_names = defaultdict(set)  # class -> {field/method name, ...}
+        self.refs = set()         # (referrer, owner, member, kind); kind "class" => member ""
+
+    def merge(self, other):
+        self.supers.update(other.supers)
+        for k, v in other.defined.items():
+            self.defined[k] |= v
+        for k, v in other.defined_names.items():
+            self.defined_names[k] |= v
+        self.refs |= other.refs
 
 
-def parse_dexdump(dexdump, dex_path, model):
+def parse_dexdump(dexdump, dex_path):
+    model = DexModel()
     proc = subprocess.Popen([dexdump, "-d", dex_path], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, errors="replace")
+                            stderr=subprocess.PIPE, text=True, errors="replace")
     cur = "?"
     in_ifaces = False
     pending_name = None
     for line in proc.stdout:
-        m = CLASS_RE.search(line)
-        if m:
-            cur, in_ifaces, pending_name = m.group(1), False, None
-            model.supers.setdefault(cur, [])
-            continue
-        m = SUPER_RE.search(line)
-        if m:
-            model.supers[cur] = [m.group(1)] + model.supers.get(cur, [])
-            continue
+        # Hot path first: the overwhelming majority of lines are instructions,
+        # and only member/type refs among them matter.
+        if "//" in line and " L" in line:
+            m = MEMBER_RE.search(line)
+            if m:
+                owner, name, desc, kind = m.groups()
+                if kind == "method":
+                    # dexdump prints `.name:(args)ret // method@…`; the regex may
+                    # have eaten a trailing ';' of an object(-array) return type.
+                    ret = desc.split(")")[-1]
+                    member = name + desc + (";" if ret.lstrip("[").startswith("L") else "")
+                else:
+                    member = name
+                model.refs.add((cur, owner, member, kind))
+                continue
+            m = TYPE_RE.search(line)
+            if m:
+                model.refs.add((cur, m.group(1), "", "class"))
+                continue
+        if "Class descriptor" in line:
+            m = CLASS_RE.search(line)
+            if m:
+                cur, in_ifaces, pending_name = m.group(1), False, None
+                model.supers.setdefault(cur, [])
+                continue
+        if "Superclass" in line:
+            m = SUPER_RE.search(line)
+            if m:
+                model.supers[cur] = [m.group(1)] + model.supers.get(cur, [])
+                continue
         if "Interfaces" in line and "-" in line:
             in_ifaces = True
             continue
@@ -139,22 +238,20 @@ def parse_dexdump(dexdump, dex_path, model):
         m = DEF_TYPE_RE.match(line)
         if m and pending_name is not None:
             model.defined[cur].add(pending_name + ":" + m.group(1))
+            model.defined_names[cur].add(pending_name)
             pending_name = None
             continue
-        if " L" not in line or "//" not in line:
-            continue
-        m = MEMBER_RE.search(line)
-        if m:
-            owner, name, desc, kind = m.groups()
-            if kind == "method":
-                # dexdump prints `.name:(args)ret // method@…`; the regex may have
-                # eaten a trailing ';' of an object(-array) return type — restore it.
-                ret = desc.split(")")[-1]
-                member = name + desc + (";" if ret.lstrip("[").startswith("L") else "")
-            else:
-                member = name
-            model.refs.add((cur, owner, member, kind))
-    proc.wait()
+    err = proc.stderr.read()
+    if proc.wait() != 0:
+        # RuntimeError, not die(): this runs in a pool worker, and SystemExit
+        # does not cross the process boundary cleanly — main() converts it.
+        raise RuntimeError(
+            f"dexdump failed on {os.path.basename(dex_path)}: "
+            f"{err.strip().splitlines()[-1] if err.strip() else 'exit ' + str(proc.returncode)}")
+    # No per-dex minimum-yield check: a small trailing multidex file can
+    # legitimately parse to almost nothing. Vacuity is judged on the MERGED
+    # model in main() (plus the mass-stale-allowlist refusal).
+    return model
 
 
 def resolve_api(classes, owner, member, is_field):
@@ -168,25 +265,25 @@ def resolve_api(classes, owner, member, is_field):
         info = classes.get(cn)
         if not info:
             continue
-        s = (info[3] if is_field else info[2]).get(member)
+        s = (info.fields if is_field else info.methods).get(member)
         if s is not None:
             best = s if best is None else min(best, s)
-        stack.extend(info[1])
+        stack.extend(info.supers)
     return best
 
 
-def member_defined(model, cn, member, is_method):
+def member_defined(model, cn, member, sig, is_method):
     if is_method:
-        sig = member.split("(")[0] + ":(" + member.split("(", 1)[1]
         return sig in model.defined.get(cn, ())
-    return any(e.startswith(member + ":") for e in model.defined.get(cn, ()))
+    return member in model.defined_names.get(cn, ())
 
 
 def java_ancestors(model, owner, member, kind):
     """For a non-java owner: java/javax ancestors reachable WITHOUT passing a
     class that defines the member itself (an in-app definition handles the call)."""
     is_method = kind == "method"
-    if member_defined(model, owner, member, is_method):
+    sig = member.replace("(", ":(", 1) if is_method else None
+    if member_defined(model, owner, member, sig, is_method):
         return []
     out, stack, seen = [], list(model.supers.get(owner, [])), {owner}
     while stack:
@@ -197,30 +294,61 @@ def java_ancestors(model, owner, member, kind):
         if cn.startswith("java/") or cn.startswith("javax/"):
             out.append(cn)
             continue
-        if member_defined(model, cn, member, is_method):
+        if member_defined(model, cn, member, sig, is_method):
             continue  # overridden inside the app — the call resolves there
         stack.extend(model.supers.get(cn, []))
     return out
 
 
 def load_allowlist(path):
+    if not path:
+        return []
+    if not os.path.exists(path):
+        die(f"--allowlist file does not exist: {path} (use /dev/null to run bare)")
     entries = []
-    if path and os.path.exists(path):
-        for raw in open(path):
-            # Full-line comments only: targets themselves contain '#'
-            # (owner#member), so inline comments are not supported.
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            prefix, target = line.split(None, 1)
-            entries.append((prefix, target.strip()))
+    for lineno, raw in enumerate(open(path), 1):
+        # Full-line comments only: targets themselves contain '#'
+        # (owner#member), so inline comments are not supported.
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            die(f"malformed allowlist line {lineno} (want '<referrer-prefix> "
+                f"<owner#member>'): {line!r}")
+        prefix, target = parts[0], parts[1].strip()
+        # Historical entries carried a ' (inherited from X)' suffix; the named
+        # ancestor is a traversal accident of the toolchain, so matching
+        # ignores it (it still appears in failure output as a diagnostic).
+        target = target.split(" (inherited from ", 1)[0]
+        if prefix.startswith(FIRST_PARTY_PREFIXES):
+            die(f"allowlist line {lineno} has a FIRST-PARTY prefix ({prefix}) — "
+                f"first-party violations must be fixed, never allowlisted")
+        entries.append((prefix, target))
     return entries
+
+
+def apk_min_sdk(aapt, apk):
+    if not aapt or not os.path.exists(aapt):
+        die("no build-tools/*/aapt in SDK (needed to read the APK's minSdkVersion; "
+            "or pass --min-api explicitly)")
+    out = subprocess.run([aapt, "dump", "badging", apk], capture_output=True, text=True)
+    m = re.search(r"sdkVersion:'(\d+)'", out.stdout)
+    if out.returncode != 0 or not m:
+        die(f"could not read minSdkVersion from {apk} via aapt "
+            f"(pass --min-api explicitly): {out.stderr.strip()[:200]}")
+    return int(m.group(1))
+
+
+def _parse_one(dexdump_and_path):
+    return parse_dexdump(*dexdump_and_path)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apk", required=True)
-    ap.add_argument("--min-api", type=int, default=29)
+    ap.add_argument("--min-api", type=int, default=None,
+                    help="default: the APK manifest's own minSdkVersion")
     ap.add_argument("--allowlist", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                         "min-api-allowlist.txt"))
     ap.add_argument("--sdk")
@@ -230,62 +358,123 @@ def main():
     bt = newest(os.path.join(sdk, "build-tools"), r"\d+\.\d+\.\d+(-rc\d+)?")
     dexdump = bt and os.path.join(bt, "dexdump")
     if not dexdump or not os.path.exists(dexdump):
-        sys.exit("error: no build-tools/*/dexdump in SDK")
+        die("no build-tools/*/dexdump in SDK")
     classes = load_api_versions(sdk)
     allow = load_allowlist(args.allowlist)
+    min_api = args.min_api if args.min_api is not None \
+        else apk_min_sdk(os.path.join(bt, "aapt"), args.apk)
 
     model = DexModel()
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(args.apk) as z:
             dexes = [n for n in z.namelist() if re.fullmatch(r"classes\d*\.dex", n)]
             if not dexes:
-                sys.exit(f"error: no classes*.dex in {args.apk}")
-            for n in dexes:
-                z.extract(n, tmp)
-                parse_dexdump(dexdump, os.path.join(tmp, n), model)
+                die(f"no classes*.dex in {args.apk}")
+            paths = [z.extract(n, tmp) for n in dexes]
+            # Dex files are independent (multidex partitions classes), so
+            # disassembly — the dominant cost — parallelizes cleanly.
+            try:
+                with ProcessPoolExecutor() as pool:
+                    for part in pool.map(_parse_one, [(dexdump, p) for p in paths]):
+                        model.merge(part)
+            except RuntimeError as e:
+                die(str(e))
+    if not model.refs or not model.supers:
+        die("dexdump produced no usable output for any dex in the APK — "
+            "output format drift? (the gate refuses to pass vacuously)")
+
+    def class_since(cn):
+        info = classes.get(cn)
+        return info.since if info else None
 
     violations = {}
+
+    def record(referrer, target, since):
+        violations[(referrer, target)] = max(since, violations.get((referrer, target), 0))
+
+    # Class-level: extends/implements of java.* types crash at class load.
+    for cls, supers in model.supers.items():
+        for sup in supers:
+            if sup.startswith(("java/", "javax/")):
+                s = class_since(sup)
+                if s is not None and s > min_api:
+                    record(cls, f"{sup}#<class>", s)
+
+    resolve_cache = {}
+    anc_cache = {}
     for referrer, owner, member, kind in model.refs:
+        if kind == "class":
+            if owner.startswith(("java/", "javax/")):
+                s = class_since(owner)
+                if s is not None and s > min_api:
+                    record(referrer, f"{owner}#<class>", s)
+            continue
         is_field = kind == "field"
-        if owner.startswith("java/") or owner.startswith("javax/"):
-            since = resolve_api(classes, owner, member, is_field)
-            if since is not None and since > args.min_api:
-                violations[(referrer, f"{owner}#{member}")] = since
+        if owner.startswith(("java/", "javax/")):
+            key = (owner, member, kind)
+            if key not in resolve_cache:
+                since = resolve_api(classes, owner, member, is_field)
+                # Loading the owner class is a precondition of any member
+                # access: a new class's inherited old member still crashes.
+                cs = class_since(owner)
+                if cs is not None and cs > min_api:
+                    since = max(since or 0, cs)
+                resolve_cache[key] = since
+            since = resolve_cache[key]
+            if since is not None and since > min_api:
+                record(referrer, f"{owner}#{member}", since)
         else:
             # A subclass-owned ref may still bind to an inherited JDK member.
-            for anc in java_ancestors(model, owner, member, kind):
-                since = resolve_api(classes, anc, member, is_field)
-                if since is not None and since > args.min_api:
-                    violations[(referrer, f"{owner}#{member} (inherited from {anc})")] = since
-                    break
+            key = (owner, member, kind)
+            if key not in anc_cache:
+                hit = None
+                for anc in java_ancestors(model, owner, member, kind):
+                    since = resolve_api(classes, anc, member, is_field)
+                    if since is not None and since > min_api:
+                        hit = (anc, since)
+                        break
+                anc_cache[key] = hit
+            if anc_cache[key]:
+                anc, since = anc_cache[key]
+                record(referrer, f"{owner}#{member} (inherited from {anc})", since)
+
+    def match_key(target):
+        return target.split(" (inherited from ", 1)[0]
 
     used_allow = set()
     new = defaultdict(list)
     for (ref, target), since in sorted(violations.items()):
-        for i, (prefix, atarget) in enumerate(allow):
-            if ref.startswith(prefix) and target == atarget:
-                used_allow.add(i)
-                break
+        if not ref.startswith(FIRST_PARTY_PREFIXES):
+            for i, (prefix, atarget) in enumerate(allow):
+                if ref.startswith(prefix) and match_key(target) == atarget:
+                    used_allow.add(i)
+                    break
+            else:
+                new[target, since].append(ref)
         else:
             new[target, since].append(ref)
 
-    for i, (prefix, target) in enumerate(allow):
-        if i not in used_allow:
-            print(f"note: stale allowlist entry (no longer referenced): {prefix} {target}")
+    stale = [i for i in range(len(allow)) if i not in used_allow]
+    for i in stale:
+        print(f"note: stale allowlist entry (no longer referenced): {allow[i][0]} {allow[i][1]}")
+    if allow and len(stale) > len(allow) // 2:
+        die(f"{len(stale)} of {len(allow)} allowlist entries are stale at once — "
+            f"that is the signature of a dexdump/api-versions format change, not "
+            f"of real cleanups; refusing to trust this scan")
 
     if new:
-        print(f"\nFAIL: references to java/javax APIs above API {args.min_api} "
+        print(f"\nFAIL: references to java/javax APIs above API {min_api} "
               f"that neither D8 backports nor desugar_jdk_libs cover:\n")
         for (target, since), refs in sorted(new.items()):
-            print(f"  API {since}: {target}")
-            for ref in sorted(set(refs)):
+            print(f"  API {fmt_level(since)}: {target}")
+            for ref in sorted(refs):
                 print(f"      referenced from {ref}")
         print(f"\nThese crash at runtime on devices below that API level (minSdk is "
-              f"{args.min_api}). Fix the call (see the minSdk API budget in CLAUDE.md "
+              f"{min_api}). Fix the call (see the minSdk API budget in CLAUDE.md "
               f"— core Futures/Hex/BigIntegers, Paths.get, manual stream drains), or, "
               f"for a reviewed third-party case, add an entry to {args.allowlist}.")
         sys.exit(1)
-    print(f"OK: no unexpected java/javax references above API {args.min_api} "
+    print(f"OK: no unexpected java/javax references above API {min_api} "
           f"({len(violations)} allowlisted third-party refs)")
 
 

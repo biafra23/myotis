@@ -95,4 +95,14 @@ class FuturesTest {
         ExecutionException ex = assertThrows(ExecutionException.class, out::get);
         assertInstanceOf(IllegalArgumentException.class, ex.getCause());
     }
+
+    @Test
+    void exceptionallyComposeNullFnThrowsSynchronouslyLikeTheJdk() {
+        // The JDK null-checks fn up front — even when the future has already
+        // succeeded and fn would never run. A shim that skipped the check would
+        // let the same code behave differently on JVM hosts vs Android.
+        assertThrows(NullPointerException.class,
+                () -> Futures.exceptionallyCompose(
+                        CompletableFuture.completedFuture("ok"), null));
+    }
 }

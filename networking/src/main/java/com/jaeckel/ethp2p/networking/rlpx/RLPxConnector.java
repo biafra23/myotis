@@ -328,7 +328,7 @@ public final class RLPxConnector implements AutoCloseable {
                 fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount)),
                 ex -> {
                     log.warn("[rlpx] Batched request failed on peer {}: {}, trying next",
-                            handler.getRemoteAddress(), ex.getMessage());
+                            handler.getRemoteAddress(), failureKind(ex));
                     return tryBatchedPeer(peers, peerIndex + 1, startBlock, totalCount);
                 });
     }
@@ -408,6 +408,13 @@ public final class RLPxConnector implements AutoCloseable {
     public CompletableFuture<List<List<Bytes>>> requestReceipts(Bytes32... hashes) {
         return rotateRequest("GetReceipts(" + hashes.length + ")", hashes.length,
                 h -> h.requestReceiptsAsync(hashes));
+    }
+
+    /** Log-friendly failure description: a bare {@code TimeoutException} (the
+     *  shape {@code Futures.orTimeout} completes with) has a null message, so
+     *  fall back to the exception itself rather than logging "null". */
+    private static Object failureKind(Throwable ex) {
+        return ex.getMessage() != null ? ex.getMessage() : ex;
     }
 
     /** Build a per-peer attempt supplier list from the current READY peers (capped
@@ -574,7 +581,7 @@ public final class RLPxConnector implements AutoCloseable {
             address.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
         return Futures.exceptionallyCompose(future, ex -> {
             log.warn("[rlpx] Snap request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
+                handler.getRemoteAddress(), failureKind(ex));
             // Don't permanently mark as failed — disconnects and timeouts are usually transient
             return trySnapPeer(address, stateRoot, peers, index + 1);
         });
@@ -631,7 +638,7 @@ public final class RLPxConnector implements AutoCloseable {
         return future.handle((result, ex) -> {
             if (ex != null) {
                 log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
-                    handler.getRemoteAddress(), ex.getMessage());
+                    handler.getRemoteAddress(), failureKind(ex));
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
             if (result.slots().isEmpty() && result.proof().isEmpty()) {

@@ -1036,6 +1036,51 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         return future;
     }
 
+    /** In-method deadline for header requests whose callers wait externally
+     *  ({@code fetchBatch}'s 10 s {@code Futures.orTimeout}, the query paths'
+     *  {@code .get(30 s)}). A raw {@code .get} NEVER completes the future, so
+     *  without an in-method deadline a silent peer would strand the tracking
+     *  entries for the connection lifetime; set ABOVE the longest caller-side
+     *  wait so no caller ever observes this timer instead of its own. */
+    static final long HEADER_REQUEST_DEADLINE_MS = 35_000;
+
+    /** How long a timed-out header request's spec stays admissible for a LATE
+     *  response. The spec in {@code pendingHeaderReqs} is what lets
+     *  {@code handleBlockHeaders} tell a slow-but-solicited response from an
+     *  unsolicited one (the window-poisoning guard): dropping it exactly at
+     *  the timeout would silence the serve-cache/chainHead side channel on
+     *  high-RTT links where probes routinely answer after their deadline. */
+    static final long LATE_HEADER_ADMISSION_GRACE_MS = 30_000;
+
+    /** Register a header request in BOTH tracking maps and arm its whole
+     *  lifecycle. {@code pendingRequests} is dropped on ANY completion — the
+     *  response path, a caller's external {@code Futures.orTimeout} (which
+     *  completes this same future), or the in-method {@code deadlineMs}.
+     *  {@code pendingHeaderReqs} additionally survives an exceptional
+     *  completion by {@link #LATE_HEADER_ADMISSION_GRACE_MS} so a late
+     *  response is still admitted into the serve caches, then is dropped.
+     *  The two maps are parallel: register and clean them ONLY through here —
+     *  hand-copied partial cleanups are how both past leaks happened. */
+    private CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> trackHeaderRequest(
+            ChannelHandlerContext ctx, long reqId, HeaderReq spec, long deadlineMs) {
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
+        pendingRequests.put(reqId, future);
+        pendingHeaderReqs.put(reqId, spec);
+        Futures.orTimeout(future, deadlineMs, TimeUnit.MILLISECONDS)
+            .whenComplete((r, ex) -> {
+                pendingRequests.remove(reqId);
+                if (ex == null) {
+                    // Response path already consumed the spec (handleBlockHeaders
+                    // removes it before completing the future); belt-and-braces.
+                    pendingHeaderReqs.remove(reqId);
+                } else {
+                    ctx.executor().schedule(() -> pendingHeaderReqs.remove(reqId),
+                        LATE_HEADER_ADMISSION_GRACE_MS, TimeUnit.MILLISECONDS);
+                }
+            });
+        return future;
+    }
+
     /**
      * Request block headers and return a future that completes when the response arrives.
      * Uses the stored ChannelHandlerContext from the READY state.
@@ -1047,10 +1092,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
 
-        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
         long reqId = requestId.getAndIncrement();
-        pendingRequests.put(reqId, future);
-        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byNumber(blockNumber, count),
+                HEADER_REQUEST_DEADLINE_MS);
         log.debug("[eth] GetBlockHeaders (async) block={} count={} reqId={}", blockNumber, count, reqId);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
@@ -1084,15 +1129,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 new IllegalStateException("No best block hash from peer"));
         }
         long reqId = requestId.getAndIncrement();
-        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
-        pendingRequests.put(reqId, headerFut);
-        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), 5_000);
         byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.debug("[eth] GetBlockHeaders (fresh head, hash={}) reqId={}",
             hash.toShortHexString(), reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
-        return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
-            .whenComplete((r, ex) -> { pendingRequests.remove(reqId); pendingHeaderReqs.remove(reqId); })
+        return headerFut
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
                     throw new RuntimeException("Peer returned no header for its own best hash");
@@ -1128,15 +1171,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 new IllegalStateException("EthHandler not READY"));
         }
         long reqId = requestId.getAndIncrement();
-        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
-        pendingRequests.put(reqId, headerFut);
-        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(fromNumber, window));
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byNumber(fromNumber, window), 5_000);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, fromNumber, window, 0, false);
         log.debug("[eth] GetBlockHeaders (live head probe from #{} window={}) reqId={}",
             fromNumber, window, reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
-        return Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS)
-            .whenComplete((r, ex) -> { pendingRequests.remove(reqId); pendingHeaderReqs.remove(reqId); })
+        return headerFut
             .thenApply(headers -> {
                 if (headers.isEmpty()) {
                     throw new RuntimeException(
@@ -1278,8 +1319,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
         // Always fetch a fresh header from this peer to get a non-pruned state root
         CompletableFuture<AccountRangeMessage.DecodeResult> result = new CompletableFuture<>();
-        long reqId = requestId.getAndIncrement();
-        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
             // Guard BEFORE registering the request: an early return here used to
@@ -1287,14 +1326,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
-        pendingRequests.put(reqId, headerFut);
-        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
+        long reqId = requestId.getAndIncrement();
+        // 5 s deadline: if this peer doesn't respond, fail fast so RLPxConnector tries the next
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), 5_000);
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header (hash={}) from peer {} before snap query",
             hash.toShortHexString(), remoteAddress);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
-        // 5-second timeout: if this peer doesn't respond, fail fast so RLPxConnector tries the next
-        Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS).thenAccept(headers -> {
+        headerFut.thenAccept(headers -> {
             if (headers.isEmpty()) {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
@@ -1322,8 +1362,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 });
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed: {}", remoteAddress, ex.getMessage());
-            pendingRequests.remove(reqId); // clean up (both maps — a timeout never reaches
-            pendingHeaderReqs.remove(reqId); // the response-side removal in handleBlockHeaders)
             result.completeExceptionally(ex);
             return null;
         });
@@ -1394,21 +1432,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
         // Fetch fresh header for non-pruned state root
         CompletableFuture<StorageRangesMessage.DecodeResult> result = new CompletableFuture<>();
-        long reqId = requestId.getAndIncrement();
-        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
         org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
         if (hash == null) {
             // Guard BEFORE registering the request — same leak shape as the account path.
             return Futures.failedFuture(
                 new IllegalStateException("No best block hash from peer"));
         }
-        pendingRequests.put(reqId, headerFut);
-        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), 5_000);
         byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         log.info("[snap] Fetching fresh header for storage query from peer {}", remoteAddress);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
 
-        Futures.orTimeout(headerFut, 5, TimeUnit.SECONDS).thenAccept(headers -> {
+        headerFut.thenAccept(headers -> {
             if (headers.isEmpty()) {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
@@ -1433,8 +1470,6 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 });
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed for storage query: {}", remoteAddress, ex.getMessage());
-            pendingRequests.remove(reqId);
-            pendingHeaderReqs.remove(reqId);
             result.completeExceptionally(ex);
             return null;
         });

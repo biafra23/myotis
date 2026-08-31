@@ -160,17 +160,15 @@ jobs:
             echo "  ok: $abi has both libmyotis_engine.so and libjnidispatch.so"
           done <<< "$engines"
 
-      # minSdk 29 JDK-API gate: scan the built APK's dex — the post-desugaring
-      # ground truth — for java.*/javax.* references above API 29 that neither
-      # D8 backports nor desugar_jdk_libs cover. Each one is a NoSuchMethodError
-      # waiting on the Android 10/11 devices the manifest claims to support
-      # (they never get ART module backports). The scan also resolves calls that
-      # reach JDK methods through third-party subclasses, which source-level
-      # lint misses. Reviewed third-party residue lives in
-      # scripts/min-api-allowlist.txt; a first-party hit fails the build.
-      # See CLAUDE.md's "minSdk 29 JDK-API budget".
-      - name: Verify minSdk 29 JDK-API compatibility
+      # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
+      # budget"; the script's docstring is the full story. The platform install
+      # feeds its api-versions canary: pre-36.1 databases don't record every
+      # policed API (Files.readString first appears in the 36.1 database), and
+      # the script refuses to scan against a database that old (exit 2).
+      - name: Verify minSdk JDK-API compatibility
         run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36.1" \
+            || echo "::warning::sdkmanager could not install platforms;android-36.1 — the gate's own database canary will decide"
           apk=$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)
           python3 scripts/check_apk_min_api.py --apk "$apk"
 

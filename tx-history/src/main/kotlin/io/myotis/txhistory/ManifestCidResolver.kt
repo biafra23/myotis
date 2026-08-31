@@ -105,12 +105,16 @@ class ManifestCidResolver(
         return if (v in 0..Int.MAX_VALUE) v.toInt() else null
     }
 
-    // Files.readAllBytes/write, not readString/writeString: the String variants are
-    // Android API 33 and neither desugar_jdk_libs nor D8 backports cover them —
-    // minSdk is 29 (same constraint NodeKey.java documents).
+    // Files.readAllBytes + a strict decoder, not readString (API 33; see CLAUDE.md's
+    // minSdk budget). The explicit CharsetDecoder matters: readString REPORTED
+    // malformed UTF-8 (throw -> the catch below -> cache miss -> self-healing
+    // refetch), while the String(bytes) constructor silently substitutes U+FFFD —
+    // which would let a byte-corrupted cache file pass the shape gate as a
+    // mojibake CID and poison lookups for the whole cache TTL.
     private fun readCache(): Pair<Long, String>? = try {
         if (!Files.exists(cacheFile)) null
-        else String(Files.readAllBytes(cacheFile), StandardCharsets.UTF_8)
+        else StandardCharsets.UTF_8.newDecoder()
+            .decode(java.nio.ByteBuffer.wrap(Files.readAllBytes(cacheFile))).toString()
             .trim().split('\t').takeIf { it.size == 2 }
             ?.let { (ts, cid) -> ts.toLongOrNull()?.let { it to cid } }
     } catch (e: Exception) {

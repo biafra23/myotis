@@ -22,6 +22,9 @@ j$/ java/util/concurrent/Flow$Subscriber#onNext(Ljava/lang/Object;)V
 j$/ java/util/concurrent/Flow$Subscriber#onSubscribe(Ljava/util/concurrent/Flow$Subscription;)V
 j$/ java/util/concurrent/Flow$Subscription#cancel()V
 j$/ java/util/concurrent/Flow$Subscription#request(J)V
+j$/ java/util/concurrent/Flow$Publisher#<class>
+j$/ java/util/concurrent/Flow$Subscriber#<class>
+j$/ java/util/concurrent/Flow$Subscription#<class>
 
 # (ConsenSys discv5: no entries — :networking consumes it as the
 # biafra23/discovery Android fork since #397, which patched its post-29 JDK
@@ -35,8 +38,8 @@ io/libp2p/ java/util/concurrent/CompletableFuture#orTimeout(JLjava/util/concurre
 
 # Besu fork + upstream besu jars. UInt256 (unsignedMultiplyHigh, API 35!) and
 # the Eq/Shift256/Exp operations are the EVM interpreter's word arithmetic —
-# [LIVE] for eth_call/ENS on Android 10/11 without ART backports; tracked for
-# the next biafra23/besu fork rebase (<ver>-android.N). Era1Type,
+# [LIVE] for eth_call/ENS on Android 10/11 without ART backports; tracked by
+# issue #402 for the next biafra23/besu fork rebase (<ver>-android.N). Era1Type,
 # RollingFileWriter, LogsBloomFilter.Builder, Merkleizer, PrintWriter/
 # BufferedInputStream uses and the xerial-snappy read are era1/util paths the
 # wallet never executes. [dormant]
@@ -58,7 +61,7 @@ org/hyperledger/ java/util/HexFormat#formatHex([B)Ljava/lang/String;
 org/hyperledger/ java/util/HexFormat#of()Ljava/util/HexFormat;
 org/hyperledger/ java/util/List#getFirst()Ljava/lang/Object;
 org/hyperledger/ java/util/List#removeLast()Ljava/lang/Object;
-org/hyperledger/ org/xerial/snappy/SnappyFramedInputStream#readAllBytes()[B (inherited from java/io/InputStream)
+org/hyperledger/ org/xerial/snappy/SnappyFramedInputStream#readAllBytes()[B
 
 # Caffeine (Besu transitive). The fork constructs no Caffeine cache on the EVM
 # path (see android-app/build.gradle.kts), and Caffeine itself probes VarHandle
@@ -79,21 +82,31 @@ com/github/benmanes/caffeine/ java/util/stream/Stream#takeWhile(Ljava/util/funct
 # helpers, UnsignedBytes comparator, LittleEndianByteArray, FuturesGetChecked),
 # each loaded reflectively inside try/catch with a pure-Java fallback. [guarded]
 com/google/ java/lang/ClassValue#get(Ljava/lang/Class;)Ljava/lang/Object;
+com/google/ java/lang/ClassValue#<class>
+com/google/ java/lang/ClassValue#<init>()V
 com/google/ java/lang/invoke/MethodHandles#byteArrayViewVarHandle(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;
 com/google/ java/lang/invoke/MethodHandles$Lookup#findVarHandle(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
 com/google/ java/util/Arrays#compareUnsigned([B[B)I
+# Hashing$ChecksumType's crc32c supplier news up java.util.zip.CRC32C (API 34);
+# new-instance resolves lazily at first execution and no wallet path uses guava
+# Hashing checksums. [dormant]
+com/google/ java/util/zip/CRC32C#<class>
+com/google/ java/util/zip/CRC32C#<init>()V
 
 # Netty PlatformDependent/RefCnt: VarHandle fences behind netty's own
 # platform/Java-version probes with AtomicFieldUpdater fallbacks. [guarded]
 io/netty/ java/lang/invoke/VarHandle#storeStoreFence()V
+io/netty/ java/lang/invoke/VarHandle#<class>
 
 # kotlin-reflect / kotlinx-coroutines / kotlinx-serialization: ClassValue-based
 # caches instantiated only after an availability probe (their Android paths use
 # the fallback cache instead). [guarded]
-kotlin kotlin/reflect/jvm/internal/ComputableClassValue#get(Ljava/lang/Class;)Ljava/lang/Object; (inherited from java/lang/ClassValue)
-kotlin kotlin/reflect/jvm/internal/ComputableClassValue#remove(Ljava/lang/Class;)V (inherited from java/lang/ClassValue)
-kotlin kotlinx/coroutines/internal/ClassValueCtorCache$cache$1#get(Ljava/lang/Class;)Ljava/lang/Object; (inherited from java/lang/ClassValue)
-kotlin kotlinx/serialization/internal/ClassValueReferences#get(Ljava/lang/Class;)Ljava/lang/Object; (inherited from java/lang/ClassValue)
+kotlin kotlin/reflect/jvm/internal/ComputableClassValue#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin kotlin/reflect/jvm/internal/ComputableClassValue#remove(Ljava/lang/Class;)V
+kotlin kotlinx/coroutines/internal/ClassValueCtorCache$cache$1#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin kotlinx/serialization/internal/ClassValueReferences#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin java/lang/ClassValue#<class>
+kotlin java/lang/ClassValue#<init>()V
 
 # tuweni-units UInt32Value default methods — no wallet path constructs UInt32
 # values (UInt256/UInt64 are the used types). [dormant]

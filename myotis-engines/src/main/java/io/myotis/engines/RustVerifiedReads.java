@@ -473,9 +473,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
      *  storage position — the forms the natives expect). core's Hex, not
-     *  {@code java.util.HexFormat}: HexFormat needs Android API 34 and —
-     *  contrary to a comment that used to sit here — NO desugar_jdk_libs
-     *  release covers it (the class is absent from the 2.1.x jars); minSdk is 29. */
+     *  {@code java.util.HexFormat} (API 34; see CLAUDE.md's minSdk budget). */
     private static String toHex(byte[] bytes) {
         if (bytes == null) throw new EngineException("byte input is required");
         return com.jaeckel.ethp2p.core.encoding.Hex.formatHexPrefixed(bytes);

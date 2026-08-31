@@ -15,6 +15,16 @@ import java.nio.charset.StandardCharsets;
  * that method also accepts non-ASCII Unicode digits (Arabic-Indic, fullwidth,
  * …), which {@code HexFormat} rejects — a real difference on paths that parse
  * untrusted strings (addresses, CCIP-Read gateway responses).
+ *
+ * <p>Why not Tuweni's {@code Bytes.fromHexString} (already a dependency of
+ * most modules using this class): same laxness problem, verified against
+ * tuweni-bytes 2.7.2 — it accepts a {@code 0x} prefix (so callers that strip
+ * one prefix themselves would silently accept doubled-prefix input, and a
+ * 40-char length check no longer proves 20 bytes) and accepts the same
+ * non-ASCII Unicode digits as {@code Character.digit}. This class is the
+ * strict codec for validation paths; Tuweni {@code Bytes} remains fine where
+ * the input is already trusted bytes. (Also: {@code :myotis-engines} has no
+ * Tuweni on its classpath at all.)
  */
 public final class Hex {
 

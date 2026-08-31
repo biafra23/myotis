@@ -268,8 +268,12 @@ that produced this note.
   built APK's dex — the post-desugaring ground truth. It also resolves calls
   that reach a JDK method through a third-party subclass, which lint-style
   source checks and a naive api-versions.xml lookup both miss (that is exactly
-  how `SnappyFramedInputStream.readAllBytes()` once slipped through), and
-  api-versions.xml itself has gaps (`Files.readString` has no entry at all).
+  how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus
+  class-level references (extends/checkcast of a post-29 `java.*` class). It
+  is deliberately fail-closed: pre-36.1 platform databases don't record every
+  policed API (`Files.readString` first appears in the android-36.1 database),
+  so the script refuses to scan against a database that cannot resolve its
+  canary APIs rather than passing vacuously.
 - **JVM 17 is the default source/target.** New modules should compile to
   Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
   `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from

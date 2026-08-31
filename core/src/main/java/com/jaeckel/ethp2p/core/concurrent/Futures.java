@@ -55,6 +55,10 @@ public final class Futures {
      */
     public static <T> CompletableFuture<T> exceptionallyCompose(
             CompletableFuture<T> future, Function<Throwable, ? extends CompletionStage<T>> fn) {
+        // The JDK null-checks fn up front (synchronous NPE even when the future
+        // has already succeeded) — match it, or hosts diverge on exactly the
+        // contract this class exists to preserve.
+        java.util.Objects.requireNonNull(fn, "fn");
         return future
                 .handle((result, ex) -> ex == null ? future : fn.apply(ex))
                 .thenCompose(Function.identity());
