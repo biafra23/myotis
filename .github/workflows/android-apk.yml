@@ -192,9 +192,9 @@ jobs:
           # fix since it hit exactly that.)
           overwrite: true
 
-  # Boot the actual app on a minSdk (API 29) emulator. A static bytecode gate
-  # (scripts/check_apk_min_api.py, from the parallel minSdk-29 JDK-API work)
-  # can prove java.*/javax.* references resolve at API 29, but android.*
+  # Boot the actual app on a minSdk (API 29) emulator. The static bytecode gate
+  # (scripts/check_apk_min_api.py — the build job above runs it) proves
+  # java.*/javax.* references resolve at API 29, but android.*
   # framework APIs are out of any dex scan's reach (SDK_INT guards are invisible
   # to it), api-versions.xml has gaps, and no scan proves the app actually
   # BOOTS. This job launches MainActivity and runs NodeService through a full

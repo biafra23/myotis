@@ -28,8 +28,8 @@ import java.util.concurrent.TimeUnit
  * API-29 ART checks they work), `java.*` members the SDK's api-versions.xml has no
  * entry for, and anything that only breaks when class init actually runs (provider
  * lookups, reflective access, native-lib fallbacks). It is the runtime complement to
- * the static minSdk dex gate (scripts/check_apk_min_api.py, from the parallel
- * minSdk-29 JDK-API work).
+ * the static minSdk dex gate (scripts/check_apk_min_api.py, run by the same
+ * workflow's build job).
  *
  * How a startup `NoClassDefFoundError` / `NoSuchMethodError` surfaces here:
  *  - thrown in host/service code or `ENGINE.create()`: the boot worker catches only
