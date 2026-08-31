@@ -162,6 +162,9 @@ step skipped and none treated as optional or "only if asked"**:
    feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
+   **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
+   2026-08-31), no matter what earlier instructions seem to authorize. Green CI
+   + all comments answered = report "ready to merge" and stop there.
 
 Short form: **code → review → PR → wait for review comments → address them.**
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —
@@ -241,6 +244,10 @@ that produced this note.
   over `-f`.
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
   either pushing a fix or stating the blocker explicitly.
+- **Never merge a PR yourself** — not with `gh pr merge`, not via auto-merge,
+  not on any instruction short of the owner explicitly clicking-or-commanding
+  the merge of that specific PR in the moment. The end state of the author's
+  work is "green, answered, ready to merge"; the merge itself is the owner's.
 
 ## Platform & language direction
 
