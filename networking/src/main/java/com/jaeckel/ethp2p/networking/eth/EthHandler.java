@@ -994,10 +994,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         rlpxHandler.sendMessage(ctx, ETH_STATUS, payload);
     }
 
+    // The two fire-and-forget post-handshake probes below also register through
+    // trackHeaderRequest (future ignored): without it their specs stayed
+    // admissible for the connection lifetime — the indefinite late-admission
+    // window the helper's deadline + grace exist to bound.
+
     public void requestBlockHeadersByHash(ChannelHandlerContext ctx, org.apache.tuweni.bytes.Bytes32 hash) {
         long reqId = requestId.getAndIncrement();
         log.info("[eth] GetBlockHeaders by hash={} reqId={}", hash.toShortHexString(), reqId);
-        pendingHeaderReqs.put(reqId, HeaderReq.byHash(hash));
+        trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), HEADER_REQUEST_DEADLINE_MS);
         byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
     }
@@ -1005,7 +1010,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public void requestBlockHeaders(ChannelHandlerContext ctx, long blockNumber, int count) {
         long reqId = requestId.getAndIncrement();
         log.debug("[eth] GetBlockHeaders block={} count={} reqId={}", blockNumber, count, reqId);
-        pendingHeaderReqs.put(reqId, HeaderReq.byNumber(blockNumber, count));
+        trackHeaderRequest(ctx, reqId, HeaderReq.byNumber(blockNumber, count), HEADER_REQUEST_DEADLINE_MS);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
     }

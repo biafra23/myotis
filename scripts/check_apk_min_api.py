@@ -65,8 +65,14 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from typing import NamedTuple
 
-# Referrers under these prefixes are first-party: never allowlistable.
-FIRST_PARTY_PREFIXES = ("com/jaeckel/", "io/myotis/")
+# Referrers under these prefixes are first-party: never allowlistable. Beyond
+# the repo's own packages, this covers first-party code living under
+# foreign-looking prefixes: the hand-written log4j shims in android-app
+# (org.apache.logging.log4j.*) and the committed UniFFI-generated bindings in
+# :myotis-engines (uniffi.myotis_engine.*) — for generated code the wanted
+# remediation is fix/regenerate, never an allowlist entry.
+FIRST_PARTY_PREFIXES = ("com/jaeckel/", "io/myotis/",
+                        "org/apache/logging/log4j/", "uniffi/myotis_engine/")
 
 # The database must resolve these, or the whole scan would be vacuously green
 # exactly where it matters (each is an API this repo's budget polices; the
@@ -132,13 +138,7 @@ class ApiClass(NamedTuple):
     fields: dict
 
 
-def load_api_versions(sdk):
-    # android-36.1-style minor platforms sort AFTER their base release and are
-    # the ones that carry minor-release `since` values (e.g. Files.readString).
-    plat = newest(os.path.join(sdk, "platforms"), r"android-\d+(\.\d+)?")
-    xml = plat and os.path.join(plat, "data", "api-versions.xml")
-    if not xml or not os.path.exists(xml):
-        die("no platforms/android-N/data/api-versions.xml in SDK")
+def parse_api_versions(xml):
     classes = {}
     for c in ET.parse(xml).getroot().iter("class"):
         since = parse_level(c.get("since"), 1)
@@ -151,12 +151,37 @@ def load_api_versions(sdk):
             elif ch.tag == "field":
                 fields[ch.get("name")] = parse_level(ch.get("since"), since)
         classes[c.get("name")] = ApiClass(since, supers, methods, fields)
-    for owner, member, kind in DB_CANARIES:
-        if resolve_api(classes, owner, member, kind == "field") is None:
-            die(f"api-versions.xml at {xml} cannot resolve {owner}#{member} — "
-                f"the SDK's platform database is too old for this gate; install "
-                f"a current platforms/android-N (see DB_CANARIES in this script)")
     return classes
+
+
+def load_api_versions(sdk):
+    """The OLDEST installed platform database that resolves every canary.
+
+    Oldest-passing, not newest-available: preview platforms (CI runners
+    preinstall them) reshuffle `since` data — the android-37 preview records
+    StringBuilder#getChars as since=37 where every stable database resolves it
+    to 1, which made the gate report phantom violations. Canary coverage sets
+    the floor (>= android-36.1); preferring the oldest passing database keeps
+    the choice pinned to stable releases and identical across machines."""
+    pdir = os.path.join(sdk, "platforms")
+    if not os.path.isdir(pdir):
+        die("no platforms/ directory in SDK")
+    plats = sorted(
+        (name for name in os.listdir(pdir) if re.fullmatch(r"android-\d+(\.\d+)?", name)),
+        key=lambda n: tuple(int(x) for x in re.findall(r"\d+", n)))
+    tried = []
+    for name in plats:
+        xml = os.path.join(pdir, name, "data", "api-versions.xml")
+        if not os.path.exists(xml):
+            continue
+        tried.append(name)
+        classes = parse_api_versions(xml)
+        if all(resolve_api(classes, o, m, k == "field") is not None
+               for o, m, k in DB_CANARIES):
+            return classes
+    die(f"no installed platform database resolves the canary APIs "
+        f"(tried: {', '.join(tried) or 'none'}) — this gate needs "
+        f"platforms;android-36.1 or newer stable (see DB_CANARIES in this script)")
 
 
 CLASS_RE = re.compile(r"Class descriptor\s*:\s*'L([\w/$\-]+);'")
