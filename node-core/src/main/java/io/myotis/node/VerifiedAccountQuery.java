@@ -1,6 +1,7 @@
 package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -72,17 +73,17 @@ public final class VerifiedAccountQuery {
         RLPxConnector connector = stack != null ? stack.connector() : null;
         BeaconSyncState beaconSyncState = stack != null ? stack.beaconSyncState() : null;
         if (stack == null || !stack.isRunning() || connector == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("Node is not running"));
         }
         if (hexAddress == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address is required"));
         }
         String hex = hexAddress.strip();
         if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
         if (hex.length() != 40) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
         }
         final String hexAddrFinal = hex;
@@ -90,7 +91,7 @@ public final class VerifiedAccountQuery {
         try {
             address = Bytes.fromHexString(hex);
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
         }
         Bytes32 accountHash = Hash.keccak256(address);
@@ -173,7 +174,7 @@ public final class VerifiedAccountQuery {
     public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
             ChainStack stack, String hexAddress) {
         if (stack == null || !stack.isRunning()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         return queryProof(stack.connector(), stack.beaconSyncState(),
                 stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress);
@@ -187,22 +188,22 @@ public final class VerifiedAccountQuery {
             RLPxConnector connector, BeaconSyncState bss,
             long clGenesisTime, int secondsPerSlot, String hexAddress) {
         if (connector == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         if (hexAddress == null) {
-            return CompletableFuture.failedFuture(new IllegalArgumentException("Address is required"));
+            return Futures.failedFuture(new IllegalArgumentException("Address is required"));
         }
         String hex = hexAddress.strip();
         if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
         if (hex.length() != 40) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
         }
         Bytes address;
         try {
             address = Bytes.fromHexString(hex);
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
         }
         final String addr = "0x" + hex;
@@ -436,8 +437,8 @@ public final class VerifiedAccountQuery {
         }
         int total = (int) totalLong;
         log.info("[verify] Fetching {} headers from #{} to #{}", total, finalizedBlock, peerBlock);
-        return connector.requestBlockHeadersBatched(finalizedBlock, total)
-                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+        return Futures.orTimeout(connector.requestBlockHeadersBatched(finalizedBlock, total),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
                     boolean valid = verifyHeaderChain(headers, beaconBlockHash, peerStateRoot);
                     log.info("[verify] Full header chain ({} blocks) valid: {}", headers.size(), valid);

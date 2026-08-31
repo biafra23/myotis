@@ -1276,13 +1276,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         }
     }
 
-    /** 0x-hex (or null/"0x"/empty) → bytes; null/empty → an empty array. */
+    /** 0x-hex (or null/"0x"/empty) → bytes; null/empty → an empty array.
+     *  core's Hex, not {@code java.util.HexFormat}: HexFormat needs Android
+     *  API 34 (minSdk is 29), and Hex keeps its strict ASCII parse contract. */
     private static byte[] hexToBytes(String hexOrNull) {
         if (hexOrNull == null) return new byte[0];
         String h = (hexOrNull.startsWith("0x") || hexOrNull.startsWith("0X"))
                 ? hexOrNull.substring(2) : hexOrNull;
-        if (h.isEmpty()) return new byte[0];
-        return java.util.HexFormat.of().parseHex(h);
+        return com.jaeckel.ethp2p.core.encoding.Hex.parseHex(h);
     }
 
     /** Left-pad a big-endian value to a 32-byte word (a storage value is ≤ 32 bytes). */

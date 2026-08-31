@@ -1,8 +1,9 @@
 package io.myotis.evm.world;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
+
 import java.math.BigInteger;
 import java.util.Collections;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -106,7 +107,7 @@ public interface StateProofCache {
             });
         }
 
-        private static String hex(byte[] b) { return HexFormat.of().formatHex(b); }
+        private static String hex(byte[] b) { return Hex.formatHex(b); }
 
         private static String accountKey(byte[] root, byte[] addr) {
             return hex(root) + ':' + hex(addr);

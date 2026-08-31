@@ -46,6 +46,9 @@ dependencies {
     // starts it over RustVerifiedReads, mirroring how the Java engine (node-core)
     // self-starts it internally. Consumers already ship it transitively via node-core.
     implementation(project(":jsonrpc-server"))
+    // Android-safe minSdk-29 shims shared across the engine modules (core.encoding.Hex
+    // for the FFI hex boundary — java.util.HexFormat is API 34; see CLAUDE.md).
+    implementation(project(":core"))
     implementation(libs.minimal.json)
     implementation(libs.slf4j.api)
     // The FFI layer under the UniFFI-generated Kotlin bindings (replaces hand-JNI).

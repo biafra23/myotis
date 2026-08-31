@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking.rlpx;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
@@ -30,6 +31,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.concurrent.TimeUnit;
 
@@ -291,7 +293,7 @@ public final class RLPxConnector implements AutoCloseable {
             // channel likely closed between the two checks; remove it.
             it.remove();
         }
-        return CompletableFuture.failedFuture(
+        return Futures.failedFuture(
                 new IllegalStateException("No active peer with completed eth handshake"));
     }
 
@@ -307,7 +309,7 @@ public final class RLPxConnector implements AutoCloseable {
             if (h.isReady()) readyPeers.add(h);
         }
         if (readyPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("No active peer with completed eth handshake"));
         }
         return tryBatchedPeer(readyPeers, 0, startBlock, totalCount);
@@ -316,16 +318,17 @@ public final class RLPxConnector implements AutoCloseable {
     private CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> tryBatchedPeer(
             List<EthHandler> peers, int peerIndex, long startBlock, int totalCount) {
         if (peerIndex >= peers.size()) {
-            return CompletableFuture.failedFuture(new IllegalStateException(
+            return Futures.failedFuture(new IllegalStateException(
                     "All " + peers.size() + " peers failed to serve batched headers"));
         }
         EthHandler handler = peers.get(peerIndex);
         log.info("[rlpx] Batched header request: block={}, count={}, peer={} ({}/{})",
                 startBlock, totalCount, handler.getRemoteAddress(), peerIndex + 1, peers.size());
-        return fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount))
-                .exceptionallyCompose(ex -> {
+        return Futures.exceptionallyCompose(
+                fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount)),
+                ex -> {
                     log.warn("[rlpx] Batched request failed on peer {}: {}, trying next",
-                            handler.getRemoteAddress(), ex.getMessage());
+                            handler.getRemoteAddress(), failureKind(ex));
                     return tryBatchedPeer(peers, peerIndex + 1, startBlock, totalCount);
                 });
     }
@@ -338,12 +341,12 @@ public final class RLPxConnector implements AutoCloseable {
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
                 handler.requestBlockHeadersAsync(startBlock, count);
         if (future == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("Peer disconnected during batched header fetch"));
         }
-        return future.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS).thenCompose(batch -> {
+        return Futures.orTimeout(future, 10, java.util.concurrent.TimeUnit.SECONDS).thenCompose(batch -> {
             if (batch.size() != count) {
-                return CompletableFuture.failedFuture(new RuntimeException(
+                return Futures.failedFuture(new RuntimeException(
                         "Expected " + count + " headers, got " + batch.size()));
             }
             accumulated.addAll(batch);
@@ -407,6 +410,13 @@ public final class RLPxConnector implements AutoCloseable {
                 h -> h.requestReceiptsAsync(hashes));
     }
 
+    /** Log-friendly failure description: a bare {@code TimeoutException} (the
+     *  shape {@code Futures.orTimeout} completes with) has a null message, so
+     *  fall back to the exception itself rather than logging "null". */
+    private static Object failureKind(Throwable ex) {
+        return ex.getMessage() != null ? ex.getMessage() : ex;
+    }
+
     /** Build a per-peer attempt supplier list from the current READY peers (capped
      *  at {@link #BODY_RECEIPT_MAX_PEERS}), starting at the {@link #bodyReceiptRr}
      *  cursor so consecutive calls spread over the whole ready set instead of
@@ -424,7 +434,7 @@ public final class RLPxConnector implements AutoCloseable {
             if (h.isReady()) ready.add(h);
         }
         if (ready.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("No active peer with completed eth handshake"));
         }
         int cap = Math.min(ready.size(), BODY_RECEIPT_MAX_PEERS);
@@ -478,14 +488,14 @@ public final class RLPxConnector implements AutoCloseable {
             if (sawCleanEmpty) {
                 return CompletableFuture.completedFuture(List.of());
             }
-            return CompletableFuture.failedFuture(lastEx != null ? lastEx
+            return Futures.failedFuture(lastEx != null ? lastEx
                     : new IllegalStateException("all peer(s) failed to serve " + what));
         }
         CompletableFuture<List<T>> f = attempts.get(i).get();
         if (f == null) {
             return rotateFrom(what, expected, attempts, i + 1, sawCleanEmpty, lastEx, perAttemptTimeoutMs);
         }
-        return f.orTimeout(perAttemptTimeoutMs, TimeUnit.MILLISECONDS)
+        return Futures.orTimeout(f, perAttemptTimeoutMs, TimeUnit.MILLISECONDS)
                 .handle((list, ex) -> {
                     if (ex == null && list != null && list.size() >= expected) {
                         return CompletableFuture.completedFuture(list);
@@ -547,7 +557,7 @@ public final class RLPxConnector implements AutoCloseable {
             }
         }
         if (snapPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No active peer with snap/1 support"));
         }
         return trySnapPeer(address, stateRoot, snapPeers, 0);
@@ -556,7 +566,7 @@ public final class RLPxConnector implements AutoCloseable {
     private CompletableFuture<AccountRangeMessage.DecodeResult> trySnapPeer(
             Bytes address, Bytes32 stateRoot, List<EthHandler> peers, int index) {
         if (index >= peers.size()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("All " + peers.size() + " snap peers failed to serve account data"));
         }
         EthHandler handler = peers.get(index);
@@ -569,9 +579,9 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetAccountRange for {} to peer {} ({}/{})",
             address.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return future.exceptionallyCompose(ex -> {
+        return Futures.exceptionallyCompose(future, ex -> {
             log.warn("[rlpx] Snap request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
+                handler.getRemoteAddress(), failureKind(ex));
             // Don't permanently mark as failed — disconnects and timeouts are usually transient
             return trySnapPeer(address, stateRoot, peers, index + 1);
         });
@@ -599,7 +609,7 @@ public final class RLPxConnector implements AutoCloseable {
             }
         }
         if (snapPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No active peer with snap/1 support"));
         }
         return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, snapPeers, 0);
@@ -609,7 +619,7 @@ public final class RLPxConnector implements AutoCloseable {
             Bytes contractAddress, Bytes32 storageKeyHash, Bytes32 stateRoot,
             List<EthHandler> peers, int index) {
         if (index >= peers.size()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("All " + peers.size() + " snap peers failed to serve storage data"));
         }
         EthHandler handler = peers.get(index);
@@ -621,7 +631,16 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetStorageRanges for {} to peer {} ({}/{})",
             storageKeyHash.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return future.thenCompose(result -> {
+        // One decision point on THIS peer's outcome, with the retry recursion outside
+        // it: wrapping the recursion in the failure handler (the previous shape)
+        // replayed the remaining peer list once per level — up to 2^n snap requests
+        // on a fully-failing pool instead of n.
+        return future.handle((result, ex) -> {
+            if (ex != null) {
+                log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
+                    handler.getRemoteAddress(), failureKind(ex));
+                return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
+            }
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
@@ -629,11 +648,7 @@ public final class RLPxConnector implements AutoCloseable {
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
             return CompletableFuture.completedFuture(result);
-        }).exceptionallyCompose(ex -> {
-            log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
-            return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
-        });
+        }).thenCompose(Function.identity());
     }
 
     /** Bench a peer that failed to serve — unless it is the last un-benched serving

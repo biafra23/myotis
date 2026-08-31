@@ -160,6 +160,18 @@ jobs:
             echo "  ok: $abi has both libmyotis_engine.so and libjnidispatch.so"
           done <<< "$engines"
 
+      # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
+      # budget"; the script's docstring is the full story. The platform install
+      # feeds its api-versions canary: pre-36.1 databases don't record every
+      # policed API (Files.readString first appears in the 36.1 database), and
+      # the script refuses to scan against a database that old (exit 2).
+      - name: Verify minSdk JDK-API compatibility
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36.1" \
+            || echo "::warning::sdkmanager could not install platforms;android-36.1 — the gate's own database canary will decide"
+          apk=$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)
+          python3 scripts/check_apk_min_api.py --apk "$apk"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

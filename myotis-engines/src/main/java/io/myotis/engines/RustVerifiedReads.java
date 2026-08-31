@@ -472,11 +472,10 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
-     *  storage position — the forms the natives expect). */
+     *  storage position — the forms the natives expect). core's Hex, not
+     *  {@code java.util.HexFormat} (API 34; see CLAUDE.md's minSdk budget). */
     private static String toHex(byte[] bytes) {
         if (bytes == null) throw new EngineException("byte input is required");
-        // HexFormat is desugared for Android here (desugar_jdk_libs 2.1.x) — the same
-        // API node-core (ChainStack) and myotis-ens already rely on in main code.
-        return "0x" + java.util.HexFormat.of().formatHex(bytes);
+        return com.jaeckel.ethp2p.core.encoding.Hex.formatHexPrefixed(bytes);
     }
 }

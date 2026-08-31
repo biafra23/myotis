@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.consensus.libp2p;
 
 import com.jaeckel.ethp2p.consensus.types.MetadataMessage;
 import com.jaeckel.ethp2p.consensus.types.StatusMessage;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.libp2p.core.Host;
 import io.libp2p.core.P2PChannel;
 import io.libp2p.core.PeerId;
@@ -693,7 +694,7 @@ public class BeaconP2PService implements AutoCloseable {
         String protoId = v2 ? STATUS : STATUS_V1;
         QueuedReqRespBinding binding = bindings.get(protoId);
         if (binding == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("no binding for " + protoId));
         }
         byte[] requestPayload;
@@ -701,7 +702,7 @@ public class BeaconP2PService implements AutoCloseable {
             byte[] ssz = v2 ? local.encode() : local.encodeV1();
             requestPayload = ReqRespCodec.encodeRequest(ssz);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
         binding.enqueue(pid, requestPayload, responseFuture);
@@ -851,12 +852,12 @@ public class BeaconP2PService implements AutoCloseable {
      */
     public CompletableFuture<Void> queryIdentify(String peerMultiaddr) {
         Host h = host;
-        if (h == null) return CompletableFuture.failedFuture(new IllegalStateException("not started"));
+        if (h == null) return Futures.failedFuture(new IllegalStateException("not started"));
 
         try {
             Multiaddr peerAddr = new Multiaddr(peerMultiaddr);
             PeerId peerId = peerAddr.getPeerId();
-            if (peerId == null) return CompletableFuture.failedFuture(new IllegalArgumentException("no peer id"));
+            if (peerId == null) return Futures.failedFuture(new IllegalArgumentException("no peer id"));
 
             // Honor the Goodbye cooldown exactly like doReqResp: re-dialing a peer
             // that just told us to go away is the signal that gets us scored down.
@@ -866,7 +867,7 @@ public class BeaconP2PService implements AutoCloseable {
             if (cooldownUntil != null) {
                 long remaining = cooldownUntil - System.currentTimeMillis();
                 if (remaining > 0) {
-                    return CompletableFuture.failedFuture(
+                    return Futures.failedFuture(
                             new RuntimeException("peer " + peerId + " in Goodbye cooldown for "
                                     + remaining + "ms"));
                 }
@@ -908,7 +909,7 @@ public class BeaconP2PService implements AutoCloseable {
                 return null;
             });
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
     }
 
@@ -932,7 +933,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(local.encode());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         dumpOutgoingStatus(peerMultiaddr, "v2", local, requestPayload);
         return doReqResp(peerMultiaddr, STATUS, requestPayload)
@@ -947,7 +948,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(local.encodeV1());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         dumpOutgoingStatus(peerMultiaddr, "v1", local, requestPayload);
         return doReqResp(peerMultiaddr, STATUS_V1, requestPayload)
@@ -1000,14 +1001,14 @@ public class BeaconP2PService implements AutoCloseable {
 
     public CompletableFuture<byte[]> requestBootstrap(String peerMultiaddr, byte[] blockRoot32) {
         if (blockRoot32 == null || blockRoot32.length != 32) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("blockRoot32 must be exactly 32 bytes"));
         }
         byte[] requestPayload;
         try {
             requestPayload = ReqRespCodec.encodeRequest(blockRoot32);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, BOOTSTRAP, requestPayload)
                 .thenApply(BeaconP2PService::decodeSingleResponse);
@@ -1056,7 +1057,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(sszRequest);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, UPDATES, requestPayload, timeoutMs)
                 .thenApply(raw -> {
@@ -1081,7 +1082,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(buf.array());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, BLOCKS_BY_RANGE, requestPayload)
                 .thenApply(raw -> {
@@ -1152,24 +1153,15 @@ public class BeaconP2PService implements AutoCloseable {
 
         Host h = host;
         if (h == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("BeaconP2PService not started"));
         }
 
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
-        if (timeoutMs > 0L) {
-            // Start the deadline now so it matches the caller's intent (X ms total),
-            // not "X ms from when the muxer happened to open a stream". When the
-            // timer fires it completes responseFuture exceptionally, which triggers
-            // the stream-close whenComplete registered after the stream opens
-            // (see below) — without that, channelRead0 would keep buffering bytes
-            // from a silent peer.
-            responseFuture.orTimeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-        }
 
         QueuedReqRespBinding binding = bindings.get(protocolId);
         if (binding == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("No binding registered for " + protocolId));
         }
 
@@ -1177,7 +1169,7 @@ public class BeaconP2PService implements AutoCloseable {
             Multiaddr peerAddr = new Multiaddr(peerMultiaddr);
             PeerId peerId = peerAddr.getPeerId();
             if (peerId == null) {
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalArgumentException("Cannot extract PeerId from: " + peerMultiaddr));
             }
 
@@ -1189,11 +1181,24 @@ public class BeaconP2PService implements AutoCloseable {
             if (cooldownUntil != null) {
                 long remaining = cooldownUntil - System.currentTimeMillis();
                 if (remaining > 0) {
-                    return CompletableFuture.failedFuture(
+                    return Futures.failedFuture(
                             new RuntimeException("peer " + peerId + " in Goodbye cooldown for "
                                     + remaining + "ms"));
                 }
                 goodbyeUntilMs.remove(peerId.toString());
+            }
+
+            if (timeoutMs > 0L) {
+                // Arm the deadline (in place, on responseFuture) after the cheap
+                // synchronous validation above but before any network step, so it
+                // still spans the caller's full X ms — not "X ms from when the muxer
+                // happened to open a stream" — while the early-return paths above
+                // never park an orphaned timer task for a future nobody completes.
+                // When the timer fires it completes responseFuture exceptionally,
+                // which triggers the stream-close whenComplete registered after the
+                // stream opens (see below) — without that, channelRead0 would keep
+                // buffering bytes from a silent peer.
+                Futures.orTimeout(responseFuture, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
 
             log.debug("[beacon-p2p] Opening stream {} to {}", protocolId, peerMultiaddr);
@@ -1579,7 +1584,7 @@ public class BeaconP2PService implements AutoCloseable {
                 log.debug("[beacon-p2p] Peer-initiated {} stream from {} (agent={}) — no responder, closing",
                         protocolId, pid, agent);
                 try { stream.close(); } catch (Exception ignored) {}
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("Responder role not implemented for " + protocolId));
             }
 
@@ -1590,7 +1595,7 @@ public class BeaconP2PService implements AutoCloseable {
             try {
                 outgoingPeerId = stream.getConnection().secureSession().getRemoteId().toString();
             } catch (Exception e) {
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("Cannot resolve peer ID for outgoing " + protocolId, e));
             }
             ConcurrentLinkedQueue<PendingRequest> queue = pendingByPeer.get(outgoingPeerId);
@@ -1605,7 +1610,7 @@ public class BeaconP2PService implements AutoCloseable {
             if (pending == null) {
                 log.warn("[beacon-p2p] No pending request for outgoing {} to {} — queue was empty!",
                         protocolId, outgoingPeerId);
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("No pending request for " + protocolId
                                 + " to " + outgoingPeerId));
             }

@@ -1,5 +1,6 @@
 package io.myotis.evm;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.myotis.evm.besu.BlockContextValues;
 import io.myotis.evm.besu.EvmFactory;
 import io.myotis.evm.world.AccessTracker;
@@ -77,7 +78,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
     @Override
     public CompletableFuture<Long> estimateGas(UnsignedTransaction tx, BlockContext blockContext) {
         if (tx.to() == null) {
-            return CompletableFuture.failedFuture(new UnsupportedOperationException(
+            return Futures.failedFuture(new UnsupportedOperationException(
                     "Phase 5 does not yet handle contract creation (to=null)"));
         }
         return CompletableFuture.supplyAsync(() -> estimateGasOnce(tx, blockContext), executor);

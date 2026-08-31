@@ -1,5 +1,6 @@
 package io.myotis.evm.world;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
 import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
 import io.myotis.evm.Address;
 import io.myotis.evm.CryptoProviders;
@@ -15,7 +16,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -309,9 +309,9 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         throw new EvmExecutionException(
                                 new EvmExecutionError.InvalidProof(
                                         new byte[32], Address.ZERO,
-                                        "bytecode hash mismatch: expected 0x"
-                                                + HexFormat.of().formatHex(codeHash)
-                                                + " got 0x" + HexFormat.of().formatHex(actualHash)));
+                                        "bytecode hash mismatch: expected "
+                                                + Hex.formatHexPrefixed(codeHash)
+                                                + " got " + Hex.formatHexPrefixed(actualHash)));
                     }
                     bytecodeCache.put(codeHash, code);
                     return code;

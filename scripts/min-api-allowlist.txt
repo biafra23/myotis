@@ -1,0 +1,114 @@
+# Reviewed third-party references to java.* APIs above minSdk 29 that remain in
+# the APK after desugaring (post-D8/desugar_jdk_libs ground truth). Consumed by
+# scripts/check_apk_min_api.py: `<referrer-class-prefix> <owner#member>` per
+# line, prefix-matched on the referring class, exact-matched on the target.
+#
+# A FIRST-PARTY (com/jaeckel/*, io/myotis/*) violation NEVER belongs here — fix
+# the call instead (CLAUDE.md "minSdk 29 JDK-API budget": core Futures/Hex/
+# BigIntegers, Paths.get, manual stream drains). Third-party entries fall into
+# three classes, noted per section:
+#   [guarded]  the library probes for the API at runtime and falls back;
+#   [dormant]  the code path is not wired/reachable in this app's configuration;
+#   [LIVE]     reachable on a normal run — a real crash on Android 10/11 (API
+#              29/30, no ART module backports) tracked for an upstream/fork fix.
+# Regenerate candidates by running the checker with --allowlist /dev/null.
+
+# desugar_jdk_libs' own j$ wrappers bridge to the platform Flow only on devices
+# that have it (API 30+) — self-guarded by construction. [guarded]
+j$/ java/util/concurrent/Flow$Publisher#subscribe(Ljava/util/concurrent/Flow$Subscriber;)V
+j$/ java/util/concurrent/Flow$Subscriber#onComplete()V
+j$/ java/util/concurrent/Flow$Subscriber#onError(Ljava/lang/Throwable;)V
+j$/ java/util/concurrent/Flow$Subscriber#onNext(Ljava/lang/Object;)V
+j$/ java/util/concurrent/Flow$Subscriber#onSubscribe(Ljava/util/concurrent/Flow$Subscription;)V
+j$/ java/util/concurrent/Flow$Subscription#cancel()V
+j$/ java/util/concurrent/Flow$Subscription#request(J)V
+j$/ java/util/concurrent/Flow$Publisher#<class>
+j$/ java/util/concurrent/Flow$Subscriber#<class>
+j$/ java/util/concurrent/Flow$Subscription#<class>
+
+# (ConsenSys discv5: no entries — :networking consumes it as the
+# biafra23/discovery Android fork since #397, which patched its post-29 JDK
+# calls at the source. See the libs.versions.toml entry for the fork playbook.)
+
+# jvm-libp2p 1.3.2: circuit-relay, QUIC and AutoNAT protocol handlers. Our
+# BeaconP2PService wires TCP+Noise+Identify only, so these classes are never
+# instantiated. [dormant]
+io/libp2p/ java/util/concurrent/CompletableFuture#failedFuture(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;
+io/libp2p/ java/util/concurrent/CompletableFuture#orTimeout(JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/CompletableFuture;
+
+# Besu fork + upstream besu jars. UInt256 (unsignedMultiplyHigh, API 35!) and
+# the Eq/Shift256/Exp operations are the EVM interpreter's word arithmetic —
+# [LIVE] for eth_call/ENS on Android 10/11 without ART backports; tracked by
+# issue #402 for the next biafra23/besu fork rebase (<ver>-android.N). Era1Type,
+# RollingFileWriter, LogsBloomFilter.Builder, Merkleizer, PrintWriter/
+# BufferedInputStream uses and the xerial-snappy read are era1/util paths the
+# wallet never executes. [dormant]
+org/hyperledger/ java/io/BufferedInputStream#readNBytes(I)[B
+org/hyperledger/ java/io/BufferedInputStream#skipNBytes(J)V
+org/hyperledger/ java/io/ByteArrayInputStream#readNBytes(I)[B
+org/hyperledger/ java/io/ByteArrayOutputStream#toString(Ljava/nio/charset/Charset;)Ljava/lang/String;
+org/hyperledger/ java/io/PrintWriter#<init>(Ljava/io/OutputStream;ZLjava/nio/charset/Charset;)V
+org/hyperledger/ java/lang/Math#unsignedMultiplyHigh(JJ)J
+org/hyperledger/ java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;
+org/hyperledger/ java/lang/invoke/MethodHandles#byteArrayViewVarHandle(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;
+org/hyperledger/ java/math/BigInteger#TWO
+org/hyperledger/ java/math/BigInteger#longValueExact()J
+org/hyperledger/ java/nio/file/Path#of(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;
+org/hyperledger/ java/util/Arrays#equals([BII[BII)Z
+org/hyperledger/ java/util/Arrays#mismatch([BII[BII)I
+org/hyperledger/ java/util/Arrays#mismatch([B[B)I
+org/hyperledger/ java/util/HexFormat#formatHex([B)Ljava/lang/String;
+org/hyperledger/ java/util/HexFormat#of()Ljava/util/HexFormat;
+org/hyperledger/ java/util/List#getFirst()Ljava/lang/Object;
+org/hyperledger/ java/util/List#removeLast()Ljava/lang/Object;
+org/hyperledger/ org/xerial/snappy/SnappyFramedInputStream#readAllBytes()[B
+
+# Caffeine (Besu transitive). The fork constructs no Caffeine cache on the EVM
+# path (see android-app/build.gradle.kts), and Caffeine itself probes VarHandle
+# support at class-init inside try/catch with fallbacks. [dormant]/[guarded]
+com/github/benmanes/caffeine/ java/lang/Class#getPackageName()Ljava/lang/String;
+com/github/benmanes/caffeine/ java/lang/Thread#onSpinWait()V
+com/github/benmanes/caffeine/ java/lang/invoke/MethodHandles#arrayElementVarHandle(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+com/github/benmanes/caffeine/ java/lang/invoke/MethodHandles#privateLookupIn(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;
+com/github/benmanes/caffeine/ java/lang/invoke/MethodHandles$Lookup#findStaticVarHandle(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+com/github/benmanes/caffeine/ java/lang/invoke/MethodHandles$Lookup#findVarHandle(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+com/github/benmanes/caffeine/ java/lang/invoke/VarHandle#loadLoadFence()V
+com/github/benmanes/caffeine/ java/lang/invoke/VarHandle#storeStoreFence()V
+com/github/benmanes/caffeine/ java/util/concurrent/CompletableFuture#delayedExecutor(JLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;
+com/github/benmanes/caffeine/ java/util/stream/Stream#takeWhile(Ljava/util/function/Predicate;)Ljava/util/stream/Stream;
+
+# Guava (JRE variant, deliberately — see android-app/build.gradle.kts). All
+# hits are its capability-probing enum holders (AbstractFutureState atomic
+# helpers, UnsignedBytes comparator, LittleEndianByteArray, FuturesGetChecked),
+# each loaded reflectively inside try/catch with a pure-Java fallback. [guarded]
+com/google/ java/lang/ClassValue#get(Ljava/lang/Class;)Ljava/lang/Object;
+com/google/ java/lang/ClassValue#<class>
+com/google/ java/lang/ClassValue#<init>()V
+com/google/ java/lang/invoke/MethodHandles#byteArrayViewVarHandle(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;
+com/google/ java/lang/invoke/MethodHandles$Lookup#findVarHandle(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+com/google/ java/util/Arrays#compareUnsigned([B[B)I
+# Hashing$ChecksumType's crc32c supplier news up java.util.zip.CRC32C (API 34);
+# new-instance resolves lazily at first execution and no wallet path uses guava
+# Hashing checksums. [dormant]
+com/google/ java/util/zip/CRC32C#<class>
+com/google/ java/util/zip/CRC32C#<init>()V
+
+# Netty PlatformDependent/RefCnt: VarHandle fences behind netty's own
+# platform/Java-version probes with AtomicFieldUpdater fallbacks. [guarded]
+io/netty/ java/lang/invoke/VarHandle#storeStoreFence()V
+io/netty/ java/lang/invoke/VarHandle#<class>
+
+# kotlin-reflect / kotlinx-coroutines / kotlinx-serialization: ClassValue-based
+# caches instantiated only after an availability probe (their Android paths use
+# the fallback cache instead). [guarded]
+kotlin kotlin/reflect/jvm/internal/ComputableClassValue#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin kotlin/reflect/jvm/internal/ComputableClassValue#remove(Ljava/lang/Class;)V
+kotlin kotlinx/coroutines/internal/ClassValueCtorCache$cache$1#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin kotlinx/serialization/internal/ClassValueReferences#get(Ljava/lang/Class;)Ljava/lang/Object;
+kotlin java/lang/ClassValue#<class>
+kotlin java/lang/ClassValue#<init>()V
+
+# tuweni-units UInt32Value default methods — no wallet path constructs UInt32
+# values (UInt256/UInt64 are the used types). [dormant]
+org/apache/tuweni/ java/math/BigInteger#intValueExact()I
+org/apache/tuweni/ java/math/BigInteger#longValueExact()J
