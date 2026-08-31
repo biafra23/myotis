@@ -23,16 +23,9 @@ j$/ java/util/concurrent/Flow$Subscriber#onSubscribe(Ljava/util/concurrent/Flow$
 j$/ java/util/concurrent/Flow$Subscription#cancel()V
 j$/ java/util/concurrent/Flow$Subscription#request(J)V
 
-# ConsenSys discv5 (io.consensys.protocols:discovery 26.4.0). KBucket is the
-# CORE of the Kademlia routing table and RecursiveLookupTasks/AsyncPinger run
-# on every lookup/liveness tick — [LIVE] on Android 10/11 the first bucket
-# update or lookup crashes. Needs an Android-safe fork patch (like the
-# biafra23/besu fork); tracked in the PR that introduced this file.
-org/ethereum/beacon/discovery/ java/util/List#addFirst(Ljava/lang/Object;)V
-org/ethereum/beacon/discovery/ java/util/List#getLast()Ljava/lang/Object;
-org/ethereum/beacon/discovery/ java/util/stream/Stream#takeWhile(Ljava/util/function/Predicate;)Ljava/util/stream/Stream;
-org/ethereum/beacon/discovery/ java/util/concurrent/CompletableFuture#failedFuture(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;
-org/ethereum/beacon/discovery/ java/util/concurrent/CompletableFuture#orTimeout(JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/CompletableFuture;
+# (ConsenSys discv5: no entries — :networking consumes it as the
+# biafra23/discovery Android fork since #397, which patched its post-29 JDK
+# calls at the source. See the libs.versions.toml entry for the fork playbook.)
 
 # jvm-libp2p 1.3.2: circuit-relay, QUIC and AutoNAT protocol handlers. Our
 # BeaconP2PService wires TCP+Noise+Identify only, so these classes are never

@@ -1212,7 +1212,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockBodies (async) hashes={} reqId={}", hashes.length, reqId);
         byte[] payload = GetBlockBodiesMessage.encode(reqId, hashes);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_BODIES, payload);
-        return future.orTimeout(BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        return Futures.orTimeout(future, BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .whenComplete((r, ex) -> pendingBodyRequests.remove(reqId));
     }
 
@@ -1233,7 +1233,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetReceipts (async) hashes={} reqId={}", hashes.length, reqId);
         byte[] payload = GetReceiptsMessage.encode(reqId, hashes);
         rlpxHandler.sendMessage(ctx, ETH_GET_RECEIPTS, payload);
-        return future.orTimeout(BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        return Futures.orTimeout(future, BODY_RECEIPT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .whenComplete((r, ex) -> pendingReceiptRequests.remove(reqId));
     }
 
