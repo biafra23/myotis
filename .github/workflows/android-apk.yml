@@ -267,11 +267,50 @@ jobs:
       # cache the system image + AVD to shave those minutes. swiftshader_indirect:
       # the runner has no GPU, so render in software (the documented GMD-on-CI
       # setting).
+      # STEP-level continue-on-error, adjudicated by the next step — not
+      # success-blind: both of this job's first PR runs hit a known AGP/UTP
+      # results-TRANSPORT bug (issuetracker.google.com/issues/335857362) where
+      # the device-side test finishes and its verdict is written to disk, but
+      # UTP's gRPC stream back to Gradle dies ("SEVERE: recordTestResultEvent
+      # ... UNAVAILABLE: io exception" in utp.0.log) and Gradle fails the task
+      # with "Failed to receive the UTP test results" — a false red over a
+      # PASSED run. The verdict file UTP writes is the ground truth either way,
+      # so the next step reads THAT: genuine failures stay red (verdict FAILED,
+      # or no verdict written at all), and the transport bug alone becomes a
+      # loud warning on a green job.
       - name: Run the boot smoke test on the API-29 managed device
+        id: gmd
+        continue-on-error: true
         run: |
           ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine \
             -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect \
             --stacktrace
+
+      - name: Adjudicate the device-side test verdict
+        run: |
+          set -eu
+          mapfile -t protos < <(find android-app/build/outputs/androidTest-results/managedDevice \
+            -name 'test-result.textproto' 2>/dev/null)
+          if [ "${#protos[@]}" -eq 0 ]; then
+            echo "::error::no test-result.textproto was written — the run produced no device-side verdict (infra/build failure; see the gradle step above)"
+            exit 1
+          fi
+          for p in "${protos[@]}"; do
+            if grep -qE 'test_status: (FAILED|ERROR|ABORTED|CANCELLED)' "$p"; then
+              echo "::error::device-side verdict is a failure in $p:"
+              grep -m1 -A12 'error_message' "$p" || true
+              exit 1
+            fi
+          done
+          # An empty or foreign suite must not pass as "our test was fine".
+          grep -q 'NodeBootSmokeTest' "${protos[@]}" \
+            || { echo "::error::NodeBootSmokeTest is missing from the device-side results"; exit 1; }
+          grep -q 'test_status: PASSED' "${protos[@]}" \
+            || { echo "::error::no PASSED verdict recorded"; exit 1; }
+          if [ "${{ steps.gmd.outcome }}" != "success" ]; then
+            echo "::warning title=UTP results transport failed::the gradle task failed only in the UTP results stream (known AGP/UTP gRPC bug, issue 335857362); the device-side verdict is PASSED"
+          fi
+          echo "device-side verdict: PASSED"
 
       # Results + per-test logcat — the boot verdict/diagnostics live here when
       # the test fails. Not on green runs: that bundle is dead weight.
