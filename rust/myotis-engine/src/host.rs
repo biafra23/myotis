@@ -2387,8 +2387,13 @@ pub fn log_index_status_json(handle: i64) -> String {
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
-        return eljson::error_json("node is not running");
+    // Propagate snapshot_reader's reason like the verified-read natives do:
+    // with the host-side wake gate gone from this probe, a paused chain's
+    // status is the first thing a caller sees — "handle is paused" points at
+    // `resume`, where a collapsed "node is not running" pointed at start.
+    let (reader, _, _) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
     };
     let rate_bps = reader.log_index_rate_bps();
     // Measured against the ANCHORED HEAD, which is what `latest` resolves to
