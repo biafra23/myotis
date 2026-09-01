@@ -229,23 +229,34 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
 // cargo is missing. When the bare name is NOT on the daemon's PATH but the
 // standard rustup install dir ($CARGO_HOME/bin, default ~/.cargo/bin) has it,
 // every Rust probe and cargo* task runs with that dir prepended to PATH.
-// A PATH override — not absolute tool paths in each commandLine — so the fix
-// reaches the whole process tree: cargo's own rustc/rustup shims, `cargo ndk`
-// subcommand resolution, and the bare `cargo` call inside build-android.sh.
-// null when bare `cargo` already resolves (a terminal build: zero change) or
-// when the fallback dir has no cargo either (the toolchain is really missing).
+// A PATH override — not only absolute tool paths in each commandLine — so the
+// fix reaches the whole process tree: cargo's own rustc/rustup shims,
+// `cargo ndk` subcommand resolution, and the bare `cargo` call inside
+// build-android.sh. null when bare `cargo` already resolves (a terminal build:
+// zero change) or when the fallback dir has no cargo either (the toolchain is
+// really missing). (On Windows a second `PATH` key can duplicate the inherited
+// `Path` with unspecified precedence — acceptable: the launchd problem is
+// macOS-specific, and rustTool below fixes the direct invocations regardless.)
 val isWindowsHost = System.getProperty("os.name").lowercase().contains("win")
 val rustToolBinDir: File? = run {
     val exe = if (isWindowsHost) "cargo.exe" else "cargo"
+    fun executableIn(dir: File) = dir.resolve(exe).let { it.isFile && it.canExecute() }
     val envPath = System.getenv("PATH") ?: ""
-    val onPath = envPath.split(File.pathSeparator).any { it.isNotEmpty() && File(it, exe).canExecute() }
+    val onPath = envPath.split(File.pathSeparator).any { it.isNotEmpty() && executableIn(File(it)) }
     if (onPath) return@run null
-    listOfNotNull(System.getenv("CARGO_HOME")?.let { File(it) }, File(System.getProperty("user.home"), ".cargo"))
+    listOfNotNull(
+        // Set-but-empty must mean unset, same as rustTargetTriple below.
+        System.getenv("CARGO_HOME")?.takeIf { it.isNotBlank() }?.let { File(it) },
+        File(System.getProperty("user.home"), ".cargo"),
+    )
         .map { it.resolve("bin") }
-        .firstOrNull { it.resolve(exe).canExecute() }
+        .firstOrNull { executableIn(it) }
 }
-val rustToolchainPath: String? = rustToolBinDir?.let {
-    "${it.absolutePath}${File.pathSeparator}${System.getenv("PATH") ?: ""}"
+val rustToolchainPath: String? = rustToolBinDir?.let { bin ->
+    // No trailing separator when PATH is unset: an empty PATH element means cwd.
+    val envPath = System.getenv("PATH")
+    if (envPath.isNullOrEmpty()) bin.absolutePath
+    else "${bin.absolutePath}${File.pathSeparator}$envPath"
 }
 
 // The PATH override alone is not enough for direct invocations: Java resolves a
@@ -257,7 +268,7 @@ val rustToolchainPath: String? = rustToolBinDir?.let {
 // shells and cargo DO search the child PATH).
 fun rustTool(name: String): String {
     val exe = if (isWindowsHost) "$name.exe" else name
-    return rustToolBinDir?.resolve(exe)?.takeIf { it.canExecute() }?.absolutePath ?: name
+    return rustToolBinDir?.resolve(exe)?.takeIf { it.isFile && it.canExecute() }?.absolutePath ?: name
 }
 
 // Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
@@ -492,7 +503,7 @@ tasks.register<Exec>("cargoNdkAndroid") {
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
     // through bash there (Git for Windows ships one alongside git itself).
-    if (System.getProperty("os.name").lowercase().contains("win")) {
+    if (isWindowsHost) {
         commandLine("bash", "./build-android.sh")
     } else {
         commandLine("./build-android.sh")
