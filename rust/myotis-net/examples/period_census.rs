@@ -1,8 +1,16 @@
 //! Period census: crawl a chain's discv5 DHT and ask EVERY fork-matched peer
 //! for `light_client_updates_by_range` at ONE period, then report the
 //! sync-committee participation of each answer. Answers the operational
-//! question "does anybody on this network serve a VERIFIABLE update for
-//! period N?" — a light client needs >= 2/3 participation to accept one.
+//! question "does anybody on this network serve a plausible update for
+//! period N?" — a light client needs >= 2/3 participation to accept one, so a
+//! peer below that bar can never satisfy it.
+//!
+//! SCOPE: this counts participation BITS. It does not verify the BLS aggregate,
+//! applicability, or the Merkle branches — `LightClientProcessor::process_update`
+//! does that against a trusted committee, which a one-shot crawler has no anchor
+//! for. A forged update with 512 bits set would be reported as claiming a
+//! supermajority. Use this to answer "is the data out there at all", not "is
+//! this peer honest".
 //!
 //! Written for the mainnet period-1840 stall (2026-09-01), where one server's
 //! stored update had 113/512 and wallets could not advance past it.
@@ -246,9 +254,9 @@ async fn main() {
             Verdict::Serves(bits, slot) => {
                 servers.push((peer.clone(), addr.clone(), *bits, *slot, *secs));
                 if *bits >= need {
-                    "SERVES_VERIFIABLE"
+                    "claims-supermajority"
                 } else {
-                    "serves-TOO-WEAK"
+                    "below-2/3-bar"
                 }
             }
             Verdict::RespondedUndecodable => "responded-undecodable",
@@ -275,24 +283,28 @@ async fn main() {
     }
     println!("identify-advertised LC protocol: {}", identify_lc.len());
     let _ = ws;
-    let verifiable = servers.iter().filter(|s| s.2 >= need).count();
+    let supermajority = servers.iter().filter(|s| s.2 >= need).count();
     println!(
-        "\nANSWERS FOR PERIOD {} ({} total, {} VERIFIABLE, {} too weak):",
+        "\nANSWERS FOR PERIOD {} ({} total, {} claim >= 2/3, {} below the bar):",
         period,
         servers.len(),
-        verifiable,
-        servers.len() - verifiable
+        supermajority,
+        servers.len() - supermajority
     );
     servers.sort_by(|a, b| b.2.cmp(&a.2));
     for (peer, addr, bits, slot, secs) in &servers {
         let offset = slot.saturating_sub(period * 8192);
-        let mark = if *bits >= need { "OK  " } else { "WEAK" };
+        let mark = if *bits >= need { ">=2/3" } else { "WEAK " };
         println!(
             "  [{mark}] {bits:>3}/512  attested slot {slot} (offset {offset})  rtt={secs:.1}s  {addr}/p2p/{peer}"
         );
     }
     println!(
-        "\nVERDICT: {} peer(s) on {} serve a period-{} update a light client can accept.",
-        verifiable, config.name, period
+        "\nVERDICT: {} peer(s) on {} serve a period-{} update whose sync aggregate\n\
+         CLAIMS a >=2/3 supermajority. This census counts participation bits ONLY —\n\
+         it does NOT verify the BLS aggregate, applicability, or Merkle branches\n\
+         (that needs a processor anchored to a trusted committee). Read it as\n\
+         'the data exists and is not obviously too weak', not as 'proven good'.",
+        supermajority, config.name, period
     );
 }
