@@ -13,6 +13,32 @@ import java.util.Properties
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
+// R8/D8 override: AGP 8.7.3 bundles R8 8.7.18, which predates Kotlin 2.2 and
+// cannot parse this build's Kotlin 2.2.21 metadata — every Android dex step
+// then warns "An error occurred when parsing kotlin metadata" per Kotlin
+// class, and an R8-minified build ships stale/dropped @Metadata (visible to
+// kotlin-reflect). The remedy while AGP is older than the Kotlin toolchain is
+// pinning a newer R8 on the root buildscript classpath (the R8 project's
+// documented override; the compatible versions come from
+// developer.android.com/studio/build/kotlin-d8-r8-versions): 8.13.19 is that
+// table's Kotlin 2.3 row (AGP 8.2.2-8.13, which includes 8.7.3) — a superset
+// of the Kotlin 2.2 row's 8.10.21 (AGP 7.3.1-8.10), so it reads this build's
+// 2.2 metadata and already covers a Kotlin 2.3 bump. Drop this whole block
+// when AGP moves past 8.10 while Kotlin is 2.2 (the bundled R8 then reads 2.2
+// natively); if Kotlin bumps to 2.3 first, the pin is still needed up to AGP 8.13.
+buildscript {
+    repositories {
+        google {
+            // Filtered per the convention for special-purpose repos in
+            // settings.gradle.kts: this entry exists only to serve the R8 pin.
+            content { includeGroup("com.android.tools") }
+        }
+    }
+    dependencies {
+        classpath("com.android.tools:r8:8.13.19")
+    }
+}
+
 plugins {
     java
     // Load the Android/Kotlin/Compose plugins once on the root classpath (apply false) so
