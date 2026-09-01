@@ -21,9 +21,11 @@ import org.gradle.process.ExecOperations
 // pinning a newer R8 on the root buildscript classpath (the R8 project's
 // documented override; the compatible versions come from
 // developer.android.com/studio/build/kotlin-d8-r8-versions): 8.13.19 is that
-// table's version for AGP 8.2.2-8.13 and understands Kotlin 2.2/2.3 metadata.
-// Drop this whole block when AGP itself moves past 8.10 — the bundled R8 then
-// understands Kotlin 2.2 natively.
+// table's Kotlin 2.3 row (AGP 8.2.2-8.13, which includes 8.7.3) — a superset
+// of the Kotlin 2.2 row's 8.10.21 (AGP 7.3.1-8.10), so it reads this build's
+// 2.2 metadata and already covers a Kotlin 2.3 bump. Drop this whole block
+// when AGP moves past 8.10 while Kotlin is 2.2 (the bundled R8 then reads 2.2
+// natively); if Kotlin bumps to 2.3 first, the pin is still needed up to AGP 8.13.
 buildscript {
     repositories {
         google {
