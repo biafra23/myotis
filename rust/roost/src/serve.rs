@@ -320,7 +320,19 @@ async fn resolve_fork_digest(
     archived
 }
 
-/// Fill every period the upstream still serves that we do not already hold.
+/// Fill every period the upstream still serves that we do not already hold —
+/// and REFRESH every held period whose record is provisional: below the
+/// light-client supermajority or undecodable by this build. An update captured
+/// while its period was in progress can carry a fraction of the committee
+/// (observed: 113/512 at mainnet period 1840, frozen by the old
+/// `has_period`-skip, stalling every wallet's catch-up), and this daemon's
+/// slot ticker captures a new period within minutes of rollover — so without
+/// the refresh rule the daemon re-earns that freeze on every rollover no
+/// matter what the CLI ingest does. Unlike the CLI ingest, the daemon does NOT
+/// always refetch the in-progress period: it refreshes only while the record
+/// is below the bar, so each period costs a handful of strictly-improving
+/// appends and goes quiet once wallets can use it (the shared
+/// `needs_refetch`/`should_replace` rules in main.rs, `in_progress = false`).
 async fn fill_periods(
     client: &NimbusRest,
     store: &LcStore,
@@ -330,7 +342,16 @@ async fn fill_periods(
 ) -> Result<usize> {
     let mut fetched = 0;
     for period in floor..=head_period {
-        if store.has_period(period) {
+        let held = store.has_period(period);
+        let stored = if held {
+            store
+                .update_ssz(period)
+                .as_deref()
+                .and_then(crate::participation_of)
+        } else {
+            None
+        };
+        if !crate::needs_refetch(held, stored, false) {
             continue;
         }
         // One flaky request out of ~1300 must not abort a whole backfill; the
@@ -350,6 +371,16 @@ async fn fill_periods(
             }
         };
         for c in &chunks {
+            if held {
+                let fresh = crate::participation_of(&c.ssz);
+                if !crate::should_replace(stored, fresh) {
+                    tracing::debug!(period, ?stored, ?fresh,
+                        "provisional record kept — upstream no better");
+                    continue;
+                }
+                tracing::info!(period, ?stored, ?fresh,
+                    "replacing a provisional update");
+            }
             archive.append(period, c.fork_digest, &c.ssz)?;
             store.insert_update(period, c.fork_digest, &c.ssz);
             fetched += 1;
@@ -848,14 +879,16 @@ pub async fn serve(
                 }
 
                 // A new period turns over every ~27 hours; checking each slot is
-                // free next to the HTTP calls above.
+                // free next to the HTTP calls above. No has_period guard:
+                // fill_periods itself decides — it also REFRESHES a held record
+                // that is still below the supermajority bar (the guard was what
+                // froze a 113/512 capture at mainnet period 1840), and it makes
+                // zero upstream calls once the record clears the bar.
                 let p = params.period_of_slot(head_slot);
-                if !store.has_period(p) {
-                    match fill_periods(&client, &store, &mut archive, p, p).await {
-                        Ok(n) if n > 0 => tracing::info!(period = p, "archived a new period"),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "filling the new period failed"),
-                    }
+                match fill_periods(&client, &store, &mut archive, p, p).await {
+                    Ok(n) if n > 0 => tracing::info!(period = p, "archived a new period"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "filling the new period failed"),
                 }
             }
         }

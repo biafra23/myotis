@@ -36,6 +36,10 @@ path = "src/main.rs"
 # `decode_multi_chunk_response` / `protocols`. The whole point is to serve bytes
 # our own wallets are already proven against.
 myotis-net = { path = "../myotis-net" }
+# Decode LightClientUpdate at ingest to judge sync-aggregate participation:
+# an update captured while its period is in progress can carry a fraction of
+# the committee, and a wallet refuses < 2/3 — see the ingest fill loop.
+myotis-consensus = { path = "../myotis-consensus" }
 
 # An async HTTP client is a genuine gap in the Rust workspace (it has only
 # serde_json today). rustls rather than native-tls: this is a Linux daemon, and
