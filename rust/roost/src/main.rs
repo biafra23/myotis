@@ -409,9 +409,14 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
     let mut newest_digest = None;
     for period in floor..=head_period {
         let stored = participation.get(&period).copied();
-        let weak = stored.is_some_and(|p| {
-            p * 3 < myotis_consensus::spec::SYNC_COMMITTEE_SIZE * 2
-        });
+        // An UNDECODABLE stored record (stored=None while the period is held)
+        // is provisional too: it serves nobody a build with this decoder can
+        // serve, and freezing it would be the same stall class this loop
+        // exists to prevent — a decodable fresh update is a strict upgrade.
+        let weak = store.has_period(period)
+            && stored.is_none_or(|p| {
+                p * 3 < myotis_consensus::spec::SYNC_COMMITTEE_SIZE * 2
+            });
         if store.has_period(period) && !weak && period != head_period {
             continue;
         }
@@ -422,10 +427,13 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
             continue;
         }
         let mut stored_now = 0usize;
+        let was_held = store.has_period(period);
         for c in &chunks {
-            if store.has_period(period) {
-                let fresh = participation_of(&c.ssz);
-                match (stored, fresh) {
+            if was_held {
+                match (stored, participation_of(&c.ssz)) {
+                    // A fresh update this build cannot decode can't be judged —
+                    // keep what we have rather than churn blindly.
+                    (_, None) => continue,
                     (Some(old), Some(new)) if new <= old => {
                         println!(
                             "  period {period}: upstream no better \
@@ -439,10 +447,12 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
                              ({old} -> {new} participants)"
                         );
                     }
-                    // An undecodable side (foreign fork shape for this build's
-                    // decoder) can't be compared — keep what we have rather
-                    // than churn on a judgement we cannot make.
-                    _ => continue,
+                    (None, Some(new)) => {
+                        println!(
+                            "  period {period}: replacing an undecodable stored \
+                             update ({new} participants)"
+                        );
+                    }
                 }
             }
             archive.append(period, c.fork_digest, &c.ssz)?;
@@ -450,12 +460,12 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
             fetched += 1;
             stored_now += 1;
         }
-        if stored_now > 0 && stored.is_none() {
+        if stored_now > 0 && !was_held {
             println!("  period {period}: stored {stored_now} chunk(s)");
         }
     }
     archive.flush()?;
-    println!("  fetched   {fetched} new period(s)");
+    println!("  fetched   {fetched} update(s) (new or replaced)");
 
     // The newest period's digest, used as the interim context bytes for the
     // single-object endpoints below.

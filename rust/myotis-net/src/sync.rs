@@ -2389,11 +2389,15 @@ async fn catch_up(
             if round_rejects > 0 {
                 // Loud on purpose (hosts keep info+ only in their log rings): a
                 // round whose staged update for the target period keeps failing
-                // verification is how a serving peer holding a weak or foreign
-                // update stalls catch-up INDEFINITELY — exactly this shape hid
-                // a server-side weak-participation update (113/512 signers at
+                // verification is how a serving peer holding a weak update
+                // stalls catch-up INDEFINITELY — exactly this shape hid a
+                // server-side weak-participation update (113/512 signers at
                 // mainnet period 1840) behind debug-only logs for days. The
                 // per-check reason logs at debug in myotis_consensus::store.
+                // (Counts verify-rejects only; a chunk that fails DECODE stays
+                // debug — apply_staged_step reports it as neither applied nor
+                // rejected, because malformed frames say nothing about our
+                // store or the period's data.)
                 tracing::warn!(period = processor.store.current_period(),
                     rejects = round_rejects, idle_rounds,
                     "catch-up: staged update for the target period failed verification — \
