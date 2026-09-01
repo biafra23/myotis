@@ -570,16 +570,17 @@ where
         last_err: String::new(),
     };
     // ONE push site: two `async move` blocks are distinct anonymous types and
-    // could not share a FuturesUnordered without boxing every attempt.
-    let mut start_another = true;
+    // could not share a FuturesUnordered without boxing every attempt. Pushed
+    // whenever there is capacity: every select arm below that continues the
+    // loop — failed attempt, non-verdict answer, hedge timer — is a
+    // "start another" trigger, so no flag needs to gate this.
     loop {
-        if start_another && next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
+        if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
             let idx = next;
             let fut = make(peers[idx].clone());
             in_flight.push(async move { (idx, fut.await) });
             next += 1;
         }
-        start_another = false;
         if in_flight.is_empty() {
             break;
         }
@@ -595,19 +596,15 @@ where
                     // a different peer can still verify.
                     out.missed.push(idx);
                     out.fallback.get_or_insert(value);
-                    start_another = true;
                 }
                 Err(e) => {
                     out.missed.push(idx);
                     out.last_err = e;
-                    start_another = true;
                 }
             },
-            // Nobody answered in time and a candidate remains: start it
-            // ALONGSIDE the ones running, never instead of them.
-            _ = hedge, if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS => {
-                start_another = true;
-            }
+            // Nobody answered in time and a candidate remains: wake the loop,
+            // which starts it ALONGSIDE the ones running, never instead of them.
+            _ = hedge, if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS => {}
             else => break,
         }
     }
