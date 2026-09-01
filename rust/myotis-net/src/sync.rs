@@ -2177,6 +2177,7 @@ async fn catch_up(
 
         let staged_before = staged.len();
         let mut poisoned_this_round = false;
+        let mut round_rejects = 0usize;
         let mut in_flight: FuturesUnordered<_> = peers
             .into_iter()
             .map(|peer| {
@@ -2278,6 +2279,7 @@ async fn catch_up(
                 let before_period = processor.store.current_period();
                 let (applied_now, verify_rejects, applied_from) =
                     apply_staged_step(processor, staged, slot_estimate);
+                round_rejects += verify_rejects;
                 // ORDER MATTERS: an apply in this batch BLS-verified against
                 // the restored committee and proves the snapshot genuine —
                 // confirm() must win over poison accounting (a reject in the
@@ -2384,6 +2386,19 @@ async fn catch_up(
             empty_backoff = Duration::from_secs(0);
         } else {
             idle_rounds += 1;
+            if round_rejects > 0 {
+                // Loud on purpose (hosts keep info+ only in their log rings): a
+                // round whose staged update for the target period keeps failing
+                // verification is how a serving peer holding a weak or foreign
+                // update stalls catch-up INDEFINITELY — exactly this shape hid
+                // a server-side weak-participation update (113/512 signers at
+                // mainnet period 1840) behind debug-only logs for days. The
+                // per-check reason logs at debug in myotis_consensus::store.
+                tracing::warn!(period = processor.store.current_period(),
+                    rejects = round_rejects, idle_rounds,
+                    "catch-up: staged update for the target period failed verification — \
+                     the serving peer may hold a weak-participation update for it");
+            }
             if idle_rounds >= CATCHUP_MAX_IDLE_ROUNDS {
                 tracing::warn!(period = processor.store.current_period(), idle_rounds,
                     "catch-up made no progress — returning to the poll loop");

@@ -3099,6 +3099,7 @@ version = "0.1.7"
 dependencies = [
  "myotis-bls",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -4253,6 +4254,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "hex",
+ "myotis-consensus",
  "myotis-net",
  "reqwest",
  "serde_json",

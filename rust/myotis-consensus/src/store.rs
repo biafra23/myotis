@@ -198,6 +198,7 @@ impl LightClientProcessor {
 
     pub fn process_update(&mut self, update: &LightClientUpdate) -> bool {
         let Some(committee) = self.store.current_sync_committee() else {
+            tracing::debug!("update rejected: store has no current sync committee");
             return false;
         };
 
@@ -212,6 +213,10 @@ impl LightClientProcessor {
             sig_period == store_period
         };
         if !applicable {
+            tracing::debug!(store_period, sig_period, have_next,
+                signature_slot = update.signature_slot,
+                attested_slot = update.attested_header.beacon.slot,
+                "update rejected: not applicable to the store's period");
             return false;
         }
 
@@ -222,6 +227,11 @@ impl LightClientProcessor {
             &self.fork_version,
             &self.genesis_validators_root,
         ) {
+            tracing::debug!(store_period, sig_period,
+                signature_slot = update.signature_slot,
+                attested_slot = update.attested_header.beacon.slot,
+                participants = update.sync_aggregate.count_participants(),
+                "update rejected: sync-aggregate BLS verification failed");
             return false;
         }
 
@@ -234,12 +244,20 @@ impl LightClientProcessor {
             spec::finalized_root_gindex(depth),
             &update.attested_header.beacon.state_root,
         ) {
+            tracing::debug!(depth,
+                finalized_slot = update.finalized_header.beacon.slot,
+                attested_slot = update.attested_header.beacon.slot,
+                "update rejected: finality branch does not verify");
             return false;
         }
 
         if !Self::verify_execution_branch(&update.attested_header)
             || !Self::verify_execution_branch(&update.finalized_header)
         {
+            tracing::debug!(
+                attested_slot = update.attested_header.beacon.slot,
+                finalized_slot = update.finalized_header.beacon.slot,
+                "update rejected: execution branch does not verify");
             return false;
         }
 
@@ -253,6 +271,9 @@ impl LightClientProcessor {
                 spec::next_sync_committee_gindex(depth),
                 &update.attested_header.beacon.state_root,
             ) {
+                tracing::debug!(depth,
+                    attested_slot = update.attested_header.beacon.slot,
+                    "update rejected: next-sync-committee branch does not verify");
                 return false;
             }
             self.store

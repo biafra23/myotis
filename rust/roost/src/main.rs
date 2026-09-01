@@ -356,9 +356,22 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 
     // Memory is an accelerator in front of the archive, so the store is rebuilt
     // from it on every start. Re-encoding 1327 periods is milliseconds.
+    // Participation is decoded alongside: the fill loop below uses it to decide
+    // whether a stored update is provisional. Last record per period wins, the
+    // same last-wins rule insert_update applies.
     let store = LcStore::new();
+    let mut participation: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
     for (period, rec) in &records {
         store.insert_update(*period, rec.fork_digest, &rec.ssz);
+        match participation_of(&rec.ssz) {
+            Some(p) => {
+                participation.insert(*period, p);
+            }
+            None => {
+                participation.remove(period);
+            }
+        }
     }
 
     let (head_slot, syncing) = client.syncing().await?;
@@ -379,10 +392,27 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
     println!("  window    periods {floor}..={head_period}");
 
     println!("\n== fill ==");
+    // A stored update is PROVISIONAL — refetched, not frozen — when its
+    // sync-aggregate participation is below the light-client supermajority
+    // (participants*3 < SYNC_COMMITTEE_SIZE*2) or its period is still in
+    // progress. Upstream's by-range answer is its best update SEEN SO FAR, so
+    // an ingest that runs early in a period can capture the period's first
+    // slots' update carrying a fraction of the committee (observed: 113/512 at
+    // mainnet period 1840, attested at the period's slot 0) — and a wallet
+    // REFUSES < 2/3, so a frozen weak update stalls every catch-up through
+    // that period, silently, forever. `has_period` used to be that freezer.
+    // Replacement is strictly-better-only (more participants), so a repeated
+    // ingest never grows the archive with equal copies; the append-only
+    // archive + last-wins insert_update/rebuild make the better record
+    // supersede on this run and on every later start.
     let mut fetched = 0usize;
     let mut newest_digest = None;
     for period in floor..=head_period {
-        if store.has_period(period) {
+        let stored = participation.get(&period).copied();
+        let weak = stored.is_some_and(|p| {
+            p * 3 < myotis_consensus::spec::SYNC_COMMITTEE_SIZE * 2
+        });
+        if store.has_period(period) && !weak && period != head_period {
             continue;
         }
         let resp = client.updates(period, 1).await?;
@@ -391,12 +421,38 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
             println!("  period {period}: upstream returned no data, skipping");
             continue;
         }
+        let mut stored_now = 0usize;
         for c in &chunks {
+            if store.has_period(period) {
+                let fresh = participation_of(&c.ssz);
+                match (stored, fresh) {
+                    (Some(old), Some(new)) if new <= old => {
+                        println!(
+                            "  period {period}: upstream no better \
+                             ({new} <= {old} participants), keeping"
+                        );
+                        continue;
+                    }
+                    (Some(old), Some(new)) => {
+                        println!(
+                            "  period {period}: replacing a provisional update \
+                             ({old} -> {new} participants)"
+                        );
+                    }
+                    // An undecodable side (foreign fork shape for this build's
+                    // decoder) can't be compared — keep what we have rather
+                    // than churn on a judgement we cannot make.
+                    _ => continue,
+                }
+            }
             archive.append(period, c.fork_digest, &c.ssz)?;
             store.insert_update(period, c.fork_digest, &c.ssz);
             fetched += 1;
+            stored_now += 1;
         }
-        println!("  period {period}: stored {} chunk(s)", chunks.len());
+        if stored_now > 0 && stored.is_none() {
+            println!("  period {period}: stored {stored_now} chunk(s)");
+        }
     }
     archive.flush()?;
     println!("  fetched   {fetched} new period(s)");
@@ -469,6 +525,15 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 
     serving_self_check(&store, &c, bootstrap_root)?;
     Ok(())
+}
+
+/// Sync-aggregate participant count of an SSZ-encoded `LightClientUpdate`, or
+/// `None` when it does not decode with this build's (fork-polymorphic) decoder.
+/// Used by ingest to judge whether a stored update is provisional.
+fn participation_of(ssz: &[u8]) -> Option<usize> {
+    myotis_consensus::types::LightClientUpdate::decode(ssz)
+        .ok()
+        .map(|u| u.sync_aggregate.count_participants())
 }
 
 /// Serve from the store exactly as the libp2p responder will, and decode the
