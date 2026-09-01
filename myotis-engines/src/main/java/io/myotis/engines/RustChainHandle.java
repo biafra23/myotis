@@ -1081,7 +1081,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /** Log-index status JSON ({"error":...} when the gate is down). */
     @Override
     public String logIndexStatusJson() {
-        return gated(() -> RustEngineNative.nativeLogIndexStatusJson(handle));
+        // NOT gated(): this is a STATUS PROBE the hosts poll every ~2s for the UI
+        // snapshot (Android AndroidNodeBridge.snapshots, desktop DesktopNode). The
+        // gated() wake-and-hold waits up to WAKE_WAIT_CAP_MS for readyForReads() —
+        // which a booting, catching-up, or STALE_ANCHOR-parked chain never
+        // satisfies — so gating here stalled every snapshot emission ~90s per
+        // unready chain and froze the whole UI at its previous state (chains
+        // rendered "stopped" while running; the stale-anchor consent appeared to
+        // do nothing). It also stamped activity + woke paused stacks on every
+        // poll, fighting the idle-pause controller. The native answers with
+        // {"error":...} on its own when the gate is down — exactly the not-ready
+        // shape this method documents — so no readiness hold is needed.
+        return RustEngineNative.nativeLogIndexStatusJson(handle);
     }
 
     /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */
