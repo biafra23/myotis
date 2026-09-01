@@ -226,24 +226,29 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
 // GUI-launched IDEs inherit launchd's minimal PATH on macOS (no ~/.cargo/bin),
 // so a Rust toolchain that works from a terminal "vanishes" when the same build
 // runs inside Android Studio — requireAndroidRustEngine then fails claiming
-// cargo is missing. When the bare name is NOT on the daemon's PATH but the
-// standard rustup install dir ($CARGO_HOME/bin, default ~/.cargo/bin) has it,
-// every Rust probe and cargo* task runs with that dir prepended to PATH.
-// A PATH override — not only absolute tool paths in each commandLine — so the
-// fix reaches the whole process tree: cargo's own rustc/rustup shims,
-// `cargo ndk` subcommand resolution, and the bare `cargo` call inside
-// build-android.sh. null when bare `cargo` already resolves (a terminal build:
-// zero change) or when the fallback dir has no cargo either (the toolchain is
-// really missing). (On Windows a second `PATH` key can duplicate the inherited
-// `Path` with unspecified precedence — acceptable: the launchd problem is
-// macOS-specific, and rustTool below fixes the direct invocations regardless.)
+// cargo is missing. rustToolBinDir is the directory holding cargo: from the
+// daemon's PATH when present, else the standard rustup install dir
+// ($CARGO_HOME/bin, default ~/.cargo/bin); null only when cargo is in neither
+// (the toolchain is really missing). It feeds two mechanisms, both needed:
+//   • rustTool resolves direct cargo/rustup invocations to absolute paths —
+//     exec resolves a bare command name against the PATH the JVM captured at
+//     its FIRST process spawn, not the current System.getenv, so even a
+//     PATH-listed cargo is resolved absolutely (a Studio-spawned daemon reused
+//     by a terminal build syncs the env but keeps the frozen exec search path);
+//   • rustToolchainPath prepends the dir to each probe's/task's child PATH,
+//     reaching what those processes spawn: cargo's rustc/rustup shims,
+//     `cargo ndk` subcommand lookup, the bare `cargo` inside build-android.sh.
+// (On Windows a second `PATH` key can duplicate the inherited `Path` with
+// unspecified precedence — acceptable: the launchd problem is macOS-specific,
+// and rustTool fixes the direct invocations regardless.)
 val isWindowsHost = System.getProperty("os.name").lowercase().contains("win")
 val rustToolBinDir: File? = run {
     val exe = if (isWindowsHost) "cargo.exe" else "cargo"
     fun executableIn(dir: File) = dir.resolve(exe).let { it.isFile && it.canExecute() }
     val envPath = System.getenv("PATH") ?: ""
-    val onPath = envPath.split(File.pathSeparator).any { it.isNotEmpty() && executableIn(File(it)) }
-    if (onPath) return@run null
+    envPath.split(File.pathSeparator)
+        .firstOrNull { it.isNotEmpty() && executableIn(File(it)) }
+        ?.let { return@run File(it) }
     listOfNotNull(
         // Set-but-empty must mean unset, same as rustTargetTriple below.
         System.getenv("CARGO_HOME")?.takeIf { it.isNotBlank() }?.let { File(it) },
@@ -251,6 +256,11 @@ val rustToolBinDir: File? = run {
     )
         .map { it.resolve("bin") }
         .firstOrNull { executableIn(it) }
+        ?.also {
+            // Self-announcing, but only at --info: an engaged fallback means the
+            // cargo this build runs is not the one `which cargo` shows in a shell.
+            logger.info("[rust] cargo is not on the daemon's PATH; using $it")
+        }
 }
 val rustToolchainPath: String? = rustToolBinDir?.let { bin ->
     // No trailing separator when PATH is unset: an empty PATH element means cwd.
@@ -259,13 +269,9 @@ val rustToolchainPath: String? = rustToolBinDir?.let { bin ->
     else "${bin.absolutePath}${File.pathSeparator}$envPath"
 }
 
-// The PATH override alone is not enough for direct invocations: Java resolves a
-// bare command name against the PARENT JVM's PATH, not the child's environment
-// map, so `commandLine("cargo", …)` would still miss the fallback dir. Every
-// direct cargo/rustup invocation therefore goes through this resolver; the PATH
-// override still matters for everything those processes spawn (cargo → rustc,
-// `cargo ndk` subcommand lookup, the bare `cargo` inside build-android.sh —
-// shells and cargo DO search the child PATH).
+// Every direct cargo/rustup invocation goes through this resolver (see the
+// rustToolBinDir rationale above); a tool not present in that dir (clang) falls
+// through to the bare name and resolves as before.
 fun rustTool(name: String): String {
     val exe = if (isWindowsHost) "$name.exe" else name
     return rustToolBinDir?.resolve(exe)?.takeIf { it.isFile && it.canExecute() }?.absolutePath ?: name
