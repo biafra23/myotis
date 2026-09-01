@@ -2178,6 +2178,7 @@ async fn catch_up(
         let staged_before = staged.len();
         let mut poisoned_this_round = false;
         let mut round_rejects = 0usize;
+        let mut last_reject_participants: Option<usize> = None;
         let mut in_flight: FuturesUnordered<_> = peers
             .into_iter()
             .map(|peer| {
@@ -2277,9 +2278,12 @@ async fn catch_up(
                 // redundant multi-MiB streams are cancelled behind one
                 // signature verification instead of a full batch of them.
                 let before_period = processor.store.current_period();
-                let (applied_now, verify_rejects, applied_from) =
+                let (applied_now, verify_rejects, applied_from, reject_participants) =
                     apply_staged_step(processor, staged, slot_estimate);
                 round_rejects += verify_rejects;
+                if let Some(p) = reject_participants {
+                    last_reject_participants = Some(p);
+                }
                 // ORDER MATTERS: an apply in this batch BLS-verified against
                 // the restored committee and proves the snapshot genuine —
                 // confirm() must win over poison accounting (a reject in the
@@ -2348,7 +2352,7 @@ async fn catch_up(
             let mut drained = 0usize;
             loop {
                 let before_period = processor.store.current_period();
-                let (applied_now, _verify_rejects, applied_from) =
+                let (applied_now, _verify_rejects, applied_from, _reject_participants) =
                     apply_staged_step(processor, staged, slot_estimate);
                 if applied_now == 0 {
                     break;
@@ -2400,8 +2404,9 @@ async fn catch_up(
                 // store or the period's data.)
                 tracing::warn!(period = processor.store.current_period(),
                     rejects = round_rejects, idle_rounds,
+                    participants = ?last_reject_participants,
                     "catch-up: staged update for the target period failed verification — \
-                     the serving peer may hold a weak-participation update for it");
+                     below-2/3 participants means the serving peer holds a weak update");
             }
             if idle_rounds >= CATCHUP_MAX_IDLE_ROUNDS {
                 tracing::warn!(period = processor.store.current_period(), idle_rounds,
@@ -2437,9 +2442,12 @@ async fn catch_up(
 /// (`force_rotate_if_past_period` on the recorded wall-clock estimate — Java
 /// `applyCatchUpResponses`). A chunk that fails decode/verify is dropped from
 /// the buffer so the next round refetches that period from a different peer.
-/// Returns `(applied, verify_rejects, applied_from)` — applied and
-/// verify_rejects are each 0 or 1, and applied_from is the shared-cache key
-/// of the peer whose response staged the applied chunk (None unless applied).
+/// Returns `(applied, verify_rejects, applied_from, reject_participants)` —
+/// applied and verify_rejects are each 0 or 1, applied_from is the
+/// shared-cache key of the peer whose response staged the applied chunk (None
+/// unless applied), and reject_participants is the rejected update's
+/// sync-aggregate participant count (None unless a verify-reject), carried so
+/// the round's WARN can name a weak-server stall at info level.
 /// verify_rejects counts ONLY an update that decoded fine but failed
 /// BLS/Merkle verification (`process_update` → false): that is the resume
 /// guard's poison signal, since a corrupt restored committee rejects every
@@ -2449,10 +2457,10 @@ fn apply_staged_step(
     processor: &mut LightClientProcessor,
     staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
     slot_estimate: u64,
-) -> (usize, usize, Option<String>) {
+) -> (usize, usize, Option<String>, Option<usize>) {
     let target_period = processor.store.current_period();
     let Some(chunk) = staged.remove(&target_period) else {
-        return (0, 0, None);
+        return (0, 0, None, None);
     };
     match LightClientUpdate::decode(&chunk.ssz) {
         Ok(update) => {
@@ -2462,17 +2470,20 @@ fn apply_staged_step(
                     finalized_slot = update.finalized_header.beacon.slot,
                     period = processor.store.current_period(),
                     "catch-up update applied");
-                (1, 0, Some(chunk.from))
+                (1, 0, Some(chunk.from), None)
             } else {
                 tracing::debug!(target_period,
                     finalized_slot = update.finalized_header.beacon.slot,
                     "catch-up update rejected");
-                (0, 1, None)
+                // The participant count rides back so the round's info-level
+                // WARN can say WHY without a debug session: a weak-server
+                // stall (below the 2/3 bar) then reads directly off the warn.
+                (0, 1, None, Some(update.sync_aggregate.count_participants()))
             }
         }
         Err(e) => {
             tracing::debug!(target_period, error = %e, "catch-up update decode failed");
-            (0, 0, None)
+            (0, 0, None, None)
         }
     }
 }

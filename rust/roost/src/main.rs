@@ -450,11 +450,21 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
             if held {
                 let fresh = participation_of(&c.ssz);
                 if !should_replace(stored, fresh) {
-                    if let (Some(old), Some(new)) = (stored, fresh) {
-                        println!(
+                    match (stored, fresh) {
+                        (Some(old), Some(new)) => println!(
                             "  period {period}: upstream no better \
                              ({new} <= {old} participants), keeping"
-                        );
+                        ),
+                        // stdout is the operator's whole interface — a
+                        // provisional period whose upstream answer doesn't
+                        // decode must say so, not stay silent run after run.
+                        (_, None) => println!(
+                            "  period {period}: upstream answer undecodable by \
+                             this build — keeping the held record"
+                        ),
+                        (None, Some(_)) => unreachable!(
+                            "should_replace is true for decodable-over-undecodable"
+                        ),
                     }
                     continue;
                 }
@@ -555,7 +565,7 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 /// Sync-aggregate participant count of an SSZ-encoded `LightClientUpdate`, or
 /// `None` when it does not decode with this build's (fork-polymorphic) decoder.
 /// Used by ingest to judge whether a stored update is provisional.
-fn participation_of(ssz: &[u8]) -> Option<usize> {
+pub(crate) fn participation_of(ssz: &[u8]) -> Option<usize> {
     myotis_consensus::types::LightClientUpdate::decode(ssz)
         .ok()
         .map(|u| u.sync_aggregate.count_participants())
@@ -563,7 +573,7 @@ fn participation_of(ssz: &[u8]) -> Option<usize> {
 
 /// Below the light-client supermajority bar — a wallet REFUSES such an update,
 /// so serving one stalls every catch-up through its period.
-fn below_supermajority(participants: usize) -> bool {
+pub(crate) fn below_supermajority(participants: usize) -> bool {
     participants * 3 < myotis_consensus::spec::SYNC_COMMITTEE_SIZE * 2
 }
 
@@ -573,7 +583,7 @@ fn below_supermajority(participants: usize) -> bool {
 /// the supermajority; or stored undecodable by this build (`stored == None`
 /// while held — a record nobody with this decoder can use). Pure — every
 /// promised ingest property is pinned by the table tests below.
-fn needs_refetch(held: bool, stored: Option<usize>, in_progress: bool) -> bool {
+pub(crate) fn needs_refetch(held: bool, stored: Option<usize>, in_progress: bool) -> bool {
     !held || in_progress || stored.is_none_or(below_supermajority)
 }
 
@@ -582,7 +592,7 @@ fn needs_refetch(held: bool, stored: Option<usize>, in_progress: bool) -> bool {
 /// chunk never replaces anything (it cannot be judged). Strictly-better-only
 /// is what makes repeated ingests idempotent — equal copies are never
 /// re-appended. Pure — pinned by the table tests below.
-fn should_replace(stored: Option<usize>, fresh: Option<usize>) -> bool {
+pub(crate) fn should_replace(stored: Option<usize>, fresh: Option<usize>) -> bool {
     match (stored, fresh) {
         (_, None) => false,
         (None, Some(_)) => true,
