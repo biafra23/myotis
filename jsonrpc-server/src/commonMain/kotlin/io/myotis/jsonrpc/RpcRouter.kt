@@ -277,7 +277,19 @@ class RpcRouter(
             }
         }
         val t0 = TimeSource.Monotonic.markNow()
-        val verified = tryVerified(method, id, root)
+        val verified = try {
+            tryVerified(method, id, root)
+        } catch (e: EngineReadUnavailable) {
+            // A backend read that failed WITH a reason: the same -32000 class
+            // as the generic decline below, but carrying the engine's actual
+            // diagnosis — e.g. "all 8 snap peer(s) failed to serve a
+            // verifiable block: 8x peer returned 0 headers" (the 2026-09-02
+            // stale-pool incident, whose generic "no peer / not synced" text
+            // sent everyone chasing sync state while the node WAS synced).
+            logger.record(method ?: "request", idStr, "ERROR", elapsedMs(t0), -32000)
+            return errorEnvelope(id, -32000,
+                "method '${method ?: "request"}' cannot be served verified right now: ${e.reason}")
+        }
         if (verified != null) {
             // Label the answer for what it IS. A served override ran over
             // verified state but under the CALLER'S hypothesis, so it is not a
@@ -412,6 +424,28 @@ class RpcRouter(
      * The state-reading handlers (eth_call / eth_getBalance / …) are BLOCKING, so
      * they run on the IO dispatcher to keep the Ktor worker thread free.
      */
+    /** Thrown inside [tryVerified] when a backend JSON read carried an engine
+     *  {"error": ...} envelope; caught at the dispatch site in [handleOne] and
+     *  surfaced as -32000 WITH the engine's reason instead of the generic
+     *  no-peer/not-synced text. */
+    private class EngineReadUnavailable(val reason: String) : RuntimeException(reason)
+
+    /** Unwrap an engine error envelope from a JSON-string read result: a
+     *  single-key `{"error": ...}` object throws [EngineReadUnavailable] (so
+     *  the call sites stay one-liners); every normal result — block object,
+     *  receipt array, the literal "null" — passes through untouched. Engines
+     *  return the envelope instead of a bare null exactly when the failure has
+     *  a reason a wallet/operator needs (mirrors the eth_getLogs contract,
+     *  which pioneered the shape for index-coverage errors). */
+    private fun String.orEngineThrow(): String {
+        val parsed = try { json.parseToJsonElement(this) } catch (_: Exception) { return this }
+        val obj = parsed as? JsonObject ?: return this
+        if (obj.size != 1) return this
+        val err = obj["error"] ?: return this
+        val msg = (err as? JsonPrimitive)?.contentOrNull ?: err.toString()
+        throw EngineReadUnavailable(msg)
+    }
+
     private suspend fun tryVerified(method: String?, id: JsonElement, root: JsonObject): String? {
         val b = backend ?: return null
         return when (method) {
@@ -561,14 +595,14 @@ class RpcRouter(
                 // CAN'T verify (not synced / no peer), which falls through to the strict
                 // error — so we never tell the wallet "pending on a healthy chain" when we
                 // actually couldn't check.
-                val receiptJson = withContext(rpcIoDispatcher) { b.getTransactionReceipt(txHash) } ?: return null
+                val receiptJson = withContext(rpcIoDispatcher) { b.getTransactionReceipt(txHash) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
             }
             "eth_getTransactionByHash" -> {
                 val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 // Object string when found (mined or pending-from-our-cache); "null" for a
                 // verified-unknown tx; Kotlin null (can't verify) → strict error.
-                val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) } ?: return null
+                val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(txJson))
             }
             "eth_getBlockByNumber" -> {
@@ -584,7 +618,7 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_getBlockByHash" -> {
@@ -599,7 +633,7 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for an unknown/non-canonical hash; Kotlin
                 // null (can't verify) → strict error.
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             // ---- compat batch: answers derived from reads already served above ----
@@ -638,50 +672,50 @@ class RpcRouter(
             // null) carries through unchanged.
             "eth_getBlockTransactionCountByNumber" -> {
                 val block = root.params().specShapedBlockTag(0) ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getBlockTransactionCountByHash" -> {
                 val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getTransactionByBlockNumberAndIndex" -> {
                 val p = root.params()
                 val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getTransactionByBlockHashAndIndex" -> {
                 val p = root.params()
                 val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleCountByBlockNumber" -> {
                 val block = root.params().specShapedBlockTag(0) ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleCountByBlockHash" -> {
                 val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleByBlockNumberAndIndex" -> {
                 val p = root.params()
                 val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleByBlockHashAndIndex" -> {
                 val p = root.params()
                 val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getBlockReceipts" -> {
@@ -706,7 +740,7 @@ class RpcRouter(
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
                 val receiptsJson =
-                    withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) } ?: return null
+                    withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptsJson))
             }
             "eth_getLogs" -> {

@@ -797,6 +797,34 @@ class RpcRouterTest {
         assertEquals(-32000, errorCode(resp))                    // verified method, can't serve now
     }
 
+    @Test fun getBlockByNumber_engineErrorEnvelope_surfacesMessageAt32000() {
+        // The stale-pool incident (2026-09-02): the engine KNEW the reason and
+        // the wallet saw only "no peer / not synced" while the node was SYNCED.
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun getBlockByNumber(block: String?, fullTransactions: Boolean): String =
+                """{"error":"all 8 snap peer(s) failed to serve a verifiable block: 8x peer returned 0 headers, expected 1"}"""
+        }
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest", false]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+        assertTrue(resp.contains("8x peer returned 0 headers"))
+    }
+
+    @Test fun getBlockByNumber_composite_engineErrorEnvelope_surfacesToo() {
+        // Composites that derive from the block serve (tx count, tx/uncle by
+        // index) must surface the same reason, not embed the envelope as data.
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun getBlockByNumber(block: String?, fullTransactions: Boolean): String =
+                """{"error":"all 8 snap peer(s) failed to serve a verifiable block: 8x request timed out"}"""
+        }
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":["latest"]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+        assertTrue(resp.contains("8x request timed out"))
+    }
+
     @Test fun getLogs_engineErrorEnvelope_surfacesMessageAt32000() {
         val backend = object : VerifiedReads by FakeBackend() {
             override fun getLogs(filterJson: String?): String =
