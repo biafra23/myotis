@@ -5737,6 +5737,54 @@ fn decode_ccip_answer(
 mod tests {
     use super::*;
 
+    /// The whole-pool failure summary: what a stuck wallet's one visible error
+    /// line is built from, so its shape is pinned (2026-09-02 stale-pool
+    /// incident — "8x peer returned 0 headers" was the whole diagnosis).
+    mod failure_summaries {
+        use super::*;
+
+        #[test]
+        fn identical_reasons_collapse_with_a_count() {
+            let f = vec!["peer returned 0 headers, expected 1".to_string(); 8];
+            assert_eq!(
+                summarize_peer_failures(&f),
+                "8x peer returned 0 headers, expected 1"
+            );
+        }
+
+        #[test]
+        fn distinct_reasons_are_listed_most_frequent_first() {
+            let f = vec![
+                "request timed out".to_string(),
+                "peer disconnected".to_string(),
+                "request timed out".to_string(),
+            ];
+            assert_eq!(
+                summarize_peer_failures(&f),
+                "2x request timed out; peer disconnected"
+            );
+        }
+
+        #[test]
+        fn overflow_beyond_the_distinct_cap_is_counted_not_dropped_silently() {
+            let f: Vec<String> = (0..6).map(|i| format!("reason {i}")).collect();
+            let s = summarize_peer_failures(&f);
+            assert!(s.contains("(+2 more distinct reasons)"), "{s}");
+        }
+
+        #[test]
+        fn long_reasons_are_truncated() {
+            let f = vec!["x".repeat(500)];
+            let s = summarize_peer_failures(&f);
+            assert!(s.len() <= 130, "len {}", s.len());
+        }
+
+        #[test]
+        fn empty_input_yields_the_defensive_placeholder() {
+            assert_eq!(summarize_peer_failures(&[]), "no failures recorded");
+        }
+    }
+
     /// Hedging invariants (#320): a silent peer must not hold the read for the
     /// full request timeout, and — the half a naive per-attempt deadline gets
     /// wrong — a slow-but-working peer must still win when the peers after it
