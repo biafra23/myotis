@@ -119,8 +119,9 @@ public record NetworkConfig(
             prependLocal(
                     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
-                    // Re-verified 2026-09-02 — census served a 512/512 period-1840
-                    // update (first three) or TCP-alive; TCP-dead entries pruned.
+                    // Re-verified 2026-09-02 — the first two served the census a
+                    // 512/512 period-1840 update, the third served the standalone
+                    // Nimbus light client; the rest TCP-alive. TCP-dead pruned.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",

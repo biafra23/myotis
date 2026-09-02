@@ -567,8 +567,9 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
     // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the
     // roost comment above says why pinning an unreachable address is not free).
-    // The three below served a VERIFIABLE period-1840 update to this census
-    // and are cross-verified against independent clients:
+    // The three below are cross-verified against independent clients (the
+    // first two served this census a 512/512 period-1840 update; the third
+    // was verified via the standalone Nimbus light client):
     //  - 57.129.130.18: Lighthouse v8.2.2; enforces the one_every(10s) updates
     //    quota, so it serves ONE period per ask (single_period_peers handles it);
     //    also served the Java engine's catch-up (periods 1837-1838).
@@ -3185,16 +3186,33 @@ mod tests {
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
-        // 11 verified peers + roost mainnet, pinned by NAME only.
-        assert_eq!(c.static_peers.len(), 12);
-        // roost is FIRST — the ordering is the point, not an accident of the
-        // list. The Java twin prepends it with prependLocal(); if these two ever
-        // disagree on position, the default engine and the Rust engine pick
-        // different first-choice peers and only one of them is the dedicated one.
+        // The FULL list, order and addresses — same discipline as the sepolia
+        // test below, for the same reason: the Java twin asserts full strings,
+        // and pinning only count + element 0 here (as this test once did) let a
+        // copy-paste divergence between the engines go machine-unchecked. roost
+        // is FIRST — the ordering is the point, not an accident of the list;
+        // the Java twin prepends it with prependLocal().
         assert_eq!(
-            c.static_peers[0],
-            "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
+            c.static_peers,
+            vec![
+                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+                "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+                "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+                "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
+                "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
+                "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
+                "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
+                "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
+                "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
+                "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
+                "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
+            ],
+            "same list, order AND addresses as the Java NetworkConfig.MAINNET.clPeerMultiaddrs"
         );
+        // A malformed pin would otherwise reach run_sync and surface only as a
+        // "skipping unparseable static peer multiaddr" warn.
+        assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
     }
