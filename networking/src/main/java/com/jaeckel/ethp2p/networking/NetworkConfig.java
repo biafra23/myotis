@@ -79,11 +79,16 @@ public record NetworkConfig(
             Bytes32.fromHexString("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"), // genesis (honest)
             new byte[]{(byte) 0x07, (byte) 0xc9, (byte) 0x46, (byte) 0x2e}, // post-BPO2 (Fusaka)
             0L,
+            // discv4 bootnodes = go-ethereum params/bootnodes.go MainnetBootnodes
+            // (labels are geth's), re-synced 2026-09-02: two stale entries replaced
+            // by the Hetzner pair. Keep in lockstep with the Rust twin
+            // (rust/myotis-net/src/el/reader.rs, ElConfig::mainnet), which
+            // documents the incident.
             List.of(
-                    new InetSocketAddress("18.138.108.67", 30303),
-                    new InetSocketAddress("3.209.45.79", 30303),
-                    new InetSocketAddress("18.188.214.86", 30303),
-                    new InetSocketAddress("3.219.208.172", 30303)
+                    new InetSocketAddress("18.138.108.67", 30303), // bootnode-aws-ap-southeast-1-001
+                    new InetSocketAddress("3.209.45.79", 30303),   // bootnode-aws-us-east-1-001
+                    new InetSocketAddress("65.108.70.101", 30303), // bootnode-hetzner-hel
+                    new InetSocketAddress("157.90.35.166", 30303)  // bootnode-hetzner-fsn
             ),
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
