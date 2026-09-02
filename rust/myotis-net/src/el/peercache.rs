@@ -36,8 +36,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Consecutive snap-serve failures before a peer is marked DENIED (Java
-/// `PeerCache.SNAP_FAILURE_THRESHOLD`).
-const FAILURE_THRESHOLD: u32 = 3;
+/// `PeerCache.SNAP_FAILURE_THRESHOLD`). `pub(crate)` so the pool's live
+/// eviction threshold can be pinned equal to it by a compile-time assert
+/// (see `el::pool`) — the two must move together or an evicted laggard can be
+/// re-admitted before its cache verdict turns DENIED.
+pub(crate) const FAILURE_THRESHOLD: u32 = 3;
 
 /// Consecutive TCP connect failures before a peer reports DENIED from
 /// [`ElPeerCache::peers`] — a currently-unreachable CONFIRMED peer must not

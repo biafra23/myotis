@@ -157,6 +157,11 @@ const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 /// between the two constants would silently reopen that re-admit churn.
 const READ_FAILS_EVICT: u32 = 3;
 
+/// Enforce the equality the doc above calls load-bearing at COMPILE time, not
+/// just in prose: tuning peercache's threshold without moving this one now
+/// fails the build instead of silently reopening the re-admit churn.
+const _: () = assert!(READ_FAILS_EVICT == crate::el::peercache::FAILURE_THRESHOLD);
+
 /// A live pooled peer plus the address it was dialed at (so pruning a dropped
 /// peer can free its address for a future re-dial).
 struct PooledPeer {
@@ -274,6 +279,11 @@ impl PoolInner {
         // the transient backoff so the dialer doesn't immediately re-dial
         // the same laggard; its Arc drop closes the session once the ladder
         // lets go of its clone.
+        // Prune first so `len` counts only LIVE peers: a corpse left in the vec
+        // would let the sole-peer shield be pierced (evicting the one real
+        // server while a dead entry made len look like 2). prune_closed locks
+        // `peers` on its own, so it must run BEFORE we take the lock below.
+        self.prune_closed().await;
         {
             let mut peers = self.peers.lock().await;
             let len = peers.len();
@@ -288,9 +298,15 @@ impl PoolInner {
                             "evicting snap peer after repeated verified-read failures — \
                              freeing the slot for a fresh candidate");
                         peers.retain(|p| p.addr != addr);
-                        self.attempted.lock().await.remove(&addr);
+                        // NOTE the order across the next awaits: the address stays
+                        // claimed in `attempted` until AFTER its backoff is
+                        // recorded, so a concurrent try_dial (which checks backoff
+                        // first, then the attempted claim) can never see this
+                        // laggard as both un-backed-off AND un-claimed and re-dial
+                        // it in the gap.
                         drop(peers);
                         self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
+                        self.attempted.lock().await.remove(&addr);
                         // fall through to the persisted verdict below
                         return self.record_quality_cache(addr, served).await;
                     }
