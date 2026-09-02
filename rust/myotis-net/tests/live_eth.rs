@@ -32,8 +32,8 @@ use myotis_net::el::rlpx::transport::RlpxConnection;
 const MAINNET_BOOTNODES: &[&str] = &[
     "18.138.108.67:30303",
     "3.209.45.79:30303",
-    "18.188.214.86:30303",
-    "3.219.208.172:30303",
+    "65.108.70.101:30303",
+    "157.90.35.166:30303",
 ];
 
 /// Mainnet chain constants (mirror `NetworkConfig.MAINNET`).

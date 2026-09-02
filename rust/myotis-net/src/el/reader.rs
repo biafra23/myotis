@@ -120,11 +120,21 @@ impl ElConfig {
     /// pinned hash the Java engine also carries; a hard fork would need a bump
     /// here (tracked as the EL-A7 fork-id item).
     pub fn mainnet() -> ElConfig {
+        // discv4 bootnodes = go-ethereum `params/bootnodes.go` MainnetBootnodes
+        // (labels are geth's), re-synced 2026-09-02. The previous list carried
+        // two addresses that are not in geth's current list (18.188.214.86,
+        // 3.219.208.172); observed from one vantage point that day, none of the
+        // old four answered a ping while both Hetzner entries did. With no
+        // pinned mainnet enodes and no EIP-1459 DNS fallback, an embedder's
+        // fresh profile (no EL peer cache) then never seeds discovery and never
+        // holds a snap peer. Mirror any change into the Java
+        // `NetworkConfig.MAINNET`, the live tests under `tests/` (they pin this
+        // list verbatim) and `rust/tor-poc/src/main.rs` (carries the pubkeys).
         const MAINNET_BOOTNODES: &[&str] = &[
-            "18.138.108.67:30303",
-            "3.209.45.79:30303",
-            "18.188.214.86:30303",
-            "3.219.208.172:30303",
+            "18.138.108.67:30303", // bootnode-aws-ap-southeast-1-001
+            "3.209.45.79:30303",   // bootnode-aws-us-east-1-001
+            "65.108.70.101:30303", // bootnode-hetzner-hel
+            "157.90.35.166:30303", // bootnode-hetzner-fsn
         ];
         ElConfig {
             network_id: 1,

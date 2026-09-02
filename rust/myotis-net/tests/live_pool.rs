@@ -28,8 +28,8 @@ use myotis_net::el::snap::fetch::AccountOutcome;
 const MAINNET_BOOTNODES: &[&str] = &[
     "18.138.108.67:30303",
     "3.209.45.79:30303",
-    "18.188.214.86:30303",
-    "3.219.208.172:30303",
+    "65.108.70.101:30303",
+    "157.90.35.166:30303",
 ];
 const MAINNET_GENESIS: &str = "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3";
 const MAINNET_FORK_ID: [u8; 4] = [0x07, 0xc9, 0x46, 0x2e];
