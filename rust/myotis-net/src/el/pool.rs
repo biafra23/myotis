@@ -136,11 +136,66 @@ impl Default for PoolConfig {
     }
 }
 
+/// Bench window after a verified-read failure: the peer is moved BEHIND
+/// unbenched peers in the read ladder (never excluded outright — the sole
+/// server must stay reachable) so the next read tries somebody else first.
+/// Java's transient 30 s bench twin (`benchUnlessLastServing`); before this
+/// the live pool had NO reaction to read failures at all, and 8 lagging
+/// cached peers held every slot through days of failing reads (2026-09-02).
+const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
+
+/// Consecutive verified-read failures that EVICT a live peer, freeing its
+/// slot for the maintainer to refill with a fresh candidate. Reset on any
+/// successful serve. Never applied to the sole remaining peer — a failure
+/// against the only server is ambiguous (it may be our own stale ask), the
+/// same rationale as record_quality's persisted-verdict guard.
+///
+/// Kept EQUAL to peercache's snap FAILURE_THRESHOLD on purpose: when other
+/// peers exist the live strike here and the persisted cache strike increment
+/// in lockstep, so an evicted laggard flips to `Denied` in the same beat and
+/// the hunt's confirmed-peer backoff bypass won't instantly re-dial it. Drift
+/// between the two constants would silently reopen that re-admit churn.
+const READ_FAILS_EVICT: u32 = 3;
+
 /// A live pooled peer plus the address it was dialed at (so pruning a dropped
 /// peer can free its address for a future re-dial).
 struct PooledPeer {
     addr: SocketAddr,
     peer: Arc<ManagedPeer>,
+    /// Sidelined until this instant after a verified-read failure (see
+    /// [`READ_FAIL_BENCH`]); `None`/past = in the front of the read ladder.
+    benched_until: Option<Instant>,
+    /// Consecutive verified-read failures (see [`READ_FAILS_EVICT`]).
+    read_fails: u32,
+}
+
+/// Read-ladder order over newest-first bench flags: unbenched peers first
+/// (newest first), benched ones behind them (newest first). Pure — the
+/// ordering is the rotation, so it is pinned by tests.
+fn ladder_order(benched_newest_first: &[bool]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..benched_newest_first.len())
+        .filter(|&i| !benched_newest_first[i])
+        .collect();
+    order.extend((0..benched_newest_first.len()).filter(|&i| benched_newest_first[i]));
+    order
+}
+
+/// Live verdict after a verified-read failure — pure. Returns
+/// `(new_fail_count, evict)`: evict once the count reaches
+/// [`READ_FAILS_EVICT`], except for the sole remaining peer.
+///
+/// A sole peer's failures are NOT banked (`read_fails` stays 0): a failure
+/// against the only server is ambiguous — likely our own stale ask, the same
+/// reason the persisted-verdict guard shields it — so banking strikes there
+/// would evict it on its very next failure the instant the pool grows, before
+/// it has actually failed as a NON-sole peer. It is still benched by the
+/// caller (30 s) so a second peer, once found, leads the ladder.
+fn read_failure_verdict(fails_before: u32, pool_len: usize) -> (u32, bool) {
+    if pool_len <= 1 {
+        return (0, false);
+    }
+    let fails = fails_before.saturating_add(1);
+    (fails, fails >= READ_FAILS_EVICT)
 }
 
 struct PoolInner {
@@ -209,6 +264,44 @@ impl PoolInner {
     /// The single quality-recording path (dirty-gated flush inside) — shared by
     /// the pool's public sinks and [`SnapQualitySink`] so behavior can't drift.
     async fn record_quality(&self, addr: SocketAddr, served: bool) {
+        // LIVE-POOL accounting first (this is the rotation the 2026-09-02
+        // stale-pool wedge was missing — 8 lagging cached peers held every
+        // slot because a failed read cost them nothing here): a success
+        // clears the bench and the strike count; a failure benches the peer
+        // (the read ladder tries others first, see snap_peers) and, at
+        // READ_FAILS_EVICT consecutive failures, evicts it so the maintainer
+        // refills the slot with a fresh candidate. The evicted address gets
+        // the transient backoff so the dialer doesn't immediately re-dial
+        // the same laggard; its Arc drop closes the session once the ladder
+        // lets go of its clone.
+        {
+            let mut peers = self.peers.lock().await;
+            let len = peers.len();
+            if let Some(p) = peers.iter_mut().find(|p| p.addr == addr) {
+                if served {
+                    p.benched_until = None;
+                    p.read_fails = 0;
+                } else {
+                    let (fails, evict) = read_failure_verdict(p.read_fails, len);
+                    if evict {
+                        tracing::info!(%addr, fails,
+                            "evicting snap peer after repeated verified-read failures — \
+                             freeing the slot for a fresh candidate");
+                        peers.retain(|p| p.addr != addr);
+                        self.attempted.lock().await.remove(&addr);
+                        drop(peers);
+                        self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
+                        // fall through to the persisted verdict below
+                        return self.record_quality_cache(addr, served).await;
+                    }
+                    // Not evicting: bank the strike and bench the peer so the
+                    // read ladder tries others first. (On the evict branch the
+                    // entry is retained away, so writing these would be dead.)
+                    p.read_fails = fails;
+                    p.benched_until = Some(Instant::now() + READ_FAIL_BENCH);
+                }
+            }
+        }
         // Never demote the LAST live snap peer: an empty/failed fetch against
         // the sole server usually means WE asked for a root outside its
         // snapshot window (stale local head), not that the peer is bad — and
@@ -218,12 +311,17 @@ impl PoolInner {
         // not on pool size — a lone pooled peer at a DIFFERENT address means
         // the failing one isn't our last resort and the strike must count.
         // (Deliberate asymmetry with Java: this skips a PERSISTED verdict
-        // step, Java skips a transient 30s bench — same trigger, harsher
-        // consequence here, hence the same protection.)
+        // step, Java skips a transient 30s bench — the transient bench above
+        // now exists here too, but the persisted verdict keeps its guard.)
         if !served && !self.peers.lock().await.iter().any(|p| p.addr != addr) {
             tracing::debug!(%addr, "skipping snap-failure verdict — no other serving peer");
             return;
         }
+        self.record_quality_cache(addr, served).await;
+    }
+
+    /// The persisted half of [`record_quality`] (cache verdict + flush).
+    async fn record_quality_cache(&self, addr: SocketAddr, served: bool) {
         let mut cache = self.cache.lock().await;
         if served {
             cache.record_snap_served(addr);
@@ -350,7 +448,12 @@ impl PoolInner {
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
-                self.peers.lock().await.push(PooledPeer { addr, peer });
+                self.peers.lock().await.push(PooledPeer {
+                    addr,
+                    peer,
+                    benched_until: None,
+                    read_fails: 0,
+                });
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
                 // `flush` no-ops on a re-connect.
@@ -486,18 +589,25 @@ impl PeerPool {
     }
 
     /// All live snap peers, NEWEST first (freshest head → most likely to still
-    /// retain the state a query needs). The verified-read ladder tries them in
-    /// order, moving to the next on a failure — twin of the Java
-    /// `RLPxConnector.trySnapPeer` retry loop. Prunes closed peers first.
+    /// retain the state a query needs), with read-benched peers moved BEHIND
+    /// the rest (see [`READ_FAIL_BENCH`]) — every peer stays reachable as the
+    /// last resort, but the ladder rotates away from ones that just failed a
+    /// verified read instead of re-asking them first forever. The
+    /// verified-read ladder tries them in order, moving to the next on a
+    /// failure — twin of the Java `RLPxConnector.trySnapPeer` retry loop with
+    /// its transient bench. Prunes closed peers first.
     pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
-        self.inner
-            .peers
-            .lock()
-            .await
+        let now = Instant::now();
+        let peers = self.inner.peers.lock().await;
+        let newest_first: Vec<&PooledPeer> = peers.iter().rev().collect();
+        let benched: Vec<bool> = newest_first
             .iter()
-            .rev()
-            .map(|p| Arc::clone(&p.peer))
+            .map(|p| p.benched_until.is_some_and(|t| t > now))
+            .collect();
+        ladder_order(&benched)
+            .into_iter()
+            .map(|i| Arc::clone(&newest_first[i].peer))
             .collect()
     }
 
@@ -927,6 +1037,24 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // The HUNT keys on peers that can actually serve reads right now:
+        // read-benched peers don't count. A pool whose every slot is held by
+        // read-failing laggards is a serving outage exactly like an empty one
+        // — before this, 8 such peers suppressed the hunt through days of
+        // failing reads (2026-09-02) because "live" looked healthy. Fill and
+        // pin decisions below keep using the TOTAL live count: eviction (see
+        // record_quality) frees the slots within READ_FAILS_EVICT failed
+        // reads, so the two counts converge quickly.
+        let serving = {
+            let now = Instant::now();
+            inner
+                .peers
+                .lock()
+                .await
+                .iter()
+                .filter(|p| !p.benched_until.is_some_and(|t| t > now))
+                .count()
+        };
         // target == 0 = maintainer deliberately idle: an empty pool is the
         // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
         if inner.pool_cfg.target_snap_peers == 0 {
@@ -934,15 +1062,15 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
             inner.hunting.store(false, Ordering::Relaxed);
             continue;
         }
-        if live > 0 {
+        if serving > 0 {
             zero_since = None;
             if inner.hunting.swap(false, Ordering::Relaxed) {
-                tracing::info!(live, "EL hunt disengaged — snap peer serving again");
+                tracing::info!(serving, live, "EL hunt disengaged — snap peer serving again");
             }
         } else {
             zero_since.get_or_insert_with(Instant::now);
         }
-        let hunting = el_hunt_due(live, zero_since, Instant::now());
+        let hunting = el_hunt_due(serving, zero_since, Instant::now());
         if hunting && !inner.hunting.swap(true, Ordering::Relaxed) {
             tracing::info!(stall_secs = EL_HUNT_STALL.as_secs(),
                 "EL hunt engaged — serving pool empty past the stall window \
@@ -1067,6 +1195,48 @@ impl SnapQualitySink {
 
 #[cfg(test)]
 mod tests {
+    /// The read-ladder rotation (2026-09-02 stale-pool wedge): benched peers
+    /// go behind unbenched ones but are never dropped from the ladder, and
+    /// repeated read failures evict — except the sole peer.
+    mod read_rotation {
+        use super::super::{ladder_order, read_failure_verdict, READ_FAILS_EVICT};
+
+        #[test]
+        fn unbenched_lead_benched_trail_newest_first_within_each() {
+            //                          n     n-1    n-2    n-3
+            let benched = [false, true, false, true];
+            assert_eq!(ladder_order(&benched), vec![0, 2, 1, 3]);
+        }
+
+        #[test]
+        fn an_all_benched_pool_still_serves_the_full_ladder() {
+            // The sole-server semantics: benched is a preference, not a veto —
+            // a wallet with only failing peers must still ask them rather
+            // than answer nothing while the maintainer refills.
+            assert_eq!(ladder_order(&[true, true, true]), vec![0, 1, 2]);
+        }
+
+        #[test]
+        fn nothing_benched_keeps_the_newest_first_order() {
+            assert_eq!(ladder_order(&[false, false]), vec![0, 1]);
+        }
+
+        #[test]
+        fn eviction_at_the_threshold_but_never_the_sole_peer() {
+            assert_eq!(read_failure_verdict(0, 8), (1, false));
+            assert_eq!(read_failure_verdict(READ_FAILS_EVICT - 1, 8), (READ_FAILS_EVICT, true));
+            // The sole remaining peer is benched but never evicted, and its
+            // strike is NOT banked — a failure against the only server may be
+            // our own stale ask, so the count stays 0 rather than arming an
+            // eviction the instant a second peer appears.
+            assert_eq!(read_failure_verdict(0, 1), (0, false));
+            assert_eq!(read_failure_verdict(READ_FAILS_EVICT - 1, 1), (0, false));
+            // ...so after the pool grows the ex-sole peer starts from 0, not
+            // one failure from eviction.
+            assert_eq!(read_failure_verdict(0, 2), (1, false));
+        }
+    }
+
     #[test]
     fn backfill_plan_is_always_anchored() {
         use super::{backfill_plan, BatchAnchor, BACKFILL_BATCH};
