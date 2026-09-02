@@ -122,27 +122,61 @@ final class GatedVerifiedReads implements VerifiedReads {
 
     @Override
     public String getTransactionReceipt(byte[] txHash) {
-        return guarded(d -> d.getTransactionReceipt(txHash));
+        return guardedJson(d -> d.getTransactionReceipt(txHash));
     }
 
     @Override
     public String getTransactionByHash(byte[] txHash) {
-        return guarded(d -> d.getTransactionByHash(txHash));
+        return guardedJson(d -> d.getTransactionByHash(txHash));
+    }
+
+
+    /**
+     * [guarded] for the JSON-string read methods, with the engine-error
+     * envelope contract the router understands: a read that THROWS with a
+     * message comes back as {"error": ...} instead of propagating (or being
+     * flattened to null), so the router can answer -32000 with the reason.
+     * Same contract as the Rust twin (RustVerifiedReads.errJson) — the two
+     * engines must fail identically or the same wallet sees different
+     * diagnostics depending on the engine toggle.
+     */
+    private String guardedJson(java.util.function.Function<VerifiedReads, String> call) {
+        try {
+            return guarded(call);
+        } catch (RuntimeException e) {
+            String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            StringBuilder b = new StringBuilder(m.length() + 16).append("{\"error\":\"");
+            for (int i = 0; i < m.length(); i++) {
+                char c = m.charAt(i);
+                switch (c) {
+                    case '"' -> b.append("\\\"");
+                    case '\\' -> b.append("\\\\");
+                    case '\n' -> b.append("\\n");
+                    case '\r' -> b.append("\\r");
+                    case '\t' -> b.append("\\t");
+                    default -> {
+                        if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+                        else b.append(c);
+                    }
+                }
+            }
+            return b.append("\"}").toString();
+        }
     }
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
-        return guarded(d -> d.getBlockByNumber(block, fullTransactions));
+        return guardedJson(d -> d.getBlockByNumber(block, fullTransactions));
     }
 
     @Override
     public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
-        return guarded(d -> d.getBlockByHash(blockHash32, fullTransactions));
+        return guardedJson(d -> d.getBlockByHash(blockHash32, fullTransactions));
     }
 
     @Override
     public String getBlockReceipts(String blockSelector) {
-        return guarded(d -> d.getBlockReceipts(blockSelector));
+        return guardedJson(d -> d.getBlockReceipts(blockSelector));
     }
 
     @Override

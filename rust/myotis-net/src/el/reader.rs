@@ -661,6 +661,39 @@ enum BlockFromError {
     Undecodable(String),
 }
 
+/// Compress a whole pool's per-peer failure strings into one diagnosis-grade
+/// line: identical reasons are counted ("6x request timed out"), distinct ones
+/// listed, the output bounded so it stays fit for an error message and a log
+/// ring. The old behavior kept only the LAST peer's error, which hid exactly
+/// the pattern that matters in a whole-pool failure — "all timeouts" (stale
+/// connections) reads very differently from "all window mismatches" (our head
+/// is ahead of the peers').
+fn summarize_peer_failures(failures: &[String]) -> String {
+    const MAX_REASON_CHARS: usize = 120;
+    const MAX_DISTINCT: usize = 4;
+    if failures.is_empty() {
+        return "no failures recorded".to_string();
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for f in failures {
+        let short: String = f.chars().take(MAX_REASON_CHARS).collect();
+        match counts.iter_mut().find(|(s, _)| *s == short) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((short, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let shown = counts.len().min(MAX_DISTINCT);
+    let mut parts: Vec<String> = counts[..shown]
+        .iter()
+        .map(|(s, n)| if *n > 1 { format!("{n}x {s}") } else { s.clone() })
+        .collect();
+    if counts.len() > shown {
+        parts.push(format!("(+{} more distinct reasons)", counts.len() - shown));
+    }
+    parts.join("; ")
+}
+
 /// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
 /// value comes from the beacon-anchored header window; rewards additionally
 /// from bodies verified against `transactionsRoot` and receipts against
@@ -4199,7 +4232,7 @@ impl ElReader {
             return Err("no snap peer available".to_string());
         }
         let total = peers.len();
-        let mut last_err = String::new();
+        let mut failures: Vec<String> = Vec::with_capacity(total);
         for peer in &peers {
             match self.get_block_from(peer, target_num, back, &head_hash, full_transactions).await
             {
@@ -4218,11 +4251,18 @@ impl ElReader {
                 }
                 Err(BlockFromError::Peer(e)) => {
                     self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
+                    failures.push(e);
                 }
             }
         }
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable block: {last_err}"))
+        let summary = summarize_peer_failures(&failures);
+        // WARN, not debug: a whole-pool verified-read failure is the moment an
+        // operator needs the per-peer reasons, and hosts keep info+ only in
+        // their log rings — debug-only reasons made the Android period-1840 /
+        // stale-pool incidents (2026-09-01/02) undiagnosable on-device.
+        tracing::warn!(total, target_num, back, summary = %summary,
+            "verified block fetch failed against every snap peer");
+        Err(format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}"))
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
@@ -4821,7 +4861,7 @@ impl ElReader {
             return Err("no snap peer available".to_string());
         }
         let total = peers.len();
-        let mut last_err = String::new();
+        let mut failures: Vec<String> = Vec::with_capacity(total);
         for peer in &peers {
             match self.block_receipts_from(peer, target_num, back, &head_hash).await {
                 Ok(served) => {
@@ -4830,12 +4870,17 @@ impl ElReader {
                 }
                 Err(e) => {
                     self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
+                    failures.push(e);
                 }
             }
         }
+        let summary = summarize_peer_failures(&failures);
+        // Same rationale as get_block_by_number: whole-pool failures must be
+        // diagnosable from an info+ log ring.
+        tracing::warn!(total, target_num, back, summary = %summary,
+            "verified receipts fetch failed against every snap peer");
         Err(format!(
-            "all {total} snap peer(s) failed to serve verifiable block receipts: {last_err}"
+            "all {total} snap peer(s) failed to serve verifiable block receipts: {summary}"
         ))
     }
 
@@ -5691,6 +5736,54 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole-pool failure summary: what a stuck wallet's one visible error
+    /// line is built from, so its shape is pinned (2026-09-02 stale-pool
+    /// incident — "8x peer returned 0 headers" was the whole diagnosis).
+    mod failure_summaries {
+        use super::*;
+
+        #[test]
+        fn identical_reasons_collapse_with_a_count() {
+            let f = vec!["peer returned 0 headers, expected 1".to_string(); 8];
+            assert_eq!(
+                summarize_peer_failures(&f),
+                "8x peer returned 0 headers, expected 1"
+            );
+        }
+
+        #[test]
+        fn distinct_reasons_are_listed_most_frequent_first() {
+            let f = vec![
+                "request timed out".to_string(),
+                "peer disconnected".to_string(),
+                "request timed out".to_string(),
+            ];
+            assert_eq!(
+                summarize_peer_failures(&f),
+                "2x request timed out; peer disconnected"
+            );
+        }
+
+        #[test]
+        fn overflow_beyond_the_distinct_cap_is_counted_not_dropped_silently() {
+            let f: Vec<String> = (0..6).map(|i| format!("reason {i}")).collect();
+            let s = summarize_peer_failures(&f);
+            assert!(s.contains("(+2 more distinct reasons)"), "{s}");
+        }
+
+        #[test]
+        fn long_reasons_are_truncated() {
+            let f = vec!["x".repeat(500)];
+            let s = summarize_peer_failures(&f);
+            assert!(s.len() <= 130, "len {}", s.len());
+        }
+
+        #[test]
+        fn empty_input_yields_the_defensive_placeholder() {
+            assert_eq!(summarize_peer_failures(&[]), "no failures recorded");
+        }
+    }
 
     /// Hedging invariants (#320): a silent peer must not hold the read for the
     /// full request timeout, and — the half a naive per-attempt deadline gets

@@ -146,7 +146,7 @@ final class RustVerifiedReads implements VerifiedReads {
         try {
             return handle.codeVerified(toHex(address));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified code read unavailable: {}", e.getMessage());
+            log.info("[engines] verified code read unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -161,7 +161,7 @@ final class RustVerifiedReads implements VerifiedReads {
         try {
             return handle.storageAtVerified(toHex(address), toHex(slot32));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified storage read unavailable: {}", e.getMessage());
+            log.info("[engines] verified storage read unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -198,7 +198,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     block,
                     stateOverridesJson == null ? "" : stateOverridesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call (overrides) unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call (overrides) unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -219,7 +219,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     valueWei == null ? "" : valueWei,
                     block);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -242,7 +242,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     : handle.ethCallVerifiedDetailedWithOverrides(
                             fromHex, toHex20, dataHex, value, block, stateOverridesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call (detailed) unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call (detailed) unavailable: {}", e.getMessage());
             return io.myotis.api.CallResult.unavailable(e.getMessage());
         }
     }
@@ -270,8 +270,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // polling), or throws when it can't verify (→ null → strict -32000).
             return handle.transactionReceiptJson(toHex(txHash));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified receipt read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified receipt read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -287,9 +287,38 @@ final class RustVerifiedReads implements VerifiedReads {
             // own-sent-tx pending answer yet (needs the sent-tx cache).
             return handle.transactionByHashJson(toHex(txHash));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified tx read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified tx read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
+    }
+
+
+    /**
+     * Engine error envelope for the JSON-string read methods: `{"error": ...}`
+     * instead of a bare null, so the router can answer -32000 WITH the
+     * engine's reason (mirrors the eth_getLogs contract). A bare null told a
+     * wallet only "no peer / not synced" — during the 2026-09-02 stale-pool
+     * incident that text pointed at sync state while the node WAS synced and
+     * the real reason ("8x peer returned 0 headers") was swallowed here.
+     */
+    private static String errJson(RuntimeException e) {
+        String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        StringBuilder b = new StringBuilder(m.length() + 16).append("{\"error\":\"");
+        for (int i = 0; i < m.length(); i++) {
+            char c = m.charAt(i);
+            switch (c) {
+                case '"' -> b.append("\\\"");
+                case '\\' -> b.append("\\\\");
+                case '\n' -> b.append("\\n");
+                case '\r' -> b.append("\\r");
+                case '\t' -> b.append("\\t");
+                default -> {
+                    if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+                    else b.append(c);
+                }
+            }
+        }
+        return b.append("\"}").toString();
     }
 
     @Override
@@ -301,8 +330,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // block), or throws when it can't verify (→ null → -32000).
             return handle.blockByNumberJson(tag, fullTransactions);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified block read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified block read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -315,8 +344,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // verified / reorged away), or throws (→ null → strict -32000).
             return handle.blockByHashJson(toHex(blockHash32), fullTransactions);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -343,8 +372,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // block or never-verified hash), or throws (→ null → strict -32000).
             return handle.blockReceiptsJson(sel);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -384,7 +413,7 @@ final class RustVerifiedReads implements VerifiedReads {
             // (→ null → strict -32000). No "null" literal case for this method.
             return handle.feeHistoryJson(blockCount, tag, percentilesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified feeHistory unavailable: {}", e.getMessage());
+            log.info("[engines] verified feeHistory unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -411,7 +440,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     data == null ? "" : toHex(data),
                     valueWei == null ? "" : valueWei);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified estimateGas (detailed) unavailable: {}", e.getMessage());
+            log.info("[engines] verified estimateGas (detailed) unavailable: {}", e.getMessage());
             return io.myotis.api.EstimateResult.unavailable(e.getMessage());
         }
     }
@@ -439,7 +468,7 @@ final class RustVerifiedReads implements VerifiedReads {
             // or a raw unchecked throwable off the native path) as "can't answer
             // verified right now" — the router's tryVerified dispatch is not
             // exception-guarded, so nothing may escape this adapter.
-            log.debug("[engines] verified account read unavailable: {}", e.getMessage());
+            log.info("[engines] verified account read unavailable: {}", e.getMessage());
             return null;
         }
     }
