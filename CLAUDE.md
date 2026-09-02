@@ -184,11 +184,15 @@ ruling, 2026-09-02):
    fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
    gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
    host consents.
-2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** The list is
-   pinned in `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
-   (`rust/myotis-net/src/el/reader.rs`; its unit test pins the strings and
-   the `myotis-net` live tests read it) and, with pubkeys, `rust/tor-poc`;
-   source of truth is geth's `params/bootnodes.go` `MainnetBootnodes`.
+2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
+   truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
+   `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
+   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
+   any other verbatim copy — do not trust this list, `grep -rn` the tree for
+   one of the current addresses before and after the edit until zero copies
+   of the old ones remain (the `myotis-net` live tests carry their own
+   copies until #414 makes them read `ElConfig::mainnet()` and pins the
+   strings in its unit test).
    Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
    fallback (the Java engine has one), so a fresh profile with a stale list
    never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
