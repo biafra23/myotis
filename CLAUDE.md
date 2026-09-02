@@ -190,9 +190,9 @@ ruling, 2026-09-02):
    (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
    any other verbatim copy — do not trust this list, `grep -rn` the tree for
    one of the current addresses before and after the edit until zero copies
-   of the old ones remain (the `myotis-net` live tests carry their own
-   copies until #414 makes them read `ElConfig::mainnet()` and pins the
-   strings in its unit test).
+   of the old ones remain. Since #414 the `myotis-net` live tests read
+   `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
+   four strings, so a partial re-sync fails in the fast lib test.
    Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
    fallback (the Java engine has one), so a fresh profile with a stale list
    never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
