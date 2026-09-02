@@ -172,6 +172,33 @@ Do not stop at "pushed" and do not ask whether to open the PR or run the review 
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
 
+## Releases — ask before cutting one
+
+When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
+**ask these two questions first and act only on what they choose** (owner
+ruling, 2026-09-02):
+
+1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
+   blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
+   `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
+   fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
+   gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
+   host consents.
+2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
+   truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
+   `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
+   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
+   any other verbatim copy — do not trust this list, `grep -rn` the tree for
+   one of the current addresses before and after the edit until zero copies
+   of the old ones remain. Since #414 the `myotis-net` live tests read
+   `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
+   four strings, so a partial re-sync fails in the fast lib test.
+   Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
+   fallback (the Java engine has one), so a fresh profile with a stale list
+   never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
+   Warm profiles and the dispatched smoke job hide this because they dial
+   their peer cache directly.
+
 ## Pull requests and code review
 
 These rules are for the **PR author** answering a review. The reviewer's own
