@@ -830,6 +830,18 @@ struct PeerPool {
     /// Peers that actually SERVED light-client data (bootstrap or an applied
     /// update) — mirrors the Java proven-server tracking; preferred first.
     proven: HashSet<PeerId>,
+    /// Peers that closed the connection on a MULTI-period updates_by_range and
+    /// must therefore be asked for exactly one period at a time.
+    ///
+    /// Lighthouse enforces `light_client_updates_by_range = one_every(10s)`
+    /// (rpc/config.rs) by CLOSING the stream ~30 ms into any multi-count
+    /// request, while answering count=1 from the same peer normally — verified
+    /// live against 57.129.130.18 (Lighthouse v8.2.2). Without this, every
+    /// span>1 round charges such a peer a failure and the 3-strike rule evicts
+    /// the whole Lighthouse-class population — precisely the servers the
+    /// verify-reject rotation steers toward. Nimbus-class servers stay on the
+    /// big span (one answered five periods in a single batch).
+    single_period_peers: HashSet<PeerId>,
     /// Per-peer "don't re-ask updates_by_range until" marks. Live CL peers
     /// rate-limit that protocol to ~one served update per request window; an
     /// immediate re-ask returns an empty stream, so rotate away for a while.
@@ -874,6 +886,15 @@ const MAX_POOL: usize = 512;
 /// gets slack so one transient blip doesn't drop a scarce LC server.
 const UNPROVEN_EVICT_AT: u32 = 1;
 const PROVEN_EVICT_AT: u32 = 3;
+/// Verify-rejects tolerated before a peer is evicted.
+///
+/// Deliberately NOT the unproven threshold (1): `process_update` also returns
+/// false for INAPPLICABLE updates — a future-period chunk from an honest,
+/// generous server is the common case in the drain loop — so evicting on the
+/// first reject would cull exactly the well-behaved servers the rotation steers
+/// toward. The cooldown is what rotates away immediately; eviction is reserved
+/// for a peer that keeps failing verification (PR #410 review).
+const REJECT_EVICT_AT: u32 = 3;
 /// Window for the served-peers health metric (BeaconStatus.servedPeersLastMinute).
 const SERVED_WINDOW: Duration = Duration::from_secs(60);
 
@@ -887,6 +908,7 @@ impl PeerPool {
             proven: HashSet::new(),
             cooldown_until: HashMap::new(),
             fail_counts: HashMap::new(),
+            single_period_peers: HashSet::new(),
             recent_serves: HashMap::new(),
             discv5_table_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sync_start_period: -1,
@@ -904,6 +926,37 @@ impl PeerPool {
         // that is now demonstrably serving us). Mirrors Java line
         // `peersNoLcUpdates.remove(ma) | provenLightClient.add(ma)`.
         self.no_lc_updates.remove(&id);
+    }
+
+    /// The factual half of `mark_proven`: this peer answered an
+    /// updates_by_range request, so it demonstrably serves the protocol and any
+    /// stale nolc verdict is wrong. Deliberately does NOT grant the proven tier
+    /// or clear fail_counts — DELIVERING a chunk says nothing about whether the
+    /// chunk verifies, and conflating the two is what let one peer serving an
+    /// unverifiable update hold the catch-up walk indefinitely (mainnet 1840).
+    fn clear_no_lc_for(&mut self, id: PeerId) {
+        self.no_lc_updates.remove(&id);
+    }
+
+    /// Charge a peer for serving a chunk that FAILED BLS verification: a strike
+    /// toward eviction plus a cooldown, so the next round asks somebody else.
+    /// Without this the fan-out re-asked the same fast bad server every round.
+    ///
+    /// The strike IS measured against a threshold (`REJECT_EVICT_AT`) and does
+    /// evict — incrementing `fail_counts` without ever comparing it would let a
+    /// peer serving unverifiable updates sit in the capped pool forever, retried
+    /// each time its cooldown lapsed (PR #410 review). The cooldown is the part
+    /// that rotates the walk away *this round*; eviction only fires for a peer
+    /// that keeps doing it, because an inapplicable-update reject is not proof
+    /// of a bad server.
+    fn note_verify_reject(&mut self, id: PeerId) {
+        self.proven.remove(&id);
+        self.set_updates_cooldown(id);
+        let n = self.fail_counts.entry(id).or_insert(0);
+        *n += 1;
+        if *n >= REJECT_EVICT_AT {
+            self.evict(&id);
+        }
     }
 
     /// Reconcile the LIVE Identify LC-capability signal into the deny set: any
@@ -1001,6 +1054,16 @@ impl PeerPool {
         self.fail_counts.remove(id);
     }
 
+    /// Remember that this peer closed on a multi-period ask (see
+    /// `single_period_peers`); future rounds request one period from it.
+    fn mark_single_period(&mut self, id: PeerId) {
+        self.single_period_peers.insert(id);
+    }
+
+    fn wants_single_period(&self, id: &PeerId) -> bool {
+        self.single_period_peers.contains(id)
+    }
+
     fn set_updates_cooldown(&mut self, id: PeerId) {
         self.cooldown_until.insert(id, Instant::now() + UPDATES_SERVE_COOLDOWN);
     }
@@ -1065,6 +1128,16 @@ impl PeerPool {
     /// to the cross-engine cache under the exact key it was written with.
     fn cache_key(&self, id: &PeerId) -> Option<String> {
         self.peers.iter().find(|p| &p.id == id).map(|p| format!("{}/p2p/{}", p.addr, p.id))
+    }
+
+    /// Inverse of `cache_key`: the pooled peer id behind a `<multiaddr>/p2p/<id>`
+    /// key. Used to charge a verify-reject to the peer that actually STAGED the
+    /// bad chunk — the responder handling the round is often someone else.
+    fn id_for_key(&self, key: &str) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|p| format!("{}/p2p/{}", p.addr, p.id) == key)
+            .map(|p| p.id)
     }
 
     /// Add a pinned static (config) peer and record its id as un-evictable
@@ -1947,7 +2020,22 @@ impl ResumeGuard {
 struct StagedChunk {
     ssz: Vec<u8>,
     from: String,
+    /// Other peers' chunks for the SAME period, kept as fallbacks.
+    ///
+    /// The fan-out asks every peer for the same range, so several answer with
+    /// the same period — and before this, the FIRST responder's chunk took the
+    /// slot and every other copy was dropped. A fast peer serving an
+    /// unverifiable update therefore wedged the whole walk: its chunk lost BLS
+    /// verification, the honest copies had already been discarded, and the next
+    /// round raced the same way (mainnet period 1840, ~4.6k identical requests
+    /// to one server; issue seen live 2026-09-01). Alternates make a
+    /// verify-reject fall through to the next peer's copy instead.
+    alternates: Vec<(Vec<u8>, String)>,
 }
+
+/// Cap on alternates per period — enough to route around a few bad or stale
+/// servers without holding a full fan-out's multi-MiB responses in memory.
+const MAX_STAGED_ALTERNATES: usize = 3;
 
 /// Periods requested per catch-up round — the full spec cap, matching the
 /// Java client's `min(periodsToFetch, 128)`. This is THE cold-sync lever:
@@ -2175,6 +2263,19 @@ async fn catch_up(
         ssz_request.extend_from_slice(&span.to_le_bytes());
         let wire = codec::encode_request(&ssz_request);
 
+        // count=1 variant for quota-limited servers (see single_period_peers).
+        let mut single_ssz = Vec::with_capacity(16);
+        single_ssz.extend_from_slice(&committee_period.to_le_bytes());
+        single_ssz.extend_from_slice(&1u64.to_le_bytes());
+        let single_wire = codec::encode_request(&single_ssz);
+        // Snapshot: the closures below cannot borrow `pool` (it is mutated as
+        // responses land).
+        let pool_wants_single: HashSet<PeerId> = peers
+            .iter()
+            .filter(|p| pool.wants_single_period(&p.id))
+            .map(|p| p.id)
+            .collect();
+
         let staged_before = staged.len();
         let mut poisoned_this_round = false;
         let mut round_rejects = 0usize;
@@ -2182,12 +2283,15 @@ async fn catch_up(
         let mut in_flight: FuturesUnordered<_> = peers
             .into_iter()
             .map(|peer| {
-                let wire = wire.clone();
                 let client = client.clone();
-                // Same (period, span) for every peer — see the fan-out comment
-                // above. Kept as per-future bindings so the response handler can
-                // stay range-agnostic if staggering is ever reintroduced.
-                let (sub_from, sub_count) = (committee_period, span);
+                // Same START period for every peer — see the fan-out comment
+                // above; the prefix period is the pipeline's bottleneck and must
+                // be redundantly requested. The COUNT is per-peer: a server that
+                // closed on a multi-period ask (Lighthouse's quota) is asked for
+                // exactly one, so it can serve instead of being struck out.
+                let single = pool_wants_single.contains(&peer.id);
+                let (sub_from, sub_count) = (committee_period, if single { 1 } else { span });
+                let wire = if single { single_wire.clone() } else { wire.clone() };
                 async move {
                     let res = client
                         .request_raw(peer.id, peer.addr.clone(), protocols::UPDATES_BY_RANGE, wire)
@@ -2219,6 +2323,18 @@ async fn catch_up(
                         if !pool.is_static(&peer.id) {
                             clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
                         }
+                    } else if e == RequestError::ConnectionClosed && sub_count > 1 {
+                        // NOT a dead peer: Lighthouse enforces its
+                        // updates_by_range quota by closing the stream on any
+                        // multi-count request while answering count=1 fine
+                        // (verified live, v8.2.2). Charging a failure here would
+                        // three-strike the entire Lighthouse-class population —
+                        // and the verify-reject rotation steers traffic straight
+                        // at them. Remember to ask this peer one period at a
+                        // time instead, and cost it nothing.
+                        pool.mark_single_period(peer.id);
+                        tracing::debug!(peer = %peer.id, sub_count,
+                            "closed on a multi-period ask — will request one period at a time");
                     } else if e != RequestError::Shutdown {
                         // Dial/timeout/connection-closed — count toward eviction
                         // so dead peers stop occupying MAX_POOL slots.
@@ -2258,15 +2374,48 @@ async fn catch_up(
                     break; // truncated/empty chunk — nothing after it is trustworthy
                 }
                 served += 1;
-                staged.entry(sub_from + i as u64).or_insert_with(|| StagedChunk {
-                    ssz: chunk,
-                    from: peer_key.clone(),
-                });
+                match staged.entry(sub_from + i as u64) {
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        v.insert(StagedChunk {
+                            ssz: chunk,
+                            from: peer_key.clone(),
+                            alternates: Vec::new(),
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut o) => {
+                        // Another peer already staged this period: keep this
+                        // copy as a FALLBACK rather than dropping it, so a
+                        // verify-reject on the leader can try someone else's
+                        // (see StagedChunk::alternates). Skip byte-identical
+                        // copies — they would fail verification identically.
+                        let slot = o.get_mut();
+                        if slot.alternates.len() < MAX_STAGED_ALTERNATES
+                            && slot.ssz != chunk
+                            && !slot.alternates.iter().any(|(ssz, _)| *ssz == chunk)
+                        {
+                            slot.alternates.push((chunk, peer_key.clone()));
+                        }
+                    }
+                }
             }
             if served > 0 {
                 tracing::info!(peer = %peer.id, sub_from, sub_count, served,
                     raw_len = raw.len(), "updates_by_range served");
-                pool.mark_proven(peer.id);
+                // A peer that answered DOES serve the protocol, so reverse any
+                // stale nolc verdict — that part is factual. But it is NOT yet
+                // "proven": mark_proven also grants the preferred tier and
+                // wipes fail_counts, and granting that for mere DELIVERY is
+                // what let a fast peer serving an unverifiable update keep
+                // winning selection forever (mainnet 1840). Promotion now
+                // happens only where the update actually VERIFIES, below.
+                //
+                // PARITY (#342): this mirrors the Java reference, which records
+                // a catch-up server ONLY inside `if (applied > 0)` after
+                // processUpdate returned true (BeaconLightClient
+                // .applyCatchUpResponses). The Java engine never had this stall
+                // precisely because it credits verification, not delivery —
+                // keep the two in step.
+                pool.clear_no_lc_for(peer.id);
                 // Deliberately NO cooldown for a peer that just served: it is
                 // often the only willing server in the pool, and the ~13 s
                 // round cadence sits at Lighthouse's ~1-per-10s quota anyway —
@@ -2278,11 +2427,26 @@ async fn catch_up(
                 // redundant multi-MiB streams are cancelled behind one
                 // signature verification instead of a full batch of them.
                 let before_period = processor.store.current_period();
-                let (applied_now, verify_rejects, applied_from, reject_participants) =
-                    apply_staged_step(processor, staged, slot_estimate);
+                let step = apply_staged_step(processor, staged, slot_estimate);
+                let (applied_now, verify_rejects, applied_from) =
+                    (step.applied, step.verify_rejects, step.applied_from.clone());
+                // PR #409: carry the participant count into the round WARN so a
+                // below-2/3 stall explains itself.
                 round_rejects += verify_rejects;
-                if let Some(p) = reject_participants {
+                if let Some(p) = step.reject_participants {
                     last_reject_participants = Some(p);
+                }
+                // Charge every peer whose chunk failed verification — by peer
+                // KEY, so the strike lands on whoever actually served the bad
+                // copy rather than on whoever happened to respond last.
+                for bad in &step.rejected_from {
+                    if let Some(id) = pool.id_for_key(bad) {
+                        pool.note_verify_reject(id);
+                        clcache.mark_failure(bad);
+                        tracing::warn!(peer = %bad, period = before_period,
+                            "catch-up: update failed verification — peer penalised, \
+                             will try another next round");
+                    }
                 }
                 // ORDER MATTERS: an apply in this batch BLS-verified against
                 // the restored committee and proves the snapshot genuine —
@@ -2305,15 +2469,27 @@ async fn catch_up(
                 }
                 if applied_now > 0 {
                     resume.confirm();
-                    pool.note_served(peer.id); // BLS-verified and applied
+                    // Promotion belongs HERE — to the peer whose update actually
+                    // VERIFIED, which is not necessarily this responder: with
+                    // alternates (and with chunks lingering from earlier
+                    // responses) the applied copy can be someone else's, and
+                    // `applied_from` names its true source. Crediting the
+                    // responder instead would wipe strikes and grant priority
+                    // to a peer that merely delivered bytes (PR #410 review).
+                    let credited = applied_from
+                        .as_deref()
+                        .and_then(|key| pool.id_for_key(key))
+                        .unwrap_or(peer.id);
+                    pool.mark_proven(credited);
+                    pool.note_served(credited); // BLS-verified and applied
                     // Only VERIFIED periods reach the shared cross-engine
                     // cache, credited to the peer whose response STAGED the
                     // applied chunk — usually this responder, but a chunk
                     // lingering from an earlier response can be the one that
                     // applies (Java applyCatchUpResponses records AFTER
                     // processUpdate the same way — never before verification).
-                    if let Some(key) = applied_from {
-                        clcache.record_served(&key, before_period, before_period);
+                    if let Some(key) = applied_from.as_deref() {
+                        clcache.record_served(key, before_period, before_period);
                     }
                     applied += applied_now;
                     empty_backoff = Duration::from_secs(0);
@@ -2352,15 +2528,32 @@ async fn catch_up(
             let mut drained = 0usize;
             loop {
                 let before_period = processor.store.current_period();
-                let (applied_now, _verify_rejects, applied_from, _reject_participants) =
-                    apply_staged_step(processor, staged, slot_estimate);
+                let step = apply_staged_step(processor, staged, slot_estimate);
+                let (applied_now, applied_from) = (step.applied, step.applied_from.clone());
+                // Same accounting AND the same WARN as the first apply path:
+                // future-period chunks retained from earlier responders commonly
+                // reject here, and silencing it would leave the Logs tab without
+                // the peer-and-period line this fix promises (PR #410 review).
+                for bad in &step.rejected_from {
+                    if let Some(id) = pool.id_for_key(bad) {
+                        pool.note_verify_reject(id);
+                        clcache.mark_failure(bad);
+                        tracing::warn!(peer = %bad, period = before_period,
+                            "catch-up: update failed verification — peer penalised, \
+                             will try another next round");
+                    }
+                }
                 if applied_now == 0 {
                     break;
                 }
                 applied += applied_now;
                 drained += 1;
-                if let Some(key) = applied_from {
-                    clcache.record_served(&key, before_period, before_period);
+                if let Some(key) = applied_from.as_deref() {
+                    if let Some(id) = pool.id_for_key(key) {
+                        pool.mark_proven(id);
+                        pool.note_served(id);
+                    }
+                    clcache.record_served(key, before_period, before_period);
                 }
                 persist_snapshot(config, processor, last_persisted_period);
                 publish_status(config, client, processor, &*pool, status_tx, anchor, hunting).await;
@@ -2457,35 +2650,66 @@ fn apply_staged_step(
     processor: &mut LightClientProcessor,
     staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
     slot_estimate: u64,
-) -> (usize, usize, Option<String>, Option<usize>) {
+) -> StepOutcome {
     let target_period = processor.store.current_period();
     let Some(chunk) = staged.remove(&target_period) else {
-        return (0, 0, None, None);
+        return StepOutcome::default();
     };
-    match LightClientUpdate::decode(&chunk.ssz) {
-        Ok(update) => {
-            if processor.process_update(&update) {
-                processor.store.force_rotate_if_past_period(slot_estimate);
-                tracing::debug!(target_period,
-                    finalized_slot = update.finalized_header.beacon.slot,
-                    period = processor.store.current_period(),
-                    "catch-up update applied");
-                (1, 0, Some(chunk.from), None)
-            } else {
-                tracing::debug!(target_period,
+    let mut out = StepOutcome::default();
+    // The leader first, then every alternate: one bad copy of a period must not
+    // block the walk when another peer served a good one in the same round.
+    let candidates = std::iter::once((chunk.ssz, chunk.from)).chain(chunk.alternates.into_iter());
+    for (ssz, from) in candidates {
+        match LightClientUpdate::decode(&ssz) {
+            Ok(update) => {
+                if processor.process_update(&update) {
+                    processor.store.force_rotate_if_past_period(slot_estimate);
+                    tracing::debug!(target_period,
+                        finalized_slot = update.finalized_header.beacon.slot,
+                        period = processor.store.current_period(),
+                        "catch-up update applied");
+                    out.applied = 1;
+                    out.applied_from = Some(from);
+                    return out;
+                }
+                // Verify-reject: name the peer so the caller can charge it —
+                // rewarding a peer for merely DELIVERING an unverifiable update
+                // is what let one bad server hold the walk indefinitely.
+                //
+                // The participant count rides back too (PR #409): the round's
+                // WARN can then say WHY without a debug session — a weak-server
+                // stall (below the 2/3 bar) reads directly off the warn.
+                tracing::debug!(target_period, %from,
                     finalized_slot = update.finalized_header.beacon.slot,
                     "catch-up update rejected");
-                // The participant count rides back so the round's info-level
-                // WARN can say WHY without a debug session: a weak-server
-                // stall (below the 2/3 bar) then reads directly off the warn.
-                (0, 1, None, Some(update.sync_aggregate.count_participants()))
+                out.verify_rejects += 1;
+                out.reject_participants = Some(update.sync_aggregate.count_participants());
+                out.rejected_from.push(from);
+            }
+            Err(e) => {
+                tracing::debug!(target_period, %from, error = %e,
+                    "catch-up update decode failed");
+                out.decode_failures += 1;
             }
         }
-        Err(e) => {
-            tracing::debug!(target_period, error = %e, "catch-up update decode failed");
-            (0, 0, None, None)
-        }
     }
+    out
+}
+
+/// What one `apply_staged_step` pass did — richer than the old tuple so the
+/// caller can charge verify-rejects to the peers that actually served them.
+#[derive(Default)]
+struct StepOutcome {
+    applied: usize,
+    verify_rejects: usize,
+    decode_failures: usize,
+    /// Peer key of the response whose chunk APPLIED (verified), if any.
+    applied_from: Option<String>,
+    /// Peer keys whose chunks failed BLS verification this pass.
+    rejected_from: Vec<String>,
+    /// Participant count of the LAST rejected update (PR #409) — surfaced in
+    /// the round WARN so a below-2/3 stall is legible without a debug session.
+    reject_participants: Option<usize>,
 }
 
 /// One finality-poll pass: try peers until one update verifies and applies —
@@ -3564,6 +3788,123 @@ mod tests {
         let addr = pool.peers.iter().find(|p| p.id == roost).map(|p| p.addr.to_string()).unwrap();
         assert_eq!(addr, "/dns4/roost.example.org/tcp/9109",
             "the name is the healing path; a numeric snapshot must not replace it");
+    }
+
+    /// The mainnet period-1840 wedge, as a unit test.
+    ///
+    /// One fast peer served an update that failed BLS verification (113/512
+    /// participants). Before the fix it was `mark_proven`'d for merely
+    /// DELIVERING the chunk — which also wiped its fail_counts — so it stayed
+    /// in the preferred tier and won the next round's race too. ~4.6k identical
+    /// requests later the walk had not advanced a single period.
+    #[test]
+    fn a_peer_serving_an_unverifiable_update_loses_priority() {
+        let mut pool = PeerPool::new();
+        let bad = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add(bad, "/ip4/10.0.0.1/tcp/9000".parse().unwrap());
+
+        // It answers the protocol, so the nolc verdict is (correctly) reversed…
+        pool.clear_no_lc_for(bad);
+        assert!(
+            !pool.proven.contains(&bad),
+            "delivering bytes must NOT grant the proven tier — verification does"
+        );
+
+        // …and when its chunk fails verification it is charged, not rewarded.
+        pool.note_verify_reject(bad);
+        assert!(
+            !pool.proven.contains(&bad),
+            "a verify-reject must not leave a peer proven"
+        );
+        assert_eq!(
+            pool.fail_counts.get(&bad).copied(),
+            Some(1),
+            "reject counts toward eviction"
+        );
+        assert!(
+            pool.peers.iter().any(|p| p.id == bad),
+            "ONE reject must not evict: process_update also rejects merely \
+             inapplicable updates from honest servers"
+        );
+        assert!(
+            !pool.cooled_down(&bad),
+            "rejecting peer is cooled down so the next round asks someone else"
+        );
+
+        // …but a peer that keeps failing verification is eventually evicted.
+        pool.note_verify_reject(bad);
+        pool.note_verify_reject(bad);
+        assert!(
+            !pool.peers.iter().any(|p| p.id == bad),
+            "repeated verify-rejects must evict, not loop forever behind a cooldown"
+        );
+
+        // A peer whose update actually verifies still gets promoted.
+        let good = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        pool.add(good, "/ip4/10.0.0.2/tcp/9000".parse().unwrap());
+        pool.mark_proven(good);
+        assert!(pool.proven.contains(&good));
+    }
+
+    /// A rejected leader must fall through to ANOTHER PEER'S copy of the same
+    /// period — exercised through the real `apply_staged_step`, with the real
+    /// corpus bootstrap and update, so it fails if the fallback iteration or
+    /// the attribution is removed (PR #410 review: the first version of this
+    /// test only inspected the Vec and would have stayed green).
+    #[test]
+    fn a_rejected_leader_falls_through_to_another_peers_copy() {
+        use myotis_consensus::types::LightClientBootstrap;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/lc/mainnet");
+        let Ok(bootstrap_ssz) = std::fs::read(dir.join("bootstrap.ssz")) else {
+            eprintln!("skipping: LC corpus not present");
+            return;
+        };
+        let bootstrap = LightClientBootstrap::decode(&bootstrap_ssz).expect("bootstrap decodes");
+        // The corpus' first update is the one that applies against this anchor.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with("-update.ssz") && n.len() == "000-update.ssz".len())
+            .collect();
+        names.sort();
+        let good_ssz = std::fs::read(dir.join(&names[0])).expect("first update");
+
+        let mut store = myotis_consensus::store::LightClientStore::new_mainnet_preset();
+        store.initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
+        let expected_period = store.current_period();
+        let mut processor = LightClientProcessor::new(
+            store,
+            crate::sync::ChainConfig::mainnet().fork_version,
+            crate::sync::ChainConfig::mainnet().genesis_validators_root,
+        );
+
+        // A fast peer stages a chunk that cannot verify; a slower peer's HONEST
+        // copy of the same period lands as an alternate.
+        let mut staged: std::collections::BTreeMap<u64, StagedChunk> =
+            std::collections::BTreeMap::new();
+        staged.insert(
+            expected_period,
+            StagedChunk {
+                ssz: good_ssz.iter().map(|b| b ^ 0xff).collect(), // same length, garbage
+                from: "/ip4/10.0.0.1/tcp/9000/p2p/bad".into(),
+                alternates: vec![(good_ssz, "/ip4/10.0.0.2/tcp/9000/p2p/good".into())],
+            },
+        );
+
+        let out = apply_staged_step(&mut processor, &mut staged, u64::MAX);
+        assert_eq!(out.applied, 1, "the alternate must apply after the leader is rejected");
+        assert_eq!(
+            out.applied_from.as_deref(),
+            Some("/ip4/10.0.0.2/tcp/9000/p2p/good"),
+            "credit must name the peer whose copy VERIFIED, not the responder or the leader"
+        );
+        assert!(
+            out.rejected_from.iter().any(|f| f.contains("bad"))
+                || out.decode_failures > 0,
+            "the bad leader must be reported as rejected (or undecodable), never silently dropped"
+        );
     }
 
     #[test]
