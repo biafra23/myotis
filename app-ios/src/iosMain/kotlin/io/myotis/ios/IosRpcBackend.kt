@@ -331,22 +331,38 @@ class IosRpcBackend(
         return o
     }
 
-    /** Tri-state JSON passthrough: object string | literal "null" | null (can't verify). */
+    /** Tri-state JSON passthrough: object string | literal "null" | null (can't
+     *  verify). A single-key `{"error": ...}` envelope PASSES THROUGH — the
+     *  shared router unwraps it into a -32000 carrying the engine's reason
+     *  (api VerifiedReads contract). Flattening it to null here was the iOS
+     *  hole in the "diagnostics must not depend on the host" guarantee: the
+     *  Rust C ABI already emits exactly this shape (eljson::error_json). */
     private fun triStateJson(json: String): String? {
         val t = json.trim()
         if (t.isEmpty()) return null
         if (t == "null") return t
+        if (isEngineErrorEnvelope(t)) return t
         return if (resultOrNull(t) != null) t else null
     }
 
     /** [triStateJson]'s array twin (eth_getBlockReceipts): array string |
-     *  literal "null" | null. An `{"error"}` envelope (an object) → null. */
+     *  literal "null" | the `{"error"}` envelope (passed through for the
+     *  router to unwrap) | null. */
     private fun triStateArrayJson(json: String): String? {
         val t = json.trim()
         if (t.isEmpty()) return null
         if (t == "null") return t
+        if (isEngineErrorEnvelope(t)) return t
         val e = runCatching { engineJson.parseToJsonElement(t) }.getOrNull() ?: return null
         return if (e is kotlinx.serialization.json.JsonArray) t else null
+    }
+
+    /** The api VerifiedReads error envelope: a single-key `{"error": ...}`
+     *  object — same detection the router's orEngineThrow applies. */
+    private fun isEngineErrorEnvelope(t: String): Boolean {
+        if (!t.startsWith("{\"error\"")) return false
+        val o = runCatching { engineJson.parseToJsonElement(t).jsonObject }.getOrNull() ?: return false
+        return o.size == 1 && o.containsKey("error")
     }
 
     private fun statusOrNull(handle: Long): JsonObject? =

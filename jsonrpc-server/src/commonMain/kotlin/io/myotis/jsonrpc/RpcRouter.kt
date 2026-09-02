@@ -824,7 +824,7 @@ class RpcRouter(
                     else -> return null
                 }
                 val historyJson = withContext(rpcIoDispatcher) { b.feeHistory(blockCount, newest, pctArr) }
-                    ?: return null
+                    ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(historyJson))
             }
             "eth_estimateGas" -> {
