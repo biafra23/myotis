@@ -544,8 +544,12 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
 ];
 
-/// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
-/// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
+/// Known light-client-serving mainnet peers — mirrored with the Java
+/// `NetworkConfig.MAINNET` clPeerMultiaddrs list (same entries, same order;
+/// both parity tests pin the full strings). Provenance: originally discovered
+/// via the Lighthouse peer API 2026-03-11, re-censused via period_census
+/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411 — per-entry
+/// evidence in the comments below).
 const MAINNET_STATIC_PEERS: &[&str] = &[
     // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
     // general-purpose beacon node shares one connection semaphore between
@@ -564,24 +568,32 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // because it makes no outbound connections — so this line is the thing that
     // breaks if the address moves.
     "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
-    "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
-    "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
-    "/ip4/54.157.213.0/tcp/9000/p2p/16Uiu2HAmQz83bNmMaBFCafuxDasiNdPYZF1B4zhgo3DckByU8bo3",
-    "/ip4/84.229.246.214/tcp/9001/p2p/16Uiu2HAm1UtRynVpuvWUgn3bfNooSUKYSUrbW8oeuBBcwVxbC1c9",
-    "/ip4/73.205.184.197/tcp/9000/p2p/16Uiu2HAm9CKG1x5rJk6sgEnCh9TKRagNEVVJfjR1jC3ruzPQfwzb",
-    "/ip4/172.92.13.157/tcp/9000/p2p/16Uiu2HAm7TEx4DP8iVj1RedeDNK59pw9AskGRwV7x9vgexTQi8CM",
-    "/ip4/77.12.100.127/tcp/9012/p2p/16Uiu2HAmA5VXnNKGu9jmV5yhL3tGy5seiNMnaBMTaV1vBesz84iJ",
+    // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
+    // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the
+    // roost comment above says why pinning an unreachable address is not free).
+    // The three below are cross-verified against independent clients (the
+    // first two served this census a 512/512 period-1840 update; the third
+    // was verified via the standalone Nimbus light client):
+    //  - 57.129.130.18: Lighthouse v8.2.2; enforces the one_every(10s) updates
+    //    quota, so it serves ONE period per ask (single_period_peers handles it);
+    //    also served the Java engine's catch-up (periods 1837-1838).
+    //  - 84.112.35.112: served the Java engine (1836-1837) and this census.
+    //  - 91.189.182.90: Nimbus fleet; served the standalone Nimbus light client
+    //    all five periods 1840-1844 in a single batched response (generous).
+    "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+    "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+    "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+    // TCP-alive on 2026-09-02 but declining libp2p dials at probe time (busy
+    // public nodes shed light clients first — flaky by construction, kept
+    // because they demonstrably served the period census within hours).
     "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
     "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
     "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
     "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-    "/ip4/195.201.160.183/tcp/9000/p2p/16Uiu2HAm79xzMY5FNnXGo6xcBRxCzYvMNE7CM6NZytrjXoDB5yRQ",
     "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
     "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
     "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
-    "/ip4/216.105.170.30/tcp/9000/p2p/16Uiu2HAm86YwyECbBiHTo2imwQJ4UXGgR1NLY2W6dPUfEFDony6d",
     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
-    "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM",
 ];
 
 /// Mainnet CL discv5 bootnodes — the Java `NetworkConfig.MAINNET`
@@ -3178,16 +3190,34 @@ mod tests {
         // The live digest the Java computes (verified against jshell).
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
-        // 18 discovered peers + roost mainnet, pinned by NAME only.
-        assert_eq!(c.static_peers.len(), 19);
-        // roost is FIRST — the ordering is the point, not an accident of the
-        // list. The Java twin prepends it with prependLocal(); if these two ever
-        // disagree on position, the default engine and the Rust engine pick
-        // different first-choice peers and only one of them is the dedicated one.
+        // The FULL list, order and addresses — same discipline as the sepolia
+        // test below, and the Java twin (NetworkConfigGnosisTest
+        // .mainnetPinsRoostFirst) pins the same 12 strings, so a one-sided edit
+        // fails a test on whichever side diverges; pinning only count +
+        // element 0 (as both tests once did) let elements 1-11 drift
+        // machine-unchecked. roost is FIRST — the ordering is the point, not an
+        // accident of the list; the Java twin prepends it with prependLocal().
         assert_eq!(
-            c.static_peers[0],
-            "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC"
+            c.static_peers,
+            vec![
+                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+                "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+                "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+                "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
+                "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
+                "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
+                "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
+                "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
+                "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
+                "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
+                "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
+            ],
+            "same list, order AND addresses as the Java NetworkConfig.MAINNET.clPeerMultiaddrs"
         );
+        // A malformed pin would otherwise reach run_sync and surface only as a
+        // "skipping unparseable static peer multiaddr" warn.
+        assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
     }
