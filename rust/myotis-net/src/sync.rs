@@ -544,8 +544,12 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
 ];
 
-/// Known light-client-serving mainnet peers — the Java `NetworkConfig.MAINNET`
-/// clPeerMultiaddrs list (nimbus/lodestar/lighthouse, discovered 2026-03-11).
+/// Known light-client-serving mainnet peers — mirrored with the Java
+/// `NetworkConfig.MAINNET` clPeerMultiaddrs list (same entries, same order;
+/// both parity tests pin the full strings). Provenance: originally discovered
+/// via the Lighthouse peer API 2026-03-11, re-censused via period_census
+/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411 — per-entry
+/// evidence in the comments below).
 const MAINNET_STATIC_PEERS: &[&str] = &[
     // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
     // general-purpose beacon node shares one connection semaphore between
@@ -3187,11 +3191,12 @@ mod tests {
         assert_eq!(c.current_fork_digest(), [0x8C, 0x9F, 0x62, 0xFE]);
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
         // The FULL list, order and addresses — same discipline as the sepolia
-        // test below, for the same reason: the Java twin asserts full strings,
-        // and pinning only count + element 0 here (as this test once did) let a
-        // copy-paste divergence between the engines go machine-unchecked. roost
-        // is FIRST — the ordering is the point, not an accident of the list;
-        // the Java twin prepends it with prependLocal().
+        // test below, and the Java twin (NetworkConfigGnosisTest
+        // .mainnetPinsRoostFirst) pins the same 12 strings, so a one-sided edit
+        // fails a test on whichever side diverges; pinning only count +
+        // element 0 (as both tests once did) let elements 1-11 drift
+        // machine-unchecked. roost is FIRST — the ordering is the point, not an
+        // accident of the list; the Java twin prepends it with prependLocal().
         assert_eq!(
             c.static_peers,
             vec![

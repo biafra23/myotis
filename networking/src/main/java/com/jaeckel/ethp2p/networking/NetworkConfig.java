@@ -103,8 +103,10 @@ public record NetworkConfig(
             // an older digest are either stale ENRs or unupgraded nodes — matching
             // them wouldn't help us sync to the current head anyway.
             null,
-            // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
-            // discovered via Lighthouse peer API 2026-03-11
+            // CL peer multiaddrs: known light-client-serving peers. Provenance:
+            // originally discovered via the Lighthouse peer API 2026-03-11,
+            // re-censused via period_census 2026-09-01 (#410), re-verified and
+            // pruned 2026-09-02 (#411 — per-entry evidence in the list comments).
             // NOTE the order: the LITERAL leads and the NAME follows. That looks
             // backwards and is not — see ROOST_PIN_ORDER in the Rust twin. Java
             // walks this list in order and falls through, so a stale literal

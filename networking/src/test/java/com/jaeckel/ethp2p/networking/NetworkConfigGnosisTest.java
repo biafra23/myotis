@@ -201,12 +201,27 @@ class NetworkConfigGnosisTest {
         // It also matters more here than in Rust: addPeer inserts discovered
         // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
         // this side.
+        // The FULL list, order and addresses — the Rust twin
+        // (mainnet_config_matches_networkconfig_java) pins the same 12 strings,
+        // so an address typo or one-sided IP rotation fails a test on WHICHEVER
+        // side diverges; count + element 0 alone let elements 1-11 drift
+        // machine-unchecked (PR #411 review).
         List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/"
-                        + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
-                cl.get(0),
-                "roost mainnet must be the first CL peer tried");
-        assertEquals(12, cl.size(),
-                "11 verified peers + roost; pinning must not drop the fallbacks");
+        assertEquals(List.of(
+                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+                "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+                "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+                "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
+                "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
+                "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
+                "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
+                "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
+                "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
+                "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
+                "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ"),
+                cl,
+                "same list, order AND addresses as the Rust MAINNET_STATIC_PEERS; "
+                        + "roost mainnet must be the first CL peer tried");
     }
 }
