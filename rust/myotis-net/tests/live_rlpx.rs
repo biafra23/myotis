@@ -16,13 +16,7 @@ use myotis_core::keccak::keccak256;
 use myotis_core::nodekey::NodeKey;
 use myotis_net::el::discv4::{Discv4Config, Discv4Service, TableEntry};
 use myotis_net::el::rlpx::transport::{decode_hello, encode_hello, RlpxConnection, P2P_HELLO};
-
-const MAINNET_BOOTNODES: &[&str] = &[
-    "18.138.108.67:30303",
-    "3.209.45.79:30303",
-    "65.108.70.101:30303",
-    "157.90.35.166:30303",
-];
+use myotis_net::el::reader::ElConfig;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live network test: discovers a mainnet peer and RLPx-dials it to FRAMED"]
@@ -35,7 +29,7 @@ async fn dials_a_mainnet_peer_to_framed() {
         .try_init();
 
     let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"myotis-live-rlpx")).unwrap());
-    let bootnodes: Vec<SocketAddr> = MAINNET_BOOTNODES.iter().map(|s| s.parse().unwrap()).collect();
+    let bootnodes: Vec<SocketAddr> = ElConfig::mainnet().bootnodes; // one source of truth
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
     let discovery = Discv4Service::start(

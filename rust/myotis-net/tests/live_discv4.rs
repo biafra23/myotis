@@ -14,14 +14,7 @@ use std::time::Duration;
 use myotis_core::keccak::keccak256;
 use myotis_core::nodekey::NodeKey;
 use myotis_net::el::discv4::{Discv4Config, Discv4Service};
-
-/// Mainnet discv4 bootnodes (ip:port), mirroring `NetworkConfig.MAINNET`.
-const MAINNET_BOOTNODES: &[&str] = &[
-    "18.138.108.67:30303",
-    "3.209.45.79:30303",
-    "65.108.70.101:30303",
-    "157.90.35.166:30303",
-];
+use myotis_net::el::reader::ElConfig;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live network test: pings mainnet discv4 bootnodes over UDP"]
@@ -34,10 +27,9 @@ async fn bonds_and_discovers_on_live_mainnet() {
         .try_init();
 
     let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"myotis-live-discv4")).unwrap());
-    let bootnodes: Vec<SocketAddr> = MAINNET_BOOTNODES
-        .iter()
-        .map(|s| s.parse().expect("valid bootnode addr"))
-        .collect();
+    // Seed list = the engine config (one source of truth, pinned by
+    // `mainnet_config_pins_known_values`).
+    let bootnodes: Vec<SocketAddr> = ElConfig::mainnet().bootnodes;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let service = Discv4Service::start(

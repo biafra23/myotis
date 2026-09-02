@@ -6145,7 +6145,20 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        assert_eq!(c.bootnodes.len(), 4, "all four mainnet bootnodes must parse");
+        // The four discv4 seeds, pinned as strings: this const is the anchor
+        // the live tests build from and the Java NetworkConfig.MAINNET mirrors,
+        // so a partial re-sync fails here in a fast lib test.
+        let bootnodes: Vec<String> = c.bootnodes.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            bootnodes,
+            [
+                "18.138.108.67:30303",
+                "3.209.45.79:30303",
+                "65.108.70.101:30303",
+                "157.90.35.166:30303",
+            ],
+            "mainnet discv4 bootnodes = go-ethereum MainnetBootnodes (see ElConfig::mainnet)"
+        );
     }
 
     #[test]

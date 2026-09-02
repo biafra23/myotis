@@ -28,13 +28,7 @@ use myotis_core::nodekey::NodeKey;
 use myotis_net::el::discv4::{Discv4Config, Discv4Service, TableEntry};
 use myotis_net::el::eth::session::{EthConfig, EthSession};
 use myotis_net::el::rlpx::transport::RlpxConnection;
-
-const MAINNET_BOOTNODES: &[&str] = &[
-    "18.138.108.67:30303",
-    "3.209.45.79:30303",
-    "65.108.70.101:30303",
-    "157.90.35.166:30303",
-];
+use myotis_net::el::reader::ElConfig;
 
 /// Mainnet chain constants (mirror `NetworkConfig.MAINNET`).
 const MAINNET_GENESIS: &str = "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3";
@@ -52,7 +46,7 @@ async fn fetches_and_verifies_headers_on_live_mainnet() {
         .try_init();
 
     let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"myotis-live-eth")).unwrap());
-    let bootnodes: Vec<SocketAddr> = MAINNET_BOOTNODES.iter().map(|s| s.parse().unwrap()).collect();
+    let bootnodes: Vec<SocketAddr> = ElConfig::mainnet().bootnodes; // one source of truth
     let genesis = hex32(MAINNET_GENESIS);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
