@@ -206,7 +206,7 @@ class NetworkConfigGnosisTest {
                         + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                 cl.get(0),
                 "roost mainnet must be the first CL peer tried");
-        assertEquals(19, cl.size(),
-                "18 discovered peers + roost; pinning must not drop the fallbacks");
+        assertEquals(12, cl.size(),
+                "11 verified peers + roost; pinning must not drop the fallbacks");
     }
 }
