@@ -83,7 +83,9 @@ public interface SnapPeer {
      *  NOT off a merely non-empty response: a structurally valid but junk
      *  response otherwise clears failure streaks before its verification
      *  fails, letting a byzantine peer oscillate a strike ladder 0↔1 and
-     *  dodge eviction forever. Default no-op. */
+     *  dodge eviction forever. Fired at the oracle's concrete verification
+     *  sites (not centrally on op success, which a fully cache-filled batch
+     *  chunk can reach without checking this peer's bytes). Default no-op. */
     default void reportServed() {}
 
     /**

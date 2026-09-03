@@ -3969,8 +3969,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  updated before the oracle's fail-fast skim re-consults the supplier), so
      *  the potentially blocking sink call moves off-thread here instead. */
     private void recordSnapQualityAsync(EthHandler peer, boolean served) {
-        java.util.concurrent.CompletableFuture.runAsync(() -> recordSnapQuality(peer, served));
+        // FIFO-chained, not independent runAsync tasks: the cache counts
+        // CONSECUTIVE failures, so a stale serve task overtaking three failure
+        // tasks would re-confirm a peer the pool just evicted and undo the
+        // DENIED verdict the eviction ladder pairs with. Appending under the
+        // lock fixes each event's position at callback time; the chain runs on
+        // the common pool, so callbacks still never block on the sink. Old
+        // stages become unreachable as the chain advances (no growth).
+        synchronized (snapQualityOrder) {
+            snapQualityTail = snapQualityTail.thenRunAsync(() -> recordSnapQuality(peer, served));
+        }
     }
+
+    /** Tail of the FIFO quality-write chain; guarded by {@link #snapQualityOrder}. */
+    private java.util.concurrent.CompletableFuture<Void> snapQualityTail =
+            java.util.concurrent.CompletableFuture.completedFuture(null);
+    private final Object snapQualityOrder = new Object();
 
     private void recordSnapQuality(EthHandler peer, boolean served) {
         if (peer == null) return;
