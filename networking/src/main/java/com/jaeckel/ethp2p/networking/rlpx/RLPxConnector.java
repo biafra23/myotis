@@ -647,7 +647,10 @@ public final class RLPxConnector implements AutoCloseable {
                 benchReadFailure(handler);
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
-            recordReadServed(handler);
+            // No streak clear here: nothing on this path is verified (the proof
+            // check happens in the caller), and the serve credit must not be
+            // spoofable with junk bytes — clears, like strikes, come only from
+            // the oracle path, post-verification (SnapPeer.reportServed).
             return CompletableFuture.completedFuture(result);
         }).thenCompose(Function.identity());
     }
@@ -725,17 +728,30 @@ public final class RLPxConnector implements AutoCloseable {
      *  serve: routing prefers proven servers, so a struck peer may not be re-tried
      *  soon, and strikes from unrelated transient lags can accumulate to an eviction —
      *  acceptable, since eviction only costs a re-dial and the cache verdict needs the
-     *  same three failures it always did. */
-    public synchronized void recordReadFailure(EthHandler failed) {
+     *  same three failures it always did.
+     *
+     *  @return true when a strike was banked (BENCH/EVICT); false on the sole-peer
+     *      SHIELD — callers pairing this with a persisted failure verdict must skip
+     *      that write too, or three shielded outages would persist DENIED against
+     *      the one peer that kept serving (the guard Rust's record_quality keeps). */
+    public synchronized boolean recordReadFailure(EthHandler failed) {
         boolean anotherServing = anotherServing(failed);
         // Judged on the post-bank streak; the bank itself happens per branch because
         // the shield must not strike. Bank and clear both happen under the connector
         // monitor (recordReadServed is synchronized too), so streak+1 IS the
         // post-bank value.
         switch (readFailureVerdict(anotherServing, failed.snapReadFailStreak() + 1)) {
-            case SHIELD -> log.info(
-                "[rlpx] Not benching {} — last serving snap peer (empty response likely "
-                    + "a stale-root request)", failed.getRemoteAddress());
+            case SHIELD -> {
+                // Zero the streak, matching the Rust twin: keeping banked
+                // strikes frozen through a shielded phase would evict the peer
+                // on its very next failure the instant the pool regrows,
+                // before it has actually failed as a NON-sole peer.
+                failed.clearSnapReadFailures();
+                log.info(
+                    "[rlpx] Not benching {} — last serving snap peer (empty response likely "
+                        + "a stale-root request)", failed.getRemoteAddress());
+                return false;
+            }
             case BENCH -> {
                 failed.bankSnapReadFailure();
                 failed.markSnapServingFailed();
@@ -755,6 +771,7 @@ public final class RLPxConnector implements AutoCloseable {
                 failed.evict();
             }
         }
+        return true;
     }
 
     /** A verified read served from this peer — reset its consecutive-failure streak.

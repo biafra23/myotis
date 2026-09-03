@@ -1785,8 +1785,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         final java.util.function.Consumer<EthHandler> onRootDenied = p -> {
             if (rootDenied.add(p)) {
                 rootServed.remove(p);
-                recordSnapQualityAsync(p, false);
-                oracleConn.recordReadFailure(p);
+                // Strike first: on the sole-peer SHIELD (no strike banked) the
+                // persisted failure verdict is skipped too, or three shielded
+                // outages would persist DENIED against the one peer that kept
+                // serving — the same guard the Rust record_quality keeps.
+                if (oracleConn.recordReadFailure(p)) {
+                    recordSnapQualityAsync(p, false);
+                }
             }
         };
         final java.util.function.Consumer<EthHandler> onRootServed = p -> {

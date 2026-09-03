@@ -57,11 +57,12 @@ public final class EthHandlerSnapPeer implements SnapPeer {
      *  current state root (deprioritize it for this head). Runs SYNCHRONOUSLY on
      *  the reporting thread (often the Netty event loop): keep it to lock-free
      *  routing mutations and offload anything that can block.
-     * @param onRootServed run when this peer returns a usable (non-empty) proof, so
-     *  the EL peer cache can record it as a proven snap-serving peer to dial first
-     *  on a restart. The two callbacks are mutually exclusive per fetch: a non-empty
-     *  proof fires {@code onRootServed}; an empty one is treated by the oracle as
-     *  no-state and ultimately fires {@code onRootUnavailable}.
+     * @param onRootServed run when a fetch through this peer VERIFIES (fired via
+     *  {@link #reportServed} from the oracle, never on a merely non-empty
+     *  response), so the EL peer cache can record it as a proven snap-serving
+     *  peer to dial first on a restart. The two callbacks are mutually exclusive
+     *  per fetch: a verified fetch fires {@code onRootServed}; an empty or
+     *  unverifiable one ultimately fires {@code onRootUnavailable}.
      */
     public EthHandlerSnapPeer(EthHandler handler, Runnable onRootUnavailable,
                               Runnable onRootServed, SnapLaneGate laneGate) {
@@ -79,6 +80,18 @@ public final class EthHandlerSnapPeer implements SnapPeer {
     @Override
     public String describe() {
         return handler.getRemoteAddress();
+    }
+
+    @Override
+    public void reportServed() {
+        // Fired by the oracle AFTER the fetched proof verified (never on a
+        // merely non-empty response — see SnapPeer.reportServed): the serve
+        // credit must not be spoofable with junk bytes. Synchronous, mirroring
+        // reportRootUnavailable: the supplier's rootServed preference should
+        // see the serve before the next consult.
+        if (onRootServed != null) {
+            try { onRootServed.run(); } catch (RuntimeException ignore) {}
+        }
     }
 
     @Override
@@ -147,17 +160,12 @@ public final class EthHandlerSnapPeer implements SnapPeer {
                 for (CompletableFuture<List<Bytes>> f : perSet) {
                     all.addAll(f.join());
                 }
-                // A non-empty proof means this peer actually retains the trie for
-                // this root — the durable "snap-serving" signal the EL cache wants.
-                // Empty proofs fall through to the oracle's no-state path, which
-                // calls reportRootUnavailable instead. Synchronous, mirroring
-                // reportRootUnavailable: the supplier's rootServed preference
-                // should see the serve before the next consult, and the callback
-                // contract requires callbacks to offload their own blocking work
-                // (see reportRootUnavailable).
-                if (!all.isEmpty() && onRootServed != null) {
-                    try { onRootServed.run(); } catch (RuntimeException ignore) {}
-                }
+                // NO serve credit here: a non-empty node list is not yet a
+                // serve — the oracle still has to verify it, and fires
+                // reportServed only when it does. Crediting on non-empty bytes
+                // let a junk response clear failure streaks (review finding on
+                // the eviction ladder). Empty proofs fall through to the
+                // oracle's no-state path → reportRootUnavailable.
                 return all;
             });
     }

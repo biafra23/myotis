@@ -77,6 +77,15 @@ public interface SnapPeer {
      */
     default void reportRootUnavailable() {}
 
+    /** Reported when a fetch through this peer VERIFIED (Merkle proof or hash
+     *  checked by the oracle) — the trustworthy "this peer served" signal.
+     *  Routing preference and any pool/cache serve credit must hang off this,
+     *  NOT off a merely non-empty response: a structurally valid but junk
+     *  response otherwise clears failure streaks before its verification
+     *  fails, letting a byzantine peer oscillate a strike ladder 0↔1 and
+     *  dodge eviction forever. Default no-op. */
+    default void reportServed() {}
+
     /**
      * Short human-readable identity for logs ("ip:port" for network-backed
      * implementations). Purely diagnostic — never used for routing decisions.

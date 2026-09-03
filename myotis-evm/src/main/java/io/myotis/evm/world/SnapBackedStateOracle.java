@@ -451,6 +451,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         }
         future.whenComplete((value, error) -> {
             if (error == null) {
+                // Every op run through here proves or hash-checks what it
+                // fetched before completing, so success == VERIFIED serve —
+                // the only point trustworthy enough to credit the peer
+                // (routing preference, pool streak reset, cache verdict).
+                try { peer.reportServed(); } catch (RuntimeException ignore) {}
                 sink.complete(value);
                 return;
             }
