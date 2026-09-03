@@ -23,6 +23,19 @@ class PeerCacheTest {
     }
 
     @Test
+    void snapFailureThresholdMatchesThePoolEvictionLadder() {
+        // The read that evicts (RLPxConnector.READ_FAILS_EVICT, the in-pool
+        // consecutive-failure ladder) must be the read whose cache verdict
+        // flips to DENIED — the two counters move in lockstep, like the Rust
+        // engine's compile-asserted READ_FAILS_EVICT == FAILURE_THRESHOLD
+        // (pool.rs). The classes can't reference each other (hosts don't see
+        // :networking at runtime), so this test carries the assertion.
+        assertEquals(
+            com.jaeckel.ethp2p.networking.rlpx.RLPxConnector.READ_FAILS_EVICT,
+            PeerCache.SNAP_FAILURE_THRESHOLD);
+    }
+
+    @Test
     void connectFailuresDemoteThenEvict(@TempDir Path dir) {
         PeerCache cache = new PeerCache(dir.resolve("peers.cache"));
         cache.add(A, PK, true);

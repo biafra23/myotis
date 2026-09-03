@@ -78,7 +78,14 @@ public final class AndroidPeerCache implements Closeable {
     private static final String TAG = "ethp2p.cache";
     private static final char SEP = '\t';
 
-    /** Consecutive snap-serve failures before a peer is marked {@code DENIED}. */
+    /** Consecutive snap-serve failures before a peer is marked {@code DENIED}.
+     *  Deliberately equal to {@code RLPxConnector.READ_FAILS_EVICT}: the read
+     *  that evicts a peer from the live pool is the read whose persisted
+     *  verdict flips to DENIED, like the Rust engine's compile-asserted twin
+     *  thresholds (pool.rs / peercache.rs). This host module can't reference
+     *  the constant and has no JVM test source set; the daemon twin's
+     *  {@code PeerCacheTest} pins the equality — keep this mirror in step with
+     *  {@code PeerCache.SNAP_FAILURE_THRESHOLD} when it moves. */
     public static final int SNAP_FAILURE_THRESHOLD = 3;
 
     /** Consecutive TCP connect failures before a peer reports {@code DENIED}

@@ -107,6 +107,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      *  snap serving pool (0 = not benched). nanoTime, not currentTimeMillis: a wall-clock
      *  adjustment (NTP / manual) must not extend or prematurely expire the cooldown. */
     private volatile long snapServingFailedUntilNs = 0L;
+    /** CONSECUTIVE verified-read failures (a serve resets it). Banked and judged by
+     *  {@code RLPxConnector.recordReadFailure} — the bench above handles a momentary
+     *  lag, this counter is the escalation for a peer that KEEPS failing after its
+     *  cooldowns: at {@code RLPxConnector.READ_FAILS_EVICT} the peer is disconnected
+     *  so the maintainer refills the slot with a fresh candidate (twin of the Rust
+     *  engine's read-failure eviction, pool.rs). */
+    private final java.util.concurrent.atomic.AtomicInteger snapReadFails =
+        new java.util.concurrent.atomic.AtomicInteger();
     private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
     private volatile long latestStateRootBlockNumber = -1;
 
@@ -1657,6 +1665,41 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         long until = System.nanoTime() + SNAP_SERVING_COOLDOWN_NS;
         // nanoTime can legitimately be 0; remap so 0 keeps meaning "not benched".
         snapServingFailedUntilNs = (until == 0L) ? 1L : until;
+    }
+
+    /** Current consecutive verified-read failure streak. */
+    public int snapReadFailStreak() {
+        return snapReadFails.get();
+    }
+
+    /** Bank one consecutive verified-read failure and return the new streak.
+     *  Policy (bench vs evict) lives in {@code RLPxConnector.recordReadFailure}. */
+    public int bankSnapReadFailure() {
+        return snapReadFails.incrementAndGet();
+    }
+
+    /** A verified read served — reset the CONSECUTIVE-failure streak. */
+    public void clearSnapReadFailures() {
+        snapReadFails.set(0);
+    }
+
+    /** Close this peer's connection, sending a best-effort p2p Disconnect(0x03
+     *  useless peer) first. The channel's close future does the rest (pending
+     *  requests fail, {@code activeHandlers} removal, the host's close callback
+     *  applies its transient backoff), and the snap maintainer refills the freed
+     *  slot on its next tick. Used by the read-failure eviction ladder. */
+    public void evict() {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null) {
+            return;
+        }
+        try {
+            // RLP([reason]) with reason 0x03 = "useless peer".
+            rlpxHandler.sendMessage(ctx, P2P_DISCONNECT, new byte[] {(byte) 0xC1, 0x03});
+        } catch (RuntimeException ignore) {
+            // Best-effort courtesy only — the close below is what matters.
+        }
+        ctx.close();
     }
 
     public State getState() {

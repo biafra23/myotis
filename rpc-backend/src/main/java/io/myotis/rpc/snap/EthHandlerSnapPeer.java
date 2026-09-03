@@ -88,9 +88,12 @@ public final class EthHandlerSnapPeer implements SnapPeer {
         // state (rootDenied/rootServed in VerifiedRpcBackend) must already
         // reflect the deny — an async offload here loses that race and the
         // skim sees the pre-failure world, failing operations fast while
-        // untried peers exist. The callback contract is therefore: routing
-        // mutations only (lock-free sets); any potentially blocking work
-        // (quality sinks, persistence) must be offloaded BY THE CALLBACK.
+        // untried peers exist. The callback contract is therefore: routing and
+        // pool-discipline mutations only — lock-free sets, plus the connector's
+        // read-failure monitor, which is verified non-blocking (a short scan, a
+        // volatile bench, an async close; no I/O and no other lock is ever held
+        // with it); any potentially blocking work (quality sinks, persistence)
+        // must be offloaded BY THE CALLBACK.
         if (onRootUnavailable != null) {
             try { onRootUnavailable.run(); } catch (RuntimeException ignore) {}
         }

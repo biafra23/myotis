@@ -644,30 +644,124 @@ public final class RLPxConnector implements AutoCloseable {
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
-                benchUnlessLastServing(handler);
+                benchReadFailure(handler);
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
+            recordReadServed(handler);
             return CompletableFuture.completedFuture(result);
         }).thenCompose(Function.identity());
     }
 
-    /** Bench a peer that failed to serve — unless it is the last un-benched serving
-     *  snap peer. An empty snap response usually means WE asked for a state root
-     *  outside the peer's ~128-block snapshot window (stale local head), not that
-     *  the peer is broken; benching the sole server empties the serving pool and
-     *  flaps the status (and the EL hunt) between 0 and 1 until the bench expires.
-     *  Synchronized so two concurrent failures on the last two serving peers
-     *  can't each see the other as still serving and both bench — the scan and
-     *  the mark must be atomic against other benchers. */
-    private synchronized void benchUnlessLastServing(EthHandler failed) {
+    /** Consecutive verified-read failures at which a peer is DISCONNECTED instead of
+     *  benched, freeing its slot for a fresh candidate (the snap maintainer refills on
+     *  serving count). Twin of the Rust engine's {@code READ_FAILS_EVICT}
+     *  (rust/myotis-net/src/el/pool.rs), and deliberately equal to the peer caches'
+     *  snap-failure DENIED threshold ({@code PeerCache}/{@code AndroidPeerCache}
+     *  {@code SNAP_FAILURE_THRESHOLD} — they can't import this constant, hosts don't
+     *  see {@code :networking}; {@code PeerCacheTest} pins the equality) so eviction
+     *  and the persisted verdict move in lockstep: the read that evicts is the read
+     *  that denies. */
+    public static final int READ_FAILS_EVICT = 3;
+
+    /** Outcome of one banked verified-read failure. */
+    enum ReadFailureVerdict { SHIELD, BENCH, EVICT }
+
+    /** The pure ladder, extracted for tests: the sole serving peer is shielded (an
+     *  empty response there is likelier OUR stale root than a broken peer, and
+     *  benching it flaps the serving pool between 0 and 1); otherwise the streak
+     *  benches until it reaches {@link #READ_FAILS_EVICT}, then evicts. */
+    static ReadFailureVerdict readFailureVerdict(boolean anotherServing, int failsAfterBank) {
+        if (!anotherServing) {
+            return ReadFailureVerdict.SHIELD;
+        }
+        return failsAfterBank >= READ_FAILS_EVICT ? ReadFailureVerdict.EVICT
+                                                  : ReadFailureVerdict.BENCH;
+    }
+
+    /** True when a serving snap peer other than {@code failed} exists. Caller must hold
+     *  the connector monitor (the scan and the subsequent bench/evict must be atomic
+     *  against other benchers, or the last two serving peers can each see the other as
+     *  still serving and both leave the pool). Counts UN-BENCHED peers — deliberately
+     *  narrower than the Rust twin's shield (any live pool peer, benched included,
+     *  pool.rs): it mirrors the pre-eviction {@code benchUnlessLastServing} predicate,
+     *  and stops striking once the rest of the pool is already benched, which a
+     *  whole-pool outage (our stale root, not the peers') would otherwise turn into a
+     *  pool-wide eviction. */
+    private boolean anotherServing(EthHandler failed) {
         for (EthHandler h : activeHandlers) {
             if (h != failed && h.isReady() && h.isSnapNegotiated() && !h.isSnapServingFailed()) {
-                failed.markSnapServingFailed();
-                return;
+                return true;
             }
         }
-        log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
-            + "a stale-root request)", failed.getRemoteAddress());
+        return false;
+    }
+
+    /** Bench a peer whose response failed a read, without banking an eviction strike —
+     *  for PER-RESPONSE failure paths (one storage request rotating N peers fires this
+     *  N times, and concurrent requests multiply it): banking here would let a couple
+     *  of stale-root queries walk healthy peers to eviction, and this path has no
+     *  cache access, so an eviction from it could not write the DENIED verdict the
+     *  ladder promises ("the read that evicts is the read that denies"). Strikes come
+     *  only from {@link #recordReadFailure}, whose oracle caller dedupes per root
+     *  context and pairs each strike with a cache verdict. */
+    public synchronized void benchReadFailure(EthHandler failed) {
+        if (anotherServing(failed)) {
+            failed.markSnapServingFailed();
+        } else {
+            log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
+                + "a stale-root request)", failed.getRemoteAddress());
+        }
+    }
+
+    /** A verified read failed against this peer: bench it for the cooldown, or — on the
+     *  {@link #READ_FAILS_EVICT}th CONSECUTIVE failure — disconnect it so the maintainer
+     *  replaces it (a 30s bench routes around a momentary lag; it cannot rotate out a
+     *  peer that keeps failing, which is how a stale pool held every slot in the Rust
+     *  engine's 2026-09-02 incident). The last un-benched serving snap peer is shielded
+     *  (no strike banked either — matching the Rust pool's sole-peer shield). Callers
+     *  must dedupe to at most one call per peer per failed READ (the oracle gates on
+     *  its per-root-context deny set) — per-response paths use
+     *  {@link #benchReadFailure} instead. Note "consecutive" means no intervening
+     *  serve: routing prefers proven servers, so a struck peer may not be re-tried
+     *  soon, and strikes from unrelated transient lags can accumulate to an eviction —
+     *  acceptable, since eviction only costs a re-dial and the cache verdict needs the
+     *  same three failures it always did. */
+    public synchronized void recordReadFailure(EthHandler failed) {
+        boolean anotherServing = anotherServing(failed);
+        // Judged on the post-bank streak; the bank itself happens per branch because
+        // the shield must not strike. Bank and clear both happen under the connector
+        // monitor (recordReadServed is synchronized too), so streak+1 IS the
+        // post-bank value.
+        switch (readFailureVerdict(anotherServing, failed.snapReadFailStreak() + 1)) {
+            case SHIELD -> log.info(
+                "[rlpx] Not benching {} — last serving snap peer (empty response likely "
+                    + "a stale-root request)", failed.getRemoteAddress());
+            case BENCH -> {
+                failed.bankSnapReadFailure();
+                failed.markSnapServingFailed();
+            }
+            case EVICT -> {
+                failed.bankSnapReadFailure();
+                // Bench BEFORE the close: removal from activeHandlers happens
+                // asynchronously in the close-future listener, so without this
+                // a just-evicted peer still satisfies the anotherServing scan
+                // above and two concurrent evictions could drain the pool past
+                // the shield (the Rust twin's prune_closed guards the same
+                // corpse-counting hole, pool.rs).
+                failed.markSnapServingFailed();
+                log.info("[rlpx] Evicting snap peer {} after {} consecutive verified-read "
+                    + "failures — freeing the slot for a fresh candidate",
+                    failed.getRemoteAddress(), READ_FAILS_EVICT);
+                failed.evict();
+            }
+        }
+    }
+
+    /** A verified read served from this peer — reset its consecutive-failure streak.
+     *  Synchronized with {@link #recordReadFailure} so a concurrent serve can't zero a
+     *  streak between that method's read and its bank. */
+    public synchronized void recordReadServed(EthHandler served) {
+        served.clearSnapReadFailures();
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}
