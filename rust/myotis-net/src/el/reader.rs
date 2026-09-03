@@ -322,6 +322,36 @@ pub struct VerifiedBlock {
 /// response soft limit.
 const BLOCK_LOOKBACK_MAX: u64 = 512;
 
+/// Tip-lag tolerance for a `latest` block/receipt read. The anchored head is
+/// the beacon OPTIMISTIC head, which can momentarily run 1-2 blocks ahead of
+/// what EL peers have imported — they then honestly answer "0 headers" for a
+/// block that, for them, does not exist yet (verified live 2026-09-02: `head`
+/// missed while `head-100` served, gap closing within seconds). The header
+/// window can only be verified up to the anchored head hash, so we cannot
+/// serve an older block instead — but the lag is transient, so a bounded
+/// retry (re-reading the advancing anchor and the current pool each time)
+/// rides it out. Scoped to `latest`: a pinned number returning "0 headers"
+/// is a peer that pruned it, not tip lag. ~3 × 400 ms adds latency ONLY on
+/// the failing path, and only when EVERY peer is merely behind the head (a
+/// mixed/transport failure fails fast — retrying it just burns a second).
+const TIP_LAG_RETRIES: usize = 3;
+const TIP_LAG_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// True when every per-peer failure is a "behind the anchored head" shape
+/// (short/empty header window, or a window head that isn't yet the anchored
+/// head) — the exact signature of the optimistic-head-vs-imported-tip race,
+/// distinct from a transport failure (timeout/disconnect) or a genuine proof
+/// error. Kept as a string match on the phrases `fetch_anchored_window`
+/// produces (there is no typed error across its four callers); the phrases
+/// live here so the coupling is visible.
+fn all_tip_lag(failures: &[String]) -> bool {
+    !failures.is_empty()
+        && failures.iter().all(|f| {
+            f.contains("headers, expected")
+                || f.contains("window head does not match the beacon-anchored head hash")
+        })
+}
+
 /// First-ever receipt scan for a tx hash looks back this many blocks below the
 /// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
 /// grows coverage forward as the wallet polls.
@@ -4221,7 +4251,45 @@ impl ElReader {
         target: Option<u64>,
         full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
+        // Tip-lag retry for `latest` only — see TIP_LAG_RETRIES. Each attempt
+        // re-reads the anchor (it advances) and the pool ladder (the rotation
+        // may have swapped in fresher peers between attempts).
+        let mut attempt = 0;
+        loop {
+            let (result, tip_lag) = self.get_block_by_number_once(target, full_transactions).await;
+            match result {
+                Err(e) if tip_lag && target.is_none() && attempt < TIP_LAG_RETRIES => {
+                    attempt += 1;
+                    tracing::debug!(attempt, error = %e,
+                        "latest block behind peers' imported tip — retrying");
+                    tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One full attempt of [`Self::get_block_by_number`] against the current
+    /// anchor and pool ladder. The bool is true when the attempt failed with
+    /// every peer merely BEHIND the anchored head ([`all_tip_lag`]) — the
+    /// retryable tip-lag shape, as opposed to transport/proof failures.
+    async fn get_block_by_number_once(
+        &self,
+        target: Option<u64>,
+        full_transactions: bool,
+    ) -> (Result<Option<VerifiedBlock>, String>, bool) {
+        match self.get_block_by_number_inner(target, full_transactions).await {
+            Ok(v) => (Ok(v), false),
+            Err((e, tip_lag)) => (Err(e), tip_lag),
+        }
+    }
+
+    async fn get_block_by_number_inner(
+        &self,
+        target: Option<u64>,
+        full_transactions: bool,
+    ) -> Result<Option<VerifiedBlock>, (String, bool)> {
+        let (head_num, head_hash) = self.anchored_head().map_err(|e| (e, false))?;
         let target_num = target.unwrap_or(head_num);
         // A pin above the verified head is future/unknown, not an error.
         if target_num > head_num {
@@ -4229,9 +4297,9 @@ impl ElReader {
         }
         let back = head_num - target_num;
         if back >= BLOCK_LOOKBACK_MAX {
-            return Err(format!(
+            return Err((format!(
                 "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ));
+            ), false));
         }
         // Serve over the snap pool (the peer set the reader maintains); a block
         // serve is eth-only (headers + bodies), so this is a superset of what's
@@ -4239,14 +4307,18 @@ impl ElReader {
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err("no snap peer available".to_string());
+            return Err(("no snap peer available".to_string(), false));
         }
         let total = peers.len();
         let mut failures: Vec<String> = Vec::with_capacity(total);
+        let mut failed: Vec<std::net::SocketAddr> = Vec::with_capacity(total);
         for peer in &peers {
             match self.get_block_from(peer, target_num, back, &head_hash, full_transactions).await
             {
                 Ok(block) => {
+                    // Strikes are DEFERRED: with a success in the batch the
+                    // earlier failures were individual, so bank them now.
+                    self.record_batch_failures(&failed).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(block));
                 }
@@ -4256,11 +4328,12 @@ impl ElReader {
                 // (retrying the pool would just re-download the block N times
                 // and burn the shared snap reputation on verified-good peers).
                 Err(BlockFromError::Undecodable(e)) => {
+                    self.record_batch_failures(&failed).await;
                     self.pool.record_snap_served(peer.addr()).await;
-                    return Err(e);
+                    return Err((e, false));
                 }
                 Err(BlockFromError::Peer(e)) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     failures.push(e);
                 }
             }
@@ -4272,7 +4345,21 @@ impl ElReader {
         // stale-pool incidents (2026-09-01/02) undiagnosable on-device.
         tracing::warn!(total, target_num, back, summary = %summary,
             "verified block fetch failed against every snap peer");
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}"))
+        let tip_lag = all_tip_lag(&failures);
+        // A whole-pool tip-lag batch carries NO signal about any peer — it's
+        // our anchor running ahead of their imported tip. Banking it would let
+        // one retrying `latest` read (up to 1 + TIP_LAG_RETRIES attempts)
+        // push every healthy peer past READ_FAILS_EVICT and drain the pool the
+        // retry exists to re-use. A genuinely header-less peer still accrues
+        // strikes whenever any other peer succeeds (the success path above) or
+        // fails differently (mixed batch → not tip-lag).
+        if !tip_lag {
+            self.record_batch_failures(&failed).await;
+        }
+        Err((
+            format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}"),
+            tip_lag,
+        ))
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
@@ -4855,42 +4942,73 @@ impl ElReader {
         &self,
         target: Option<u64>,
     ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
+        // Tip-lag retry for `latest` only — same shape and rationale as
+        // get_block_by_number (see TIP_LAG_RETRIES).
+        let mut attempt = 0;
+        loop {
+            match self.block_receipts_at_inner(target).await {
+                Err((e, true)) if target.is_none() && attempt < TIP_LAG_RETRIES => {
+                    attempt += 1;
+                    tracing::debug!(attempt, error = %e,
+                        "latest receipts behind peers' imported tip — retrying");
+                    tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                }
+                Err((e, _)) => return Err(e),
+                Ok(v) => return Ok(v),
+            }
+        }
+    }
+
+    /// One full attempt of [`Self::block_receipts_at`]; the error's bool is
+    /// the [`all_tip_lag`] verdict (see get_block_by_number_inner).
+    async fn block_receipts_at_inner(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, (String, bool)> {
+        let (head_num, head_hash) = self.anchored_head().map_err(|e| (e, false))?;
         let target_num = target.unwrap_or(head_num);
         if target_num > head_num {
             return Ok(None); // future/unknown block → eth null
         }
         let back = head_num - target_num;
         if back >= BLOCK_LOOKBACK_MAX {
-            return Err(format!(
+            return Err((format!(
                 "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ));
+            ), false));
         }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err("no snap peer available".to_string());
+            return Err(("no snap peer available".to_string(), false));
         }
         let total = peers.len();
         let mut failures: Vec<String> = Vec::with_capacity(total);
+        let mut failed: Vec<std::net::SocketAddr> = Vec::with_capacity(total);
         for peer in &peers {
             match self.block_receipts_from(peer, target_num, back, &head_hash).await {
                 Ok(served) => {
+                    self.record_batch_failures(&failed).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(Some(served));
                 }
                 Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     failures.push(e);
                 }
             }
+        }
+        let tip_lag = all_tip_lag(&failures);
+        // Tip-lag batches don't strike peers — see get_block_by_number_inner.
+        if !tip_lag {
+            self.record_batch_failures(&failed).await;
         }
         let summary = summarize_peer_failures(&failures);
         // Same rationale as get_block_by_number: whole-pool failures must be
         // diagnosable from an info+ log ring.
         tracing::warn!(total, target_num, back, summary = %summary,
             "verified receipts fetch failed against every snap peer");
-        Err(format!(
-            "all {total} snap peer(s) failed to serve verifiable block receipts: {summary}"
+        Err((
+            format!("all {total} snap peer(s) failed to serve verifiable block receipts: {summary}"),
+            tip_lag,
         ))
     }
 
@@ -4940,6 +5058,17 @@ impl ElReader {
     fn remember_block_number(&self, block_hash: [u8; 32], number: u64) {
         if let Ok(mut lru) = self.block_hash_numbers.lock() {
             lru.put(block_hash, number);
+        }
+    }
+
+    /// Bank one deferred read-failure strike per peer of a serve batch. The
+    /// block/receipts loops defer recording until the batch's outcome is known
+    /// so a whole-pool TIP-LAG failure (our anchor ahead of the peers' imported
+    /// tip — no peer's fault) strikes nobody; every other outcome banks the
+    /// strikes exactly as immediate recording did.
+    async fn record_batch_failures(&self, failed: &[std::net::SocketAddr]) {
+        for addr in failed {
+            self.pool.record_snap_failure(*addr).await;
         }
     }
 
@@ -5324,8 +5453,18 @@ async fn fetch_anchored_window(
     head_hash: &[u8; 32],
 ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, String> {
     let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
-    if window.len() as u64 != count {
+    // Distinct messages on purpose: a SHORT window is tip-lag-shaped (the peer
+    // may simply not have imported up to our anchor yet — all_tip_lag matches
+    // "headers, expected"), while returning MORE than asked is a protocol
+    // violation that must never read as retryable.
+    if (window.len() as u64) < count {
         return Err(format!("peer returned {} headers, expected {count}", window.len()));
+    }
+    if window.len() as u64 != count {
+        return Err(format!(
+            "peer over-served the header request: {} returned for {count} asked",
+            window.len()
+        ));
     }
     if window[0].header.number != from {
         return Err("peer returned the wrong starting block number".to_string());
@@ -5792,6 +5931,57 @@ mod tests {
         #[test]
         fn empty_input_yields_the_defensive_placeholder() {
             assert_eq!(summarize_peer_failures(&[]), "no failures recorded");
+        }
+    }
+
+    /// The tip-lag classifier gating the bounded `latest` retry: it must fire
+    /// only when EVERY peer failed in a way consistent with "the anchored head
+    /// is ahead of the peers' imported tip" — a short-header window or a head
+    /// hash the window doesn't reach. Anything else (transport errors, bad
+    /// proofs) means retrying won't help and must fail fast.
+    mod tip_lag {
+        use super::*;
+
+        fn s(v: &[&str]) -> Vec<String> {
+            v.iter().map(|x| x.to_string()).collect()
+        }
+
+        #[test]
+        fn all_zero_header_windows_is_tip_lag() {
+            assert!(all_tip_lag(&s(&[
+                "peer returned 0 headers, expected 1",
+                "peer returned 0 headers, expected 1",
+            ])));
+        }
+
+        #[test]
+        fn head_hash_mismatch_is_tip_lag() {
+            assert!(all_tip_lag(&s(&[
+                "window head does not match the beacon-anchored head hash",
+                "peer returned 2 headers, expected 3",
+            ])));
+        }
+
+        #[test]
+        fn a_single_transport_failure_disqualifies_the_batch() {
+            assert!(!all_tip_lag(&s(&[
+                "peer returned 0 headers, expected 1",
+                "request timed out",
+            ])));
+        }
+
+        #[test]
+        fn empty_failures_are_not_tip_lag() {
+            assert!(!all_tip_lag(&[]));
+        }
+
+        #[test]
+        fn an_over_served_header_window_is_a_protocol_violation_not_tip_lag() {
+            // fetch_anchored_window words the too-many case differently so it
+            // can never match the classifier — pin both halves of that pact.
+            assert!(!all_tip_lag(&s(&[
+                "peer over-served the header request: 5 returned for 3 asked",
+            ])));
         }
     }
 
