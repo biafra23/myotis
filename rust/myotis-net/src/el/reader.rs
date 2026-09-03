@@ -352,6 +352,22 @@ fn all_tip_lag(failures: &[String]) -> bool {
         })
 }
 
+/// A whole-pool read failure, split by how the caller must handle strikes.
+enum PoolReadError {
+    /// Not tip-lag (or not a whole-pool batch): any strikes are already
+    /// banked; retrying cannot help.
+    Fatal(String),
+    /// Every peer failed tip-lag-shaped ([`all_tip_lag`]). The batch's
+    /// strikes are DEFERRED to the caller: forgiven only for an attempt the
+    /// caller retries (the anchor advances past a transient lag), banked via
+    /// `record_batch_failures` the moment it gives up. So a blip shorter than
+    /// the retry budget strikes nobody, while a persistently lagging pool
+    /// keeps accruing one strike per peer per failed READ — the pre-retry
+    /// rate the 2026-09-02 stale-pool escape (eviction + refill) depends
+    /// on — and a pinned read, which never retries, banks immediately.
+    TipLag { error: String, failed: Vec<std::net::SocketAddr> },
+}
+
 /// First-ever receipt scan for a tx hash looks back this many blocks below the
 /// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
 /// grows coverage forward as the wallet polls.
@@ -4256,31 +4272,32 @@ impl ElReader {
         // may have swapped in fresher peers between attempts).
         let mut attempt = 0;
         loop {
-            let (result, tip_lag) = self.get_block_by_number_once(target, full_transactions).await;
-            match result {
-                Err(e) if tip_lag && target.is_none() && attempt < TIP_LAG_RETRIES => {
-                    attempt += 1;
-                    tracing::debug!(attempt, error = %e,
-                        "latest block behind peers' imported tip — retrying");
-                    tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+            match self.get_block_by_number_inner(target, full_transactions).await {
+                Err(PoolReadError::TipLag { error, failed }) => {
+                    if target.is_none() && attempt < TIP_LAG_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(attempt, error = %error,
+                            "latest block behind peers' imported tip — retrying");
+                        tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                        continue;
+                    }
+                    // Giving up (or a pinned read, which never retries): bank
+                    // this final attempt's deferred strikes — one per peer per
+                    // failed read, the pre-retry rate (PoolReadError::TipLag).
+                    self.record_batch_failures(&failed).await;
+                    return Err(error);
                 }
-                other => return other,
+                Err(PoolReadError::Fatal(e)) => return Err(e),
+                Ok(v) => {
+                    if attempt > 0 {
+                        // Pair the per-attempt WARNs with their outcome in the
+                        // same info+ ring hosts keep (debug is dropped there).
+                        tracing::info!(attempt,
+                            "latest block read recovered after tip-lag retries");
+                    }
+                    return Ok(v);
+                }
             }
-        }
-    }
-
-    /// One full attempt of [`Self::get_block_by_number`] against the current
-    /// anchor and pool ladder. The bool is true when the attempt failed with
-    /// every peer merely BEHIND the anchored head ([`all_tip_lag`]) — the
-    /// retryable tip-lag shape, as opposed to transport/proof failures.
-    async fn get_block_by_number_once(
-        &self,
-        target: Option<u64>,
-        full_transactions: bool,
-    ) -> (Result<Option<VerifiedBlock>, String>, bool) {
-        match self.get_block_by_number_inner(target, full_transactions).await {
-            Ok(v) => (Ok(v), false),
-            Err((e, tip_lag)) => (Err(e), tip_lag),
         }
     }
 
@@ -4288,8 +4305,8 @@ impl ElReader {
         &self,
         target: Option<u64>,
         full_transactions: bool,
-    ) -> Result<Option<VerifiedBlock>, (String, bool)> {
-        let (head_num, head_hash) = self.anchored_head().map_err(|e| (e, false))?;
+    ) -> Result<Option<VerifiedBlock>, PoolReadError> {
+        let (head_num, head_hash) = self.anchored_head().map_err(PoolReadError::Fatal)?;
         let target_num = target.unwrap_or(head_num);
         // A pin above the verified head is future/unknown, not an error.
         if target_num > head_num {
@@ -4297,9 +4314,9 @@ impl ElReader {
         }
         let back = head_num - target_num;
         if back >= BLOCK_LOOKBACK_MAX {
-            return Err((format!(
+            return Err(PoolReadError::Fatal(format!(
                 "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ), false));
+            )));
         }
         // Serve over the snap pool (the peer set the reader maintains); a block
         // serve is eth-only (headers + bodies), so this is a superset of what's
@@ -4307,7 +4324,7 @@ impl ElReader {
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err(("no snap peer available".to_string(), false));
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
         let total = peers.len();
         let mut failures: Vec<String> = Vec::with_capacity(total);
@@ -4330,7 +4347,7 @@ impl ElReader {
                 Err(BlockFromError::Undecodable(e)) => {
                     self.record_batch_failures(&failed).await;
                     self.pool.record_snap_served(peer.addr()).await;
-                    return Err((e, false));
+                    return Err(PoolReadError::Fatal(e));
                 }
                 Err(BlockFromError::Peer(e)) => {
                     failed.push(peer.addr());
@@ -4345,21 +4362,18 @@ impl ElReader {
         // stale-pool incidents (2026-09-01/02) undiagnosable on-device.
         tracing::warn!(total, target_num, back, summary = %summary,
             "verified block fetch failed against every snap peer");
-        let tip_lag = all_tip_lag(&failures);
-        // A whole-pool tip-lag batch carries NO signal about any peer — it's
-        // our anchor running ahead of their imported tip. Banking it would let
-        // one retrying `latest` read (up to 1 + TIP_LAG_RETRIES attempts)
-        // push every healthy peer past READ_FAILS_EVICT and drain the pool the
-        // retry exists to re-use. A genuinely header-less peer still accrues
-        // strikes whenever any other peer succeeds (the success path above) or
-        // fails differently (mixed batch → not tip-lag).
-        if !tip_lag {
-            self.record_batch_failures(&failed).await;
+        let error = format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}");
+        if all_tip_lag(&failures) {
+            // Strike DEFERRAL, not forgiveness: the caller banks `failed` the
+            // moment it stops retrying (see PoolReadError::TipLag). Banking
+            // per attempt here would let one retrying read push every healthy
+            // peer past READ_FAILS_EVICT and drain the pool the retry exists
+            // to re-use; never banking would hand a persistently lagging pool
+            // the 2026-09-02 wedge back.
+            return Err(PoolReadError::TipLag { error, failed });
         }
-        Err((
-            format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}"),
-            tip_lag,
-        ))
+        self.record_batch_failures(&failed).await;
+        Err(PoolReadError::Fatal(error))
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
@@ -4943,42 +4957,53 @@ impl ElReader {
         target: Option<u64>,
     ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, String> {
         // Tip-lag retry for `latest` only — same shape and rationale as
-        // get_block_by_number (see TIP_LAG_RETRIES).
+        // get_block_by_number (see TIP_LAG_RETRIES / PoolReadError).
         let mut attempt = 0;
         loop {
             match self.block_receipts_at_inner(target).await {
-                Err((e, true)) if target.is_none() && attempt < TIP_LAG_RETRIES => {
-                    attempt += 1;
-                    tracing::debug!(attempt, error = %e,
-                        "latest receipts behind peers' imported tip — retrying");
-                    tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                Err(PoolReadError::TipLag { error, failed }) => {
+                    if target.is_none() && attempt < TIP_LAG_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(attempt, error = %error,
+                            "latest receipts behind peers' imported tip — retrying");
+                        tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                        continue;
+                    }
+                    self.record_batch_failures(&failed).await;
+                    return Err(error);
                 }
-                Err((e, _)) => return Err(e),
-                Ok(v) => return Ok(v),
+                Err(PoolReadError::Fatal(e)) => return Err(e),
+                Ok(v) => {
+                    if attempt > 0 {
+                        tracing::info!(attempt,
+                            "latest receipts read recovered after tip-lag retries");
+                    }
+                    return Ok(v);
+                }
             }
         }
     }
 
-    /// One full attempt of [`Self::block_receipts_at`]; the error's bool is
-    /// the [`all_tip_lag`] verdict (see get_block_by_number_inner).
+    /// One full attempt of [`Self::block_receipts_at`]; error semantics are
+    /// [`PoolReadError`]'s (see get_block_by_number_inner).
     async fn block_receipts_at_inner(
         &self,
         target: Option<u64>,
-    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, (String, bool)> {
-        let (head_num, head_hash) = self.anchored_head().map_err(|e| (e, false))?;
+    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, PoolReadError> {
+        let (head_num, head_hash) = self.anchored_head().map_err(PoolReadError::Fatal)?;
         let target_num = target.unwrap_or(head_num);
         if target_num > head_num {
             return Ok(None); // future/unknown block → eth null
         }
         let back = head_num - target_num;
         if back >= BLOCK_LOOKBACK_MAX {
-            return Err((format!(
+            return Err(PoolReadError::Fatal(format!(
                 "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ), false));
+            )));
         }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err(("no snap peer available".to_string(), false));
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
         let total = peers.len();
         let mut failures: Vec<String> = Vec::with_capacity(total);
@@ -4996,20 +5021,19 @@ impl ElReader {
                 }
             }
         }
-        let tip_lag = all_tip_lag(&failures);
-        // Tip-lag batches don't strike peers — see get_block_by_number_inner.
-        if !tip_lag {
-            self.record_batch_failures(&failed).await;
-        }
         let summary = summarize_peer_failures(&failures);
         // Same rationale as get_block_by_number: whole-pool failures must be
         // diagnosable from an info+ log ring.
         tracing::warn!(total, target_num, back, summary = %summary,
             "verified receipts fetch failed against every snap peer");
-        Err((
-            format!("all {total} snap peer(s) failed to serve verifiable block receipts: {summary}"),
-            tip_lag,
-        ))
+        let error =
+            format!("all {total} snap peer(s) failed to serve verifiable block receipts: {summary}");
+        if all_tip_lag(&failures) {
+            // Strike deferral — see get_block_by_number_inner.
+            return Err(PoolReadError::TipLag { error, failed });
+        }
+        self.record_batch_failures(&failed).await;
+        Err(PoolReadError::Fatal(error))
     }
 
     /// One peer's block-receipts serve: anchored window, body + receipts in
