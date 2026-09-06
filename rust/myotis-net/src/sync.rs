@@ -539,7 +539,12 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     //
     // The address is the netcup relay (see the ADDRESS note above); ENR
     // publication (docs/lc-server-design.md §7) is what removes the need to
-    // pin at all.
+    // pin at all. Recovery from a RELAY move is operator-driven, not automatic:
+    // behind the tunnel the address is configuration on both ends (this pin
+    // and the upstream Nimbus's --nat=extip), and roost takes its external
+    // address from that upstream's ENR (rust/roost/src/serve.rs,
+    // track_upstream_ip) — so repoint Nimbus, roost republishes with a bumped
+    // seq, then refresh this pin and the bootstrap ENR below.
     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
     // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the

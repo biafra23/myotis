@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PinnedNodeIdDerivationTest {
 
-    /** (pinned libp2p peer id, the ENR that node published on 2026-08-10). */
+    /** (pinned libp2p peer id, the ENR that node published on 2026-09-06 from behind the netcup relay). */
     private static final String[][] ROOST_VECTORS = {
         { // mainnet, tcp 9109
             "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
