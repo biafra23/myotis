@@ -33,7 +33,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1:8545`** for mainnet; per-network ports beside it) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
-- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
+- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, the head isn't beacon-anchored yet, or an uncovered log-index range — retryable).
 - `3` — `eth_call` / `eth_estimateGas` executed over verified state and the contract (or the transaction being estimated) REVERTED: the standard `execution reverted` error, with the raw revert payload in `error.data` and the decoded `Error(string)` reason in the message when present. This is a verified chain answer (not retryable) — wallets rely on it, e.g. MetaMask's ERC-165 token-standard probe expects a revert on plain ERC-20s, and a doomed transaction's estimate shows its actual revert reason instead of "node not synced".
 - `-32602` — the request's parameters are structurally valid but unsupported by this node, and no retry will change that. Today this is `eth_call` / `eth_estimateGas` carrying a state override (`params[2]`) or block override (`params[3]`): the node does not apply them, and answering without them would return a well-formed result computed against different state than you asked about. Fall back to a request without overrides, or use an upstream that applies them.
 
@@ -66,9 +66,9 @@ actually been asked and answered.
 | `net_listening`, `net_peerCount` | `true` (the discovery listener is live whenever the node runs); the peer count comes from the node's own status snapshot, never a fabricated zero |
 | `web3_clientVersion`, `web3_sha3` | static identifier `Myotis/verified-light-client`; local keccak-256 — no chain data involved |
 
-Any other method returns `-32601` (not served verified). A method from the table that
-cannot be answered *right now* (not synced, no snap peer, coverage gap) returns the
-retryable `-32000` instead, so a wallet can tell "not yet" from "never".
+Any other method returns `-32601` (not served verified); a method from the table that
+cannot be answered *right now* returns the retryable `-32000` instead — the full
+error-code contract is the list at the top of this section.
 
 **Node introspection (`myotis_*`).** Answered locally, bypassing the verified backend, so a
 myotis-aware client can poll them before the node is synced or has peers:
