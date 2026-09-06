@@ -33,7 +33,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1:8545`** for mainnet; per-network ports beside it) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
-- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
+- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, the head isn't beacon-anchored yet, or an uncovered log-index range — retryable).
 - `3` — `eth_call` / `eth_estimateGas` executed over verified state and the contract (or the transaction being estimated) REVERTED: the standard `execution reverted` error, with the raw revert payload in `error.data` and the decoded `Error(string)` reason in the message when present. This is a verified chain answer (not retryable) — wallets rely on it, e.g. MetaMask's ERC-165 token-standard probe expects a revert on plain ERC-20s, and a doomed transaction's estimate shows its actual revert reason instead of "node not synced".
 - `-32602` — the request's parameters are structurally valid but unsupported by this node, and no retry will change that. Today this is `eth_call` / `eth_estimateGas` carrying a state override (`params[2]`) or block override (`params[3]`): the node does not apply them, and answering without them would return a well-formed result computed against different state than you asked about. Fall back to a request without overrides, or use an upstream that applies them.
 
@@ -43,18 +43,39 @@ The Android and desktop apps and the desktop daemon run an embedded JSON-RPC ser
 
 ### Implemented (verified) methods
 
+The authoritative list is `VERIFIED_METHODS` in `jsonrpc-server`'s `RpcRouter.kt`; this
+table mirrors it. `myotis_rpcCoverage` on a running node reports what has
+actually been asked and answered.
+
 | Method | How it's verified |
 |---|---|
 | `eth_chainId`, `net_version` | from config |
 | `eth_blockNumber` | beacon optimistic-head execution block number |
+| `eth_syncing` | straight from the beacon light client: `false` once `SYNCED`, otherwise a syncing object with zero bounds (the verified surface has no block-download notion and serves no chain-state reads before `SYNCED`; config and utility methods answer regardless) |
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (absent accounts/slots proven via exclusion proof — a verified zero, not a guess) |
 | `eth_call` | local Besu EVM over proof-served state; multi-hop speculative prefetch batches the SLOAD round-trips |
 | `eth_estimateGas` | local EVM gas metering (intrinsic + EVM + 15% buffer); a plain transfer to an EOA short-circuits to 21000; a reverting tx returns an error, never a number |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; priority-fee tips from block bodies verified against `transactionsRoot` (+ receipts vs `receiptsRoot` for the gas-weighted percentile reward walk) |
-| `eth_getBlockByNumber` | verified header window anchored to the beacon head; tx hashes checked against `transactionsRoot` (no snap peer required) |
-| `eth_getTransactionReceipt` | scans the recent verified block window; receipts verified against `receiptsRoot` (handles eth/69 bloomless receipts by recomputing the bloom) |
+| `eth_getBlockByNumber`, `eth_getBlockByHash` | verified header window anchored to the beacon head; tx hashes checked against `transactionsRoot` (no snap peer required); an unknown or non-canonical hash answers `null` |
+| `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex`, `eth_getUncleCountByBlockNumber`, `eth_getUncleCountByBlockHash`, `eth_getUncleByBlockNumberAndIndex`, `eth_getUncleByBlockHashAndIndex` | derived from the same verified block serve (count or element read out of the verified block); post-Merge blocks have no uncles, so the uncle reads answer `0` / `null` from a verified block, not a stub |
+| `eth_getTransactionReceipt`, `eth_getBlockReceipts` | scans the recent verified block window; receipts verified against `receiptsRoot` (handles eth/69 bloomless receipts by recomputing the bloom) |
 | `eth_getTransactionByHash` | mined txs from the verified block window; locally-broadcast txs served as *pending* from a sent-tx cache; sender recovered from the signature (legacy + EIP-2930/1559/4844/7702) |
+| `eth_getLogs` | served **only from the [log index](#log-index-verified-eth_getlogs)**: an opt-in, per-network index of the contracts you choose, every log verified against `receiptsRoot` over devp2p. A range the index has not covered is refused with `-32000` (the message says how far coverage reaches), never answered with a misleading `[]`. Historical coverage has to be built — a backfill to the contract's deployment block — and can be **bundled**: build once on an always-on daemon, `export-logindex` the portable chain-tagged `.db`, import it in the app. Rust engine only. |
 | `eth_sendRawTransaction` | gossips the user-signed bytes to devp2p peers and returns the hash (Myotis never signs — the wallet does) |
+| `eth_accounts` | the node holds no keys: exactly `[]`, a verified-grade constant |
+| `net_listening`, `net_peerCount` | `true` (the discovery listener is live whenever the node runs); the peer count comes from the node's own status snapshot, never a fabricated zero |
+| `web3_clientVersion`, `web3_sha3` | static identifier `Myotis/verified-light-client`; local keccak-256 — no chain data involved |
+
+Any other method returns `-32601` (not served verified); a method from the table that
+cannot be answered *right now* returns the retryable `-32000` instead — the full
+error-code contract is the list at the top of this section.
+
+**Node introspection (`myotis_*`).** Answered locally, bypassing the verified backend, so a
+myotis-aware client can poll them before the node is synced or has peers:
+`myotis_status` and `myotis_beaconStatus` (the JSON-RPC twins of the daemon's `status` /
+`beacon-status` commands), `myotis_rpcCoverage` (which methods have been requested and how
+they were answered), and `myotis_pause` / `myotis_wakeup` (the host's background/foreground
+hooks).
 
 A number-pinned read (wallets pin every read to the block they just saw) is served from the verified head's state when the pinned block is at/near the head; a genuinely historical pin is rejected rather than answered with newer state.
 
