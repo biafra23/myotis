@@ -154,7 +154,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
             return tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.storageSlot(accountHash, slotHash)))
-                    .thenApply(nodes -> verifyAndDecodeStorage(storageRoot, slotHash, address, nodes)))
+                    .thenApply(nodes -> {
+                        BigInteger v = verifyAndDecodeStorage(storageRoot, slotHash, address, nodes);
+                        credit(peer);
+                        return v;
+                    }))
                     .thenApply(value -> {
                         stateCache.putStorage(storageRootBytes, slot, value);
                         return value;
@@ -237,7 +241,15 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             // a chunk that can't be verified after retries is left uncached (the caller's
             // per-item path re-fetches it), so the batch never weakens correctness.
             CompletableFuture<Void> cf = tryWithRetries(peer -> peer.getTrieNodes(root, paths)
-                    .thenApply(nodes -> { verifyAndCacheChunk(stateRoot, root, chunk, nodes); return (Void) null; }))
+                    .thenApply(nodes -> {
+                        // Credit only when the chunk verified something from THIS
+                        // response: a fully cache-filled chunk (concurrent batch)
+                        // checks nothing of this peer's bytes.
+                        if (verifyAndCacheChunk(stateRoot, root, chunk, nodes)) {
+                            credit(peer);
+                        }
+                        return (Void) null;
+                    }))
                     .exceptionally(t -> {
                         log.debug("[snap-oracle] batch chunk ({} accounts) failed: {}",
                                 chunk.size(), t.getMessage());
@@ -252,9 +264,14 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  list the peer returned. Each proof is checked with the same verifier the
      *  per-item path uses (the verifier builds a hash→node map, so a combined node set
      *  verifies each key independently); a bad proof throws InvalidProof, failing the
-     *  whole chunk so tryWithRetries rotates to another peer. */
-    private void verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
-                                     List<BatchItem> chunk, List<Bytes> nodes) {
+     *  whole chunk so tryWithRetries rotates to another peer.
+     *
+     *  @return true iff at least one account or slot was verified from THIS
+     *      response (false = everything was already cache-filled, so nothing of
+     *      this peer's bytes was checked and no serve credit is deserved) */
+    private boolean verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
+                                        List<BatchItem> chunk, List<Bytes> nodes) {
+        boolean verifiedAny = false;
         for (BatchItem it : chunk) {
             // Query the cache live (not a static per-build snapshot): on a chunk retry
             // against a different peer, items the previous attempt already verified are
@@ -268,6 +285,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         Bytes32.wrap(cached.get().storageRoot()));
             } else {
                 awr = verifyAndDecodeAccount(root, it.accountHash(), it.address(), nodes);
+                verifiedAny = true;
                 stateCache.putAccount(stateRoot, it.addr(),
                         new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
             }
@@ -281,9 +299,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 if (stateCache.getStorage(storageRootBytes, slot).isPresent()) continue;
                 BigInteger value = verifyAndDecodeStorage(
                         storageRoot, it.slotHashes().get(s), it.address(), nodes);
+                verifiedAny = true;
                 stateCache.putStorage(storageRootBytes, slot, value);
             }
         }
+        return verifiedAny;
     }
 
     @Override
@@ -314,6 +334,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                                                 + " got " + Hex.formatHexPrefixed(actualHash)));
                     }
                     bytecodeCache.put(codeHash, code);
+                    credit(peer);
                     return code;
                 }));
     }
@@ -344,7 +365,12 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         return accountCache.computeIfAbsent(key, k -> {
             CompletableFuture<AccountWithStorageRoot> f = tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.account(accountHash)))
-                    .thenApply(nodes -> verifyAndDecodeAccount(root, accountHash, address, nodes)));
+                    .thenApply(nodes -> {
+                        AccountWithStorageRoot awr =
+                                verifyAndDecodeAccount(root, accountHash, address, nodes);
+                        credit(peer);
+                        return awr;
+                    }));
             // Evict failed fetches so a later read can retry across peers; on success
             // promote the verified record to the cross-call cache. Use *Async so
             // neither runs synchronously inside computeIfAbsent (a reentrant map
@@ -377,6 +403,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      * the worst case from {@code maxAttempts × request-timeout} (~30s of
      * zombie latency, longer than wallet client timeouts) to a single attempt.
      */
+    /** Credit {@code peer} with a VERIFIED serve ({@link SnapPeer#reportServed}).
+     *  Called only at the concrete verification sites, immediately after a proof
+     *  or hash check on THIS peer's bytes passed — never centrally on op success,
+     *  because an op can succeed without checking anything from this peer (a
+     *  batch chunk whose items a concurrent batch already cache-filled), and a
+     *  slow junk peer must not be able to farm serve credit off that race. */
+    private static void credit(SnapPeer peer) {
+        try { peer.reportServed(); } catch (RuntimeException ignore) {}
+    }
+
     private <T> CompletableFuture<T> tryWithRetries(java.util.function.Function<SnapPeer, CompletableFuture<T>> op) {
         CompletableFuture<T> result = new CompletableFuture<>();
         // Keys are SnapPeer.identity() tokens, compared by reference.

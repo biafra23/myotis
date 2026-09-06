@@ -82,7 +82,12 @@ public final class PeerCache implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(PeerCache.class);
     private static final char SEP = '\t';
 
-    /** Consecutive snap-serve failures before a peer is marked {@code DENIED}. */
+    /** Consecutive snap-serve failures before a peer is marked {@code DENIED}.
+     *  Deliberately equal to {@code RLPxConnector.READ_FAILS_EVICT} (which this
+     *  host module can't reference at runtime — {@code PeerCacheTest} pins the
+     *  equality): the read that evicts a peer from the live pool is the read
+     *  whose persisted verdict flips to DENIED, like the Rust engine's
+     *  compile-asserted twin thresholds (pool.rs / peercache.rs). */
     public static final int SNAP_FAILURE_THRESHOLD = 3;
 
     /** Consecutive TCP connect failures before a peer reports {@code DENIED}

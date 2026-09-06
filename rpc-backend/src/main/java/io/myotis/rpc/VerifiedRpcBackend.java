@@ -1776,7 +1776,30 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // non-empty proof confirms the peer as snap-serving (dialed first on
         // restart); the same root-unavailable event that deprioritizes it for this
         // head also feeds a failure verdict so repeat hangers are deprioritized
-        // across restarts.
+        // across restarts — and, in lockstep, a pool strike (bench, and at
+        // READ_FAILS_EVICT consecutive contexts a disconnect, so the maintainer
+        // replaces a peer that keeps failing instead of re-benching it forever).
+        // Gated on the routing set's add() so one context banks AT MOST ONE strike
+        // and one cache verdict per peer, however many concurrent fetches report
+        // the same deny (the strike ladder counts CONTEXTS, not fetches).
+        final java.util.function.Consumer<EthHandler> onRootDenied = p -> {
+            if (rootDenied.add(p)) {
+                rootServed.remove(p);
+                // Strike first: on the sole-peer SHIELD (no strike banked) the
+                // persisted failure verdict is skipped too, or three shielded
+                // outages would persist DENIED against the one peer that kept
+                // serving — the same guard the Rust record_quality keeps.
+                if (oracleConn.recordReadFailure(p)) {
+                    recordSnapQualityAsync(p, false);
+                }
+            }
+        };
+        final java.util.function.Consumer<EthHandler> onRootServed = p -> {
+            if (rootServed.add(p)) {
+                recordSnapQualityAsync(p, true);
+                oracleConn.recordReadServed(p);
+            }
+        };
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
                         () -> {
@@ -1792,10 +1815,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 final EthHandler chosen = served.get(Math.floorMod(n, served.size()));
                                 return new EthHandlerSnapPeer(
                                         chosen,
-                                        () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                                recordSnapQualityAsync(chosen, false); },
-                                        () -> { rootServed.add(chosen);
-                                                recordSnapQualityAsync(chosen, true); },
+                                        () -> onRootDenied.accept(chosen),
+                                        () -> onRootServed.accept(chosen),
                                         snapLaneGate);
                             }
                             // Discovery phase (none proven yet): probed peer first (known to
@@ -1805,10 +1826,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 final EthHandler pp = probedPeer;
                                 return new EthHandlerSnapPeer(
                                         pp,
-                                        () -> { rootDenied.add(pp); rootServed.remove(pp);
-                                                recordSnapQualityAsync(pp, false); },
-                                        () -> { rootServed.add(pp);
-                                                recordSnapQualityAsync(pp, true); },
+                                        () -> onRootDenied.accept(pp),
+                                        () -> onRootServed.accept(pp),
                                         snapLaneGate);
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
@@ -1822,10 +1841,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                     ready.get(Math.floorMod(n, ready.size()));
                             return new EthHandlerSnapPeer(
                                     chosen,
-                                    () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                            recordSnapQualityAsync(chosen, false); },
-                                    () -> { rootServed.add(chosen);
-                                            recordSnapQualityAsync(chosen, true); });
+                                    () -> onRootDenied.accept(chosen),
+                                    () -> onRootServed.accept(chosen));
                         },
                         bytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS,
@@ -3952,8 +3969,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  updated before the oracle's fail-fast skim re-consults the supplier), so
      *  the potentially blocking sink call moves off-thread here instead. */
     private void recordSnapQualityAsync(EthHandler peer, boolean served) {
-        java.util.concurrent.CompletableFuture.runAsync(() -> recordSnapQuality(peer, served));
+        // FIFO-chained, not independent runAsync tasks: the cache counts
+        // CONSECUTIVE failures, so a stale serve task overtaking three failure
+        // tasks would re-confirm a peer the pool just evicted and undo the
+        // DENIED verdict the eviction ladder pairs with. Appending under the
+        // lock fixes each event's position at callback time; the chain runs on
+        // the common pool, so callbacks still never block on the sink. Old
+        // stages become unreachable as the chain advances (no growth).
+        synchronized (snapQualityOrder) {
+            snapQualityTail = snapQualityTail.thenRunAsync(() -> recordSnapQuality(peer, served));
+        }
     }
+
+    /** Tail of the FIFO quality-write chain; guarded by {@link #snapQualityOrder}. */
+    private java.util.concurrent.CompletableFuture<Void> snapQualityTail =
+            java.util.concurrent.CompletableFuture.completedFuture(null);
+    private final Object snapQualityOrder = new Object();
 
     private void recordSnapQuality(EthHandler peer, boolean served) {
         if (peer == null) return;
