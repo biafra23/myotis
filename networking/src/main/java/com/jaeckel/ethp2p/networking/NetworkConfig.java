@@ -180,10 +180,12 @@ public record NetworkConfig(
                     "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
                     "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA",
                     // roost mainnet (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-09-06, from behind the netcup relay). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
                     "enr:-KG4QKUnChEU8InNkAxOj6e_KZzebsvUQYJ850DJaEQAygKJb_8Y2Mv5IxDEOacUs0pkVctDN1f8CjrCfG7Vf2leulkIhGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
             )
     );
@@ -289,10 +291,12 @@ public record NetworkConfig(
                     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
                     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
                     // roost sepolia (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-09-06, from behind the netcup relay). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
                     "enr:-KG4QOZNbpU9w2wGBTa5tMaJKfLFOBvygYCYCtSewcQcXnWnNLbuZFar-gCtb70gJTLrAki7efXD5yBj1tSXOEBgul4HhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ"
             )
     );
@@ -389,10 +393,12 @@ public record NetworkConfig(
                     "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
                     "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
                     // roost gnosis (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-09-06, from behind the netcup relay). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
                     "enr:-KG4QCjwDSRCD6CysnECiWR9i6LBDoETDWI-0zU9bHBbFvgwKHZBGM4LBOBLl15zPJdgPePLlUNJrcbO8l9CGY6aagQHhGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA"
             )
     );
