@@ -112,19 +112,18 @@ public record NetworkConfig(
             // originally discovered via the Lighthouse peer API 2026-03-11,
             // re-censused via period_census 2026-09-01 (#410), re-verified and
             // pruned 2026-09-02 (#411 — per-entry evidence in the list comments).
-            // NOTE the order: the LITERAL leads and the NAME follows. That looks
-            // backwards and is not — see ROOST_PIN_ORDER in the Rust twin. Java
-            // walks this list in order and falls through, so a stale literal
-            // costs one failed dial before the name resolves; the Rust pool
-            // refreshes a static's address in place and keeps the LAST entry,
-            // which must be the name because a static there can never self-heal.
+            // roost is pinned by the literal address of the netcup relay
+            // (188.68.32.16, a static VPS): zbox itself sits behind mobile CGNAT
+            // and is reachable only through a WireGuard tunnel that DNATs the
+            // serving ports to it, so zbox's own uplink rotating no longer moves
+            // this pin. The earlier DynDNS-name + residential-literal pair is gone.
             // roost mainnet is prepended for the same reason as sepolia's: it is a
             // dedicated LC server, so it neither trims us nor shares its inbound
             // budget with a gossip mesh. 9109/tcp was verified forwarded before
             // pinning. See the Rust twin (MAINNET_STATIC_PEERS) for the full
             // reasoning; keep the two lists and their ORDER in step.
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                    "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
                     // Re-verified 2026-09-02 — the first two served the census a
                     // 512/512 period-1840 update, the third served the standalone
@@ -181,11 +180,13 @@ public record NetworkConfig(
                     "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
                     "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA",
                     // roost mainnet (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QCbsE9s7xHdLK_32iZh-P840CxuQ3rbJAtuoFgh3IVLqQP0-Hhkllnv-k9qLfZb47V4sxPw0Ynmj4UaabQ3-RjkChGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QKUnChEU8InNkAxOj6e_KZzebsvUQYJ850DJaEQAygKJb_8Y2Mv5IxDEOacUs0pkVctDN1f8CjrCfG7Vf2leulkIhGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
             )
     );
 
@@ -256,13 +257,14 @@ public record NetworkConfig(
             // InvalidRemotePubKey (see the doc's §5 note). roost has no such
             // mode — its identity is persisted by construction.
             //
-            // Both literal IPs carry the same exposure: the line is residential
-            // and the address is not guaranteed stable. ENR publication
-            // (lc-server-design §7) is what removes the need to pin at all.
+            // Both literals are the netcup relay (188.68.32.16, static VPS) in
+            // front of zbox, which lives behind mobile CGNAT — see the mainnet
+            // list above. ENR publication (lc-server-design §7) is what removes
+            // the need to pin at all.
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                    "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
-                            "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                            "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                             "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
                     )),
             null,
@@ -289,11 +291,13 @@ public record NetworkConfig(
                     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
                     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
                     // roost sepolia (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QGERMtMCoXY2T1Jwp3zk2fpdn9e-Q8p9IeUCuJ1ZA7JjVLXvrtuxMHqP6iRWbkO3O2eWETkvMBcIRAV3SkBgKAADhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QOZNbpU9w2wGBTa5tMaJKfLFOBvygYCYCtSewcQcXnWnNLbuZFar-gCtb70gJTLrAki7efXD5yBj1tSXOEBgul4HhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ"
             )
     );
 
@@ -346,11 +350,10 @@ public record NetworkConfig(
             // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
             // second address for a known id would be dropped there while Java (which
             // dedupes by multiaddr string) dialed both.
-            // roost gnosis first, by name then by literal — same shape as the
-            // other two chains. See the Rust GNOSIS_STATIC_PEERS for why the
-            // literal stays behind the name.
+            // roost gnosis first, by the relay literal — same shape as the other
+            // two chains.
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+                    "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
@@ -390,11 +393,13 @@ public record NetworkConfig(
                     "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
                     "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
                     // roost gnosis (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QCjwDSRCD6CysnECiWR9i6LBDoETDWI-0zU9bHBbFvgwKHZBGM4LBOBLl15zPJdgPePLlUNJrcbO8l9CGY6aagQHhGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA"
             )
     );
 
@@ -565,11 +570,11 @@ public record NetworkConfig(
      *  this node runs the name-based cap bypass so a myotis wallet is admitted even when
      *  it is full. Direct-dialing it removes the wait for discovery to surface it.
      *
-     *  <p>Operational caveat: the key is stable (persisted nodekey), the IP is a
-     *  residential address — if it rotates this entry goes stale and discovery carries
-     *  the load until it is refreshed. */
+     *  <p>Operational caveat: the key is stable (persisted nodekey); the address is the
+     *  netcup relay (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard —
+     *  zbox itself is behind mobile CGNAT, so its own uplink rotating no longer matters. */
     private static final List<String> SEPOLIA_EL_ENODES = List.of(
-            "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405"
+            "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405"
     );
 
     /** Gnosis EL enodes (chainspec {@code nodes}) — Gnosis publishes no EL enrtree, so these

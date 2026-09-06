@@ -79,10 +79,11 @@ pub struct ElConfig {
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
-/// Key stable (persisted nodekey); the IP is residential, so a rotation makes
-/// this entry stale and discovery carries the load until it is refreshed.
+/// Key stable (persisted nodekey); the address is the netcup relay
+/// (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard — zbox
+/// itself is behind mobile CGNAT, so its own uplink rotating no longer matters.
 const SEPOLIA_MYOTIS_ENODE: &str =
-    "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405";
+    "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405";
 
 /// Parse `enode://<128 hex pubkey>@host:port` entries into dialable
 /// `(addr, pubkey)` pairs, skipping anything malformed — a bad pin must not
@@ -6381,7 +6382,7 @@ mod tests {
         let cfg = ElConfig::sepolia();
         assert_eq!(cfg.boot_enodes.len(), 1, "sepolia pins the dedicated serving node");
         let (addr, pubkey) = cfg.boot_enodes[0];
-        assert_eq!(addr.to_string(), "87.154.209.161:30405");
+        assert_eq!(addr.to_string(), "188.68.32.16:30405");
         assert_eq!(pubkey[0], 0xcf);
         assert_eq!(pubkey[63], 0x2c);
         // The other networks ship none (mainnet/gnosis reach peers via discovery).

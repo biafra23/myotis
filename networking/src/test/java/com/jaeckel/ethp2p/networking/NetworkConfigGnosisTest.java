@@ -144,10 +144,10 @@ class NetworkConfigGnosisTest {
         // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
         // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
         List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by NAME only");
-        // roost FIRST, and by NAME — no literal behind it. A dynamic address is
-        // absorbed by DNS instead of by a second entry.
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
+        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by the relay literal");
+        // roost FIRST, by the netcup relay literal (188.68.32.16, static VPS in
+        // front of zbox) — one entry, no name; see the Rust GNOSIS_STATIC_PEERS.
+        assertEquals("/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
         // The harvested list is unchanged, just shifted by the one roost entry.
         assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
                 + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(1));
@@ -167,20 +167,20 @@ class NetworkConfigGnosisTest {
         // waiting on discovery. The CL entry must come FIRST: the light client walks
         // clPeerMultiaddrs in order, and this is the peer we know serves bootstraps.
         String enode = NetworkConfig.SEPOLIA.elBootEnodes().get(0);
-        assertTrue(enode.endsWith("@87.154.209.161:30405"), enode);
+        assertTrue(enode.endsWith("@188.68.32.16:30405"), enode);
 
         // roost, the dedicated light-client server, is tried first — that is the
         // point of having it. The dedicated Nimbus stays behind it as fallback,
         // so a roost fault degrades to the previous behaviour.
         String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
+        assertEquals("/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
                 "roost must be the first CL peer tried");
         // POSITION, not presence: the Rust twin asserts index 1, and index is
         // load-bearing on this side in particular — addPeer inserts every
         // discovered peer at Math.min(1, size()), i.e. exactly the slot the
         // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
         // than anywhere else.
-        assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
+        assertEquals("/ip4/188.68.32.16/tcp/9104/p2p/"
                         + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                 NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
                 "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
@@ -208,7 +208,7 @@ class NetworkConfigGnosisTest {
         // machine-unchecked (PR #411 review).
         List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
         assertEquals(List.of(
-                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                 "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
                 "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
                 "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
