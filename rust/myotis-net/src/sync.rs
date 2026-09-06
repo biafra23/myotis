@@ -397,23 +397,12 @@ fn hex32(s: &str) -> [u8; 32] {
 }
 
 ///
-/// ORDER LOOKS BACKWARDS AND IS NOT. The literal comes FIRST and the name LAST
-/// because the two engines consume the pair differently, and the engine that
-/// cannot recover is the one that must end up on the name:
-///
-///   Rust  — `PeerPool::add` REFRESHES a static peer's address in place (the
-///           #322 fix), so for one peer id the LAST entry wins. Statics are
-///           un-evictable and roost publishes no ENR, so a stale literal here
-///           could never self-heal: no eviction, no rediscovery, undialable
-///           until a release. Ending on the name is what makes an address
-///           change survivable.
-///   Java  — dedupes by multiaddr string and walks the list in order, so it
-///           tries the literal first and falls through to the name. A stale
-///           literal costs one failed dial, then the name resolves. That is why
-///           the "worse" order is harmless there.
-///
-/// Putting the name first inverts both: Rust would keep the literal (the case
-/// that cannot recover) and gain nothing.
+/// ADDRESS: every roost/zbox literal below is the netcup relay (188.68.32.16, a
+/// static VPS). zbox itself sits behind mobile CGNAT and is reachable only via
+/// a WireGuard tunnel that DNATs the serving ports to it, so its own uplink
+/// rotating no longer moves these pins. The earlier "DynDNS name last, literal
+/// first" pair (name for self-healing, literal for the unverified Java DNS
+/// path) went with it: one literal per peer id, identical on both engines.
 
 /// Pinned sepolia LC-serving peer multiaddrs (Java `NetworkConfig.SEPOLIA.clPeerMultiaddrs`
 /// — keep the two lists, their ORDER and their addresses in step;
@@ -434,24 +423,10 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // restarts by construction; unlike the Nimbus entry there is no flag to
     // forget, because roost has no mode in which it mints a fresh one.
     //
-    // Pinning a literal IP has the same exposure as the entries below: the line
-    // is residential and the address is not guaranteed stable. ENR publication
-    // (design §7) is what removes it. See ROOST_PIN_ORDER above for why the
-    // literal precedes the name.
-    // roost BY NAME, ahead of its own literal IP.
-    //
-    // The line is residential and the address is not guaranteed stable; the
-    // name is DynDNS with a ~30s TTL and libp2p resolves it AT DIAL TIME, every
-    // dial, so an address change costs one failed dial instead of a release.
-    //
-    // The literal below is kept deliberately as the next entry: DNS resolution
-    // is verified working on the RUST engine (live sync from roost over this
-    // name) but NOT on the Java one, which is the default — jvm-libp2p parses
-    // the multiaddr and extracts the peer id, but its transport's DNS handling
-    // is unverified. If it cannot dial a name it falls through to the IP and
-    // behaves exactly as before. Drop the literal once Java is confirmed.
-    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-    "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+    // The address is the netcup relay (see the ADDRESS note above); ENR
+    // publication (design §7) is what removes the need to pin at all.
+    "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+    "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
     "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
 ];
 
@@ -472,12 +447,12 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
     // roost sepolia (this project's dedicated LC server) — a SNAPSHOT of its
-    // published record (2026-08-10): seeding it makes roost dialable from the
+    // published record (2026-09-06, from behind the netcup relay): seeding it makes roost dialable from the
     // first table without waiting for any walk. The embedded IP goes stale if
     // the server's address rotates; the targeted-lookup path (node_id derived
     // from the position-0 static peer pin, `discovery::node_id_for_peer`)
     // is what recovers the CURRENT record then.
-    "enr:-KG4QGERMtMCoXY2T1Jwp3zk2fpdn9e-Q8p9IeUCuJ1ZA7JjVLXvrtuxMHqP6iRWbkO3O2eWETkvMBcIRAV3SkBgKAADhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ",
+    "enr:-KG4QOZNbpU9w2wGBTa5tMaJKfLFOBvygYCYCtSewcQcXnWnNLbuZFar-gCtb70gJTLrAki7efXD5yBj1tSXOEBgul4HhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ",
 ];
 
 /// Pinned Gnosis LC-serving peer multiaddrs (Java `NetworkConfig.GNOSIS.clPeerMultiaddrs`
@@ -499,7 +474,7 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // digest and every peer answered Goodbye(IrrelevantNetwork). Pinning a
     // server in that state would have cost every gnosis wallet its
     // strikes-to-eviction on a peer that could never answer.
-    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+    "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -536,12 +511,12 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
     "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
     // roost gnosis (this project's dedicated LC server) — a SNAPSHOT of its
-    // published record (2026-08-10): seeding it makes roost dialable from the
+    // published record (2026-09-06, from behind the netcup relay): seeding it makes roost dialable from the
     // first table without waiting for any walk. The embedded IP goes stale if
     // the server's address rotates; the targeted-lookup path (node_id derived
     // from the position-0 static peer pin, `discovery::node_id_for_peer`)
     // is what recovers the CURRENT record then.
-    "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
+    "enr:-KG4QCjwDSRCD6CysnECiWR9i6LBDoETDWI-0zU9bHBbFvgwKHZBGM4LBOBLl15zPJdgPePLlUNJrcbO8l9CGY6aagQHhGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
 ];
 
 /// Known light-client-serving mainnet peers — mirrored with the Java
@@ -562,12 +537,10 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // the neighbouring 9107). Pinning an unreachable address is not free — a
     // wallet spends its strikes-to-eviction on a node that is actually fine.
     //
-    // Same residential-IP exposure as every literal here; ENR publication
-    // (docs/lc-server-design.md §7) is what removes it. NOTE that roost cannot
-    // currently notice its own IP changing — its Identify quorum never settles
-    // because it makes no outbound connections — so this line is the thing that
-    // breaks if the address moves.
-    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+    // The address is the netcup relay (see the ADDRESS note above); ENR
+    // publication (docs/lc-server-design.md §7) is what removes the need to
+    // pin at all.
+    "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
     // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
     // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the
     // roost comment above says why pinning an unreachable address is not free).
@@ -623,12 +596,12 @@ const MAINNET_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
     "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA",
     // roost mainnet (this project's dedicated LC server) — a SNAPSHOT of its
-    // published record (2026-08-10): seeding it makes roost dialable from the
+    // published record (2026-09-06, from behind the netcup relay): seeding it makes roost dialable from the
     // first table without waiting for any walk. The embedded IP goes stale if
     // the server's address rotates; the targeted-lookup path (node_id derived
     // from the position-0 static peer pin, `discovery::node_id_for_peer`)
     // is what recovers the CURRENT record then.
-    "enr:-KG4QCbsE9s7xHdLK_32iZh-P840CxuQ3rbJAtuoFgh3IVLqQP0-Hhkllnv-k9qLfZb47V4sxPw0Ynmj4UaabQ3-RjkChGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ",
+    "enr:-KG4QKUnChEU8InNkAxOj6e_KZzebsvUQYJ850DJaEQAygKJb_8Y2Mv5IxDEOacUs0pkVctDN1f8CjrCfG7Vf2leulkIhGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ",
 ];
 
 // -------------------------------------------------------------------------
@@ -3200,7 +3173,7 @@ mod tests {
         assert_eq!(
             c.static_peers,
             vec![
-                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
                 "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
                 "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
                 "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
@@ -3268,8 +3241,8 @@ mod tests {
         assert_eq!(
             c.static_peers,
             vec![
-                "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+                "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
                 "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
             ],
             "roost first (the dedicated LC server), the dedicated Nimbus second as \
@@ -3330,11 +3303,11 @@ mod tests {
         // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
         // (`PeerPool::add` dedupes by peer id, so a second address for a known
         // id would never be dialed here while Java dialed both).
-        // 22 discovered gnosis peers + roost, pinned by NAME only.
+        // 22 discovered gnosis peers + roost, pinned by the relay literal.
         assert_eq!(c.static_peers.len(), 23);
         // POSITION, like the other two chains: both engines must agree on which
         // peer the light client tries FIRST, not merely that roost is present.
-        assert_eq!(c.static_peers[0], "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
+        assert_eq!(c.static_peers[0], "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
         // The discovered list is unchanged, just shifted by the one roost entry.
         assert!(c.static_peers[1].ends_with(
             "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"

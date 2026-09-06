@@ -13,10 +13,10 @@ class NetworkConfigEnrTest {
         // We have 17 ENRs; some may lack tcp port, but most should convert
         assertTrue(addrs.size() >= 5, "Expected at least 5 CL multiaddrs, got " + addrs.size());
         for (String ma : addrs) {
-            // /dns4/ is allowed alongside /ip4/: roost is pinned by DynDNS name so a
-            // changing residential IP costs one failed dial rather than a release.
-            // What this test is actually protecting is DIALABILITY — a transport and
-            // a peer id — not the address family.
+            // /dns4/ stays allowed alongside /ip4/ even though no current pin uses a
+            // name (roost moved from a DynDNS name to the netcup relay literal): what
+            // this test is actually protecting is DIALABILITY — a transport and a
+            // peer id — not the address family.
             assertTrue(ma.startsWith("/ip4/") || ma.startsWith("/dns4/"),
                     "Multiaddr should start with /ip4/ or /dns4/: " + ma);
             assertTrue(ma.contains("/tcp/"), "Multiaddr should contain /tcp/: " + ma);
