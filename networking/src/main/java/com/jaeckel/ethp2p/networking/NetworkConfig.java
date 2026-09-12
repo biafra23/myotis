@@ -294,9 +294,14 @@ public record NetworkConfig(
             // removes the need to pin at all.
             //
             // The public servers after it are census-verified 2026-09-11: each
-            // answered light_client_bootstrap for the pinned root AND
+            // answered light_client_bootstrap for the THEN-pinned root AND
             // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
-            // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
+            // v8.2.2. Re-verified 2026-09-12 against the anchor this build
+            // ships (period 1357) by the release's live_pins_alive run: 4 of 4
+            // pins, roost included, served a bootstrap for the new root and a
+            // period of updates — re-run it after every checkpoint refresh,
+            // since a census against a superseded root says nothing about the
+            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
             // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
             // switched off as well, cost the Rust engine's bootstrap fan-out

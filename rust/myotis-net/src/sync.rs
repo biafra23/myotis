@@ -520,9 +520,20 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // publication (design §7) is what removes the need to pin at all.
     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     // Public sepolia LC servers, census-verified 2026-09-11: each answered
-    // light_client_bootstrap for the pinned root AND updates_by_range(1356,1)
-    // from a fresh peer id, all Lighthouse v8.2.2 (so the catch-up asks them
-    // for one period at a time — see agent_serves_one_period). They replace
+    // light_client_bootstrap for the THEN-pinned root AND
+    // updates_by_range(1356,1) from a fresh peer id, all Lighthouse v8.2.2 (so
+    // the catch-up asks them for one period at a time — see
+    // agent_serves_one_period).
+    //
+    // Re-verified 2026-09-12 against the anchor THIS build ships (period
+    // 1357), by the release's live_pins_alive run on a clean CI host: 4 of 4
+    // pins, roost included, served a bootstrap for the new root and a period
+    // of updates. Re-run it after every checkpoint refresh — a census against
+    // a superseded root says nothing about the anchor a fresh install actually
+    // starts from, which is the #422 shape: every check green while no pinned
+    // server can answer for the root being shipped.
+    //
+    // They replace
     // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
     // libp2p handshake times out — the tunnel's far end is not answering) and
     // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
@@ -3555,7 +3566,13 @@ mod tests {
         assert!(agent_serves_one_period(Some("Lighthouse/v8.1.3-176cce5/x86_64-linux")));
         assert!(!agent_serves_one_period(Some("nimbus-eth2/v26.4.0")));
         assert!(!agent_serves_one_period(Some("lodestar/v1.47.0/2aff495")));
-        assert!(!agent_serves_one_period(Some("myotis/0.1.8-rs")));
+        // Built the way the engine builds it (reqresp.rs), so this sample
+        // cannot drift to a previous release's version at the next sweep.
+        assert!(!agent_serves_one_period(Some(concat!(
+            "myotis/",
+            env!("CARGO_PKG_VERSION"),
+            "-rs"
+        ))));
         // Case-sensitive on purpose: Lighthouse always capitalises its agent.
         assert!(!agent_serves_one_period(Some("lighthouse/v8.2.2")));
         assert!(!agent_serves_one_period(None));

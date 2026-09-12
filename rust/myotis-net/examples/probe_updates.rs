@@ -27,7 +27,7 @@ async fn main() {
         .init();
 
     let config = ChainConfig::mainnet();
-    let from_period = config.checkpoint_slot / 8192; // 1777
+    let from_period = config.checkpoint_slot / 8192; // the shipped anchor's period
     let span: u64 = 16;
 
     // Same pre-bootstrap Status SyncHandle::start serves (checkpoint anchors).
