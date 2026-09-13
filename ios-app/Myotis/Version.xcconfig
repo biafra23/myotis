@@ -13,5 +13,5 @@
 //                             requires CFBundleVersion's first integer to be
 //                             greater than zero, so it cannot simply repeat the
 //                             0.x marketing version.
-MARKETING_VERSION = 0.1.8
-CURRENT_PROJECT_VERSION = 1008
+MARKETING_VERSION = 0.1.9
+CURRENT_PROJECT_VERSION = 1009

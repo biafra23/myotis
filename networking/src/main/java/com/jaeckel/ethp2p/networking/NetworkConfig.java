@@ -117,9 +117,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15185856, 2026-09-10, period 1853)
-            Bytes.fromHexString("16d197d597d795c05cb9a195a1bd34c77acd6c1f8ba336f75c5cfbc395710d68").toArrayUnsafe(),
-            15185856L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15208352, 2026-09-13, period 1856)
+            Bytes.fromHexString("912d2071fff678e498fc526b8c9fa7021b412c0a30bad659ffaccfed84d980bd").toArrayUnsafe(),
+            15208352L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -164,6 +164,10 @@ public record NetworkConfig(
                     // the bootstrap and a 511/512 updates_by_range(1854,1).
                     // 57.129.130.18 closes on runner IPs but served the residential
                     // address in full. Seven entries that failed every run pruned.
+                    // Re-verified 2026-09-13 at the anchor this build ships (period
+                    // 1856), run 34776025758: 4 of 5. 57.129.130.18 served a runner in
+                    // full this time and 91.189.182.90 closed instead, so the closes
+                    // look intermittent rather than tied to runner IPs.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -236,9 +240,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11110080, 2026-09-10, period 1356)
-            Bytes.fromHexString("3fdfc6b7c39990c859ca1ea0a73d4f072a49a7d3dfe7f6e416bf90006d6f079b").toArrayUnsafe(),
-            11110080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11132576, 2026-09-13, period 1358)
+            Bytes.fromHexString("6cfed028ffbd34db0b2ce5f783d707ce909bb19248177fea182a736bf076ba6a").toArrayUnsafe(),
+            11132576L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
@@ -294,9 +298,16 @@ public record NetworkConfig(
             // removes the need to pin at all.
             //
             // The public servers after it are census-verified 2026-09-11: each
-            // answered light_client_bootstrap for the pinned root AND
+            // answered light_client_bootstrap for the THEN-pinned root AND
             // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
-            // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
+            // v8.2.2. Re-verified 2026-09-12 at period 1357, the anchor then
+            // embedded, by the release's live_pins_alive run: 4 of 4 pins, roost
+            // included, served a bootstrap for that root and a period of
+            // updates. Re-verified 2026-09-13 at the anchor this build ships
+            // (period 1358), run 34776027257: 4 of 4 again. Re-run it after every
+            // checkpoint refresh,
+            // since a census against a superseded root says nothing about the
+            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
             // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
             // switched off as well, cost the Rust engine's bootstrap fan-out
@@ -374,9 +385,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30012384, 2026-09-10, period 3663)
-            Bytes.fromHexString("ed1faabdc3c3a7cac06a67bc7d6c483c2a4af00c37f754a4d3860d06e1745997").toArrayUnsafe(),
-            30012384L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30066368, 2026-09-13, period 3670)
+            Bytes.fromHexString("74a088669a561daad8a3af71966847a3dae10e0b976e0e773fa1e2735872cd3a").toArrayUnsafe(),
+            30066368L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
@@ -414,6 +425,8 @@ public record NetworkConfig(
                     // Re-censused 2026-09-13 at the period-3666 anchor: all Lighthouse
                     // v8.2.x advertising light_client_updates_by_range, each serving the
                     // bootstrap and a 507/512 updates_by_range(3666,1).
+                    // Re-verified 2026-09-13 at the anchor this build ships (period
+                    // 3670), run 34776024335: 8 of 8.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",

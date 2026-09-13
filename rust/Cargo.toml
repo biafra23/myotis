@@ -50,7 +50,7 @@ exclude = ["tor-poc", "roost"]
 # lock files. uniffi-bindgen is a pinned TOOL, not a release artifact, and keeps
 # its own version.
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
