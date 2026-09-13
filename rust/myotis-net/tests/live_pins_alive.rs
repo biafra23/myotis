@@ -9,7 +9,7 @@
 //!
 //! Seconds when the pins are healthy; a sick one costs up to its retries
 //! (`3 x PIN_TIMEOUT`), and the bootnode test has its own 60 s budget, so a bad
-//! list on a 23-pin network is minutes, not seconds.
+//! list of a couple of dozen pins is minutes, not seconds.
 //!
 //! ```bash
 //! NET=gnosis cargo test -p myotis-net --test live_pins_alive -- --ignored --nocapture
@@ -20,9 +20,12 @@
 //! host it runs from: a machine whose IP a Lighthouse node has banned sees that
 //! node as `dial failed` even though it is healthy for everyone else (that ban
 //! is what #422 was about, and a developer box that ran a pre-gossipsub build
-//! carries it for 12 h). So the gate is a FLOOR — enough pins alive to
-//! actually bootstrap a fresh install — and the per-pin lines above it are the
-//! part a human acts on.
+//! carries it for 12 h). The reverse happens too: mainnet pin 57.129.130.18
+//! closed the connection on GitHub-hosted runner IPs on 2026-09-12 and
+//! 2026-09-13 while serving a residential address in full, so confirm a pin
+//! only one host calls dead from a second address before dropping it. So the
+//! gate is a FLOOR — enough pins alive to actually bootstrap a fresh install —
+//! and the per-pin lines above it are the part a human acts on.
 //!
 //! What each line means:
 //!
@@ -33,7 +36,8 @@
 //!   un-evictable pool slot for nothing.
 //! * a pin whose peer ID does not match — the server minted a new key (Nimbus
 //!   does this per restart without `--netkey-file`); the pin is dead even
-//!   though the host is up, and the dial reports `InvalidRemotePubKey` or a
+//!   though the host is up, and the dial fails with `Unexpected peer ID <new
+//!   id>` (in reqresp's debug log; the line here only says `dial failed`) or a
 //!   failed handshake rather than a clean refusal.
 //! * bootnodes below the floor — discovery cannot seed, which strands a fresh
 //!   install even when the pins are fine.
@@ -167,7 +171,7 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
     let mut dead = Vec::new();
     let mut alive = 0usize;
     for pin in &config.static_peers {
-        // A malformed pin is a finding, not a reason to lose the other 22 —
+        // A malformed pin is a finding, not a reason to lose the rest —
         // `run_sync` itself only warns and skips one.
         let Ok(full) = pin.parse::<Multiaddr>() else {
             dead.push(format!("{pin} — unparseable multiaddr"));

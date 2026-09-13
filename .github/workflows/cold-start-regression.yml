@@ -12,7 +12,11 @@
 #                 and the one that would have caught #422 before it shipped.
 #                 A CI runner is a clean host, which matters: a Lighthouse node
 #                 that banned a dev box's IP looks dead from there and is fine
-#                 from here.
+#                 from here. Clean is not neutral, though: mainnet pin
+#                 57.129.130.18 closed the connection on runner IPs on
+#                 2026-09-12 and 2026-09-13 while serving a residential address
+#                 in full, so confirm a pin only a runner calls dead from a
+#                 second address before pruning it.
 #   * dead-pins:  every pinned server still CONFIGURED but unreachable — the
 #                 #422 shape. Pinned peers are exempt from eviction, so they
 #                 hold their pool slots and keep steering targeted lookups;
