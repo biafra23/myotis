@@ -903,7 +903,9 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
                 "this build script's copy has drifted (or been swapped across networks); fix it before refreshing an anchor")
         }
     }
-    val genesis = checkpointGenesisTime(project, net)
+    // Called for effect: fail fast on a missing or malformed genesis time before
+    // any network work. writeCheckpointRegions re-reads the value it needs.
+    checkpointGenesisTime(project, net)
 
     val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
@@ -1398,8 +1400,11 @@ tasks.register("refreshCheckpoint") {
                 conflicting.joinToString { "-P$it" })
         }
         if (!anchorFile.isFile) throw GradleException("-PanchorFile: no such file: $anchorFile")
-        // Read and validate every network, entry and genesis time, before writing
-        // any, so a bad one cannot leave the tree half on recorded anchors.
+        // Read and validate every network's entry and genesis time before writing
+        // any, so a bad one cannot leave the tree half on recorded anchors. One
+        // mode this does not cover: a missing or drifted @checkpoint marker still
+        // throws inside the writer, after the networks before it were written.
+        // The undo is the two-file `git checkout` in the anchor file's header.
         val recorded = nets.associateWith { readRecordedCheckpoint(anchorFile, it) }
         nets.forEach { checkpointGenesisTime(project, it) }
         recorded.forEach { (net, anchor) ->
