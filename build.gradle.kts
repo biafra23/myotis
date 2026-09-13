@@ -871,9 +871,7 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val extra = (project.findProperty("extraEndpoint") as String?)?.split(",")?.map { it.trim() }
         ?.filter { it.isNotEmpty() } ?: emptyList()
     val endpoints = checkpointEndpoints.getValue(net) + extra
-    val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
     val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
-    val slotsPerEpoch = checkpointSlotsPerEpoch.getValue(net)
 
     val javaFile = project(":networking").projectDir
         .resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
@@ -905,14 +903,8 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
                 "this build script's copy has drifted (or been swapped across networks); fix it before refreshing an anchor")
         }
     }
-    // Guarded, as the helper this replaces was: a missing or malformed property
-    // would otherwise surface as a ClassCastException or NumberFormatException
-    // deep in the task rather than as the configuration error it is.
-    val genesis = (project.findProperty("ethp2p.$net.genesisTime") as? String)
-        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
-        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
+    val genesis = checkpointGenesisTime(project, net)
 
-    val dryRun = project.hasProperty("dry")
     val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
     fun fetch(url: String): String? = try {
@@ -1104,15 +1096,48 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
         }
     }
 
-    val period = minSlot / slotsPerPeriod
-    val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
-
-    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
-
     // An anchor pinned to a chosen old slot is NOT "recent finalized" — wrong
     // provenance wording beside a trust root invites the next reader to trust
     // the wrong story, same argument as keeping provenance inside the markers.
     val provenance = if (pinnedSlot != null) "pinned" else "recent finalized"
+    writeCheckpointRegions(project, logger, net, minSlot, finalRoot, provenance)
+}
+
+/** `ethp2p.<net>.genesisTime`, guarded: a missing or malformed property would
+ *  otherwise surface as a ClassCastException or NumberFormatException deep in
+ *  the task rather than as the configuration error it is. */
+fun checkpointGenesisTime(project: Project, net: String): Long =
+    (project.findProperty("ethp2p.$net.genesisTime") as? String)
+        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
+        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
+
+/**
+ * The half of a refresh that needs no network: render one resolved anchor into
+ * every engine's marked regions and write them (or preview, under -Pdry).
+ * [refreshOneCheckpoint] reaches it after fetching and cross-validating; a
+ * `-PanchorFile` run reaches it straight from a committed file of recorded
+ * anchors ([readRecordedCheckpoint]).
+ */
+fun writeCheckpointRegions(
+    project: Project,
+    logger: org.gradle.api.logging.Logger,
+    net: String,
+    minSlot: Long,
+    finalRoot: String,
+    provenance: String,
+) {
+    val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
+    val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
+    val slotsPerEpoch = checkpointSlotsPerEpoch.getValue(net)
+    val genesis = checkpointGenesisTime(project, net)
+    val dryRun = project.hasProperty("dry")
+    val javaFile = project.project(":networking").projectDir
+        .resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+
+    val period = minSlot / slotsPerPeriod
+    val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
+
+    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
     /** 14560000 -> 14_560_000, the form every other numeric literal in sync.rs uses. */
     fun rustLiteral(n: Long): String = n.toString().reversed().chunked(3).joinToString("_").reversed()
@@ -1233,6 +1258,24 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     }
 }
 
+/**
+ * The anchor recorded for [net] in [file], a properties file with `<net>.slot`
+ * and `<net>.root` (see rust/testdata/anchors/oldest-servable.properties). Not
+ * fetched, not cross-validated: for tests that must not wait on public
+ * endpoints, which also stop serving historical slots over time. A missing or
+ * malformed entry fails the task instead of leaving that network on whatever
+ * anchor the tree already had.
+ */
+fun readRecordedCheckpoint(file: File, net: String): Pair<Long, String> {
+    val props = Properties().apply { file.inputStream().use { load(it) } }
+    val slot = props.getProperty("$net.slot")?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
+        ?: throw GradleException("[refresh:$net] ${file.name} has no valid $net.slot")
+    val root = props.getProperty("$net.root")?.trim()?.lowercase()?.removePrefix("0x")
+        ?.takeIf { Regex("[0-9a-f]{64}").matches(it) }
+        ?: throw GradleException("[refresh:$net] ${file.name} has no valid $net.root (64 hex digits)")
+    return slot to root
+}
+
 /** Per-network checkpoint sources — independent, public, and PLURAL by design.
  *
  *  These serve a narrow slice of the Beacon API (`/eth/v2/beacon/blocks/{id}`
@@ -1304,6 +1347,8 @@ val checkpointGenesisValidatorsRoot = mapOf(
  *   ./gradlew refreshCheckpoint                      # all three networks
  *   ./gradlew refreshCheckpoint -Pnetwork=mainnet    # one
  *   ./gradlew refreshCheckpoint -Pdry                # preview, no write
+ *   ./gradlew refreshCheckpoint -PanchorFile=rust/testdata/anchors/oldest-servable.properties
+ *                                                    # recorded TEST anchors, no network
  *
  * Generalised from the gnosis-only task after the same gap appeared twice: an
  * anchor that drifts below roost's archive floor can never be reached, because
@@ -1320,7 +1365,7 @@ val checkpointGenesisValidatorsRoot = mapOf(
  */
 tasks.register("refreshCheckpoint") {
     group = "trust"
-    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview, -Pperiod=<n>/-Pslot=<n> to pin instead of head."
+    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview, -Pperiod=<n>/-Pslot=<n> to pin instead of head, -PanchorFile=<file> to write recorded test anchors without fetching."
 
     doLast {
         val only = project.findProperty("network") as String?
@@ -1338,7 +1383,31 @@ tasks.register("refreshCheckpoint") {
                 throw GradleException("unknown network '$n' (mainnet|sepolia|gnosis)")
             }
         }
-        nets.forEach { net -> refreshOneCheckpoint(project, logger, net) }
+        // -PanchorFile writes recorded anchors instead of fetching. It fixes the
+        // slot AND the root, so every option that shapes a fetch would be
+        // silently ignored beside it: refuse the combination instead.
+        val anchorFile = (project.findProperty("anchorFile") as String?)?.let { project.rootDir.resolve(it) }
+        if (anchorFile == null) {
+            nets.forEach { net -> refreshOneCheckpoint(project, logger, net) }
+            return@doLast
+        }
+        val conflicting = listOf("slot", "period", "extraEndpoint", "allowSingleSource")
+            .filter { project.hasProperty(it) }
+        if (conflicting.isNotEmpty()) {
+            throw GradleException("-PanchorFile writes recorded anchors; it cannot be combined with " +
+                conflicting.joinToString { "-P$it" })
+        }
+        if (!anchorFile.isFile) throw GradleException("-PanchorFile: no such file: $anchorFile")
+        // Read and validate every network, entry and genesis time, before writing
+        // any, so a bad one cannot leave the tree half on recorded anchors.
+        val recorded = nets.associateWith { readRecordedCheckpoint(anchorFile, it) }
+        nets.forEach { checkpointGenesisTime(project, it) }
+        recorded.forEach { (net, anchor) ->
+            val (slot, root) = anchor
+            logger.warn("[refresh:$net] writing the RECORDED anchor from ${anchorFile.name} " +
+                "(slot $slot, root 0x$root): not fetched or cross-validated, for testing only")
+            writeCheckpointRegions(project, logger, net, slot, root, "recorded test")
+        }
     }
 }
 
