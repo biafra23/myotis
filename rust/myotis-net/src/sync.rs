@@ -560,10 +560,12 @@ const SEPOLIA_BOOTSTRAP_ENRS: &[&str] = &[
 ];
 
 /// Pinned Gnosis LC-serving peer multiaddrs (Java `NetworkConfig.GNOSIS.clPeerMultiaddrs`
-/// — keep the two lists and their ORDER in step). Identify-confirmed LC servers
-/// harvested from a long-running desktop profile's cl-peers-gnosis.cache
-/// (2026-08-06, issue #291): a cold Gnosis pool starves catch-up because so few
-/// nodes serve light-client data, so a fresh install gets a serving head start.
+/// — keep the two lists and their ORDER in step; both parity tests pin the full
+/// strings). Identify-confirmed LC servers harvested from a long-running desktop
+/// profile's cl-peers-gnosis.cache (2026-08-06, issue #291): a cold Gnosis pool
+/// starves catch-up because so few nodes serve light-client data, so a fresh
+/// install gets a serving head start. Re-censused 2026-09-13 and cut from 22
+/// harvested entries to the 7 that still serve catch-up (evidence below).
 /// One address per peer id: `PeerPool::add` dedupes by peer id, so a second
 /// address for an already-known id would be silently dropped here (Java dedupes
 /// by multiaddr string and would dial both) — keeping the lists identical means
@@ -579,28 +581,54 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // server in that state would have cost every gnosis wallet its
     // strikes-to-eviction on a peer that could never answer.
     "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
-    "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
+    // Re-censused 2026-09-13 like mainnet, against period 3666 (the anchor the
+    // v0.1.9 release refreshes to) and period 3663: live_pins_alive on
+    // GitHub-hosted runners (run 34660358795 on 2026-09-12 at 3666, run
+    // 34764525187 on 2026-09-13 at 3663) and, from a residential address, a
+    // one-pin-at-a-time probe plus period_census. The seven kept are
+    // Lighthouse v8.2.x whose Identify advertises light_client_updates_by_range;
+    // each served the 2026-09-12 runner run and the residential probe in full,
+    // the period-3666 bootstrap and a 507/512 updates_by_range(3666,1)
+    // included. The two on :9500 (134.65.194.144, 164.152.161.131) timed out on
+    // the 2026-09-13 runner run, then served the residential probe in full; one
+    // slow run is not grounds to prune.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
-    "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
-    "/ip4/135.148.35.18/tcp/9000/p2p/16Uiu2HAm5g8koS1AgicyMZKekLoyh5rK3eBGoZJP5KUsoK5wcehs",
-    "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
-    "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
-    "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
-    "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
-    "/ip4/144.76.164.21/tcp/9016/p2p/16Uiu2HAm2UAjrJax6SAtu53VykpbmPrzDDdfB3G79ypQeiXnjj3u",
-    "/ip4/144.76.196.184/tcp/13000/p2p/16Uiu2HAm6wUQPL4FYKHqmGfZQBPYbDd8GNHxNYeH5DZGLunPAw4J",
-    "/ip4/146.103.38.79/tcp/4101/p2p/16Uiu2HAmKnRLFoU3QMX3zkTZLRv5mG8FBp4qfZpGJYuT3LAErt11",
-    "/ip4/146.70.243.142/tcp/9000/p2p/16Uiu2HAm6uE18CuSgCEi5LyjxvbEXdZFQHv1HJCad3WpqerJfDrE",
     "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
-    "/ip4/148.251.184.20/tcp/15974/p2p/16Uiu2HAmQYoJ6Gn5caze4BAZXMQ5CJX5qZbdkY3o7S23vvSAPLu9",
     "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
-    "/ip4/148.251.237.209/tcp/9000/p2p/16Uiu2HAmSLirTFzTcPE9wsHE6UhbXXmDxFkunHDVhPtrBfuPMq5U",
-    "/ip4/148.56.243.210/tcp/9000/p2p/16Uiu2HAkyQr5e7gobYTAutAoCDR6ZKEMrgmsChUztDkw2fQTiYL4",
     "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
-    "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw",
+    // Pruned 2026-09-13 (15 of the 22):
+    //  - Ten that serve nothing: refusing TCP (104.37.190.86, 136.243.146.247,
+    //    146.70.243.142), unreachable (148.56.243.210, and 144.76.106.139, whose
+    //    TCP connect times out), accepting TCP but closing or stalling before
+    //    the handshake completes (146.103.38.79, 159.195.30.80), a different
+    //    peer id at the pinned address (138.201.196.44), or closing the
+    //    connection before answering from BOTH vantage points (141.94.46.9, and
+    //    148.251.184.20, an Erigon/Caplin v3.6.0 node).
+    //  - Five Lighthouse v8.1.3 nodes (135.129.103.34, 135.148.35.18,
+    //    144.76.164.21, 148.251.237.209, 144.76.196.184) that serve bootstrap,
+    //    finality and optimistic updates but NOT updates_by_range: Identify
+    //    does not advertise it and negotiating it fails. They can anchor a
+    //    fresh install but never advance it — catch-up is what a gnosis pin is
+    //    for, and live_pins_alive counts each of them as not alive. Pinned,
+    //    they also cost the Rust catch-up a little: pins are exempt from the
+    //    no-LC denial (`PeerPool::mark_no_lc_updates` skips static ids, on the
+    //    premise that pins serve light-client data), so catch-up re-asks each
+    //    one whenever its 11 s cooldown lapses, from the top tier once it has
+    //    served a bootstrap or a finality update (`mark_proven`). Each ask
+    //    fails fast at negotiation. Unpinned, one failure denies such a peer
+    //    for catch-up while bootstrap and finality rounds, which ignore the
+    //    denial, keep using it; the Java engine skips it for catch-up whenever
+    //    its Identify is known (`servesLightClientUpdates`), pinned or not.
+    //    What dropping them costs is redundancy: 8 bootstrap- and
+    //    finality-serving pins where there were 13. Pinning such a server at
+    //    no catch-up cost would take the pool denying a pin whose live Identify
+    //    lacks updates_by_range, as the Java engine effectively does.
+    //    (144.76.196.184 also closed the connection on both runner runs, yet
+    //    answered the residential probe's bootstrap, finality and optimistic
+    //    requests.)
 ];
 
 /// Gnosis CL discv5 bootstrap ENRs (Java `NetworkConfig.GNOSIS.clDiscv5Bootnodes`
@@ -628,8 +656,8 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
 /// `NetworkConfig.MAINNET` clPeerMultiaddrs list (same entries, same order;
 /// both parity tests pin the full strings). Provenance: originally discovered
 /// via the Lighthouse peer API 2026-03-11, re-censused via period_census
-/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411 — per-entry
-/// evidence in the comments below).
+/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411), re-censused and
+/// pruned again 2026-09-13 (per-entry evidence in the comments below).
 const MAINNET_STATIC_PEERS: &[&str] = &[
     // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
     // general-purpose beacon node shares one connection semaphore between
@@ -651,34 +679,38 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // track_upstream_ip) — so repoint Nimbus, roost republishes with a bumped
     // seq, then refresh this pin and the bootstrap ENR below.
     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
-    // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
-    // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the
-    // roost comment above says why pinning an unreachable address is not free).
-    // The three below are cross-verified against independent clients (the
-    // first two served this census a 512/512 period-1840 update; the third
-    // was verified via the standalone Nimbus light client):
-    //  - 57.129.130.18: Lighthouse v8.2.2; enforces the one_every(10s) updates
-    //    quota, so it serves ONE period per ask (`agent_serves_one_period` asks
-    //    it for one up front; `single_period_peers` is the fallback for peers
-    //    that closed a batch before Identify named them);
-    //    also served the Java engine's catch-up (periods 1837-1838).
-    //  - 84.112.35.112: served the Java engine (1836-1837) and this census.
-    //  - 91.189.182.90: Nimbus fleet; served the standalone Nimbus light client
-    //    all five periods 1840-1844 in a single batched response (generous).
+    // Re-censused 2026-09-13 against period 1854 (the anchor the v0.1.9
+    // release refreshes to) and period 1853, from two vantage points:
+    // live_pins_alive on GitHub-hosted runners (run 34660361028 on 2026-09-12
+    // at 1854, run 34764523424 on 2026-09-13 at 1853) and, from a residential
+    // address, a one-pin-at-a-time probe of bootstrap, finality, optimistic and
+    // updates_by_range plus examples/period_census.rs. Each entry below served
+    // that probe everything, the period-1854 bootstrap and a 511/512
+    // updates_by_range(1854,1) included. All four are Lighthouse by Identify,
+    // so the catch-up asks each for one period at a time
+    // (`agent_serves_one_period`; the one_every(10s) updates quota was
+    // verified live against 57.129.130.18 on 2026-09-02).
+    //  - 57.129.130.18 (v8.2.2): closed the connection on BOTH runner runs
+    //    before answering anything, then served the residential probe in full.
+    //    That is the vantage point, not the pin — wallets dial from residential
+    //    and mobile addresses, not from cloud runners — so a runner-only
+    //    "connection closed" is not grounds to prune.
+    //  - 84.112.35.112 (v8.2.1), 91.189.182.90 (v8.2.2), 54.201.148.177 (v8.2.1):
+    //    served both runner runs as well. (The 2026-09-02 note called
+    //    91.189.182.90 a Nimbus-fleet node; its Identify says Lighthouse.)
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
-    // TCP-alive on 2026-09-02 but declining libp2p dials at probe time (busy
-    // public nodes shed light clients first — flaky by construction, kept
-    // because they demonstrably served the period census within hours).
-    "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
-    "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
-    "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
-    "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-    "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
-    "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
-    "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
+    // Pruned 2026-09-13, having failed every run above from both vantage
+    // points: six addresses now present a DIFFERENT peer id than the one
+    // pinned whenever the handshake completes ("Unexpected peer ID": the key
+    // rotated or the address changed hands — 52.200.203.85, 82.139.21.242,
+    // 135.181.210.123, 45.10.55.78, 185.107.68.131, 51.161.218.70), and
+    // 217.67.221.74 accepts TCP but never completes the handshake. A dead pin
+    // is not free: pins are never evicted, so it keeps a place in the
+    // bootstrap fan-out, and a bootstrap round waits for its slowest dial —
+    // ten seconds for a handshake that never completes.
 ];
 
 /// Mainnet CL discv5 bootnodes — the Java `NetworkConfig.MAINNET`
@@ -945,7 +977,7 @@ struct PeerPool {
     /// span>1 round charges such a peer a failure and the 3-strike rule evicts
     /// the whole Lighthouse-class population — precisely the servers the
     /// verify-reject rotation steers toward. Nimbus-class servers stay on the
-    /// big span (one answered five periods in a single batch).
+    /// big span.
     single_period_peers: HashSet<PeerId>,
     /// Peers whose ONE multi-count response applied two or more periods
     /// (verified) — Nimbus/Lodestar/roost-class servers with no per-request
@@ -1235,7 +1267,7 @@ impl PeerPool {
             // Already pooled. Refresh a pinned static peer's address in place:
             // it is un-evictable, so removal-then-rediscovery (the path an
             // ordinary peer self-heals an IP change through) never runs for it.
-            // The 22 Gnosis statics are hardcoded /ip4/…; when an operator moves
+            // The Gnosis statics are hardcoded /ip4/…; when an operator moves
             // (same node key, new address) discovery re-reports the same PeerId
             // at the current address, and without this refresh the entry would
             // be dialed at the stale address for the process lifetime (PR #322
@@ -3134,8 +3166,8 @@ fn apply_staged_step(
 /// against a one-token bucket, so it serves the first chunk and closes the
 /// stream. Asking it for one period up front turns every first contact into
 /// a served update instead of a truncated one. Nimbus and roost answer whole
-/// spans (a Nimbus node served five periods in one batch), and unknown
-/// agents keep the span until the reactive `single_period_peers` mark fires.
+/// spans, and unknown agents keep the span until the reactive
+/// `single_period_peers` mark fires.
 pub(crate) fn agent_serves_one_period(agent: Option<&str>) -> bool {
     agent.is_some_and(|a| a.starts_with("Lighthouse"))
 }
@@ -3669,9 +3701,9 @@ mod tests {
         assert_eq!(c.accepted_fork_digests(), vec![[0x8C, 0x9F, 0x62, 0xFE]]);
         // The FULL list, order and addresses — same discipline as the sepolia
         // test below, and the Java twin (NetworkConfigGnosisTest
-        // .mainnetPinsRoostFirst) pins the same 12 strings, so a one-sided edit
+        // .mainnetPinsRoostFirst) pins the same strings, so a one-sided edit
         // fails a test on whichever side diverges; pinning only count +
-        // element 0 (as both tests once did) let elements 1-11 drift
+        // element 0 (as both tests once did) let every later element drift
         // machine-unchecked. roost is FIRST — the ordering is the point, not an
         // accident of the list; the Java twin prepends it with prependLocal().
         assert_eq!(
@@ -3681,13 +3713,6 @@ mod tests {
                 "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
                 "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
                 "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
-                "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
-                "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
-                "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
-                "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-                "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
-                "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
-                "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
                 "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
             ],
             "same list, order AND addresses as the Java NetworkConfig.MAINNET.clPeerMultiaddrs"
@@ -3921,27 +3946,33 @@ mod tests {
             c.accepted_fork_digests(),
             vec![[0x32, 0x37, 0xDA, 0xB6], [0x7D, 0x5A, 0xAB, 0x40]]
         );
-        // 22 pinned LC peers — same list and order as the Java
-        // NetworkConfig.GNOSIS.clPeerMultiaddrs, ONE ADDRESS PER PEER ID
-        // (`PeerPool::add` dedupes by peer id, so a second address for a known
-        // id would never be dialed here while Java dialed both).
-        // 22 discovered gnosis peers + roost, pinned by the relay literal.
-        assert_eq!(c.static_peers.len(), 23);
-        // POSITION, like the other two chains: both engines must agree on which
-        // peer the light client tries FIRST, not merely that roost is present.
-        assert_eq!(c.static_peers[0], "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh");
-        // The discovered list is unchanged, just shifted by the one roost entry.
-        assert!(c.static_peers[1].ends_with(
-            "/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59"
-        ));
-        assert!(c.static_peers[22].ends_with(
-            "/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
-        ));
-        let unique: std::collections::HashSet<_> = c.static_peers.iter().collect();
-        assert_eq!(unique.len(), 23);
+        // The FULL list, order and addresses, like the other two chains — the
+        // Java twin (NetworkConfigGnosisTest.gnosisPinsHarvestedLcServers) pins
+        // the same strings, so a one-sided edit fails on whichever side
+        // diverges. This used to pin only the count and three positions, the
+        // same gap #411 closed for mainnet. roost FIRST: both engines must agree
+        // on which peer the light client tries first, not merely that roost is
+        // present.
+        assert_eq!(
+            c.static_peers,
+            vec![
+                "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+                "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
+                "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
+                "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
+                "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
+                "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
+                "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
+                "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw",
+            ],
+            "same list, order AND addresses as the Java NetworkConfig.GNOSIS.clPeerMultiaddrs"
+        );
+        // ONE ADDRESS PER PEER ID: `PeerPool::add` dedupes by peer id, so a
+        // second address for a known id would never be dialed here while Java,
+        // which dedupes by multiaddr string, dialed both.
         let ids: std::collections::HashSet<_> =
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
-        assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
+        assert_eq!(ids.len(), c.static_peers.len(), "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
         // Every pin must also derive a discv5 node id: that is what lets the
         // targeted lookup recover a pinned server's CURRENT record when its
