@@ -1007,7 +1007,17 @@ struct QueuedRequest {
 }
 
 struct SwarmCtx {
-    pending: HashMap<OutboundRequestId, Pending>,
+    /// What each outstanding outbound request's outcome completes.
+    ///
+    /// Keyed by (protocol, id) for the same reason as `in_flight`:
+    /// `OutboundRequestId` is issued PER behaviour, each counting from 1. Keyed
+    /// on the id alone, a new peer's auto-Status and a bootstrap to another peer
+    /// could share an id. The second insert evicted the first entry — a caller
+    /// saw "service shut down", an auto-Status never settled and stranded the
+    /// requests parked behind it — and the first outcome to arrive completed
+    /// the survivor, handing a bootstrap caller Status bytes. Only
+    /// [`send_tracked`] inserts, so a key always names the behaviour that issued it.
+    pending: HashMap<(&'static str, OutboundRequestId), Pending>,
     connected: HashSet<PeerId>,
     /// Peers we dialed BY NAME, and the name used. Logging only — cleared when
     /// the dial resolves one way or the other.
@@ -1051,28 +1061,34 @@ struct SwarmCtx {
     peer_source_ips: HashMap<PeerId, (IpAddr, bool)>,
 }
 
+impl SwarmCtx {
+    fn new(local_status: Arc<LocalStatus>, lc: Option<Arc<dyn LcResponder>>) -> Self {
+        Self {
+            pending: HashMap::new(),
+            connected: HashSet::new(),
+            dns_dials: HashMap::new(),
+            status_done: HashSet::new(),
+            queued: HashMap::new(),
+            lc_servers: HashSet::new(),
+            peer_earliest: HashMap::new(),
+            peer_agents: HashMap::new(),
+            local_status,
+            lc,
+            in_flight: HashMap::new(),
+            in_flight_bytes: 0,
+            observed_ips: HashMap::new(),
+            peer_source_ips: HashMap::new(),
+        }
+    }
+}
+
 async fn run_swarm(
     mut swarm: Swarm<Behaviour>,
     mut rx: mpsc::Receiver<Command>,
     local_status: Arc<LocalStatus>,
     lc: Option<Arc<dyn LcResponder>>,
 ) {
-    let mut ctx = SwarmCtx {
-        pending: HashMap::new(),
-        connected: HashSet::new(),
-        dns_dials: HashMap::new(),
-        status_done: HashSet::new(),
-        queued: HashMap::new(),
-        lc_servers: HashSet::new(),
-        peer_earliest: HashMap::new(),
-        peer_agents: HashMap::new(),
-        local_status,
-        lc,
-        in_flight: HashMap::new(),
-        in_flight_bytes: 0,
-        observed_ips: HashMap::new(),
-        peer_source_ips: HashMap::new(),
-    };
+    let mut ctx = SwarmCtx::new(local_status, lc);
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -1155,12 +1171,7 @@ fn submit_request(
     reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
 ) {
     if ctx.status_done.contains(&peer) {
-        let Some(rr) = behaviour_for(swarm, protocol) else {
-            let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
-            return;
-        };
-        let id = rr.send_request_with_addresses(&peer, wire, addrs);
-        ctx.pending.insert(id, Pending::External(reply));
+        send_tracked(swarm, ctx, peer, protocol, wire, addrs, Pending::External(reply));
         return;
     }
 
@@ -1208,6 +1219,32 @@ fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<
     })
 }
 
+/// Send `wire` on `protocol`'s behaviour and record what its outcome completes.
+///
+/// The only place a `pending` entry is created: the protocol that picks the
+/// behaviour is the protocol in the key, so a key can never name a behaviour
+/// other than the one that issued its id (see `SwarmCtx::pending`).
+fn send_tracked(
+    swarm: &mut Swarm<Behaviour>,
+    ctx: &mut SwarmCtx,
+    peer: PeerId,
+    protocol: &'static str,
+    wire: Vec<u8>,
+    addrs: Vec<Multiaddr>,
+    on_outcome: Pending,
+) {
+    let Some(rr) = behaviour_for(swarm, protocol) else {
+        // Only an external caller can name a protocol this host lacks; the
+        // auto-Status ones are this module's own constants.
+        if let Pending::External(reply) = on_outcome {
+            let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
+        }
+        return;
+    };
+    let id = rr.send_request_with_addresses(&peer, wire, addrs);
+    ctx.pending.insert((protocol, id), on_outcome);
+}
+
 fn fail_queued(ctx: &mut SwarmCtx, peer: &PeerId, error: RequestError) {
     if let Some(queue) = ctx.queued.remove(peer) {
         for q in queue {
@@ -1221,12 +1258,7 @@ fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: Peer
     ctx.status_done.insert(peer);
     let Some(queue) = ctx.queued.remove(&peer) else { return };
     for q in queue {
-        let Some(rr) = behaviour_for(swarm, q.protocol) else {
-            let _ = q.reply.send(Err(RequestError::Io(format!("unknown protocol {}", q.protocol))));
-            continue;
-        };
-        let id = rr.send_request_with_addresses(&peer, q.wire, q.addrs);
-        ctx.pending.insert(id, Pending::External(q.reply));
+        send_tracked(swarm, ctx, peer, q.protocol, q.wire, q.addrs, Pending::External(q.reply));
     }
 }
 
@@ -1263,8 +1295,8 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // in the Java service). v2 first, v1 fallback on negotiation
                 // failure. Parked requests flush when it settles.
                 let wire = codec::encode_request(&ctx.local_status.get().encode());
-                let id = swarm.behaviour_mut().status_v2.send_request(&peer_id, wire);
-                ctx.pending.insert(id, Pending::AutoStatusV2(peer_id));
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V2, wire, Vec::new(),
+                    Pending::AutoStatusV2(peer_id));
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -1351,7 +1383,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
             request_response::Message::Response { request_id, response } => {
-                complete(ctx, swarm, request_id, peer, Ok(response));
+                complete(ctx, swarm, protocol, request_id, peer, Ok(response));
             }
             request_response::Message::Request { request, channel, request_id, .. } => {
                 let mut response = respond_inbound(ctx, protocol, peer, &request);
@@ -1410,7 +1442,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 other => RequestError::Io(other.to_string()),
             };
             tracing::debug!(peer = %peer, protocol, error = %error, "outbound failure");
-            complete(ctx, swarm, request_id, peer, Err(mapped));
+            complete(ctx, swarm, protocol, request_id, peer, Err(mapped));
         }
         // Both terminal outcomes release the budget; missing either would leak it
         // and converge on a responder that refuses everything.
@@ -1427,11 +1459,12 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
 fn complete(
     ctx: &mut SwarmCtx,
     swarm: &mut Swarm<Behaviour>,
+    protocol: &'static str,
     request_id: OutboundRequestId,
-    _peer: PeerId,
+    peer: PeerId,
     result: Result<Vec<u8>, RequestError>,
 ) {
-    match ctx.pending.remove(&request_id) {
+    match ctx.pending.remove(&(protocol, request_id)) {
         Some(Pending::External(reply)) => {
             let _ = reply.send(result);
         }
@@ -1446,8 +1479,8 @@ fn complete(
                 // v1-only peer (Nimbus bucket in the Java notes) — fall back.
                 let local = ctx.local_status.get();
                 let wire = codec::encode_request(&local.encode_v1());
-                let id = swarm.behaviour_mut().status_v1.send_request(&peer_id, wire);
-                ctx.pending.insert(id, Pending::AutoStatusV1(peer_id));
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V1, wire, Vec::new(),
+                    Pending::AutoStatusV1(peer_id));
             }
             Err(e) => {
                 tracing::debug!(peer = %peer_id, error = %e, "auto-status v2 failed");
@@ -1467,7 +1500,10 @@ fn complete(
             }
             mark_status_done(swarm, ctx, peer_id);
         }
-        None => {}
+        None => {
+            tracing::debug!(peer = %peer, protocol, %request_id,
+                "outcome for an untracked outbound request — dropped");
+        }
     }
 }
 
@@ -2086,5 +2122,200 @@ mod dns_change_detection_tests {
         a.sort();
         b.sort();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod pending_request_tests {
+    //! `OutboundRequestId` is unique only PER `request_response::Behaviour`, and
+    //! this host runs one behaviour per protocol, each counting from 1. These
+    //! drive the real dispatch (`submit_request`, the auto-Status on
+    //! `ConnectionEstablished`) and the real completion (`on_rr_event`) with
+    //! colliding ids, and check that every outcome reaches whoever asked for it.
+    use super::*;
+    use libp2p::core::transport::PortUse;
+    use libp2p::core::{ConnectedPoint, Endpoint};
+    use libp2p::swarm::ConnectionId;
+    use std::num::NonZeroU32;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    fn host() -> (Swarm<Behaviour>, SwarmCtx) {
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None))
+    }
+
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id()
+    }
+
+    fn addr() -> Multiaddr {
+        "/ip4/127.0.0.1/tcp/9000".parse().unwrap()
+    }
+
+    fn status(earliest_available_slot: u64) -> StatusMessage {
+        StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot,
+        }
+    }
+
+    /// The id every behaviour gives its FIRST request. `OutboundRequestId` has
+    /// no public constructor, so it is minted the way the host's behaviours mint
+    /// theirs — and checked to collide across two protocols, which is the
+    /// premise of every test here.
+    fn first_request_id() -> OutboundRequestId {
+        let p = peer();
+        let a = rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        let b = rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        assert_eq!(a, b, "request ids no longer collide across behaviours — revisit these tests");
+        a
+    }
+
+    fn response(peer: PeerId, request_id: OutboundRequestId, bytes: &[u8]) -> RrEvent {
+        request_response::Event::Message {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            message: request_response::Message::Response { request_id, response: bytes.to_vec() },
+        }
+    }
+
+    fn failure(
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        error: request_response::OutboundFailure,
+    ) -> RrEvent {
+        request_response::Event::OutboundFailure {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            request_id,
+            error,
+        }
+    }
+
+    /// A new connection, which is what starts a peer's auto-Status.
+    fn connect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: ConnectedPoint::Dialer {
+                address: addr(),
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: NonZeroU32::MIN,
+            concurrent_dial_errors: None,
+            established_in: Duration::ZERO,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// Two protocols' first requests in flight together carry the same id. Keyed
+    /// on the id alone, the second insert dropped the first caller's reply
+    /// channel — which a caller sees as "service shut down" — and the bootstrap
+    /// response was handed to the finality caller.
+    #[tokio::test]
+    async fn first_requests_on_two_protocols_reach_their_own_callers() {
+        let (mut swarm, mut ctx) = host();
+        let p = peer();
+        let id = first_request_id();
+        ctx.status_done.insert(p); // an established peer: both dispatch at once
+        let (boot_tx, mut boot_rx) = oneshot::channel();
+        let (fin_tx, mut fin_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::BOOTSTRAP, vec![1], boot_tx);
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::FINALITY_UPDATE, Vec::new(), fin_tx);
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(p, id, b"bootstrap"));
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::FINALITY_UPDATE,
+            failure(p, id, request_response::OutboundFailure::Timeout),
+        );
+
+        assert_eq!(
+            boot_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "the bootstrap caller must get the bootstrap response"
+        );
+        assert_eq!(
+            fin_rx.try_recv(),
+            Ok(Err(RequestError::Timeout)),
+            "the finality caller must get its own outcome"
+        );
+        assert!(ctx.pending.is_empty(), "each outcome consumes its own entry");
+    }
+
+    /// The race the sync loop's fan-out produces: B connects while a bootstrap
+    /// to A is outstanding, so B's auto-Status and A's bootstrap are both id 1.
+    /// Keyed on the id alone, A was handed B's Status bytes as a successful
+    /// bootstrap (undecodable, so A gets struck) and B never settled, stranding
+    /// the request parked behind B's Status.
+    #[tokio::test]
+    async fn auto_status_and_a_request_to_another_peer_settle_independently() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        let (parked_tx, mut parked_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], parked_tx);
+        assert!(ctx.queued.contains_key(&b), "B's request waits for B's Status");
+
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![2], a_tx);
+
+        let b_status = codec::encode_success_response(&status(4242).encode(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V2, response(b, id, &b_status));
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+
+        assert_eq!(
+            a_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "A must get A's bootstrap, not B's Status"
+        );
+        assert!(ctx.status_done.contains(&b), "B's Status reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&4242), "and be read as B's Status");
+        assert!(!ctx.queued.contains_key(&b), "settling B releases its parked request");
+        assert_eq!(parked_rx.try_recv(), Err(TryRecvError::Empty), "released into flight, not dropped");
+        assert_eq!(ctx.pending.len(), 1, "B's released request is the only one outstanding");
+    }
+
+    /// A v1-only peer refusing status/2 while another peer's first bootstrap is
+    /// out: the refusal must start THAT peer's v1 fallback, never reach the
+    /// bootstrap caller as UnsupportedProtocol, and the v1 reply — id 1 on a
+    /// third behaviour — must settle the peer.
+    #[tokio::test]
+    async fn a_status_v2_refusal_falls_back_for_that_peer_only() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![1], a_tx);
+
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::UnsupportedProtocols),
+        );
+        assert_eq!(a_rx.try_recv(), Err(TryRecvError::Empty), "B's refusal is not A's outcome");
+
+        let b_status = codec::encode_success_response(&status(0).encode_v1(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V1, response(b, id, &b_status));
+        assert!(ctx.status_done.contains(&b), "B's v1 reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&0), "a v1 peer reports history from genesis");
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+        assert_eq!(a_rx.try_recv(), Ok(Ok(b"bootstrap".to_vec())));
+        assert!(ctx.pending.is_empty());
     }
 }
