@@ -17,8 +17,9 @@
 # cross-job fail-fast.)
 #
 # Keep that list exhaustive: every workflow that uploads to a release (`gh release
-# upload`, action-gh-release) belongs in it and must call this guard. An audit
-# reads this list — while it was stale, ios-xcframework published unguarded.
+# upload`, `gh release create <tag> <files>`, action-gh-release) belongs in it and
+# must call this guard. An audit reads this list — while it was stale,
+# ios-xcframework published unguarded.
 #
 # GitHub has no cross-workflow job dependencies, so "one shared guard" means one
 # shared *definition*: this file is the single source of the check, instantiated
