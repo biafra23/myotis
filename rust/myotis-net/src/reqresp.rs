@@ -1468,6 +1468,19 @@ fn complete(
         Some(Pending::External(reply)) => {
             let _ = reply.send(result);
         }
+        // Stale: the peer's LAST connection closed before this outcome arrived.
+        // libp2p yields `SwarmEvent::ConnectionClosed` first and the request's
+        // `OutboundFailure` on a later poll, so the close handler has already
+        // reset the peer and failed its parked requests. Settling it now would
+        // mark a disconnected peer Status-done, sending its next requests ahead
+        // of the next connection's own auto-Status. Nothing can reconnect the
+        // peer in between: queued behaviour events drain before the pool is
+        // polled again.
+        Some(Pending::AutoStatusV2(peer_id) | Pending::AutoStatusV1(peer_id))
+            if !ctx.connected.contains(&peer_id) =>
+        {
+            tracing::debug!(peer = %peer_id, protocol, "auto-status outcome after disconnect — ignored");
+        }
         Some(Pending::AutoStatusV2(peer_id)) => match result {
             Ok(raw) => {
                 if let Some(earliest) = log_peer_status("v2", peer_id, &raw) {
@@ -2197,19 +2210,31 @@ mod pending_request_tests {
         }
     }
 
+    fn dialer() -> ConnectedPoint {
+        ConnectedPoint::Dialer { address: addr(), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }
+    }
+
     /// A new connection, which is what starts a peer's auto-Status.
     fn connect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
         let event = SwarmEvent::ConnectionEstablished {
             peer_id,
             connection_id: ConnectionId::new_unchecked(1),
-            endpoint: ConnectedPoint::Dialer {
-                address: addr(),
-                role_override: Endpoint::Dialer,
-                port_use: PortUse::Reuse,
-            },
+            endpoint: dialer(),
             num_established: NonZeroU32::MIN,
             concurrent_dial_errors: None,
             established_in: Duration::ZERO,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// The peer's LAST connection closing.
+    fn disconnect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: dialer(),
+            num_established: 0,
+            cause: None,
         };
         handle_swarm_event(swarm, ctx, event);
     }
@@ -2317,5 +2342,39 @@ mod pending_request_tests {
         on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
         assert_eq!(a_rx.try_recv(), Ok(Ok(b"bootstrap".to_vec())));
         assert!(ctx.pending.is_empty());
+    }
+
+    /// libp2p yields a peer's last `ConnectionClosed` BEFORE the `OutboundFailure`
+    /// of the auto-Status in flight on it: the behaviour queues the failure while
+    /// handling the close, and it surfaces on a later poll. That late failure must
+    /// not settle the peer. A disconnected peer marked Status-done sends whatever
+    /// was parked since the close, and every request after it, ahead of the next
+    /// connection's own auto-Status — the ordering the parking exists to prevent.
+    #[tokio::test]
+    async fn a_late_auto_status_failure_does_not_settle_a_disconnected_peer() {
+        let (mut swarm, mut ctx) = host();
+        let b = peer();
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        disconnect(&mut swarm, &mut ctx, b);
+        let (early_tx, mut early_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], early_tx);
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::ConnectionClosed),
+        );
+        assert!(!ctx.status_done.contains(&b), "a disconnected peer is never Status-done");
+        assert!(ctx.pending.is_empty(), "the request parked since the close stays parked");
+
+        connect(&mut swarm, &mut ctx, b); // the reconnect sends its own auto-Status
+        let (late_tx, mut late_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![2], late_tx);
+        assert_eq!(ctx.queued.get(&b).map(Vec::len), Some(2), "both wait for the new Status");
+        assert_eq!(ctx.pending.len(), 1, "only the new auto-Status is in flight");
+        assert_eq!(early_rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(late_rx.try_recv(), Err(TryRecvError::Empty));
     }
 }
