@@ -143,21 +143,27 @@ class NetworkConfigGnosisTest {
 
     @Test
     void gnosisPinsHarvestedLcServers() {
-        // 22 Identify-confirmed LC servers from a long-running desktop cache
-        // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
-        // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
-        List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by the relay literal");
+        // LC servers harvested from a long-running desktop cache (issue #291),
+        // pruned 2026-09-13 to the ones a census found serving — the per-entry
+        // evidence is in the Rust GNOSIS_STATIC_PEERS. The FULL list, order and
+        // addresses: the Rust twin (sync.rs gnosis_config_matches_networkconfig_java)
+        // pins the same strings, so a one-sided edit fails on whichever side
+        // diverges; this used to pin only the count and three positions.
         // roost FIRST, by the netcup relay literal (188.68.32.16, static VPS in
-        // front of zbox) — one entry, no name; see the Rust GNOSIS_STATIC_PEERS.
-        assertEquals("/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
-        // The harvested list is unchanged, just shifted by the one roost entry.
-        assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
-                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(1));
-        assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
-                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(22));
-        assertEquals(23, cl.stream().distinct().count());
-        assertEquals(23, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
+        // front of zbox).
+        List<String> cl = G.clPeerMultiaddrs();
+        assertEquals(List.of(
+                "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+                "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
+                "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
+                "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
+                "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
+                "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
+                "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
+                "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"),
+                cl,
+                "same list, order AND addresses as the Rust GNOSIS_STATIC_PEERS; roost first");
+        assertEquals(cl.size(), cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
                 "one address per peer id");
         for (String addr : cl) {
             assertTrue(addr.matches("/(ip4/\\d+\\.\\d+\\.\\d+\\.\\d+|dns4/[\\w.-]+)/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
@@ -199,9 +205,9 @@ class NetworkConfigGnosisTest {
         // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
         // this side.
         // The FULL list, order and addresses — the Rust twin
-        // (mainnet_config_matches_networkconfig_java) pins the same 12 strings,
-        // so an address typo or one-sided IP rotation fails a test on WHICHEVER
-        // side diverges; count + element 0 alone let elements 1-11 drift
+        // (mainnet_config_matches_networkconfig_java) pins the same strings, so
+        // an address typo or one-sided IP rotation fails a test on WHICHEVER
+        // side diverges; count + element 0 alone let every later element drift
         // machine-unchecked (PR #411 review).
         List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
         assertEquals(List.of(
@@ -209,13 +215,6 @@ class NetworkConfigGnosisTest {
                 "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
                 "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
                 "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
-                "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
-                "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
-                "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
-                "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-                "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
-                "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
-                "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
                 "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ"),
                 cl,
                 "same list, order AND addresses as the Rust MAINNET_STATIC_PEERS; "

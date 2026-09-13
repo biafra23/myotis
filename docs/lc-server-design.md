@@ -9,10 +9,12 @@ particular do not travel:
 
 - **~1327 periods ≈ 36 MB is sepolia's archive.** Mainnet's Altair floor and
   Gnosis's own beacon chain (`docs/multichain-design.md`) give different sizes.
-- **Mainnet does not have this problem in the same shape.** `NetworkConfig` pins
-  **12** mainnet CL multiaddrs against sepolia's **4**, so "replace the pinned CL
-  multiaddr with discovery" is a sepolia-shaped statement. Whether mainnet and
-  gnosis follow is deliberately left open.
+- **Mainnet did not have this problem in the same shape.** When this was written
+  `NetworkConfig` pinned **12** mainnet CL multiaddrs against sepolia's **4**, so
+  "replace the pinned CL multiaddr with discovery" was a sepolia-shaped statement.
+  The 2026-09-13 re-census cut mainnet to **5** (roost included), so that contrast
+  has mostly gone. Whether mainnet and gnosis follow is still deliberately left
+  open.
 
 ## Why
 

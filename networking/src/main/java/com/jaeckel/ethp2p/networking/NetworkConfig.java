@@ -144,7 +144,8 @@ public record NetworkConfig(
             // CL peer multiaddrs: known light-client-serving peers. Provenance:
             // originally discovered via the Lighthouse peer API 2026-03-11,
             // re-censused via period_census 2026-09-01 (#410), re-verified and
-            // pruned 2026-09-02 (#411 — per-entry evidence in the list comments).
+            // pruned 2026-09-02 (#411), re-censused and pruned 2026-09-13
+            // (per-entry evidence in the Rust twin's list comments).
             // roost is pinned by the literal address of the netcup relay
             // (188.68.32.16, a static VPS): zbox itself sits behind mobile CGNAT
             // and is reachable only through a WireGuard tunnel that DNATs the
@@ -158,21 +159,16 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
-                    // Re-verified 2026-09-02 — the first two served the census a
-                    // 512/512 period-1840 update, the third served the standalone
-                    // Nimbus light client; the rest TCP-alive. TCP-dead pruned.
+                    // Re-censused 2026-09-13 at the period-1854 anchor from two vantage
+                    // points (GitHub-hosted runners, a residential address): each served
+                    // the bootstrap and a 511/512 updates_by_range(1854,1).
+                    // 57.129.130.18 closes on runner IPs but served the residential
+                    // address in full. Seven entries that failed every run pruned.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
                     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
                     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
-                    "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
-                    "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
-                    "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
-                    "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-                    "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
-                    "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
-                    "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
                     "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ"
             )),
             "http://localhost:5052",
@@ -402,7 +398,10 @@ public record NetworkConfig(
             // CL peer multiaddrs for Gnosis: Identify-confirmed LC servers harvested
             // from a long-running desktop profile's cl-peers-gnosis.cache (2026-08-06,
             // issue #291 — a cold Gnosis pool starves catch-up because so few nodes
-            // serve light-client data; these give a fresh install a serving head start).
+            // serve light-client data; these give a fresh install a serving head start),
+            // re-censused 2026-09-13 and cut from 22 to the 7 that still serve catch-up.
+            // Per-entry evidence, and why five bootstrap-only Lighthouse v8.1.3 nodes
+            // were dropped rather than kept, in the Rust twin.
             // Same list and ORDER as the Rust GNOSIS_STATIC_PEERS (sync.rs) — keep in
             // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
             // second address for a known id would be dropped there while Java (which
@@ -412,27 +411,15 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
-                    "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
+                    // Re-censused 2026-09-13 at the period-3666 anchor: all Lighthouse
+                    // v8.2.x advertising light_client_updates_by_range, each serving the
+                    // bootstrap and a 507/512 updates_by_range(3666,1).
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
-                    "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
-                    "/ip4/135.148.35.18/tcp/9000/p2p/16Uiu2HAm5g8koS1AgicyMZKekLoyh5rK3eBGoZJP5KUsoK5wcehs",
-                    "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
-                    "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
-                    "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
-                    "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
-                    "/ip4/144.76.164.21/tcp/9016/p2p/16Uiu2HAm2UAjrJax6SAtu53VykpbmPrzDDdfB3G79ypQeiXnjj3u",
-                    "/ip4/144.76.196.184/tcp/13000/p2p/16Uiu2HAm6wUQPL4FYKHqmGfZQBPYbDd8GNHxNYeH5DZGLunPAw4J",
-                    "/ip4/146.103.38.79/tcp/4101/p2p/16Uiu2HAmKnRLFoU3QMX3zkTZLRv5mG8FBp4qfZpGJYuT3LAErt11",
-                    "/ip4/146.70.243.142/tcp/9000/p2p/16Uiu2HAm6uE18CuSgCEi5LyjxvbEXdZFQHv1HJCad3WpqerJfDrE",
                     "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
-                    "/ip4/148.251.184.20/tcp/15974/p2p/16Uiu2HAmQYoJ6Gn5caze4BAZXMQ5CJX5qZbdkY3o7S23vvSAPLu9",
                     "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
-                    "/ip4/148.251.237.209/tcp/9000/p2p/16Uiu2HAmSLirTFzTcPE9wsHE6UhbXXmDxFkunHDVhPtrBfuPMq5U",
-                    "/ip4/148.56.243.210/tcp/9000/p2p/16Uiu2HAkyQr5e7gobYTAutAoCDR6ZKEMrgmsChUztDkw2fQTiYL4",
                     "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
-                    "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
                     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
             )),
             null,
