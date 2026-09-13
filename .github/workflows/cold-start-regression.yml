@@ -24,16 +24,17 @@
 #                 smoke job dials a warm peer cache, which hides this.
 #   * old-anchor: the trust anchor is several periods behind, so bootstrap is
 #                 not enough and catch-up must actually walk periods. A
-#                 release-fresh anchor walks 0-2 periods and proves little,
-#                 which is why the anchor is an input rather than the embedded
-#                 one. It must be further behind than the network's
-#                 weak-subjectivity bound (gnosis 3 periods, mainnet/sepolia
-#                 13); the test asserts that. Take it from a release OLDER than
-#                 the current one — the newest tag is usually the release whose
-#                 anchor is the one on main, so it is no good:
-#                   prev=$(git tag --sort=-v:refname | sed -n 2p)
-#                   git show "$prev":rust/myotis-net/src/sync.rs \
-#                     | grep -A6 '@checkpoint:gnosis:begin'
+#                 release-fresh anchor walks 0-2 periods and proves little, so
+#                 the test never uses the embedded one. By default it takes
+#                 this network's entry in
+#                 rust/testdata/anchors/oldest-servable.properties: the oldest
+#                 checkpoint roost's serving nodes still bootstrap, far past
+#                 every weak-subjectivity bound (gnosis 3 periods,
+#                 mainnet/sepolia 13), which the test asserts. anchor_root and
+#                 anchor_slot override it, together. If this step fails before
+#                 bootstrapping, first suspect that the file's entry has aged
+#                 out of what roost still serves: re-probe on zbox and update
+#                 the file before hunting for a regression.
 name: cold-start regression
 
 on:
@@ -50,11 +51,11 @@ on:
         options: [full, pins-only]
         default: full
       anchor_root:
-        description: "Old anchor block root (64 hex). Required when scope is full."
+        description: "Optional override: old anchor block root (64 hex). Default: this network's entry in rust/testdata/anchors/oldest-servable.properties."
         type: string
         default: ""
       anchor_slot:
-        description: "Old anchor slot (must accompany the root)"
+        description: "Optional override: old anchor slot (set together with anchor_root)"
         type: string
         default: ""
 
@@ -85,17 +86,6 @@ jobs:
         with:
           workspaces: rust
 
-      # A green tick must not mean "the release check ran" when the deep walk
-      # was silently skipped for want of an anchor. Skipping is a CHOICE
-      # (scope: pins-only), never an accident of leaving a field blank.
-      - name: Refuse a full run without an anchor
-        if: inputs.scope == 'full' && (inputs.anchor_root == '' || inputs.anchor_slot == '')
-        run: |
-          echo "::error::scope=full runs the old-anchor regression, which needs both" \
-               "anchor_root and anchor_slot. Supply them, or dispatch with scope=pins-only" \
-               "to deliberately run only the pin census and the dead-pins cold start."
-          exit 1
-
       - name: Build the tests
         working-directory: rust
         run: |
@@ -123,9 +113,9 @@ jobs:
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
 
-      # Runs for every scope except an explicit pins-only, so a missing or
-      # half-supplied anchor reaches the test's own loud guards rather than
-      # skipping green. The gate above already refused a blank full run.
+      # Runs for every scope except an explicit pins-only. With no override the
+      # test reads the committed test-anchor file; a half-supplied override
+      # reaches the test's own loud guard rather than skipping green.
       - name: Cold start from an old anchor
         if: inputs.scope != 'pins-only'
         working-directory: rust

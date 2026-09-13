@@ -19,32 +19,34 @@
 //! * `cold_start_from_an_old_anchor_walks_periods_to_head` — the trust anchor
 //!   is several periods behind, so bootstrap is not enough and catch-up must
 //!   actually walk. A release-fresh anchor makes the walk 0–2 periods and
-//!   proves almost nothing, which is why the anchor is a parameter.
+//!   proves almost nothing, which is why this test never uses the embedded one.
 //!
 //! ```bash
 //! # dead pins (default network: gnosis — where #422 bit hardest)
 //! cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
 //!     cold_start_with_every_pinned_peer_unreachable
 //!
-//! # Old anchor: it must be MORE THAN the network's weak-subjectivity bound
-//! # behind the wall clock (gnosis 3 periods, mainnet/sepolia 13) — the test
-//! # asserts that, because a shallower anchor walks a period or two and would
-//! # have survived the bug this guards.
-//! #
-//! # Take it from a release OLDER than the current one. Note the newest tag is
-//! # usually the release whose anchor is the one on main, so it is no good:
-//! #   prev=$(git tag --sort=-v:refname | sed -n 2p)
-//! #   git show "$prev":rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
-//! #
-//! # Worked example, measured 2026-09-11 — v0.1.7's gnosis anchor, 70 periods
-//! # behind, walked to head in 170 s:
-//! #   MYOTIS_TEST_ANCHOR_ROOT=5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954
-//! #   MYOTIS_TEST_ANCHOR_SLOT=29458656
-//! NET=gnosis \
-//! MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
+//! # Old anchor: by default this network's entry in
+//! # rust/testdata/anchors/oldest-servable.properties, the oldest checkpoint
+//! # the serving nodes behind roost still bootstrap, far past every network's
+//! # weak-subjectivity bound (gnosis 3 periods, mainnet/sepolia 13). The test
+//! # asserts the anchor is further behind than the bound, because a shallower
+//! # one walks a period or two and would have survived the bug this guards.
+//! # Measured 2026-09-11: gnosis's entry, 70 periods behind, walked to head in
+//! # 170 s.
+//! NET=gnosis cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
+//!     cold_start_from_an_old_anchor
+//!
+//! # Override the anchor, both variables or neither:
+//! NET=gnosis MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
 //! cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
 //!     cold_start_from_an_old_anchor
 //! ```
+//!
+//! If the old-anchor run never bootstraps, first suspect that the anchor file's
+//! entry has aged out of what roost still serves (bootstrap retention is a
+//! moving horizon): re-probe on zbox and update the file before hunting for a
+//! regression.
 //!
 //! NOTE both tests are peer-quota-bound, not CPU-bound: light-client servers
 //! serve roughly one update per 10 s each, so a deep walk takes minutes. The
@@ -63,12 +65,50 @@ use myotis_net::{ChainConfig, SyncHandle, SyncState};
 /// something else (CLAUDE.md: a parameter that can change the answer must be
 /// applied or refused, never accepted and silently ignored).
 fn config_for_env() -> ChainConfig {
-    match std::env::var("NET").unwrap_or_else(|_| "gnosis".into()).as_str() {
+    match net_from_env().as_str() {
         "mainnet" => ChainConfig::mainnet(),
         "sepolia" => ChainConfig::sepolia(),
         "gnosis" => ChainConfig::gnosis(),
         other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
     }
+}
+
+/// `NET`, defaulting to gnosis. [`config_for_env`] refuses an unknown value.
+fn net_from_env() -> String {
+    std::env::var("NET").unwrap_or_else(|_| "gnosis".into())
+}
+
+/// The committed test-anchor file, as it is named in failure messages.
+const ANCHOR_FILE: &str = "rust/testdata/anchors/oldest-servable.properties";
+
+/// `<net>.root` and `<net>.slot` from [`ANCHOR_FILE`], the oldest checkpoint
+/// per network the serving nodes behind roost still bootstrap. Panics when the
+/// file or the entry is missing: the old-anchor test must never pass having
+/// walked nothing.
+fn recorded_test_anchor(net: &str) -> (String, String) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../testdata/anchors/oldest-servable.properties");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {ANCHOR_FILE} ({}): {e}", path.display()));
+    let value = |key: &str| {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            // Last duplicate wins, as in java.util.Properties, which is what
+            // refreshCheckpoint -PanchorFile reads the same file with.
+            .filter(|(k, _)| k.trim() == key)
+            .last()
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{ANCHOR_FILE} has no {key}: add this network's entry, or set \
+                     MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT"
+                )
+            })
+    };
+    (value(&format!("{net}.root")), value(&format!("{net}.slot")))
 }
 
 /// How long the dead-pins cold start may take. Named, with the prose
@@ -182,23 +222,29 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
     assert_no_cl_env_overrides();
     let mut config = config_for_env();
 
-    // The anchor is required, and a missing one FAILS rather than returning:
-    // this test only runs when someone asked for it by name (it is #[ignore]d),
-    // and a green "1 passed" for a run that did nothing is how a regression
-    // quietly stops being one.
+    // The anchor comes from MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT
+    // when both are set, else from this network's entry in the committed
+    // test-anchor file. Empty values count as unset (the workflow passes blank
+    // inputs through). A missing or half-supplied anchor FAILS rather than
+    // returning: this test only runs when someone asked for it by name (it is
+    // #[ignore]d), and a green "1 passed" for a run that did nothing is how a
+    // regression quietly stops being one.
     let env_non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let root_hex = env_non_empty("MYOTIS_TEST_ANCHOR_ROOT").unwrap_or_else(|| {
-        panic!(
-            "set MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT to an anchor further \
-             behind than this network's weak-subjectivity bound — see this file's header \
-             for where to get one"
-        )
-    });
-    let slot: u64 = env_non_empty("MYOTIS_TEST_ANCHOR_SLOT")
-        .expect("MYOTIS_TEST_ANCHOR_SLOT must accompany MYOTIS_TEST_ANCHOR_ROOT")
-        .trim()
-        .parse()
-        .expect("anchor slot must be a number");
+    let (root_hex, slot, source) = match (
+        env_non_empty("MYOTIS_TEST_ANCHOR_ROOT"),
+        env_non_empty("MYOTIS_TEST_ANCHOR_SLOT"),
+    ) {
+        (Some(root), Some(slot)) => (root, slot, "MYOTIS_TEST_ANCHOR_ROOT/SLOT".to_string()),
+        (None, None) => {
+            let (root, slot) = recorded_test_anchor(&net_from_env());
+            (root, slot, ANCHOR_FILE.to_string())
+        }
+        _ => panic!(
+            "MYOTIS_TEST_ANCHOR_ROOT and MYOTIS_TEST_ANCHOR_SLOT override the anchor together: \
+             set both, or neither to use {ANCHOR_FILE}"
+        ),
+    };
+    let slot: u64 = slot.trim().parse().expect("anchor slot must be a number");
     let root_hex = root_hex.trim().trim_start_matches("0x");
     assert_eq!(root_hex.len(), 64, "anchor root must be 32 bytes of hex");
     let mut root = [0u8; 32];
@@ -217,8 +263,8 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
         wall_period.saturating_sub(anchor_period)
     );
     let behind = wall_period - anchor_period;
-    eprintln!("[old-anchor] anchor period {anchor_period}, wall {wall_period} ({behind} behind, \
-               ws bound {bound})");
+    eprintln!("[old-anchor] anchor period {anchor_period} from {source}, wall {wall_period} \
+               ({behind} behind, ws bound {bound})");
 
     config.checkpoint_root = root;
     config.checkpoint_slot = slot;
@@ -236,7 +282,9 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
         panic!(
             "cold start {behind} periods behind did not reach SYNCED in {} min — \
              the bootstrap may have landed but catch-up made no progress, which is \
-             exactly the #422 stall",
+             exactly the #422 stall. If it never bootstrapped, first suspect that the \
+             anchor ({source}) has aged out of what roost still serves: re-probe on zbox \
+             and update {ANCHOR_FILE} before hunting for a regression",
             OLD_ANCHOR_BUDGET.as_secs() / 60
         )
     });
