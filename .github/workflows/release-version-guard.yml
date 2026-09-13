@@ -7,13 +7,18 @@
 # sweep went green and published a v0.1.5-named apk that reports versionName 0.1.4
 # in Settings -> Apps, next to a .deb stamped 0.1.4 and a .dmg stamped 1.1.4.
 #
-# Called as a job by every workflow that publishes tag-named release assets:
-# android-apk, ci, desktop-dmg, desktop-linux-deb, node-binding. Each one gates
-# the call on startsWith(github.ref, 'refs/tags/v') and makes its publishing job
-# needs: it, so a mismatch fails the run before anything is uploaded. Because it
-# is a separate job it runs in PARALLEL with the builds, and the whole step is
-# ~30s, so the verdict lands long before a 40-minute dmg leg. (Those legs still
-# run to completion — Actions has no cross-job fail-fast.)
+# Called as a job by every workflow that uploads assets to a `v*` tag's release:
+# android-apk, ci, desktop-dmg, desktop-linux-deb, ios-framework, ios-xcframework,
+# node-binding. Each one gates the call on startsWith(github.ref, 'refs/tags/v')
+# and makes its publishing job needs: it, so a mismatch fails the run before
+# anything is uploaded. Because it is a separate job it runs in PARALLEL with the
+# builds, and the whole step is ~30s, so the verdict lands long before a
+# 40-minute dmg leg. (Those legs still run to completion — Actions has no
+# cross-job fail-fast.)
+#
+# Keep that list exhaustive: every workflow that uploads to a release (`gh release
+# upload`, action-gh-release) belongs in it and must call this guard. An audit
+# reads this list — while it was stale, ios-xcframework published unguarded.
 #
 # GitHub has no cross-workflow job dependencies, so "one shared guard" means one
 # shared *definition*: this file is the single source of the check, instantiated
@@ -25,8 +30,8 @@
 # cannot match, so the expected outcome is a refusal:
 #
 #     git tag v9.9.9-guardtest && git push origin v9.9.9-guardtest
-#     # expect: this job fails in all five workflows, every publishing job is
-#     #         SKIPPED, and `gh release view v9.9.9-guardtest` finds nothing
+#     # expect: this job fails in every workflow listed above, every publishing
+#     #         job is SKIPPED, and `gh release view v9.9.9-guardtest` finds nothing
 #     git push origin --delete v9.9.9-guardtest && git tag -d v9.9.9-guardtest
 #
 # The opposite direction (a CORRECT tag passes) cannot be rehearsed this way —

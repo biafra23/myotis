@@ -211,9 +211,9 @@ jobs:
     # failed/cancelled build still blocks it as the implicit success() used to.
     #
     # 'skipped' is accepted ONLY on workflow_dispatch. On a tag push the guard is
-    # required to have actually SUCCEEDED: this is the one workflow of the five
-    # whose release job doesn't share its `if` with the guard, so it is the only
-    # one where a future mis-gate could silently degrade to an unguarded publish.
+    # required to have actually SUCCEEDED: this is the one guard caller whose
+    # release job doesn't share its `if` with the guard, so it is the only one
+    # where a future mis-gate could silently degrade to an unguarded publish.
     # Narrowing 'skipped' to the event that legitimately skips makes that fail
     # closed instead.
     if: >-
