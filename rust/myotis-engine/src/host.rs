@@ -491,9 +491,16 @@ fn read_anchor_marker(path: &std::path::Path) -> Result<Option<([u8; 32], u64)>,
     parse().map(Some).ok_or(())
 }
 
-/// Record the caller's anchor durably (the tree's atomic writer: unique temp,
-/// fsync, rename, parent fsync) so a crash or power loss mid-write leaves
-/// either the old marker or the new one, never a torn file.
+/// Record the caller's anchor DURABLY: the tree's atomic writer (unique temp,
+/// fsync, rename) followed by an fsync of the parent directory that is
+/// required to succeed. `write_atomic`'s own directory sync is best-effort —
+/// right for a cache, where a lost rename just means the previous checkpoint —
+/// but wrong here: if the rename were not durable, a power loss after the
+/// engine persisted a caller-anchored snapshot could leave that snapshot
+/// WITHOUT its marker, and a later plain `create()` would classify the
+/// directory as embedded-anchor state and resume it under the wrong anchor.
+/// So a create is registered only once the marker's directory entry is on
+/// disk; any failure here surfaces as `CREATE_FAILED`, never as a handle.
 fn write_anchor_marker(path: &std::path::Path, root: &[u8; 32], slot: u64) -> std::io::Result<()> {
     let body = serde_json::json!({
         "checkpointRoot": format!("0x{}", hex32(root)),
@@ -501,7 +508,27 @@ fn write_anchor_marker(path: &std::path::Path, root: &[u8; 32], slot: u64) -> st
         "note": "trust anchor supplied by the host at createWithCheckpoint; the engine \
                  verifies forward from it but did not authenticate it",
     });
-    myotis_net::el::logindex::write_atomic(path, &serde_json::to_vec_pretty(&body)?)
+    myotis_net::el::logindex::write_atomic(path, &serde_json::to_vec_pretty(&body)?)?;
+    sync_parent_dir(path)
+}
+
+/// Make a rename in `path`'s directory durable. On Unix that is an fsync of
+/// the directory itself, and it must succeed. Windows has no directory fsync
+/// (opening a directory as a file is refused) and NTFS journals directory
+/// metadata itself, so nothing is required there.
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "marker path has no parent")
+        })?;
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Insert a not-yet-started handle for `config` and hand out its id.
