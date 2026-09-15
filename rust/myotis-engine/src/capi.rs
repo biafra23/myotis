@@ -84,7 +84,8 @@ pub unsafe extern "C" fn myotis_canonical_network_name(
 
 /// Allocate a not-yet-started handle id (`nativeCreate` twin). Returns the id
 /// (≥ 1), or a negative sentinel: -1 for an unknown name / runtime-init
-/// failure, -2 for a canonical-but-unsupported network.
+/// failure, -2 for a canonical-but-unsupported network, -3 for a dataDir bound
+/// to a caller-supplied checkpoint (`myotis_create_with_checkpoint`).
 ///
 /// # Safety
 /// Both pointers must be null or valid null-terminated C strings.
@@ -98,6 +99,35 @@ pub unsafe extern "C" fn myotis_create(
     };
     let data_dir = read_string(data_dir).unwrap_or_default();
     crate::host::create(&network, &data_dir)
+}
+
+/// Allocate a handle that bootstraps from the CALLER's checkpoint instead of
+/// the embedded one (#441; plain-C/Node hosts only — there is no UniFFI or
+/// Kotlin/Native wrapper, those hosts refuse a directory this has bound). Returns the id
+/// (≥ 1) or a negative sentinel: -1 invalid input (unknown name, malformed or
+/// zero root, slot 0 / in the future, empty dataDir, runtime-init
+/// failure), -2 canonical-but-unsupported network, -3 the dataDir already
+/// belongs to a different trust anchor. The engine verifies forward from the
+/// root exactly as from the embedded checkpoint; it does not authenticate it —
+/// see `host::create_with_checkpoint` for the full contract.
+///
+/// # Safety
+/// All pointers must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_create_with_checkpoint(
+    network: *const c_char,
+    data_dir: *const c_char,
+    checkpoint_root: *const c_char,
+    checkpoint_slot: u64,
+) -> i64 {
+    let (Some(network), Some(data_dir), Some(root)) = (
+        read_string(network),
+        read_string(data_dir),
+        read_string(checkpoint_root),
+    ) else {
+        return -1;
+    };
+    crate::host::create_with_checkpoint(&network, &data_dir, &root, checkpoint_slot)
 }
 
 /// Start the sync loop (`nativeStart` twin). True on success; false for an
@@ -607,6 +637,12 @@ mod tests {
     #[test]
     fn null_inputs_hit_sentinels_not_crashes() {
         assert_eq!(unsafe { myotis_create(std::ptr::null(), std::ptr::null()) }, -1);
+        assert_eq!(
+            unsafe {
+                myotis_create_with_checkpoint(std::ptr::null(), std::ptr::null(), std::ptr::null(), 1)
+            },
+            -1
+        );
         assert!(!myotis_start(0));
         assert_eq!(unsafe { take(myotis_status_json(0)) }, "{}");
         myotis_stop(0); // unknown id: must be a silent no-op

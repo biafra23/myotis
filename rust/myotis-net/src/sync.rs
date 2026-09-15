@@ -471,6 +471,13 @@ impl ChainConfig {
         }
     }
 
+    /// Wall-clock slot estimate, for callers outside this crate that must judge
+    /// a slot against "now" (the host refuses a caller-supplied checkpoint from
+    /// the future). Same clock read as everything else here.
+    pub fn wall_clock_slot(&self) -> u64 {
+        self.current_slot_estimate()
+    }
+
     /// Wall-clock slot estimate — THE clock read of this crate.
     fn current_slot_estimate(&self) -> u64 {
         let now = SystemTime::now()
@@ -1756,7 +1763,7 @@ async fn run_sync(
             publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
         } else {
             tracing::info!(
-                "persisted snapshot not newer than the embedded checkpoint — bootstrapping fresh");
+                "persisted snapshot not newer than the configured checkpoint — bootstrapping fresh");
         }
     }
 
@@ -1946,7 +1953,7 @@ async fn run_sync(
                 // back to the embedded checkpoint — the trust anchor path.
                 tracing::warn!(rejects = RESUME_REJECTS_MAX,
                     "restored snapshot failed verification repeatedly — discarding; \
-                     re-bootstrapping from the embedded checkpoint");
+                     re-bootstrapping from the configured checkpoint");
                 if let Some(path) = &config.snapshot_path {
                     let _ = std::fs::remove_file(path);
                 }
@@ -2141,6 +2148,31 @@ async fn try_bootstrap(
             tracing::warn!(peer = %peer, got = %hex_str(&header_root),
                 "bootstrap rejected: header root does not match checkpoint");
             continue;
+        }
+        // Slot reconciliation: the root is what we verify against; the
+        // configured slot only feeds the anchor PERIOD (persist floor, resume
+        // rule, weak-subjectivity age). The embedded checkpoints record the
+        // epoch-boundary slot the root finalizes, and a host-supplied one
+        // (createWithCheckpoint) should be the header's own slot — either way
+        // the period must agree. Log loudly rather than reject: a header a few
+        // skipped slots behind its boundary is normal, a period off is a host
+        // error whose cost is persistence (nothing is written until the store
+        // passes the claimed period), never verification.
+        let header_slot = bootstrap.header.beacon.slot;
+        if header_slot != config.checkpoint_slot {
+            let spp = config.slots_per_period();
+            if spec::compute_sync_committee_period_with(header_slot, spp)
+                != spec::compute_sync_committee_period_with(config.checkpoint_slot, spp)
+            {
+                tracing::warn!(peer = %peer, header_slot, configured = config.checkpoint_slot,
+                    "bootstrap: verified header lies in a DIFFERENT sync-committee period than \
+                     the configured checkpoint slot — the anchor period is wrong; persistence \
+                     and snapshot resume will be off until the store passes the claimed period");
+            } else {
+                tracing::info!(header_slot, configured = config.checkpoint_slot,
+                    "bootstrap: verified header slot differs from the configured checkpoint \
+                     slot (same period — fine)");
+            }
         }
         let depth = bootstrap.current_sync_committee_branch.len();
         if !ssz::verify_merkle_branch(

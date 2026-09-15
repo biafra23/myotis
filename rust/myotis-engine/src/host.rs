@@ -46,6 +46,14 @@ const SLOTS_PER_PERIOD: u64 = 8192;
 const CREATE_FAILED: i64 = -1;
 /// A canonical network that R1 does not host yet (anything but mainnet).
 const UNSUPPORTED_NETWORK: i64 = -2;
+/// The dataDir already holds sync state from a DIFFERENT trust anchor than the
+/// one this call names: a caller-supplied checkpoint that does not match the
+/// directory's recorded anchor, a caller-supplied checkpoint for a directory
+/// whose snapshot came from the embedded checkpoint, or a plain `create` on a
+/// directory bootstrapped from a caller-supplied checkpoint. Never silently
+/// resolved — the host owns its directories and must pick a fresh one (or the
+/// matching anchor) itself.
+const ANCHOR_MISMATCH: i64 = -3;
 
 /// One hosted chain: created-but-not-started, or running. Running keeps the
 /// config so status reads can derive wall-clock values (targetPeriod) fresh.
@@ -170,47 +178,281 @@ pub fn tor_status() -> i32 {
     }
 }
 
-/// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
+/// `nativeCreate`: allocate a handle for a hosted network (mainnet, gnosis,
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
-/// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
-/// unknown name, an unavailable runtime, or an uncreatable dataDir.
+/// network this engine doesn't host yet, `CREATE_FAILED` (-1) for an unknown
+/// name, an unavailable runtime, or an uncreatable dataDir, and
+/// `ANCHOR_MISMATCH` (-3) when the dataDir was bootstrapped from a
+/// caller-supplied checkpoint (see [`create_with_checkpoint`]) — resuming such
+/// a directory from the embedded anchor would silently swap trust anchors.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
     };
-    // Unknown network → CREATE_FAILED; canonical-but-not-hosted → UNSUPPORTED.
-    let mut config = match crate::catalog::canonical_network_name(network_name) {
-        None => return CREATE_FAILED,
-        Some(_) => match config_for(network_name) {
-            Some(c) => c,
-            None => return UNSUPPORTED_NETWORK,
-        },
+    let mut config = match resolve_config(network_name) {
+        Ok(c) => c,
+        Err(sentinel) => return sentinel,
     };
-    // Persistence lives under the host's dataDir, in the SAME files (names and
-    // formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
-    // `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
-    // state and proven LC servers survive restarts AND engine switches.
     if !data_dir.is_empty() {
-        // The dir may not exist yet (fresh host profile) — create it now.
-        // Without this, sync runs fine but every snapshot/cache write fails
-        // with ENOENT ("retrying on the next period advance", forever), so
-        // persistence is silently lost and every restart bootstraps cold.
-        // An uncreatable dataDir is a runtime-init failure the caller must
-        // see (honest error over silent degradation), hence CREATE_FAILED
-        // rather than warn-and-continue.
-        if let Err(e) = std::fs::create_dir_all(data_dir) {
-            tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
-            return CREATE_FAILED;
-        }
-        let suffix = if config.name == "mainnet" {
-            String::new()
-        } else {
-            format!("-{}", config.name)
+        let dir = match bind_persistence(&mut config, data_dir) {
+            Ok(d) => d,
+            Err(sentinel) => return sentinel,
         };
-        let dir = std::path::Path::new(data_dir);
-        config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
-        config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
+        // A directory carrying a caller-supplied anchor belongs to that
+        // generation: the embedded checkpoint is a different trust anchor, and
+        // the snapshot-resume rule would happily continue from the caller's
+        // verified state as if it descended from ours. An unreadable marker
+        // counts too (same rule as create_with_checkpoint: never unlock on a
+        // marker we cannot read).
+        if anchor_marker_path(&dir, &config).exists() {
+            tracing::warn!(data_dir, "dataDir was bootstrapped from a caller-supplied \
+                checkpoint — refusing to create it from the embedded anchor");
+            return ANCHOR_MISMATCH;
+        }
     }
+    register(engine, config)
+}
+
+/// Like [`create`], but the light client bootstraps from the CALLER's beacon
+/// block root and slot instead of the embedded checkpoint. Reached through the
+/// plain C ABI (`myotis_create_with_checkpoint`) and the Node addon; the
+/// UniFFI/JVM and iOS hosts have no wrapper for it (they refuse a directory it
+/// has bound — see `ANCHOR_MISMATCH`). This is the recovery path for a host whose install is
+/// past the weak-subjectivity bound (`STALE_ANCHOR`) and that has obtained a
+/// fresher checkpoint through its own means (#441).
+///
+/// **Trust boundary.** The engine does not — cannot — authenticate the root.
+/// It treats it exactly as it treats the embedded checkpoint: the bootstrap is
+/// pinned to it (a peer can only return the committee that Merkle-proves
+/// against it), every later update is BLS-verified against the committee
+/// chain that follows from it, the persisted snapshot stays on probation until
+/// an update verifies against it, and the weak-subjectivity gate judges the
+/// supplied slot's age like any other anchor: a root that is itself past the
+/// bound still parks in `STALE_ANCHOR`. Supplying a checkpoint therefore never
+/// marks the client synced or unlocks verified reads early; it only moves the
+/// anchor. Whether the root is the honest chain's is the caller's
+/// responsibility and must be described as such to users.
+///
+/// **Slot.** The slot of the checkpoint BLOCK HEADER (the header whose
+/// hash_tree_root equals `root`), not the epoch boundary it finalizes: with
+/// skipped slots the two differ. Only the sync-committee PERIOD derived from
+/// it is load-bearing (it floors what gets persisted and what a later restart
+/// may resume from); the bootstrap logs a warning when the verified header's
+/// slot disagrees, and a slot in a LATER period than the header degrades
+/// persistence (nothing is written until the store passes the claimed period)
+/// without weakening verification. `>= 1` and not in the future; the Node
+/// binding additionally bounds it to a JS safe integer.
+///
+/// **Generations.** The first successful call on a directory records the
+/// anchor in `sync-anchor[-net].json` next to the snapshot, before any sync
+/// state exists. From then on the directory belongs to that anchor:
+/// - the same root and slot on a later call RESUMES it — the engine's normal
+///   rule applies (a persisted snapshot strictly newer than the checkpoint is
+///   restored and re-verified; otherwise it bootstraps from the checkpoint
+///   again), so a restart never reverts to the embedded anchor;
+/// - a different root or slot, a directory whose snapshot predates the marker
+///   (state from the embedded anchor), an unreadable marker, or a plain
+///   [`create`] on a marked directory returns `ANCHOR_MISMATCH` (-3). Nothing
+///   is deleted or rewritten; the host picks a fresh directory or the matching
+///   anchor. A directory another live handle of this process already uses is
+///   refused with `CREATE_FAILED` before the marker is touched — two handles
+///   persisting into one snapshot would mix generations.
+///
+/// Invalid inputs — unknown/unsupported network, malformed or all-zero root,
+/// slot 0 or ahead of the wall clock, empty dataDir — return
+/// `CREATE_FAILED` (-1) / `UNSUPPORTED_NETWORK` (-2) before the directory is
+/// created or touched. A non-empty dataDir is required: a caller-supplied
+/// anchor without a home for its marker could not be told apart on restart.
+pub fn create_with_checkpoint(
+    network_name: &str,
+    data_dir: &str,
+    checkpoint_root_hex: &str,
+    checkpoint_slot: u64,
+) -> i64 {
+    let Some(engine) = engine() else {
+        return CREATE_FAILED;
+    };
+    let mut config = match resolve_config(network_name) {
+        Ok(c) => c,
+        Err(sentinel) => return sentinel,
+    };
+    if data_dir.is_empty() {
+        tracing::warn!("createWithCheckpoint needs a dataDir to record its anchor in");
+        return CREATE_FAILED;
+    }
+    let Some(root) = parse_hex_fixed::<32>(checkpoint_root_hex) else {
+        tracing::warn!("createWithCheckpoint: checkpoint root is not 32 bytes of hex");
+        return CREATE_FAILED;
+    };
+    if root == [0u8; 32] {
+        tracing::warn!("createWithCheckpoint: checkpoint root is all zeros");
+        return CREATE_FAILED;
+    }
+    let wall_slot = config.wall_clock_slot();
+    if checkpoint_slot == 0 || checkpoint_slot > wall_slot {
+        tracing::warn!(slot = checkpoint_slot, wall_slot,
+            "createWithCheckpoint: checkpoint slot is zero or in the future");
+        return CREATE_FAILED;
+    }
+    let dir = match bind_persistence(&mut config, data_dir) {
+        Ok(d) => d,
+        Err(sentinel) => return sentinel,
+    };
+    // A live handle already persisting into this directory (typically a plain
+    // create() that has not written its first snapshot yet) would later drop
+    // embedded-anchor state into the caller's generation. Host error, refused
+    // before any marker is written.
+    if let Some(other) = handle_using(engine, config.snapshot_path.as_deref()) {
+        tracing::warn!(data_dir, other_handle = other,
+            "createWithCheckpoint: dataDir is in use by another handle — refusing");
+        return CREATE_FAILED;
+    }
+    let marker = anchor_marker_path(&dir, &config);
+    match read_anchor_marker(&marker) {
+        Err(()) => {
+            tracing::warn!(data_dir,
+                "createWithCheckpoint: existing anchor marker is unreadable — refusing \
+                 (it never unlocks a resume; restore it or use a fresh directory)");
+            return ANCHOR_MISMATCH;
+        }
+        Ok(Some((recorded_root, recorded_slot))) => {
+            if recorded_root != root || recorded_slot != checkpoint_slot {
+                tracing::warn!(data_dir, recorded_slot, requested_slot = checkpoint_slot,
+                    "createWithCheckpoint: dataDir belongs to a different checkpoint \
+                     generation — refusing");
+                return ANCHOR_MISMATCH;
+            }
+            tracing::info!(data_dir, slot = checkpoint_slot,
+                "createWithCheckpoint: resuming the recorded checkpoint generation");
+        }
+        Ok(None) => {
+            // No marker: either a fresh directory or one that already holds a
+            // snapshot from the EMBEDDED anchor. The latter must not be
+            // silently adopted — its state descends from a different root.
+            let has_foreign_state = config
+                .snapshot_path
+                .as_ref()
+                .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
+            if has_foreign_state {
+                tracing::warn!(data_dir,
+                    "createWithCheckpoint: dataDir holds a snapshot from the embedded \
+                     anchor and no checkpoint marker — refusing (use a fresh directory)");
+                return ANCHOR_MISMATCH;
+            }
+            if let Err(e) = write_anchor_marker(&marker, &root, checkpoint_slot) {
+                tracing::warn!(data_dir, error = %e,
+                    "createWithCheckpoint: could not record the checkpoint anchor");
+                return CREATE_FAILED;
+            }
+            tracing::info!(data_dir, slot = checkpoint_slot,
+                "createWithCheckpoint: fresh directory bound to the caller's checkpoint");
+        }
+    }
+    config.checkpoint_root = root;
+    config.checkpoint_slot = checkpoint_slot;
+    register(engine, config)
+}
+
+/// Unknown network → `CREATE_FAILED`; canonical-but-not-hosted → `UNSUPPORTED`.
+fn resolve_config(network_name: &str) -> Result<ChainConfig, i64> {
+    match crate::catalog::canonical_network_name(network_name) {
+        None => Err(CREATE_FAILED),
+        Some(_) => config_for(network_name).ok_or(UNSUPPORTED_NETWORK),
+    }
+}
+
+/// Point the config's persistence at the host's (non-empty) dataDir, creating
+/// it, and return the directory.
+///
+/// Persistence lives under the host's dataDir, in the SAME files (names and
+/// formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
+/// `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
+/// state and proven LC servers survive restarts AND engine switches.
+fn bind_persistence(config: &mut ChainConfig, data_dir: &str) -> Result<std::path::PathBuf, i64> {
+    // The dir may not exist yet (fresh host profile) — create it now.
+    // Without this, sync runs fine but every snapshot/cache write fails
+    // with ENOENT ("retrying on the next period advance", forever), so
+    // persistence is silently lost and every restart bootstraps cold.
+    // An uncreatable dataDir is a runtime-init failure the caller must
+    // see (honest error over silent degradation), hence CREATE_FAILED
+    // rather than warn-and-continue.
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
+        return Err(CREATE_FAILED);
+    }
+    let suffix = persistence_suffix(config);
+    let dir = std::path::PathBuf::from(data_dir);
+    config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
+    config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
+    Ok(dir)
+}
+
+/// The id of a live handle (created, running, or paused) whose persistence is
+/// bound to `snapshot_path`, if any.
+fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -> Option<i64> {
+    let target = snapshot_path?;
+    let map = engine.handles.lock().ok()?;
+    map.iter()
+        .find(|(_, entry)| {
+            let cfg = match entry {
+                ChainEntry::Created(c) => c,
+                ChainEntry::Running(c, _, _) => c,
+                ChainEntry::Paused(c, _) => c,
+            };
+            cfg.snapshot_path.as_deref() == Some(target)
+        })
+        .map(|(id, _)| *id)
+}
+
+/// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
+/// shared with the Java hosts.
+fn persistence_suffix(config: &ChainConfig) -> String {
+    if config.name == "mainnet" {
+        String::new()
+    } else {
+        format!("-{}", config.name)
+    }
+}
+
+/// The caller-supplied-checkpoint marker for this network under `dir`
+/// (`sync-anchor[-net].json`, next to the snapshot it governs).
+fn anchor_marker_path(dir: &std::path::Path, config: &ChainConfig) -> std::path::PathBuf {
+    dir.join(format!("sync-anchor{}.json", persistence_suffix(config)))
+}
+
+/// Read a marker written by [`write_anchor_marker`]: `Ok(None)` when absent,
+/// `Err(())` when present but unreadable — which both entry points treat as a
+/// foreign generation (a marker we cannot read never unlocks a resume).
+fn read_anchor_marker(path: &std::path::Path) -> Result<Option<([u8; 32], u64)>, ()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let parse = || -> Option<([u8; 32], u64)> {
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let root = parse_hex_fixed::<32>(v.get("checkpointRoot")?.as_str()?)?;
+        let slot = v.get("checkpointSlot")?.as_u64()?;
+        Some((root, slot))
+    };
+    parse().map(Some).ok_or(())
+}
+
+/// Record the caller's anchor durably (the tree's atomic writer: unique temp,
+/// fsync, rename, parent fsync) so a crash or power loss mid-write leaves
+/// either the old marker or the new one, never a torn file.
+fn write_anchor_marker(path: &std::path::Path, root: &[u8; 32], slot: u64) -> std::io::Result<()> {
+    let body = serde_json::json!({
+        "checkpointRoot": format!("0x{}", hex32(root)),
+        "checkpointSlot": slot,
+        "note": "trust anchor supplied by the host at createWithCheckpoint; the engine \
+                 verifies forward from it but did not authenticate it",
+    });
+    myotis_net::el::logindex::write_atomic(path, &serde_json::to_vec_pretty(&body)?)
+}
+
+/// Insert a not-yet-started handle for `config` and hand out its id.
+fn register(engine: &EngineState, config: ChainConfig) -> i64 {
     let id = engine.next_id.fetch_add(1, Ordering::Relaxed);
     match engine.handles.lock() {
         Ok(mut map) => {
@@ -285,11 +527,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // on mainnet — the same file the Java daemon writes — `peers-sepolia.cache`
     // etc. otherwise), so verified snap peers warm-start across restarts and
     // engine switches without cross-network contamination.
-    let el_suffix = if config.name == "mainnet" {
-        String::new()
-    } else {
-        format!("-{}", config.name)
-    };
+    let el_suffix = persistence_suffix(&config);
     let el_cache_path = config
         .snapshot_path
         .as_deref()
@@ -1938,6 +2176,129 @@ mod tests {
         assert!(dir.is_dir(), "dataDir was not created");
         stop(id);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_with_checkpoint_rejects_bad_input_before_touching_the_disk() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.to_str().unwrap();
+        let root = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let future = ChainConfig::mainnet().wall_clock_slot() + 10_000;
+        for (label, id) in [
+            ("unknown network", create_with_checkpoint("nope", d, root, 100)),
+            ("short root", create_with_checkpoint("mainnet", d, "0x1234", 100)),
+            ("non-hex root", create_with_checkpoint("mainnet", d, &"zz".repeat(32), 100)),
+            ("zero root", create_with_checkpoint("mainnet", d, &"00".repeat(32), 100)),
+            ("slot 0", create_with_checkpoint("mainnet", d, root, 0)),
+            ("future slot", create_with_checkpoint("mainnet", d, root, future)),
+            ("empty data_dir", create_with_checkpoint("mainnet", "", root, 100)),
+        ] {
+            assert_eq!(id, CREATE_FAILED, "{label} must be refused with CREATE_FAILED");
+        }
+        // Refusals happen BEFORE any state mutation: no directory, no marker.
+        assert!(!dir.exists(), "a refused createWithCheckpoint must not create the dataDir");
+    }
+
+    #[test]
+    fn create_with_checkpoint_binds_a_fresh_dir_and_resumes_only_the_same_anchor() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-gen-{}", std::process::id()))
+            .join("fresh");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let d = dir.to_str().unwrap();
+        let root = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let other = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let slot = 8_192 * 3 + 5; // not an epoch boundary on purpose
+
+        // Fresh directory: bound to the caller's anchor, config carries it.
+        let id = create_with_checkpoint("mainnet", d, root, slot);
+        assert!(id >= 1, "fresh createWithCheckpoint failed: {id}");
+        let marker = dir.join("sync-anchor.json");
+        assert!(marker.is_file(), "the anchor marker must be written on first use");
+        assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
+        {
+            let map = engine().unwrap().handles.lock().unwrap();
+            let ChainEntry::Created(cfg) = map.get(&id).expect("handle registered") else {
+                panic!("fresh handle must be Created");
+            };
+            assert_eq!(cfg.checkpoint_root, parse_hex_fixed::<32>(root).unwrap());
+            assert_eq!(cfg.checkpoint_slot, slot);
+            assert_eq!(cfg.snapshot_path.as_deref(), Some(dir.join("sync-state.snapshot").as_path()));
+        }
+        // While that handle is alive the directory is in use: a second binding —
+        // even the same anchor — is refused before any marker work.
+        assert_eq!(create_with_checkpoint("mainnet", d, root, slot), CREATE_FAILED);
+        stop(id);
+
+        // Same anchor again: resume (a second handle, same generation).
+        let again = create_with_checkpoint("mainnet", d, root, slot);
+        assert!(again >= 1, "same-anchor restart must resume: {again}");
+        stop(again);
+
+        // A different root, or the same root at another slot: refused, marker untouched.
+        assert_eq!(create_with_checkpoint("mainnet", d, other, slot), ANCHOR_MISMATCH);
+        assert_eq!(create_with_checkpoint("mainnet", d, root, slot + 1), ANCHOR_MISMATCH);
+        assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
+
+        // The embedded anchor must not be able to adopt this generation either.
+        assert_eq!(create("mainnet", d), ANCHOR_MISMATCH);
+
+        // Another network in the same dir is a separate generation (own suffix).
+        let g = create_with_checkpoint("gnosis", d, other, slot);
+        assert!(g >= 1, "per-network markers are independent: {g}");
+        assert!(dir.join("sync-anchor-gnosis.json").is_file());
+        stop(g);
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_with_checkpoint_refuses_a_dir_holding_embedded_anchor_state() {
+        // A snapshot without a marker is state that descends from the EMBEDDED
+        // checkpoint: adopting it would let the snapshot-resume rule continue
+        // from a different trust anchor than the caller named.
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sync-state.snapshot"), b"whatever").unwrap();
+        let root = "0x4444444444444444444444444444444444444444444444444444444444444444";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), ANCHOR_MISMATCH);
+        assert!(!dir.join("sync-anchor.json").exists(), "no marker may be written on refusal");
+        // The plain path still works on such a directory (no marker → not ours to refuse).
+        let id = create("mainnet", dir.to_str().unwrap());
+        assert!(id >= 1);
+        stop(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_marker_round_trips_and_rejects_garbage() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sync-anchor.json");
+        let root = [0xabu8; 32];
+        assert_eq!(read_anchor_marker(&p), Ok(None), "absent marker reads as None");
+        write_anchor_marker(&p, &root, 12_345).unwrap();
+        assert_eq!(read_anchor_marker(&p), Ok(Some((root, 12_345))));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "sync-anchor.json").collect();
+        assert!(leftovers.is_empty(), "temp files must be renamed away: {leftovers:?}");
+        // Garbage is Err, never None: a marker we cannot read must never unlock a
+        // resume (createWithCheckpoint answers ANCHOR_MISMATCH on it).
+        std::fs::write(&p, b"{not json").unwrap();
+        assert_eq!(read_anchor_marker(&p), Err(()));
+        std::fs::write(&p, br#"{"checkpointRoot":"0x12","checkpointSlot":1}"#).unwrap();
+        assert_eq!(read_anchor_marker(&p), Err(()));
+        let other = "0x7777777777777777777777777777777777777777777777777777777777777777";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), other, 100), ANCHOR_MISMATCH);
+        assert_eq!(create("mainnet", dir.to_str().unwrap()), ANCHOR_MISMATCH);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

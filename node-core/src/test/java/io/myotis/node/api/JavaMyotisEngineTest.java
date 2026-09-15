@@ -123,6 +123,36 @@ class JavaMyotisEngineTest {
     }
 
     @Test
+    void createRefusesASnapshotDirBoundToACallerSuppliedCheckpoint() throws Exception {
+        // The Rust engine's createWithCheckpoint (ABI 26) marks its dataDir with
+        // sync-anchor[-net].json; the snapshot there descends from the CALLER's root,
+        // not this engine's embedded checkpoint. Resuming it would swap trust anchors
+        // silently, so create() must refuse — and say why.
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("myotis-anchor-mark");
+        try {
+            java.nio.file.Files.writeString(dir.resolve("sync-anchor-gnosis.json"),
+                    "{\"checkpointRoot\":\"0x11\",\"checkpointSlot\":1}");
+            JavaMyotisEngine engine = new JavaMyotisEngine();
+            EngineConfig config = new EngineConfig("gnosis", 0, 0, 0,
+                    dir.resolve("sync-state-gnosis.snapshot").toString(), 0, true, dir.toString());
+            EngineException ex = assertThrows(EngineException.class,
+                    () -> engine.create(config, testPorts(new MemoryKeyStore())));
+            assertTrue(ex.getMessage().contains("caller-supplied checkpoint"), ex.getMessage());
+            assertTrue(engine.hostedNetworks().isEmpty(), "a refused create must not register");
+            // A marker for ANOTHER network does not affect this one (per-network suffix).
+            java.nio.file.Files.delete(dir.resolve("sync-anchor-gnosis.json"));
+            java.nio.file.Files.writeString(dir.resolve("sync-anchor.json"), "{}");
+            assertNotNull(engine.create(config, testPorts(new MemoryKeyStore())));
+            engine.stop("gnosis");
+        } finally {
+            try (var walk = java.nio.file.Files.walk(dir)) {
+                walk.sorted(java.util.Comparator.reverseOrder())
+                        .forEach(p -> { try { java.nio.file.Files.delete(p); } catch (Exception ignored) { } });
+            }
+        }
+    }
+
+    @Test
     void createReusesStoredKey() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
         MemoryKeyStore keyStore = new MemoryKeyStore();

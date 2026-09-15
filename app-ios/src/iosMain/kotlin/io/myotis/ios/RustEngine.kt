@@ -105,7 +105,9 @@ object RustEngine {
         return take(myotis_canonical_network_name(nameOrAlias))
     }
 
-    /** Handle id (>= 1), or a negative sentinel (-1 create failed, -2 unsupported). */
+    /** Handle id (>= 1), or a negative sentinel (-1 create failed, -2 unsupported,
+     *  -3 the dataDir is bound to a caller-supplied checkpoint — ABI 26's
+     *  `myotis_create_with_checkpoint`, which this host does not wrap). */
     fun create(network: String, dataDir: String): Long {
         requireAbi()
         return myotis_create(network, dataDir)

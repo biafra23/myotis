@@ -82,7 +82,11 @@ uniffi::setup_scaffolding!();
 /// v25: added set_ws_bound_periods + accept_stale_anchor (the weak-subjectivity
 ///      anchor-age gate: STALE_ANCHOR beaconState + wsBoundPeriods status key;
 ///      a too-old sync anchor now parks fail-closed awaiting consent).
-pub const ABI_VERSION: i32 = 25;
+/// v26: added create_with_checkpoint (bootstrap from a CALLER-supplied beacon
+///      root + slot, #441; the dataDir records the anchor in
+///      `sync-anchor[-net].json` and resumes only that generation). `create`
+///      gained the -3 ANCHOR_MISMATCH sentinel for a marked dataDir.
+pub const ABI_VERSION: i32 = 26;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

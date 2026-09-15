@@ -35,7 +35,8 @@ use napi_derive::napi;
 // resolve `extern "C"` imports of its no_mangle symbols.
 use myotis_engine::capi::{
     myotis_accept_stale_anchor, myotis_available_networks_json, myotis_canonical_network_name,
-    myotis_create, myotis_drain_logs, myotis_ens_record_json, myotis_estimate_gas_json,
+    myotis_create, myotis_create_with_checkpoint, myotis_drain_logs, myotis_ens_record_json,
+    myotis_estimate_gas_json,
     myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
     myotis_send_raw_transaction_json, myotis_set_ws_bound_periods, myotis_start,
@@ -109,8 +110,10 @@ pub fn canonical_network_name(name_or_alias: String) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Allocate a not-yet-started handle (≥ 1); -1 unknown name / runtime-init
-/// failure, -2 canonical-but-unsupported network. `data_dir` is where the
-/// engine persists sync snapshots and peer caches.
+/// failure, -2 canonical-but-unsupported network, -3 `dataDir` was bound to a
+/// caller-supplied checkpoint by `createWithCheckpoint` (resume it there, or
+/// use a fresh directory). `data_dir` is where the engine persists sync
+/// snapshots and peer caches.
 #[napi]
 pub fn create(env: &Env, network: String, data_dir: String) -> Result<i64> {
     scheduler::prepare(env)?;
@@ -118,6 +121,54 @@ pub fn create(env: &Env, network: String, data_dir: String) -> Result<i64> {
         return Ok(-1);
     };
     let handle = unsafe { myotis_create(n.as_ptr(), d.as_ptr()) };
+    if handle > 0 { scheduler::created(env, handle)?; }
+    Ok(handle)
+}
+
+/// Allocate a handle that bootstraps from the CALLER's checkpoint instead of
+/// the embedded one (#441): the recovery path for an install parked in
+/// `STALE_ANCHOR` after the host obtained a fresher checkpoint by its own
+/// means. `checkpointRoot` is the beacon block root (32-byte hex, `0x`
+/// optional); `checkpointSlot` is that block HEADER's slot as a plain JS
+/// number (a safe integer, `1..=Number.MAX_SAFE_INTEGER`, not in the future).
+///
+/// Returns the handle (≥ 1) or an in-band sentinel: -1 invalid input (unknown
+/// network, malformed/zero root, bad slot, empty dataDir, runtime failure),
+/// -2 canonical-but-unsupported network, -3 the dataDir already belongs to a
+/// different trust anchor. The engine does NOT authenticate the root — it
+/// verifies forward from it exactly as from the embedded checkpoint (BLS on
+/// every update, snapshot probation, weak-subjectivity gate on the supplied
+/// slot's age), so supplying one never marks the client synced early. The
+/// first call on a directory records the anchor in `sync-anchor[-net].json`;
+/// later calls with the same root+slot resume that generation; any other
+/// anchor, a directory holding embedded-anchor state, or a plain `create()` on
+/// a marked directory is refused (-3) rather than silently switching anchors.
+/// Requires `init() >= 26`.
+#[napi]
+pub fn create_with_checkpoint(
+    env: &Env,
+    network: String,
+    data_dir: String,
+    checkpoint_root: String,
+    checkpoint_slot: f64,
+) -> Result<i64> {
+    // The documented JS representation is a safe integer; anything else is a
+    // permanently malformed request, answered in-band like every other engine
+    // refusal (never a JS exception).
+    if !checkpoint_slot.is_finite()
+        || checkpoint_slot.fract() != 0.0
+        || checkpoint_slot < 1.0
+        || checkpoint_slot > 9_007_199_254_740_991.0
+    {
+        return Ok(-1);
+    }
+    scheduler::prepare(env)?;
+    let (Ok(n), Ok(d), Ok(r)) = (c_arg(&network), c_arg(&data_dir), c_arg(&checkpoint_root)) else {
+        return Ok(-1);
+    };
+    let handle = unsafe {
+        myotis_create_with_checkpoint(n.as_ptr(), d.as_ptr(), r.as_ptr(), checkpoint_slot as u64)
+    };
     if handle > 0 { scheduler::created(env, handle)?; }
     Ok(handle)
 }

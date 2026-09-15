@@ -166,6 +166,40 @@ class SelectorEngineTest {
         e.stop("gnosis");
     }
 
+    @Test
+    void autoDoesNotFallBackToJavaOnACallerSuppliedCheckpointDir() throws Exception {
+        // ABI 26: a dataDir marked by the Rust engine's createWithCheckpoint belongs to
+        // the CALLER's trust anchor. In auto mode the Rust create() answers
+        // ANCHOR_MISMATCH (-3); that must surface as an error, never as the usual
+        // "fall back to the Java engine" — which would resume the snapshot there under
+        // the embedded checkpoint, the silent anchor swap the refusal exists to stop.
+        assumeRustAvailable();
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("myotis-anchor-auto");
+        try {
+            java.nio.file.Files.writeString(dir.resolve("sync-anchor.json"),
+                    "{\"checkpointRoot\":\"0x11\",\"checkpointSlot\":1}");
+            Engines.select("auto");
+            MyotisEngine e = Engines.engine();
+            EngineConfig config = new EngineConfig("mainnet", 42303, 42900, 42545,
+                    dir.resolve("sync-state.snapshot").toString(), 0, true, dir.toString());
+            EngineException ex = assertThrows(EngineException.class, () -> e.create(config, ports()));
+            assertTrue(ex.getMessage().contains("caller-supplied checkpoint"), ex.getMessage());
+            assertNull(e.get("mainnet"), "nothing may be hosted after the refusal");
+            assertNull(Engines.engineKindFor("mainnet"));
+        } finally {
+            try (var walk = java.nio.file.Files.walk(dir)) {
+                walk.sorted(java.util.Comparator.reverseOrder())
+                        .forEach(p -> { try { java.nio.file.Files.delete(p); } catch (Exception ignored) { } });
+            }
+        }
+    }
+
+    private static void assumeRustAvailable() {
+        org.junit.jupiter.api.Assumptions.assumeTrue(RustMyotisEngine.isAvailable(),
+                "libmyotis_engine is NOT available — the with-library selector paths "
+                        + "are covered where cargo built it (cargoBuildHost)");
+    }
+
     private static void assumeRustUnavailable() {
         org.junit.jupiter.api.Assumptions.assumeTrue(!RustMyotisEngine.isAvailable(),
                 "libmyotis_engine IS available — the without-library selector paths "

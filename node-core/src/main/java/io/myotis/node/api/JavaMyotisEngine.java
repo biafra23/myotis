@@ -74,6 +74,20 @@ public final class JavaMyotisEngine implements MyotisEngine {
         if (handles.containsKey(name)) {
             throw new EngineException("network already hosted: " + name);
         }
+        // A snapshot directory bound to a CALLER-supplied checkpoint (the Rust engine's
+        // createWithCheckpoint writes `sync-anchor[-net].json` next to the snapshot,
+        // ABI 26) descends from a different trust anchor than this engine's embedded
+        // checkpoint. Resuming it here would silently swap anchors; refuse instead.
+        if (config.syncSnapshotPath() != null) {
+            java.nio.file.Path snap = Paths.get(config.syncSnapshotPath());
+            java.nio.file.Path marker = snap.resolveSibling(
+                    "sync-anchor" + ("mainnet".equals(name) ? "" : "-" + name) + ".json");
+            if (java.nio.file.Files.exists(marker)) {
+                throw new EngineException("snapshot directory " + snap.getParent()
+                        + " is bound to a caller-supplied checkpoint (" + marker.getFileName()
+                        + "); the Java engine cannot resume it — use a fresh directory");
+            }
+        }
         // Fail here with a named error rather than letting a null port surface as an
         // undiagnosable NPE swallowed by ChainStack.start()'s fault isolation.
         if (ports.peerCache() == null) throw new EngineException("peerCache port is required");

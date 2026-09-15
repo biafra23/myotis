@@ -29,6 +29,11 @@ myotis.init();   // ABI handshake — returns the engine ABI version; gate on
 const h = myotis.create('mainnet', '/path/to/data-dir');  // dir is created if missing
 myotis.start(h);
 
+// Recovery from STALE_ANCHOR with a checkpoint the HOST authenticated (ABI >= 26):
+// bootstraps a fresh dir from that root/slot instead of the embedded checkpoint.
+// const h = myotis.createWithCheckpoint('mainnet', '/path/to/fresh-dir',
+//   '0x<32-byte beacon block root>', 15208352 /* that block header's slot */);
+
 // Lifecycle and status are synchronous (stop/pause can wait for native work):
 JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, ... }
 
@@ -90,6 +95,42 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   rest of this run. Put them behind your own UI or set a policy on your users'
   behalf — the durable alternative on short-window chains is a fresher anchor
   (ship/refresh the checkpoint), not a wider gate.
+- **Caller-supplied checkpoint** (`createWithCheckpoint(network, dataDir,
+  checkpointRoot, checkpointSlot)`, ABI ≥ 26, #441): for a host that is parked
+  in `STALE_ANCHOR` and has obtained a fresher checkpoint through its own
+  channels, this bootstraps from that beacon block root instead of the embedded
+  one. The trust boundary is explicit: **the engine does not authenticate the
+  root** — the caller does — and it treats it exactly like the embedded
+  checkpoint afterwards: the bootstrap is pinned to it, every update is
+  BLS-verified against the committee chain that follows, a persisted snapshot
+  stays on probation until an update verifies against it, and the
+  weak-subjectivity gate judges the supplied slot's age like any anchor (a root
+  that is itself past the bound still parks). Supplying a checkpoint never
+  marks the node synced or unlocks verified reads early. `checkpointRoot` is
+  32-byte hex (`0x` optional); `checkpointSlot` is the checkpoint block
+  **header's** slot as a plain JS number (safe integer, not the epoch boundary
+  it finalizes — with skipped slots they differ, and the period derived from
+  it selects the committee the bootstrap is checked against). Generations: the
+  first call on a directory records the anchor in `sync-anchor[-net].json`
+  next to the snapshot; a later call with the **same root and slot resumes**
+  that generation under the normal rules (a snapshot strictly newer than the
+  checkpoint is restored and re-verified, otherwise it bootstraps again), so a
+  restart never reverts to the embedded anchor and needs no extra flag. Any
+  other root/slot, a directory that already holds a snapshot from the embedded
+  anchor, or a plain `create()` on a marked directory returns **-3**
+  (`ANCHOR_MISMATCH`) — nothing is deleted or rewritten; pick a fresh
+  directory or the matching anchor. Invalid input (unknown/unsupported
+  network, malformed or all-zero root, slot 0 / non-integer / above
+  `Number.MAX_SAFE_INTEGER` / in the future, empty dataDir) returns **-1**
+  before the directory is created or touched; so does a directory another live
+  handle of the process is already using. Detect support with `init() >= 26`
+  (or `typeof myotis.createWithCheckpoint === 'function'`). Two practical
+  notes: only the sync-committee **period** derived from the slot is
+  load-bearing (the bootstrap warns when the verified header's slot differs; a
+  slot in a later period than the header delays persistence until the store
+  passes it), and a fresh directory starts without the proven-LC-server cache
+  — copying `cl-peers[-net].cache` from the old directory into the new one is
+  safe (it holds peers, not trust) and shortens the cold start.
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but
@@ -102,8 +143,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation preserves the current engine's **ABI 25** and existing JS
-argument/result shapes. It is not a drop-in artifact for a host pinned to ABI 22.
+This implementation targets the current engine's **ABI 26** and existing JS
+argument/result shapes (ABI 26 only adds `createWithCheckpoint`; everything a
+host pinned to ABI 25 used is unchanged). It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 
@@ -198,7 +240,7 @@ lookups. It does not add semaphore waiters. Hosts should bound their own queue
 and retry busy verified reads within their own request deadline. Node's one
 executing request per handle is intentional: a slow ENS call delays queued
 calls on the same chain, while another chain can execute concurrently. The
-ABI 25 migration must account for the four queued/executing requests per
+ABI 25+ migration must account for the four queued/executing requests per
 handle and treat `native scheduler busy` as admission refusal.
 
 A cancelled partial RLPx frame cannot be resumed safely. The torn-write marker
