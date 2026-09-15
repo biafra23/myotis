@@ -78,6 +78,42 @@ its deployment block:
      ./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status
      ```
 
+   - **Seed it from a full node in minutes — UNVERIFIED** (demo / bootstrap
+     path, `scripts/synth_logindex.py`). Two facts make this small: only the
+     PostageStamp contract's logs are ever requested (Bee reads the staking,
+     redistribution and oracle contracts with `eth_call`), and Bee v2.8.2
+     embeds a batch snapshot up to block **47,061,407** (`batch-archive
+     v0.0.9`) that it replays in-process, so it asks the RPC for logs only
+     above that. Fetch the ~40k logs from 47,000,000 to head with one
+     `eth_getLogs` per 50,000 blocks from any Gnosis full node (seconds; one
+     JSON object per line, exactly as returned), then frame them:
+
+     ```bash
+     scripts/synth_logindex.py --network-id 100 \
+         --watch 0x45a1502382541Cd610CC9068e88727426b696293:47000000 \
+         --to-block <the fetch's fixed toBlock> \
+         --logs data/bee/gnosis/postagestamp-logs-47000000-<toBlock>.jsonl.gz \
+         --out /tmp/bee-logindex-gnosis-seed.db
+     ./gradlew :app:run -Pnetwork=gnosis -Pargs="import-logindex /tmp/bee-logindex-gnosis-seed.db"
+     ```
+
+     The bridge closes the gap from the file's top to head within seconds
+     and the appender follows from there, verified. What is NOT verified is
+     the seeded span itself: the import path takes a file as "claimed
+     verified by whoever generated it" (docs/eth-getlogs-design.md §Import),
+     and here the generator is a full node's RPC. The walker does re-descend
+     through the seeded span afterwards (`blocksRemaining` in
+     `logindex-status` counts down at the usual 30–83 blk/s), but served
+     logs do not distinguish imported from walked coverage. Two more
+     caveats: `--watch …:47000000` is the `--from` trust assertion — it
+     asserts the contract has no logs below 47,000,000, which is false in
+     general and fine only because Bee's snapshot covers them, so this seed
+     cannot be combined with `skip-postage-snapshot: true`; and the seed is
+     one address only, not the four-contract index above. A fetched data
+     set lives in `data/bee/gnosis/` with a `.meta.json` recording the
+     node, head, hashes and sha256 (2026-09-15: zbox's Gnosis geth,
+     47,000,000–48,262,804, 39,225 logs, 3.2 MB gzipped).
+
 4. **Wait for readiness.** `beacon-status` must say `"state":"SYNCED"`, and
    `logindex-status` must show the coverage you need (for full Bee function,
    `backfillCursor` at the target and a small `headGap`).
@@ -104,6 +140,24 @@ its deployment block:
 - **Historical state pins are rejected.** Reads pinned to old blocks answer
   from the verified head or refuse — a light client cannot prove deep
   historical state.
+- **Bee v2.8.2's actual RPC needs, checked against the router (2026-09-15).**
+  Every chain access in Bee goes through one `transaction.Backend`; the
+  complete method set is `web3_clientVersion` (its first call — fatal if
+  missing), `eth_chainId` (must be 100), `eth_getBlockByNumber("latest",
+  false)` (needs `baseFeePerGas`; go-ethereum's decoder also requires
+  `logsBloom`, `sha3Uncles`, `difficulty`, `extraData`), `eth_getBalance`,
+  `eth_call` and `eth_estimateGas` (calldata arrives as `input`, which the
+  router accepts alongside `data`), `eth_maxPriorityFeePerGas`,
+  `eth_getTransactionCount` (incl. `"pending"`), `eth_sendRawTransaction`,
+  `eth_getTransactionReceipt`, `eth_getTransactionByHash`, and
+  `eth_getLogs` with `address` as a one-element array and five topic0
+  alternatives in 5,000-block pages. All served; nothing subscribes,
+  filters or batches. Operational gates on Bee's side: it refuses to
+  proceed while the latest header is more than 60 s old (Myotis must be
+  `SYNCED` and following the optimistic head), and a full node blocks
+  startup on postage sync with a 10-minute stall timeout — so the index must
+  cover Bee's range BEFORE Bee starts; an uncovered page is a `-32000` Bee
+  retries every 5 s while that clock runs.
 - The end-to-end Bee-against-Myotis compatibility run is still to be done;
   this document describes the serving surface, not a completed certification.
 
