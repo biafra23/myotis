@@ -156,10 +156,13 @@ its deployment block:
   Bee's 10-minute stall rule shut it down while the app's log showed 102
   `VERIFIED` and 3 `-32000` outcomes. The pool recovered on its own (7 snap
   peers) and Bee resumed on restart. The daemon never hit this because it
-  ran on a warm `peers-gnosis.cache`; bundling such a cache with the PoC
-  (public enodes, like the seed) and time-boxing the head-edge tail fill so
-  a slow peer yields a fast `-32000` instead of a 20 s wait are the two
-  follow-ups this points at.
+  ran on a warm `peers-gnosis.cache`; the PoC now bundles that cache (public
+  enodes, like the seed). The remaining follow-up is on the fetch side —
+  hedge the head-edge block/receipt fetch across peers and shorten the
+  per-peer timeout so one dead peer costs hundreds of milliseconds, not the
+  23 s one `eth_getLogs` took here. NOT a faster refusal: Bee retries a
+  failed page every 5 s and its stall rule counts *successful* pages, so
+  for Bee a slow success beats a fast `-32000` every time.
 
 ## Demo only: seeding from a full node (not for production)
 
@@ -244,12 +247,15 @@ with the seed above bundled inside:
   next to a manifest (coverage, usable-until block, sha256), and a build
   without the flag removes any staged seed. `-PbeePoc` also works with
   `:app-desktop:run`.
-- **CI builds it on every PR and on every push to `main`** (`desktop-dmg.yml`,
-  the `bee-poc` matrix leg): the artifact `myotis-bee-poc-dmg-arm64-<sha>`
-  holds `Myotis-bee-poc-arm64.dmg`, and the leg fails unless the dmg carries
-  the seed and its manifest (the standard leg fails if it carries one). Tag
-  builds skip the leg: it is never attached to a release, and a PoC-only
-  failure must not block one.
+- **CI builds it on every PR, every push to `main` and every release tag**
+  (`desktop-dmg.yml`, the `bee-poc` matrix leg): the artifact
+  `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`, and the
+  leg fails unless the dmg carries the seed, its manifest and the peer caches
+  (the standard leg fails if it carries a seed). On a tag the dmg is attached
+  to the GitHub release as a best-effort asset: the leg is
+  `continue-on-error`, so a PoC-only failure never blocks the standard dmgs,
+  and the release simply lacks the PoC in that case. Mind the shelf life: a
+  release older than ~29 days carries a PoC whose seed no longer catches up.
 - **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
   when no index file exists there yet, or when the bundled seed is newer than
   the one this flavour installed before (a rebuilt app after the shelf life;
@@ -259,7 +265,12 @@ with the seed above bundled inside:
   log index on and the PostageStamp watch entry at its real deployment block.
   Later starts leave settings alone. The Index tab shows the seed's provenance
   and its usable-until block while the engine's index is on, or says why the
-  bundled seed did not get installed.
+  bundled seed did not get installed. The bundle also carries **warm Gnosis
+  peer caches** (`data/bee/gnosis/peers-gnosis.cache`,
+  `cl-peers-gnosis.cache` — the engine's own text formats, public peers only,
+  re-verified on dial), installed the same way when the data dir has none,
+  so the app starts with known snap peers instead of a cold pool; refresh
+  them from a running node when refreshing the seed.
 - **Point Bee at it**: `blockchain-rpc-endpoint: http://127.0.0.1:8546` with
   the config from *Setup* step 5. Once the beacon sync reaches `SYNCED`
   (seconds with a fresh anchor; the stale-anchor dialog first if the build is
