@@ -199,8 +199,20 @@ def load_meta(path: Path) -> dict:
     for key in ("chainId", "genesisHash", "fromBlock", "toBlock", "sha256Jsonl", "filter"):
         if key not in meta:
             die(f"--meta {path}: missing {key!r}")
-    if not isinstance(meta["filter"], dict) or "address" not in meta["filter"]:
-        die(f"--meta {path}: filter.address missing")
+    if not isinstance(meta["filter"], dict):
+        die(f"--meta {path}: filter must be an object")
+    for key in ("address", "fromBlock", "toBlock"):
+        if key not in meta["filter"]:
+            die(f"--meta {path}: filter.{key} missing")
+    # The sidecar states the range twice — the top-level ints that become the
+    # coverage claim and the hex range actually sent to eth_getLogs. They must
+    # agree: a slip between them would claim coverage over blocks the fetch
+    # never queried, and an empty phantom band is indistinguishable from a
+    # genuinely empty one.
+    for key in ("fromBlock", "toBlock"):
+        sent = hex_quantity(meta["filter"][key], f"--meta filter.{key}")
+        if sent != meta[key]:
+            die(f"--meta {path}: {key} {meta[key]} disagrees with filter.{key} {sent} (the range actually fetched)")
     return meta
 
 
@@ -250,6 +262,17 @@ def build(args) -> tuple[bytes, dict]:
         if genesis is None:
             die(f"--genesis is required for network id {network_id}")
         from_block, to_block = args.from_block, args.to_block
+        if len(watch) > 1:
+            # Logs can only ever show positive results: nothing in the input
+            # distinguishes "queried and empty" from "never queried" for an
+            # address, so this claim rests on the operator alone.
+            print(
+                "synth_logindex: warning: coverage will assert the fetch queried ALL "
+                f"{len(watch)} watched addresses over {from_block}..{to_block}; the input "
+                "cannot prove this — an address the fetch skipped would be served [] "
+                "inside claimed coverage",
+                file=sys.stderr,
+            )
     if from_block > to_block:
         die(f"from-block {from_block} is above to-block {to_block}")
     for address, deploy in watch:
@@ -393,6 +416,9 @@ def check(data: bytes) -> dict:
         watch.append((address, from_block, topic0s, name))
     if any(t for _, _, t, _ in watch):
         raise ValueError("topic0-restricted entries are not produced by this script")
+    addresses = [a for a, _, _, _ in watch]
+    if len(set(addresses)) != len(addresses):
+        raise ValueError("duplicate watch address (LogIndex::new refuses it)")
     if config_fingerprint([(a, f) for a, f, _, _ in watch]) != fingerprint:
         raise ValueError("fingerprint does not match the watch table")
     n_cov = r.u32()
@@ -410,7 +436,10 @@ def check(data: bytes) -> dict:
         r.u32()
         r.u32()
         r.take(20)
-        for _ in range(r.u32()):
+        n_topics = r.u32()
+        if n_topics > 4:
+            raise ValueError(f"log at block {block} has {n_topics} topics (max 4; parse_body refuses it)")
+        for _ in range(n_topics):
             r.take(32)
         r.take(r.u32())
         lo = block if lo is None else min(lo, block)
