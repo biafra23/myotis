@@ -143,8 +143,23 @@ its deployment block:
   `eth_getTransactionReceipt` every 5 s and logged `chequebook deployed`
   25 s after the broadcast — every call in Myotis's access log
   `outcome=VERIFIED`, none `ERROR`. Read path and settlement path are both
-  exercised; only the redistribution game (staking) remains untested, by
-  choice.
+  exercised. A zero-stake run with `storage-incentives-enable: true` then
+  exercised the redistribution agent's polling (`IsOverlayFrozen`/`IsPlaying`
+  `eth_call`s per phase; `IsPlaying` reverts for an unstaked overlay, which
+  Bee logs as `phase failed` and moves on — a verified answer, correctly
+  relayed). Playing the game (staking) stays untested by choice.
+- **Peer starvation is the failure mode to watch on Gnosis.** During that run
+  the desktop app's snap-peer pool — started cold, no warm cache — sank to a
+  single unresponsive peer for ~10 minutes: the head bridge could not fetch
+  new blocks, the index's top froze, every page Bee asked for above it was
+  refused (`-32000`, honestly), `eth_call`s waited 20–97 s on proofs, and
+  Bee's 10-minute stall rule shut it down while the app's log showed 102
+  `VERIFIED` and 3 `-32000` outcomes. The pool recovered on its own (7 snap
+  peers) and Bee resumed on restart. The daemon never hit this because it
+  ran on a warm `peers-gnosis.cache`; bundling such a cache with the PoC
+  (public enodes, like the seed) and time-boxing the head-edge tail fill so
+  a slow peer yields a fast `-32000` instead of a 20 s wait are the two
+  follow-ups this points at.
 
 ## Demo only: seeding from a full node (not for production)
 
