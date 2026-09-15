@@ -81,6 +81,7 @@ import hashlib
 import json
 import struct
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAGIC = b"MLIX"
@@ -473,6 +474,7 @@ def main() -> int:
     ap.add_argument("--network-id", type=int, help="EL network id (required without --meta; 100 = Gnosis)")
     ap.add_argument("--genesis", help="EL genesis block hash (known for network id 100; required for others)")
     ap.add_argument("--out", help="output snapshot path")
+    ap.add_argument("--manifest", metavar="FILE", help="also write a Java-properties manifest describing the frame (coverage, usable-until block, sha256) — one --watch entry only")
     args = ap.parse_args()
 
     if args.check:
@@ -497,6 +499,28 @@ def main() -> int:
         f"(dropped: {stats['dropped_removed']} removed, {stats['dropped_above_finality_margin']} above the finality margin)",
         file=sys.stderr,
     )
+    if args.manifest:
+        if len(args.watch) != 1:
+            die("--manifest describes exactly one watch entry; pass exactly one --watch with it")
+        address, deploy = args.watch[0]
+        low, high = stats["span"]
+        # The engine's head bridge maps at most MAX_GAP = 500_000 blocks above a
+        # file's top (el/reader.rs); beyond that a seed never catches up.
+        lines = [
+            "# Log-index seed manifest — written by scripts/synth_logindex.py (see docs/bee-rpc-service.md)",
+            f"network={ {100: 'gnosis', 1: 'mainnet', 11155111: 'sepolia'}.get(info['network_id'], info['network_id']) }",
+            f"address=0x{address.hex()}",
+            f"deploymentBlock={deploy}",
+            f"coveredLow={low}",
+            f"coveredHigh={high}",
+            f"usableUntilBlock={high + 500_000}",
+            f"logs={stats['logs_kept']}",
+            f"sha256={hashlib.sha256(data).hexdigest()}",
+            f"source={Path(args.meta).name if args.meta else '-'}",
+            f"builtAtUtc={datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}",
+        ]
+        Path(args.manifest).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"wrote {args.manifest}", file=sys.stderr)
     print(json.dumps(info, indent=2))
     return 0
 

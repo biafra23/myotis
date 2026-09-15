@@ -139,10 +139,26 @@ val composeOsArchDir = run {
     "$osPart-$archPart"
 }
 
-// Single source of truth for the staged-resources root: the staging task's
-// output, Compose's appResourcesRootDir, and the packaging tasks' input all
-// derive from it (a drifting duplicate literal would silently untrack).
-val rustAppResourcesRoot = layout.buildDirectory.dir("rustAppResources")
+// The Bee PoC flavour flag: bare `-PbeePoc` or `-PbeePoc=true` builds the PoC
+// (see the Bee PoC section below), `-PbeePoc=false` a regular build. Anything
+// else is refused rather than quietly building the regular flavour — a flag
+// that changes the artifact must be applied or rejected, never ignored.
+val beePoc: Boolean = providers.gradleProperty("beePoc")
+    .map { raw ->
+        when (raw.trim().lowercase()) {
+            "", "true" -> true
+            "false" -> false
+            else -> throw GradleException("-PbeePoc must be bare, =true or =false (got '$raw')")
+        }
+    }
+    .getOrElse(false)
+
+// Single source of truth for the staged-resources root: the staging tasks'
+// outputs, Compose's appResourcesRootDir, and the packaging tasks' input all
+// derive from it (a drifting duplicate literal would silently untrack). It is
+// FLAVOUR-SPECIFIC: the two flavours never share a staging dir, so a regular
+// build cannot ship a seed a -PbeePoc build staged earlier.
+val rustAppResourcesRoot = layout.buildDirectory.dir(if (beePoc) "beePocAppResources" else "rustAppResources")
 
 val prepareRustAppResources = tasks.register("prepareRustAppResources") {
     group = "build"
@@ -167,6 +183,137 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
             from(src)
             into(destDir)
         }
+        // The regular app must never carry the Bee PoC seed. The flavours stage
+        // into different roots, but a root that predates that split (or a stray
+        // copy) would be synced into the bundle unnoticed — scrub it here, on
+        // every regular staging run.
+        if (!beePoc) {
+            val common = rustAppResourcesRoot.get().dir("common").asFile
+            listOf("logindex-gnosis.db", "bee-poc-seed.properties").forEach { common.resolve(it).delete() }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JNA's own native stub. JNA normally extracts libjnidispatch from its jar into
+// ~/Library/Caches/JNA/temp at runtime and dlopens it from there. A jpackage'd
+// app is ad-hoc signed with library validation, and macOS refuses that
+// unsigned temp file ("Trying to load an unsigned library") — so the Rust
+// engine silently never loaded in the packaged desktop app (observed on macOS
+// 15.7 with the Bee PoC dmg, 2026-09-15: RustEngineNative logged the dlopen
+// failure and SelectorEngine fell back to the Java engine, which has no log
+// index). Staging the stub next to the engine dylib — under a `.dylib` name,
+// because jpackage's signing pass signs `*.dylib` and executables but leaves a
+// 0644 `.jnilib` untouched, and JNA's boot-path lookup tries both names —
+// gets it ad-hoc signed with the rest of the bundle, and
+// `-Djna.boot.library.path=$APPDIR/resources` (below) makes JNA load it from
+// there instead of extracting. Dev runs see a literal, nonexistent `$APPDIR`
+// and JNA falls back to extraction, which a plain JDK process may do.
+// ---------------------------------------------------------------------------
+val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
+    group = "build"
+    description = "Stage JNA's native stub into Compose appResources so the packaged app can load the Rust engine"
+    val destDir = rustAppResourcesRoot.map { it.dir(composeOsArchDir) }
+    // The exact artifact the version catalog pins, resolved on its own rather
+    // than found by a name-prefix scan of the runtime classpath.
+    val jnaJar = configurations.detachedConfiguration(
+        dependencies.create("net.java.dev.jna:jna:${libs.versions.jna.get()}@jar"),
+    ).also { it.isTransitive = false }
+    val osPart = composeOsArchDir.substringBefore('-')
+    val daemonArm = composeOsArchDir.substringAfter('-') == "arm64"
+    val (entry, stagedName) = when (osPart) {
+        "macos" -> (if (daemonArm) "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib" else "com/sun/jna/darwin-x86-64/libjnidispatch.jnilib") to "libjnidispatch.dylib"
+        "linux" -> (if (daemonArm) "com/sun/jna/linux-aarch64/libjnidispatch.so" else "com/sun/jna/linux-x86-64/libjnidispatch.so") to "libjnidispatch.so"
+        "windows" -> "com/sun/jna/win32-x86-64/jnidispatch.dll" to "jnidispatch.dll"
+        else -> error("no JNA native stub mapping for $composeOsArchDir")
+    }
+    val staged = destDir.map { it.file(stagedName) }
+    // The packaged app's architecture is the jpackage toolchain JDK's, while
+    // Compose picks the Skiko natives — and this task picks the stub — by the
+    // Gradle daemon's. A mixed pair packages an app that dies at launch
+    // ("Can't load library: libskiko-macos-<arch>.dylib"): seen on a Mac that
+    // ran Gradle under an x86_64 JDK 17 with an aarch64 JDK 21 toolchain. The
+    // CI legs pin both to one arch; locally, fail loudly instead of shipping it.
+    val toolchainArch = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }.map { launcher ->
+        val release = launcher.metadata.installationPath.asFile.resolve("release")
+        runCatching { Regex("OS_ARCH=\"([^\"]+)\"").find(release.readText())?.groupValues?.get(1) }
+            .getOrNull()?.lowercase() ?: "unknown"
+    }
+    inputs.files(jnaJar)
+    inputs.property("osArch", composeOsArchDir)
+    inputs.property("toolchainArch", toolchainArch)
+    outputs.file(staged)
+    doLast {
+        val tc = toolchainArch.get()
+        check(tc == "unknown" || (tc in setOf("aarch64", "arm64")) == daemonArm) {
+            "Gradle runs under a ${System.getProperty("os.arch")} JVM but the JDK 21 toolchain jpackage uses " +
+                "is $tc: the packaged app would mix native libraries and die at launch. Run Gradle under a JDK " +
+                "of the target architecture (JAVA_HOME=<that JDK> plus " +
+                "-Porg.gradle.java.installations.paths=\$JAVA_HOME, as the dmg workflow does)."
+        }
+        val jar = jnaJar.singleFile
+        copy {
+            from(zipTree(jar)) { include(entry) }
+            into(destDir)
+            // Flatten com/sun/jna/<platform>/ away and apply the signable name:
+            // JNA's boot path is a plain dir.
+            eachFile { path = stagedName }
+            includeEmptyDirs = false
+        }
+        check(staged.get().asFile.isFile) { "JNA native stub $entry not found in $jar" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bee PoC flavour (-PbeePoc): bundle the Gnosis PostageStamp log-index seed so
+// a Swarm Bee full node can use the app from the first minute (BeePoc.kt;
+// docs/bee-rpc-service.md, "Bee PoC desktop build"). The seed is synthesized
+// at build time from the committed data set by scripts/synth_logindex.py and
+// staged into appResources/common/ (Compose flattens common/ next to the
+// os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
+// checks before installing it. DEBUG/DEMO artefact: RPC-sourced data,
+// unverified until the walker re-fetches it, expiring ~500,000 Gnosis blocks
+// (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
+// resources root above keeps a regular build from ever shipping the seed.
+// ---------------------------------------------------------------------------
+val beePocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
+
+val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
+    group = "build"
+    description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it into Compose appResources (-PbeePoc only)"
+    onlyIf { beePoc }
+    val meta = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json")
+    val logs = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz")
+    val script = rootProject.file("scripts/synth_logindex.py")
+    val seed = beePocSeedDir.map { it.file("logindex-gnosis.db") }
+    val manifest = beePocSeedDir.map { it.file("bee-poc-seed.properties") }
+    inputs.files(meta, logs, script)
+    outputs.files(seed, manifest)
+    doLast {
+        beePocSeedDir.get().asFile.mkdirs()
+        val cmd = listOf(
+            "python3", script.absolutePath,
+            "--meta", meta.absolutePath,
+            "--logs", logs.absolutePath,
+            // The REAL deployment block: from_block is the engine's "no logs
+            // below here" assertion, never the seed's fetched low edge.
+            "--watch", "0x45a1502382541Cd610CC9068e88727426b696293:31305656",
+            "--out", seed.get().asFile.absolutePath,
+            // The script describes what it wrote (coverage, usable-until block,
+            // sha256) — the manifest BeePoc.kt checks before installing.
+            "--manifest", manifest.get().asFile.absolutePath,
+        )
+        val proc = ProcessBuilder(cmd).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
+        val stderr = proc.errorStream.bufferedReader().readText()
+        check(proc.waitFor() == 0 && seed.get().asFile.isFile && manifest.get().asFile.isFile) {
+            "bee-poc: scripts/synth_logindex.py failed (python3 required):\n$stderr"
+        }
+        val summary = manifest.get().asFile.readLines()
+            .filter { it.startsWith("covered") || it.startsWith("usableUntil") || it.startsWith("logs=") }
+            .joinToString(", ")
+        logger.lifecycle("bee-poc: staged ${seed.get().asFile.name} — $summary")
     }
 }
 
@@ -183,6 +330,8 @@ tasks.configureEach {
         || name.startsWith("runDistributable") || name.startsWith("runRelease")
     ) {
         dependsOn(prepareRustAppResources)
+        dependsOn(prepareJnaBootLib)
+        dependsOn(prepareBeePocSeed)
         // Compose's jpackage tasks do NOT track the app-resources CONTENT as
         // an input: after a Rust-only change, prepareRustAppResources and
         // Compose's own prepareAppResources both re-run, yet
@@ -210,6 +359,12 @@ compose.desktop {
         // adjustable via -Dmyotis.log.level) instead of the DEBUG-to-unbounded-file logback.xml
         // that :app puts on the classpath. Applies to both the packaged app and :app-desktop:run.
         jvmArgs += listOf("-Dlogback.configurationFile=logback-desktop.xml")
+        // JNA loads its native stub from here in the packaged app (see
+        // prepareJnaBootLib); jpackage's launcher expands $APPDIR at start.
+        jvmArgs += "-Djna.boot.library.path=\$APPDIR/resources"
+        // The Bee PoC flavour identifies itself to Main.kt/BeePoc.kt through this
+        // property — baked into the package AND applied to :app-desktop:run.
+        if (beePoc) jvmArgs += "-Dmyotis.beePoc=true"
         // Pin the runtime jpackage bundles (via jlink) to the Java 21 toolchain. Our bytecode
         // is class-file 65 (jvmToolchain(21)) and the backend (:networking discv5, :myotis-evm
         // Besu) ships Java-21 classes that NEED a 21 runtime to load. Without this, jpackage
@@ -227,7 +382,9 @@ compose.desktop {
             // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
             // Windows host exists.
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
-            packageName = "Myotis"
+            // The Bee PoC flavour is a separate app (own name, own bundle id, own
+            // data dir — see BeePoc.kt) so it coexists with a regular install.
+            packageName = if (beePoc) "Myotis Bee PoC" else "Myotis"
             // Applies to the dmg (and a future msi); the deb overrides it below.
             // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
@@ -242,7 +399,7 @@ compose.desktop {
             // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
             includeAllModules = true
             macOS {
-                bundleID = "io.myotis.desktop"
+                bundleID = if (beePoc) "io.myotis.desktop.beepoc" else "io.myotis.desktop"
             }
             linux {
                 // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may

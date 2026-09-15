@@ -1924,9 +1924,15 @@ private fun IndexTab(
             ) { Text(if (importing) "Importing…" else "Import log-index snapshot…") }
             importResult?.let { Text(it) }
         }
+        // A seed the host installed from its own bundle (Bee PoC flavour) is
+        // served indistinguishably from walked coverage — say so where the
+        // coverage is shown, and only while the engine's index is actually on
+        // (an install that did not reach the engine must not look seeded).
+        val seededNotice = remember(network) { controller.seededIndexNotice(network) }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
             parsed?.enabled == true -> {
+                seededNotice?.let { Text(it) }
                 Text("${parsed.logCount} logs collected")
                 LogIndexStatus.progressLine(parsed)?.let { Text("Backfill: $it") }
                 // The ENGINE's entry list is authoritative — it includes imported
