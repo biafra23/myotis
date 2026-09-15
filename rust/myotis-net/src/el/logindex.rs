@@ -1309,6 +1309,111 @@ fn parse_body(
 
 #[cfg(test)]
 mod tests {
+    /// `scripts/synth_logindex.py` re-implements `serialize_impl` byte for
+    /// byte so a full node's `eth_getLogs` output can seed the index without
+    /// a devp2p walk (an UNVERIFIED seed — the script says so). Pin that the
+    /// frame it writes is accepted by the portable loader and queryable, so
+    /// a layout change on either side fails here rather than at import.
+    #[test]
+    fn synth_logindex_script_frame_is_importable() {
+        use super::*;
+        fn unhex<const N: usize>(s: &str) -> [u8; N] {
+            let mut out = [0u8; N];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+            }
+            out
+        }
+        let hex32 = unhex::<32>;
+        let hex20 = unhex::<20>;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let script = root.join("scripts/synth_logindex.py");
+        let dir = std::env::temp_dir().join(format!("logindex-synth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let addr = "0x45a1502382541Cd610CC9068e88727426b696293";
+        let t1 = format!("0x{}", "11".repeat(32));
+        let t2 = format!("0x{}", "22".repeat(32));
+        let bh = format!("0x{}", "aa".repeat(32));
+        let th = format!("0x{}", "bb".repeat(32));
+        // Two kept logs (blocks 47_000_005 and 47_000_009) and one `removed`
+        // entry the script must drop.
+        let jsonl = format!(
+            concat!(
+                r#"{{"address":"{a}","topics":["{t1}","{t2}"],"data":"0xdeadbeef","blockNumber":"0x2cd29c5","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x3","logIndex":"0x7","removed":false}}"#,
+                "\n",
+                r#"{{"address":"{a}","topics":["{t2}"],"data":"0x","blockNumber":"0x2cd29c9","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x0","logIndex":"0x0","removed":false}}"#,
+                "\n",
+                r#"{{"address":"{a}","topics":["{t1}"],"data":"0x01","blockNumber":"0x2cd29c9","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x0","logIndex":"0x1","removed":true}}"#,
+                "\n",
+            ),
+            a = addr,
+            t1 = t1,
+            t2 = t2,
+            bh = bh,
+            th = th,
+        );
+        let input = dir.join("logs.jsonl");
+        std::fs::write(&input, jsonl).unwrap();
+        let out = dir.join("synth.db");
+        let status = std::process::Command::new("python3")
+            .arg(&script)
+            .args(["--network-id", "100"])
+            .args(["--watch", &format!("{addr}:47000000")])
+            .args(["--to-block", "47000010"])
+            .arg("--logs")
+            .arg(&input)
+            .arg("--out")
+            .arg(&out)
+            .status()
+            .expect("python3 must be available to run scripts/synth_logindex.py");
+        assert!(status.success(), "synth_logindex.py failed: {status}");
+
+        let (tag, ix) = LogIndex::load_portable(&out).expect("the synthesized frame must load");
+        assert_eq!(tag.network_id, 100);
+        assert_eq!(
+            tag.genesis_hash,
+            hex32("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756")
+        );
+        let address = hex20("45a1502382541cd610cc9068e88727426b696293");
+        assert_eq!(ix.config.watch.len(), 1);
+        assert_eq!(ix.config.watch[0].address, address);
+        assert_eq!(ix.config.watch[0].from_block, 47_000_000);
+        assert!(ix.config.watch[0].topic0s.is_empty());
+        assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)));
+        assert_eq!(ix.cursor, None);
+        assert_eq!(ix.log_count(), 2);
+
+        // Runtime bits are the host's: enable to query, then filter by topic0
+        // the way Bee does (an OR-list at position 0).
+        let mut ix = ix;
+        ix.config.enabled = true;
+        let all = ix
+            .query(&LogFilter { from_block: 47_000_000, to_block: 47_000_010, addresses: vec![address], topics: vec![] })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].block_number, 47_000_005);
+        assert_eq!(all[0].tx_index, 3);
+        assert_eq!(all[0].log_index, 7);
+        assert_eq!(all[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(all[0].topics.len(), 2);
+        let only_t1 = ix
+            .query(&LogFilter {
+                from_block: 47_000_000,
+                to_block: 47_000_010,
+                addresses: vec![address],
+                topics: vec![vec![[0x11; 32]]],
+            })
+            .unwrap();
+        assert_eq!(only_t1.len(), 1);
+        assert_eq!(only_t1[0].block_number, 47_000_005);
+        // Below the span's low is asserted log-free by from_block; above the
+        // high is out of coverage — the honest refusal, never `[]`.
+        assert!(matches!(
+            ix.query(&LogFilter { from_block: 47_000_000, to_block: 47_000_011, addresses: vec![address], topics: vec![] }),
+            Err(QueryError::OutOfCoverage { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn max_speed_is_fingerprint_neutral_and_flippable() {
