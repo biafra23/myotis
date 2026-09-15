@@ -134,11 +134,17 @@ its deployment block:
   version=Myotis/verified-light-client`, chain id 100 accepted), loaded its
   embedded batch snapshot, then synced the postage store from 47,061,408 to
   the chain tip through Myotis's `eth_getLogs` in about four minutes, went
-  `beeMode: full` with 24 Swarm peers and started filling its reserve. Run
-  with `chequebook-enable: false` — the chequebook deployment (Bee's one
-  transaction, through `eth_sendRawTransaction` on peer-thin Gnosis) and
-  the funding gate are still unexercised, so this is a certification of the
-  read path, not of the settlement path.
+  `beeMode: full` with 24 Swarm peers and started filling its reserve. That
+  first run used `chequebook-enable: false`; the same evening, against the
+  packaged *Bee PoC* desktop app as the RPC, the funded node was restarted
+  with `chequebook-enable: true`: Bee passed the balance check
+  (`eth_getBalance`, 4.5 xDAI), broadcast its chequebook deployment through
+  `eth_sendRawTransaction` (accepted by a snap peer at once), polled
+  `eth_getTransactionReceipt` every 5 s and logged `chequebook deployed`
+  25 s after the broadcast — every call in Myotis's access log
+  `outcome=VERIFIED`, none `ERROR`. Read path and settlement path are both
+  exercised; only the redistribution game (staking) remains untested, by
+  choice.
 
 ## Demo only: seeding from a full node (not for production)
 
