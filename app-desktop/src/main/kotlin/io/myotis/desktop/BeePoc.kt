@@ -45,6 +45,17 @@ object BeePoc {
     const val INSTALLED_MANIFEST_FILE = "logindex-gnosis.seed.properties"
 
     /**
+     * Warm peer caches bundled beside the seed, in the engine's own formats and under the
+     * engine's own data-dir names (`peers{-network}.cache` for EL snap peers,
+     * `cl-peers{-network}.cache` for beacon light-client peers — see `host.rs`). Public
+     * peer addresses only; the engine re-verifies every peer it dials, so these are hints
+     * that shortcut discovery, not trust. A cold Gnosis pool is the PoC's other failure
+     * mode: with no cache the app once sank to a single unresponsive snap peer, the index
+     * stopped following the head, and Bee's ten-minute stall rule shut it down.
+     */
+    val PEER_CACHE_FILES: List<String> = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
+
+    /**
      * The seed's watch entry: the PostageStamp contract at its REAL deployment block —
      * `from_block` is the engine's "no logs below here" assertion, so it must never be the
      * seed's fetched low edge (docs/bee-rpc-service.md explains the difference).
@@ -79,7 +90,32 @@ object BeePoc {
     fun installSeedIfAbsent(resourcesDir: Path?, dataDir: Path): Outcome {
         val outcome = install(resourcesDir, dataDir)
         lastOutcome = outcome
+        installPeerCachesIfAbsent(resourcesDir, dataDir)
         return outcome
+    }
+
+    /**
+     * Copy each bundled peer cache into [dataDir] when the engine has none there yet.
+     * Independent of the seed's outcome, and never over an existing file: the engine
+     * rewrites these as it learns, and what it learned beats what we shipped. Returns the
+     * names installed on this call.
+     */
+    fun installPeerCachesIfAbsent(resourcesDir: Path?, dataDir: Path): List<String> {
+        val dir = resourcesDir ?: return emptyList()
+        return PEER_CACHE_FILES.filter { name ->
+            val src = dir.resolve(name)
+            val target = dataDir.resolve(name)
+            if (!Files.isRegularFile(src) || Files.exists(target)) return@filter false
+            runCatching {
+                Files.createDirectories(dataDir)
+                atomicCopy(src, target)
+                log.info("bee-poc: installed the bundled warm peer cache {}", target)
+                true
+            }.onFailure {
+                log.warn("bee-poc: could not install peer cache {}: {}", name, it.toString())
+                runCatching { Files.deleteIfExists(target.resolveSibling("${target.fileName}.tmp")) }
+            }.getOrDefault(false)
+        }
     }
 
     private fun install(resourcesDir: Path?, dataDir: Path): Outcome {

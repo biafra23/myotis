@@ -189,7 +189,8 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
         // every regular staging run.
         if (!beePoc) {
             val common = rustAppResourcesRoot.get().dir("common").asFile
-            listOf("logindex-gnosis.db", "bee-poc-seed.properties").forEach { common.resolve(it).delete() }
+            listOf("logindex-gnosis.db", "bee-poc-seed.properties", "peers-gnosis.cache", "cl-peers-gnosis.cache")
+                .forEach { common.resolve(it).delete() }
         }
     }
 }
@@ -289,10 +290,20 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     val script = rootProject.file("scripts/synth_logindex.py")
     val seed = beePocSeedDir.map { it.file("logindex-gnosis.db") }
     val manifest = beePocSeedDir.map { it.file("bee-poc-seed.properties") }
-    inputs.files(meta, logs, script)
-    outputs.files(seed, manifest)
+    // Warm peer caches (the engine's own tab/multiaddr text formats, public
+    // peers only): a cold Gnosis pool is the PoC's other failure mode — on
+    // 2026-09-15 it sank to one unresponsive snap peer for ten minutes, the
+    // index stopped following the head and Bee's stall rule shut it down.
+    val peerCaches = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
+    val cacheSources = peerCaches.map { rootProject.file("data/bee/gnosis/$it") }
+    inputs.files(meta, logs, script, cacheSources)
+    outputs.files(seed, manifest, peerCaches.map { n -> beePocSeedDir.map { it.file(n) } })
     doLast {
         beePocSeedDir.get().asFile.mkdirs()
+        cacheSources.forEach { src ->
+            check(src.isFile && src.length() > 0) { "bee-poc: warm peer cache missing or empty: $src" }
+            src.copyTo(beePocSeedDir.get().asFile.resolve(src.name), overwrite = true)
+        }
         val cmd = listOf(
             "python3", script.absolutePath,
             "--meta", meta.absolutePath,
