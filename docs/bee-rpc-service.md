@@ -129,8 +129,16 @@ its deployment block:
   startup on postage sync with a 10-minute stall timeout — so the index must
   cover Bee's range BEFORE Bee starts; an uncovered page is a `-32000` Bee
   retries every 5 s while that clock runs.
-- The end-to-end Bee-against-Myotis compatibility run is still to be done;
-  this document describes the serving surface, not a completed certification.
+- **End-to-end run, 2026-09-15 (Bee v2.8.2, macOS arm64, Rust engine, the
+  demo seed):** Bee connected (`connected to blockchain backend
+  version=Myotis/verified-light-client`, chain id 100 accepted), loaded its
+  embedded batch snapshot, then synced the postage store from 47,061,408 to
+  the chain tip through Myotis's `eth_getLogs` in about four minutes, went
+  `beeMode: full` with 24 Swarm peers and started filling its reserve. Run
+  with `chequebook-enable: false` — the chequebook deployment (Bee's one
+  transaction, through `eth_sendRawTransaction` on peer-thin Gnosis) and
+  the funding gate are still unexercised, so this is a certification of the
+  read path, not of the settlement path.
 
 ## Demo only: seeding from a full node (not for production)
 
@@ -193,6 +201,62 @@ The committed data set (`data/bee/gnosis/`, 2026-09-15, zbox's Gnosis geth,
 47,000,000–48,262,804, 39,225 logs, 3.2 MB gzipped) is a one-off demo
 artifact. Do not refresh it in git — the rule in the next section applies to
 any recurring data set.
+
+## Bee PoC desktop build (`-PbeePoc`)
+
+The hand-off for the Swarm team: a macOS app that a Bee full node can point at
+**from the first minute**. It is a separate flavour of the desktop app — its
+own name (*Myotis Bee PoC*), bundle id (`io.myotis.desktop.beepoc`) and data
+dir (`~/.myotis-bee-poc`), so it coexists with a regular Myotis install —
+with the seed above bundled inside:
+
+- **Build**: `./gradlew :app-desktop:packageDmg -PbeePoc`, with Gradle
+  running under a JDK of the TARGET architecture (as the dmg workflow does:
+  `JAVA_HOME=<aarch64 JDK 21>` plus
+  `-Porg.gradle.java.installations.paths=$JAVA_HOME`). Compose picks its
+  Skiko natives by the Gradle JVM's arch while jpackage follows the
+  toolchain JDK's, so a mixed pair (x86_64 Gradle, aarch64 toolchain — one
+  dev Mac's default) produces an app that dies at launch with
+  `Can't load library: libskiko-macos-arm64.dylib`. The
+  `prepareBeePocSeed` task runs `scripts/synth_logindex.py` on the committed
+  `data/bee/gnosis/` set at build time, stages the seed into the app bundle
+  next to a manifest (coverage, usable-until block, sha256), and a build
+  without the flag removes any staged seed. `-PbeePoc` also works with
+  `:app-desktop:run`.
+- **CI builds it on every PR** (`desktop-dmg.yml`, the `bee-poc` matrix leg):
+  the artifact `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`,
+  and the leg fails unless the dmg carries the seed and its manifest. It is
+  never attached to a release.
+- **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
+  only if no index file exists there yet, and only if the seed's sha256 matches
+  the manifest — where the engine activates it on its own
+  (`activate_log_index_from_disk`), then enables Gnosis (only) with the log
+  index on and the PostageStamp watch entry at its real deployment block.
+  Later starts leave settings alone. The Index tab shows the seed's provenance
+  and its usable-until block.
+- **Point Bee at it**: `blockchain-rpc-endpoint: http://127.0.0.1:8546` with
+  the config from *Setup* step 5. Bee's first page at 47,061,408 is served
+  immediately; the head bridge closes the gap between the seed's top and the
+  live head within minutes of the app's first `SYNCED`.
+- **Expiry**: the seed is usable until roughly 500,000 blocks (~29 days) above
+  its fetch — the manifest and the Index tab say which block. After that the
+  data set must be re-fetched and the app rebuilt; the shelf-life rule from the
+  seed section applies unchanged. The Gnosis trust anchor embedded in the
+  build ages out faster (~34 h), so the first start of a build older than that
+  opens on the stale-anchor consent dialog — expected, press accept.
+
+Packaging note that this build surfaced (and that applies to the regular
+dmg): a jpackage'd app is ad-hoc signed with library validation, so macOS
+refuses the unsigned `libjnidispatch` JNA extracts to `~/Library/Caches/JNA`
+at runtime — the Rust engine then silently never loads and the app runs on
+the Java engine, which has no log index. `prepareJnaBootLib` stages the stub
+inside the bundle (signed with the rest) and the launcher passes
+`-Djna.boot.library.path=$APPDIR/resources`; the dmg workflow fails if the
+stub is missing.
+
+Everything the *Demo only* section says about trust applies: this is an
+RPC-sourced, unverified seed served indistinguishably from walked coverage,
+for demonstrating the Bee-on-Myotis path, not a release.
 
 ## Distributing the prebuilt snapshot
 

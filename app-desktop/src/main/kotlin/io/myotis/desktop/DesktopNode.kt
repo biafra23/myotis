@@ -302,6 +302,8 @@ class DesktopNodeController(
 
     override val canImportLogIndex: Boolean get() = true
 
+    override fun seededIndexNotice(network: String): String? = BeePoc.seededIndexNotice(dataDir, network)
+
     override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
         val canonical = engine.canonicalNetworkName(network)
         // AWT file dialog wants the EDT; the import itself (engine-side merge

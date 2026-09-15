@@ -129,6 +129,16 @@ interface NodeController {
     val canImportLogIndex: Boolean get() = false
 
     /**
+     * One-line provenance note for [network]'s log index when THIS HOST seeded
+     * it from a snapshot bundled with the app (the desktop Bee PoC flavour):
+     * what the seed covers, that it is unverified until re-walked, and the block
+     * it is usable until. Null for an index the user built or imported — the
+     * engine's status JSON carries no provenance marker, so only the host that
+     * installed the seed can say so. Rendered in the Index tab.
+     */
+    fun seededIndexNotice(network: String): String? = null
+
+    /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
      * on-disk EL/CL peer cache files — so discovery starts from a fresh slate. Safe whether or
      * not the network is currently running.

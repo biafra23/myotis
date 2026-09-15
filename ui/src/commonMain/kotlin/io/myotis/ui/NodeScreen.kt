@@ -1924,6 +1924,10 @@ private fun IndexTab(
             ) { Text(if (importing) "Importing…" else "Import log-index snapshot…") }
             importResult?.let { Text(it) }
         }
+        // A seed the host installed from its own bundle (Bee PoC flavour) is
+        // served indistinguishably from walked coverage — say so where the
+        // coverage is shown.
+        controller.seededIndexNotice(network)?.let { Text(it) }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
             parsed?.enabled == true -> {

@@ -31,9 +31,27 @@ fun main() {
             if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
         }
     }
-    val dataDir = Path.of(System.getProperty("user.home"), ".myotis")
+    // The Bee PoC flavour (-PbeePoc → -Dmyotis.beePoc=true) lives in its own data dir and
+    // seeds its Gnosis log index from the bundle before anything reads that dir.
+    val beePoc = BeePoc.enabled()
+    val dataDir = if (beePoc) BeePoc.dataDir() else Path.of(System.getProperty("user.home"), ".myotis")
+    // Keep the PoC's logs in its own data dir too. logback-desktop.xml reads
+    // myotis.logdir when the first logger is created, so this must precede
+    // every log call (BeePoc's logger is lazy for exactly this reason).
+    if (beePoc && System.getProperty("myotis.logdir") == null) {
+        System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
+    }
+    val settingsFile = dataDir.resolve("settings.properties")
+    val firstStart = !java.nio.file.Files.exists(settingsFile)
+    if (beePoc) {
+        BeePoc.installSeedIfAbsent(
+            System.getProperty("compose.application.resources.dir")?.takeIf { it.isNotBlank() }?.let(Path::of),
+            dataDir,
+        )
+    }
     // settings first: the controller reads it at boot (configured RPC port + snap target).
-    val settings = DesktopSettings(file = dataDir.resolve("settings.properties"))
+    val settings = DesktopSettings(file = settingsFile)
+    if (beePoc) BeePoc.applyFirstStartSettings(settings, firstStart)
     val controller = DesktopNodeController(dataDir, settings)
     // Apply the persisted engine choice BEFORE the first network start, so a saved
     // Rust-engine preference survives a restart (Android parity: NodeService applies
@@ -58,7 +76,7 @@ fun main() {
             // Tear down the in-process node stack (Netty event loops, libp2p, sync threads)
             // before exiting so closing the window doesn't leak resources or hang shutdown.
             onCloseRequest = { controller.shutdown(); exitApplication() },
-            title = "Myotis",
+            title = if (beePoc) "Myotis Bee PoC" else "Myotis",
         ) {
             NodeScreen(controller, settings, DesktopLogSource, history = history)
         }
