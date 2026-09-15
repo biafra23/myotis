@@ -139,6 +139,12 @@ class JavaMyotisEngineTest {
                     () -> engine.create(config, testPorts(new MemoryKeyStore())));
             assertTrue(ex.getMessage().contains("caller-supplied checkpoint"), ex.getMessage());
             assertTrue(engine.hostedNetworks().isEmpty(), "a refused create must not register");
+            // A dangling symlink at the marker path is an entry, not absence: still refused.
+            java.nio.file.Files.delete(dir.resolve("sync-anchor-gnosis.json"));
+            java.nio.file.Files.createSymbolicLink(dir.resolve("sync-anchor-gnosis.json"),
+                    dir.resolve("does-not-exist"));
+            assertThrows(EngineException.class,
+                    () -> engine.create(config, testPorts(new MemoryKeyStore())));
             // A marker for ANOTHER network does not affect this one (per-network suffix).
             java.nio.file.Files.delete(dir.resolve("sync-anchor-gnosis.json"));
             java.nio.file.Files.writeString(dir.resolve("sync-anchor.json"), "{}");

@@ -217,10 +217,10 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
         // generation: the embedded checkpoint is a different trust anchor, and
         // the snapshot-resume rule would happily continue from the caller's
         // verified state as if it descended from ours. Fail closed: only a
-        // marker that is DEFINITELY absent lets the embedded anchor in — one
-        // that exists, is unreadable, or cannot even be stat'ed all refuse
-        // (same rule as create_with_checkpoint).
-        if !matches!(anchor_marker_path(&dir, &config).try_exists(), Ok(false)) {
+        // marker entry that is DEFINITELY absent lets the embedded anchor in —
+        // a file, a dangling symlink, an unreadable entry, or one that cannot
+        // even be stat'ed all refuse (same rule as create_with_checkpoint).
+        if !marker_entry_absent(&anchor_marker_path(&dir, &config)) {
             tracing::warn!(data_dir, "dataDir was bootstrapped from a caller-supplied \
                 checkpoint — refusing to create it from the embedded anchor");
             return ANCHOR_MISMATCH;
@@ -408,8 +408,20 @@ fn bind_persistence(config: &mut ChainConfig, data_dir: &str) -> Result<std::pat
         tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
         return Err(CREATE_FAILED);
     }
+    // Resolve the directory's IDENTITY, not its spelling: symlinks, `..`, and
+    // relative paths all alias the same inode, and every guard below (the
+    // in-use check, the anchor marker) must see one directory as one
+    // directory — `create('x', real)` then `createWithCheckpoint('x', alias)`
+    // used to slip past the in-use check and drop a marker into the first
+    // handle's directory (reported from freedom-browser#353).
+    let dir = match std::fs::canonicalize(data_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(data_dir, error = %e, "dataDir cannot be resolved");
+            return Err(CREATE_FAILED);
+        }
+    };
     let suffix = persistence_suffix(config);
-    let dir = std::path::PathBuf::from(data_dir);
     config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
     config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
     Ok(dir)
@@ -448,14 +460,27 @@ fn anchor_marker_path(dir: &std::path::Path, config: &ChainConfig) -> std::path:
     dir.join(format!("sync-anchor{}.json", persistence_suffix(config)))
 }
 
-/// Read a marker written by [`write_anchor_marker`]: `Ok(None)` when absent,
-/// `Err(())` when present but unreadable — which both entry points treat as a
-/// foreign generation (a marker we cannot read never unlocks a resume).
+/// Whether the marker ENTRY is definitely absent. Judged on the directory entry
+/// itself (`symlink_metadata`, never following links): a dangling symlink at
+/// the marker path is an entry, not absence — following it would read ENOENT
+/// and let a caller rebind the directory and overwrite the link
+/// (freedom-browser#353). Any error other than NotFound also counts as
+/// present (fail closed).
+fn marker_entry_absent(path: &std::path::Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Read a marker written by [`write_anchor_marker`]: `Ok(None)` when the entry
+/// is absent, `Err(())` when an entry exists but cannot be read as a marker
+/// (garbage, wrong shape, dangling symlink, permissions) — which both entry
+/// points treat as a foreign generation (a marker we cannot read never unlocks
+/// a resume).
 fn read_anchor_marker(path: &std::path::Path) -> Result<Option<([u8; 32], u64)>, ()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
+    if marker_entry_absent(path) {
+        return Ok(None);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Err(());
     };
     let parse = || -> Option<([u8; 32], u64)> {
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -2299,6 +2324,63 @@ mod tests {
         let id = create("mainnet", dir.to_str().unwrap());
         assert!(id >= 1);
         stop(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_aliases_share_one_identity_for_the_guards() {
+        // freedom-browser#353 repro: create(real) then createWithCheckpoint(alias)
+        // used to yield two live handles and a marker in the first handle's dir.
+        let base = std::env::temp_dir().join(format!("myotis-cwc-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let alias = base.join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = "0x8888888888888888888888888888888888888888888888888888888888888888";
+
+        let id = create("mainnet", real.to_str().unwrap());
+        assert!(id >= 1);
+        // The alias is the same directory: in use, refused, and no marker written.
+        assert_eq!(create_with_checkpoint("mainnet", alias.to_str().unwrap(), root, 100), CREATE_FAILED);
+        assert!(!real.join("sync-anchor.json").exists(), "no marker may land in a live handle's dir");
+        stop(id);
+
+        // Bind through the alias; the real path must then see the marker.
+        let g = create_with_checkpoint("mainnet", alias.to_str().unwrap(), root, 100);
+        assert!(g >= 1, "{g}");
+        assert!(real.join("sync-anchor.json").is_file());
+        // Plain create sees the marker through the real path (its refusal is the
+        // marker, not the in-use guard, which is createWithCheckpoint's).
+        assert_eq!(create("mainnet", real.to_str().unwrap()), ANCHOR_MISMATCH, "bound via alias");
+        stop(g);
+        assert_eq!(create("mainnet", real.to_str().unwrap()), ANCHOR_MISMATCH);
+        // And resuming through either spelling is the same generation.
+        let r = create_with_checkpoint("mainnet", real.to_str().unwrap(), root, 100);
+        assert!(r >= 1, "{r}");
+        stop(r);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_marker_path_is_an_entry_not_absence() {
+        // freedom-browser#353 repro: a dangling `sync-anchor.json` symlink used to read
+        // as "no marker" (ENOENT through the link), so createWithCheckpoint bound the
+        // directory and replaced the link. Both constructors must refuse it.
+        let dir = std::env::temp_dir().join(format!("myotis-cwc-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("sync-anchor.json");
+        std::os::unix::fs::symlink(dir.join("does-not-exist"), &marker).unwrap();
+        assert!(!marker_entry_absent(&marker));
+        assert_eq!(read_anchor_marker(&marker), Err(()));
+        let root = "0x9999999999999999999999999999999999999999999999999999999999999999";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), ANCHOR_MISMATCH);
+        assert_eq!(create("mainnet", dir.to_str().unwrap()), ANCHOR_MISMATCH);
+        assert!(std::fs::symlink_metadata(&marker).unwrap().file_type().is_symlink(),
+            "the dangling link must be left untouched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

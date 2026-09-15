@@ -123,7 +123,11 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   network, malformed or all-zero root, slot 0 / non-integer / above
   `Number.MAX_SAFE_INTEGER` / in the future, empty dataDir) returns **-1**
   before the directory is created or touched; so does a directory another live
-  handle of the process is already using. Detect support with `init() >= 26`
+  handle of the process is already using. Directory identity is canonical:
+  symlinks, `..` and relative spellings of one directory are one directory for
+  the in-use guard and the marker alike, and a dangling symlink (or any
+  unreadable entry) at the marker path counts as a marker, never as absence —
+  both constructors refuse it and leave it untouched. Detect support with `init() >= 26`
   (or `typeof myotis.createWithCheckpoint === 'function'`). Two practical
   notes: only the sync-committee **period** derived from the slot is
   load-bearing (the bootstrap warns when the verified header's slot differs; a
