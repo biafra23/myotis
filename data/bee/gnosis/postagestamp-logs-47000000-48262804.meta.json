@@ -1,0 +1,29 @@
+{
+  "rpcClientVersion": "Geth/v1.17.5-stable-9de57941/linux-amd64/go1.24.0",
+  "rpcClientVersionSource": "admin_nodeInfo.name (web3 namespace not enabled on this node)",
+  "chainId": 100,
+  "fromBlock": 47000000,
+  "toBlock": 48262804,
+  "headHash": "0x30e00749294bf014e35da1abc137343f889109ef93552d4dfcafad7bcc2f13aa",
+  "genesisHash": "0x4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756",
+  "block47000000Hash": "0x8b0c506ac1d2e41226fc1ba347ef815f60ca0bd1929b98cfb1646a1780616de4",
+  "logCount": 39225,
+  "removedCount": 0,
+  "countsByTopic0": {
+    "0x9b088e2c89b322a3c1d81515e1c88db3d386d022926f0e2d0b9b5813b7413d58": 4241,
+    "0xae46785019700e30375a5d7b4f91e32f8060ef085111f896ebf889450aa2ab5a": 8112,
+    "0xaf27998ec15e9d3809edad41aec1b5551d8412e71bd07c91611a0237ead1dc8e": 50,
+    "0xaf5756c62d6c0722ef9be1f82bef97ab06ea5aea7f3eb8ad348422079f01d88d": 18710,
+    "0xf5d8f9b1e7af440e1e7915f4693ccc004d1461a7dafd17ea7347d03decf298e1": 8112
+  },
+  "pageSizeUsed": 50000,
+  "pageSizeInitial": 50000,
+  "fetchedAtUtc": "2026-09-15T12:06:31Z",
+  "sha256Jsonl": "54980c30c76ff537c481995c8428fa593fab38e0f1b393a7352b823239c736d5",
+  "filter": {
+    "address": "0x45a1502382541Cd610CC9068e88727426b696293",
+    "fromBlock": "0x2cd29c0",
+    "toBlock": "0x2e06e94"
+  },
+  "note": "Raw eth_getLogs output from zbox's local Gnosis geth (myotis serving node), one log object per line exactly as returned. UNVERIFIED (no receipt-root proof); Bee-on-Myotis demo seed only."
+}
