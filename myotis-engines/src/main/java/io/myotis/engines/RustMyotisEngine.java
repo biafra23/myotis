@@ -29,6 +29,14 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class RustMyotisEngine implements MyotisEngine {
 
+    /** A create() refused because the dataDir belongs to a caller-supplied checkpoint
+     *  generation (native {@code ANCHOR_MISMATCH}). Distinct from a generic
+     *  {@link EngineException} so {@link SelectorEngine}'s auto mode rethrows it instead
+     *  of falling back to the Java engine on the same directory. */
+    static final class AnchorMismatchException extends EngineException {
+        AnchorMismatchException(String message) { super(message); }
+    }
+
     /** Networks this engine currently hosts, keyed by canonical name. */
     private final Map<String, RustChainHandle> hosted = new ConcurrentHashMap<>();
 
@@ -122,6 +130,17 @@ public final class RustMyotisEngine implements MyotisEngine {
         if (id == RustEngineNative.UNSUPPORTED_NETWORK) {
             throw new EngineException(
                     "the Rust engine does not host " + canonical + " yet");
+        }
+        if (id == RustEngineNative.ANCHOR_MISMATCH) {
+            // Not a fallback signal: the directory holds verified state that descends
+            // from a checkpoint the host supplied to the plain-C/Node engine, and the
+            // Java engine would resume that snapshot under the embedded anchor —
+            // exactly the silent trust-anchor swap -3 exists to refuse.
+            throw new AnchorMismatchException(
+                    "dataDir " + config.dataDir() + " is bound to a caller-supplied checkpoint"
+                    + " (sync-anchor" + ("mainnet".equals(canonical) ? "" : "-" + canonical)
+                    + ".json); the JVM hosts cannot resume it — use a fresh dataDir, or the"
+                    + " Node/C-ABI host that created it");
         }
         if (id < 0) {
             throw new EngineException("the Rust engine could not initialize the runtime"

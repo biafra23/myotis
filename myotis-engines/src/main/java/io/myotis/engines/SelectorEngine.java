@@ -143,6 +143,12 @@ public final class SelectorEngine implements MyotisEngine {
             // Throwable — OOM/StackOverflow should not be masked as a fallback.
             try {
                 return createOn(target, canonical, config, ports);
+            } catch (RustMyotisEngine.AnchorMismatchException e) {
+                // The dataDir is bound to a checkpoint the host supplied to the
+                // Rust engine (Node/C-ABI path). Falling back would let the Java
+                // engine resume that snapshot under the EMBEDDED anchor — the
+                // silent trust-anchor swap the refusal exists to prevent.
+                throw e;
             } catch (EngineException | LinkageError e) {
                 log.warn("[engines] auto: Rust engine create({}) failed ({}); "
                         + "falling back to the Java engine", config.networkName(), e.getMessage());

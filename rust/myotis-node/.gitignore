@@ -1,1 +1,3 @@
 .smoke-data/
+# local addon builds (release artifacts come from CI, never from the tree)
+*.node

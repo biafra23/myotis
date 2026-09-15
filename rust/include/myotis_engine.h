@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 25
+#define MYOTIS_ABI_VERSION 26
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -52,9 +52,30 @@ char *myotis_available_networks_json(void);
 char *myotis_canonical_network_name(const char *name_or_alias);
 
 /* Allocate a not-yet-started handle id (>= 1); -1 unknown name / runtime-init
- * failure, -2 canonical-but-unsupported network. `data_dir` is where the
- * engine persists sync snapshots and caches. */
+ * failure, -2 canonical-but-unsupported network, -3 `data_dir` was bootstrapped
+ * from a caller-supplied checkpoint (see myotis_create_with_checkpoint) and
+ * cannot be resumed from the embedded anchor. `data_dir` is where the engine
+ * persists sync snapshots and caches. */
 int64_t myotis_create(const char *network, const char *data_dir);
+
+/* Like myotis_create, but the light client bootstraps from the CALLER's beacon
+ * block root (32-byte hex, 0x optional) and header slot instead of the
+ * embedded checkpoint — the recovery path for an install parked in
+ * STALE_ANCHOR after the host obtained a fresher checkpoint by its own means.
+ * The engine does NOT authenticate the root; it pins the bootstrap to it and
+ * verifies forward from it exactly as from the embedded checkpoint (BLS on
+ * every update, snapshot probation, weak-subjectivity gate on the supplied
+ * slot's age). `checkpoint_slot` is the checkpoint block header's slot, not the
+ * epoch boundary; >= 1 and not in the future (the Node binding additionally
+ * bounds it to a JS safe integer). The first call on a
+ * directory records the anchor in `sync-anchor[-net].json`; later calls with
+ * the SAME root+slot resume that generation (normal snapshot resume rules),
+ * anything else is refused: -3 for a different anchor or a directory holding
+ * embedded-anchor state, -1 invalid input / runtime failure / empty data_dir /
+ * a data_dir another live handle of this process already uses, -2 unsupported
+ * network. Requires ABI >= 26. */
+int64_t myotis_create_with_checkpoint(const char *network, const char *data_dir,
+                                      const char *checkpoint_root, uint64_t checkpoint_slot);
 
 /* Start the sync loop. False for an unknown/already-running handle. */
 bool myotis_start(int64_t handle);

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 25; // 25: + setWsBoundPeriods/acceptStaleAnchor (weak-subjectivity gate)
+    static final int EXPECTED_ABI_VERSION = 26; // 26: + createWithCheckpoint (caller-supplied trust anchor, #441)
 
     private static final boolean AVAILABLE = load();
 
@@ -136,6 +136,12 @@ final class RustEngineNative {
      *  doesn't host it yet (must match {@code UNSUPPORTED_NETWORK} in
      *  rust/myotis-engine/src/host.rs). */
     static final long UNSUPPORTED_NETWORK = -2;
+    /** The dataDir is bound to a checkpoint the host supplied through the plain-C /
+     *  Node {@code myotis_create_with_checkpoint} (ABI 26, {@code sync-anchor[-net].json}
+     *  next to the snapshot). The JVM has no wrapper for that path and must never resume
+     *  such a directory from the embedded anchor — see {@link RustMyotisEngine}. Must
+     *  match {@code ANCHOR_MISMATCH} in rust/myotis-engine/src/host.rs. */
+    static final long ANCHOR_MISMATCH = -3;
 
     /** The embedded network catalog as a JSON array of NetworkInfo objects. */
     static String nativeAvailableNetworksJson() {

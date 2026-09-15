@@ -52,8 +52,11 @@ pub fn canonical_network_name(name_or_alias: String) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Hosting surface. Sentinels unchanged: create returns the handle id (>= 1),
-// -1 for unknown-name/runtime-init failure, -2 for canonical-but-unsupported.
+// Hosting surface. create returns the handle id (>= 1), -1 for
+// unknown-name/runtime-init failure, -2 for canonical-but-unsupported, and (v26)
+// -3 for a dataDir bound to a caller-supplied checkpoint via the plain-C/Node
+// `myotis_create_with_checkpoint` — the JVM has no wrapper for that path and
+// must not resume such a directory from the embedded anchor.
 // ---------------------------------------------------------------------------
 
 /// Allocate a not-yet-started handle for `network` (R1: mainnet only).
