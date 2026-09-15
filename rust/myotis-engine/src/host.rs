@@ -44,7 +44,8 @@ const SLOTS_PER_PERIOD: u64 = 8192;
 // but distinguishable for tests / future callers):
 /// Unknown network name, or the tokio runtime never came up.
 const CREATE_FAILED: i64 = -1;
-/// A canonical network that R1 does not host yet (anything but mainnet).
+/// A canonical catalog network this engine has no `ChainConfig` for (none today:
+/// mainnet, gnosis and sepolia are all hosted; kept for the contract).
 const UNSUPPORTED_NETWORK: i64 = -2;
 /// The dataDir already holds sync state from a DIFFERENT trust anchor than the
 /// one this call names: a caller-supplied checkpoint that does not match the
@@ -96,6 +97,15 @@ struct EngineState {
     /// re-polls). Kept at the JSON layer so a hit costs a String clone, never
     /// a result rebuild. Entries die with their handle (see `stop`).
     fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
+    /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
+    /// anchor-marker read/write, registration). Every guard in those paths is
+    /// check-then-act against the filesystem and the handle map; without one
+    /// lock across all of it, two racing creates on the same dataDir could both
+    /// pass and persist different generations into one snapshot. Creates are
+    /// cold, so a coarse lock costs nothing (the JVM's `RustMyotisEngine.create`
+    /// is `synchronized` for the same reason). Never held while `handles` is
+    /// taken by anything that could wait on a create.
+    create_lock: Mutex<()>,
 }
 
 /// How long a last-good `eth_feeHistory` result may be re-served (the Java
@@ -121,6 +131,7 @@ fn engine() -> Option<&'static EngineState> {
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
+            create_lock: Mutex::new(()),
                 }),
                 Err(_) => None,
             }
@@ -193,6 +204,10 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
         Ok(c) => c,
         Err(sentinel) => return sentinel,
     };
+    // Guard + register under one lock (see `EngineState::create_lock`).
+    let Ok(_serial) = engine.create_lock.lock() else {
+        return CREATE_FAILED;
+    };
     if !data_dir.is_empty() {
         let dir = match bind_persistence(&mut config, data_dir) {
             Ok(d) => d,
@@ -201,10 +216,11 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
         // A directory carrying a caller-supplied anchor belongs to that
         // generation: the embedded checkpoint is a different trust anchor, and
         // the snapshot-resume rule would happily continue from the caller's
-        // verified state as if it descended from ours. An unreadable marker
-        // counts too (same rule as create_with_checkpoint: never unlock on a
-        // marker we cannot read).
-        if anchor_marker_path(&dir, &config).exists() {
+        // verified state as if it descended from ours. Fail closed: only a
+        // marker that is DEFINITELY absent lets the embedded anchor in — one
+        // that exists, is unreadable, or cannot even be stat'ed all refuse
+        // (same rule as create_with_checkpoint).
+        if !matches!(anchor_marker_path(&dir, &config).try_exists(), Ok(false)) {
             tracing::warn!(data_dir, "dataDir was bootstrapped from a caller-supplied \
                 checkpoint — refusing to create it from the embedded anchor");
             return ANCHOR_MISMATCH;
@@ -228,7 +244,14 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
 /// chain that follows from it, the persisted snapshot stays on probation until
 /// an update verifies against it, and the weak-subjectivity gate judges the
 /// supplied slot's age like any other anchor: a root that is itself past the
-/// bound still parks in `STALE_ANCHOR`. Supplying a checkpoint therefore never
+/// bound still parks in `STALE_ANCHOR`. That last guarantee is enforced by the
+/// IN-RUN re-check in the sync loop (the one that re-judges the store's period
+/// right after bootstrap, before catch-up — `run_sync`'s held-gate in
+/// myotis-net's sync.rs), which reads the period the store derived from the
+/// VERIFIED header, not from the slot the caller claimed; the start-time gate
+/// only sees the claim, so an overstated slot buys exactly one bootstrap
+/// (pinned to the caller's own root) and no forward sync. Keep that re-check
+/// when refactoring the loop. Supplying a checkpoint therefore never
 /// marks the client synced or unlocks verified reads early; it only moves the
 /// anchor. Whether the root is the honest chain's is the caller's
 /// responsibility and must be described as such to users.
@@ -294,6 +317,11 @@ pub fn create_with_checkpoint(
             "createWithCheckpoint: checkpoint slot is zero or in the future");
         return CREATE_FAILED;
     }
+    // Guard, marker I/O and registration under one lock (see
+    // `EngineState::create_lock`): every check below is check-then-act.
+    let Ok(_serial) = engine.create_lock.lock() else {
+        return CREATE_FAILED;
+    };
     let dir = match bind_persistence(&mut config, data_dir) {
         Ok(d) => d,
         Err(sentinel) => return sentinel,

@@ -82,7 +82,9 @@ public final class JavaMyotisEngine implements MyotisEngine {
             java.nio.file.Path snap = Paths.get(config.syncSnapshotPath());
             java.nio.file.Path marker = snap.resolveSibling(
                     "sync-anchor" + ("mainnet".equals(name) ? "" : "-" + name) + ".json");
-            if (java.nio.file.Files.exists(marker)) {
+            // Fail closed: only a marker that is DEFINITELY absent lets this engine
+            // in (Files.exists is false when the status cannot be determined).
+            if (!java.nio.file.Files.notExists(marker)) {
                 throw new EngineException("snapshot directory " + snap.getParent()
                         + " is bound to a caller-supplied checkpoint (" + marker.getFileName()
                         + "); the Java engine cannot resume it — use a fresh directory");

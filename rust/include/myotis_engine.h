@@ -71,8 +71,9 @@ int64_t myotis_create(const char *network, const char *data_dir);
  * directory records the anchor in `sync-anchor[-net].json`; later calls with
  * the SAME root+slot resume that generation (normal snapshot resume rules),
  * anything else is refused: -3 for a different anchor or a directory holding
- * embedded-anchor state, -1 invalid input / runtime failure / empty data_dir,
- * -2 unsupported network. Requires ABI >= 26. */
+ * embedded-anchor state, -1 invalid input / runtime failure / empty data_dir /
+ * a data_dir another live handle of this process already uses, -2 unsupported
+ * network. Requires ABI >= 26. */
 int64_t myotis_create_with_checkpoint(const char *network, const char *data_dir,
                                       const char *checkpoint_root, uint64_t checkpoint_slot);
 
