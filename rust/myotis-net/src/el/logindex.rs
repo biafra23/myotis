@@ -1311,75 +1311,86 @@ fn parse_body(
 mod tests {
     /// `scripts/synth_logindex.py` re-implements `serialize_impl` byte for
     /// byte so a full node's `eth_getLogs` output can seed the index without
-    /// a devp2p walk (an UNVERIFIED seed — the script says so). Pin that the
-    /// frame it writes is accepted by the portable loader and queryable, so
-    /// a layout change on either side fails here rather than at import.
+    /// a devp2p walk (an UNVERIFIED, debug-only seed — the script says so).
+    /// Pin that the frame it writes is accepted by the portable loader and
+    /// queryable with the honest refusal below the fetched span, so a layout
+    /// change on either side fails here rather than at import. Skips (loudly)
+    /// where `python3` is not runnable — the pin holds on the Linux CI lanes,
+    /// which always have it; the Windows smoke lane runs `cargo test
+    /// --workspace` too and must not go red for a missing interpreter.
     #[test]
     fn synth_logindex_script_frame_is_importable() {
-        use super::*;
-        fn unhex<const N: usize>(s: &str) -> [u8; N] {
-            let mut out = [0u8; N];
-            for (i, b) in out.iter_mut().enumerate() {
-                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
-            }
-            out
+        let python_runs = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !python_runs {
+            eprintln!("skipping synth_logindex_script_frame_is_importable: python3 is not runnable here");
+            return;
         }
-        let hex32 = unhex::<32>;
-        let hex20 = unhex::<20>;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let script = root.join("scripts/synth_logindex.py");
-        let dir = std::env::temp_dir().join(format!("logindex-synth-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let addr = "0x45a1502382541Cd610CC9068e88727426b696293";
-        let t1 = format!("0x{}", "11".repeat(32));
-        let t2 = format!("0x{}", "22".repeat(32));
-        let bh = format!("0x{}", "aa".repeat(32));
-        let th = format!("0x{}", "bb".repeat(32));
-        // Two kept logs (blocks 47_000_005 and 47_000_009) and one `removed`
-        // entry the script must drop.
-        let jsonl = format!(
-            concat!(
-                r#"{{"address":"{a}","topics":["{t1}","{t2}"],"data":"0xdeadbeef","blockNumber":"0x2cd29c5","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x3","logIndex":"0x7","removed":false}}"#,
-                "\n",
-                r#"{{"address":"{a}","topics":["{t2}"],"data":"0x","blockNumber":"0x2cd29c9","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x0","logIndex":"0x0","removed":false}}"#,
-                "\n",
-                r#"{{"address":"{a}","topics":["{t1}"],"data":"0x01","blockNumber":"0x2cd29c9","blockHash":"{bh}","transactionHash":"{th}","transactionIndex":"0x0","logIndex":"0x1","removed":true}}"#,
-                "\n",
-            ),
-            a = addr,
-            t1 = t1,
-            t2 = t2,
-            bh = bh,
-            th = th,
-        );
-        let input = dir.join("logs.jsonl");
-        std::fs::write(&input, jsonl).unwrap();
-        let out = dir.join("synth.db");
-        let status = std::process::Command::new("python3")
-            .arg(&script)
-            .args(["--network-id", "100"])
-            .args(["--watch", &format!("{addr}:47000000")])
-            .args(["--to-block", "47000010"])
-            .arg("--logs")
-            .arg(&input)
-            .arg("--out")
-            .arg(&out)
-            .status()
-            .expect("python3 must be available to run scripts/synth_logindex.py");
-        assert!(status.success(), "synth_logindex.py failed: {status}");
+        // Removed on every exit path, including a failing assert.
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!("logindex-synth-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/synth_logindex.py");
 
+        // A synthetic contract at [0x45; 20], deployed at 31_305_656, fetched
+        // over 47_000_000..=47_000_010: two kept logs (blocks 47_000_005 and
+        // 47_000_009) and one `removed` entry the script must drop.
+        let address = [0x45u8; 20];
+        let line = |topics: &[u8], data: &str, block: &str, tx_index: &str, log_index: &str, removed: bool| {
+            let topics: Vec<String> = topics.iter().map(|b| format!("\"0x{}\"", format!("{b:02x}").repeat(32))).collect();
+            format!(
+                r#"{{"address":"0x{}","topics":[{}],"data":"{data}","blockNumber":"{block}","blockHash":"0x{}","transactionHash":"0x{}","transactionIndex":"{tx_index}","logIndex":"{log_index}","removed":{removed}}}"#,
+                "45".repeat(20),
+                topics.join(","),
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        };
+        let good = [
+            line(&[0x11, 0x22], "0xdeadbeef", "0x2cd29c5", "0x3", "0x7", false),
+            line(&[0x22], "0x", "0x2cd29c9", "0x0", "0x0", false),
+            line(&[0x11], "0x01", "0x2cd29c9", "0x0", "0x1", true),
+        ]
+        .join("\n");
+        let run = |name: &str, jsonl: &str| -> (bool, std::path::PathBuf) {
+            let input = dir.0.join(format!("{name}.jsonl"));
+            std::fs::write(&input, jsonl).unwrap();
+            let out = dir.0.join(format!("{name}.db"));
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .args(["--network-id", "100"])
+                .args(["--watch", &format!("0x{}:31305656", "45".repeat(20))])
+                .args(["--from-block", "47000000", "--to-block", "47000010", "--finality-margin", "0"])
+                .arg("--logs")
+                .arg(&input)
+                .arg("--out")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("python3 was runnable a moment ago");
+            (status.success(), out)
+        };
+
+        let (ok, out) = run("good", &good);
+        assert!(ok, "synth_logindex.py rejected a well-formed input");
         let (tag, ix) = LogIndex::load_portable(&out).expect("the synthesized frame must load");
-        assert_eq!(tag.network_id, 100);
-        assert_eq!(
-            tag.genesis_hash,
-            hex32("4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756")
-        );
-        let address = hex20("45a1502382541cd610cc9068e88727426b696293");
+        let gnosis = crate::el::reader::ElConfig::gnosis();
+        assert_eq!(tag.network_id, gnosis.network_id);
+        assert_eq!(tag.genesis_hash, gnosis.genesis_hash);
         assert_eq!(ix.config.watch.len(), 1);
         assert_eq!(ix.config.watch[0].address, address);
-        assert_eq!(ix.config.watch[0].from_block, 47_000_000);
+        assert_eq!(ix.config.watch[0].from_block, 31_305_656, "the deployment block, not the fetch's low edge");
         assert!(ix.config.watch[0].topic0s.is_empty());
-        assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)));
+        assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)), "coverage is the fetched range");
         assert_eq!(ix.cursor, None);
         assert_eq!(ix.log_count(), 2);
 
@@ -1406,13 +1417,23 @@ mod tests {
             .unwrap();
         assert_eq!(only_t1.len(), 1);
         assert_eq!(only_t1[0].block_number, 47_000_005);
-        // Below the span's low is asserted log-free by from_block; above the
-        // high is out of coverage — the honest refusal, never `[]`.
-        assert!(matches!(
-            ix.query(&LogFilter { from_block: 47_000_000, to_block: 47_000_011, addresses: vec![address], topics: vec![] }),
-            Err(QueryError::OutOfCoverage { .. })
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Between the deployment block and the fetched span, and above the
+        // span's high: out of coverage — the honest refusal, never `[]`.
+        for (from, to) in [(31_305_656, 46_999_999), (46_999_990, 47_000_010), (47_000_000, 47_000_011)] {
+            assert!(
+                matches!(
+                    ix.query(&LogFilter { from_block: from, to_block: to, addresses: vec![address], topics: vec![] }),
+                    Err(QueryError::OutOfCoverage { .. })
+                ),
+                "{from}..{to} must be refused, not answered"
+            );
+        }
+
+        // A log outside the declared fetch range contradicts the coverage the
+        // frame would assert: the script must refuse, not drop it.
+        let outside = [good.as_str(), &line(&[0x11], "0x", "0x2cd29cb", "0x0", "0x0", false)].join("\n");
+        let (ok, _) = run("outside", &outside);
+        assert!(!ok, "a log above --to-block must be a hard error");
     }
 
     #[test]

@@ -78,45 +78,14 @@ its deployment block:
      ./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status
      ```
 
-   - **Seed it from a full node in minutes — UNVERIFIED** (demo / bootstrap
-     path, `scripts/synth_logindex.py`). Two facts make this small: only the
-     PostageStamp contract's logs are ever requested (Bee reads the staking,
-     redistribution and oracle contracts with `eth_call`), and Bee v2.8.2
-     embeds a batch snapshot up to block **47,061,407** (`batch-archive
-     v0.0.9`) that it replays in-process, so it asks the RPC for logs only
-     above that. Fetch the ~40k logs from 47,000,000 to head with one
-     `eth_getLogs` per 50,000 blocks from any Gnosis full node (seconds; one
-     JSON object per line, exactly as returned), then frame them:
-
-     ```bash
-     scripts/synth_logindex.py --network-id 100 \
-         --watch 0x45a1502382541Cd610CC9068e88727426b696293:47000000 \
-         --to-block <the fetch's fixed toBlock> \
-         --logs data/bee/gnosis/postagestamp-logs-47000000-<toBlock>.jsonl.gz \
-         --out /tmp/bee-logindex-gnosis-seed.db
-     ./gradlew :app:run -Pnetwork=gnosis -Pargs="import-logindex /tmp/bee-logindex-gnosis-seed.db"
-     ```
-
-     The bridge closes the gap from the file's top to head within seconds
-     and the appender follows from there, verified. What is NOT verified is
-     the seeded span itself: the import path takes a file as "claimed
-     verified by whoever generated it" (docs/eth-getlogs-design.md §Import),
-     and here the generator is a full node's RPC. The walker does re-descend
-     through the seeded span afterwards (`blocksRemaining` in
-     `logindex-status` counts down at the usual 30–83 blk/s), but served
-     logs do not distinguish imported from walked coverage. Two more
-     caveats: `--watch …:47000000` is the `--from` trust assertion — it
-     asserts the contract has no logs below 47,000,000, which is false in
-     general and fine only because Bee's snapshot covers them, so this seed
-     cannot be combined with `skip-postage-snapshot: true`; and the seed is
-     one address only, not the four-contract index above. A fetched data
-     set lives in `data/bee/gnosis/` with a `.meta.json` recording the
-     node, head, hashes and sha256 (2026-09-15: zbox's Gnosis geth,
-     47,000,000–48,262,804, 39,225 logs, 3.2 MB gzipped).
+   (There is also a debug-only third way for a demo box — see *Demo only:
+   seeding from a full node* below. It is not a production path.)
 
 4. **Wait for readiness.** `beacon-status` must say `"state":"SYNCED"`, and
-   `logindex-status` must show the coverage you need (for full Bee function,
-   `backfillCursor` at the target and a small `headGap`).
+   `logindex-status` must show the coverage you need: for full Bee function,
+   `backfillCursor` at the target and a small `headGap`; for the demo seed,
+   `coveredLow` at or below Bee's resume block (47,061,408 for Bee v2.8.2 —
+   the seed's own low is 47,000,000) and `headGap` closed.
 
 5. **Point Bee at it.** Myotis serves verified JSON-RPC on
    `http://127.0.0.1:8546` for Gnosis (per-network ports; mainnet is 8545).
@@ -131,10 +100,12 @@ its deployment block:
 - **HTTP polling only.** Myotis serves plain HTTP JSON-RPC. There is no
   WebSocket endpoint and no `eth_newFilter`/`eth_subscribe` family; Bee's
   default HTTP polling mode works, a subscription-configured Bee does not.
-- **Coverage is explicit.** A query outside the indexed contracts or below
-  their fromBlocks errors out (`-32000`, the **retryable** class — backfill may
-  cover the range later, so a client should retry, not give up) instead of
-  returning `[]`. That is deliberate: an honest refusal can be retried, a
+- **Coverage is explicit.** A query outside the indexed contracts or outside
+  their covered range errors out (`-32000`, the **retryable** class — backfill
+  may cover the range later, so a client should retry, not give up) instead of
+  returning `[]`. The one range answered empty by definition is below an
+  entry's `fromBlock`, which is why that value must be the contract's real
+  deployment block. That is deliberate: an honest refusal can be retried, a
   fabricated empty answer is silent corruption. Only a malformed request gets
   the permanent `-32602`.
 - **Historical state pins are rejected.** Reads pinned to old blocks answer
@@ -160,6 +131,68 @@ its deployment block:
   retries every 5 s while that clock runs.
 - The end-to-end Bee-against-Myotis compatibility run is still to be done;
   this document describes the serving surface, not a completed certification.
+
+## Demo only: seeding from a full node (not for production)
+
+`scripts/synth_logindex.py` frames a full node's raw `eth_getLogs` output as
+an MLIX v2 snapshot the import path accepts. The repo rule stands: a local
+client over http "may only be used for debugging purposes, it is not an
+option for production" (CLAUDE.md, *Data sources*), and the engine serves an
+imported file's logs indistinguishably from walked ones (the provenance
+marker is tracked follow-up work in docs/eth-getlogs-design.md §Import). Use
+this to stand up a demo today; the verified paths above are the product.
+
+Why it is small: only the PostageStamp contract's logs are ever requested
+(Bee reads the staking, redistribution and oracle contracts with `eth_call`),
+and Bee v2.8.2 embeds a batch snapshot up to block **47,061,407**
+(`batch-archive v0.0.9`) that it replays in-process, so it asks the RPC for
+logs only above that. Fetch the ~40k logs from 47,000,000 to the node's
+**`finalized`** block with one `eth_getLogs` per 50,000 blocks (seconds), one
+JSON object per line exactly as returned, write the sidecar `.meta.json` the
+script checks against (chain id, genesis, address, range, sha256 — see the
+committed example), then frame and import:
+
+```bash
+scripts/synth_logindex.py \
+    --meta data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json \
+    --logs data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz \
+    --watch 0x45a1502382541Cd610CC9068e88727426b696293:31305656 \
+    --out /tmp/bee-logindex-gnosis-seed.db
+./gradlew :app:run -Pnetwork=gnosis -Pargs="import-logindex /tmp/bee-logindex-gnosis-seed.db"
+```
+
+What the frame claims, and what stays honest:
+
+- `--watch …:31305656` is the contract's real deployment block. Coverage is
+  the fetched range only, so a query between the two (Bee never makes one
+  while its snapshot is in use) gets the `-32000` refusal, and the walker
+  backfills that band over devp2p in the background, verified — never a
+  fabricated `[]`. Passing the fetch's low edge as the deployment block is
+  refused by the script for exactly that reason.
+- The span high is `toBlock − 128` by default: a fetch that ran to `latest`
+  can hold a block that was reorged out afterwards, and the walker's
+  re-descent only fills holes — it never evicts a seeded log. The dropped
+  band is re-fetched verified by the head bridge, which takes minutes for
+  today's gap, not seconds. Fetch to `finalized` and pass
+  `--finality-margin 0` when the range is known final.
+- **Shelf life: 500,000 blocks (~29 days on Gnosis).** The head bridge maps
+  at most that much above a file's top (`MAX_GAP`, el/reader.rs); a seed
+  older than that imports fine and then never catches up, and Bee's pages
+  above it stay `-32000` until its 10-minute stall timeout stops it. The
+  committed data set tops out at 48,262,804, i.e. it is usable until about
+  block 48,762,804 (~2026-10-14); after that, re-fetch.
+- **Fresh index, or re-seed from the same low.** `LogIndex::merge` clamps
+  coverage to the lowest high among the sources and drops a span that does
+  not reach it: importing the seed into an index whose own coverage tops out
+  below 47,000,000 (a from-scratch build in progress) silently discards the
+  seed, and a later top-up must start at 47,000,000 again, not at the old
+  top.
+- The seed is one address, not the four-contract index above.
+
+The committed data set (`data/bee/gnosis/`, 2026-09-15, zbox's Gnosis geth,
+47,000,000–48,262,804, 39,225 logs, 3.2 MB gzipped) is a one-off demo
+artifact. Do not refresh it in git — the rule in the next section applies to
+any recurring data set.
 
 ## Distributing the prebuilt snapshot
 
