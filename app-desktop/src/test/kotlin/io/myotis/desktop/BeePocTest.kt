@@ -1,6 +1,8 @@
 package io.myotis.desktop
 
 import io.myotis.api.NetworkInfo
+import io.myotis.desktop.BeePoc.Outcome
+import io.myotis.ui.LogIndexWatch
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -13,8 +15,9 @@ import java.security.MessageDigest
 
 /**
  * The Bee PoC flavour's first-start behaviour: the bundled seed lands in the data dir
- * exactly once (never over an index the engine owns), only when its sha256 matches the
- * manifest, and the first start boots Gnosis with the log index on.
+ * exactly once per seed version (never over an index this flavour did not install, and
+ * never over a newer-or-equal one), only when its sha256 matches the manifest, and the
+ * first start boots Gnosis with the log index on.
  */
 class BeePocTest {
 
@@ -26,8 +29,8 @@ class BeePocTest {
     private fun sha256(bytes: ByteArray) =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    private fun stageBundle(dir: Path, seed: ByteArray, sha: String = sha256(seed)): Path {
-        val res = dir.resolve("resources")
+    private fun stageBundle(dir: Path, seed: ByteArray, sha: String = sha256(seed), high: Long = 48_262_676): Path {
+        val res = dir.resolve("resources-$high")
         Files.createDirectories(res)
         Files.write(res.resolve(BeePoc.SEED_FILE), seed)
         Files.writeString(
@@ -36,8 +39,8 @@ class BeePocTest {
             network=gnosis
             address=${BeePoc.POSTAGE_STAMP}
             coveredLow=47000000
-            coveredHigh=48262676
-            usableUntilBlock=48762676
+            coveredHigh=$high
+            usableUntilBlock=${high + 500_000}
             logs=39213
             sha256=$sha
             """.trimIndent(),
@@ -46,35 +49,67 @@ class BeePocTest {
     }
 
     @Test
-    fun `seed is installed once, with its manifest, and never overwrites`(@TempDir dir: Path) {
+    fun `seed is installed once, with its manifest, and never overwrites the same version`(@TempDir dir: Path) {
         val seed = "MLIX-fake-seed".toByteArray()
         val res = stageBundle(dir, seed)
         val data = dir.resolve("data")
 
-        assertTrue(BeePoc.installSeedIfAbsent(res, data))
+        assertEquals(Outcome.INSTALLED, BeePoc.installSeedIfAbsent(res, data))
         val installed = data.resolve(BeePoc.SEED_FILE)
         assertTrue(Files.readAllBytes(installed).contentEquals(seed))
         assertTrue(Files.isRegularFile(data.resolve(BeePoc.INSTALLED_MANIFEST_FILE)))
         assertFalse(Files.exists(data.resolve("${BeePoc.SEED_FILE}.tmp")), "no temp file left behind")
 
-        // The engine owns the file after the first start: a later launch must leave it alone.
+        // The engine owns the file after the first start: a later launch of the same
+        // build must leave it alone.
         Files.write(installed, "engine-checkpoint".toByteArray())
-        assertFalse(BeePoc.installSeedIfAbsent(res, data))
+        assertEquals(Outcome.KEPT_EXISTING, BeePoc.installSeedIfAbsent(res, data))
         assertEquals("engine-checkpoint", Files.readString(installed))
+    }
+
+    @Test
+    fun `a newer bundled seed re-seeds, an older one does not`(@TempDir dir: Path) {
+        val data = dir.resolve("data")
+        val v1 = stageBundle(dir, "seed-v1".toByteArray(), high = 48_262_676)
+        assertEquals(Outcome.INSTALLED, BeePoc.installSeedIfAbsent(v1, data))
+        Files.write(data.resolve(BeePoc.SEED_FILE), "engine-checkpoint".toByteArray())
+
+        val older = stageBundle(dir, "seed-v0".toByteArray(), high = 48_000_000)
+        assertEquals(Outcome.KEPT_EXISTING, BeePoc.installSeedIfAbsent(older, data))
+        assertEquals("engine-checkpoint", Files.readString(data.resolve(BeePoc.SEED_FILE)))
+
+        val newer = stageBundle(dir, "seed-v2".toByteArray(), high = 48_800_000)
+        assertEquals(Outcome.INSTALLED, BeePoc.installSeedIfAbsent(newer, data))
+        assertEquals("seed-v2", Files.readString(data.resolve(BeePoc.SEED_FILE)))
+        assertTrue(Files.readString(data.resolve(BeePoc.INSTALLED_MANIFEST_FILE)).contains("coveredHigh=48800000"))
+    }
+
+    @Test
+    fun `an index this flavour did not install is never touched`(@TempDir dir: Path) {
+        val data = dir.resolve("data")
+        Files.createDirectories(data)
+        Files.write(data.resolve(BeePoc.SEED_FILE), "user-imported".toByteArray()) // no installed manifest
+        val res = stageBundle(dir, "seed".toByteArray())
+        assertEquals(Outcome.KEPT_EXISTING, BeePoc.installSeedIfAbsent(res, data))
+        assertEquals("user-imported", Files.readString(data.resolve(BeePoc.SEED_FILE)))
     }
 
     @Test
     fun `a seed that does not match its manifest is not installed`(@TempDir dir: Path) {
         val res = stageBundle(dir, "MLIX-fake-seed".toByteArray(), sha = "00".repeat(32))
         val data = dir.resolve("data")
-        assertFalse(BeePoc.installSeedIfAbsent(res, data))
+        assertEquals(Outcome.BAD_CHECKSUM, BeePoc.installSeedIfAbsent(res, data))
         assertFalse(Files.exists(data.resolve(BeePoc.SEED_FILE)))
+        // …and the Index tab says so instead of showing a seed.
+        val notice = BeePoc.seededIndexNotice(data, "gnosis")!!
+        assertTrue(notice.contains("NOT installed"), notice)
+        assertTrue(notice.contains("bad checksum"), notice)
     }
 
     @Test
     fun `nothing bundled means nothing installed`(@TempDir dir: Path) {
-        assertFalse(BeePoc.installSeedIfAbsent(null, dir.resolve("data")))
-        assertFalse(BeePoc.installSeedIfAbsent(dir.resolve("missing"), dir.resolve("data")))
+        assertEquals(Outcome.NOT_BUNDLED, BeePoc.installSeedIfAbsent(null, dir.resolve("data")))
+        assertEquals(Outcome.NOT_BUNDLED, BeePoc.installSeedIfAbsent(dir.resolve("missing"), dir.resolve("data")))
     }
 
     @Test
@@ -85,11 +120,18 @@ class BeePocTest {
         assertEquals("gnosis", settings.primaryNetwork())
         assertTrue(settings.logIndexEnabled("gnosis"))
         assertTrue(settings.logIndexConfigured("gnosis"))
-        assertEquals(BeePoc.WATCH_JSON, settings.logIndexWatchJson("gnosis"))
+        assertEquals(
+            listOf(LogIndexWatch.Entry(BeePoc.POSTAGE_STAMP, BeePoc.POSTAGE_STAMP_DEPLOYED)),
+            LogIndexWatch.parse(settings.logIndexWatchJson("gnosis")),
+        )
         // …and survives a restart (a fresh instance over the same file).
         val again = DesktopSettings(nets, dir.resolve("settings.properties"))
         assertEquals(listOf("gnosis"), again.enabledNetworks())
         assertTrue(again.logIndexEnabled("gnosis"))
+        assertEquals(
+            listOf(LogIndexWatch.Entry(BeePoc.POSTAGE_STAMP, BeePoc.POSTAGE_STAMP_DEPLOYED)),
+            LogIndexWatch.parse(again.logIndexWatchJson("gnosis")),
+        )
     }
 
     @Test
@@ -105,7 +147,6 @@ class BeePocTest {
     fun `the index tab notice comes from the installed manifest`(@TempDir dir: Path) {
         val res = stageBundle(dir, "MLIX-fake-seed".toByteArray())
         val data = dir.resolve("data")
-        assertNull(BeePoc.seededIndexNotice(data, "gnosis"), "nothing installed yet")
         BeePoc.installSeedIfAbsent(res, data)
         val notice = BeePoc.seededIndexNotice(data, "gnosis")!!
         assertTrue(notice.contains("47000000–48262676"), notice)

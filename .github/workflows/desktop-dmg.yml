@@ -44,20 +44,27 @@ jobs:
       # Two flavours: the regular app, and the Bee PoC build (-PbeePoc) that
       # bundles the Gnosis PostageStamp log-index seed so a Swarm Bee full node
       # can use it from the first minute (app-desktop/build.gradle.kts,
-      # docs/bee-rpc-service.md). The PoC is built on EVERY PR (arm64) so the
-      # Swarm team always has a current artifact to test; it never goes to a
-      # release (the release job's artifact pattern excludes it).
+      # docs/bee-rpc-service.md). The PoC leg runs on every PR and on pushes
+      # to main (arm64) so the Swarm team always has a current artifact to
+      # test (owner's call — it costs a second jpackage leg per PR). It is NOT
+      # part of tag builds: it never goes to a release, and a PoC-only failure
+      # must not block one (the release job needs every leg of this job).
+      # Each entry carries its own build flags, dmg name and artifact name so
+      # the steps below stay data-driven.
       matrix:
         include: ${{ github.event_name == 'pull_request'
-          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc"}]')
-          || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard"},{"arch":"x64","java-arch":"x64","flavor":"standard"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc"}]') }}
+          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')
+          || (startsWith(github.ref, 'refs/tags/')
+          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"}]')
+          || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')) }}
     runs-on: macos-14
     permissions:
       contents: read
     env:
       # The arch-tagged (and flavour-tagged) name the built dmg is renamed to,
-      # shared by the rename, verify and release steps.
-      DMG_NAME: ${{ matrix.flavor == 'bee-poc' && format('Myotis-bee-poc-{0}.dmg', matrix.arch) || format('Myotis-{0}.dmg', matrix.arch) }}
+      # shared by the rename and verify steps; the release job expects the
+      # standard legs' Myotis-<arch>.dmg.
+      DMG_NAME: ${{ matrix.dmg }}
 
     steps:
       - name: Checkout
@@ -150,7 +157,7 @@ jobs:
           RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
         run: |
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
-          FLAVOR_ARGS="${{ matrix.flavor == 'bee-poc' && '-PbeePoc' || '' }}"
+          FLAVOR_ARGS="${{ matrix.gradle-args }}"
           for attempt in 1 2 3; do
             ./gradlew :app-desktop:packageDmg --stacktrace $GRADLE_ARGS $FLAVOR_ARGS && exit 0
             echo "::warning::DMG build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
@@ -220,27 +227,39 @@ jobs:
           echo "$rustarchs" | tr ' ' '\n' | grep -qx "$want" \
             || { echo "::error::rust engine arch mismatch: expected $want, got [$rustarchs]"; exit 1; }
           echo "OK: bundled rust engine is $want"
-          # JNA's native stub must ship signed inside the bundle, or macOS refuses
-          # the unsigned temp copy JNA would extract and the Rust engine never
-          # loads (see prepareJnaBootLib in app-desktop/build.gradle.kts).
-          jna=$(find "$mnt" -type f -name 'libjnidispatch.jnilib' | head -n1 || true)
-          [ -n "$jna" ] || { echo "::error::libjnidispatch.jnilib missing from the dmg — the packaged app cannot load the Rust engine"; exit 1; }
-          echo "bundled JNA stub: $jna -> [$(lipo -archs "$jna")]"
-          # The Bee PoC flavour must actually carry its seed — the whole point of
-          # that artifact — plus the manifest the app checks it against.
+          # JNA's native stub must ship inside the bundle, matching the dmg's arch
+          # AND carrying a valid code signature: a wrong-arch or unsigned stub makes
+          # JNA fall back to the unsigned temp extraction macOS refuses, and the
+          # Rust engine silently never loads (see prepareJnaBootLib in
+          # app-desktop/build.gradle.kts). JNA swallows the boot-path failure, so
+          # only this check would notice.
+          jna=$(find "$mnt" -type f -name 'libjnidispatch.dylib' | head -n1 || true)
+          [ -n "$jna" ] || { echo "::error::libjnidispatch.dylib missing from the dmg — the packaged app cannot load the Rust engine"; exit 1; }
+          jnaarchs=$(lipo -archs "$jna")
+          echo "bundled JNA stub: $jna -> [$jnaarchs]"
+          echo "$jnaarchs" | tr ' ' '\n' | grep -qx "$want" \
+            || { echo "::error::JNA stub arch mismatch: expected $want, got [$jnaarchs]"; exit 1; }
+          codesign --verify --verbose=2 "$jna" \
+            || { echo "::error::JNA stub is not validly signed — jpackage did not sign it"; exit 1; }
+          bundled_seed=$(find "$mnt" -type f -name 'logindex-gnosis.db' | head -n1 || true)
           if [ "${{ matrix.flavor }}" = "bee-poc" ]; then
-            seed=$(find "$mnt" -type f -name 'logindex-gnosis.db' | head -n1 || true)
+            # The Bee PoC flavour must actually carry its seed — the whole point
+            # of that artifact — plus the manifest the app checks it against.
             manifest=$(find "$mnt" -type f -name 'bee-poc-seed.properties' | head -n1 || true)
-            [ -n "$seed" ] && [ -n "$manifest" ] \
+            [ -n "$bundled_seed" ] && [ -n "$manifest" ] \
               || { echo "::error::bee-poc dmg is missing its seed or manifest"; exit 1; }
-            echo "bundled seed: $seed ($(stat -f%z "$seed") bytes)"
+            echo "bundled seed: $bundled_seed ($(stat -f%z "$bundled_seed") bytes)"
             cat "$manifest"
+          else
+            # …and the regular app must never carry the RPC-sourced seed.
+            [ -z "$bundled_seed" ] \
+              || { echo "::error::the standard dmg carries the Bee PoC seed ($bundled_seed)"; exit 1; }
           fi
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.flavor == 'bee-poc' && 'myotis-bee-poc-dmg' || 'myotis-desktop-dmg' }}-${{ matrix.arch }}-${{ github.sha }}
+          name: ${{ matrix.artifact }}-${{ github.sha }}
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
           if-no-files-found: error
           retention-days: 30

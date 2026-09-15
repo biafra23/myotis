@@ -1,5 +1,6 @@
 package io.myotis.desktop
 
+import io.myotis.ui.LogIndexWatch
 import io.myotis.ui.Settings
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -14,7 +15,8 @@ import java.util.Properties
  * IMMEDIATELY — no multi-day backfill. The Gnosis PostageStamp log-index seed is bundled
  * in the app bundle (Compose appResources), installed into the flavour's own data dir on
  * first start, and the first start enables Gnosis with the log index on, so
- * `http://127.0.0.1:8546` serves Bee's `eth_getLogs` pages from the first minute.
+ * `http://127.0.0.1:8546` serves Bee's `eth_getLogs` pages as soon as the beacon sync is
+ * `SYNCED` (seconds with a fresh anchor).
  *
  * This is a DEBUG / DEMO artefact, not a production path: the seed is a full node's
  * `eth_getLogs` output framed by `scripts/synth_logindex.py`, unverified until the walker
@@ -28,7 +30,14 @@ object BeePoc {
     const val PROP = "myotis.beePoc"
     const val NETWORK = "gnosis"
 
-    /** The seed as staged into appResources (`common/`), and the manifest beside it. */
+    /**
+     * The seed as staged into appResources (`common/`), and the manifest beside it. The
+     * seed's name is the engine's own drop-in name for this network —
+     * `dataDir/logindex-<network>.db`, derived in `rust/myotis-engine/src/host.rs`
+     * (`log_index_path`) from the sync-snapshot path the desktop host passes, and
+     * activated at engine start by `activate_log_index_from_disk`. A rename on the
+     * engine side must be mirrored here or the seed is silently never opened.
+     */
     const val SEED_FILE = "logindex-gnosis.db"
     const val MANIFEST_FILE = "bee-poc-seed.properties"
 
@@ -42,7 +51,15 @@ object BeePoc {
      */
     const val POSTAGE_STAMP = "0x45a1502382541Cd610CC9068e88727426b696293"
     const val POSTAGE_STAMP_DEPLOYED = 31_305_656L
-    const val WATCH_JSON = """[{"address":"$POSTAGE_STAMP","fromBlock":$POSTAGE_STAMP_DEPLOYED}]"""
+    val WATCH_JSON: String =
+        LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(POSTAGE_STAMP, POSTAGE_STAMP_DEPLOYED)))
+
+    /** What [installSeedIfAbsent] did on this launch — the Index tab says so when it went wrong. */
+    enum class Outcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FAILED }
+
+    @Volatile
+    var lastOutcome: Outcome? = null
+        private set
 
     fun enabled(): Boolean = System.getProperty(PROP).toBoolean()
 
@@ -50,38 +67,58 @@ object BeePoc {
     fun dataDir(): Path = Path.of(System.getProperty("user.home"), ".myotis-bee-poc")
 
     /**
-     * Copy the bundled seed (and its manifest) into [dataDir] when no index file exists there
-     * yet, after checking the seed's sha256 against the manifest. NEVER overwrites: once the
-     * engine has started it owns `logindex-gnosis.db` (it rewrites it as its own checkpoint),
-     * and a seed older than what the node accumulated would only lose coverage. Returns true
-     * when a seed was installed on this call.
+     * Install the bundled seed (and its manifest) into [dataDir]. The seed lands when no
+     * index file exists there yet, or when the bundled seed is NEWER than the one this
+     * flavour installed before (a rebuilt app after the previous seed's shelf life —
+     * the manifest's `coveredHigh` is the version); the sha256 is checked against the
+     * manifest first. It never touches an index this flavour did not install (no
+     * installed manifest), and it must run BEFORE the engine starts: the engine rewrites
+     * `logindex-gnosis.db` as its own checkpoint and activates whatever is there.
+     * Returns the outcome (also kept in [lastOutcome]).
      */
-    fun installSeedIfAbsent(resourcesDir: Path?, dataDir: Path): Boolean {
-        val dir = resourcesDir ?: return false
+    fun installSeedIfAbsent(resourcesDir: Path?, dataDir: Path): Outcome {
+        val outcome = install(resourcesDir, dataDir)
+        lastOutcome = outcome
+        return outcome
+    }
+
+    private fun install(resourcesDir: Path?, dataDir: Path): Outcome {
+        val dir = resourcesDir ?: return Outcome.NOT_BUNDLED
         val seed = dir.resolve(SEED_FILE)
         val manifest = dir.resolve(MANIFEST_FILE)
-        if (!Files.isRegularFile(seed) || !Files.isRegularFile(manifest)) return false
+        if (!Files.isRegularFile(seed) || !Files.isRegularFile(manifest)) return Outcome.NOT_BUNDLED
+        val bundled = loadProps(manifest) ?: return Outcome.NOT_BUNDLED
         val target = dataDir.resolve(SEED_FILE)
-        if (Files.exists(target)) return false
-        val props = loadProps(manifest) ?: return false
-        val expected = props.getProperty("sha256")?.lowercase()
+        val installedManifest = dataDir.resolve(INSTALLED_MANIFEST_FILE)
+        if (Files.exists(target)) {
+            val installed = loadProps(installedManifest)
+                ?: return Outcome.KEPT_EXISTING // an index this flavour did not install: leave it alone
+            val installedHigh = installed.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
+            val bundledHigh = bundled.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
+            if (bundledHigh <= installedHigh) return Outcome.KEPT_EXISTING
+            log.info(
+                "bee-poc: the bundled seed (to block {}) is newer than the installed one (to block {}) — re-seeding",
+                bundledHigh, installedHigh,
+            )
+        }
+        val expected = bundled.getProperty("sha256")?.lowercase()
         if (expected == null || sha256Hex(seed) != expected) {
             log.warn("bee-poc: bundled seed {} does not match its manifest sha256 — not installing", seed)
-            return false
+            return Outcome.BAD_CHECKSUM
         }
         return runCatching {
             Files.createDirectories(dataDir)
             atomicCopy(seed, target)
-            atomicCopy(manifest, dataDir.resolve(INSTALLED_MANIFEST_FILE))
+            atomicCopy(manifest, installedManifest)
             log.info(
                 "bee-poc: installed the bundled Gnosis log-index seed into {} (coverage {}–{}, usable until block {})",
-                target, props.getProperty("coveredLow"), props.getProperty("coveredHigh"), props.getProperty("usableUntilBlock"),
+                target, bundled.getProperty("coveredLow"), bundled.getProperty("coveredHigh"), bundled.getProperty("usableUntilBlock"),
             )
-            true
+            Outcome.INSTALLED
         }.onFailure {
             log.warn("bee-poc: seed install into {} failed: {}", dataDir, it.toString())
             runCatching { Files.deleteIfExists(target) }
-        }.getOrDefault(false)
+        }.getOrDefault(Outcome.FAILED)
     }
 
     /**
@@ -100,19 +137,29 @@ object BeePoc {
     }
 
     /**
-     * One line for the Index tab when [network]'s index was seeded by this flavour, from the
-     * installed manifest; null otherwise (regular installs, other networks).
+     * One line for the Index tab about [network]'s seed: what the installed manifest says
+     * it covered (the live coverage shown next to it grows from there), or why the bundled
+     * seed did not get installed on this launch. Null for other networks and for a regular
+     * install. Cheap to call once; callers cache it — nothing here changes after start.
      */
     fun seededIndexNotice(dataDir: Path, network: String): String? {
         if (network != NETWORK) return null
-        val props = loadProps(dataDir.resolve(INSTALLED_MANIFEST_FILE)) ?: return null
+        val props = loadProps(dataDir.resolve(INSTALLED_MANIFEST_FILE))
+        if (props == null) {
+            return when (lastOutcome) {
+                Outcome.BAD_CHECKSUM, Outcome.FAILED, Outcome.NOT_BUNDLED ->
+                    "Bee PoC: the bundled seed was NOT installed (${lastOutcome!!.name.lowercase().replace('_', ' ')}; see the log) — " +
+                        "this index will backfill from peers instead, which takes days."
+                else -> null
+            }
+        }
         val low = props.getProperty("coveredLow") ?: return null
         val high = props.getProperty("coveredHigh") ?: return null
         val until = props.getProperty("usableUntilBlock") ?: return null
         val logs = props.getProperty("logs") ?: "?"
         return "Bee PoC seed: $logs PostageStamp logs, blocks $low–$high, from a Gnosis full node — " +
-            "unverified until the walker re-fetches them; usable until about block $until " +
-            "(the head bridge spans at most 500,000 blocks above the seed)."
+            "unverified until the walker re-fetches them (the live coverage below grows from there); " +
+            "usable until about block $until, after which a rebuilt app re-seeds."
     }
 
     private fun loadProps(file: Path): Properties? =

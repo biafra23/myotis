@@ -4,8 +4,6 @@
 
 import org.gradle.api.tasks.PathSensitivity
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
-import java.security.MessageDigest
-import java.time.Instant
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -141,10 +139,18 @@ val composeOsArchDir = run {
     "$osPart-$archPart"
 }
 
-// Single source of truth for the staged-resources root: the staging task's
-// output, Compose's appResourcesRootDir, and the packaging tasks' input all
-// derive from it (a drifting duplicate literal would silently untrack).
-val rustAppResourcesRoot = layout.buildDirectory.dir("rustAppResources")
+// The Bee PoC flavour flag: `-PbeePoc` (bare, or any true value) builds the
+// PoC — see the Bee PoC section below; `-PbeePoc=false` is a regular build.
+val beePoc: Boolean = providers.gradleProperty("beePoc")
+    .map { it.isBlank() || it.toBoolean() }
+    .getOrElse(false)
+
+// Single source of truth for the staged-resources root: the staging tasks'
+// outputs, Compose's appResourcesRootDir, and the packaging tasks' input all
+// derive from it (a drifting duplicate literal would silently untrack). It is
+// FLAVOUR-SPECIFIC: the two flavours never share a staging dir, so a regular
+// build cannot ship a seed a -PbeePoc build staged earlier.
+val rustAppResourcesRoot = layout.buildDirectory.dir(if (beePoc) "beePocAppResources" else "rustAppResources")
 
 val prepareRustAppResources = tasks.register("prepareRustAppResources") {
     group = "build"
@@ -169,6 +175,14 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
             from(src)
             into(destDir)
         }
+        // The regular app must never carry the Bee PoC seed. The flavours stage
+        // into different roots, but a root that predates that split (or a stray
+        // copy) would be synced into the bundle unnoticed — scrub it here, on
+        // every regular staging run.
+        if (!beePoc) {
+            val common = rustAppResourcesRoot.get().dir("common").asFile
+            listOf("logindex-gnosis.db", "bee-poc-seed.properties").forEach { common.resolve(it).delete() }
+        }
     }
 }
 
@@ -180,55 +194,67 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
 // engine silently never loaded in the packaged desktop app (observed on macOS
 // 15.7 with the Bee PoC dmg, 2026-09-15: RustEngineNative logged the dlopen
 // failure and SelectorEngine fell back to the Java engine, which has no log
-// index). Staging the stub next to the engine dylib gets it ad-hoc signed
-// with the rest of the bundle, and `-Djna.boot.library.path=$APPDIR/resources`
-// (below) makes JNA load it from there instead of extracting. Dev runs see a
-// literal, nonexistent `$APPDIR` and JNA falls back to extraction, which a
-// plain JDK process may do.
+// index). Staging the stub next to the engine dylib — under a `.dylib` name,
+// because jpackage's signing pass signs `*.dylib` and executables but leaves a
+// 0644 `.jnilib` untouched, and JNA's boot-path lookup tries both names —
+// gets it ad-hoc signed with the rest of the bundle, and
+// `-Djna.boot.library.path=$APPDIR/resources` (below) makes JNA load it from
+// there instead of extracting. Dev runs see a literal, nonexistent `$APPDIR`
+// and JNA falls back to extraction, which a plain JDK process may do.
 // ---------------------------------------------------------------------------
 val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
     group = "build"
-    description = "Stage JNA's libjnidispatch into Compose appResources so the packaged app can load the Rust engine"
+    description = "Stage JNA's native stub into Compose appResources so the packaged app can load the Rust engine"
     val destDir = rustAppResourcesRoot.map { it.dir(composeOsArchDir) }
-    val jnaJars = configurations.runtimeClasspath.map { cp ->
-        cp.files.filter { it.name.startsWith("jna-") && !it.name.contains("platform") }
+    // The exact artifact the version catalog pins, resolved on its own rather
+    // than found by a name-prefix scan of the runtime classpath.
+    val jnaJar = configurations.detachedConfiguration(
+        dependencies.create("net.java.dev.jna:jna:${libs.versions.jna.get()}@jar"),
+    ).also { it.isTransitive = false }
+    val osPart = composeOsArchDir.substringBefore('-')
+    val daemonArm = composeOsArchDir.substringAfter('-') == "arm64"
+    val (entry, stagedName) = when (osPart) {
+        "macos" -> (if (daemonArm) "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib" else "com/sun/jna/darwin-x86-64/libjnidispatch.jnilib") to "libjnidispatch.dylib"
+        "linux" -> (if (daemonArm) "com/sun/jna/linux-aarch64/libjnidispatch.so" else "com/sun/jna/linux-x86-64/libjnidispatch.so") to "libjnidispatch.so"
+        "windows" -> "com/sun/jna/win32-x86-64/jnidispatch.dll" to "jnidispatch.dll"
+        else -> error("no JNA native stub mapping for $composeOsArchDir")
     }
-    // The stub must match the PACKAGED app's architecture, which is the jpackage
-    // toolchain JDK's — not the Gradle daemon's. They differ on a Mac whose
-    // Gradle runs under an x86_64 JDK 17 while the JDK 21 toolchain is
-    // aarch64 (the CI legs pin both to one arch, so they agree there). The
-    // JDK's `release` file states OS_ARCH; fall back to the daemon's arch
-    // when it is unreadable.
-    val packagingArch = javaToolchains.launcherFor {
+    val staged = destDir.map { it.file(stagedName) }
+    // The packaged app's architecture is the jpackage toolchain JDK's, while
+    // Compose picks the Skiko natives — and this task picks the stub — by the
+    // Gradle daemon's. A mixed pair packages an app that dies at launch
+    // ("Can't load library: libskiko-macos-<arch>.dylib"): seen on a Mac that
+    // ran Gradle under an x86_64 JDK 17 with an aarch64 JDK 21 toolchain. The
+    // CI legs pin both to one arch; locally, fail loudly instead of shipping it.
+    val toolchainArch = javaToolchains.launcherFor {
         languageVersion.set(JavaLanguageVersion.of(21))
     }.map { launcher ->
         val release = launcher.metadata.installationPath.asFile.resolve("release")
-        val stated = runCatching { Regex("OS_ARCH=\"([^\"]+)\"").find(release.readText())?.groupValues?.get(1) }.getOrNull()
-        (stated ?: System.getProperty("os.arch")).lowercase()
+        runCatching { Regex("OS_ARCH=\"([^\"]+)\"").find(release.readText())?.groupValues?.get(1) }
+            .getOrNull()?.lowercase() ?: "unknown"
     }
-    inputs.files(jnaJars)
+    inputs.files(jnaJar)
     inputs.property("osArch", composeOsArchDir)
-    inputs.property("packagingArch", packagingArch)
-    outputs.dir(destDir)
+    inputs.property("toolchainArch", toolchainArch)
+    outputs.file(staged)
     doLast {
-        val arm = packagingArch.get() in setOf("aarch64", "arm64")
-        val entry = when (composeOsArchDir.substringBefore('-')) {
-            "macos" -> if (arm) "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib" else "com/sun/jna/darwin-x86-64/libjnidispatch.jnilib"
-            "linux" -> if (arm) "com/sun/jna/linux-aarch64/libjnidispatch.so" else "com/sun/jna/linux-x86-64/libjnidispatch.so"
-            "windows" -> "com/sun/jna/win32-x86-64/jnidispatch.dll"
-            else -> error("no JNA native stub mapping for $composeOsArchDir")
+        val tc = toolchainArch.get()
+        check(tc == "unknown" || (tc in setOf("aarch64", "arm64")) == daemonArm) {
+            "Gradle runs under a ${System.getProperty("os.arch")} JVM but the JDK 21 toolchain jpackage uses " +
+                "is $tc: the packaged app would mix native libraries and die at launch. Run Gradle under a JDK " +
+                "of the target architecture (JAVA_HOME=<that JDK> plus " +
+                "-Porg.gradle.java.installations.paths=\$JAVA_HOME, as the dmg workflow does)."
         }
-        val jar = jnaJars.get().singleOrNull() ?: error("expected exactly one jna jar on the runtime classpath, got ${jnaJars.get()}")
+        val jar = jnaJar.singleFile
         copy {
             from(zipTree(jar)) { include(entry) }
             into(destDir)
-            // Flatten com/sun/jna/<platform>/ away: JNA's boot path is a plain dir.
-            eachFile { path = name }
+            // Flatten com/sun/jna/<platform>/ away and apply the signable name:
+            // JNA's boot path is a plain dir.
+            eachFile { path = stagedName }
             includeEmptyDirs = false
         }
-        check(destDir.get().asFile.resolve(entry.substringAfterLast('/')).isFile) {
-            "JNA native stub $entry not found in $jar"
-        }
+        check(staged.get().asFile.isFile) { "JNA native stub $entry not found in $jar" }
     }
 }
 
@@ -241,31 +267,24 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
 // checks before installing it. DEBUG/DEMO artefact: RPC-sourced data,
 // unverified until the walker re-fetches it, expiring ~500,000 Gnosis blocks
-// (~29 days) after its fetch. A build WITHOUT -PbeePoc must never ship a seed
-// left behind by one with it, so the task always runs and cleans up.
+// (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
+// resources root above keeps a regular build from ever shipping the seed.
 // ---------------------------------------------------------------------------
-val beePoc = project.hasProperty("beePoc")
 val beePocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
 
 val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     group = "build"
-    description = "Stage the Bee PoC Gnosis log-index seed into Compose appResources (-PbeePoc), or ensure none is staged"
+    description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it into Compose appResources (-PbeePoc only)"
+    onlyIf { beePoc }
     val meta = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json")
     val logs = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz")
     val script = rootProject.file("scripts/synth_logindex.py")
+    val seed = beePocSeedDir.map { it.file("logindex-gnosis.db") }
+    val manifest = beePocSeedDir.map { it.file("bee-poc-seed.properties") }
     inputs.files(meta, logs, script)
-    inputs.property("beePoc", beePoc)
-    outputs.dir(beePocSeedDir)
+    outputs.files(seed, manifest)
     doLast {
-        val dir = beePocSeedDir.get().asFile
-        val seed = dir.resolve("logindex-gnosis.db")
-        val manifest = dir.resolve("bee-poc-seed.properties")
-        if (!beePoc) {
-            seed.delete()
-            manifest.delete()
-            return@doLast
-        }
-        dir.mkdirs()
+        beePocSeedDir.get().asFile.mkdirs()
         val cmd = listOf(
             "python3", script.absolutePath,
             "--meta", meta.absolutePath,
@@ -273,41 +292,20 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
             // The REAL deployment block: from_block is the engine's "no logs
             // below here" assertion, never the seed's fetched low edge.
             "--watch", "0x45a1502382541Cd610CC9068e88727426b696293:31305656",
-            "--out", seed.absolutePath,
+            "--out", seed.get().asFile.absolutePath,
+            // The script describes what it wrote (coverage, usable-until block,
+            // sha256) — the manifest BeePoc.kt checks before installing.
+            "--manifest", manifest.get().asFile.absolutePath,
         )
-        val proc = ProcessBuilder(cmd).start()
-        val stdout = proc.inputStream.bufferedReader().readText()
+        val proc = ProcessBuilder(cmd).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
         val stderr = proc.errorStream.bufferedReader().readText()
-        check(proc.waitFor() == 0 && seed.isFile) {
+        check(proc.waitFor() == 0 && seed.get().asFile.isFile && manifest.get().asFile.isFile) {
             "bee-poc: scripts/synth_logindex.py failed (python3 required):\n$stderr"
         }
-        // The script prints the --check description of the frame it wrote to stdout.
-        val info = groovy.json.JsonSlurper().parseText(stdout) as Map<*, *>
-        val coverage = (info["coverage"] as List<*>)[0] as List<*>
-        val low = (coverage[0] as Number).toLong()
-        val high = (coverage[1] as Number).toLong()
-        val usableUntil = high + 500_000 // the head bridge's MAX_GAP (el/reader.rs)
-        val sha = MessageDigest.getInstance("SHA-256")
-            .digest(seed.readBytes())
-            .joinToString("") { b -> "%02x".format(b) }
-        manifest.writeText(
-            """
-            # Bee PoC seed manifest — written by :app-desktop:prepareBeePocSeed (see BeePoc.kt)
-            network=gnosis
-            address=0x45a1502382541Cd610CC9068e88727426b696293
-            deploymentBlock=31305656
-            coveredLow=$low
-            coveredHigh=$high
-            usableUntilBlock=$usableUntil
-            logs=${info["logs"]}
-            sha256=$sha
-            source=${meta.name}
-            builtAtUtc=${Instant.now()}
-            """.trimIndent() + "\n",
-        )
-        logger.lifecycle(
-            "bee-poc: staged ${seed.name} — coverage $low–$high, ${info["logs"]} logs, usable until block $usableUntil",
-        )
+        val summary = manifest.get().asFile.readLines()
+            .filter { it.startsWith("covered") || it.startsWith("usableUntil") || it.startsWith("logs=") }
+            .joinToString(", ")
+        logger.lifecycle("bee-poc: staged ${seed.get().asFile.name} — $summary")
     }
 }
 

@@ -17,19 +17,18 @@ fun main() {
     // lib BEFORE anything touches Engines. Dev runs pass an explicit
     // -Dmyotis.engine.lib (absolute path) and win; a missing lib leaves the
     // property unset, and the selector's Java fallback still works.
-    if (System.getProperty("myotis.engine.lib") == null) {
-        System.getProperty("compose.application.resources.dir")
-            ?.takeIf { it.isNotBlank() } // blank would resolve against the CWD
-            ?.let { dir ->
-            val os = System.getProperty("os.name").lowercase()
-            val lib = when {
-                os.contains("mac") -> "libmyotis_engine.dylib"
-                os.contains("win") -> "myotis_engine.dll"
-                else -> "libmyotis_engine.so"
-            }
-            val f = Path.of(dir, lib).toFile()
-            if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
+    val resourcesDir: Path? = System.getProperty("compose.application.resources.dir")
+        ?.takeIf { it.isNotBlank() } // blank would resolve against the CWD
+        ?.let(Path::of)
+    if (System.getProperty("myotis.engine.lib") == null && resourcesDir != null) {
+        val os = System.getProperty("os.name").lowercase()
+        val lib = when {
+            os.contains("mac") -> "libmyotis_engine.dylib"
+            os.contains("win") -> "myotis_engine.dll"
+            else -> "libmyotis_engine.so"
         }
+        val f = resourcesDir.resolve(lib).toFile()
+        if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
     }
     // The Bee PoC flavour (-PbeePoc → -Dmyotis.beePoc=true) lives in its own data dir and
     // seeds its Gnosis log index from the bundle before anything reads that dir.
@@ -43,12 +42,7 @@ fun main() {
     }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
-    if (beePoc) {
-        BeePoc.installSeedIfAbsent(
-            System.getProperty("compose.application.resources.dir")?.takeIf { it.isNotBlank() }?.let(Path::of),
-            dataDir,
-        )
-    }
+    if (beePoc) BeePoc.installSeedIfAbsent(resourcesDir, dataDir)
     // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings(file = settingsFile)
     if (beePoc) BeePoc.applyFirstStartSettings(settings, firstStart)

@@ -302,7 +302,17 @@ class DesktopNodeController(
 
     override val canImportLogIndex: Boolean get() = true
 
-    override fun seededIndexNotice(network: String): String? = BeePoc.seededIndexNotice(dataDir, network)
+    // Only the Bee PoC flavour seeds anything; the notice is fixed for the life of the
+    // process (the manifest is written before any network starts), so compute it once
+    // per network rather than re-reading a file on every recomposition.
+    private val seededNotices = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<String>>()
+
+    override fun seededIndexNotice(network: String): String? {
+        if (!BeePoc.enabled()) return null
+        return seededNotices
+            .computeIfAbsent(network) { java.util.Optional.ofNullable(BeePoc.seededIndexNotice(dataDir, it)) }
+            .orElse(null)
+    }
 
     override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
         val canonical = engine.canonicalNetworkName(network)

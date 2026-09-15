@@ -223,21 +223,30 @@ with the seed above bundled inside:
   next to a manifest (coverage, usable-until block, sha256), and a build
   without the flag removes any staged seed. `-PbeePoc` also works with
   `:app-desktop:run`.
-- **CI builds it on every PR** (`desktop-dmg.yml`, the `bee-poc` matrix leg):
-  the artifact `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`,
-  and the leg fails unless the dmg carries the seed and its manifest. It is
-  never attached to a release.
+- **CI builds it on every PR and on every push to `main`** (`desktop-dmg.yml`,
+  the `bee-poc` matrix leg): the artifact `myotis-bee-poc-dmg-arm64-<sha>`
+  holds `Myotis-bee-poc-arm64.dmg`, and the leg fails unless the dmg carries
+  the seed and its manifest (the standard leg fails if it carries one). Tag
+  builds skip the leg: it is never attached to a release, and a PoC-only
+  failure must not block one.
 - **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
-  only if no index file exists there yet, and only if the seed's sha256 matches
-  the manifest — where the engine activates it on its own
-  (`activate_log_index_from_disk`), then enables Gnosis (only) with the log
-  index on and the PostageStamp watch entry at its real deployment block.
+  when no index file exists there yet, or when the bundled seed is newer than
+  the one this flavour installed before (a rebuilt app after the shelf life;
+  an index the flavour did not install is never touched), and only if the
+  seed's sha256 matches the manifest — where the engine activates it on its
+  own (`activate_log_index_from_disk`), then enables Gnosis (only) with the
+  log index on and the PostageStamp watch entry at its real deployment block.
   Later starts leave settings alone. The Index tab shows the seed's provenance
-  and its usable-until block.
+  and its usable-until block while the engine's index is on, or says why the
+  bundled seed did not get installed.
 - **Point Bee at it**: `blockchain-rpc-endpoint: http://127.0.0.1:8546` with
-  the config from *Setup* step 5. Bee's first page at 47,061,408 is served
-  immediately; the head bridge closes the gap between the seed's top and the
-  live head within minutes of the app's first `SYNCED`.
+  the config from *Setup* step 5. Once the beacon sync reaches `SYNCED`
+  (seconds with a fresh anchor; the stale-anchor dialog first if the build is
+  older than ~34 h) Bee's first page at 47,061,408 is served, and the head
+  bridge closes the gap between the seed's top and the live head within
+  minutes. The PoC has its own data dir but the same default RPC port as a
+  regular Myotis running Gnosis — stop that one or move its port, or Bee
+  talks to the unseeded instance.
 - **Expiry**: the seed is usable until roughly 500,000 blocks (~29 days) above
   its fetch — the manifest and the Index tab say which block. After that the
   data set must be re-fetched and the app rebuilt; the shelf-life rule from the
@@ -250,9 +259,11 @@ dmg): a jpackage'd app is ad-hoc signed with library validation, so macOS
 refuses the unsigned `libjnidispatch` JNA extracts to `~/Library/Caches/JNA`
 at runtime — the Rust engine then silently never loads and the app runs on
 the Java engine, which has no log index. `prepareJnaBootLib` stages the stub
-inside the bundle (signed with the rest) and the launcher passes
-`-Djna.boot.library.path=$APPDIR/resources`; the dmg workflow fails if the
-stub is missing.
+inside the bundle under a `.dylib` name (jpackage's signing pass signs
+`*.dylib` files, not a `.jnilib`; JNA's boot-path lookup accepts either) and
+the launcher passes `-Djna.boot.library.path=$APPDIR/resources`; the dmg
+workflow fails unless the stub is present, of the dmg's architecture, and
+validly signed.
 
 Everything the *Demo only* section says about trust applies: this is an
 RPC-sourced, unverified seed served indistinguishably from walked coverage,

@@ -147,6 +147,12 @@ jobs:
           # assertion keeps that assumption honest).
           rustlib=$(find "$ex" -type f -name 'libmyotis_engine.so' | head -n1 || true)
           [ -n "$rustlib" ] || { echo "::error::libmyotis_engine.so missing from the deb"; exit 1; }
+          # JNA's native stub is staged next to it on every platform (prepareJnaBootLib
+          # in app-desktop/build.gradle.kts, -Djna.boot.library.path); parity with the
+          # dmg workflow's check.
+          jna=$(find "$ex" -type f -name 'libjnidispatch.so' | head -n1 || true)
+          [ -n "$jna" ] || { echo "::error::libjnidispatch.so missing from the deb"; exit 1; }
+          echo "bundled JNA stub: $(file -b "$jna")"
           rustinfo=$(file -b "$rustlib")
           echo "bundled rust engine: $rustinfo"
           echo "$rustinfo" | grep -q "$want_elf" \
