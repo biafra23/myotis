@@ -102,7 +102,11 @@ object BeePoc {
             )
         }
         val expected = bundled.getProperty("sha256")?.lowercase()
-        if (expected == null || sha256Hex(seed) != expected) {
+        val actual = runCatching { sha256Hex(seed) }.getOrElse {
+            log.warn("bee-poc: bundled seed {} is unreadable, previous state kept: {}", seed, it.toString())
+            return Outcome.FAILED
+        }
+        if (expected == null || actual != expected) {
             log.warn("bee-poc: bundled seed {} does not match its manifest sha256 — not installing", seed)
             return Outcome.BAD_CHECKSUM
         }
@@ -116,8 +120,14 @@ object BeePoc {
             )
             Outcome.INSTALLED
         }.onFailure {
-            log.warn("bee-poc: seed install into {} failed: {}", dataDir, it.toString())
-            runCatching { Files.deleteIfExists(target) }
+            // atomicCopy only ever replaces a file with a COMPLETE one (tmp + rename), so
+            // whatever `target` holds now is intact — the previous index in the re-seed
+            // path, nothing in the fresh path. Never delete it; only sweep the tmp
+            // siblings a failed copy or move can leave behind.
+            log.warn("bee-poc: seed install into {} failed, previous state kept: {}", dataDir, it.toString())
+            for (f in listOf(target, installedManifest)) {
+                runCatching { Files.deleteIfExists(f.resolveSibling("${f.fileName}.tmp")) }
+            }
         }.getOrDefault(Outcome.FAILED)
     }
 

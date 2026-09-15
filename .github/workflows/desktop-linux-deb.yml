@@ -152,7 +152,10 @@ jobs:
           # dmg workflow's check.
           jna=$(find "$ex" -type f -name 'libjnidispatch.so' | head -n1 || true)
           [ -n "$jna" ] || { echo "::error::libjnidispatch.so missing from the deb"; exit 1; }
-          echo "bundled JNA stub: $(file -b "$jna")"
+          jnainfo=$(file -b "$jna")
+          echo "bundled JNA stub: $jnainfo"
+          echo "$jnainfo" | grep -q "$want_elf" \
+            || { echo "::error::JNA stub ELF arch mismatch: expected $want_elf in: $jnainfo"; exit 1; }
           rustinfo=$(file -b "$rustlib")
           echo "bundled rust engine: $rustinfo"
           echo "$rustinfo" | grep -q "$want_elf" \

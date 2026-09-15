@@ -85,6 +85,37 @@ class BeePocTest {
     }
 
     @Test
+    fun `a failed re-seed keeps the previous index and leaves no temp file`(@TempDir dir: Path) {
+        org.junit.jupiter.api.Assumptions.assumeFalse(
+            System.getProperty("os.name").lowercase().contains("win"),
+            "relies on POSIX permissions to make the bundled seed unreadable",
+        )
+        val data = dir.resolve("data")
+        val v1 = stageBundle(dir, "seed-v1".toByteArray(), high = 48_262_676)
+        assertEquals(Outcome.INSTALLED, BeePoc.installSeedIfAbsent(v1, data))
+        Files.write(data.resolve(BeePoc.SEED_FILE), "engine-checkpoint".toByteArray())
+
+        // A newer bundle whose seed cannot be read (the manifest still matches its
+        // sha256, so the checksum gate passes and the copy itself fails).
+        val newer = stageBundle(dir, "seed-v2".toByteArray(), high = 48_800_000)
+        val newerSeed = newer.resolve(BeePoc.SEED_FILE)
+        Files.setPosixFilePermissions(newerSeed, emptySet())
+        try {
+            // sha256 is computed by streaming the file, which the permission denies too:
+            // that surfaces as FAILED via the checksum path or the copy path, and either
+            // way the previous index must survive.
+            val outcome = BeePoc.installSeedIfAbsent(newer, data)
+            assertTrue(outcome == Outcome.FAILED || outcome == Outcome.BAD_CHECKSUM, "got $outcome")
+            assertEquals("engine-checkpoint", Files.readString(data.resolve(BeePoc.SEED_FILE)))
+            assertTrue(Files.readString(data.resolve(BeePoc.INSTALLED_MANIFEST_FILE)).contains("coveredHigh=48262676"))
+            assertFalse(Files.exists(data.resolve("${BeePoc.SEED_FILE}.tmp")))
+            assertFalse(Files.exists(data.resolve("${BeePoc.INSTALLED_MANIFEST_FILE}.tmp")))
+        } finally {
+            Files.setPosixFilePermissions(newerSeed, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r--r--"))
+        }
+    }
+
+    @Test
     fun `an index this flavour did not install is never touched`(@TempDir dir: Path) {
         val data = dir.resolve("data")
         Files.createDirectories(data)

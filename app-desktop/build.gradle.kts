@@ -139,10 +139,18 @@ val composeOsArchDir = run {
     "$osPart-$archPart"
 }
 
-// The Bee PoC flavour flag: `-PbeePoc` (bare, or any true value) builds the
-// PoC — see the Bee PoC section below; `-PbeePoc=false` is a regular build.
+// The Bee PoC flavour flag: bare `-PbeePoc` or `-PbeePoc=true` builds the PoC
+// (see the Bee PoC section below), `-PbeePoc=false` a regular build. Anything
+// else is refused rather than quietly building the regular flavour — a flag
+// that changes the artifact must be applied or rejected, never ignored.
 val beePoc: Boolean = providers.gradleProperty("beePoc")
-    .map { it.isBlank() || it.toBoolean() }
+    .map { raw ->
+        when (raw.trim().lowercase()) {
+            "", "true" -> true
+            "false" -> false
+            else -> throw GradleException("-PbeePoc must be bare, =true or =false (got '$raw')")
+        }
+    }
     .getOrElse(false)
 
 // Single source of truth for the staged-resources root: the staging tasks'
