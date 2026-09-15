@@ -85,6 +85,9 @@ dependencies {
 
     implementation(compose.desktop.currentOs)
     implementation(libs.kotlinx.coroutines.core)
+    // AppNap.kt talks to the Objective-C runtime through JNA (already on the classpath
+    // transitively for the Rust engine; declared here because the app uses it directly).
+    implementation(libs.jna)
 
     // implementation (not runtimeOnly): DesktopLogAppender compiles against logback's
     // AppenderBase/ILoggingEvent to tee logs into the in-app Logs tab's in-memory ring.

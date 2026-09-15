@@ -163,6 +163,14 @@ its deployment block:
   23 s one `eth_getLogs` took here. NOT a faster refusal: Bee retries a
   failed page every 5 s and its stall rule counts *successful* pages, so
   for Bee a slow success beats a fast `-32000` every time.
+- **…and App Nap sat underneath it.** Once its window was covered by other
+  windows, the same app ran throttled to macOS's background scheduling band
+  for the rest of the evening (the second packaging note in the PoC section
+  below): the "unresponsive" pool and the 20–97 s proof waits were in part
+  the app itself being starved of CPU on a loaded host, and a later relaunch
+  on the bundled warm caches still showed 5–60 s gaps before connections were
+  even accepted until App Nap was switched off — after which the same host,
+  same minute, answered in 16–144 ms. The bundle now opts out of App Nap.
 
 ## Demo only: seeding from a full node (not for production)
 
@@ -296,6 +304,32 @@ inside the bundle under a `.dylib` name (jpackage's signing pass signs
 the launcher passes `-Djna.boot.library.path=$APPDIR/resources`; the dmg
 workflow fails unless the stub is present, of the dmg's architecture, and
 validly signed.
+
+A second packaging note that this build surfaced, and that applies to the
+regular dmg just the same: the app is a GUI app that serves *other* processes
+over localhost, and macOS **App Nap** throttles a GUI app whose window is
+hidden or fully covered down to the background scheduling band — `ps -M -p
+<pid>` shows every thread at kernel priority `4`, back to `31` the moment the
+window is frontmost. On an otherwise busy Mac (load average ~120) that turned
+into multi-second gaps before the RPC server even accepted a connection (Bee's
+requests sat unread in the kernel's accept backlog, `CLOSE_WAIT` with the whole
+POST in `Recv-Q`), safepoint syncs of seconds, one 92 s Full GC, a head bridge
+that took seven minutes instead of thirty seconds, and Bee's 10-minute postage
+stall. Measured 2026-09-16, same host, same minute: napped, 25 of 40
+`eth_blockNumber` probes took over a second (up to 18 s); un-napped, 0 of 30
+(16–144 ms). The app therefore holds an `NSProcessInfo` activity
+(`NSActivityUserInitiatedAllowingIdleSystemSleep`) for its whole lifetime
+(`AppNap.kt`, through JNA's Objective-C runtime calls) and logs the outcome as
+the first line of every start; being in-process this covers `:app-desktop:run`
+dev runs too. Two things it deliberately does not do: keep the Mac awake (a
+closed lid or the idle-sleep timer still stops everything — `caffeinate` or the
+*Prevent automatic sleeping* energy setting is that layer), and rely on the
+`NSAppSleepDisabled` Info.plist key, which current macOS ignores — measured on
+15.7 with the same hide-the-window procedure, a bundle carrying the key napped
+exactly like one without (every thread `4T` within 30 s). The key's
+user-defaults form does work and remains the in-place fix for a build from
+before this change: `defaults write io.myotis.desktop.beepoc NSAppSleepDisabled
+-bool YES` (`io.myotis.desktop` for the regular app) and a relaunch.
 
 Everything the *Demo only* section says about trust applies: this is an
 RPC-sourced, unverified seed served indistinguishably from walked coverage,
