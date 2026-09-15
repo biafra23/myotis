@@ -106,6 +106,13 @@ struct EngineState {
     /// is `synchronized` for the same reason). Never held while `handles` is
     /// taken by anything that could wait on a create.
     create_lock: Mutex<()>,
+    /// Snapshot paths whose handle has been removed from `handles` but whose
+    /// sync loop is still being awaited by `stop` (teardown runs OUTSIDE the
+    /// map lock). A loop in that window can still persist a snapshot, so the
+    /// directory stays "in use" for the create guards until the await returns
+    /// — otherwise a `createWithCheckpoint` slipping in between would label a
+    /// late embedded-anchor snapshot as the caller's generation.
+    tearing_down: Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 /// How long a last-good `eth_feeHistory` result may be re-served (the Java
@@ -132,6 +139,7 @@ fn engine() -> Option<&'static EngineState> {
                     pending_served_window: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
+            tearing_down: Mutex::new(std::collections::HashSet::new()),
                 }),
                 Err(_) => None,
             }
@@ -277,9 +285,11 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
 ///   (state from the embedded anchor), an unreadable marker, or a plain
 ///   [`create`] on a marked directory returns `ANCHOR_MISMATCH` (-3). Nothing
 ///   is deleted or rewritten; the host picks a fresh directory or the matching
-///   anchor. A directory another live handle of this process already uses is
-///   refused with `CREATE_FAILED` before the marker is touched — two handles
-///   persisting into one snapshot would mix generations.
+///   anchor. A directory another live handle of this process already uses —
+///   or one whose stopped handle is still tearing down — is refused with
+///   `CREATE_FAILED` before the marker is touched: two writers into one
+///   snapshot would mix generations, and a loop mid-shutdown is still a
+///   writer.
 ///
 /// Invalid inputs — unknown/unsupported network, malformed or all-zero root,
 /// slot 0 or ahead of the wall clock, empty dataDir — return
@@ -428,10 +438,16 @@ fn bind_persistence(config: &mut ChainConfig, data_dir: &str) -> Result<std::pat
 }
 
 /// The id of a live handle (created, running, or paused) whose persistence is
-/// bound to `snapshot_path`, if any.
+/// bound to `snapshot_path`, if any — or `Some(0)` when no handle owns it any
+/// more but a stopped loop is still tearing down there (see `tearing_down`).
 fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -> Option<i64> {
     let target = snapshot_path?;
+    // Lock order everywhere: handles, then tearing_down (stop() takes them the
+    // same way), so the two views cannot interleave into a gap.
     let map = engine.handles.lock().ok()?;
+    if engine.tearing_down.lock().ok()?.contains(target) {
+        return Some(0);
+    }
     map.iter()
         .find(|(_, entry)| {
             let cfg = match entry {
@@ -875,7 +891,17 @@ pub fn stop(handle: i64) {
     // and can take a moment; holding the map lock across it would serialize all
     // other natives needlessly).
     let entry = match engine.handles.lock() {
-        Ok(mut m) => m.remove(&handle),
+        Ok(mut m) => {
+            let entry = m.remove(&handle);
+            // Still under the map lock: the directory must never be observable
+            // as free while the loop below may still write to it.
+            if let Some(ChainEntry::Running(cfg, _, _)) = &entry {
+                if let (Some(p), Ok(mut td)) = (cfg.snapshot_path.clone(), engine.tearing_down.lock()) {
+                    td.insert(p);
+                }
+            }
+            entry
+        }
         Err(_) => return,
     };
     // The handle's cached feeHistory dies with it.
@@ -885,7 +911,7 @@ pub fn stop(handle: i64) {
     if let Ok(mut pending) = engine.pending_served_window.lock() {
         pending.remove(&handle);
     }
-    if let Some(ChainEntry::Running(_, sync, reader)) = entry {
+    if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
             if let Some(reader) = &reader { reader.cancel_requests(); }
             sync.stop().await;
@@ -893,6 +919,10 @@ pub fn stop(handle: i64) {
                 reader.stop().await;
             }
         });
+        // Teardown complete: no writer is left for this directory.
+        if let (Some(p), Ok(mut td)) = (cfg.snapshot_path.as_ref(), engine.tearing_down.lock()) {
+            td.remove(p);
+        }
     }
 }
 
@@ -2408,6 +2438,28 @@ mod tests {
         assert_eq!(create("mainnet", dir.to_str().unwrap()), ANCHOR_MISMATCH);
         assert!(std::fs::symlink_metadata(&marker).unwrap().file_type().is_symlink(),
             "the dangling link must be left untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_still_tearing_down_counts_as_in_use() {
+        // stop() removes the handle from the map before awaiting its loop, which
+        // may still persist a snapshot; the directory must stay "in use" for the
+        // create guards until teardown returns (Copilot on #442).
+        let dir = std::env::temp_dir().join(format!("myotis-cwc-teardown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let snap = canonical.join("sync-state.snapshot");
+        let engine = engine().unwrap();
+        engine.tearing_down.lock().unwrap().insert(snap.clone());
+        let root = "0xabababababababababababababababababababababababababababababababab";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), CREATE_FAILED);
+        assert!(!canonical.join("sync-anchor.json").exists(), "no marker while a writer may remain");
+        engine.tearing_down.lock().unwrap().remove(&snap);
+        let id = create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100);
+        assert!(id >= 1, "{id}");
+        stop(id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

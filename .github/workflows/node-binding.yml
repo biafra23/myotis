@@ -73,6 +73,17 @@ jobs:
       - name: Rename to .node
         shell: bash
         run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"
+      # API tests against the artifact we are about to publish (the f64 slot
+      # boundary and the createWithCheckpoint generation semantics live only in
+      # the addon, so host.rs tests cannot cover them). Native legs only: the
+      # x64 macOS slice is cross-compiled on an arm64 runner and cannot load.
+      - name: Addon API tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_NODE_ADDON: ${{ github.workspace }}/${{ matrix.artifact }}
+        run: node --test addon-api.test.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

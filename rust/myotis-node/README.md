@@ -119,10 +119,11 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   other root/slot, a directory that already holds a snapshot from the embedded
   anchor, or a plain `create()` on a marked directory returns **-3**
   (`ANCHOR_MISMATCH`) — nothing is deleted or rewritten; pick a fresh
-  directory or the matching anchor. Invalid input (unknown/unsupported
-  network, malformed or all-zero root, slot 0 / non-integer / above
-  `Number.MAX_SAFE_INTEGER` / in the future, empty dataDir) returns **-1**
-  before the directory is created or touched; so does a directory another live
+  directory or the matching anchor. Invalid input (unknown network, malformed
+  or all-zero root, slot 0 / non-integer / above `Number.MAX_SAFE_INTEGER` /
+  in the future, empty dataDir) returns **-1**, and a canonical network this
+  engine does not host returns **-2** (`UNSUPPORTED_NETWORK`, the same
+  sentinel `create()` uses), both before the directory is created or touched; so does a directory another live
   handle of the process is already using. Directory identity is canonical:
   symlinks, `..` and relative spellings of one directory are one directory for
   the in-use guard and the marker alike, and a dangling symlink (or any
