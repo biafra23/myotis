@@ -384,8 +384,12 @@ class IosNodeController(
 
     override fun resetSyncState(network: String) {
         val net = canonical(network)
-        // Same lane + lock as clearCaches: the snapshot files are written on
-        // stop/pause, so the delete must not race a concurrent teardown.
+        // Same lane + lock as clearCaches — but NOT because a teardown writes the
+        // snapshot: the sync task ends by abort and persists on neither stop nor
+        // pause (rust/myotis-net/src/sync.rs). The race that matters is the other
+        // direction: a reset immediately followed by a start would otherwise let
+        // these unlinks run against the boot's snapshot read, and a boot that won
+        // would resume from the old snapshot as if the reset had never happened.
         scope.launch(lifecycleLane) {
             bootMutex.withLock {
                 val suffix = if (net == "mainnet") "" else "-$net"
