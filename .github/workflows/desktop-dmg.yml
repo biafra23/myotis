@@ -44,19 +44,25 @@ jobs:
       # Two flavours: the regular app, and the Bee PoC build (-PbeePoc) that
       # bundles the Gnosis PostageStamp log-index seed so a Swarm Bee full node
       # can use it from the first minute (app-desktop/build.gradle.kts,
-      # docs/bee-rpc-service.md). The PoC leg runs on every PR and on pushes
-      # to main (arm64) so the Swarm team always has a current artifact to
-      # test (owner's call — it costs a second jpackage leg per PR). It is NOT
-      # part of tag builds: it never goes to a release, and a PoC-only failure
-      # must not block one (the release job needs every leg of this job).
+      # docs/bee-rpc-service.md). The PoC leg (arm64) runs on every PR, on
+      # pushes to main and on release tags, so the Swarm team always has a
+      # current artifact (owner's call — it costs a second jpackage leg per
+      # PR). On a tag its dmg is attached to the release as a BEST-EFFORT
+      # asset: the leg is continue-on-error there, so a PoC-only failure never
+      # blocks the standard dmgs (the release job needs every leg of this
+      # job), and the release job uploads the PoC dmg only if it exists. On
+      # PRs and main the leg is a hard gate like the others.
       # Each entry carries its own build flags, dmg name and artifact name so
       # the steps below stay data-driven.
       matrix:
         include: ${{ github.event_name == 'pull_request'
           && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')
-          || (startsWith(github.ref, 'refs/tags/')
-          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"}]')
-          || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')) }}
+          || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]') }}
+    # The PoC is best-effort on TAG builds only — its failure is reported but
+    # never fails this job there, so it never blocks a release. On PRs and
+    # pushes to main it is a hard gate like the standard legs: a PoC
+    # regression (seed, manifest, caches, JNA stub) must turn the run red.
+    continue-on-error: ${{ matrix.flavor == 'bee-poc' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-14
     permissions:
       contents: read
@@ -166,6 +172,16 @@ jobs:
           echo "::error::DMG build failed after 3 attempts"
           exit 1
 
+      # The desktop tests' macOS branch — AppNapTest, the Objective-C bridge that keeps
+      # App Nap off for the RPC server — runs nowhere else: ci.yml is ubuntu-only, where
+      # it is skipped by assumption. One leg is enough; the x64 leg would only repeat
+      # it under Rosetta. The Rust engine is not needed by these tests.
+      - name: Run desktop tests (macOS)
+        if: matrix.flavor == 'standard' && matrix.arch == 'arm64'
+        run: |
+          GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
+          ./gradlew :app-desktop:test --stacktrace $GRADLE_ARGS
+
       # Compose names both arches' output the same (Myotis-<packageVersion>.dmg, derived
       # from the project version in app-desktop/build.gradle.kts); rename so the
       # downloaded file itself states the architecture, not just the artifact wrapper.
@@ -250,10 +266,22 @@ jobs:
               || { echo "::error::bee-poc dmg is missing its seed or manifest"; exit 1; }
             echo "bundled seed: $bundled_seed ($(stat -f%z "$bundled_seed") bytes)"
             cat "$manifest"
+            # …and the warm peer caches that keep a cold Gnosis pool from starving.
+            for c in peers-gnosis.cache cl-peers-gnosis.cache; do
+              f=$(find "$mnt" -type f -name "$c" | head -n1 || true)
+              [ -n "$f" ] && [ -s "$f" ] \
+                || { echo "::error::bee-poc dmg is missing its warm peer cache $c"; exit 1; }
+              echo "bundled peer cache: $c ($(wc -l < "$f" | tr -d ' ') peers)"
+            done
           else
-            # …and the regular app must never carry the RPC-sourced seed.
+            # …and the regular app must never carry the RPC-sourced seed, nor the
+            # PoC's peer caches (the Gradle scrub treats both as PoC-only).
             [ -z "$bundled_seed" ] \
               || { echo "::error::the standard dmg carries the Bee PoC seed ($bundled_seed)"; exit 1; }
+            for c in peers-gnosis.cache cl-peers-gnosis.cache; do
+              stray=$(find "$mnt" -type f -name "$c" | head -n1 || true)
+              [ -z "$stray" ] || { echo "::error::the standard dmg carries the Bee PoC peer cache ($stray)"; exit 1; }
+            done
           fi
 
       - name: Upload DMG
@@ -302,7 +330,8 @@ jobs:
       - name: Download dmg artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: myotis-desktop-dmg-*-${{ github.sha }}
+          # Both standard dmgs plus, when its leg succeeded, the Bee PoC dmg.
+          pattern: myotis-*-dmg-*-${{ github.sha }}
           path: dmg
           merge-multiple: true
 
@@ -335,6 +364,14 @@ jobs:
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
+          **Bee PoC (`Myotis-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          unverified until the walker re-fetches it, and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
           **Desktop Linux (`Myotis-<arch>.deb`)** — install with
           `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
@@ -352,3 +389,9 @@ jobs:
             || gh release view "$tag" >/dev/null 2>&1
           fi
           gh release upload "$tag" dmg/Myotis-arm64.dmg dmg/Myotis-x64.dmg --clobber
+          # Best-effort: the PoC leg is continue-on-error, so its dmg may be absent.
+          if [ -f dmg/Myotis-bee-poc-arm64.dmg ]; then
+            gh release upload "$tag" dmg/Myotis-bee-poc-arm64.dmg --clobber
+          else
+            echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
+          fi

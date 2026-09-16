@@ -16,7 +16,9 @@ import java.util.Properties
  * in the app bundle (Compose appResources), installed into the flavour's own data dir on
  * first start, and the first start enables Gnosis with the log index on, so
  * `http://127.0.0.1:8546` serves Bee's `eth_getLogs` pages as soon as the beacon sync is
- * `SYNCED` (seconds with a fresh anchor).
+ * `SYNCED` (seconds with a fresh anchor). The warm Gnosis peer caches from `data/bee/gnosis`
+ * (`peers-gnosis.cache`, `cl-peers-gnosis.cache`; public peers only) ride along the same way — installed once, never over what the engine
+ * has learned since — so the pool does not start cold either.
  *
  * This is a DEBUG / DEMO artefact, not a production path: the seed is a full node's
  * `eth_getLogs` output framed by `scripts/synth_logindex.py`, unverified until the walker
@@ -43,6 +45,17 @@ object BeePoc {
 
     /** The manifest's copy in the data dir — how the UI knows the index was seeded. */
     const val INSTALLED_MANIFEST_FILE = "logindex-gnosis.seed.properties"
+
+    /**
+     * Warm peer caches bundled beside the seed, in the engine's own formats and under the
+     * engine's own data-dir names (`peers{-network}.cache` for EL snap peers,
+     * `cl-peers{-network}.cache` for beacon light-client peers — see `host.rs`). Public
+     * peer addresses only; the engine re-verifies every peer it dials, so these are hints
+     * that shortcut discovery, not trust. A cold Gnosis pool is the PoC's other failure
+     * mode: with no cache the app once sank to a single unresponsive snap peer, the index
+     * stopped following the head, and Bee's ten-minute stall rule shut it down.
+     */
+    val PEER_CACHE_FILES: List<String> = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
 
     /**
      * The seed's watch entry: the PostageStamp contract at its REAL deployment block —
@@ -79,7 +92,37 @@ object BeePoc {
     fun installSeedIfAbsent(resourcesDir: Path?, dataDir: Path): Outcome {
         val outcome = install(resourcesDir, dataDir)
         lastOutcome = outcome
+        installPeerCachesIfAbsent(resourcesDir, dataDir)
         return outcome
+    }
+
+    /**
+     * Copy each bundled peer cache into [dataDir] when the engine has none there yet.
+     * Independent of the seed's outcome, and never over an existing file: the engine
+     * rewrites these as it learns, and what it learned beats what we shipped. Returns the
+     * names installed on this call.
+     */
+    fun installPeerCachesIfAbsent(resourcesDir: Path?, dataDir: Path): List<String> {
+        val dir = resourcesDir ?: return emptyList()
+        return PEER_CACHE_FILES.filter { name ->
+            val src = dir.resolve(name)
+            val target = dataDir.resolve(name)
+            if (!Files.isRegularFile(src)) {
+                // The dmg leg asserts the caches are bundled; a dev `run` may lack them.
+                log.debug("bee-poc: no bundled {} in {}", name, dir)
+                return@filter false
+            }
+            if (Files.exists(target)) return@filter false
+            runCatching {
+                Files.createDirectories(dataDir)
+                atomicCopy(src, target)
+                log.info("bee-poc: installed the bundled warm peer cache {}", target)
+                true
+            }.onFailure {
+                log.warn("bee-poc: could not install peer cache {}: {}", name, it.toString())
+                runCatching { Files.deleteIfExists(target.resolveSibling("${target.fileName}.tmp")) }
+            }.getOrDefault(false)
+        }
     }
 
     private fun install(resourcesDir: Path?, dataDir: Path): Outcome {

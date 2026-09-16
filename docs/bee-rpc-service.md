@@ -156,10 +156,21 @@ its deployment block:
   Bee's 10-minute stall rule shut it down while the app's log showed 102
   `VERIFIED` and 3 `-32000` outcomes. The pool recovered on its own (7 snap
   peers) and Bee resumed on restart. The daemon never hit this because it
-  ran on a warm `peers-gnosis.cache`; bundling such a cache with the PoC
-  (public enodes, like the seed) and time-boxing the head-edge tail fill so
-  a slow peer yields a fast `-32000` instead of a 20 s wait are the two
-  follow-ups this points at.
+  ran on a warm `peers-gnosis.cache`; the PoC now bundles that cache (public
+  enodes, like the seed). The remaining follow-up is on the fetch side —
+  hedge the head-edge block/receipt fetch across peers and shorten the
+  per-peer timeout so one dead peer costs hundreds of milliseconds, not the
+  23 s one `eth_getLogs` took here. NOT a faster refusal: Bee retries a
+  failed page every 5 s and its stall rule counts *successful* pages, so
+  for Bee a slow success beats a fast `-32000` every time.
+- **…and App Nap sat underneath it.** Once its window was covered by other
+  windows, the same app ran throttled to macOS's background scheduling band
+  for the rest of the evening (the second packaging note in the PoC section
+  below): the "unresponsive" pool and the 20–97 s proof waits were in part
+  the app itself being starved of CPU on a loaded host, and a later relaunch
+  on the bundled warm caches still showed 5–60 s gaps before connections were
+  even accepted until App Nap was switched off — after which the same host,
+  same minute, answered in 16–144 ms. The bundle now opts out of App Nap.
 
 ## Demo only: seeding from a full node (not for production)
 
@@ -244,12 +255,15 @@ with the seed above bundled inside:
   next to a manifest (coverage, usable-until block, sha256), and a build
   without the flag removes any staged seed. `-PbeePoc` also works with
   `:app-desktop:run`.
-- **CI builds it on every PR and on every push to `main`** (`desktop-dmg.yml`,
-  the `bee-poc` matrix leg): the artifact `myotis-bee-poc-dmg-arm64-<sha>`
-  holds `Myotis-bee-poc-arm64.dmg`, and the leg fails unless the dmg carries
-  the seed and its manifest (the standard leg fails if it carries one). Tag
-  builds skip the leg: it is never attached to a release, and a PoC-only
-  failure must not block one.
+- **CI builds it on every PR, every push to `main` and every release tag**
+  (`desktop-dmg.yml`, the `bee-poc` matrix leg): the artifact
+  `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`, and the
+  leg fails unless the dmg carries the seed, its manifest and the peer caches
+  (the standard leg fails if it carries a seed). On a tag the dmg is attached
+  to the GitHub release as a best-effort asset: the leg is
+  `continue-on-error`, so a PoC-only failure never blocks the standard dmgs,
+  and the release simply lacks the PoC in that case. Mind the shelf life: a
+  release older than ~29 days carries a PoC whose seed no longer catches up.
 - **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
   when no index file exists there yet, or when the bundled seed is newer than
   the one this flavour installed before (a rebuilt app after the shelf life;
@@ -259,7 +273,18 @@ with the seed above bundled inside:
   log index on and the PostageStamp watch entry at its real deployment block.
   Later starts leave settings alone. The Index tab shows the seed's provenance
   and its usable-until block while the engine's index is on, or says why the
-  bundled seed did not get installed.
+  bundled seed did not get installed. The bundle also carries **warm Gnosis
+  peer caches** (`data/bee/gnosis/peers-gnosis.cache`,
+  `cl-peers-gnosis.cache` — the engine's own text formats, public peers only,
+  re-verified on dial), installed the same way when the data dir has none,
+  so the app starts with known snap peers instead of a cold pool. Refresh
+  them when refreshing the seed, from a node that has run Gnosis for a while:
+  the daemon writes `app/peers-gnosis.cache` and `app/cl-peers-gnosis.cache`
+  (its data dir), the desktop app the same names under `~/.myotis`; drop the
+  lines the engine has already demoted (`fails=5` and above, or `snapbad`)
+  so the shipped set is warm, not just long. *Purge cache* in the PoC
+  deletes both files, so the next start re-installs the shipped ones — the
+  PoC never truly starts cold, by design.
 - **Point Bee at it**: `blockchain-rpc-endpoint: http://127.0.0.1:8546` with
   the config from *Setup* step 5. Once the beacon sync reaches `SYNCED`
   (seconds with a fresh anchor; the stale-anchor dialog first if the build is
@@ -285,6 +310,33 @@ inside the bundle under a `.dylib` name (jpackage's signing pass signs
 the launcher passes `-Djna.boot.library.path=$APPDIR/resources`; the dmg
 workflow fails unless the stub is present, of the dmg's architecture, and
 validly signed.
+
+A second packaging note that this build surfaced, and that applies to the
+regular dmg just the same: the app is a GUI app that serves *other* processes
+over localhost, and macOS **App Nap** throttles a GUI app whose window is
+hidden or fully covered down to the background scheduling band — `ps -M -p
+<pid>` shows every thread at kernel priority `4`, back to `31` the moment the
+window is frontmost. On an otherwise busy Mac (load average ~120) that turned
+into multi-second gaps before the RPC server even accepted a connection (Bee's
+requests sat unread in the kernel's accept backlog, `CLOSE_WAIT` with the whole
+POST in `Recv-Q`), safepoint syncs of seconds, one 92 s Full GC, a head bridge
+that took seven minutes instead of thirty seconds, and Bee's 10-minute postage
+stall. Measured 2026-09-16, same host, same minute: napped, 25 of 40
+`eth_blockNumber` probes took over a second (up to 18 s); un-napped, 0 of 30
+(16–144 ms). The app therefore holds an `NSProcessInfo` activity
+(`NSActivityUserInitiatedAllowingIdleSystemSleep`) for its whole lifetime
+(`AppNap.kt`, through JNA's Objective-C runtime calls) and logs the outcome as
+the first line of every start; being in-process this covers `:app-desktop:run`
+dev runs too. Measured the same way: with the activity held, two minutes
+hidden left every thread at `28`–`31`, never `4`. Two things it deliberately does not do: keep the Mac awake (a
+closed lid or the idle-sleep timer still stops everything — `caffeinate` or the
+*Prevent automatic sleeping* energy setting is that layer), and rely on the
+`NSAppSleepDisabled` Info.plist key, which current macOS ignores — measured on
+15.7 with the same hide-the-window procedure, a bundle carrying the key napped
+exactly like one without (every thread `4T` within 30 s). The key's
+user-defaults form does work and remains the in-place fix for a build from
+before this change: `defaults write io.myotis.desktop.beepoc NSAppSleepDisabled
+-bool YES` (`io.myotis.desktop` for the regular app) and a relaunch.
 
 Everything the *Demo only* section says about trust applies: this is an
 RPC-sourced, unverified seed served indistinguishably from walked coverage,
