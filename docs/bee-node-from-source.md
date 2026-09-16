@@ -20,7 +20,10 @@ it fails), `eth_chainId` (must be 100), `eth_getBlockByNumber` (`"latest"`, with
 `eth_estimateGas`, `eth_maxPriorityFeePerGas`, `eth_getTransactionCount`
 (including `"pending"`), `eth_sendRawTransaction`, `eth_getTransactionReceipt`,
 `eth_getTransactionByHash` and `eth_getLogs`. No WebSocket, no filters, no
-batches. All twelve are served verified by Myotis.
+batches. All twelve are served by Myotis, verified — with one carve-out this
+document exists to explain: seeded `eth_getLogs` coverage is a full node's
+word until the walker re-verifies it, and not all of it can be (sections 2, 5
+and 6).
 
 Three of Bee's rules shape everything below:
 
@@ -49,8 +52,10 @@ Stock Myotis, any build, on Gnosis:
   `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
   `eth_getStorageAt`, blocks and receipts by number/hash, transaction
   broadcast to the peers and receipt lookup;
-- a **log index** for `eth_getLogs`: logs are extracted from *verified*
-  receipts (checked against each header's receipts root) for a configurable
+- a **log index** for `eth_getLogs` (Rust engine only — the default, and the
+  one every build in section 3 ships; a `-PskipRustEngine` build has no log
+  index at all): logs are extracted from *verified* receipts (checked against
+  each header's receipts root) for a configurable
   watch-list of contract addresses, stored locally, and served only for the
   block range the index actually covers. A query outside coverage is
   **refused** with a retryable error (`-32000`, "requested range is not indexed
@@ -168,7 +173,8 @@ python3 scripts/synth_logindex.py \
   --watch 0x45a1502382541Cd610CC9068e88727426b696293:31305656 \
   --out /tmp/bee-logindex-gnosis-seed.db
 
-# 2. run the Gnosis daemon (RPC on http://127.0.0.1:8546), wait for SYNCED
+# 2. run the Gnosis daemon (RPC on http://127.0.0.1:8546) — it blocks until
+#    stopped, so keep it running and do the rest from a second terminal
 ./gradlew :app:run -Pnetwork=gnosis
 ./gradlew :app:run -Pnetwork=gnosis -Pargs=beacon-status      # "state":"SYNCED"
 
