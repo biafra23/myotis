@@ -157,10 +157,13 @@ its deployment block:
   `VERIFIED` and 3 `-32000` outcomes. The pool recovered on its own (7 snap
   peers) and Bee resumed on restart. The daemon never hit this because it
   ran on a warm `peers-gnosis.cache`; the PoC now bundles that cache (public
-  enodes, like the seed). The remaining follow-up is on the fetch side —
-  hedge the head-edge block/receipt fetch across peers and shorten the
-  per-peer timeout so one dead peer costs hundreds of milliseconds, not the
-  23 s one `eth_getLogs` took here. NOT a faster refusal: Bee retries a
+  enodes, like the seed). The fetch side has since been hedged: block,
+  receipt and `eth_call` state reads ask a second peer after 3 s without an
+  answer (up to three in flight), so a dead first peer no longer costs a full
+  15 s request timeout. The optimistic tail's own candidate fetch — the head
+  edge that 23 s `eth_getLogs` waited on — is not hedged yet: it runs under a
+  2 s tick budget, shorter than the hedge delay, and needs its own treatment.
+  NOT a faster refusal, either way: Bee retries a
   failed page every 5 s and its stall rule counts *successful* pages, so
   for Bee a slow success beats a fast `-32000` every time.
 - **…and App Nap sat underneath it.** Once its window was covered by other

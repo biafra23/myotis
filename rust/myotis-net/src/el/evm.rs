@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
+use super::reader::{hedged_race, RaceOutcome};
+
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
@@ -273,6 +275,22 @@ impl PoolOracle {
         }
     }
 
+    /// Feed one hedged race into the reputation sink: the winner served, every
+    /// miss failed. Peers still in flight when the winner returned are neither —
+    /// being slower is not a fault (the same rule as `ElReader::hedged_read`).
+    async fn record_race<T>(
+        quality: &Option<crate::el::pool::SnapQualitySink>,
+        peers: &[Arc<ManagedPeer>],
+        out: &RaceOutcome<T>,
+    ) {
+        for idx in &out.missed {
+            Self::record(quality, &peers[*idx], false).await;
+        }
+        if let Some((idx, _)) = &out.accepted {
+            Self::record(quality, &peers[*idx], true).await;
+        }
+    }
+
     /// The proof-verified account leaf at `address`, or `None` when proven absent.
     /// Memoised per call. `Err` only when no peer could prove it.
     fn leaf(
@@ -286,22 +304,26 @@ impl PoolOracle {
         }
         // No lock held across the network fetch.
         let quality = self.quality.clone();
+        let peers = &self.peers;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer.snap_get_account(state_root, &address).await {
-                    Ok(AccountOutcome::Present(leaf)) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(Some(leaf));
-                    }
-                    Ok(AccountOutcome::Absent) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(None);
-                    }
-                    // Bad proof / transport for this peer — try the next.
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged across the call's peers (reader::hedged_race). An eth_call
+            // makes several state reads, and a silent first peer used to hold
+            // EACH of them for a full request timeout — the main source of
+            // multi-second eth_call latency on a flaky pool. Any proof-verified
+            // answer ends the race; a bad proof or transport error is a miss.
+            let out = hedged_race(
+                peers,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_account(state_root, &address).await
+                },
+                |_: &AccountOutcome| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            out.accepted.map(|(_, outcome)| match outcome {
+                AccountOutcome::Present(leaf) => Some(leaf),
+                AccountOutcome::Absent => None,
+            })
         })?;
         match fetched {
             Some(leaf) => {
@@ -578,20 +600,20 @@ impl SnapStateOracle for PoolOracle {
         }
         let position = slot.to_be_bytes::<32>();
         let quality = self.quality.clone();
+        let peers = &self.peers;
+        let leaf = &leaf;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer
-                    .snap_get_storage(state_root, &address, &leaf, &position)
-                    .await
-                {
-                    Ok(value) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(value);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged like the account leaf above.
+            let out = hedged_race(
+                peers,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_storage(state_root, &address, leaf, &position).await
+                },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            out.accepted.map(|(_, value)| value)
         })?;
         match fetched {
             // Empty bytes = a proven-zero / absent slot.
@@ -612,17 +634,18 @@ impl SnapStateOracle for PoolOracle {
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
+        let peers = &self.peers;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer.snap_get_bytecode(code_hash).await {
-                    Ok(code) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(code);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged like the account leaf above. Code is content-addressed and
+            // keyed by hash, so racing discloses nothing new about the caller.
+            let out = hedged_race(
+                peers,
+                |peer: Arc<ManagedPeer>| async move { peer.snap_get_bytecode(code_hash).await },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            out.accepted.map(|(_, code)| code)
         })?;
         fetched.ok_or(OracleError::BytecodeUnavailable {
             code_hash: *code_hash,
