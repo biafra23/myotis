@@ -7,7 +7,7 @@
 // release-sweep pins: `./gradlew check` (verifyIosVersion) fails when either
 // disagrees with the project version.
 //   MARKETING_VERSION       = the release version (CFBundleShortVersionString)
-//   CURRENT_PROJECT_VERSION = 1010
+//   CURRENT_PROJECT_VERSION = the root build's releaseBuildNumber
 //                             (MAJOR*1_000_000 + MINOR*1_000 + PATCH), the same
 //                             number android-app ships as versionCode. Apple
 //                             requires CFBundleVersion's first integer to be
