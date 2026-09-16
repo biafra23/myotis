@@ -233,11 +233,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15208352, 2026-09-13, period 1856)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15226272, 2026-09-16, period 1858)
             checkpoint_root: hex32(
-                "912d2071fff678e498fc526b8c9fa7021b412c0a30bad659ffaccfed84d980bd",
+                "7297ab81a5100382af1ffc47741a18a16d80622a7053408af2da4862ed18e2dc",
             ),
-            checkpoint_slot: 15_208_352,
+            checkpoint_slot: 15_226_272,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -293,11 +293,11 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11132576, 2026-09-13, period 1358)
+            // trusted checkpoint: recent finalized sepolia block root (slot 11150496, 2026-09-16, period 1361)
             checkpoint_root: hex32(
-                "6cfed028ffbd34db0b2ce5f783d707ce909bb19248177fea182a736bf076ba6a",
+                "75a2c3a26326b624b1bb656b260196881effc82f6a230377516d46cd30872e74",
             ),
-            checkpoint_slot: 11_132_576,
+            checkpoint_slot: 11_150_496,
             // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -362,11 +362,11 @@ impl ChainConfig {
             // anything older than a few periods anyway — and use `-Pperiod=<n>`
             // only to pin a retained state for testing, never one below the floor.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30066368, 2026-09-13, period 3670)
+            // trusted checkpoint: recent finalized gnosis block root (slot 30109376, 2026-09-16, period 3675)
             checkpoint_root: hex32(
-                "74a088669a561daad8a3af71966847a3dae10e0b976e0e773fa1e2735872cd3a",
+                "11121adefa7f7f497b2c2046d4c1469ca49a5369177fe21e0e16fc33dc5ead28",
             ),
-            checkpoint_slot: 30_066_368,
+            checkpoint_slot: 30_109_376,
             // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -3738,10 +3738,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_208_352);
+        assert_eq!(c.checkpoint_slot, 15_226_272);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "912d2071fff678e498fc526b8c9fa7021b412c0a30bad659ffaccfed84d980bd"
+            "7297ab81a5100382af1ffc47741a18a16d80622a7053408af2da4862ed18e2dc"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -3882,10 +3882,10 @@ mod tests {
             ]
         );
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 11_132_576);
+        assert_eq!(c.checkpoint_slot, 11_150_496);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "6cfed028ffbd34db0b2ce5f783d707ce909bb19248177fea182a736bf076ba6a"
+            "75a2c3a26326b624b1bb656b260196881effc82f6a230377516d46cd30872e74"
         );
         // @checkpoint:sepolia:test:end
         assert_eq!(
@@ -3970,10 +3970,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_008), [0x05, 0, 0, 0x64]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_009), [0x06, 0, 0, 0x64]);
         // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 30_066_368);
+        assert_eq!(c.checkpoint_slot, 30_109_376);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "74a088669a561daad8a3af71966847a3dae10e0b976e0e773fa1e2735872cd3a"
+            "11121adefa7f7f497b2c2046d4c1469ca49a5369177fe21e0e16fc33dc5ead28"
         );
         // @checkpoint:gnosis:test:end
         assert_eq!(
