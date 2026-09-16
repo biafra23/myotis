@@ -764,13 +764,21 @@ private fun StatusTab(
         // sidecar — matched by the same glob — is rewritten unthrottled every ~12 s, and
         // `close()` persists again at shutdown. So pressed on a running chain the action is
         // unpredictable rather than merely slow, and it only ever takes effect at the NEXT
-        // start anyway. Stop first, reset, start: that sequence always means what it says.
+        // start anyway. Stop, reset, start is the sequence to use — on desktop the delete now
+        // takes the same per-network boot lock as the cache clear, so it cannot race the next
+        // boot's snapshot read. Android's reset is still an unlocked detached delete (and drops
+        // only the main file, no sibling glob), so there the sequence stays best-effort.
         //
         // One honest limit: `primaryActive` follows the host's 2 s snapshot poll, and the engine
         // drops a stopping chain from its registry BEFORE the loop finishes tearing down (it
         // tracks that window itself and refuses a fresh create into the same directory). So the
         // button can go live a moment before the last writer is gone. A write there needs a
         // period advance, so the odds are slim — but the gate is a guard rail, not a lock.
+        // Android has a third window that is not poll-related: its bridge emits an EMPTY
+        // snapshot map whenever the Activity is unbound from the foreground service — while the
+        // engine under it keeps running — so just after a rebind these can render enabled
+        // against a live node until the next tick, and a tap then executes for real (the
+        // service handle is resolved at click time, by which point the bind has completed).
         OutlinedButton(
             onClick = { controller.clearCaches(primary) },
             enabled = !primaryActive,
