@@ -743,15 +743,61 @@ private fun StatusTab(
         Spacer(Modifier.height(16.dp))
         // Maintenance actions (mirrors the old Android Status screen): wipe peer caches to give
         // discovery a fresh slate, or drop the persisted sync snapshot to re-bootstrap next start.
+        //
+        // BOTH are offered only while the network is down (owner's call, 2026-09-16): each is one
+        // mis-click away from throwing out hours of learned peers or the sync anchor, and neither
+        // is worth that risk mid-run. The reasons they are unsafe differ, though, and the
+        // difference is worth keeping written down.
+        //
+        // `clearCaches` actually WORKS while running: it goes THROUGH the engine (clearPeerState
+        // plus the live cache instances), so a live stack cannot write the old peers back. Gating
+        // it therefore costs something real — handing discovery a fresh slate without a restart is
+        // a genuine debugging move — and that cost is accepted deliberately to make the accidental
+        // click impossible.
+        //
+        // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
+        // STICKS while the chain runs depends on the engine and on what it is doing — which is
+        // the reason to gate it rather than the reason not to. Rust, synced: persistence is
+        // throttled to a sync-committee PERIOD advance (~11 h gnosis, ~27 h mainnet) and there
+        // is no stop-time persist, so the delete usually holds. Rust, catching up: a persist
+        // lands per applied period, i.e. seconds, and the delete is gone. Java: the `.roots`
+        // sidecar — matched by the same glob — is rewritten unthrottled every ~12 s, and
+        // `close()` persists again at shutdown. So pressed on a running chain the action is
+        // unpredictable rather than merely slow, and it only ever takes effect at the NEXT
+        // start anyway. Stop, reset, start is the sequence to use — on desktop the delete now
+        // takes the same per-network boot lock as the cache clear, so it cannot race the next
+        // boot's snapshot read. Android's reset is still an unlocked detached delete (and drops
+        // only the main file, no sibling glob), so there the sequence stays best-effort.
+        //
+        // One honest limit: `primaryActive` follows the host's 2 s snapshot poll, and the engine
+        // drops a stopping chain from its registry BEFORE the loop finishes tearing down (it
+        // tracks that window itself and refuses a fresh create into the same directory). So the
+        // button can go live a moment before the last writer is gone. A write there needs a
+        // period advance, so the odds are slim — but the gate is a guard rail, not a lock.
+        // Android has a third window that is not poll-related: its bridge emits an EMPTY
+        // snapshot map whenever the Activity is unbound from the foreground service — while the
+        // engine under it keeps running — so just after a rebind these can render enabled
+        // against a live node until the next tick, and a tap then executes for real (the
+        // service handle is resolved at click time, by which point the bind has completed).
         OutlinedButton(
             onClick = { controller.clearCaches(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Clear peer caches") }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = { controller.resetSyncState(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Reset sync state") }
+        if (primaryActive) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Stop $primary first: these discard learned peers and the sync anchor, and a "
+                    + "reset only applies at the next start anyway.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
 
         // Per-peer detail for the READY peers (address, snap support, client id).
         if (snap != null && snap.readyPeerList.isNotEmpty()) {

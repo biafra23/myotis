@@ -406,11 +406,18 @@ class DesktopNodeController(
         val canonical = engine.canonicalNetworkName(network)
         // Off the UI thread — directory scan + deletes are blocking IO.
         Thread({
-            val suffix = if (canonical == "mainnet") "" else "-$canonical"
-            // Delete the persisted snapshot and any sibling parts (e.g. the ".roots"
-            // accumulator) so the next start re-bootstraps from the embedded checkpoint.
-            java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
-                s.forEach { java.nio.file.Files.deleteIfExists(it) }
+            // Serialize with enable/disable through the per-network boot lock, exactly as
+            // clearCaches does above. Without it a Reset immediately followed by Start races
+            // the unlinks against the boot's snapshot read: if the boot wins, the node resumes
+            // from the old snapshot and the reset silently did nothing — the same no-op the
+            // Status-tab gate exists to remove, moved inside the recommended sequence.
+            synchronized(bootLock(canonical)) {
+                val suffix = if (canonical == "mainnet") "" else "-$canonical"
+                // Delete the persisted snapshot and any sibling parts (e.g. the ".roots"
+                // accumulator) so the next start re-bootstraps from the embedded checkpoint.
+                java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
+                    s.forEach { java.nio.file.Files.deleteIfExists(it) }
+                }
             }
         }, "desktop-reset-sync-$canonical").apply { isDaemon = true }.start()
     }
