@@ -145,7 +145,8 @@ const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 
 /// Consecutive verified-read failures that EVICT a live peer, freeing its
 /// slot for the maintainer to refill with a fresh candidate. Reset on any
-/// successful serve. Never applied to the sole remaining peer — a failure
+/// successful serve. A repeated outpace counts as a failure too (see
+/// [`OUTPACES_BEFORE_STRIKE`]). Never applied to the sole remaining peer — a failure
 /// against the only server is ambiguous (it may be our own stale ask), the
 /// same rationale as record_quality's persisted-verdict guard.
 ///
@@ -161,6 +162,24 @@ const READ_FAILS_EVICT: u32 = 3;
 /// fails the build instead of silently reopening the re-admit churn.
 const _: () = assert!(READ_FAILS_EVICT == crate::el::peercache::FAILURE_THRESHOLD);
 
+/// Times a peer may be OUTPACED (see `PeerPool::record_snap_outpaced`) since it
+/// last served before each further outpace also counts as a verified-read
+/// failure. A hedged read drops a silent attempt once another peer answers, so
+/// without this a dead connection that stays open (a request timeout does not
+/// close it, and nothing pings an idle one) would never be struck: it would sit
+/// out 30 s benches forever, costing a hedge delay after each, and never free
+/// its slot. The first outpace stays free so one stall is not held against a
+/// peer; with [`READ_FAILS_EVICT`] a peer that never serves is evicted on its
+/// fourth consecutive outpace.
+const OUTPACES_BEFORE_STRIKE: u32 = 1;
+
+/// Live verdict after an outpace — pure. Returns `(new_streak, strike)`, where
+/// `strike` means the outpace also counts as a verified-read failure.
+fn outpace_verdict(streak_before: u32) -> (u32, bool) {
+    let streak = streak_before.saturating_add(1);
+    (streak, streak > OUTPACES_BEFORE_STRIKE)
+}
+
 /// A live pooled peer plus the address it was dialed at (so pruning a dropped
 /// peer can free its address for a future re-dial).
 struct PooledPeer {
@@ -171,6 +190,8 @@ struct PooledPeer {
     benched_until: Option<Instant>,
     /// Consecutive verified-read failures (see [`READ_FAILS_EVICT`]).
     read_fails: u32,
+    /// Outpaces since the last successful serve (see [`OUTPACES_BEFORE_STRIKE`]).
+    outpaced: u32,
 }
 
 /// Read-ladder order over newest-first bench flags: unbenched peers first
@@ -266,12 +287,25 @@ struct PoolInner {
 }
 
 impl PoolInner {
-    /// Bench without a strike — see `record_snap_outpaced`.
+    /// Bench an outpaced peer, and strike a repeat — see `record_snap_outpaced`.
     async fn record_outpaced(&self, addr: SocketAddr) {
         self.prune_closed().await;
-        let mut peers = self.peers.lock().await;
-        if let Some(p) = peers.iter_mut().find(|p| p.addr == addr) {
+        let strike = {
+            let mut peers = self.peers.lock().await;
+            let Some(p) = peers.iter_mut().find(|p| p.addr == addr) else {
+                return;
+            };
+            let (streak, strike) = outpace_verdict(p.outpaced);
+            p.outpaced = streak;
             p.benched_until = Some(Instant::now() + READ_FAIL_BENCH);
+            strike
+        };
+        // Outside the lock: record_quality takes it again (tokio's Mutex is
+        // not reentrant). It benches too, banks the strike under the sole-peer
+        // shield, may evict, and feeds the persisted verdict, exactly as a
+        // failed read does.
+        if strike {
+            self.record_quality(addr, false).await;
         }
     }
 
@@ -300,6 +334,7 @@ impl PoolInner {
                 if served {
                     p.benched_until = None;
                     p.read_fails = 0;
+                    p.outpaced = 0;
                 } else {
                     let (fails, evict) = read_failure_verdict(p.read_fails, len);
                     if evict {
@@ -478,6 +513,7 @@ impl PoolInner {
                     peer,
                     benched_until: None,
                     read_fails: 0,
+                    outpaced: 0,
                 });
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
@@ -684,11 +720,16 @@ impl PeerPool {
         self.inner.record_quality(addr, false).await;
     }
 
-    /// A hedge answered while this peer's attempt had been outstanding past the
-    /// hedge delay. Bench it for [`READ_FAIL_BENCH`] so the next read starts
-    /// with someone else — WITHOUT a strike. On a uniformly slow link every
-    /// peer gets outpaced by whichever happens to answer first, and counting
-    /// that would drain the pool the hedge exists to keep usable.
+    /// A hedged read was answered by a peer asked AFTER this one, while this
+    /// one had been outstanding for at least the hedge delay (see
+    /// `reader::RaceOutcome::outpaced`). Bench it for [`READ_FAIL_BENCH`] so the
+    /// next reads start with someone else. The first outpace since the peer
+    /// last served costs nothing more; each further one is also a
+    /// verified-read failure (see [`OUTPACES_BEFORE_STRIKE`]).
+    ///
+    /// Only a peer asked before the winner can be outpaced, so a uniformly slow
+    /// link does not strike anyone: there the first peer asked usually answers
+    /// first, and the hedges started after it are not counted.
     ///
     /// Without this, a silent peer was never struck once reads were hedged: the
     /// winner returns and the silent attempt is simply dropped, so the peer
@@ -1232,9 +1273,9 @@ impl SnapQualitySink {
         self.inner.record_quality(addr, false).await;
     }
 
-    /// A snap fetch against `addr` was still outstanding past the hedge delay
-    /// when another peer answered: bench it, no strike (see
-    /// `ElPool::record_snap_outpaced`).
+    /// A hedged snap fetch against `addr` was outpaced by a peer asked after
+    /// it: bench it, and count a repeat as a failure (see
+    /// `PeerPool::record_snap_outpaced`).
     pub async fn outpaced(&self, addr: SocketAddr) {
         self.inner.record_outpaced(addr).await;
     }
@@ -1246,7 +1287,9 @@ mod tests {
     /// go behind unbenched ones but are never dropped from the ladder, and
     /// repeated read failures evict — except the sole peer.
     mod read_rotation {
-        use super::super::{ladder_order, read_failure_verdict, READ_FAILS_EVICT};
+        use super::super::{
+            ladder_order, outpace_verdict, read_failure_verdict, OUTPACES_BEFORE_STRIKE, READ_FAILS_EVICT,
+        };
 
         #[test]
         fn unbenched_lead_benched_trail_newest_first_within_each() {
@@ -1281,6 +1324,34 @@ mod tests {
             // ...so after the pool grows the ex-sole peer starts from 0, not
             // one failure from eviction.
             assert_eq!(read_failure_verdict(0, 2), (1, false));
+        }
+
+        #[test]
+        fn a_peer_that_never_serves_is_evicted_by_repeated_outpaces() {
+            // A hedged read drops a silent attempt once another peer answers,
+            // so an open-but-dead connection only ever shows up as outpaced.
+            // The first outpace is free, each further one is a strike, and the
+            // strikes evict at the usual threshold: gone on the fourth
+            // outpace, not never.
+            assert_eq!(outpace_verdict(0), (1, false));
+            assert_eq!(outpace_verdict(1), (2, true));
+            assert_eq!(outpace_verdict(u32::MAX), (u32::MAX, true));
+            let (mut streak, mut fails) = (0, 0);
+            let mut evicted_at = None;
+            for n in 1..=10u32 {
+                let (next, strike) = outpace_verdict(streak);
+                streak = next;
+                if strike {
+                    let (f, evict) = read_failure_verdict(fails, 8);
+                    fails = f;
+                    if evict {
+                        evicted_at = Some(n);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(evicted_at, Some(OUTPACES_BEFORE_STRIKE + READ_FAILS_EVICT));
+            assert_eq!(evicted_at, Some(4));
         }
     }
 

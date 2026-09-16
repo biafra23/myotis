@@ -276,8 +276,9 @@ impl PoolOracle {
     }
 
     /// Feed one hedged race into the reputation sink: the winner served, every
-    /// miss failed, and every attempt the winner outpaced benched without a
-    /// strike (the same rules as `ElReader::hedged_read`).
+    /// miss failed, and every attempt the winner outpaced reported as outpaced
+    /// (benched; a repeat before the peer serves again is a failure). The same
+    /// rules as `ElReader::hedged_read`.
     async fn record_race<T>(
         quality: &Option<crate::el::pool::SnapQualitySink>,
         peers: &[Arc<ManagedPeer>],

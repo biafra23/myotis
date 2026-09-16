@@ -250,10 +250,11 @@ agent through commit → reveal → claim → sample (where `IsPlaying` reverts 
 an unstaked overlay, as designed), and every one of its calls came back
 `VERIFIED`. Typical latencies are tens of milliseconds; `eth_call`s that need
 fresh state proofs and `eth_getLogs` pages at the head edge occasionally take
-1–20 s when a peer is slow. State reads now ask a second peer after 3 s
-without an answer and block and receipt reads after 6 s, which trims most of
-that tail; the optimistic tail's own head-edge fetch is not hedged yet. Myotis's own log (`Logs` tab, filter `access`) shows every request
-with its outcome and latency.
+1–20 s when a peer is slow. Reads now ask a second peer after 3 s without an
+answer (6 s for a block or receipt read far behind the head), which trims
+most of that tail; the optimistic tail's own head-edge fetch is not hedged
+yet. Myotis's own log (`Logs` tab, filter `access`) shows every request with
+its outcome and latency.
 
 ## 5. The backfill: what it does and why
 

@@ -158,16 +158,21 @@ its deployment block:
   peers) and Bee resumed on restart. The daemon never hit this because it
   ran on a warm `peers-gnosis.cache`; the PoC now bundles that cache (public
   enodes, like the seed). The fetch side has since been hedged: `eth_call`
-  state reads ask a second peer after 3 s without an answer, block and
-  receipt reads after 6 s (their responses are large, so a download that is
-  merely slow should not be duplicated eagerly), up to three in flight — a
-  dead first peer no longer costs a full 15 s request timeout, and a peer the
-  hedge outpaces is moved to the back of the queue so the next read starts
-  elsewhere. The optimistic tail's own candidate fetch — the head edge that
-  23 s `eth_getLogs` waited on — is not hedged yet: its time budget is only
-  checked between candidate chunks, and its header-window fetch never checks
-  it, so a silent peer can still hold a tail tick for the full 15 s. That
-  needs its own treatment.
+  state reads, and block and receipt reads near the head, ask a second peer
+  after 3 s without an answer, up to three in flight. A block or receipt read
+  128 or more blocks behind the head waits 6 s instead, because its header
+  window is a large download that should not be duplicated eagerly. A dead
+  first peer no longer costs a full 15 s request timeout. A peer that is
+  beaten by one asked after it is moved behind the others for 30 s, and if
+  that happens again before it serves anything it counts as a failed read,
+  so a dead connection is evicted after a few reads instead of lingering.
+  The optimistic tail's own fetch — the head edge that 23 s `eth_getLogs`
+  waited on — is not hedged yet. Its header-window loop and its
+  candidate-chunk loop each try peers one at a time with the full 15 s
+  timeout, neither counts a failure against the peer, and the chunk loop
+  starts again from the first peer. One silent peer at the front can
+  therefore hold a tail tick for about 30 s, and several for a multiple of
+  that. That needs its own treatment.
   NOT a faster refusal, either way: Bee retries a
   failed page every 5 s and its stall rule counts *successful* pages, so
   for Bee a slow success beats a fast `-32000` every time.

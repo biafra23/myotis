@@ -677,15 +677,47 @@ const TIP_SUGGEST_BLOCKS: u64 = 3;
 /// if it still arrives first.
 pub(crate) const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Hedge delay for BLOCK and RECEIPT reads. Their responses are large — the
-/// anchored header window can run to a few hundred KB (see `get_block_from`),
-/// plus a full body and its receipts — so on a slow or metered link a peer that
-/// is still SENDING looks exactly like one that went silent, and hedging it at
-/// [`HEDGE_DELAY`] would duplicate the download, and split the bandwidth, far
-/// too eagerly. Twice the proof-read delay still caps a truly silent peer well
-/// under the 15 s request timeout. A tuning choice rather than a derived bound:
-/// revisit with measurements from a metered mobile link.
+/// Hedge delay for a block or receipt read whose anchored header window is
+/// DEEP (see [`block_hedge_delay`]). That window grows with the distance to the
+/// head, up to a few hundred KB at the lookback cap (see `get_block_from`), so
+/// on a slow or metered link a peer that is still SENDING it looks exactly like
+/// one that went silent, and hedging at [`HEDGE_DELAY`] would duplicate the
+/// download, and split the bandwidth, far too eagerly. Twice the proof-read
+/// delay still caps a truly silent peer well under the 15 s request timeout. A
+/// tuning choice rather than a derived bound: revisit with measurements from a
+/// metered mobile link.
 pub(crate) const BULK_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Header-window depth (blocks behind the anchored head) from which a block or
+/// receipt read hedges on [`BULK_HEDGE_DELAY`]. Below it the window is a few
+/// dozen KB at most, the same order as the body or receipts that come with it,
+/// so the slower delay would buy nothing and cost two paths that cannot afford
+/// it: the latest-block read every `eth_call` starts with (a window of one),
+/// and the on-demand `eth_getLogs` fill, whose whole deadline
+/// ([`LOG_INDEX_FILL_DEADLINE`]) is shorter than the bulk delay. That fill works
+/// at or just below finality, which normally trails the head by about two
+/// epochs (32 blocks on Gnosis, 64 on mainnet), so this leaves it room.
+const BULK_HEDGE_MIN_BACK: u64 = 128;
+const _: () = assert!(BULK_HEDGE_MIN_BACK < BLOCK_LOOKBACK_MAX, "the bulk delay must be reachable");
+
+/// The hedge delay for a block or receipt read `back` blocks behind the
+/// anchored head — pure, so the size rule is pinned by a test.
+pub(crate) fn block_hedge_delay(back: u64) -> std::time::Duration {
+    if back < BULK_HEDGE_MIN_BACK {
+        HEDGE_DELAY
+    } else {
+        BULK_HEDGE_DELAY
+    }
+}
+
+/// Hard deadline of the on-demand log-index fill
+/// (`ElReader::advance_log_index_tail_now`).
+const LOG_INDEX_FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A shallow read's hedge must be able to fire, and its second peer answer,
+/// inside the fill's deadline; otherwise hedging does nothing on that path and
+/// the race is cancelled before it can bench the silent peer.
+const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_millis());
 
 /// Cap on concurrently hedged attempts for one read. Two reasons to keep it
 /// small, load AND privacy:
@@ -708,18 +740,20 @@ pub(crate) const BULK_HEDGE_DELAY: std::time::Duration = std::time::Duration::fr
 const MAX_HEDGED_ATTEMPTS: usize = 3;
 
 /// What a hedged race produced: the accepted answer (with the index of the peer
-/// that gave it), the best non-accepted result as a fallback, and the indices
-/// that missed (failed, or answered without a verdict) so the caller can feed
-/// peer quality. Peers still in flight when the winner returned are in NEITHER
-/// list — they were neither good nor bad, just slower.
+/// that gave it), the best non-accepted result as a fallback, the indices that
+/// missed (failed, or answered without a verdict), and the ones the winner
+/// outpaced — so the caller can feed peer quality. Any other attempt still in
+/// flight when the winner returned is in no list: it was asked after the
+/// winner, or has not had the hedge delay yet, so its slowness proves nothing.
 pub(crate) struct RaceOutcome<T> {
     pub(crate) accepted: Option<(usize, T)>,
     pub(crate) fallback: Option<T>,
     pub(crate) missed: Vec<usize>,
-    /// Attempts still in flight when the winner returned that had been
-    /// outstanding for at least the hedge delay — the ones the winner OUTPACED.
-    /// Neither a failure nor a success, but not nothing either: a silent peer
-    /// only ever shows up here, so callers bench these (no strike).
+    /// Attempts the winner OUTPACED: asked before it, outstanding for at least
+    /// the hedge delay, and still silent when it answered. Not a failure on its
+    /// own, but a silent peer only ever shows up here, so callers report these
+    /// (`PeerPool::record_snap_outpaced`), which benches the peer and counts a
+    /// repeat as a failure.
     pub(crate) outpaced: Vec<usize>,
     /// Every failure reason, in arrival order. The block and receipt reads
     /// summarise the whole pool and classify tip-lag across it, so they need
@@ -739,7 +773,7 @@ impl<T> RaceOutcome<T> {
 /// flight), stopping at the first result `accept` approves. A slow peer keeps
 /// running while its hedge does, so it still wins if it answers first. Proof
 /// reads pass [`HEDGE_DELAY`]; block and receipt reads pass
-/// [`BULK_HEDGE_DELAY`].
+/// [`block_hedge_delay`] of their header-window depth.
 ///
 /// Pure policy — no pool bookkeeping, no peer types — so the timing invariants
 /// are unit-testable. Callers apply the outcome: [`ElReader::hedged_read`] for
@@ -749,7 +783,12 @@ impl<T> RaceOutcome<T> {
 /// NB when a winner returns, the remaining in-flight attempts are dropped
 /// mid-request. That can leave a loser's writer marked torn, which condemns
 /// that connection (`ManagedPeer::fail_all`) — the same trade the backfill
-/// pipeline already makes, and paid only once we HAVE the answer.
+/// pipeline already makes, and paid only once we HAVE the answer. For the same
+/// reason the losers are not polled again to see whether any of them finished
+/// in the winner's wakeup: a multi-step read (block, receipts) would start its
+/// next request on that poll, and dropping it mid-write is exactly the tear. So
+/// a loser that failed in that same wakeup is judged by its age like the rest,
+/// and at worst is reported as outpaced rather than as a miss.
 pub(crate) async fn hedged_race<T, P: Clone, Fut>(
     peers: &[P],
     delay: std::time::Duration,
@@ -796,11 +835,15 @@ where
             Some((idx, res)) = in_flight.next() => { done[idx] = true; match res {
                 Ok(value) => {
                     if accept(&value) {
-                        // Anyone still running past the delay was outpaced; a
-                        // hedge that started moments ago is no evidence either way.
+                        // OUTPACED = asked BEFORE the winner (attempts start in
+                        // index order) AND outstanding for at least the delay.
+                        // A peer asked after the winner had less time than the
+                        // winner needed, so on a uniformly slow link it proves
+                        // nothing. A peer asked just before it (a failure starts
+                        // the next attempt at once) has not had the delay yet.
                         let now = tokio::time::Instant::now();
-                        out.outpaced = (0..next)
-                            .filter(|&i| i != idx && !done[i])
+                        out.outpaced = (0..idx)
+                            .filter(|&i| !done[i])
                             .filter(|&i| started[i].is_some_and(|s| now.duration_since(s) >= delay))
                             .collect();
                         out.accepted = Some((idx, value));
@@ -827,7 +870,9 @@ where
 
 /// One peer's result in a hedged block read. Both variants END the race.
 enum BlockAttempt {
-    Block(VerifiedBlock),
+    /// Boxed: a verified block is hundreds of bytes, and every in-flight
+    /// attempt's future is sized for the largest variant.
+    Block(Box<VerifiedBlock>),
     /// The body root-verified but a transaction in it does not decode: the peer
     /// served CORRECT data every peer would serve identically, so the read
     /// fails without striking anyone.
@@ -839,7 +884,7 @@ enum BlockAttempt {
 /// the mapping is unit-testable; `ElReader::settle_pool_race` applies it.
 enum PoolRaceVerdict<T> {
     /// A peer answered. `failed` lost ahead of it (bank them); `outpaced` were
-    /// still outstanding past the hedge delay (bench them, no strike).
+    /// asked before it and are still silent (report them as outpaced).
     Won { idx: usize, value: T, failed: Vec<usize>, outpaced: Vec<usize> },
     /// Every peer failed and every reason was tip-lag shaped: the caller
     /// retries, and banks `failed` only when it stops (see `PoolReadError`).
@@ -2089,7 +2134,6 @@ impl ElReader {
     /// minutes-long stall. On timeout the caller just re-queries and serves the
     /// original refusal; the wallet already handles retry.
     pub async fn advance_log_index_tail_now(&self, target: u64) {
-        const FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
         let fill = async {
             let _drive = self.log_index_drive.lock().await;
             // Re-check under the lock: the background tick — or another caller's
@@ -2103,7 +2147,7 @@ impl ElReader {
         };
         // Cancellation at an await point is safe: coverage and the tail record
         // mutate only synchronously under the index lock (append_block).
-        let _ = tokio::time::timeout(FILL_DEADLINE, fill).await;
+        let _ = tokio::time::timeout(LOG_INDEX_FILL_DEADLINE, fill).await;
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
@@ -3759,7 +3803,9 @@ impl ElReader {
     /// result that carries a verdict — so a hung/dead peer neither fails the
     /// query nor holds it for the full request timeout. The winner is marked
     /// CONFIRMED; peers that fail or answer without a verdict record a strike
-    /// (→ deprioritized), while peers merely still in flight are left untouched.
+    /// (→ deprioritized); peers the winner outpaced are reported as such
+    /// (benched, a repeat counts as a strike); any other peer still in flight is
+    /// left untouched.
     pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
         // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
@@ -3788,9 +3834,11 @@ impl ElReader {
     }
 
     /// [`hedged_race`] plus peer-quality bookkeeping: record the winner as
-    /// served and every miss as a failure (peers merely still in flight are
-    /// left alone — being slower than the winner is not a fault), then return
-    /// the accepted answer, else the fallback, else the last error.
+    /// served, every miss as a failure, and every peer the winner outpaced as
+    /// outpaced (benched; a repeat before it serves again is a failure). Any
+    /// other peer still in flight is left alone: it had less time than the
+    /// winner, so being slower is no fault. Then return the accepted answer,
+    /// else the fallback, else the last error.
     async fn hedged_read<T, Fut>(
         &self,
         peers: &[std::sync::Arc<ManagedPeer>],
@@ -3823,7 +3871,7 @@ impl ElReader {
     /// Apply a hedged pool read's [`PoolRaceVerdict`] to the pool and shape its
     /// result — shared by the block and receipt reads, whose strikes are
     /// DEFERRED on tip-lag. On a win: bank the peers that failed ahead of the
-    /// winner, bench (no strike) the ones it outpaced, credit the winner. On a
+    /// winner, report the ones it outpaced, credit the winner. On a
     /// whole-pool failure: WARN with every peer's reason — the moment an
     /// operator needs them, and hosts keep only info+ in their log rings (the
     /// Android period-1840 / stale-pool incidents of 2026-09-01/02 were
@@ -4740,16 +4788,17 @@ impl ElReader {
         // Hedged (hedged_race): a silent first peer no longer costs a whole
         // request timeout before the next one is asked — on a flaky pool that
         // stacked up per dead peer, which is where 45-second block reads came
-        // from. BULK_HEDGE_DELAY: a block serve is large, and a slow download
-        // that is still arriving should not be duplicated too eagerly. Any Ok
-        // ends the race: a verified block, or an undecodable body. Block reads
-        // carry no address, so racing widens no disclosure.
+        // from. The delay follows the window depth (block_hedge_delay): a deep
+        // window is a large download that should not be duplicated too
+        // eagerly, while `latest`, which every eth_call starts with, is one
+        // header. Any Ok ends the race: a verified block, or an undecodable
+        // body. Block reads carry no address, so racing widens no disclosure.
         let out = hedged_race(
             &peers,
-            BULK_HEDGE_DELAY,
+            block_hedge_delay(back),
             |peer: std::sync::Arc<ManagedPeer>| async move {
                 match self.get_block_from(&peer, target_num, back, &head_hash, full_transactions).await {
-                    Ok(block) => Ok(BlockAttempt::Block(block)),
+                    Ok(block) => Ok(BlockAttempt::Block(Box::new(block))),
                     Err(BlockFromError::Undecodable(e)) => Ok(BlockAttempt::Undecodable(e)),
                     Err(BlockFromError::Peer(e)) => Err(e),
                 }
@@ -4767,7 +4816,7 @@ impl ElReader {
             )
             .await?
         {
-            BlockAttempt::Block(block) => Ok(Some(block)),
+            BlockAttempt::Block(block) => Ok(Some(*block)),
             // The peer served CORRECT data every peer would serve identically,
             // so this is our rendering failure — the settle credited the peer.
             BlockAttempt::Undecodable(e) => Err(PoolReadError::Fatal(e)),
@@ -5223,13 +5272,15 @@ impl ElReader {
         // used to hold every poll for a full request timeout. hedged_read keeps
         // the old bookkeeping (winner served, every miss struck — now when the
         // race ends rather than as each happens) and the old "all N snap
-        // peer(s) failed to serve verifiable receipts" error. It fetches a whole
-        // block's receipts, so it hedges on BULK_HEDGE_DELAY.
+        // peer(s) failed to serve verifiable receipts" error. It fetches one
+        // block's receipts and no header window (locating the tx already
+        // verified the header), so it hedges on HEDGE_DELAY like the other
+        // interactive reads.
         let loc = &loc;
         let vr = self
             .hedged_read(
                 &peers,
-                BULK_HEDGE_DELAY,
+                HEDGE_DELAY,
                 |peer| async move { self.receipt_from(&peer, loc).await },
                 |_: &VerifiedReceipt| true,
                 "verifiable receipts",
@@ -5405,13 +5456,14 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        // Hedged like get_block_by_number_inner, on the same BULK_HEDGE_DELAY and
-        // the same deferred-strike settle. It matters at least as much here: this
-        // read also feeds the log-index appender, which abandons its whole tick
-        // on a single failed read.
+        // Hedged like get_block_by_number_inner, on the same depth-scaled delay
+        // and the same deferred-strike settle. It matters at least as much here:
+        // this read also feeds the log-index appender, which abandons its whole
+        // tick on a single failed read, and the on-demand eth_getLogs fill,
+        // which has LOG_INDEX_FILL_DEADLINE in total.
         let out = hedged_race(
             &peers,
-            BULK_HEDGE_DELAY,
+            block_hedge_delay(back),
             |peer: std::sync::Arc<ManagedPeer>| async move {
                 self.block_receipts_from(&peer, target_num, back, &head_hash).await
             },
@@ -6623,8 +6675,8 @@ mod tests {
             // Peer 0 never answers; peer 1 is hedged in and wins. Peer 0 is
             // neither a miss nor the winner — before this it was simply dropped,
             // so a dead connection was never struck and stayed first in the
-            // ladder. It was outstanding past the delay, so it is reported for
-            // the caller to bench.
+            // ladder. It was asked before the winner and has been outstanding
+            // past the delay, so it is reported as outpaced.
             let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
             let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
             assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
@@ -6633,19 +6685,62 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn a_hedge_that_only_just_started_is_not_benched() {
-            // Peer 0 is slow but works (answers at 4 s); peer 1, hedged in at
-            // 3 s, has had one second when peer 0 wins. One second is no evidence
-            // of anything — only attempts outstanding past the delay count.
-            let peers = [Peer::Answers(Duration::from_secs(4), 7), Peer::Answers(Duration::from_secs(600), 8)];
+        async fn a_peer_asked_after_the_winner_is_never_outpaced() {
+            // A uniformly slow link: peer 0 answers at 10 s, and the hedges
+            // started at 3 s and 6 s are still running, each for longer than
+            // the delay. They had LESS time than peer 0 needed, so their
+            // slowness proves nothing. Counting them would bench, and on a
+            // repeat strike, healthy peers on exactly the link hedging is for.
+            let peers = [
+                Peer::Answers(Duration::from_secs(10), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_secs(600), 3),
+            ];
             let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
-            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 7)));
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 1)));
             assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
         }
 
         #[tokio::test(start_paused = true)]
+        async fn a_peer_asked_just_before_the_winner_is_not_outpaced_yet() {
+            // Peer 1 is hedged in at 3 s. Peer 0 fails at 3.1 s, which starts
+            // peer 2 at once, and peer 2 answers at 3.2 s. Peer 1 was asked
+            // before the winner but has had 0.2 s, not the delay: no evidence.
+            let peers = [
+                Peer::FailsAfter(Duration::from_millis(3100)),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_millis(100), 3),
+            ];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((2, 3)));
+            assert_eq!(out.missed, vec![0]);
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_loser_is_a_miss_not_outpaced() {
+            // Peer 0 fails at 4 s, after peer 1 was hedged in at 3 s; its
+            // failure starts peer 2 at 4 s, and peer 3 is hedged in at 7 s and
+            // wins at 7.05 s. Peers 1 and 2 were asked before the winner and
+            // have had at least the delay: outpaced. Peer 0 had even longer,
+            // but it FINISHED, so it is a miss and must not be listed twice.
+            let peers = [
+                Peer::FailsAfter(Duration::from_secs(4)),
+                Peer::Answers(Duration::from_secs(600), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_millis(50), 3),
+            ];
+            let started = tokio::time::Instant::now();
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(started.elapsed(), Duration::from_millis(7050));
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((3, 3)));
+            assert_eq!(out.missed, vec![0]);
+            assert_eq!(out.outpaced, vec![1, 2]);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn the_hedge_delay_is_the_callers() {
-            // Block and receipt reads hedge on BULK_HEDGE_DELAY, not HEDGE_DELAY.
+            // Deep block and receipt reads hedge on BULK_HEDGE_DELAY.
             let started = tokio::time::Instant::now();
             let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
             let out = hedged_race(&peers, BULK_HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
@@ -6654,7 +6749,20 @@ mod tests {
         }
 
         #[test]
-        fn a_won_pool_race_banks_its_misses_and_benches_its_outpaced() {
+        fn only_a_deep_block_window_hedges_on_the_bulk_delay() {
+            // `latest` (every eth_call's first read) and the finality-lag
+            // blocks the on-demand getLogs fill appends are shallow, and must
+            // hedge early enough to finish inside the fill's deadline.
+            assert_eq!(block_hedge_delay(0), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(64), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BULK_HEDGE_MIN_BACK - 1), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BULK_HEDGE_MIN_BACK), BULK_HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BLOCK_LOOKBACK_MAX - 1), BULK_HEDGE_DELAY);
+            assert!(block_hedge_delay(0) < LOG_INDEX_FILL_DEADLINE);
+        }
+
+        #[test]
+        fn a_won_pool_race_hands_back_its_misses_and_outpaced() {
             let out = RaceOutcome {
                 accepted: Some((2, 9u32)),
                 fallback: None,
