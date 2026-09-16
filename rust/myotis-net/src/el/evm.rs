@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
-use super::reader::{hedged_race, RaceOutcome};
+use super::reader::{hedged_race, RaceOutcome, HEDGE_DELAY};
 
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
@@ -276,8 +276,8 @@ impl PoolOracle {
     }
 
     /// Feed one hedged race into the reputation sink: the winner served, every
-    /// miss failed. Peers still in flight when the winner returned are neither —
-    /// being slower is not a fault (the same rule as `ElReader::hedged_read`).
+    /// miss failed, and every attempt the winner outpaced benched without a
+    /// strike (the same rules as `ElReader::hedged_read`).
     async fn record_race<T>(
         quality: &Option<crate::el::pool::SnapQualitySink>,
         peers: &[Arc<ManagedPeer>],
@@ -285,6 +285,11 @@ impl PoolOracle {
     ) {
         for idx in &out.missed {
             Self::record(quality, &peers[*idx], false).await;
+        }
+        if let Some(q) = quality {
+            for idx in &out.outpaced {
+                q.outpaced(peers[*idx].addr()).await;
+            }
         }
         if let Some((idx, _)) = &out.accepted {
             Self::record(quality, &peers[*idx], true).await;
@@ -313,6 +318,7 @@ impl PoolOracle {
             // answer ends the race; a bad proof or transport error is a miss.
             let out = hedged_race(
                 peers,
+                HEDGE_DELAY,
                 |peer: Arc<ManagedPeer>| async move {
                     peer.snap_get_account(state_root, &address).await
                 },
@@ -606,6 +612,7 @@ impl SnapStateOracle for PoolOracle {
             // Hedged like the account leaf above.
             let out = hedged_race(
                 peers,
+                HEDGE_DELAY,
                 |peer: Arc<ManagedPeer>| async move {
                     peer.snap_get_storage(state_root, &address, leaf, &position).await
                 },
@@ -640,6 +647,7 @@ impl SnapStateOracle for PoolOracle {
             // keyed by hash, so racing discloses nothing new about the caller.
             let out = hedged_race(
                 peers,
+                HEDGE_DELAY,
                 |peer: Arc<ManagedPeer>| async move { peer.snap_get_bytecode(code_hash).await },
                 |_: &Vec<u8>| true,
             )

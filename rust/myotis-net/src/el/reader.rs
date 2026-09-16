@@ -675,7 +675,17 @@ const TIP_SUGGEST_BLOCKS: u64 = 3;
 /// once per peer before anyone answers — worse than the stall it fixes.
 /// Racing costs one extra in-flight request and keeps the slow peer's answer
 /// if it still arrives first.
-const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Hedge delay for BLOCK and RECEIPT reads. Their responses are large — the
+/// anchored header window can run to a few hundred KB (see `get_block_from`),
+/// plus a full body and its receipts — so on a slow or metered link a peer that
+/// is still SENDING looks exactly like one that went silent, and hedging it at
+/// [`HEDGE_DELAY`] would duplicate the download, and split the bandwidth, far
+/// too eagerly. Twice the proof-read delay still caps a truly silent peer well
+/// under the 15 s request timeout. A tuning choice rather than a derived bound:
+/// revisit with measurements from a metered mobile link.
+pub(crate) const BULK_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Cap on concurrently hedged attempts for one read. Two reasons to keep it
 /// small, load AND privacy:
@@ -706,6 +716,11 @@ pub(crate) struct RaceOutcome<T> {
     pub(crate) accepted: Option<(usize, T)>,
     pub(crate) fallback: Option<T>,
     pub(crate) missed: Vec<usize>,
+    /// Attempts still in flight when the winner returned that had been
+    /// outstanding for at least the hedge delay — the ones the winner OUTPACED.
+    /// Neither a failure nor a success, but not nothing either: a silent peer
+    /// only ever shows up here, so callers bench these (no strike).
+    pub(crate) outpaced: Vec<usize>,
     /// Every failure reason, in arrival order. The block and receipt reads
     /// summarise the whole pool and classify tip-lag across it, so they need
     /// all of them, not just the last.
@@ -720,13 +735,16 @@ impl<T> RaceOutcome<T> {
 }
 
 /// Race `make(peer)` across `peers` with hedging: start the first, and every
-/// [`HEDGE_DELAY`] without an answer start one more (up to
-/// [`MAX_HEDGED_ATTEMPTS`] in flight), stopping at the first result `accept`
-/// approves. A slow peer keeps running while its hedge does, so it still wins
-/// if it answers first.
+/// `delay` without an answer start one more (up to [`MAX_HEDGED_ATTEMPTS`] in
+/// flight), stopping at the first result `accept` approves. A slow peer keeps
+/// running while its hedge does, so it still wins if it answers first. Proof
+/// reads pass [`HEDGE_DELAY`]; block and receipt reads pass
+/// [`BULK_HEDGE_DELAY`].
 ///
 /// Pure policy — no pool bookkeeping, no peer types — so the timing invariants
-/// are unit-testable. [`ElReader::hedged_read`] wraps it for the real reads.
+/// are unit-testable. Callers apply the outcome: [`ElReader::hedged_read`] for
+/// the per-peer-strike reads, `ElReader::settle_pool_race` for the block and
+/// receipt reads, and the eth_call oracle's `record_race`.
 ///
 /// NB when a winner returns, the remaining in-flight attempts are dropped
 /// mid-request. That can leave a loser's writer marked torn, which condemns
@@ -734,6 +752,7 @@ impl<T> RaceOutcome<T> {
 /// pipeline already makes, and paid only once we HAVE the answer.
 pub(crate) async fn hedged_race<T, P: Clone, Fut>(
     peers: &[P],
+    delay: std::time::Duration,
     mut make: impl FnMut(P) -> Fut,
     accept: impl Fn(&T) -> bool,
 ) -> RaceOutcome<T>
@@ -745,10 +764,15 @@ where
     let total = peers.len();
     let mut in_flight = FuturesUnordered::new();
     let mut next = 0usize;
+    // When each attempt started, and whether it has finished — what decides
+    // which in-flight losers the winner OUTPACED.
+    let mut started: Vec<Option<tokio::time::Instant>> = vec![None; total];
+    let mut done = vec![false; total];
     let mut out = RaceOutcome {
         accepted: None,
         fallback: None,
         missed: Vec::new(),
+        outpaced: Vec::new(),
         errors: Vec::new(),
     };
     // ONE push site: two `async move` blocks are distinct anonymous types and
@@ -760,17 +784,25 @@ where
         if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
             let idx = next;
             let fut = make(peers[idx].clone());
+            started[idx] = Some(tokio::time::Instant::now());
             in_flight.push(async move { (idx, fut.await) });
             next += 1;
         }
         if in_flight.is_empty() {
             break;
         }
-        let hedge = tokio::time::sleep(HEDGE_DELAY);
+        let hedge = tokio::time::sleep(delay);
         tokio::select! {
-            Some((idx, res)) = in_flight.next() => match res {
+            Some((idx, res)) = in_flight.next() => { done[idx] = true; match res {
                 Ok(value) => {
                     if accept(&value) {
+                        // Anyone still running past the delay was outpaced; a
+                        // hedge that started moments ago is no evidence either way.
+                        let now = tokio::time::Instant::now();
+                        out.outpaced = (0..next)
+                            .filter(|&i| i != idx && !done[i])
+                            .filter(|&i| started[i].is_some_and(|s| now.duration_since(s) >= delay))
+                            .collect();
                         out.accepted = Some((idx, value));
                         return out;
                     }
@@ -783,7 +815,7 @@ where
                     out.missed.push(idx);
                     out.errors.push(e);
                 }
-            },
+            }},
             // Nobody answered in time and a candidate remains: wake the loop,
             // which starts it ALONGSIDE the ones running, never instead of them.
             _ = hedge, if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS => {}
@@ -800,6 +832,39 @@ enum BlockAttempt {
     /// served CORRECT data every peer would serve identically, so the read
     /// fails without striking anyone.
     Undecodable(String),
+}
+
+/// How a hedged pool read ended, and the peer bookkeeping that implies, for the
+/// reads whose strikes are DEFERRED on tip-lag (block and receipts). Pure, so
+/// the mapping is unit-testable; `ElReader::settle_pool_race` applies it.
+enum PoolRaceVerdict<T> {
+    /// A peer answered. `failed` lost ahead of it (bank them); `outpaced` were
+    /// still outstanding past the hedge delay (bench them, no strike).
+    Won { idx: usize, value: T, failed: Vec<usize>, outpaced: Vec<usize> },
+    /// Every peer failed and every reason was tip-lag shaped: the caller
+    /// retries, and banks `failed` only when it stops (see `PoolReadError`).
+    TipLag { summary: String, failed: Vec<usize> },
+    /// Every peer failed for some other reason: bank `failed` now.
+    Fatal { summary: String, failed: Vec<usize> },
+}
+
+fn pool_race_verdict<T>(out: RaceOutcome<T>) -> PoolRaceVerdict<T> {
+    match out.accepted {
+        Some((idx, value)) => PoolRaceVerdict::Won {
+            idx,
+            value,
+            failed: out.missed,
+            outpaced: out.outpaced,
+        },
+        None => {
+            let summary = summarize_peer_failures(&out.errors);
+            if all_tip_lag(&out.errors) {
+                PoolRaceVerdict::TipLag { summary, failed: out.missed }
+            } else {
+                PoolRaceVerdict::Fatal { summary, failed: out.missed }
+            }
+        }
+    }
 }
 
 /// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
@@ -3714,6 +3779,7 @@ impl ElReader {
         // verdict failure (stale head / bad proof) becomes the fallback.
         self.hedged_read(
             &peers,
+            HEDGE_DELAY,
             |peer| async move { self.get_account_from(&peer, address).await },
             |r: &VerifiedAccount| r.verify_method.is_some() || is_global_fail(r.fail_reason),
             "a verifiable account",
@@ -3728,6 +3794,7 @@ impl ElReader {
     async fn hedged_read<T, Fut>(
         &self,
         peers: &[std::sync::Arc<ManagedPeer>],
+        delay: std::time::Duration,
         make: impl FnMut(std::sync::Arc<ManagedPeer>) -> Fut,
         accept: impl Fn(&T) -> bool,
         what: &str,
@@ -3736,10 +3803,13 @@ impl ElReader {
         Fut: std::future::Future<Output = Result<T, String>>,
     {
         let total = peers.len();
-        let out = hedged_race(peers, make, accept).await;
+        let out = hedged_race(peers, delay, make, accept).await;
         let last_err = out.last_err().to_string();
         for idx in &out.missed {
             self.pool.record_snap_failure(peers[*idx].addr()).await;
+        }
+        for idx in &out.outpaced {
+            self.pool.record_snap_outpaced(peers[*idx].addr()).await;
         }
         if let Some((idx, value)) = out.accepted {
             self.pool.record_snap_served(peers[idx].addr()).await;
@@ -3748,6 +3818,55 @@ impl ElReader {
         out.fallback.map(Ok).unwrap_or_else(|| {
             Err(format!("all {total} snap peer(s) failed to serve {what}: {last_err}"))
         })
+    }
+
+    /// Apply a hedged pool read's [`PoolRaceVerdict`] to the pool and shape its
+    /// result — shared by the block and receipt reads, whose strikes are
+    /// DEFERRED on tip-lag. On a win: bank the peers that failed ahead of the
+    /// winner, bench (no strike) the ones it outpaced, credit the winner. On a
+    /// whole-pool failure: WARN with every peer's reason — the moment an
+    /// operator needs them, and hosts keep only info+ in their log rings (the
+    /// Android period-1840 / stale-pool incidents of 2026-09-01/02 were
+    /// undiagnosable on-device with debug-only reasons) — then either hand
+    /// tip-lag back UN-banked for the caller's retry loop (banking per attempt
+    /// would let one retrying read push every healthy peer to eviction; never
+    /// banking would bring back the 2026-09-02 wedge), or bank and fail.
+    async fn settle_pool_race<T>(
+        &self,
+        peers: &[std::sync::Arc<ManagedPeer>],
+        out: RaceOutcome<T>,
+        (target_num, back): (u64, u64),
+        what: &str,
+        label: &str,
+    ) -> Result<T, PoolReadError> {
+        let total = peers.len();
+        let addrs = |ix: &[usize]| -> Vec<std::net::SocketAddr> {
+            ix.iter().map(|i| peers[*i].addr()).collect()
+        };
+        match pool_race_verdict(out) {
+            PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
+                self.record_batch_failures(&addrs(&failed)).await;
+                for i in outpaced {
+                    self.pool.record_snap_outpaced(peers[i].addr()).await;
+                }
+                self.pool.record_snap_served(peers[idx].addr()).await;
+                Ok(value)
+            }
+            PoolRaceVerdict::TipLag { summary, failed } => {
+                tracing::warn!(total, target_num, back, summary = %summary, "{}", label);
+                Err(PoolReadError::TipLag {
+                    error: format!("all {total} snap peer(s) failed to serve {what}: {summary}"),
+                    failed: addrs(&failed),
+                })
+            }
+            PoolRaceVerdict::Fatal { summary, failed } => {
+                tracing::warn!(total, target_num, back, summary = %summary, "{}", label);
+                self.record_batch_failures(&addrs(&failed)).await;
+                Err(PoolReadError::Fatal(format!(
+                    "all {total} snap peer(s) failed to serve {what}: {summary}"
+                )))
+            }
+        }
     }
 
     /// One account fetch + verdict against a single peer (no retry, no cache
@@ -4008,6 +4127,7 @@ impl ElReader {
         }
         self.hedged_read(
             &peers,
+            HEDGE_DELAY,
             |peer| async move {
                 self.get_storage_from(&peer, address, slot, holder, storage_key).await
             },
@@ -4146,6 +4266,7 @@ impl ElReader {
         // so ANY peer's bytes are the answer — accept the first that returns.
         self.hedged_read(
             &peers,
+            HEDGE_DELAY,
             |peer| {
                 let hash = *code_hash;
                 async move { peer.snap_get_bytecode(&hash).await }
@@ -4616,14 +4737,16 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        let total = peers.len();
         // Hedged (hedged_race): a silent first peer no longer costs a whole
         // request timeout before the next one is asked — on a flaky pool that
         // stacked up per dead peer, which is where 45-second block reads came
-        // from. Any Ok ends the race: a verified block, or an undecodable body.
-        // Block reads carry no address, so racing widens no disclosure.
+        // from. BULK_HEDGE_DELAY: a block serve is large, and a slow download
+        // that is still arriving should not be duplicated too eagerly. Any Ok
+        // ends the race: a verified block, or an undecodable body. Block reads
+        // carry no address, so racing widens no disclosure.
         let out = hedged_race(
             &peers,
+            BULK_HEDGE_DELAY,
             |peer: std::sync::Arc<ManagedPeer>| async move {
                 match self.get_block_from(&peer, target_num, back, &head_hash, full_transactions).await {
                     Ok(block) => Ok(BlockAttempt::Block(block)),
@@ -4634,41 +4757,21 @@ impl ElReader {
             |_: &BlockAttempt| true,
         )
         .await;
-        // Strikes stay DEFERRED exactly as before: `missed` are the peers that
-        // failed ahead of the winner — banked now when there is one, handed to
-        // the caller as TipLag otherwise. Peers still in flight when the winner
-        // returned are in neither list: being slower is not a fault.
-        let failed: Vec<std::net::SocketAddr> =
-            out.missed.iter().map(|i| peers[*i].addr()).collect();
-        if let Some((idx, attempt)) = out.accepted {
-            self.record_batch_failures(&failed).await;
-            self.pool.record_snap_served(peers[idx].addr()).await;
-            return match attempt {
-                BlockAttempt::Block(block) => Ok(Some(block)),
-                // Our rendering failure, not the peer's — credited above.
-                BlockAttempt::Undecodable(e) => Err(PoolReadError::Fatal(e)),
-            };
+        match self
+            .settle_pool_race(
+                &peers,
+                out,
+                (target_num, back),
+                "a verifiable block",
+                "verified block fetch failed against every snap peer",
+            )
+            .await?
+        {
+            BlockAttempt::Block(block) => Ok(Some(block)),
+            // The peer served CORRECT data every peer would serve identically,
+            // so this is our rendering failure — the settle credited the peer.
+            BlockAttempt::Undecodable(e) => Err(PoolReadError::Fatal(e)),
         }
-        let failures = out.errors;
-        let summary = summarize_peer_failures(&failures);
-        // WARN, not debug: a whole-pool verified-read failure is the moment an
-        // operator needs the per-peer reasons, and hosts keep info+ only in
-        // their log rings — debug-only reasons made the Android period-1840 /
-        // stale-pool incidents (2026-09-01/02) undiagnosable on-device.
-        tracing::warn!(total, target_num, back, summary = %summary,
-            "verified block fetch failed against every snap peer");
-        let error = format!("all {total} snap peer(s) failed to serve a verifiable block: {summary}");
-        if all_tip_lag(&failures) {
-            // Strike DEFERRAL, not forgiveness: the caller banks `failed` the
-            // moment it stops retrying (see PoolReadError::TipLag). Banking
-            // per attempt here would let one retrying read push every healthy
-            // peer past READ_FAILS_EVICT and drain the pool the retry exists
-            // to re-use; never banking would hand a persistently lagging pool
-            // the 2026-09-02 wedge back.
-            return Err(PoolReadError::TipLag { error, failed });
-        }
-        self.record_batch_failures(&failed).await;
-        Err(PoolReadError::Fatal(error))
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
@@ -5118,12 +5221,15 @@ impl ElReader {
         }
         // Hedged: this is the wallet's post-send confirm poll, and a silent peer
         // used to hold every poll for a full request timeout. hedged_read keeps
-        // the old bookkeeping (winner served, each miss struck at once) and the
-        // old "all N snap peer(s) failed to serve verifiable receipts" error.
+        // the old bookkeeping (winner served, every miss struck — now when the
+        // race ends rather than as each happens) and the old "all N snap
+        // peer(s) failed to serve verifiable receipts" error. It fetches a whole
+        // block's receipts, so it hedges on BULK_HEDGE_DELAY.
         let loc = &loc;
         let vr = self
             .hedged_read(
                 &peers,
+                BULK_HEDGE_DELAY,
                 |peer| async move { self.receipt_from(&peer, loc).await },
                 |_: &VerifiedReceipt| true,
                 "verifiable receipts",
@@ -5299,40 +5405,28 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        let total = peers.len();
-        // Hedged like get_block_by_number_inner, with the same deferred-strike
-        // bookkeeping. It matters at least as much here: this read also feeds
-        // the log-index appender, which abandons its whole tick on a single
-        // failed read.
+        // Hedged like get_block_by_number_inner, on the same BULK_HEDGE_DELAY and
+        // the same deferred-strike settle. It matters at least as much here: this
+        // read also feeds the log-index appender, which abandons its whole tick
+        // on a single failed read.
         let out = hedged_race(
             &peers,
+            BULK_HEDGE_DELAY,
             |peer: std::sync::Arc<ManagedPeer>| async move {
                 self.block_receipts_from(&peer, target_num, back, &head_hash).await
             },
             |_: &([u8; 32], Vec<VerifiedReceipt>)| true,
         )
         .await;
-        let failed: Vec<std::net::SocketAddr> =
-            out.missed.iter().map(|i| peers[*i].addr()).collect();
-        if let Some((idx, served)) = out.accepted {
-            self.record_batch_failures(&failed).await;
-            self.pool.record_snap_served(peers[idx].addr()).await;
-            return Ok(Some(served));
-        }
-        let failures = out.errors;
-        let summary = summarize_peer_failures(&failures);
-        // Same rationale as get_block_by_number: whole-pool failures must be
-        // diagnosable from an info+ log ring.
-        tracing::warn!(total, target_num, back, summary = %summary,
-            "verified receipts fetch failed against every snap peer");
-        let error =
-            format!("all {total} snap peer(s) failed to serve verifiable block receipts: {summary}");
-        if all_tip_lag(&failures) {
-            // Strike deferral — see get_block_by_number_inner.
-            return Err(PoolReadError::TipLag { error, failed });
-        }
-        self.record_batch_failures(&failed).await;
-        Err(PoolReadError::Fatal(error))
+        self.settle_pool_race(
+            &peers,
+            out,
+            (target_num, back),
+            "verifiable block receipts",
+            "verified receipts fetch failed against every snap peer",
+        )
+        .await
+        .map(Some)
     }
 
     /// One peer's block-receipts serve: anchored window, body + receipts in
@@ -6386,6 +6480,8 @@ mod tests {
             FailsNow,
             /// Answers after `delay`, but without a verdict (accept == false).
             NoVerdict(Duration),
+            /// Fails after `delay` (a slow failure: a timeout, a late bad proof).
+            FailsAfter(Duration),
         }
 
         /// Race the scripted peers, accepting any answer except `NoVerdict`
@@ -6402,6 +6498,7 @@ mod tests {
         ) -> Result<u32, String> {
             let out = hedged_race(
                 &peers,
+                HEDGE_DELAY,
                 |p: Peer| {
                     let live = Arc::clone(&live);
                     let peak = Arc::clone(&peak);
@@ -6418,6 +6515,10 @@ mod tests {
                                 Ok(0)
                             }
                             Peer::FailsNow => Err("peer failed".to_string()),
+                            Peer::FailsAfter(d) => {
+                                tokio::time::sleep(d).await;
+                                Err("peer failed late".to_string())
+                            }
                         };
                         live.fetch_sub(1, Ordering::SeqCst);
                         res
@@ -6478,6 +6579,10 @@ mod tests {
                     Ok(0)
                 }
                 Peer::FailsNow => Err("peer failed".to_string()),
+                Peer::FailsAfter(d) => {
+                    tokio::time::sleep(d).await;
+                    Err("peer failed late".to_string())
+                }
             }
         }
 
@@ -6487,16 +6592,104 @@ mod tests {
             // classify tip-lag across all of them, so the race must return each
             // reason — not only the last, which is all it used to keep.
             let peers = [Peer::FailsNow, Peer::FailsNow, Peer::Answers(Duration::from_millis(10), 5)];
-            let out = hedged_race(&peers, attempt, |v: &u32| *v != 0).await;
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
             assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((2, 5)));
             assert_eq!(out.missed, vec![0, 1]);
             assert_eq!(out.errors.len(), 2, "one reason per peer that failed ahead of the winner");
 
             let peers = [Peer::FailsNow; 4];
-            let out = hedged_race(&peers, attempt, |v: &u32| *v != 0).await;
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
             assert!(out.accepted.is_none());
             assert_eq!(out.errors.len(), 4, "a whole-pool failure reports every peer");
             assert_eq!(out.last_err(), "peer failed");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_failure_is_still_awaited_and_counted() {
+            // A whole-pool failure must report EVERY peer, including one that
+            // fails late while the others fail at once — classifying the pool
+            // (tip-lag or not) depends on seeing all of them.
+            let started = tokio::time::Instant::now();
+            let peers = [Peer::FailsAfter(Duration::from_secs(5)), Peer::FailsNow, Peer::FailsNow];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert!(out.accepted.is_none());
+            assert_eq!(out.errors.len(), 3);
+            assert_eq!(out.missed, vec![1, 2, 0]);
+            assert_eq!(started.elapsed(), Duration::from_secs(5));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_peer_outpaced_by_a_hedge_is_reported() {
+            // Peer 0 never answers; peer 1 is hedged in and wins. Peer 0 is
+            // neither a miss nor the winner — before this it was simply dropped,
+            // so a dead connection was never struck and stayed first in the
+            // ladder. It was outstanding past the delay, so it is reported for
+            // the caller to bench.
+            let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert!(out.missed.is_empty());
+            assert_eq!(out.outpaced, vec![0]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_hedge_that_only_just_started_is_not_benched() {
+            // Peer 0 is slow but works (answers at 4 s); peer 1, hedged in at
+            // 3 s, has had one second when peer 0 wins. One second is no evidence
+            // of anything — only attempts outstanding past the delay count.
+            let peers = [Peer::Answers(Duration::from_secs(4), 7), Peer::Answers(Duration::from_secs(600), 8)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 7)));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_hedge_delay_is_the_callers() {
+            // Block and receipt reads hedge on BULK_HEDGE_DELAY, not HEDGE_DELAY.
+            let started = tokio::time::Instant::now();
+            let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, BULK_HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.map(|(i, _)| i), Some(1));
+            assert_eq!(started.elapsed(), BULK_HEDGE_DELAY + Duration::from_millis(50));
+        }
+
+        #[test]
+        fn a_won_pool_race_banks_its_misses_and_benches_its_outpaced() {
+            let out = RaceOutcome {
+                accepted: Some((2, 9u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![1],
+                errors: vec!["transport timeout".to_string()],
+            };
+            match pool_race_verdict(out) {
+                PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
+                    assert_eq!((idx, value), (2, 9));
+                    assert_eq!(failed, vec![0]);
+                    assert_eq!(outpaced, vec![1]);
+                }
+                _ => panic!("a race with a winner must settle as Won"),
+            }
+        }
+
+        #[test]
+        fn a_whole_pool_failure_defers_strikes_only_when_every_reason_is_tip_lag() {
+            let lag = "got 0 headers, expected 5".to_string();
+            let failed_race = |errors: Vec<String>| RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0, 1],
+                outpaced: vec![],
+                errors,
+            };
+            match pool_race_verdict(failed_race(vec![lag.clone(), lag.clone()])) {
+                PoolRaceVerdict::TipLag { failed, .. } => assert_eq!(failed, vec![0, 1]),
+                _ => panic!("an all-tip-lag pool must defer its strikes"),
+            }
+            match pool_race_verdict(failed_race(vec![lag, "connection reset".to_string()])) {
+                PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0, 1]),
+                _ => panic!("any other reason makes the failure Fatal"),
+            }
         }
 
         #[tokio::test(start_paused = true)]

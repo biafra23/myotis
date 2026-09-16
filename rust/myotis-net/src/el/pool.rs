@@ -266,6 +266,15 @@ struct PoolInner {
 }
 
 impl PoolInner {
+    /// Bench without a strike — see `record_snap_outpaced`.
+    async fn record_outpaced(&self, addr: SocketAddr) {
+        self.prune_closed().await;
+        let mut peers = self.peers.lock().await;
+        if let Some(p) = peers.iter_mut().find(|p| p.addr == addr) {
+            p.benched_until = Some(Instant::now() + READ_FAIL_BENCH);
+        }
+    }
+
     /// The single quality-recording path (dirty-gated flush inside) — shared by
     /// the pool's public sinks and [`SnapQualitySink`] so behavior can't drift.
     async fn record_quality(&self, addr: SocketAddr, served: bool) {
@@ -673,6 +682,21 @@ impl PeerPool {
     /// cached peer is marked DENIED (deprioritized next run). Dirty-gated flush.
     pub async fn record_snap_failure(&self, addr: SocketAddr) {
         self.inner.record_quality(addr, false).await;
+    }
+
+    /// A hedge answered while this peer's attempt had been outstanding past the
+    /// hedge delay. Bench it for [`READ_FAIL_BENCH`] so the next read starts
+    /// with someone else — WITHOUT a strike. On a uniformly slow link every
+    /// peer gets outpaced by whichever happens to answer first, and counting
+    /// that would drain the pool the hedge exists to keep usable.
+    ///
+    /// Without this, a silent peer was never struck once reads were hedged: the
+    /// winner returns and the silent attempt is simply dropped, so the peer
+    /// stayed at the front of the ladder and every read paid the hedge delay
+    /// for as long as its dead connection lasted (a request timeout does not
+    /// close the connection, and nothing pings it).
+    pub async fn record_snap_outpaced(&self, addr: SocketAddr) {
+        self.inner.record_outpaced(addr).await;
     }
 
     /// A cloneable, task-safe handle onto the snap-quality sinks — hands the
@@ -1206,6 +1230,13 @@ impl SnapQualitySink {
     /// A snap fetch against `addr` failed (bad proof / transport / timeout).
     pub async fn failed(&self, addr: SocketAddr) {
         self.inner.record_quality(addr, false).await;
+    }
+
+    /// A snap fetch against `addr` was still outstanding past the hedge delay
+    /// when another peer answered: bench it, no strike (see
+    /// `ElPool::record_snap_outpaced`).
+    pub async fn outpaced(&self, addr: SocketAddr) {
+        self.inner.record_outpaced(addr).await;
     }
 }
 

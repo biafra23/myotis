@@ -157,12 +157,17 @@ its deployment block:
   `VERIFIED` and 3 `-32000` outcomes. The pool recovered on its own (7 snap
   peers) and Bee resumed on restart. The daemon never hit this because it
   ran on a warm `peers-gnosis.cache`; the PoC now bundles that cache (public
-  enodes, like the seed). The fetch side has since been hedged: block,
-  receipt and `eth_call` state reads ask a second peer after 3 s without an
-  answer (up to three in flight), so a dead first peer no longer costs a full
-  15 s request timeout. The optimistic tail's own candidate fetch — the head
-  edge that 23 s `eth_getLogs` waited on — is not hedged yet: it runs under a
-  2 s tick budget, shorter than the hedge delay, and needs its own treatment.
+  enodes, like the seed). The fetch side has since been hedged: `eth_call`
+  state reads ask a second peer after 3 s without an answer, block and
+  receipt reads after 6 s (their responses are large, so a download that is
+  merely slow should not be duplicated eagerly), up to three in flight — a
+  dead first peer no longer costs a full 15 s request timeout, and a peer the
+  hedge outpaces is moved to the back of the queue so the next read starts
+  elsewhere. The optimistic tail's own candidate fetch — the head edge that
+  23 s `eth_getLogs` waited on — is not hedged yet: its time budget is only
+  checked between candidate chunks, and its header-window fetch never checks
+  it, so a silent peer can still hold a tail tick for the full 15 s. That
+  needs its own treatment.
   NOT a faster refusal, either way: Bee retries a
   failed page every 5 s and its stall rule counts *successful* pages, so
   for Bee a slow success beats a fast `-32000` every time.
