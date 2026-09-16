@@ -44,6 +44,10 @@ object AppNap {
         if (activity != null) return true
         if (!isMac) return false
         return try {
+            // NSProcessInfo and NSString live in Foundation: load it explicitly so the
+            // classes resolve regardless of what the launch path happened to link (the
+            // jpackage launcher is a Cocoa app; a bare test JVM is not).
+            NativeLibrary.getInstance("Foundation")
             val objc = NativeLibrary.getInstance("objc")
             val objcGetClass = objc.getFunction("objc_getClass")
             val selRegisterName = objc.getFunction("sel_registerName")

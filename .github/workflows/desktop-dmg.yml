@@ -172,6 +172,16 @@ jobs:
           echo "::error::DMG build failed after 3 attempts"
           exit 1
 
+      # The desktop tests' macOS branch — AppNapTest, the Objective-C bridge that keeps
+      # App Nap off for the RPC server — runs nowhere else: ci.yml is ubuntu-only, where
+      # it is skipped by assumption. One leg is enough; the x64 leg would only repeat
+      # it under Rosetta. The Rust engine is not needed by these tests.
+      - name: Run desktop tests (macOS)
+        if: matrix.flavor == 'standard' && matrix.arch == 'arm64'
+        run: |
+          GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
+          ./gradlew :app-desktop:test --stacktrace $GRADLE_ARGS
+
       # Compose names both arches' output the same (Myotis-<packageVersion>.dmg, derived
       # from the project version in app-desktop/build.gradle.kts); rename so the
       # downloaded file itself states the architecture, not just the artifact wrapper.
