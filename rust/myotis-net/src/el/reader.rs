@@ -457,6 +457,52 @@ const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// well inside that lookback cap; anything deeper is a bridge walk.
 const APPEND_WINDOW: u64 = 128;
 
+/// Ticks the per-block appender may go WITHOUT advancing the edge — while there
+/// is something to append — before the head BRIDGE takes the gap over early.
+/// The per-block path fetches receipts for every block and abandons its tick on
+/// the first failed read, so on a flaky pool it can trail a 5 s chain by a
+/// handful of blocks indefinitely without ever reaching `APPEND_WINDOW` — and a
+/// consumer that needs `latest` (Bee's postage sync, which shuts the node down
+/// after 10 minutes without a page) starves meanwhile. The bridge bloom-filters
+/// candidates first (a few percent of blocks for a typical watch) and rotates
+/// peers on failure, which is what closed exactly such gaps in seconds on
+/// 2026-09-16 whenever a restart forced it. 3 ticks = 18 s.
+const APPEND_STALL_TICKS: u32 = 3;
+
+/// The per-block appender's progress across ticks, owned by the appender loop
+/// (an on-demand tick starts from a fresh one). See `APPEND_STALL_TICKS`.
+#[derive(Default)]
+struct AppendStall {
+    last_edge: Option<u64>,
+    ticks: u32,
+}
+
+impl AppendStall {
+    /// Record the edge this tick starts from. True once the edge has not moved
+    /// for `APPEND_STALL_TICKS` consecutive ticks that each had a gap to fill.
+    /// A tick without a gap resets the count: an appender that is simply
+    /// caught up is not stalled.
+    fn stalled(&mut self, edge: u64, gap: u64) -> bool {
+        if gap == 0 {
+            self.last_edge = None;
+            self.ticks = 0;
+            return false;
+        }
+        if self.last_edge == Some(edge) {
+            self.ticks = self.ticks.saturating_add(1);
+        } else {
+            self.last_edge = Some(edge);
+            self.ticks = 0;
+        }
+        self.ticks >= APPEND_STALL_TICKS
+    }
+
+    /// True on the tick that crosses the threshold, for a single log line.
+    fn just_stalled(&self) -> bool {
+        self.ticks == APPEND_STALL_TICKS
+    }
+}
+
 /// The sent-tx state behind one lock (see the `sent_txs` field doc). The
 /// WATCH itself lives separately in the shared Arc every peer read loop also
 /// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
@@ -1588,6 +1634,7 @@ impl ElReader {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
+            let mut append_stall = AppendStall::default();
             let mut ticks = 0u64;
             let mut backfill_ok = 0u64;
             let mut name_attempts: std::collections::HashMap<[u8; 20], (u8, u64)> =
@@ -1606,7 +1653,9 @@ impl ElReader {
                     // on-demand caller (a synchronous FFI thread) wait behind the
                     // backfill budget for nothing.
                     let _drive = reader.log_index_drive.lock().await;
-                    reader.log_index_append_tick(&mut since_persist, ticks).await;
+                    reader
+                        .log_index_append_tick(&mut since_persist, &mut append_stall, ticks)
+                        .await;
                 }
                 reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
                 reader.log_index_name_tick(&mut name_attempts, ticks).await;
@@ -1689,7 +1738,12 @@ impl ElReader {
 
     /// One appender tick: record finalized blocks from the append edge up to
     /// the finalized head (bounded batch per tick).
-    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+    async fn log_index_append_tick(
+        &self,
+        since_persist: &mut u32,
+        stall: &mut AppendStall,
+        ticks: u64,
+    ) {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
         if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
@@ -1724,7 +1778,27 @@ impl ElReader {
         // append needs contiguity, so a single gap wider than the window meant
         // coverage never advanced again and every `toBlock: "latest"` query
         // stayed outside coverage forever.
-        if finalized.saturating_sub(start) > APPEND_WINDOW {
+        // …and so is a gap the per-block path has stopped closing: a pool whose
+        // receipts reads keep failing leaves the edge parked a few blocks under
+        // finality for as long as the pool stays that way (APPEND_STALL_TICKS),
+        // and a plan already in flight is finished rather than thrown away for
+        // the per-block path to redo its last blocks one receipts read at a time.
+        let gap = finalized.saturating_sub(start);
+        let stalled = stall.stalled(start, gap);
+        let bridging = self
+            .log_index_bridge
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        if gap > APPEND_WINDOW || bridging || stalled {
+            if stalled && stall.just_stalled() {
+                tracing::info!(
+                    edge = start,
+                    finalized,
+                    gap,
+                    "log index appender stalled; handing the gap to the head bridge"
+                );
+            }
             self.log_index_bridge_step(start, finalized, ticks).await;
             return;
         }
@@ -1820,7 +1894,7 @@ impl ElReader {
                 return;
             }
             let mut since_persist = 0u32;
-            self.log_index_append_tick(&mut since_persist, 0).await;
+            self.log_index_append_tick(&mut since_persist, &mut AppendStall::default(), 0).await;
         };
         // Cancellation at an await point is safe: coverage and the tail record
         // mutate only synchronously under the index lock (append_block).
@@ -5948,6 +6022,30 @@ fn decode_ccip_answer(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn append_stall_counts_only_unmoved_edges_with_a_gap() {
+        let mut st = super::AppendStall::default();
+        // Caught up: never stalled, and a later gap starts counting from zero.
+        assert!(!st.stalled(100, 0));
+        assert!(!st.stalled(100, 0));
+        // Same edge, gap present: stalls on the third consecutive tick.
+        assert!(!st.stalled(100, 5));
+        assert!(!st.stalled(100, 5));
+        assert!(!st.stalled(100, 5));
+        assert!(st.stalled(100, 5));
+        assert!(st.just_stalled());
+        assert!(st.stalled(100, 5));
+        assert!(!st.just_stalled(), "the log line fires once");
+        // Progress resets the count even while a gap remains.
+        assert!(!st.stalled(116, 3));
+        assert!(!st.stalled(116, 3));
+        assert!(!st.stalled(116, 3));
+        assert!(st.stalled(116, 3));
+        // A closed gap resets everything.
+        assert!(!st.stalled(200, 0));
+        assert!(!st.stalled(200, 4));
+    }
     use super::*;
 
     /// The whole-pool failure summary: what a stuck wallet's one visible error
