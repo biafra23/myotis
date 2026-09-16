@@ -144,9 +144,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   is answered from head state, not from that block (exact-block execution is
   #382). Anything else is refused rather than answered from the head:
   - `{"error": "…", "code": -32602}` is **permanent**: a number behind the
-    window, `earliest`, a block hash, a malformed selector, or a malformed
-    `from`/`to`/`data`/`value`. Answer it as JSON-RPC invalid params, and do
-    not retry.
+    window, `earliest`, a block hash, a malformed selector, a malformed
+    `from`/`to`/`data`/`value`, or a NUL byte in any argument. Answer it as
+    JSON-RPC invalid params, and do not retry.
   - A plain `{"error": "…"}` is retryable: a number ahead of the window, or no
     verified head yet.
 

@@ -283,7 +283,9 @@ pub fn eth_call_json<'env>(env: &'env Env,
             (Ok(f), Ok(t), Ok(d), Ok(v), Ok(b)) => take(unsafe {
                 myotis_eth_call_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr(), b.as_ptr())
             }),
-            _ => r#"{"error":"argument contains NUL"}"#.to_string(),
+            // A malformed argument, refused here instead of in the engine:
+            // permanent, like the engine's own refusals for this call (README).
+            _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
         }
     })
 }

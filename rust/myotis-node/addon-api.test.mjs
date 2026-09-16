@@ -110,6 +110,13 @@ test('ethCallJson refuses an unservable block as permanent invalid params (ABI 2
       assert.equal(typeof r.error, 'string', `${block}: ${JSON.stringify(r)}`);
       assert.equal(r.code, -32602, `${block}: ${JSON.stringify(r)}`);
     }
+    // A NUL byte is refused by the addon itself, before the engine, and is
+    // just as permanent.
+    for (const [from, block] of [['0x\0', 'latest'], ['', 'lat\0est']]) {
+      const r = JSON.parse(await m.ethCallJson(h, from, to, '', '', block));
+      assert.equal(r.error, 'argument contains NUL', JSON.stringify(r));
+      assert.equal(r.code, -32602, JSON.stringify(r));
+    }
     // A well-formed number passes the parse. This handle was never started,
     // so the call fails as a plain, retryable error, not with head state.
     const r = JSON.parse(await m.ethCallJson(h, '', to, '', '', '0x1'));
