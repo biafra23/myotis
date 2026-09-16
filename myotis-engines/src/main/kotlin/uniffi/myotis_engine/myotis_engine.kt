@@ -980,7 +980,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_estimate_gas_json() != 21056) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 39183) {
+    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 58198) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
@@ -1447,7 +1447,9 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
          * Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
          * `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
          * is the answer); `value` is wei as a decimal string; `block` is the RPC block
-         * tag.
+         * selector. The call runs against the verified head, so a block number
+         * outside [head-64, head+16] is refused (`{"error","code":-32602}` when it can
+         * never be served), never answered from the head.
          */ fun `ethCallJson`(`handle`: kotlin.Long, `from`: kotlin.String, `to`: kotlin.String, `data`: kotlin.String, `value`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->

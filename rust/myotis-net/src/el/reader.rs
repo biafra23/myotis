@@ -4133,9 +4133,10 @@ impl ElReader {
 
     /// Verified `eth_call`: run a read-only call against the verified head's state.
     ///
-    /// The block is pinned to the current verified head (the host gates the RPC
-    /// block param to the servable window before calling this, as it does for the
-    /// other reads). Builds a [`BlockContext`](myotis_evm::BlockContext) from the
+    /// The block is pinned to the current verified head: `myotis-engine`'s host
+    /// layer refuses an RPC block param outside the servable window before
+    /// calling this (#452), and the JVM/iOS hosts gate it too, as they do for the
+    /// other reads. Builds a [`BlockContext`](myotis_evm::BlockContext) from the
     /// head header, then runs the `revm` executor on a blocking thread — its
     /// [`PoolOracle`] bridges each verified snap fetch to the network via
     /// `block_on`, which is sound there (a blocking thread, not a runtime worker).

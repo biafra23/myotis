@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 26
+#define MYOTIS_ABI_VERSION 27
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -130,8 +130,18 @@ char *myotis_get_code_json(int64_t handle, const char *address);
 char *myotis_get_storage_at_json(int64_t handle, const char *address,
                                  const char *position);
 /* eth_call: {"status":"ok","resultHex"} | {"status":"revert","dataHex"} |
- * {"status":"unavailable","reason"} | {"error"}. `from` empty = anonymous;
- * `value` is wei as a decimal string. */
+ * {"status":"unavailable","reason"} | {"error"} | {"error","code":-32602}.
+ * `from` empty = anonymous; `value` is wei as a decimal string.
+ * The call always runs against the VERIFIED HEAD's state, and the engine
+ * checks `block` itself (ABI >= 27): latest/pending/safe/finalized or
+ * empty/NULL run; a block number (0x-hex, or bare decimal digits) runs only
+ * within [head-64, head+16], and still against head state. Anything else is
+ * refused, never answered from the head:
+ *   - behind that window, earliest, a block hash, or a malformed selector:
+ *     {"error","code":-32602}, PERMANENT (JSON-RPC invalid params) — do
+ *     not retry. A malformed from/to/data/value is refused the same way;
+ *   - ahead of the window, or no verified head yet: a plain {"error"},
+ *     retryable. */
 char *myotis_eth_call_json(int64_t handle, const char *from, const char *to,
                            const char *data, const char *value,
                            const char *block);
@@ -139,7 +149,9 @@ char *myotis_eth_call_json(int64_t handle, const char *from, const char *to,
 /* eth_call with a STATE OVERRIDE object as JSON (empty => none). The answer is
    a simulation over verified state — the caller's hypothesis, not a chain fact.
    An EMPTY `to` selects contract creation: the calldata is init code and the
-   constructor's return data is the result. */
+   constructor's return data is the result, and a NULL `to` is refused.
+   `block` is checked, and a malformed argument (overrides included) refused,
+   exactly as for myotis_eth_call_json. */
 char *myotis_eth_call_overrides_json(int64_t handle, const char *from,
                                      const char *to, const char *data,
                                      const char *value, const char *block,
