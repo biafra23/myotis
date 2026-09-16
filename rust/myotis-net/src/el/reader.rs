@@ -457,6 +457,116 @@ const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// well inside that lookback cap; anything deeper is a bridge walk.
 const APPEND_WINDOW: u64 = 128;
 
+/// Ticks the per-block appender may go WITHOUT advancing the edge — while there
+/// is something to append — before the head BRIDGE takes the gap over early.
+/// The per-block path fetches receipts for every block and abandons its tick on
+/// the first failed read, so on a flaky pool it can trail a 5 s chain by a
+/// handful of blocks indefinitely without ever reaching `APPEND_WINDOW` — and a
+/// consumer that needs `latest` (Bee's postage sync, which shuts the node down
+/// after 10 minutes without a page) starves meanwhile. The bridge bloom-filters
+/// candidates first (a few percent of blocks for a typical watch) and, unlike
+/// the per-block path, anchors its verification at the FINALIZED block every
+/// peer has rather than at our optimistic head — which is why a restart closed
+/// exactly such gaps in seconds on 2026-09-16. Three consecutive ticks is ~18 s
+/// after the edge last moved.
+const APPEND_STALL_TICKS: u32 = 3;
+
+/// Widest head gap one bridge plan will map (`log_index_bridge_step`). Beyond
+/// it the bridge deliberately HOLDS coverage rather than build an unbounded
+/// plan — so in that state nothing is closing the gap and the backfill must
+/// keep working rather than yield to a path that has given up.
+const BRIDGE_MAX_GAP: u64 = 500_000;
+
+/// How far above finality the optimistic tail will chase
+/// (`log_index_tail_tick`). At or beyond it the tail parks at finality, so the
+/// head gap is again nobody's job — same reasoning as `BRIDGE_MAX_GAP`.
+const TAIL_MAX_ABOVE_FINALITY: u64 = 1024;
+
+/// Pending blocks (`edge..=head`, inclusive) the backfill tolerates before
+/// standing down. A block or two is the
+/// steady state of a live chain between tail ticks, so the floor must sit above
+/// that — but it is a TIME budget in disguise and the chains differ. Eight
+/// blocks is ~40 s on gnosis (5 s blocks) and ~96 s on mainnet (12 s): both far
+/// above the steady state, and both well inside the 10 minutes a Bee node gives
+/// its RPC before shutting down. In blocks rather than seconds because the
+/// reader has no per-network block time; revisit if one is ever added.
+const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 8;
+
+/// Consecutive ticks the backfill may be yielded before taking one batch anyway
+/// (~5 min at 6 s). A fairness floor: head-follow states this code does not
+/// enumerate must not silence the downward walk forever.
+const BACKFILL_YIELD_MAX_TICKS: u32 = 50;
+
+/// Whether the downward walk stands down for head-follow this tick.
+///
+/// Pure, because the interesting part is WHEN NOT to yield: yielding is only
+/// right while head-follow can actually close the gap. Beyond the bridge's span
+/// coverage holds by design, and with finality stalled `TAIL_MAX` below the head
+/// the tail parks — yielding in either state would idle the whole index instead
+/// of trading one job for a more urgent one.
+///
+/// `finalized == 0` (an anchor with an optimistic head but no finality yet)
+/// falls out as "keep walking": the head-to-finality distance is then the whole
+/// chain, far past `TAIL_MAX_ABOVE_FINALITY` — and head-follow itself returns
+/// early without a finalized anchor, so there would be nothing to defer to.
+fn backfill_should_yield(edge: u64, head: u64, finalized: u64, yielded_ticks: u32) -> bool {
+    // `edge` is the NEXT block to append, so the pending range INCLUDES it:
+    // edge..=head. (The two guards below deliberately do not add that one —
+    // each mirrors, operand for operand, the check in the path it defers to,
+    // so each has to keep that path's own arithmetic.)
+    let pending = if head >= edge { head - edge + 1 } else { 0 };
+    if pending <= BACKFILL_HEAD_GAP_TOLERANCE {
+        return false;
+    }
+    if yielded_ticks >= BACKFILL_YIELD_MAX_TICKS {
+        return false;
+    }
+    finalized.saturating_sub(edge) <= BRIDGE_MAX_GAP
+        && head.saturating_sub(finalized) < TAIL_MAX_ABOVE_FINALITY
+}
+
+/// The per-block appender's progress across ticks, owned by the appender loop
+/// (an on-demand tick starts from a fresh one). See `APPEND_STALL_TICKS`.
+#[derive(Default)]
+struct AppendStall {
+    last_edge: Option<u64>,
+    ticks: u32,
+}
+
+impl AppendStall {
+    /// Observe the edge this tick starts from; true once it has not moved for
+    /// `APPEND_STALL_TICKS` consecutive observations.
+    ///
+    /// There is deliberately no "nothing to append" exemption: by the time this
+    /// runs the caller has already handed off to the tail if coverage passed
+    /// finality, so a block is always pending. An earlier version exempted
+    /// `finalized - edge == 0` — which is not "caught up" but "exactly ONE
+    /// block pending", the steady state between finality epochs and the
+    /// terminal state of the very stall this detects, so the detector went
+    /// blind precisely where it was needed.
+    fn observe(&mut self, edge: u64) -> bool {
+        if self.last_edge == Some(edge) {
+            self.ticks = self.ticks.saturating_add(1);
+        } else {
+            self.last_edge = Some(edge);
+            self.ticks = 1; // this observation is the first
+        }
+        self.ticks >= APPEND_STALL_TICKS
+    }
+
+    /// True on the tick that crosses the threshold, for a single log line.
+    fn just_stalled(&self) -> bool {
+        self.ticks == APPEND_STALL_TICKS
+    }
+
+    /// Coverage passed finality and the tail took over: drop the charge so a
+    /// later gap counts from scratch instead of resuming a stale count.
+    fn reset(&mut self) {
+        self.last_edge = None;
+        self.ticks = 0;
+    }
+}
+
 /// The sent-tx state behind one lock (see the `sent_txs` field doc). The
 /// WATCH itself lives separately in the shared Arc every peer read loop also
 /// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
@@ -1588,8 +1698,10 @@ impl ElReader {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
+            let mut append_stall = AppendStall::default();
             let mut ticks = 0u64;
             let mut backfill_ok = 0u64;
+            let mut backfill_yielded = 0u32;
             let mut name_attempts: std::collections::HashMap<[u8; 20], (u8, u64)> =
                 std::collections::HashMap::new();
             loop {
@@ -1606,9 +1718,13 @@ impl ElReader {
                     // on-demand caller (a synchronous FFI thread) wait behind the
                     // backfill budget for nothing.
                     let _drive = reader.log_index_drive.lock().await;
-                    reader.log_index_append_tick(&mut since_persist, ticks).await;
+                    reader
+                        .log_index_append_tick(&mut since_persist, Some(&mut append_stall), ticks)
+                        .await;
                 }
-                reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                reader
+                    .log_index_backfill_step(ticks, &mut backfill_ok, &mut backfill_yielded)
+                    .await;
                 reader.log_index_name_tick(&mut name_attempts, ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
@@ -1689,7 +1805,12 @@ impl ElReader {
 
     /// One appender tick: record finalized blocks from the append edge up to
     /// the finalized head (bounded batch per tick).
-    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+    async fn log_index_append_tick(
+        &self,
+        since_persist: &mut u32,
+        mut stall: Option<&mut AppendStall>,
+        ticks: u64,
+    ) {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
         if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
@@ -1699,12 +1820,18 @@ impl ElReader {
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // leaving the per-block path: never carry a count across
+            }
             return;
         }
         let finalized = self.finalized_block_number();
         if finalized == 0 {
             self.clear_log_index_bridge();
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // ditto: no finality, so the per-block path never ran
+            }
             return;
         }
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
@@ -1713,7 +1840,12 @@ impl ElReader {
             Some(e) if e <= finalized => e,
             // Caught up to finality — now follow the OPTIMISTIC tail, which is
             // where `toBlock: "latest"` actually points.
-            Some(_) => return self.log_index_tail_tick(finalized, ticks).await,
+            Some(_) => {
+                if let Some(s) = stall.as_deref_mut() {
+                    s.reset(); // the tail owns coverage now; no stale charge
+                }
+                return self.log_index_tail_tick(finalized, ticks).await;
+            }
         };
         // The verified whole-block path anchors a window from the target to
         // the optimistic head; stay well inside its lookback cap. A deeper lag
@@ -1724,15 +1856,73 @@ impl ElReader {
         // append needs contiguity, so a single gap wider than the window meant
         // coverage never advanced again and every `toBlock: "latest"` query
         // stayed outside coverage forever.
-        if finalized.saturating_sub(start) > APPEND_WINDOW {
+        // …and so is a gap the per-block path has stopped closing: a pool whose
+        // receipts reads keep failing leaves the edge parked a few blocks under
+        // finality for as long as the pool stays that way (APPEND_STALL_TICKS),
+        // and a plan already in flight is finished rather than thrown away for
+        // the per-block path to redo its last blocks one receipts read at a time.
+        let gap = finalized.saturating_sub(start);
+        // Only the BACKGROUND tick may route to the bridge. The on-demand fill
+        // (a <=4-block shortfall under a 5s timeout) must not: the bridge takes
+        // its plan out of the slot for the duration, so a timeout mid-step would
+        // drop a descent the background tick has been building.
+        let background = stall.is_some();
+        let deep = gap > APPEND_WINDOW;
+        let bridging = background
+            && self
+                .log_index_bridge
+                .lock()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false);
+        // Count only the ticks the per-block path actually DRIVES. It is that
+        // path's failure this detects, and ticks the bridge was already driving
+        // — a deep gap, or a descent spanning several ticks — would otherwise
+        // make the hand-off line below claim a cause that was not the reason.
+        let (stalled, crossed) = match stall.as_deref_mut() {
+            Some(s) if !deep && !bridging => {
+                let st = s.observe(start);
+                (st, st && s.just_stalled())
+            }
+            Some(s) => {
+                s.reset();
+                (false, false)
+            }
+            None => (false, false),
+        };
+        if background && (deep || bridging || stalled) {
+            if crossed {
+                tracing::info!(
+                    edge = start,
+                    finalized,
+                    gap,
+                    "log index appender stalled; handing the gap to the head bridge"
+                );
+            }
             self.log_index_bridge_step(start, finalized, ticks).await;
             return;
         }
-        self.clear_log_index_bridge();
-        // Coverage is at/below finality here, so the tail tick (and its
-        // vouched check) will not run: any entry left in the record describes
-        // a block this run never proved canonical.
-        self.retire_tail_record();
+        if deep {
+            // On-demand only — the background tick returned above. This path
+            // cannot bridge (see the gate), and the per-block loop is not built
+            // for a deep gap: its verify window grows with the distance to the
+            // head, and past BLOCK_LOOKBACK_MAX it cannot succeed at all. Leave
+            // the gap to the background tick instead of burning the caller's
+            // deadline on fetches that get slower the further behind we are.
+            return;
+        }
+        // Only the background tick owns the bridge plan. The on-demand fill is
+        // a guest on this path: clearing the slot would DESTROY a descent the
+        // background tick is building — worse than the mid-step cancellation the
+        // gate above exists to prevent. Leaving the stale tail record costs at
+        // most this fill's own last blocks — the next background tick's retire
+        // can rewind below them — which is bounded, and far cheaper.
+        if stall.is_some() {
+            self.clear_log_index_bridge();
+            // Coverage is at/below finality here, so the tail tick (and its
+            // vouched check) will not run: any entry left in the record
+            // describes a block this run never proved canonical.
+            self.retire_tail_record();
+        }
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
             let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
@@ -1820,7 +2010,7 @@ impl ElReader {
                 return;
             }
             let mut since_persist = 0u32;
-            self.log_index_append_tick(&mut since_persist, 0).await;
+            self.log_index_append_tick(&mut since_persist, None, 0).await;
         };
         // Cancellation at an await point is safe: coverage and the tail record
         // mutate only synchronously under the index lock (append_block).
@@ -1854,7 +2044,7 @@ impl ElReader {
     async fn log_index_tail_tick(&self, finalized: u64, ticks: u64) {
         /// Never chase more than this above finality: a stalled beacon anchor
         /// must not turn into an unbounded walk.
-        const TAIL_MAX: u64 = 1024;
+        const TAIL_MAX: u64 = TAIL_MAX_ABOVE_FINALITY;
         /// Candidate blocks per body/receipts request, as the bridge uses —
         /// an unchunked burst of a full tail would blow every peer's response
         /// budget and make no progress at all.
@@ -2351,7 +2541,7 @@ impl ElReader {
         /// holds: a staged bridge (descend headers-only to an intermediate
         /// anchor, then map MAX_GAP at a time) is the follow-up that would
         /// close arbitrarily deep gaps without an unbounded plan.
-        const MAX_GAP: u64 = 500_000;
+        const MAX_GAP: u64 = BRIDGE_MAX_GAP;
 
         let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
         else {
@@ -2737,7 +2927,47 @@ impl ElReader {
     /// (bloom hit) get body+receipts fetched and verified against both roots
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
-    async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64) {
+    async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64, yielded: &mut u32) {
+        // FORWARD FIRST (owner's call, 2026-09-16), with guards. The walk and
+        // the head-follow paths share one snap-peer pool and one 6 s tick, and
+        // the appender abandons its whole tick on a single failed receipts read
+        // — so the walk was buying its progress out of the head's. Nothing waits
+        // on the walk, while a head-reaching `eth_getLogs` is REFUSED for as
+        // long as the top lags, and behind that refusal sits Bee's 10-minute
+        // shutdown clock.
+        //
+        // It yields only while head-follow can actually close the gap
+        // (`backfill_should_yield`) and never for longer than the fairness
+        // floor: a walk switched off in a state nobody is fixing would idle the
+        // index completely, which is worse than either job running slowly.
+        if let (Some(edge), Some(head)) = (
+            self.with_log_index(|ix| ix.append_edge()).flatten(),
+            self.head_block_number(),
+        ) {
+            let finalized = self.finalized_block_number();
+            if backfill_should_yield(edge, head, finalized, *yielded) {
+                *yielded = yielded.saturating_add(1);
+                // The walker's rate clock is deliberately NOT re-anchored here.
+                // `log_index_rate_bps` withholds the rate — and the ETA with it —
+                // after 60 s without progress, precisely so a stalled walk cannot
+                // keep showing a confident number. A yielded walk is not making
+                // progress either, so "unknown" is the honest reading; holding
+                // the anchor at NOW would instead keep the pre-yield EMA on
+                // screen for as long as the yield lasts, which in the
+                // fairness-floor regime is ~50x optimistic.
+                if ticks % 100 == 0 {
+                    tracing::debug!(
+                        edge,
+                        head,
+                        finalized,
+                        yielded = *yielded,
+                        "log index backfill yielding to head-follow"
+                    );
+                }
+                return;
+            }
+        }
+        *yielded = 0;
         // Pacing: "nice" works ONE batch per 6s tick (background politeness);
         // "max speed" keeps working batches until a per-tick time budget is
         // spent — the difference between ~55 blocks/6s and peer-limited
@@ -5949,6 +6179,60 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backfill_yields_only_while_head_follow_can_close_the_gap() {
+        use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};
+        // A block or two behind is a live chain between tail ticks, not a stall.
+        assert!(!backfill_should_yield(1_000, 1_001, 1_000, 0));
+        // A real gap that head-follow can close: stand down for it.
+        assert!(backfill_should_yield(1_000, 1_200, 1_150, 0));
+        // Wider than the bridge will ever map: coverage holds by design, so the
+        // walk must keep working rather than idle the index entirely.
+        assert!(!backfill_should_yield(1_000, 1_000_000, 900_000, 0));
+        // Finality stalled TAIL_MAX below the head: the tail parks — keep walking.
+        assert!(!backfill_should_yield(1_000, 5_000, 1_000, 0));
+        // Fairness floor: after enough yielded ticks, take a batch regardless.
+        assert!(!backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS));
+        // The boundaries the two bugs lived on. At exactly TAIL_MAX the tail
+        // parks (so keep walking); one block inside it, head-follow still owns
+        // the gap.
+        assert!(!backfill_should_yield(9_000, 11_024, 10_000, 0));
+        assert!(backfill_should_yield(9_000, 11_023, 10_000, 0));
+        // At exactly BRIDGE_MAX_GAP the bridge still maps the gap; one past it
+        // the bridge holds coverage and the walk must not stand down.
+        assert!(backfill_should_yield(1_000, 501_100, 501_000, 0));
+        assert!(!backfill_should_yield(1_000, 501_100, 501_001, 0));
+        // The tolerance itself, counted inclusively over edge..=head: eight
+        // pending blocks stay with the walk, nine hand the tick to head-follow.
+        assert!(!backfill_should_yield(1_000, 1_007, 1_004, 0));
+        assert!(backfill_should_yield(1_000, 1_008, 1_004, 0));
+        // Coverage past the head (edge = head + 1) is zero pending, not one.
+        assert!(!backfill_should_yield(1_001, 1_000, 1_000, 0));
+        // No finality yet: keep walking, there is nothing to defer to.
+        assert!(!backfill_should_yield(1_000, 21_000_000, 0, 0));
+    }
+
+    #[test]
+    fn append_stall_fires_on_three_unmoved_observations_and_resets_on_progress() {
+        let mut st = super::AppendStall::default();
+        // Three consecutive observations of the same edge cross the threshold.
+        assert!(!st.observe(100));
+        assert!(!st.just_stalled(), "not before the threshold");
+        assert!(!st.observe(100));
+        assert!(st.observe(100));
+        assert!(st.just_stalled(), "the log line fires on the crossing tick");
+        assert!(st.observe(100));
+        assert!(!st.just_stalled(), "...and only on that one");
+        // Progress restarts the count.
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
+        // A hand-off to the tail drops the charge: the next gap starts fresh.
+        st.reset();
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
+    }
 
     /// The whole-pool failure summary: what a stuck wallet's one visible error
     /// line is built from, so its shape is pinned (2026-09-02 stale-pool
@@ -7392,7 +7676,7 @@ mod tail_reorg_tests {
     #[test]
     fn the_tail_window_floor_must_be_servable() {
         use super::{tail_window_floor, tail_window_is_servable};
-        const TAIL_MAX: u64 = 1_024;
+        const TAIL_MAX: u64 = super::TAIL_MAX_ABOVE_FINALITY;
         let head = 10_000u64;
         // The hard floor the tail uses must be reachable within one window —
         // head - (TAIL_MAX - 1) needs exactly TAIL_MAX headers.
