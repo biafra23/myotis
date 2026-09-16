@@ -138,6 +138,41 @@ class BeePocTest {
     }
 
     @Test
+    fun `bundled peer caches land once and never over what the engine learned`(@TempDir dir: Path) {
+        val res = stageBundle(dir, "seed".toByteArray())
+        Files.writeString(res.resolve("peers-gnosis.cache"), "1.2.3.4\t30303\t0xab\t1\tsnapok\n")
+        Files.writeString(res.resolve("cl-peers-gnosis.cache"), "/ip4/1.2.3.4/tcp/9000/p2p/16Uiu2HAmTest\n")
+        val data = dir.resolve("data")
+        Files.createDirectories(data)
+        Files.writeString(data.resolve("cl-peers-gnosis.cache"), "engine-learned\n") // pre-existing: keep
+
+        BeePoc.installSeedIfAbsent(res, data)
+        assertTrue(Files.readString(data.resolve("peers-gnosis.cache")).startsWith("1.2.3.4\t30303"))
+        assertEquals("engine-learned\n", Files.readString(data.resolve("cl-peers-gnosis.cache")))
+        assertFalse(Files.exists(data.resolve("peers-gnosis.cache.tmp")))
+
+        // A second start installs nothing more.
+        assertEquals(emptyList<String>(), BeePoc.installPeerCachesIfAbsent(res, data))
+    }
+
+    @Test
+    fun `peer caches install into a data dir that does not exist yet, and survive a second start`(@TempDir dir: Path) {
+        val res = dir.resolve("resources")
+        Files.createDirectories(res) // caches only, no seed: the PoC's cache install must not need one
+        Files.writeString(res.resolve("peers-gnosis.cache"), "1.2.3.4\t30303\t0xab\t1\tsnapok\n")
+        Files.writeString(res.resolve("cl-peers-gnosis.cache"), "/ip4/1.2.3.4/tcp/9000/p2p/16Uiu2HAmTest\n")
+        val data = dir.resolve("fresh").resolve("data")
+        assertEquals(listOf("peers-gnosis.cache", "cl-peers-gnosis.cache"), BeePoc.installPeerCachesIfAbsent(res, data))
+        assertEquals("1.2.3.4\t30303\t0xab\t1\tsnapok\n", Files.readString(data.resolve("peers-gnosis.cache")))
+
+        // The engine rewrites the files as it learns; a second start keeps that verbatim.
+        Files.writeString(data.resolve("peers-gnosis.cache"), "engine-learned\n")
+        assertEquals(emptyList<String>(), BeePoc.installPeerCachesIfAbsent(res, data))
+        assertEquals("engine-learned\n", Files.readString(data.resolve("peers-gnosis.cache")))
+        assertEquals("/ip4/1.2.3.4/tcp/9000/p2p/16Uiu2HAmTest\n", Files.readString(data.resolve("cl-peers-gnosis.cache")))
+    }
+
+    @Test
     fun `nothing bundled means nothing installed`(@TempDir dir: Path) {
         assertEquals(Outcome.NOT_BUNDLED, BeePoc.installSeedIfAbsent(null, dir.resolve("data")))
         assertEquals(Outcome.NOT_BUNDLED, BeePoc.installSeedIfAbsent(dir.resolve("missing"), dir.resolve("data")))

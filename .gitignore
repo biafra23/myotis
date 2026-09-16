@@ -54,3 +54,6 @@ ios-app/DerivedData/
 /android-app/src/main/jniLibs/*/libmyotis_*.so
 logindex-*.db
 __pycache__/
+
+# The Bee PoC ships warm Gnosis peer caches (public enodes / multiaddrs) next to its seed.
+!data/bee/gnosis/*.cache

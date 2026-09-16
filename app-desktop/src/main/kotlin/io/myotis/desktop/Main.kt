@@ -40,6 +40,16 @@ fun main() {
     if (beePoc && System.getProperty("myotis.logdir") == null) {
         System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
     }
+    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
+    // processes, so hold a user-initiated activity for the process lifetime (AppNap.kt).
+    // After the logdir property: the outcome is the first line of a start's log.
+    if (AppNap.isMac) {
+        val held = AppNap.disable("Myotis serves JSON-RPC on localhost")
+        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
+            if (held) "App Nap disabled for this process (NSProcessInfo activity held)"
+            else "App Nap NOT disabled — RPC may stall while the window is hidden",
+        )
+    }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
     if (beePoc) BeePoc.installSeedIfAbsent(resourcesDir, dataDir)
