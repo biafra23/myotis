@@ -340,7 +340,9 @@ before this change: `defaults write io.myotis.desktop.beepoc NSAppSleepDisabled
 
 Everything the *Demo only* section says about trust applies: this is an
 RPC-sourced, unverified seed served indistinguishably from walked coverage,
-for demonstrating the Bee-on-Myotis path, not a release.
+for demonstrating the Bee-on-Myotis path — not for production. The PoC dmg
+rides along with releases only as the best-effort, separately named demo asset
+described above, never as the wallet.
 
 ## Distributing the prebuilt snapshot
 
