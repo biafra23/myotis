@@ -48,18 +48,21 @@ jobs:
       # pushes to main and on release tags, so the Swarm team always has a
       # current artifact (owner's call — it costs a second jpackage leg per
       # PR). On a tag its dmg is attached to the release as a BEST-EFFORT
-      # asset: the leg is continue-on-error, so a PoC-only failure never
+      # asset: the leg is continue-on-error there, so a PoC-only failure never
       # blocks the standard dmgs (the release job needs every leg of this
-      # job), and the release job uploads the PoC dmg only if it exists.
+      # job), and the release job uploads the PoC dmg only if it exists. On
+      # PRs and main the leg is a hard gate like the others.
       # Each entry carries its own build flags, dmg name and artifact name so
       # the steps below stay data-driven.
       matrix:
         include: ${{ github.event_name == 'pull_request'
           && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')
           || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]') }}
-    # The PoC is best-effort everywhere: its failure is reported but never
-    # fails this job (and so never blocks a release).
-    continue-on-error: ${{ matrix.flavor == 'bee-poc' }}
+    # The PoC is best-effort on TAG builds only — its failure is reported but
+    # never fails this job there, so it never blocks a release. On PRs and
+    # pushes to main it is a hard gate like the standard legs: a PoC
+    # regression (seed, manifest, caches, JNA stub) must turn the run red.
+    continue-on-error: ${{ matrix.flavor == 'bee-poc' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-14
     permissions:
       contents: read
@@ -261,9 +264,14 @@ jobs:
               echo "bundled peer cache: $c ($(wc -l < "$f" | tr -d ' ') peers)"
             done
           else
-            # …and the regular app must never carry the RPC-sourced seed.
+            # …and the regular app must never carry the RPC-sourced seed, nor the
+            # PoC's peer caches (the Gradle scrub treats both as PoC-only).
             [ -z "$bundled_seed" ] \
               || { echo "::error::the standard dmg carries the Bee PoC seed ($bundled_seed)"; exit 1; }
+            for c in peers-gnosis.cache cl-peers-gnosis.cache; do
+              stray=$(find "$mnt" -type f -name "$c" | head -n1 || true)
+              [ -z "$stray" ] || { echo "::error::the standard dmg carries the Bee PoC peer cache ($stray)"; exit 1; }
+            done
           fi
 
       - name: Upload DMG

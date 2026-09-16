@@ -277,8 +277,14 @@ with the seed above bundled inside:
   peer caches** (`data/bee/gnosis/peers-gnosis.cache`,
   `cl-peers-gnosis.cache` — the engine's own text formats, public peers only,
   re-verified on dial), installed the same way when the data dir has none,
-  so the app starts with known snap peers instead of a cold pool; refresh
-  them from a running node when refreshing the seed.
+  so the app starts with known snap peers instead of a cold pool. Refresh
+  them when refreshing the seed, from a node that has run Gnosis for a while:
+  the daemon writes `app/peers-gnosis.cache` and `app/cl-peers-gnosis.cache`
+  (its data dir), the desktop app the same names under `~/.myotis`; drop the
+  lines the engine has already demoted (`fails=5` and above, or `snapbad`)
+  so the shipped set is warm, not just long. *Purge cache* in the PoC
+  deletes both files, so the next start re-installs the shipped ones — the
+  PoC never truly starts cold, by design.
 - **Point Bee at it**: `blockchain-rpc-endpoint: http://127.0.0.1:8546` with
   the config from *Setup* step 5. Once the beacon sync reaches `SYNCED`
   (seconds with a fresh anchor; the stale-anchor dialog first if the build is
@@ -321,7 +327,8 @@ stall. Measured 2026-09-16, same host, same minute: napped, 25 of 40
 (`NSActivityUserInitiatedAllowingIdleSystemSleep`) for its whole lifetime
 (`AppNap.kt`, through JNA's Objective-C runtime calls) and logs the outcome as
 the first line of every start; being in-process this covers `:app-desktop:run`
-dev runs too. Two things it deliberately does not do: keep the Mac awake (a
+dev runs too. Measured the same way: with the activity held, two minutes
+hidden left every thread at `28`–`31`, never `4`. Two things it deliberately does not do: keep the Mac awake (a
 closed lid or the idle-sleep timer still stops everything — `caffeinate` or the
 *Prevent automatic sleeping* energy setting is that layer), and rely on the
 `NSAppSleepDisabled` Info.plist key, which current macOS ignores — measured on

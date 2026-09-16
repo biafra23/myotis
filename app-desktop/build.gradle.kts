@@ -286,7 +286,7 @@ val beePocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
 
 val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     group = "build"
-    description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it into Compose appResources (-PbeePoc only)"
+    description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it, with the warm peer caches, into Compose appResources (-PbeePoc only)"
     onlyIf { beePoc }
     val meta = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json")
     val logs = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz")

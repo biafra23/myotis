@@ -16,7 +16,9 @@ import java.util.Properties
  * in the app bundle (Compose appResources), installed into the flavour's own data dir on
  * first start, and the first start enables Gnosis with the log index on, so
  * `http://127.0.0.1:8546` serves Bee's `eth_getLogs` pages as soon as the beacon sync is
- * `SYNCED` (seconds with a fresh anchor).
+ * `SYNCED` (seconds with a fresh anchor). The warm Gnosis peer caches from `data/bee/gnosis`
+ * (`peers-gnosis.cache`, `cl-peers-gnosis.cache`; public peers only) ride along the same way — installed once, never over what the engine
+ * has learned since — so the pool does not start cold either.
  *
  * This is a DEBUG / DEMO artefact, not a production path: the seed is a full node's
  * `eth_getLogs` output framed by `scripts/synth_logindex.py`, unverified until the walker
@@ -105,7 +107,12 @@ object BeePoc {
         return PEER_CACHE_FILES.filter { name ->
             val src = dir.resolve(name)
             val target = dataDir.resolve(name)
-            if (!Files.isRegularFile(src) || Files.exists(target)) return@filter false
+            if (!Files.isRegularFile(src)) {
+                // The dmg leg asserts the caches are bundled; a dev `run` may lack them.
+                log.debug("bee-poc: no bundled {} in {}", name, dir)
+                return@filter false
+            }
+            if (Files.exists(target)) return@filter false
             runCatching {
                 Files.createDirectories(dataDir)
                 atomicCopy(src, target)
