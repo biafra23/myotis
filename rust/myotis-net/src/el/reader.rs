@@ -483,9 +483,13 @@ const BRIDGE_MAX_GAP: u64 = 500_000;
 const TAIL_MAX_ABOVE_FINALITY: u64 = 1024;
 
 /// Head gap the backfill tolerates before standing down. A block or two is the
-/// steady state of a 5 s chain between tail ticks; this is a gap one tail tick
-/// could not have closed.
-const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 32;
+/// steady state of a live chain between tail ticks, so the floor must sit above
+/// that — but it is a TIME budget in disguise and the chains differ. Eight
+/// blocks is ~40 s on gnosis (5 s blocks) and ~96 s on mainnet (12 s): both far
+/// above the steady state, and both well inside the 10 minutes a Bee node gives
+/// its RPC before shutting down. In blocks rather than seconds because the
+/// reader has no per-network block time; revisit if one is ever added.
+const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 8;
 
 /// Consecutive ticks the backfill may be yielded before taking one batch anyway
 /// (~5 min at 6 s). A fairness floor: head-follow states this code does not
@@ -499,6 +503,11 @@ const BACKFILL_YIELD_MAX_TICKS: u32 = 50;
 /// coverage holds by design, and with finality stalled `TAIL_MAX` below the head
 /// the tail parks — yielding in either state would idle the whole index instead
 /// of trading one job for a more urgent one.
+///
+/// `finalized == 0` (an anchor with an optimistic head but no finality yet)
+/// falls out as "keep walking": the head-to-finality distance is then the whole
+/// chain, far past `TAIL_MAX_ABOVE_FINALITY` — and head-follow itself returns
+/// early without a finalized anchor, so there would be nothing to defer to.
 fn backfill_should_yield(edge: u64, head: u64, finalized: u64, yielded_ticks: u32) -> bool {
     if head.saturating_sub(edge) <= BACKFILL_HEAD_GAP_TOLERANCE {
         return false;
@@ -1873,8 +1882,9 @@ impl ElReader {
         // Only the background tick owns the bridge plan. The on-demand fill is
         // a guest on this path: clearing the slot would DESTROY a descent the
         // background tick is building — worse than the mid-step cancellation the
-        // gate above exists to prevent — and a stale tail record costs nothing
-        // to leave for the next background tick.
+        // gate above exists to prevent. Leaving the stale tail record costs at
+        // most this fill's own last blocks — the next background tick's retire
+        // can rewind below them — which is bounded, and far cheaper.
         if stall.is_some() {
             self.clear_log_index_bridge();
             // Coverage is at/below finality here, so the tail tick (and its
@@ -2903,22 +2913,25 @@ impl ElReader {
             self.with_log_index(|ix| ix.append_edge()).flatten(),
             self.head_block_number(),
         ) {
-            if backfill_should_yield(edge, head, self.finalized_block_number(), *yielded) {
+            let finalized = self.finalized_block_number();
+            if backfill_should_yield(edge, head, finalized, *yielded) {
                 *yielded = yielded.saturating_add(1);
-                // The yield is not the walker's idleness: hold its rate anchor
-                // at NOW so the status ETA is not charged for time it was told
-                // to stand down.
-                if let Some((cursor_now, _)) = self.with_log_index(|ix| ix.cursor).flatten() {
-                    if let Ok(mut rate) = self.log_index_rate.lock() {
-                        if let Some((_, anchor_cursor, ema)) = *rate {
-                            if cursor_now == anchor_cursor {
-                                *rate = Some((std::time::Instant::now(), anchor_cursor, ema));
-                            }
-                        }
-                    }
-                }
+                // The walker's rate clock is deliberately NOT re-anchored here.
+                // `log_index_rate_bps` withholds the rate — and the ETA with it —
+                // after 60 s without progress, precisely so a stalled walk cannot
+                // keep showing a confident number. A yielded walk is not making
+                // progress either, so "unknown" is the honest reading; holding
+                // the anchor at NOW would instead keep the pre-yield EMA on
+                // screen for as long as the yield lasts, which in the
+                // fairness-floor regime is ~50x optimistic.
                 if ticks % 100 == 0 {
-                    tracing::debug!(edge, head, "log index backfill yielding to head-follow");
+                    tracing::debug!(
+                        edge,
+                        head,
+                        finalized,
+                        yielded = *yielded,
+                        "log index backfill yielding to head-follow"
+                    );
                 }
                 return;
             }
@@ -6149,6 +6162,20 @@ mod tests {
         assert!(!backfill_should_yield(1_000, 5_000, 1_000, 0));
         // Fairness floor: after enough yielded ticks, take a batch regardless.
         assert!(!backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS));
+        // The boundaries the two bugs lived on. At exactly TAIL_MAX the tail
+        // parks (so keep walking); one block inside it, head-follow still owns
+        // the gap.
+        assert!(!backfill_should_yield(9_000, 11_024, 10_000, 0));
+        assert!(backfill_should_yield(9_000, 11_023, 10_000, 0));
+        // At exactly BRIDGE_MAX_GAP the bridge still maps the gap; one past it
+        // the bridge holds coverage and the walk must not stand down.
+        assert!(backfill_should_yield(1_000, 501_100, 501_000, 0));
+        assert!(!backfill_should_yield(1_000, 501_100, 501_001, 0));
+        // The tolerance itself.
+        assert!(!backfill_should_yield(1_000, 1_008, 1_004, 0));
+        assert!(backfill_should_yield(1_000, 1_009, 1_004, 0));
+        // No finality yet: keep walking, there is nothing to defer to.
+        assert!(!backfill_should_yield(1_000, 21_000_000, 0, 0));
     }
 
     #[test]
@@ -7616,7 +7643,7 @@ mod tail_reorg_tests {
     #[test]
     fn the_tail_window_floor_must_be_servable() {
         use super::{tail_window_floor, tail_window_is_servable};
-        const TAIL_MAX: u64 = 1_024;
+        const TAIL_MAX: u64 = super::TAIL_MAX_ABOVE_FINALITY;
         let head = 10_000u64;
         // The hard floor the tail uses must be reachable within one window —
         // head - (TAIL_MAX - 1) needs exactly TAIL_MAX headers.
