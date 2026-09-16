@@ -1854,20 +1854,30 @@ impl ElReader {
         // (a <=4-block shortfall under a 5s timeout) must not: the bridge takes
         // its plan out of the slot for the duration, so a timeout mid-step would
         // drop a descent the background tick has been building.
-        let (stalled, crossed) = match stall.as_deref_mut() {
-            Some(s) => {
-                let st = s.observe(start);
-                (st, st && s.just_stalled())
-            }
-            None => (false, false),
-        };
-        let bridging = stall.is_some()
+        let background = stall.is_some();
+        let deep = gap > APPEND_WINDOW;
+        let bridging = background
             && self
                 .log_index_bridge
                 .lock()
                 .map(|slot| slot.is_some())
                 .unwrap_or(false);
-        if stall.is_some() && (gap > APPEND_WINDOW || bridging || stalled) {
+        // Count only the ticks the per-block path actually DRIVES. It is that
+        // path's failure this detects, and ticks the bridge was already driving
+        // — a deep gap, or a descent spanning several ticks — would otherwise
+        // make the hand-off line below claim a cause that was not the reason.
+        let (stalled, crossed) = match stall.as_deref_mut() {
+            Some(s) if !deep && !bridging => {
+                let st = s.observe(start);
+                (st, st && s.just_stalled())
+            }
+            Some(s) => {
+                s.reset();
+                (false, false)
+            }
+            None => (false, false),
+        };
+        if background && (deep || bridging || stalled) {
             if crossed {
                 tracing::info!(
                     edge = start,
@@ -1877,6 +1887,15 @@ impl ElReader {
                 );
             }
             self.log_index_bridge_step(start, finalized, ticks).await;
+            return;
+        }
+        if deep {
+            // On-demand only — the background tick returned above. This path
+            // cannot bridge (see the gate), and the per-block loop is not built
+            // for a deep gap: its verify window grows with the distance to the
+            // head, and past BLOCK_LOOKBACK_MAX it cannot succeed at all. Leave
+            // the gap to the background tick instead of burning the caller's
+            // deadline on fetches that get slower the further behind we are.
             return;
         }
         // Only the background tick owns the bridge plan. The on-demand fill is
