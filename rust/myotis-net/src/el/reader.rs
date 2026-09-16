@@ -482,7 +482,8 @@ const BRIDGE_MAX_GAP: u64 = 500_000;
 /// head gap is again nobody's job — same reasoning as `BRIDGE_MAX_GAP`.
 const TAIL_MAX_ABOVE_FINALITY: u64 = 1024;
 
-/// Head gap the backfill tolerates before standing down. A block or two is the
+/// Pending blocks (`edge..=head`, inclusive) the backfill tolerates before
+/// standing down. A block or two is the
 /// steady state of a live chain between tail ticks, so the floor must sit above
 /// that — but it is a TIME budget in disguise and the chains differ. Eight
 /// blocks is ~40 s on gnosis (5 s blocks) and ~96 s on mainnet (12 s): both far
@@ -509,7 +510,12 @@ const BACKFILL_YIELD_MAX_TICKS: u32 = 50;
 /// chain, far past `TAIL_MAX_ABOVE_FINALITY` — and head-follow itself returns
 /// early without a finalized anchor, so there would be nothing to defer to.
 fn backfill_should_yield(edge: u64, head: u64, finalized: u64, yielded_ticks: u32) -> bool {
-    if head.saturating_sub(edge) <= BACKFILL_HEAD_GAP_TOLERANCE {
+    // `edge` is the NEXT block to append, so the pending range INCLUDES it:
+    // edge..=head. (The two guards below deliberately do not add that one —
+    // each mirrors, operand for operand, the check in the path it defers to,
+    // so each has to keep that path's own arithmetic.)
+    let pending = if head >= edge { head - edge + 1 } else { 0 };
+    if pending <= BACKFILL_HEAD_GAP_TOLERANCE {
         return false;
     }
     if yielded_ticks >= BACKFILL_YIELD_MAX_TICKS {
@@ -6190,9 +6196,12 @@ mod tests {
         // the bridge holds coverage and the walk must not stand down.
         assert!(backfill_should_yield(1_000, 501_100, 501_000, 0));
         assert!(!backfill_should_yield(1_000, 501_100, 501_001, 0));
-        // The tolerance itself.
-        assert!(!backfill_should_yield(1_000, 1_008, 1_004, 0));
-        assert!(backfill_should_yield(1_000, 1_009, 1_004, 0));
+        // The tolerance itself, counted inclusively over edge..=head: eight
+        // pending blocks stay with the walk, nine hand the tick to head-follow.
+        assert!(!backfill_should_yield(1_000, 1_007, 1_004, 0));
+        assert!(backfill_should_yield(1_000, 1_008, 1_004, 0));
+        // Coverage past the head (edge = head + 1) is zero pending, not one.
+        assert!(!backfill_should_yield(1_001, 1_000, 1_000, 0));
         // No finality yet: keep walking, there is nothing to defer to.
         assert!(!backfill_should_yield(1_000, 21_000_000, 0, 0));
     }
