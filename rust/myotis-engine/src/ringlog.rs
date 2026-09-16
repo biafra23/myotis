@@ -107,7 +107,10 @@ mod tests {
     /// below — so the assertions are about our own lines' order and the
     /// ring's bound, never about the ring holding exactly what we wrote
     /// (that version failed in CI whenever the scheduler let a foreign line
-    /// in: run 35075614985).
+    /// in: run 35075614985, where one foreign entry evicted one extra line of
+    /// ours and `drain(1)` returned "line 11"). It does assume no other test
+    /// DRAINS the ring — nothing calls the drain FFI today; a test of that
+    /// would have to serialize with this one.
     #[test]
     fn drains_oldest_first_bounded_and_empties() {
         // Write directly through the writer (installing the global subscriber
@@ -121,6 +124,10 @@ mod tests {
         let second = batch.find("second line").expect("second line drained");
         assert!(first < second, "oldest first: {batch}");
         assert!(
+            !batch.ends_with('\n'),
+            "no trailing newline — the Java side splits on '\\n'"
+        );
+        assert!(
             !drain(usize::MAX).contains("first line"),
             "a drained line must not come back"
         );
@@ -132,16 +139,22 @@ mod tests {
         for i in 0..(CAPACITY + 10) {
             w.write_all(format!("line {i}\n").as_bytes()).unwrap();
         }
+        // The bound, checked on the ring itself: counting lines of the drained
+        // string would miscount a foreign entry that carried an embedded
+        // newline (the writer stores one entry per event, newlines and all).
+        assert!(
+            ring().lock().unwrap().len() <= CAPACITY,
+            "the ring is bounded at CAPACITY"
+        );
         let drained = drain(usize::MAX);
         let ours: Vec<usize> = drained
             .lines()
             .filter_map(|l| l.strip_prefix("line ").and_then(|n| n.parse().ok()))
             .collect();
-        assert!(drained.lines().count() <= CAPACITY, "ring is bounded at CAPACITY");
         assert!(!ours.is_empty(), "our lines drained: {drained}");
         assert!(*ours.iter().min().unwrap() >= 10, "oldest 10 lines must have dropped: {ours:?}");
         assert_eq!(*ours.iter().max().unwrap(), CAPACITY + 9, "newest line kept");
-        assert!(ours.windows(2).all(|w| w[0] < w[1]), "oldest first, in write order");
+        assert!(ours.windows(2).all(|p| p[0] < p[1]), "oldest first, in write order");
         let _ = drain(usize::MAX);
     }
 }
