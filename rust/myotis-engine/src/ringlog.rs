@@ -155,6 +155,21 @@ mod tests {
         assert!(*ours.iter().min().unwrap() >= 10, "oldest 10 lines must have dropped: {ours:?}");
         assert_eq!(*ours.iter().max().unwrap(), CAPACITY + 9, "newest line kept");
         assert!(ours.windows(2).all(|p| p[0] < p[1]), "oldest first, in write order");
+
+        // max < len: the clamp (`n = ring.len().min(max)`) is the path every host
+        // actually runs — the daemon drains 1000, desktop and iOS 500, against a
+        // CAPACITY of 4096 — so a burst that outruns the poll always lands here.
+        // Company-safe: `one` may be a foreign line, but it can never be "clamp
+        // newer", whose elder is still queued ahead of it.
+        w.write_all(b"clamp older\n").unwrap();
+        w.write_all(b"clamp newer\n").unwrap();
+        let one = drain(1);
+        assert_eq!(one.lines().count(), 1, "drain(1) pops exactly one entry: {one}");
+        assert!(!one.contains("clamp newer"), "drain(1) pops the OLDEST entry: {one}");
+        assert!(
+            drain(usize::MAX).contains("clamp newer"),
+            "an entry the clamp left behind must still be there"
+        );
         let _ = drain(usize::MAX);
     }
 }
