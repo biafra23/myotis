@@ -1005,6 +1005,28 @@ pub struct ElReader {
     /// so those blocks' hashes are unknown and coverage above finality must
     /// be rewound rather than trusted). See [`Self::log_index_tail_tick`].
     log_index_tail: std::sync::Mutex<Vec<(u64, [u8; 32])>>,
+    /// The covered high of the installed index that THIS NODE's own checkpoint
+    /// vouched final (0: nothing vouched) — the one fact about coverage above
+    /// the anchor's finality that survives a restart without a tail record.
+    ///
+    /// Needed because a restart restores the beacon store from a snapshot
+    /// written once per sync-committee period (~11 h on gnosis, ~27 h on
+    /// mainnet): its finality can sit hours below the checkpoint, and the tail
+    /// would otherwise rewind everything in between as "unvouched" — coverage
+    /// that was final, can never reorg, and costs a head bridge to re-walk.
+    /// Set only when an index is installed from a file whose finality claim
+    /// matches it (`logindex::read_finality_claim`). Cleared once the anchor's
+    /// finality reaches it, once a current finality verified after the claim
+    /// was first weighed contradicts it ([`RestartClaim`]), or when the index
+    /// is replaced by one that did not come from that file (an import, a fresh
+    /// index). See [`Self::log_index_tail_tick`] for what it changes.
+    log_index_vouched: std::sync::atomic::AtomicU64,
+    /// The first anchor finality the current claim was weighed against (0: not
+    /// yet). Only a finality verified AFTER it may contradict the claim — a
+    /// restored one proves nothing, however current a skewed wall clock makes
+    /// it look. Set through [`Self::set_vouched`] and
+    /// [`Self::settle_restart_claim`] only.
+    log_index_claim_first_finality: std::sync::atomic::AtomicU64,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1164,6 +1186,8 @@ impl ElReader {
             log_index_rate: std::sync::Mutex::new(None),
             log_index_bridge: std::sync::Mutex::new(None),
             log_index_tail: std::sync::Mutex::new(Vec::new()),
+            log_index_vouched: std::sync::atomic::AtomicU64::new(0),
+            log_index_claim_first_finality: std::sync::atomic::AtomicU64::new(0),
             log_index_persist: PersistClock::new(),
             log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
@@ -1236,8 +1260,21 @@ impl ElReader {
             // which invalidates bridge and tail — neither describes the new
             // coverage shape.
             self.clear_log_index_bridge();
-            if let Ok(mut t) = self.log_index_tail.lock() {
-                t.clear();
+            // The tail record describes blocks this run appended and has not
+            // yet proven canonical, and THE retirement rule says it may only
+            // go together with that coverage (see `retire_tail_record`). So
+            // give the coverage back first, before the checkpoint and the
+            // merge below carry it where no tail could re-check it.
+            let unconfirmed = match self.log_index_tail.lock() {
+                Ok(mut t) => {
+                    let lowest = t.iter().map(|(n, _)| *n).min();
+                    t.clear();
+                    lowest
+                }
+                Err(_) => None,
+            };
+            if let Some(lowest) = unconfirmed {
+                ix.rewind_above(lowest.saturating_sub(1));
             }
             // Whether the file on disk now holds this checkpoint. Best-effort
             // like the periodic ones, but NOT silent, and not assumed: the
@@ -1246,16 +1283,12 @@ impl ElReader {
             // progress unprotected for a whole interval while the file on
             // disk is stale or missing.
             let checkpointed = match self.log_index_path.as_deref() {
-                // Clamped like every other checkpoint: optimistic coverage is
-                // only verifiable against this run's tail record. A zero
-                // finality means no anchor (so nothing optimistic exists) —
-                // clamping there would erase the file.
+                // Clamped like every other checkpoint — `checkpoint_clamp`,
+                // with the record already retired above.
                 Some(p) => {
-                    let r = if finalized_now == 0 {
-                        ix.persist(&tag, p)
-                    } else {
-                        ix.persist_clamped(&tag, p, finalized_now)
-                    };
+                    let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
+                    let clamp = checkpoint_clamp(finalized_now, vouched, None);
+                    let r = write_own_checkpoint(p, &checkpoint_bytes(ix, &tag, clamp), clamp);
                     if let Err(e) = &r {
                         tracing::warn!(
                             error = %e,
@@ -1312,6 +1345,16 @@ impl ElReader {
                 }
             };
             let installed_is_empty = fresh.log_count() == 0;
+            // A restart claim vouches for coverage, so it survives exactly as
+            // far as the coverage did: a merge keeps it, a fresh index has
+            // nothing for it to vouch for.
+            let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
+            let kept = fresh
+                .append_edge()
+                .map_or(0, |edge| vouched.min(edge.saturating_sub(1)));
+            if kept != vouched {
+                self.set_vouched(kept);
+            }
             *slot = Some(fresh);
             // The checkpoint above put a full-size file on disk, so it starts
             // an interval — without one the next appender tick would rewrite
@@ -1341,17 +1384,20 @@ impl ElReader {
         // its own subscription set — union the push with it and adopt its
         // coverage; imports survive restarts this way. A legacy v1 file
         // (config-keyed, pre-import builds) still loads the old way.
-        let stored = self
-            .log_index_path
-            .as_deref()
-            .and_then(crate::el::logindex::LogIndex::load_portable)
-            .filter(|(t, _)| *t == tag);
+        // The file's restart claim rides along only where its coverage does
+        // (adopted or merged), exactly as in `install_log_index_from_disk`.
+        let stored = self.log_index_path.as_deref().and_then(|p| {
+            let (ix, id) = crate::el::logindex::LogIndex::load_portable_with_id(p)?;
+            (id.tag == tag).then(|| (ix, crate::el::logindex::read_finality_claim(p, &id)))
+        });
+        let mut claim = None;
         let ix = match stored {
-            Some((_, mut stored_ix)) => {
+            Some((mut stored_ix, stored_claim)) => {
                 let adopted = config
                     .union_with(&stored_ix.config().watch)
                     .is_some_and(|eff| stored_ix.adopt_config(eff));
                 if adopted {
+                    claim = stored_claim;
                     stored_ix
                 } else if let Some(eff) = config.union_with(&stored_ix.config().watch) {
                     // Genuinely new addresses (e.g. a host preset pushed on
@@ -1368,6 +1414,7 @@ impl ElReader {
                         Some((_, mut m)) => {
                             m.set_enabled(eff.enabled);
                             m.set_max_speed(eff.max_speed);
+                            claim = stored_claim;
                             m
                         }
                         None => match crate::el::logindex::LogIndex::new(config) {
@@ -1403,6 +1450,11 @@ impl ElReader {
             }
         };
         let installed_is_empty = ix.log_count() == 0;
+        let vouched = vouched_high(ix.append_edge().map(|e| e.saturating_sub(1)), claim);
+        self.set_vouched(vouched);
+        if vouched > 0 {
+            tracing::info!(vouched, "log index: installed this node's own checkpoint, final through the vouched block");
+        }
         *slot = Some(ix);
         // Boot path: ADOPT the snapshot on disk — it already describes the
         // index just installed from it, so the first checkpoint of a restarted
@@ -1434,29 +1486,43 @@ impl ElReader {
     /// subscription set), for a foreign chain's file, or once a config has
     /// already arrived.
     pub fn activate_log_index_from_disk(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        if self.install_log_index_from_disk() {
+            self.ensure_log_index_appender(rt);
+        }
+    }
+
+    /// [`Self::activate_log_index_from_disk`] minus the appender: install the
+    /// file at this reader's own path, with the restart claim that sits beside
+    /// it if the claim describes exactly these bytes (a dropped-in or imported
+    /// file never does). Returns whether an index was installed.
+    fn install_log_index_from_disk(&self) -> bool {
         let Some(path) = self.log_index_path.as_deref() else {
-            return;
+            return false;
         };
-        let Some((t, mut ix)) = crate::el::logindex::LogIndex::load_portable(path) else {
-            return;
+        let Some((mut ix, id)) = crate::el::logindex::LogIndex::load_portable_with_id(path) else {
+            return false;
         };
-        if t != self.chain_tag() {
+        if id.tag != self.chain_tag() {
             tracing::warn!(
                 path = %path.display(),
-                file_network = t.network_id,
+                file_network = id.tag.network_id,
                 own_network = self.eth_cfg.network_id,
                 "log-index snapshot on disk belongs to another chain; ignoring it"
             );
-            return;
+            return false;
         }
+        // Outside the index lock: a file read there would stall every query.
+        let claim = crate::el::logindex::read_finality_claim(path, &id);
+        let vouched = vouched_high(ix.append_edge().map(|e| e.saturating_sub(1)), claim);
         {
             let Ok(mut slot) = self.log_index.lock() else {
-                return;
+                return false;
             };
             if slot.is_some() {
-                return; // a config already arrived — it wins
+                return false; // a config already arrived — it wins
             }
             ix.set_enabled(true);
+            self.set_vouched(vouched);
             *slot = Some(ix);
         }
         // Same reason as the boot path in `set_log_index_config`: this installs
@@ -1464,14 +1530,24 @@ impl ElReader {
         // checkpoint would rewrite the whole file before the cadence learned
         // what it weighs.
         self.note_checkpoint_adopted(path);
-        tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
-        self.ensure_log_index_appender(rt);
+        if vouched > 0 {
+            tracing::info!(
+                path = %path.display(),
+                vouched,
+                "activated log-index snapshot from disk (this node's own checkpoint: final through the vouched block)"
+            );
+        } else {
+            tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
+        }
+        true
     }
 
     /// Export the current index as a portable snapshot at `path` — the
     /// generator's output. Clamped at finality like every checkpoint
     /// (optimistic coverage is only verifiable against this run's tail
-    /// record); the v2 frame carries the watch-table + chain tag, so the file
+    /// record; [`checkpoint_clamp`] has the rule). No finality claim goes
+    /// with it — the claim is this node's, never the file's. The
+    /// v2 frame carries the watch-table + chain tag, so the file
     /// imports anywhere on the same chain. Partial coverage exports honestly
     /// — the importer's catch-up finishes the walk. Display names are
     /// STRIPPED from the export: naming is the importing wallet's job, and
@@ -1497,7 +1573,7 @@ impl ElReader {
         match self.log_index.lock() {
             Ok(slot) => match slot.as_ref() {
                 Some(ix) => ix
-                    .export_unnamed(&tag, path, (finalized > 0).then_some(finalized))
+                    .export_unnamed(&tag, path, self.checkpoint_clamp_for(finalized))
                     .map_err(|e| format!("could not write {}: {e}", path.display())),
                 None => Err("no log index is configured".to_string()),
             },
@@ -1568,12 +1644,10 @@ impl ElReader {
                 return Err("log index unavailable".to_string());
             };
             if let Some(ix) = slot.as_ref() {
-                let r = if finalized == 0 {
-                    ix.persist(&tag, &own_path)
-                } else {
-                    ix.persist_clamped(&tag, &own_path, finalized)
-                };
-                r.map_err(|e| {
+                // An ordinary checkpoint, claim included: if the import fails
+                // below, this is the file the node keeps running on.
+                let clamp = self.checkpoint_clamp_for(finalized);
+                write_own_checkpoint(&own_path, &checkpoint_bytes(ix, &tag, clamp), clamp).map_err(|e| {
                     format!("could not checkpoint the current index before merging: {e}")
                 })?;
             }
@@ -1620,6 +1694,13 @@ impl ElReader {
         // band would only hold data the first tail tick discards — the
         // rewind makes the installed index, the persisted file, and the tail
         // rule tell one story. The appender/tail re-fetch the band promptly.
+        //
+        // That is the ANCHOR's finality, not a restart claim's: the merged
+        // index holds other nodes' logs, and what this node's earlier
+        // checkpoint vouched for does not carry over to them. So the claim
+        // ends here, on disk and in memory, and any band between the anchor's
+        // finality and the claim is re-fetched verified — the same as an
+        // import has always cost.
         let finalized_now = self.finalized_block_number();
         if finalized_now > 0 {
             merged.rewind_above(finalized_now);
@@ -1628,6 +1709,13 @@ impl ElReader {
             .persist(&tag, &own_path)
             .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
         self.note_checkpoint_written(&own_path);
+        // After the write, so a failed import changes nothing. Until then the
+        // claim beside the file describes the checkpoint written above, which
+        // `read_finality_claim` can tell apart from these bytes. Best-effort
+        // for the same reason.
+        if let Err(e) = crate::el::logindex::remove_finality_claim(&own_path) {
+            tracing::warn!(error = %e, path = %own_path.display(), "log index import: could not remove the previous finality claim");
+        }
         match self.log_index.lock() {
             Ok(mut slot) => {
                 // Bridge/tail/rate describe the OLD coverage shape. Cleared
@@ -1635,7 +1723,8 @@ impl ElReader {
                 // set_log_index_config uses): the tail tick appends and
                 // records while holding this lock, so no record seeded
                 // against the old index can slip in between the clear and
-                // the install.
+                // the install. (The records' coverage is not in the merged
+                // index: the checkpoint it was built from stopped below them.)
                 self.clear_log_index_bridge();
                 if let Ok(mut t) = self.log_index_tail.lock() {
                     t.clear();
@@ -1643,6 +1732,7 @@ impl ElReader {
                 if let Ok(mut rate) = self.log_index_rate.lock() {
                     *rate = None;
                 }
+                self.set_vouched(0);
                 *slot = Some(merged);
             }
             Err(_) => return Err("log index unavailable".to_string()),
@@ -1834,6 +1924,9 @@ impl ElReader {
             }
             return;
         }
+        // Before routing: a claim the anchor has caught up with must not keep
+        // the tail on hold, and one it never will reach must not either.
+        self.settle_restart_claim(finalized);
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
         let start = match edge {
             None => finalized, // fresh index: start at the finalized head
@@ -2035,8 +2128,21 @@ impl ElReader {
     /// Coverage above finality that this run did NOT append — a persisted tail
     /// from an older build, or an imported index — has unknown hashes and
     /// cannot be re-checked, so it is rewound to finality rather than trusted.
-    /// (Checkpoints clamp at finality, so a normal restart never inherits
-    /// optimistic coverage in the first place.)
+    ///
+    /// A normal restart never inherits optimistic coverage in the first place
+    /// (checkpoints clamp at finality), but it can inherit coverage above the
+    /// anchor's finality all the same: the beacon store resumes from a snapshot
+    /// written once per sync-committee period, so the first finality this run
+    /// sees can trail the checkpoint by hours. That coverage is final, and the
+    /// checkpoint's own finality claim says so (`log_index_vouched`). So the
+    /// finality-based rules below measure against the vouched height where it
+    /// is higher than the anchor's finality — nothing at or below it can
+    /// reorg — and while the anchored head is still below it the tail holds
+    /// outright: that head has nothing to add, and a head below final
+    /// coverage is a stale anchor, not the shortened chain the rule for that
+    /// would take it for. Records still retire against the anchor's own
+    /// finality only: the vouched height says what the PREVIOUS run proved,
+    /// nothing about blocks this run appended.
     ///
     /// Serving at the optimistic head matches the rest of the engine, where
     /// every verified read (`eth_call`, `getCode`, `getBalance`) answers under
@@ -2058,6 +2164,27 @@ impl ElReader {
         let Ok((head_n, head_hash)) = self.anchored_head() else {
             return;
         };
+        // The restart claim (see above), ahead of every rule that gives
+        // coverage back, since each would read a stale anchor as evidence
+        // against coverage that is final. The two finality-based ones
+        // (unvouched coverage, finality far below the head) measure against
+        // `final_floor`; the chain-shortened one compares the head with the
+        // covered top, and only this hold keeps a head below the vouched top
+        // from looking like a reorg. `finalized` stays the anchor's own.
+        let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
+        if head_n < vouched {
+            if ticks % 100 == 0 {
+                tracing::info!(
+                    head_n,
+                    finalized,
+                    vouched,
+                    "log index tail: holding for the light client — coverage up to the vouched \
+                     block is final per this node's own checkpoint"
+                );
+            }
+            return;
+        }
+        let final_floor = tail_final_floor(finalized, vouched);
         // Re-read the edge under this tick (the caller's value predates the
         // finalized catch-up that may have just advanced it).
         let Some(mut edge) = self.with_log_index(|ix| ix.append_edge()).flatten() else {
@@ -2073,21 +2200,22 @@ impl ElReader {
             return;
         };
         // Coverage above finality this run cannot vouch for: rewind.
-        if !tail_vouches_for(&recorded, edge, finalized) {
+        if !tail_vouches_for(&recorded, edge, final_floor) {
             tracing::info!(
                 covered_high = edge.saturating_sub(1),
                 finalized,
+                vouched,
                 "log index tail: rewinding unvouched coverage above finality"
             );
-            self.log_index_rewind_to(finalized);
-            edge = finalized.saturating_add(1);
+            self.log_index_rewind_to(final_floor);
+            edge = final_floor.saturating_add(1);
         }
         // The rewind above drops record entries; re-read rather than compare
         // against a stale snapshot (which would fork-rewind coverage that no
         // longer exists and waste a tick on a misleading warning).
         let recorded: Vec<(u64, [u8; 32])> =
             self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
-        if head_n.saturating_sub(finalized) >= TAIL_MAX {
+        if head_n.saturating_sub(final_floor) >= TAIL_MAX {
             // Finality has stalled far below the head. The tail cannot
             // re-check what it appended from here (the window would exceed
             // the 1024-header serve ceiling, so no peer can cover the floor),
@@ -2095,14 +2223,17 @@ impl ElReader {
             // to finality rather than answer explicit-number queries from
             // blocks that can still reorg. `>=` because the window is
             // inclusive at both ends — at exactly TAIL_MAX it needs 1025.
-            if edge > finalized.saturating_add(1) {
+            // (Measured from the vouched floor too: after a restart the
+            // anchor's finality may be hours stale while the head is not, and
+            // nothing at or below the floor needs re-checking.)
+            if edge > final_floor.saturating_add(1) {
                 // Guarded: rewind_above scans the whole log store under the
                 // index lock, and this branch repeats every 6s for as long as
                 // finality stalls.
-                self.log_index_rewind_to(finalized);
+                self.log_index_rewind_to(final_floor);
             }
             if ticks % 100 == 0 {
-                tracing::warn!(finalized, head_n, "log index tail: finality too far below the head; coverage held at finality");
+                tracing::warn!(finalized, vouched, head_n, "log index tail: finality too far below the head; coverage held at finality");
             }
             return;
         }
@@ -2318,7 +2449,11 @@ impl ElReader {
     /// survive a restart. Persisting it would leave a later run holding
     /// coverage it can never re-check — and once finality moves past those
     /// blocks, nothing would ever rewind them (they would look immutable
-    /// while possibly being orphaned).
+    /// while possibly being orphaned). [`checkpoint_clamp`] has the exact
+    /// rule, including the two refinements: a restart claim that still holds
+    /// keeps its vouched coverage in the file, and a tail record finality has
+    /// passed but the tail has not yet re-checked stays out of it. Whatever
+    /// the clamp, the checkpoint records it as the file's finality claim.
     ///
     /// Returns whether a checkpoint was actually WRITTEN. Callers use it to
     /// decide whether their "there is work to record" flag may be cleared —
@@ -2378,14 +2513,15 @@ impl ElReader {
         // fsync dominates the checkpoint by orders of magnitude, and holding
         // the index mutex across it stalls the appender, the backfill walker
         // and every getLogs query for the whole duration.
-        let bytes = {
+        let (bytes, clamp) = {
             let Ok(slot) = self.log_index.lock() else {
                 return false;
             };
             let Some(ix) = slot.as_ref() else {
                 return false;
             };
-            checkpoint_bytes(ix, &self.chain_tag(), finalized)
+            let clamp = self.checkpoint_clamp_for(finalized);
+            (checkpoint_bytes(ix, &self.chain_tag(), clamp), clamp)
         };
         // Best-effort, but not SILENT. A checkpoint that fails every time —
         // ENOSPC is the likely cause, and the one this size-aware cadence
@@ -2393,7 +2529,7 @@ impl ElReader {
         // of walk per crash instead of ten seconds, and would otherwise leave
         // no trace of why. Same reasoning as the tail: a silently broken
         // checkpoint is the wrong failure shape.
-        if let Err(e) = crate::el::logindex::write_atomic(path, &bytes) {
+        if let Err(e) = write_own_checkpoint(path, &bytes, clamp) {
             tracing::warn!(
                 error = %e,
                 bytes = bytes.len(),
@@ -2418,6 +2554,72 @@ impl ElReader {
         self.log_index_persist
             .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
         true
+    }
+
+    /// [`checkpoint_clamp`] for the installed index at `finalized`. Call it
+    /// with the index lock held, so the tail record it reads describes the
+    /// coverage being serialized: the tail appends and records under that
+    /// lock, and index → tail is the established order.
+    fn checkpoint_clamp_for(&self, finalized: u64) -> Option<u64> {
+        let lowest = self
+            .log_index_tail
+            .lock()
+            .ok()
+            .and_then(|t| t.iter().map(|(n, _)| *n).min());
+        checkpoint_clamp(
+            finalized,
+            self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed),
+            lowest,
+        )
+    }
+
+    /// Install a restart claim (0: none) for the index being installed. The
+    /// claim starts unweighed, so the order matters: a settle racing this
+    /// must never pair the new claim with the old one's first finality.
+    fn set_vouched(&self, vouched: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.log_index_claim_first_finality.store(0, Relaxed);
+        self.log_index_vouched.store(vouched, Relaxed);
+    }
+
+    /// Settle a restart's finality claim against the anchor's `finalized`
+    /// (non-zero): keep holding, or retire it for good — once the anchor has
+    /// caught up with it, or once a current finality verified after the claim
+    /// was first weighed contradicts it. See [`RestartClaim`].
+    fn settle_restart_claim(&self, finalized: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let vouched = self.log_index_vouched.load(Relaxed);
+        if vouched == 0 {
+            return;
+        }
+        let first = match self.log_index_claim_first_finality.compare_exchange(0, finalized, Relaxed, Relaxed) {
+            Ok(_) => finalized,
+            Err(seen) => seen,
+        };
+        let fate = restart_claim_fate(finalized, vouched, first, self.anchor.finality_is_current());
+        if fate == RestartClaim::Hold {
+            return;
+        }
+        // Only retire the claim this call judged: an install racing us may
+        // just have set a new one.
+        if self.log_index_vouched.compare_exchange(vouched, 0, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        if fate == RestartClaim::Contradicted {
+            tracing::warn!(
+                finalized,
+                vouched,
+                "log index: the light client's finality is current yet sits far below what this \
+                 node's checkpoint vouched final; dropping the claim — coverage above finality is \
+                 re-checked as usual"
+            );
+        } else {
+            tracing::info!(
+                finalized,
+                vouched,
+                "log index: finality reached the coverage this node's checkpoint vouched; the tail resumes"
+            );
+        }
     }
 
     /// A full-size file was just WRITTEN to `path` by a path that does not go
@@ -2944,7 +3146,12 @@ impl ElReader {
             self.with_log_index(|ix| ix.append_edge()).flatten(),
             self.head_block_number(),
         ) {
-            let finalized = self.finalized_block_number();
+            // The finality the tail itself measures against (see its restart
+            // claim), so this check keeps mirroring the tail's own.
+            let finalized = tail_final_floor(
+                self.finalized_block_number(),
+                self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed),
+            );
             if backfill_should_yield(edge, head, finalized, *yielded) {
                 *yielded = yielded.saturating_add(1);
                 // The walker's rate clock is deliberately NOT re-anchored here.
@@ -6846,6 +7053,120 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
     expect <= finalized
 }
 
+/// How far below a restart's finality claim a CURRENT light client may sit.
+/// The claim is a finality this node verified before the restart, so it is at
+/// or below the network's finality now; a light client that reports SYNCED
+/// holds a finality at most `sync::SYNCED_SLOT_SLACK_EPOCHS` epochs (at most
+/// 160 slots on every supported network) behind the wall clock, and a chain
+/// adds at most one block per slot. 512 leaves 3x headroom, so with a correct
+/// wall clock a genuine claim is never dropped — only one that a finality
+/// verified since the claim was weighed flatly contradicts. With a clock
+/// hours slow AND a light-client server serving a finality hours old, a
+/// genuine claim can still go; that costs the re-walk this claim exists to
+/// save, never trust.
+const RESTART_CLAIM_MAX_LEAD: u64 = 512;
+
+/// What a restart's finality claim (see `ElReader::log_index_vouched`) means
+/// against the anchor's finality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartClaim {
+    /// The anchor is still below the vouched coverage: the tail holds.
+    Hold,
+    /// The anchor reached it; the claim adds nothing any more.
+    Subsumed,
+    /// A light client whose finality is CURRENT, and was verified after the
+    /// claim was first weighed, sits further below the claim than any restart
+    /// explains: the claim is wrong (a corrupt value), and holding for it
+    /// would stall head-follow for good.
+    Contradicted,
+}
+
+/// `first` is the anchor finality the claim was first weighed against. Only a
+/// finality verified after it counts as evidence against the claim: SYNCED
+/// reads the wall clock, and a clock running hours slow makes a finality
+/// restored from the snapshot look current. Pure — unit-tested.
+fn restart_claim_fate(finalized: u64, vouched: u64, first: u64, finality_current: bool) -> RestartClaim {
+    if finalized >= vouched {
+        RestartClaim::Subsumed
+    } else if finality_current && finalized > first && vouched - finalized > RESTART_CLAIM_MAX_LEAD {
+        RestartClaim::Contradicted
+    } else {
+        RestartClaim::Hold
+    }
+}
+
+/// The finality the tail's finality-based rules measure against: the anchor's,
+/// raised to what a restart claim vouched — but only once the anchor has a
+/// finality at all. Without one nothing follows the head, and a caller that
+/// mirrors the tail has to see exactly that (`backfill_should_yield`: no
+/// finality yet, keep walking). Pure — unit-tested.
+fn tail_final_floor(finalized: u64, vouched: u64) -> u64 {
+    if finalized == 0 {
+        0
+    } else {
+        finalized.max(vouched)
+    }
+}
+
+/// The coverage a restart may keep as final on the strength of this node's
+/// own checkpoint: the installed index's covered high, when the checkpoint's
+/// finality claim reaches it; nothing (0) otherwise. Pure — unit-tested.
+fn vouched_high(covered_high: Option<u64>, claim: Option<u64>) -> u64 {
+    match (covered_high, claim) {
+        (Some(high), Some(finalized)) if finalized >= high => high,
+        _ => 0,
+    }
+}
+
+/// Where a checkpoint of the installed index is clamped — and so the finality
+/// it may claim for the next run. The anchor's finality, or while a restart
+/// claim still holds the coverage that claim vouched; but never at or above a
+/// block the tail appended and has not yet confirmed canonical at or below
+/// finality. Finality moving past such a record proves nothing about the
+/// block we stored ([`record_may_retire`]). Within the run the tail still
+/// re-checks it; a checkpoint carrying it would hand the next run coverage it
+/// can never re-check, vouched final.
+///
+/// `None` means "write the index as it stands and claim nothing": no anchor
+/// and nothing vouched ([`checkpoint_bytes`] explains why that must not clamp
+/// at zero). The tail never runs without finality, so no record can exist
+/// then — and were one to, clamping at zero would erase the file, the worse
+/// failure. Pure — unit-tested.
+fn checkpoint_clamp(finalized: u64, vouched: u64, lowest_unconfirmed: Option<u64>) -> Option<u64> {
+    let floor = finalized.max(vouched);
+    if floor == 0 {
+        return None;
+    }
+    Some(match lowest_unconfirmed {
+        Some(n) => floor.min(n.saturating_sub(1)),
+        None => floor,
+    })
+}
+
+/// Write one checkpoint of this node's OWN index — bytes [`checkpoint_bytes`]
+/// produced at `clamp` — and record beside it the finality it may claim. The
+/// claim is best-effort: without one the next restart merely re-checks the
+/// checkpoint's top the old way. The index write is the result.
+fn write_own_checkpoint(path: &std::path::Path, bytes: &[u8], clamp: Option<u64>) -> std::io::Result<()> {
+    use crate::el::logindex::{remove_finality_claim, write_finality_claim, SnapshotId};
+    crate::el::logindex::write_atomic(path, bytes)?;
+    let recorded = match (clamp, SnapshotId::of_frame(bytes)) {
+        (Some(finalized), Some(id)) => write_finality_claim(path, &id, finalized),
+        // Unclamped: nothing bounds what the file holds, so nothing vouches.
+        _ => remove_finality_claim(path),
+    };
+    // Not silent, for the reason the checkpoint itself is not: a claim that
+    // never lands turns every restart back into the re-walk it exists to save.
+    if let Err(e) = recorded {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "log index: finality claim not recorded; the next restart re-checks the checkpoint's top"
+        );
+    }
+    Ok(())
+}
+
 /// The lowest block a tail window must reach. It has to cover every RECORDED
 /// block (so a reorg is detectable — a window starting at the coverage edge
 /// compares against records that all sit BELOW it, i.e. two disjoint ranges,
@@ -7592,7 +7913,8 @@ impl PersistClock {
     }
 }
 
-/// The bytes one checkpoint of `ix` should contain at the given finality.
+/// The bytes one checkpoint of `ix` should contain at `clamp` (see
+/// [`checkpoint_clamp`]).
 ///
 /// Split out so BOTH branches are testable: the choice is trust-relevant, and
 /// getting it wrong is invisible from the outside — a checkpoint that skipped
@@ -7601,17 +7923,16 @@ impl PersistClock {
 fn checkpoint_bytes(
     ix: &crate::el::logindex::LogIndex,
     tag: &crate::el::logindex::ChainTag,
-    finalized: u64,
+    clamp: Option<u64>,
 ) -> Vec<u8> {
-    if finalized == 0 {
+    match clamp {
         // No beacon anchor yet. There is no optimistic coverage to clamp
         // either (the tail only runs below a real finality), and clamping AT
         // ZERO would rewind the whole index and rename an empty file over a
         // good checkpoint — losing, on a phone, months of backfill. Write it
         // as it stands.
-        ix.serialize(tag)
-    } else {
-        ix.serialize_clamped(tag, finalized)
+        None => ix.serialize(tag),
+        Some(max) => ix.serialize_clamped(tag, max),
     }
 }
 
@@ -8802,7 +9123,7 @@ mod persist_cadence_tests {
         // them would leave the next run holding coverage it can never
         // re-check — and once finality passes them nothing would rewind them.
         let clamp = std::env::temp_dir().join(format!("ckpt-clamp-{}.db", std::process::id()));
-        crate::el::logindex::write_atomic(&clamp, &checkpoint_bytes(&ix, &tag, 12)).unwrap();
+        crate::el::logindex::write_atomic(&clamp, &checkpoint_bytes(&ix, &tag, Some(12))).unwrap();
         let clamped = LogIndex::load(&cfg, &tag, &clamp).unwrap();
         assert_eq!(
             clamped.coverage_of(&[1u8; 20]).unwrap().span,
@@ -8819,7 +9140,7 @@ mod persist_cadence_tests {
         // that can write this file is one that has not yet had an anchor at
         // all — and it appended those blocks under its own tail record.
         let nofin = std::env::temp_dir().join(format!("ckpt-nofin-{}.db", std::process::id()));
-        crate::el::logindex::write_atomic(&nofin, &checkpoint_bytes(&ix, &tag, 0)).unwrap();
+        crate::el::logindex::write_atomic(&nofin, &checkpoint_bytes(&ix, &tag, None)).unwrap();
         let unclamped = LogIndex::load(&cfg, &tag, &nofin).unwrap();
         assert_eq!(
             unclamped.coverage_of(&[1u8; 20]).unwrap().span,
@@ -8910,5 +9231,460 @@ mod persist_cadence_tests {
         clock.wrote(base + Duration::from_secs(238), None);
         assert!(!clock.is_due_at(base + Duration::from_secs(238 + 237)));
         assert!(clock.is_due_at(base + Duration::from_secs(238 + 238)));
+    }
+}
+
+#[cfg(test)]
+mod restart_claim_tests {
+    use super::{checkpoint_clamp, restart_claim_fate, vouched_high, RestartClaim, RESTART_CLAIM_MAX_LEAD};
+
+    #[test]
+    fn a_checkpoint_clamps_at_finality_the_claim_and_below_unconfirmed_records() {
+        // No anchor, nothing vouched: write as it stands and claim nothing.
+        assert_eq!(checkpoint_clamp(0, 0, None), None);
+        // A record cannot exist then; were one to, clamping at zero would
+        // erase the file — the worse failure.
+        assert_eq!(checkpoint_clamp(0, 0, Some(5)), None);
+        assert_eq!(checkpoint_clamp(1_000, 0, None), Some(1_000));
+        // Records above finality are already outside the finality clamp.
+        assert_eq!(checkpoint_clamp(1_000, 0, Some(1_001)), Some(1_000));
+        // Finality moved past records the tail has not re-checked yet (the
+        // appender's checkpoint runs BEFORE the tail in the same tick): they
+        // stay out, and so does everything above them.
+        assert_eq!(checkpoint_clamp(1_005, 0, Some(1_001)), Some(1_000));
+        // A restart claim that still holds keeps its coverage in the file,
+        // with the anchor's finality hours behind it or not there at all...
+        assert_eq!(checkpoint_clamp(900, 1_000, None), Some(1_000));
+        assert_eq!(checkpoint_clamp(0, 1_000, None), Some(1_000));
+        // ...but never this run's own unconfirmed appends above it.
+        assert_eq!(checkpoint_clamp(900, 1_000, Some(1_001)), Some(1_000));
+        // Past the claim, the anchor decides again.
+        assert_eq!(checkpoint_clamp(1_200, 1_000, None), Some(1_200));
+    }
+
+    #[test]
+    fn a_restart_claim_holds_until_finality_reaches_it_or_a_current_light_client_refutes_it() {
+        const LEAD: u64 = RESTART_CLAIM_MAX_LEAD;
+        // (finalized, vouched, first weighed at, current)
+        assert_eq!(restart_claim_fate(900, 1_000, 900, false), RestartClaim::Hold);
+        assert_eq!(restart_claim_fate(1_000, 1_000, 900, false), RestartClaim::Subsumed);
+        assert_eq!(restart_claim_fate(1_200, 1_000, 900, true), RestartClaim::Subsumed);
+        // A light client still catching up proves nothing, however far behind.
+        assert_eq!(restart_claim_fate(2, 1_000_000, 1, false), RestartClaim::Hold);
+        // A current one a few epochs behind a genuine claim: wait for it.
+        assert_eq!(restart_claim_fate(1_000 - LEAD, 1_000, 1, true), RestartClaim::Hold);
+        // Further behind than any restart explains: the claim is wrong...
+        assert_eq!(restart_claim_fate(1_000 - LEAD - 1, 1_000, 1, true), RestartClaim::Contradicted);
+        // ...but only on a finality verified since the claim was first
+        // weighed. The restored one "current" by a slow wall clock is not.
+        assert_eq!(restart_claim_fate(1, 1_000, 1, true), RestartClaim::Hold);
+        assert_eq!(restart_claim_fate(2, 1_000, 1, true), RestartClaim::Contradicted);
+    }
+
+    #[test]
+    fn the_tail_finality_floor_needs_a_finality_to_raise() {
+        use super::{backfill_should_yield, tail_final_floor};
+        assert_eq!(tail_final_floor(900, 1_000), 1_000);
+        assert_eq!(tail_final_floor(1_200, 1_000), 1_200);
+        assert_eq!(tail_final_floor(900, 0), 900);
+        // No finality: nothing follows the head, claim or not...
+        assert_eq!(tail_final_floor(0, 1_000), 0);
+        // ...so the backfill must not stand down for it. (Coverage to 1_000,
+        // an optimistic head 100 blocks above: with the claim mistaken for a
+        // finality, this would yield.)
+        assert!(!backfill_should_yield(1_001, 1_100, tail_final_floor(0, 1_000), 0));
+        assert!(backfill_should_yield(1_001, 1_100, tail_final_floor(950, 1_000), 0));
+    }
+
+    #[test]
+    fn the_lead_bound_covers_the_synced_slack_on_every_network() {
+        // A SYNCED light client's finality lags the wall clock by at most this
+        // many slots, hence blocks. The bound must sit well above it, or a
+        // genuine claim would be dropped the moment the light client catches up.
+        use crate::sync::{ChainConfig, SYNCED_SLOT_SLACK_EPOCHS};
+        for cfg in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
+            let slack = SYNCED_SLOT_SLACK_EPOCHS * cfg.slots_per_epoch;
+            assert!(RESTART_CLAIM_MAX_LEAD >= 2 * slack, "{slack} slots of SYNCED slack");
+        }
+    }
+
+    #[test]
+    fn only_a_claim_that_reaches_the_covered_top_vouches_for_it() {
+        assert_eq!(vouched_high(Some(1_000), Some(1_000)), 1_000);
+        // Clamped above its own top (a checkpoint mid-bridge).
+        assert_eq!(vouched_high(Some(990), Some(1_000)), 990);
+        // A claim below the top was not this file's clamp: vouch for nothing.
+        assert_eq!(vouched_high(Some(1_001), Some(1_000)), 0);
+        assert_eq!(vouched_high(Some(1_000), None), 0);
+        assert_eq!(vouched_high(None, Some(1_000)), 0);
+    }
+}
+
+#[cfg(test)]
+mod restart_claim_reader_tests {
+    //! A restart must keep log-index coverage its own checkpoint proved final
+    //! while the beacon anchor — resumed from a snapshot written once per
+    //! sync-committee period — still reports a finality hours older. The
+    //! heights are the 2026-09-16 Bee PoC incident's: coverage checkpointed at
+    //! 48,283,910, relaunched against finality 48,279,644, rewound, and
+    //! re-walked by the head bridge for an hour while Bee's postage sync
+    //! starved.
+    use super::*;
+    use crate::el::logindex::{
+        finality_claim_path, read_finality_claim, ChainTag, LogIndex, LogIndexConfig, StoredLog,
+        WatchEntry,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// Finality when the checkpoint was written.
+    const F1: u64 = 48_283_910;
+    /// Finality the resumed snapshot hands the anchor after the relaunch.
+    const F0: u64 = 48_279_644;
+    /// Where run 1's coverage starts — below F0, so a rewind to F0 leaves
+    /// something to observe.
+    const LOW: u64 = F1 - 5_000;
+    const STAMP: [u8; 20] = [0x45; 20];
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("reader-claim-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn hash(n: u64) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_be_bytes());
+        h
+    }
+
+    fn gnosis_tag() -> ChainTag {
+        ChainTag { network_id: 100, genesis_hash: ElConfig::gnosis().genesis_hash }
+    }
+
+    /// Point `a` where the CL loop would leave it.
+    fn set_anchor(a: &ExecAnchor, finalized: u64, head: u64) {
+        a.update_finalized(finalized, [1; 32], finalized, hash(finalized));
+        a.update_optimistic(head, head, hash(head), [2; 32]);
+    }
+
+    fn anchor_at(finalized: u64, head: u64) -> Arc<ExecAnchor> {
+        let a = Arc::new(ExecAnchor::new());
+        set_anchor(&a, finalized, head);
+        a
+    }
+
+    /// A gnosis reader with no network at all — no bootnodes, no pinned peers,
+    /// no peer cache — so the tail makes every coverage decision and then meets
+    /// an empty pool, which is exactly the part under test.
+    async fn offline_reader(anchor: Arc<ExecAnchor>, index: &Path) -> ElReader {
+        let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"restart-claim-test")).unwrap());
+        let cfg = ElConfig {
+            bootnodes: Vec::new(),
+            boot_enodes: Vec::new(),
+            discv4_port: 0,
+            cache_path: None,
+            log_index_path: Some(index.to_path_buf()),
+            ..ElConfig::gnosis()
+        };
+        ElReader::start(key, anchor, cfg).await.expect("offline reader")
+    }
+
+    fn watch() -> LogIndexConfig {
+        LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            watch: vec![WatchEntry { address: STAMP, from_block: 31_305_656, topic0s: vec![], name: String::new() }],
+        }
+    }
+
+    fn stamp_log(n: u64, data: u8) -> StoredLog {
+        StoredLog {
+            block_number: n,
+            block_hash: hash(n),
+            tx_hash: [0xcc; 32],
+            tx_index: 0,
+            log_index: 0,
+            address: STAMP,
+            topics: vec![[0x77; 32]],
+            data: vec![data],
+        }
+    }
+
+    /// Append `from..=to` to the installed index, a log in every tenth block.
+    /// `record` also enters them in the tail's record, as the tail does for
+    /// what it appends above finality.
+    fn append(reader: &ElReader, from: u64, to: u64, record: bool) {
+        let mut slot = reader.log_index.lock().unwrap();
+        let ix = slot.as_mut().expect("index installed");
+        for n in from..=to {
+            let logs = if n % 10 == 0 { vec![stamp_log(n, 1)] } else { vec![] };
+            ix.append_block(n, hash(n), logs).unwrap();
+            if record {
+                reader.log_index_tail.lock().unwrap().push((n, hash(n)));
+            }
+        }
+    }
+
+    fn vouched(reader: &ElReader) -> u64 {
+        reader.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One background appender tick, as the appender loop runs it.
+    async fn tick(reader: &ElReader) {
+        let mut since_persist = 0u32;
+        let mut stall = AppendStall::default();
+        reader.log_index_append_tick(&mut since_persist, Some(&mut stall), 0).await;
+    }
+
+    /// The checkpoint on disk: its covered top, and the finality its claim says.
+    fn on_disk(path: &Path) -> (Option<u64>, Option<u64>) {
+        let (ix, id) = LogIndex::load_portable_with_id(path).expect("checkpoint on disk");
+        (ix.append_edge().map(|e| e - 1), read_finality_claim(path, &id))
+    }
+
+    /// Run 1: an index following the head, shut down with the tail above
+    /// finality. Returns the index path.
+    async fn run_to_shutdown(dir: &Path) -> PathBuf {
+        let path = dir.join("logindex-gnosis.db");
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        append(&reader, LOW, F1, false); // final: the appender's and the bridge's
+        append(&reader, F1 + 1, F1 + 30, true); // optimistic: the tail's
+        reader.stop().await; // writes the checkpoint every stop writes
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)), "clamped at finality, and saying so");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_restart_behind_its_own_checkpoint_keeps_the_final_coverage() {
+        let dir = TempDir::new("incident");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // Run 2: the resumed beacon snapshot dates from the period's start —
+        // its finality AND its attested head sit hours below the checkpoint.
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        assert_eq!(vouched(&reader), F1, "this node's own checkpoint vouches for its top");
+
+        // The first tick after launch: where the incident's rewind happened.
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "final coverage rewound to a stale finality");
+
+        // The attested head catches up before finality does — far enough above
+        // the stale finality that "finality too far below the head" fired too.
+        set_anchor(&anchor, F0, F1 + 2_000);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        // Within reach: the tail goes on (to an empty pool, here).
+        set_anchor(&anchor, F0, F1 + 40);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+
+        // Quitting while the anchor is still behind must not cut the file back
+        // to the stale finality: the next launch is in the same position.
+        reader.stop().await;
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+
+        // Run 3 starts behind again, then the light client catches up and the
+        // claim retires. Nothing was lost on the way.
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        set_anchor(&anchor, F1, F1 + 40);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), 0, "a claim the anchor reached adds nothing");
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_config_push_at_boot_picks_up_the_claim_too() {
+        // Hosts with a settings surface push their config right after start;
+        // when that push is what loads the file, the claim must come along.
+        let dir = TempDir::new("boot-push");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        assert_eq!(vouched(&reader), F1);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn coverage_no_claim_vouches_for_is_still_rewound_to_finality() {
+        let dir = TempDir::new("unvouched");
+        let path = run_to_shutdown(&dir.0).await;
+        // The same bytes without the claim — a file from a build before claims,
+        // a lost sidecar: nothing says this top is final, so nothing trusts it.
+        std::fs::remove_file(finality_claim_path(&path)).unwrap();
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), 0);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_file_replaced_beside_the_claim_does_not_inherit_it() {
+        let dir = TempDir::new("dropin");
+        let path = run_to_shutdown(&dir.0).await;
+        // Another index dropped in place with our claim left beside it: same
+        // chain, same top, different content (a seed, another node's export).
+        let (mut ix, _) = LogIndex::load_portable_with_id(&path).unwrap();
+        ix.rewind_above(F1 - 2);
+        ix.append_block(F1 - 1, hash(F1 - 1), vec![stamp_log(F1 - 1, 9)]).unwrap();
+        ix.append_block(F1, hash(F1), vec![stamp_log(F1, 1)]).unwrap();
+        ix.persist(&gnosis_tag(), &path).unwrap();
+        assert!(finality_claim_path(&path).exists());
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), 0, "a claim covers the bytes it was written beside, not these");
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_current_light_client_waits_for_a_close_claim_and_overrules_a_far_one() {
+        let dir = TempDir::new("refuted");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // SYNCED, a few epochs short of the claim: that is finality lag, wait.
+        let anchor = anchor_at(F1 - 100, F1 - 60);
+        anchor.set_finality_current(true);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), F1);
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+
+        // "Current" at the finality the snapshot restored — what a wall clock
+        // running hours slow makes of it. Nothing has been verified yet, so
+        // that is no evidence: hold.
+        let anchor = anchor_at(F0, F0 + 40);
+        anchor.set_finality_current(true);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), F1, "a restored finality refuted the claim");
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+
+        // A finality verified since, current and still thousands of blocks
+        // short: F1 cannot have been final. The claim goes and the usual rule
+        // applies.
+        set_anchor(&anchor, F0 + 16, F0 + 56);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), 0);
+        assert_eq!(reader.log_index_covered_high(), Some(F0 + 16));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_export_carries_the_vouched_coverage_and_no_claim() {
+        let dir = TempDir::new("export");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        // This run's own appends above the vouched top, not yet confirmed.
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let out = dir.0.join("export.db");
+        reader.export_log_index(&out).unwrap();
+        let (exported, _) = LogIndex::load_portable_with_id(&out).unwrap();
+        // All the node holds as final, nothing it has yet to re-check...
+        assert_eq!(exported.append_edge(), Some(F1 + 1));
+        // ...and no claim: that is the node's, never the file's.
+        assert!(!finality_claim_path(&out).exists(), "a claim travelled with an export");
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)), "the export touched the node's own claim");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_import_ends_the_claim_on_disk_and_in_memory() {
+        let dir = TempDir::new("import");
+        let path = run_to_shutdown(&dir.0).await;
+        // Another node's export of the same contract.
+        let other = dir.0.join("other.db");
+        let mut ix = LogIndex::new(watch()).unwrap();
+        for n in (LOW + 1_000)..=(LOW + 2_000) {
+            ix.append_block(n, hash(n), vec![]).unwrap();
+        }
+        ix.persist(&gnosis_tag(), &other).unwrap();
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        reader.import_log_index(&[other]).unwrap();
+        assert_eq!(vouched(&reader), 0);
+        assert!(!finality_claim_path(&path).exists(), "a claim beside imported bytes");
+        // Rewound to the ANCHOR's finality, as an import always was.
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        assert_eq!(on_disk(&path), (Some(F0), None));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_growing_watch_list_keeps_the_claim_and_drops_unconfirmed_appends_with_their_record() {
+        let dir = TempDir::new("regrow");
+        let path = run_to_shutdown(&dir.0).await;
+        // Finality stale, head above the claim: the tail may append again.
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut grown = watch();
+        grown.watch.push(WatchEntry { address: [0x46; 20], from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(reader.set_log_index_config(grown));
+        assert!(reader.log_index_tail.lock().unwrap().is_empty());
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "unconfirmed appends outlived their record");
+        assert_eq!(vouched(&reader), F1, "the merged index lost the vouched coverage");
+        // The checkpoint the replacement wrote is this node's, and says so.
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+
+        // A replacement that keeps no coverage keeps no claim.
+        let mut conflicting = watch();
+        conflicting.watch[0].topic0s = vec![[0x99; 32]];
+        assert!(reader.set_log_index_config(conflicting));
+        assert_eq!(reader.log_index_covered_high(), None);
+        assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_stops_below_records_finality_passed_before_the_tail_rechecked_them() {
+        let dir = TempDir::new("race");
+        let path = dir.0.join("logindex-gnosis.db");
+        let anchor = anchor_at(F1, F1 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        append(&reader, F1 - 100, F1, false);
+        append(&reader, F1 + 1, F1 + 30, true);
+        // Finality moves past five records; no tail tick has compared them yet.
+        set_anchor(&anchor, F1 + 5, F1 + 40);
+        assert!(reader.persist_log_index(reader.finalized_block_number(), false));
+        assert_eq!(
+            on_disk(&path),
+            (Some(F1), Some(F1)),
+            "blocks nobody re-checked were checkpointed as final"
+        );
+        reader.stop().await;
     }
 }

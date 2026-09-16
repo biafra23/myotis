@@ -51,6 +51,7 @@ struct Inner {
     optimistic_block_hash: Option<[u8; 32]>,
     optimistic_state_root: Option<[u8; 32]>,
     known_roots: VecDeque<SlottedStateRoot>,
+    finality_current: bool,
 }
 
 /// Shared, mutable execution anchor. Cloneable handle over one `Mutex` — the
@@ -143,6 +144,23 @@ impl ExecAnchor {
 
     pub fn finalized_slot(&self) -> u64 {
         self.inner.lock().expect("anchor mutex").finalized_slot
+    }
+
+    /// Record whether the beacon light client considers its finality CURRENT —
+    /// its `SYNCED` gate: committee period current and the finalized header
+    /// within a few epochs of the wall clock. Set by the CL loop on every
+    /// status publish.
+    pub fn set_finality_current(&self, current: bool) {
+        self.inner.lock().expect("anchor mutex").finality_current = current;
+    }
+
+    /// Whether [`Self::finalized_execution`] is the network's finality give or
+    /// take a few epochs, rather than a value restored from a snapshot or left
+    /// behind by a light client still catching up. False until the CL loop says
+    /// otherwise. Not the same question as [`Self::is_synced`], which only asks
+    /// whether ANY finalized root has landed.
+    pub fn finality_is_current(&self) -> bool {
+        self.inner.lock().expect("anchor mutex").finality_current
     }
 
     /// The optimistic head block hash, for anchoring a header-chain walk at the
@@ -252,6 +270,21 @@ mod tests {
         assert!(anchor.find_state_root(&root(1)).is_some());
         assert_eq!(anchor.find_state_root(&root(2)).unwrap().slot, 102);
         assert!(anchor.find_state_root(&root(9)).is_none());
+    }
+
+    #[test]
+    fn finality_is_not_current_until_the_light_client_says_so() {
+        let anchor = ExecAnchor::new();
+        assert!(!anchor.finality_is_current());
+        // A finalized root landing (e.g. a restored snapshot) is not currency.
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        assert!(anchor.is_synced());
+        assert!(!anchor.finality_is_current());
+        anchor.set_finality_current(true);
+        assert!(anchor.finality_is_current());
+        // ...and it can fall behind again (a doze, a starved pool).
+        anchor.set_finality_current(false);
+        assert!(!anchor.finality_is_current());
     }
 
     #[test]

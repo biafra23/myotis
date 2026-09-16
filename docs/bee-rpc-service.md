@@ -293,6 +293,15 @@ with the seed above bundled inside:
   minutes. The PoC has its own data dir but the same default RPC port as a
   regular Myotis running Gnosis — stop that one or move its port, or Bee
   talks to the unseeded instance.
+- **Relaunches** keep everything the index's own last checkpoint proved final
+  (it records that block in `logindex-gnosis.db.final`). The beacon light
+  client resumes from a snapshot that can be ~11 hours older, and until it
+  catches up the index holds its coverage instead of rewinding it. Only the
+  downtime is bridged. Before this, a relaunch on 2026-09-16 discarded 4,266
+  blocks that the bridge was still re-walking more than an hour later (a lossy
+  link, and the Mac slept part of the time), while Bee's postage sync was
+  refused. The first relaunch after upgrading from a build without this record
+  still pays that cost once.
 - **Expiry**: the seed is usable until roughly 500,000 blocks (~29 days) above
   its fetch — the manifest and the Index tab say which block. After that the
   data set must be re-fetched and the app rebuilt; the shelf-life rule from the

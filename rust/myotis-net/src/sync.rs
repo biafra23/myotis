@@ -1741,11 +1741,7 @@ async fn run_sync(
                      would be indistinguishable) until the bound is raised or the risk is \
                      explicitly accepted");
             }
-            let mut status = SyncStatus::initial();
-            status.state = SyncState::StaleAnchor;
-            status.period = anchor_period;
-            status.ws_bound_periods = bound;
-            let _ = status_tx.send(status);
+            publish_stale_anchor(&status_tx, &anchor, anchor_period, bound);
             // Parked across a fork activation, the served Status digest must
             // still follow the schedule (see refresh_local_status).
             refresh_local_status(&config, &processor, &local_status);
@@ -1857,11 +1853,7 @@ async fn run_sync(
             if ws_anchor_stale(checkpoint_period, wall_period, ws_bound)
                 && !config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed)
             {
-                let mut status = SyncStatus::initial();
-                status.state = SyncState::StaleAnchor;
-                status.period = checkpoint_period;
-                status.ws_bound_periods = ws_bound;
-                let _ = status_tx.send(status);
+                publish_stale_anchor(&status_tx, &anchor, checkpoint_period, ws_bound);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -1926,11 +1918,7 @@ async fn run_sync(
                          bound while running — refusing to sync forward until the bound \
                          is raised or the risk is explicitly accepted");
                 }
-                let mut status = SyncStatus::initial();
-                status.state = SyncState::StaleAnchor;
-                status.period = held_period;
-                status.ws_bound_periods = ws_bound;
-                let _ = status_tx.send(status);
+                publish_stale_anchor(&status_tx, &anchor, held_period, ws_bound);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -3569,7 +3557,68 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
 
 /// SYNCED gate: committee period current AND the finalized header within ~5
 /// epochs of wall clock (finality itself trails the head by ~2 epochs).
-const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
+/// Crate-visible because the EL log index sizes a bound from it
+/// (`RESTART_CLAIM_MAX_LEAD` in el/reader.rs, pinned by a test there).
+pub(crate) const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
+
+/// The published state of `store` at `wall_slot` — the SYNCED gate above.
+/// Pure, so the status and the execution anchor's currency flag (which the EL
+/// log index trusts to tell a restored finality from a current one) cannot
+/// drift apart.
+fn sync_state_at(
+    store: &LightClientStore,
+    wall_slot: u64,
+    slots_per_epoch: u64,
+    slots_per_period: u64,
+) -> SyncState {
+    let wall_period = spec::compute_sync_committee_period_with(wall_slot, slots_per_period);
+    if !store.is_initialized() {
+        SyncState::Bootstrapping
+    } else if wall_period == store.current_period()
+        && store.finalized_slot() + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch >= wall_slot
+    {
+        SyncState::Synced
+    } else {
+        SyncState::CatchingUp
+    }
+}
+
+/// Feed the EL anchor from `store` at `wall_slot` — its headers
+/// ([`update_exec_anchor`]) and whether their finality is current — and return
+/// the state that decided the latter. A resumed store hands the anchor the
+/// finality it was persisted with, up to a whole period old, so the number
+/// alone cannot say whether it is current; the EL log index needs to know (a
+/// restart must not rewind coverage that only LOOKS optimistic against it).
+fn feed_exec_anchor(
+    store: &LightClientStore,
+    anchor: &ExecAnchor,
+    wall_slot: u64,
+    slots_per_epoch: u64,
+    slots_per_period: u64,
+) -> SyncState {
+    update_exec_anchor(store, anchor);
+    let state = sync_state_at(store, wall_slot, slots_per_epoch, slots_per_period);
+    anchor.set_finality_current(state == SyncState::Synced);
+    state
+}
+
+/// Publish the fail-closed STALE_ANCHOR park for `period` (every
+/// weak-subjectivity gate parks the same way). Parked, finality stops moving,
+/// so the EL anchor also hears that it is no longer current — whatever the
+/// last publish said.
+fn publish_stale_anchor(
+    status_tx: &watch::Sender<SyncStatus>,
+    anchor: &ExecAnchor,
+    period: u64,
+    ws_bound_periods: u64,
+) {
+    let mut status = SyncStatus::initial();
+    status.state = SyncState::StaleAnchor;
+    status.period = period;
+    status.ws_bound_periods = ws_bound_periods;
+    let _ = status_tx.send(status);
+    anchor.set_finality_current(false);
+}
 
 async fn publish_status(
     config: &ChainConfig,
@@ -3581,19 +3630,13 @@ async fn publish_status(
     hunting: bool,
 ) {
     let store = &processor.store;
-    update_exec_anchor(store, anchor);
-    let wall_slot = config.current_slot_estimate();
-    let wall_period =
-        spec::compute_sync_committee_period_with(wall_slot, config.slots_per_period());
-    let state = if !store.is_initialized() {
-        SyncState::Bootstrapping
-    } else if wall_period == store.current_period()
-        && store.finalized_slot() + SYNCED_SLOT_SLACK_EPOCHS * config.slots_per_epoch >= wall_slot
-    {
-        SyncState::Synced
-    } else {
-        SyncState::CatchingUp
-    };
+    let state = feed_exec_anchor(
+        store,
+        anchor,
+        config.current_slot_estimate(),
+        config.slots_per_epoch,
+        config.slots_per_period(),
+    );
     let finalized_root = store
         .finalized_header()
         .map(|h| h.beacon.hash_tree_root())
@@ -3712,6 +3755,67 @@ mod tests {
         // store's signature slot 1003.
         assert_eq!(anchor.find_state_root(&[0x11; 32]).map(|r| r.slot), Some(1000));
         assert_eq!(anchor.find_state_root(&[0x33; 32]).map(|r| r.slot), Some(1002));
+    }
+
+    #[test]
+    fn sync_state_marks_only_a_current_finality_as_synced() {
+        use myotis_consensus::types::SyncCommittee;
+        let (epoch, period_slots) = (32u64, 8192u64);
+        let wall = 10_000_000u64; // mid-period: period 1220 spans 9_994_240..
+        let committee = || SyncCommittee { pubkeys: Vec::new(), aggregate_pubkey: [0u8; 48] };
+        let mut store = LightClientStore::new_mainnet_preset();
+        assert_eq!(sync_state_at(&store, wall, epoch, period_slots), SyncState::Bootstrapping);
+
+        // Resumed from a snapshot written at this period's start: the committee
+        // is current, the finality is hours old. That is catch-up, not SYNCED —
+        // and it is exactly the state a restart hands the EL anchor.
+        let period_start = wall - wall % period_slots;
+        store.initialize(header_with_exec(period_start, [1; 32], 21_000_000, [2; 32]), committee());
+        assert_eq!(sync_state_at(&store, wall, epoch, period_slots), SyncState::CatchingUp);
+
+        // Finality within the slack of the wall clock: SYNCED.
+        store.update_finalized(&header_with_exec(wall - 64, [3; 32], 21_004_000, [4; 32]), wall - 64);
+        assert_eq!(sync_state_at(&store, wall, epoch, period_slots), SyncState::Synced);
+        let slack = SYNCED_SLOT_SLACK_EPOCHS * epoch;
+        assert_eq!(sync_state_at(&store, wall - 64 + slack, epoch, period_slots), SyncState::Synced);
+        assert_eq!(sync_state_at(&store, wall - 64 + slack + 1, epoch, period_slots), SyncState::CatchingUp);
+        // A later period on the wall clock: the committee is stale.
+        assert_eq!(
+            sync_state_at(&store, period_start + period_slots, epoch, period_slots),
+            SyncState::CatchingUp
+        );
+    }
+
+    #[test]
+    fn the_anchor_hears_whether_its_finality_is_current() {
+        use myotis_consensus::types::SyncCommittee;
+        let (epoch, period_slots) = (32u64, 8192u64);
+        let wall = 10_000_000u64;
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new_mainnet_preset();
+        let committee = SyncCommittee { pubkeys: Vec::new(), aggregate_pubkey: [0u8; 48] };
+
+        // A resumed store: its finality reaches the anchor, flagged stale.
+        let period_start = wall - wall % period_slots;
+        store.initialize(header_with_exec(period_start, [1; 32], 21_000_000, [2; 32]), committee);
+        anchor.set_finality_current(true); // whatever an earlier publish said
+        assert_eq!(feed_exec_anchor(&store, &anchor, wall, epoch, period_slots), SyncState::CatchingUp);
+        assert_eq!(anchor.finalized_execution().map(|f| f.block_number), Some(21_000_000));
+        assert!(!anchor.finality_is_current());
+
+        // Caught up: current.
+        store.update_finalized(&header_with_exec(wall - 64, [3; 32], 21_004_000, [4; 32]), wall - 64);
+        assert_eq!(feed_exec_anchor(&store, &anchor, wall, epoch, period_slots), SyncState::Synced);
+        assert_eq!(anchor.finalized_execution().map(|f| f.block_number), Some(21_004_000));
+        assert!(anchor.finality_is_current());
+
+        // A weak-subjectivity park says otherwise, whatever came before.
+        let (status_tx, status_rx) = watch::channel(SyncStatus::initial());
+        publish_stale_anchor(&status_tx, &anchor, 1_220, 13);
+        assert!(!anchor.finality_is_current());
+        let parked = status_rx.borrow().clone();
+        assert_eq!(parked.state, SyncState::StaleAnchor);
+        assert_eq!((parked.period, parked.ws_bound_periods), (1_220, 13));
     }
 
     #[test]
