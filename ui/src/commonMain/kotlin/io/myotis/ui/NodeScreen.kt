@@ -743,6 +743,28 @@ private fun StatusTab(
         Spacer(Modifier.height(16.dp))
         // Maintenance actions (mirrors the old Android Status screen): wipe peer caches to give
         // discovery a fresh slate, or drop the persisted sync snapshot to re-bootstrap next start.
+        //
+        // Only ONE of these is meaningful while the stack is up, and the difference is who owns
+        // the file. `clearCaches` goes THROUGH the running engine (clearPeerState plus the live
+        // cache instances), so a live stack cannot write the old peers back — pressing it while
+        // running is a legitimate way to hand discovery a fresh slate, and it stays enabled.
+        //
+        // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
+        // STICKS while the chain runs depends on the engine and on what it is doing — which is
+        // the reason to gate it rather than the reason not to. Rust, synced: persistence is
+        // throttled to a sync-committee PERIOD advance (~11 h gnosis, ~27 h mainnet) and there
+        // is no stop-time persist, so the delete usually holds. Rust, catching up: a persist
+        // lands per applied period, i.e. seconds, and the delete is gone. Java: the `.roots`
+        // sidecar — matched by the same glob — is rewritten unthrottled every ~12 s, and
+        // `close()` persists again at shutdown. So pressed on a running chain the action is
+        // unpredictable rather than merely slow, and it only ever takes effect at the NEXT
+        // start anyway. Stop first, reset, start: that sequence always means what it says.
+        //
+        // One honest limit: `primaryActive` follows the host's 2 s snapshot poll, and the engine
+        // drops a stopping chain from its registry BEFORE the loop finishes tearing down (it
+        // tracks that window itself and refuses a fresh create into the same directory). So the
+        // button can go live a moment before the last writer is gone. A write there needs a
+        // period advance, so the odds are slim — but the gate is a guard rail, not a lock.
         OutlinedButton(
             onClick = { controller.clearCaches(primary) },
             modifier = Modifier.fillMaxWidth(),
@@ -750,8 +772,17 @@ private fun StatusTab(
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = { controller.resetSyncState(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Reset sync state") }
+        if (primaryActive) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Stop $primary first: a reset only applies at the next start, and a running "
+                    + "node can rewrite the snapshot underneath it.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
 
         // Per-peer detail for the READY peers (address, snap support, client id).
         if (snap != null && snap.readyPeerList.isNotEmpty()) {
