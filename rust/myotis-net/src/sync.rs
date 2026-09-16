@@ -537,6 +537,10 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // included, served a bootstrap for that root and a period of updates.
     // Re-verified 2026-09-13 against the anchor this build ships (period
     // 1358): live_pins_alive run 34776027257, 4 of 4 again.
+    // Re-verified 2026-09-16 against the anchor this build ships (period
+    // 1361): live_pins_alive run 35065049320 on a GitHub-hosted runner, 4 of 4
+    // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
+    // from the recorded period-1323 anchor reached SYNCED in 55 s.
     // Re-run it after every checkpoint refresh — a census against
     // a superseded root says nothing about the anchor a fresh install actually
     // starts from, which is the #422 shape: every check green while no pinned
@@ -615,6 +619,11 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // Re-verified 2026-09-13 against the anchor this build ships (period
     // 3670): live_pins_alive run 34776024335 on a GitHub-hosted runner, 8 of 8
     // served it, both :9500 pins included.
+    // Re-verified 2026-09-16 against the anchor this build ships (period
+    // 3675): live_pins_alive run 35065032444 on a GitHub-hosted runner, 8 of 8
+    // again, both :9500 pins included; the bootnodes seeded discv5 (21
+    // entries, SYNCED), and a cold start from the recorded period-3596 anchor
+    // (79 periods behind) reached SYNCED in 85 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -728,6 +737,13 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // closed the connection instead; each has now closed on one runner run and
     // served on another, so the closes look like intermittent load on a busy
     // public node rather than anything about runner IPs. Not grounds to prune.
+    // Re-verified 2026-09-16 against the anchor this build ships (period
+    // 1858): live_pins_alive run 35065042347 on a GitHub-hosted runner, 4 of 5
+    // again — 91.189.182.90 closed the connection a second time while
+    // 57.129.130.18 served in full; still one vantage point, so still not
+    // grounds to prune, but a third close in a row should be. The bootnodes
+    // seeded discv5 (23 entries), and a cold start from the recorded
+    // period-1825 anchor reached SYNCED in 45 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
