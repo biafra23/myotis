@@ -465,8 +465,11 @@ const APPEND_WINDOW: u64 = 128;
 /// consumer that needs `latest` (Bee's postage sync, which shuts the node down
 /// after 10 minutes without a page) starves meanwhile. The bridge bloom-filters
 /// candidates first (a few percent of blocks for a typical watch) and rotates
-/// peers on failure, which is what closed exactly such gaps in seconds on
-/// 2026-09-16 whenever a restart forced it. 3 ticks = 18 s.
+/// candidates first (a few percent of blocks for a typical watch) and, unlike
+/// the per-block path, anchors its verification at the FINALIZED block every
+/// peer has rather than at our optimistic head — which is why a restart closed
+/// exactly such gaps in seconds on 2026-09-16. Three consecutive ticks is ~18 s
+/// after the edge last moved.
 const APPEND_STALL_TICKS: u32 = 3;
 
 /// The per-block appender's progress across ticks, owned by the appender loop
@@ -478,21 +481,22 @@ struct AppendStall {
 }
 
 impl AppendStall {
-    /// Record the edge this tick starts from. True once the edge has not moved
-    /// for `APPEND_STALL_TICKS` consecutive ticks that each had a gap to fill.
-    /// A tick without a gap resets the count: an appender that is simply
-    /// caught up is not stalled.
-    fn stalled(&mut self, edge: u64, gap: u64) -> bool {
-        if gap == 0 {
-            self.last_edge = None;
-            self.ticks = 0;
-            return false;
-        }
+    /// Observe the edge this tick starts from; true once it has not moved for
+    /// `APPEND_STALL_TICKS` consecutive observations.
+    ///
+    /// There is deliberately no "nothing to append" exemption: by the time this
+    /// runs the caller has already handed off to the tail if coverage passed
+    /// finality, so a block is always pending. An earlier version exempted
+    /// `finalized - edge == 0` — which is not "caught up" but "exactly ONE
+    /// block pending", the steady state between finality epochs and the
+    /// terminal state of the very stall this detects, so the detector went
+    /// blind precisely where it was needed.
+    fn observe(&mut self, edge: u64) -> bool {
         if self.last_edge == Some(edge) {
             self.ticks = self.ticks.saturating_add(1);
         } else {
             self.last_edge = Some(edge);
-            self.ticks = 0;
+            self.ticks = 1; // this observation is the first
         }
         self.ticks >= APPEND_STALL_TICKS
     }
@@ -500,6 +504,13 @@ impl AppendStall {
     /// True on the tick that crosses the threshold, for a single log line.
     fn just_stalled(&self) -> bool {
         self.ticks == APPEND_STALL_TICKS
+    }
+
+    /// Coverage passed finality and the tail took over: drop the charge so a
+    /// later gap counts from scratch instead of resuming a stale count.
+    fn reset(&mut self) {
+        self.last_edge = None;
+        self.ticks = 0;
     }
 }
 
@@ -1654,7 +1665,7 @@ impl ElReader {
                     // backfill budget for nothing.
                     let _drive = reader.log_index_drive.lock().await;
                     reader
-                        .log_index_append_tick(&mut since_persist, &mut append_stall, ticks)
+                        .log_index_append_tick(&mut since_persist, Some(&mut append_stall), ticks)
                         .await;
                 }
                 reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
@@ -1741,7 +1752,7 @@ impl ElReader {
     async fn log_index_append_tick(
         &self,
         since_persist: &mut u32,
-        stall: &mut AppendStall,
+        mut stall: Option<&mut AppendStall>,
         ticks: u64,
     ) {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
@@ -1767,7 +1778,12 @@ impl ElReader {
             Some(e) if e <= finalized => e,
             // Caught up to finality — now follow the OPTIMISTIC tail, which is
             // where `toBlock: "latest"` actually points.
-            Some(_) => return self.log_index_tail_tick(finalized, ticks).await,
+            Some(_) => {
+                if let Some(s) = stall.as_deref_mut() {
+                    s.reset(); // the tail owns coverage now; no stale charge
+                }
+                return self.log_index_tail_tick(finalized, ticks).await;
+            }
         };
         // The verified whole-block path anchors a window from the target to
         // the optimistic head; stay well inside its lookback cap. A deeper lag
@@ -1784,14 +1800,25 @@ impl ElReader {
         // and a plan already in flight is finished rather than thrown away for
         // the per-block path to redo its last blocks one receipts read at a time.
         let gap = finalized.saturating_sub(start);
-        let stalled = stall.stalled(start, gap);
-        let bridging = self
-            .log_index_bridge
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false);
-        if gap > APPEND_WINDOW || bridging || stalled {
-            if stalled && stall.just_stalled() {
+        // Only the BACKGROUND tick may route to the bridge. The on-demand fill
+        // (a <=4-block shortfall under a 5s timeout) must not: the bridge takes
+        // its plan out of the slot for the duration, so a timeout mid-step would
+        // drop a descent the background tick has been building.
+        let (stalled, crossed) = match stall.as_deref_mut() {
+            Some(s) => {
+                let st = s.observe(start);
+                (st, st && s.just_stalled())
+            }
+            None => (false, false),
+        };
+        let bridging = stall.is_some()
+            && self
+                .log_index_bridge
+                .lock()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false);
+        if stall.is_some() && (gap > APPEND_WINDOW || bridging || stalled) {
+            if crossed {
                 tracing::info!(
                     edge = start,
                     finalized,
@@ -1894,7 +1921,7 @@ impl ElReader {
                 return;
             }
             let mut since_persist = 0u32;
-            self.log_index_append_tick(&mut since_persist, &mut AppendStall::default(), 0).await;
+            self.log_index_append_tick(&mut since_persist, None, 0).await;
         };
         // Cancellation at an await point is safe: coverage and the tail record
         // mutate only synchronously under the index lock (append_block).
@@ -2812,6 +2839,35 @@ impl ElReader {
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
     async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64) {
+        // FORWARD FIRST (owner's call, 2026-09-16). While coverage has not
+        // reached the anchored head, this tick's peers and milliseconds belong
+        // to the paths that close that gap — appender, bridge, tail. The walk
+        // downward is completeness work with nobody waiting on it, while a
+        // head-reaching `eth_getLogs` is REFUSED for as long as the top lags —
+        // and behind that refusal sits Bee's 10-minute shutdown clock. The two
+        // compete for one snap-peer pool, and the appender abandons its whole
+        // tick on a single failed receipts read, so the walk was measurably
+        // buying its progress out of the head's.
+        //
+        // A healthy node still walks: the tail closes a freshly produced block
+        // within its tick, so most ticks see no gap at all.
+        if let (Some(edge), Some(head)) = (
+            self.with_log_index(|ix| ix.append_edge()).flatten(),
+            self.head_block_number(),
+        ) {
+            // `append_edge` is the NEXT block to append, so coverage has caught
+            // up exactly when it sits above the head.
+            if edge <= head {
+                if ticks % 100 == 0 {
+                    tracing::debug!(
+                        edge,
+                        head,
+                        "log index backfill yielding to head-follow until coverage reaches the head"
+                    );
+                }
+                return;
+            }
+        }
         // Pacing: "nice" works ONE batch per 6s tick (background politeness);
         // "max speed" keeps working batches until a per-tick time budget is
         // spent — the difference between ~55 blocks/6s and peer-limited
@@ -6024,27 +6080,24 @@ fn decode_ccip_answer(
 mod tests {
 
     #[test]
-    fn append_stall_counts_only_unmoved_edges_with_a_gap() {
+    fn append_stall_fires_on_three_unmoved_observations_and_resets_on_progress() {
         let mut st = super::AppendStall::default();
-        // Caught up: never stalled, and a later gap starts counting from zero.
-        assert!(!st.stalled(100, 0));
-        assert!(!st.stalled(100, 0));
-        // Same edge, gap present: stalls on the third consecutive tick.
-        assert!(!st.stalled(100, 5));
-        assert!(!st.stalled(100, 5));
-        assert!(!st.stalled(100, 5));
-        assert!(st.stalled(100, 5));
-        assert!(st.just_stalled());
-        assert!(st.stalled(100, 5));
-        assert!(!st.just_stalled(), "the log line fires once");
-        // Progress resets the count even while a gap remains.
-        assert!(!st.stalled(116, 3));
-        assert!(!st.stalled(116, 3));
-        assert!(!st.stalled(116, 3));
-        assert!(st.stalled(116, 3));
-        // A closed gap resets everything.
-        assert!(!st.stalled(200, 0));
-        assert!(!st.stalled(200, 4));
+        // Three consecutive observations of the same edge cross the threshold.
+        assert!(!st.observe(100));
+        assert!(!st.observe(100));
+        assert!(st.observe(100));
+        assert!(st.just_stalled(), "the log line fires on the crossing tick");
+        assert!(st.observe(100));
+        assert!(!st.just_stalled(), "...and only on that one");
+        // Progress restarts the count.
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
+        // A hand-off to the tail drops the charge: the next gap starts fresh.
+        st.reset();
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
     }
     use super::*;
 
