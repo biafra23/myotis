@@ -696,7 +696,8 @@ pub(crate) const BULK_HEDGE_DELAY: std::time::Duration = std::time::Duration::fr
 /// and the on-demand `eth_getLogs` fill, whose whole deadline
 /// ([`LOG_INDEX_FILL_DEADLINE`]) is shorter than the bulk delay. That fill works
 /// at or just below finality, which normally trails the head by about two
-/// epochs (32 blocks on Gnosis, 64 on mainnet), so this leaves it room.
+/// epochs (32 blocks on Gnosis, 64 on mainnet), so this leaves it room in
+/// normal operation (see the deadline assert below for the exception).
 const BULK_HEDGE_MIN_BACK: u64 = 128;
 const _: () = assert!(BULK_HEDGE_MIN_BACK < BLOCK_LOOKBACK_MAX, "the bulk delay must be reachable");
 
@@ -717,6 +718,15 @@ const LOG_INDEX_FILL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// A shallow read's hedge must be able to fire, and its second peer answer,
 /// inside the fill's deadline; otherwise hedging does nothing on that path and
 /// the race is cancelled before it can bench the silent peer.
+///
+/// This holds only while the fill's reads ARE shallow. The fill appends blocks
+/// at or below finality, so once finality trails the head by
+/// [`BULK_HEDGE_MIN_BACK`] or more (a multi-epoch finality delay) its reads
+/// take [`BULK_HEDGE_DELAY`], which outlasts the deadline, and the fill is
+/// effectively unhedged again, as it was before hedging: the caller serves the
+/// original refusal and the client retries. Accepted rather than pinning the
+/// short delay on that path, which would duplicate deep-window downloads in
+/// exactly the state where peers struggle too.
 const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_millis());
 
 /// Cap on concurrently hedged attempts for one read. Two reasons to keep it
@@ -745,6 +755,12 @@ const MAX_HEDGED_ATTEMPTS: usize = 3;
 /// outpaced — so the caller can feed peer quality. Any other attempt still in
 /// flight when the winner returned is in no list: it was asked after the
 /// winner, or has not had the hedge delay yet, so its slowness proves nothing.
+///
+/// Every index is a position in the `peers` slice passed to THAT
+/// `hedged_race` call, and means nothing against any other slice. Consumers
+/// index that same slice, and check it with [`RaceOutcome::indices`] in debug
+/// builds (the workspace builds with `panic = "abort"`, so an out-of-bounds
+/// index would abort the app).
 pub(crate) struct RaceOutcome<T> {
     pub(crate) accepted: Option<(usize, T)>,
     pub(crate) fallback: Option<T>,
@@ -762,6 +778,15 @@ pub(crate) struct RaceOutcome<T> {
 }
 
 impl<T> RaceOutcome<T> {
+    /// Every peer position this outcome refers to.
+    pub(crate) fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.missed
+            .iter()
+            .chain(&self.outpaced)
+            .copied()
+            .chain(self.accepted.as_ref().map(|(i, _)| *i))
+    }
+
     /// The most recent failure reason ("" when nothing failed).
     pub(crate) fn last_err(&self) -> &str {
         self.errors.last().map(String::as_str).unwrap_or("")
@@ -788,7 +813,10 @@ impl<T> RaceOutcome<T> {
 /// in the winner's wakeup: a multi-step read (block, receipts) would start its
 /// next request on that poll, and dropping it mid-write is exactly the tear. So
 /// a loser that failed in that same wakeup is judged by its age like the rest,
-/// and at worst is reported as outpaced rather than as a miss.
+/// and at worst is reported as outpaced rather than as a miss. An OUTER
+/// cancellation (the log-index fill deadline, a cancelled request) drops every
+/// attempt still in flight, up to [`MAX_HEDGED_ATTEMPTS`] rather than the one a
+/// sequential read had, so the same risk now reaches up to three connections.
 pub(crate) async fn hedged_race<T, P: Clone, Fut>(
     peers: &[P],
     delay: std::time::Duration,
@@ -3852,6 +3880,7 @@ impl ElReader {
     {
         let total = peers.len();
         let out = hedged_race(peers, delay, make, accept).await;
+        debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
         let last_err = out.last_err().to_string();
         for idx in &out.missed {
             self.pool.record_snap_failure(peers[*idx].addr()).await;
@@ -3888,6 +3917,7 @@ impl ElReader {
         label: &str,
     ) -> Result<T, PoolReadError> {
         let total = peers.len();
+        debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
         let addrs = |ix: &[usize]| -> Vec<std::net::SocketAddr> {
             ix.iter().map(|i| peers[*i].addr()).collect()
         };
