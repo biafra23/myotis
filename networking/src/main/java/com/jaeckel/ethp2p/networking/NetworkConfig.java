@@ -164,8 +164,8 @@ public record NetworkConfig(
                     // the bootstrap and a 511/512 updates_by_range(1854,1).
                     // 57.129.130.18 closes on runner IPs but served the residential
                     // address in full. Seven entries that failed every run pruned.
-                    // Re-verified 2026-09-13 at the anchor this build ships (period
-                    // 1856), run 34776025758: 4 of 5. 57.129.130.18 served a runner in
+                    // Re-verified 2026-09-13 at the then-shipped period-1856 anchor,
+                    // run 34776025758: 4 of 5. 57.129.130.18 served a runner in
                     // full this time and 91.189.182.90 closed instead, so the closes
                     // look intermittent rather than tied to runner IPs.
                     // Re-verified 2026-09-16 at the anchor this build ships (period
@@ -306,9 +306,9 @@ public record NetworkConfig(
             // v8.2.2. Re-verified 2026-09-12 at period 1357, the anchor then
             // embedded, by the release's live_pins_alive run: 4 of 4 pins, roost
             // included, served a bootstrap for that root and a period of
-            // updates. Re-verified 2026-09-13 at the anchor this build ships
-            // (period 1358), run 34776027257: 4 of 4 again; 2026-09-16 at the
-            // period-1361 anchor, run 35065049320: 4 of 4 again. Re-run it after every
+            // updates. Re-verified 2026-09-13 at the then-shipped period-1358
+            // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the anchor
+            // this build ships (period 1361), run 35065049320: 4 of 4 again. Re-run it after every
             // checkpoint refresh,
             // since a census against a superseded root says nothing about the
             // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
@@ -429,8 +429,8 @@ public record NetworkConfig(
                     // Re-censused 2026-09-13 at the period-3666 anchor: all Lighthouse
                     // v8.2.x advertising light_client_updates_by_range, each serving the
                     // bootstrap and a 507/512 updates_by_range(3666,1).
-                    // Re-verified 2026-09-13 at the anchor this build ships (period
-                    // 3670), run 34776024335: 8 of 8.
+                    // Re-verified 2026-09-13 at the then-shipped period-3670 anchor,
+                    // run 34776024335: 8 of 8.
                     // Re-verified 2026-09-16 at the anchor this build ships (period
                     // 3675), run 35065032444: 8 of 8 again.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
