@@ -1820,12 +1820,18 @@ impl ElReader {
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // leaving the per-block path: never carry a count across
+            }
             return;
         }
         let finalized = self.finalized_block_number();
         if finalized == 0 {
             self.clear_log_index_bridge();
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // ditto: no finality, so the per-block path never ran
+            }
             return;
         }
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
@@ -6172,7 +6178,7 @@ fn decode_ccip_answer(
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     #[test]
     fn backfill_yields_only_while_head_follow_can_close_the_gap() {
         use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};
@@ -6227,7 +6233,6 @@ mod tests {
         assert!(!st.observe(116));
         assert!(st.observe(116));
     }
-    use super::*;
 
     /// The whole-pool failure summary: what a stuck wallet's one visible error
     /// line is built from, so its shape is pinned (2026-09-02 stale-pool
