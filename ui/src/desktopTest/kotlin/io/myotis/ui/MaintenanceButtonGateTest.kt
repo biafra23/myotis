@@ -12,19 +12,15 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * The Status tab's two maintenance buttons are gated differently on purpose, and the
- * difference is easy to "tidy away" later — so pin it.
- *
- * "Reset sync state" only deletes the persisted snapshot from disk; whether that sticks
- * while the chain runs depends on the engine and on what it is doing, and it only ever
- * applies at the next start. So it is offered only while the network is down, with a
- * line saying so. "Clear peer caches" goes through the running engine and stays
- * available either way.
+ * Both Status-tab maintenance buttons are offered only while the network is down, so a
+ * mis-click cannot throw out learned peers or the sync anchor mid-run. Pinned because the
+ * gate is easy to "tidy away" later — especially on Clear peer caches, which would work
+ * while running and is gated purely to make the accident impossible.
  *
  * The maintenance buttons sit below the fold in the Status tab's scrolling column, so
  * each assertion scrolls to its node first (same pattern as IndexTabVisibilityTest).
  */
-class ResetSyncStateGateTest {
+class MaintenanceButtonGateTest {
 
     @get:Rule
     val rule = createComposeRule()
@@ -41,7 +37,7 @@ class ResetSyncStateGateTest {
     }
 
     @Test
-    fun `reset is offered while the network is down`() {
+    fun `both maintenance actions are offered while the network is down`() {
         rule.setContent { NodeScreen(controller = Stopped(), settings = FakeSettings(), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithText("Reset sync state").performScrollTo().assertIsEnabled()
@@ -49,13 +45,12 @@ class ResetSyncStateGateTest {
     }
 
     @Test
-    fun `reset is withheld while the network runs, and says why`() {
+    fun `both are withheld while the network runs, and say why`() {
         rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithText("Reset sync state").performScrollTo().assertIsNotEnabled()
+        rule.onNodeWithText("Clear peer caches").performScrollTo().assertIsNotEnabled()
         rule.onNodeWithText("Stop mainnet first", substring = true).performScrollTo().assertIsDisplayed()
-        // The other one is deliberately NOT gated: it goes through the running engine.
-        rule.onNodeWithText("Clear peer caches").performScrollTo().assertIsEnabled()
     }
 
     private fun pumpFrames(n: Int = 3) = repeat(n) { rule.mainClock.advanceTimeByFrame() }

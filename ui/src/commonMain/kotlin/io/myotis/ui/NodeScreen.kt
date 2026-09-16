@@ -744,10 +744,16 @@ private fun StatusTab(
         // Maintenance actions (mirrors the old Android Status screen): wipe peer caches to give
         // discovery a fresh slate, or drop the persisted sync snapshot to re-bootstrap next start.
         //
-        // Only ONE of these is meaningful while the stack is up, and the difference is who owns
-        // the file. `clearCaches` goes THROUGH the running engine (clearPeerState plus the live
-        // cache instances), so a live stack cannot write the old peers back — pressing it while
-        // running is a legitimate way to hand discovery a fresh slate, and it stays enabled.
+        // BOTH are offered only while the network is down (owner's call, 2026-09-16): each is one
+        // mis-click away from throwing out hours of learned peers or the sync anchor, and neither
+        // is worth that risk mid-run. The reasons they are unsafe differ, though, and the
+        // difference is worth keeping written down.
+        //
+        // `clearCaches` actually WORKS while running: it goes THROUGH the engine (clearPeerState
+        // plus the live cache instances), so a live stack cannot write the old peers back. Gating
+        // it therefore costs something real — handing discovery a fresh slate without a restart is
+        // a genuine debugging move — and that cost is accepted deliberately to make the accidental
+        // click impossible.
         //
         // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
         // STICKS while the chain runs depends on the engine and on what it is doing — which is
@@ -767,6 +773,7 @@ private fun StatusTab(
         // period advance, so the odds are slim — but the gate is a guard rail, not a lock.
         OutlinedButton(
             onClick = { controller.clearCaches(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Clear peer caches") }
         Spacer(Modifier.height(8.dp))
@@ -778,8 +785,8 @@ private fun StatusTab(
         if (primaryActive) {
             Spacer(Modifier.height(4.dp))
             Text(
-                "Stop $primary first: a reset only applies at the next start, and a running "
-                    + "node can rewrite the snapshot underneath it.",
+                "Stop $primary first: these discard learned peers and the sync anchor, and a "
+                    + "reset only applies at the next start anyway.",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
