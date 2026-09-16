@@ -819,6 +819,7 @@ mod tests {
             // Peer 0 never answers and peer 1 answers in 50 ms. Three state
             // reads in one call, each asking in the order the previous one left.
             let ask = |id: usize| async move {
+                crate::el::peer::mark_request_sent();
                 let wait = if id == 0 { Duration::from_secs(600) } else { Duration::from_millis(50) };
                 tokio::time::sleep(wait).await;
                 Ok::<usize, String>(id)

@@ -720,16 +720,18 @@ impl PeerPool {
         self.inner.record_quality(addr, false).await;
     }
 
-    /// A hedged read was answered by a peer asked AFTER this one, while this
-    /// one had been outstanding for at least the hedge delay (see
-    /// `reader::RaceOutcome::outpaced`). Bench it for [`READ_FAIL_BENCH`] so the
-    /// next reads start with someone else. The first outpace since the peer
-    /// last served costs nothing more; each further one is also a
-    /// verified-read failure (see [`OUTPACES_BEFORE_STRIKE`]).
+    /// A hedged read was answered by a peer whose request went out no earlier
+    /// than this one's, while this peer had had its request for at least the
+    /// hedge delay (see `reader::RaceOutcome::outpaced`). Bench it for
+    /// [`READ_FAIL_BENCH`] so the next reads start with someone else. The first
+    /// outpace since the peer last served costs nothing more; each further one
+    /// is also a verified-read failure (see [`OUTPACES_BEFORE_STRIKE`]).
     ///
-    /// Only a peer asked before the winner can be outpaced, so a uniformly slow
-    /// link does not strike anyone: there the first peer asked usually answers
-    /// first, and the hedges started after it are not counted.
+    /// Only a peer whose request went out no later than the winner's can be
+    /// outpaced, so a uniformly slow link does not strike anyone: there the
+    /// first peer asked usually answers first, and the hedges sent after it are
+    /// not counted. A request still waiting for the connection's writer never
+    /// reached the peer and is not counted either.
     ///
     /// Without this, a silent peer was never struck once reads were hedged: the
     /// winner returns and the silent attempt is simply dropped, so the peer
@@ -1273,8 +1275,8 @@ impl SnapQualitySink {
         self.inner.record_quality(addr, false).await;
     }
 
-    /// A hedged snap fetch against `addr` was outpaced by a peer asked after
-    /// it: bench it, and count a repeat as a failure (see
+    /// A hedged snap fetch against `addr` was outpaced by a peer whose request
+    /// went out no earlier: bench it, and count a repeat as a failure (see
     /// `PeerPool::record_snap_outpaced`).
     pub async fn outpaced(&self, addr: SocketAddr) {
         self.inner.record_outpaced(addr).await;

@@ -162,10 +162,12 @@ its deployment block:
   after 3 s without an answer, up to three in flight. A block or receipt read
   128 or more blocks behind the head waits 6 s instead, because its header
   window is a large download that should not be duplicated eagerly. A dead
-  first peer no longer costs a full 15 s request timeout. A peer that is
-  beaten by one asked after it is moved behind the others for 30 s, and if
-  that happens again before it serves anything it counts as a failed read,
-  so a dead connection is evicted after a few reads instead of lingering.
+  first peer no longer costs a full 15 s request timeout. A peer that sat on
+  a request for at least the hedge delay while a peer asked after it answered
+  is moved behind the others for 30 s, and if that happens again before it
+  serves anything it counts as a failed read, so a dead connection is evicted
+  after a few reads instead of lingering. Receipt polling is hedged end to
+  end, including the scan that finds the transaction's block.
   The optimistic tail's own fetch — the head edge that 23 s `eth_getLogs`
   waited on — is not hedged yet. Its header-window loop and its
   candidate-chunk loop each try peers one at a time with the full 15 s

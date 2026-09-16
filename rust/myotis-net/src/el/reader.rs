@@ -753,8 +753,9 @@ const MAX_HEDGED_ATTEMPTS: usize = 3;
 /// that gave it), the best non-accepted result as a fallback, the indices that
 /// missed (failed, or answered without a verdict), and the ones the winner
 /// outpaced — so the caller can feed peer quality. Any other attempt still in
-/// flight when the winner returned is in no list: it was asked after the
-/// winner, or has not had the hedge delay yet, so its slowness proves nothing.
+/// flight when the winner returned is in no list: its request went out after
+/// the winner's, has not been with its peer for the hedge delay yet, or never
+/// left our side at all, so its slowness proves nothing about the peer.
 ///
 /// Every index is a position in the `peers` slice passed to THAT
 /// `hedged_race` call, and means nothing against any other slice. Consumers
@@ -765,11 +766,14 @@ pub(crate) struct RaceOutcome<T> {
     pub(crate) accepted: Option<(usize, T)>,
     pub(crate) fallback: Option<T>,
     pub(crate) missed: Vec<usize>,
-    /// Attempts the winner OUTPACED: asked before it, outstanding for at least
-    /// the hedge delay, and still silent when it answered. Not a failure on its
-    /// own, but a silent peer only ever shows up here, so callers report these
-    /// (`PeerPool::record_snap_outpaced`), which benches the peer and counts a
-    /// repeat as a failure.
+    /// Attempts the winner OUTPACED: the request reached its peer no later than
+    /// the winner's reached the winner, has been with that peer for at least
+    /// the hedge delay, and is still unanswered. Timed from the request's
+    /// actual send (`peer::scope_send_marker`), not from the attempt's start,
+    /// because a request can first wait a long time for the connection's
+    /// shared writer. Not a failure on its own, but a silent peer only ever
+    /// shows up here, so callers report these (`PeerPool::record_snap_outpaced`),
+    /// which benches the peer and counts a repeat as a failure.
     pub(crate) outpaced: Vec<usize>,
     /// Every failure reason, in arrival order. The block and receipt reads
     /// summarise the whole pool and classify tip-lag across it, so they need
@@ -831,9 +835,11 @@ where
     let total = peers.len();
     let mut in_flight = FuturesUnordered::new();
     let mut next = 0usize;
-    // When each attempt started, and whether it has finished — what decides
-    // which in-flight losers the winner OUTPACED.
+    // When each attempt started, when its request actually went out, and
+    // whether it has finished — what decides which in-flight losers the winner
+    // OUTPACED.
     let mut started: Vec<Option<tokio::time::Instant>> = vec![None; total];
+    let mut sent: Vec<Option<std::sync::Arc<std::sync::OnceLock<tokio::time::Instant>>>> = vec![None; total];
     let mut done = vec![false; total];
     let mut out = RaceOutcome {
         accepted: None,
@@ -850,8 +856,9 @@ where
     loop {
         if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
             let idx = next;
-            let fut = make(peers[idx].clone());
+            let (marker, fut) = crate::el::peer::scope_send_marker(make(peers[idx].clone()));
             started[idx] = Some(tokio::time::Instant::now());
+            sent[idx] = Some(marker);
             in_flight.push(async move { (idx, fut.await) });
             next += 1;
         }
@@ -863,16 +870,24 @@ where
             Some((idx, res)) = in_flight.next() => { done[idx] = true; match res {
                 Ok(value) => {
                     if accept(&value) {
-                        // OUTPACED = asked BEFORE the winner (attempts start in
-                        // index order) AND outstanding for at least the delay.
-                        // A peer asked after the winner had less time than the
-                        // winner needed, so on a uniformly slow link it proves
-                        // nothing. A peer asked just before it (a failure starts
-                        // the next attempt at once) has not had the delay yet.
+                        // OUTPACED = the loser's request went out no later than
+                        // the winner's AND has been with its peer for at least
+                        // the delay. Timed from the actual send: a request still
+                        // queued for its connection's writer never reached the
+                        // peer, so it proves nothing. A request sent after the
+                        // winner's had less time than the winner needed, which
+                        // on a uniformly slow link proves nothing either, and
+                        // one sent just before it has not had the delay yet.
                         let now = tokio::time::Instant::now();
-                        out.outpaced = (0..idx)
-                            .filter(|&i| !done[i])
-                            .filter(|&i| started[i].is_some_and(|s| now.duration_since(s) >= delay))
+                        let sent_at = |i: usize| sent[i].as_ref().and_then(|m| m.get().copied());
+                        // The winner's own send, or its start if it recorded
+                        // none (an answer that needed no request).
+                        let winner_ref = sent_at(idx).or(started[idx]).unwrap_or(now);
+                        out.outpaced = (0..next)
+                            .filter(|&i| i != idx && !done[i])
+                            .filter(|&i| {
+                                sent_at(i).is_some_and(|s| s <= winner_ref && now.duration_since(s) >= delay)
+                            })
                             .collect();
                         out.accepted = Some((idx, value));
                         return out;
@@ -5667,9 +5682,12 @@ impl ElReader {
         Ok(st.found.clone())
     }
 
-    /// Run one `[from..head]` scan across the snap pool: try each peer (each
-    /// attempt bounded by [`RECEIPT_SCAN_DEADLINE`]) until one serves a fully
-    /// verified window, recording served/failure reputation per peer.
+    /// Run one `[from..head]` scan across the snap pool, HEDGED like the other
+    /// interactive reads ([`ElReader::hedged_read`]): each attempt is bounded by
+    /// [`RECEIPT_SCAN_DEADLINE`], the first fully verified window wins (found,
+    /// or verified not seen), and reputation is recorded as hedged_read does.
+    /// This is the wallet's post-send confirm poll until the tx is found, so a
+    /// silent first peer used to cost every such poll a full request timeout.
     async fn scan_window(
         &self,
         from: u64,
@@ -5681,27 +5699,26 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            let attempt = tokio::time::timeout(
-                RECEIPT_SCAN_DEADLINE,
-                self.scan_blocks_from(peer, from, head_num, head_hash, tx_hash),
-            )
-            .await
-            .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
-            match attempt {
-                Ok(found) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(found);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"))
+        // A steady-state poll scans the few blocks since the previous one. A
+        // catch-up scan can span RECEIPT_MAX_SCAN_BLOCKS_PER_POLL blocks of
+        // bodies, a bulk download that should not be duplicated eagerly.
+        let span = head_num.saturating_sub(from).saturating_add(1);
+        let delay = if span <= RECEIPT_INITIAL_LOOKBACK_BLOCKS { HEDGE_DELAY } else { BULK_HEDGE_DELAY };
+        self.hedged_read(
+            &peers,
+            delay,
+            |peer| async move {
+                tokio::time::timeout(
+                    RECEIPT_SCAN_DEADLINE,
+                    self.scan_blocks_from(&peer, from, head_num, head_hash, tx_hash),
+                )
+                .await
+                .unwrap_or_else(|_| Err("tx scan timed out".to_string()))
+            },
+            |_: &Option<TxLocation>| true,
+            "a verifiable tx scan",
+        )
+        .await
     }
 
     /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
@@ -5758,13 +5775,25 @@ impl ElReader {
             return true; // too far to recheck cheaply
         }
         let peers = self.pool.snap_peers().await;
-        for peer in &peers {
-            match self.confirm_canonical_from(peer, loc, count, head_hash).await {
-                Ok(canonical) => return canonical,
-                Err(_) => continue, // transport/anchor failure — can't disprove
-            }
+        // Hedged: this runs on every confirm poll for a found tx that is not
+        // final yet, and a silent first peer used to hold each one for a full
+        // request timeout. Any verified answer ends the race. As before, no
+        // reputation is recorded here: a failure may only mean the peer has not
+        // imported our anchored head, and the receipt fetch that follows in the
+        // same poll records reputation for the same pool anyway.
+        let out = hedged_race(
+            &peers,
+            block_hedge_delay(head_num - loc.header.number),
+            |peer: Arc<ManagedPeer>| async move {
+                self.confirm_canonical_from(&peer, loc, count, head_hash).await
+            },
+            |_: &bool| true,
+        )
+        .await;
+        match out.accepted {
+            Some((_, canonical)) => canonical,
+            None => true, // nobody could verify either way — can't disprove
         }
-        true
     }
 
     /// One peer's canonicality check: fetch `[loc.block .. head]`, require the
@@ -6564,6 +6593,12 @@ mod tests {
             NoVerdict(Duration),
             /// Fails after `delay` (a slow failure: a timeout, a late bad proof).
             FailsAfter(Duration),
+            /// Its request waits `delay` for the connection's writer, then goes
+            /// out and is never answered.
+            QueuedThenSilent(Duration),
+            /// Its request waits the first delay for the writer, then the peer
+            /// answers `value` the second delay after the send.
+            QueuedThenAnswers(Duration, Duration, u32),
         }
 
         /// Race the scripted peers, accepting any answer except `NoVerdict`
@@ -6587,21 +6622,7 @@ mod tests {
                     async move {
                         let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
-                        let res = match p {
-                            Peer::Answers(d, v) => {
-                                tokio::time::sleep(d).await;
-                                Ok(v)
-                            }
-                            Peer::NoVerdict(d) => {
-                                tokio::time::sleep(d).await;
-                                Ok(0)
-                            }
-                            Peer::FailsNow => Err("peer failed".to_string()),
-                            Peer::FailsAfter(d) => {
-                                tokio::time::sleep(d).await;
-                                Err("peer failed late".to_string())
-                            }
-                        };
+                        let res = attempt(p).await;
                         live.fetch_sub(1, Ordering::SeqCst);
                         res
                     }
@@ -6649,10 +6670,16 @@ mod tests {
             assert_eq!(started.elapsed(), HEDGE_DELAY + Duration::from_millis(50));
         }
 
-        /// One scripted attempt, as `race_tracked` runs it, without the counters.
+        /// One scripted attempt. Its request goes out at once, as a real one
+        /// does when the connection's writer is free, unless the script queues
+        /// it first.
         async fn attempt(p: Peer) -> Result<u32, String> {
+            if let Peer::QueuedThenSilent(q) | Peer::QueuedThenAnswers(q, _, _) = p {
+                tokio::time::sleep(q).await;
+            }
+            crate::el::peer::mark_request_sent();
             match p {
-                Peer::Answers(d, v) => {
+                Peer::Answers(d, v) | Peer::QueuedThenAnswers(_, d, v) => {
                     tokio::time::sleep(d).await;
                     Ok(v)
                 }
@@ -6664,6 +6691,10 @@ mod tests {
                 Peer::FailsAfter(d) => {
                     tokio::time::sleep(d).await;
                     Err("peer failed late".to_string())
+                }
+                Peer::QueuedThenSilent(_) => {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    Ok(0)
                 }
             }
         }
@@ -6766,6 +6797,51 @@ mod tests {
             assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((3, 3)));
             assert_eq!(out.missed, vec![0]);
             assert_eq!(out.outpaced, vec![1, 2]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_still_waiting_for_the_writer_is_not_outpaced() {
+            // Peer 0's request never gets past its connection's writer (we are
+            // busy writing something else to that peer); peer 1 is hedged in
+            // and wins. Peer 0 never saw the request, so nothing is held
+            // against it.
+            let peers = [Peer::QueuedThenSilent(Duration::from_secs(600)), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((1, 2)));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn outpacing_is_timed_from_the_send_not_the_start() {
+            // Peer 1 is hedged in at 3 s and answers at 5 s. Peer 0's request
+            // went out at 1 s: silent for 4 s by then, so outpaced.
+            let peers = [Peer::QueuedThenSilent(Duration::from_secs(1)), Peer::Answers(Duration::from_secs(2), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert_eq!(out.outpaced, vec![0]);
+            // Queued until 2.5 s instead: 2.5 s with the peer is under the
+            // delay, although the attempt itself started 5 s earlier.
+            let peers = [Peer::QueuedThenSilent(Duration::from_millis(2500)), Peer::Answers(Duration::from_secs(2), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn send_order_not_ask_order_decides_who_was_outpaced() {
+            // Peer 0 is asked first, but its request waits 7 s for the writer;
+            // peer 1 is hedged in at 3 s and its request goes out at once. Peer
+            // 0 then answers 0.1 s after its send. Peer 1's peer has had the
+            // request for 4.1 s by then, longer than the delay and longer than
+            // the winner needed, so peer 1 was outpaced although it was asked
+            // second.
+            let peers = [
+                Peer::QueuedThenAnswers(Duration::from_secs(7), Duration::from_millis(100), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+            ];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 1)));
+            assert_eq!(out.outpaced, vec![1]);
         }
 
         #[tokio::test(start_paused = true)]
