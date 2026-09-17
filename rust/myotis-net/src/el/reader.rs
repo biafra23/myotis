@@ -1272,7 +1272,7 @@ impl ElReader {
                 // with the record already retired above.
                 Some(p) => {
                     let clamp = checkpoint_clamp(finalized_now, self.vouched_now(), None);
-                    let r = write_own_checkpoint(p, &checkpoint_bytes(ix, &tag, clamp), clamp);
+                    let r = self.write_own_checkpoint(p, &checkpoint_bytes(ix, &tag, clamp), clamp);
                     if let Err(e) = &r {
                         tracing::warn!(
                             error = %e,
@@ -1631,7 +1631,7 @@ impl ElReader {
                 // An ordinary checkpoint, claim included: if the import fails
                 // below, this is the file the node keeps running on.
                 let clamp = self.checkpoint_clamp_for(finalized);
-                write_own_checkpoint(&own_path, &checkpoint_bytes(ix, &tag, clamp), clamp).map_err(|e| {
+                self.write_own_checkpoint(&own_path, &checkpoint_bytes(ix, &tag, clamp), clamp).map_err(|e| {
                     format!("could not checkpoint the current index before merging: {e}")
                 })?;
             }
@@ -2516,7 +2516,7 @@ impl ElReader {
         // of walk per crash instead of ten seconds, and would otherwise leave
         // no trace of why. Same reasoning as the tail: a silently broken
         // checkpoint is the wrong failure shape.
-        if let Err(e) = write_own_checkpoint(path, &bytes, clamp) {
+        if let Err(e) = self.write_own_checkpoint(path, &bytes, clamp) {
             tracing::warn!(
                 error = %e,
                 bytes = bytes.len(),
@@ -2561,6 +2561,63 @@ impl ElReader {
         self.log_index_claim.lock().map(|c| c.vouched).unwrap_or(0)
     }
 
+    /// Write one checkpoint of this node's OWN index — bytes
+    /// [`checkpoint_bytes`] produced at `clamp` — and record beside it the
+    /// finality it may claim. The index write is the result; the claim is
+    /// best-effort, since without one the next restart merely re-checks the
+    /// checkpoint's top the old way.
+    fn write_own_checkpoint(
+        &self,
+        path: &std::path::Path,
+        bytes: &[u8],
+        clamp: Option<u64>,
+    ) -> std::io::Result<()> {
+        crate::el::logindex::write_atomic(path, bytes)?;
+        self.publish_finality_claim(path, bytes, clamp);
+        Ok(())
+    }
+
+    /// Record (or remove) the finality claim for the checkpoint just written.
+    ///
+    /// RE-CHECKS the clamp before publishing, under the claim lock. A
+    /// checkpoint serializes under the index lock and writes outside it, and
+    /// [`Self::settle_restart_claim`] takes neither that lock nor the
+    /// checkpoint lock — so a claim can be retired while these bytes are in
+    /// flight. Publishing the clamp anyway would put a claim the light client
+    /// has just overruled back on disk, and the next restart would accept it
+    /// again. The clamp still stands if the node's own finality, or a claim
+    /// still held, reaches it; otherwise the file keeps its coverage with no
+    /// claim, which is the old (re-check on restart) behaviour.
+    ///
+    /// The lock also orders this against a contradicted settle's own removal:
+    /// whichever runs second sees the other's decision, and both orders end
+    /// with no claim on disk.
+    fn publish_finality_claim(&self, path: &std::path::Path, bytes: &[u8], clamp: Option<u64>) {
+        use crate::el::logindex::{remove_finality_claim, write_finality_claim, SnapshotId};
+        // Before the claim lock: the anchor's lock is never taken under it.
+        let finalized_now = self.finalized_block_number();
+        let claim = self.log_index_claim.lock();
+        let vouched = claim.as_ref().map(|c| c.vouched).unwrap_or(0);
+        // A clamp at block 0 bounds the file at genesis and vouches for
+        // nothing; `None` means nothing bounds it at all.
+        let backed = clamp.is_some_and(|c| c > 0 && c <= finalized_now.max(vouched));
+        let recorded = match (backed.then_some(clamp).flatten(), SnapshotId::of_frame(bytes)) {
+            (Some(finalized), Some(id)) => write_finality_claim(path, &id, finalized),
+            _ => remove_finality_claim(path),
+        };
+        drop(claim);
+        // Not silent, for the reason the checkpoint itself is not: a claim
+        // that never lands turns every restart back into the re-walk it
+        // exists to save.
+        if let Err(e) = recorded {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "log index: finality claim not recorded; the next restart re-checks the checkpoint's top"
+            );
+        }
+    }
+
     /// Install a restart claim (0: none) for the index being installed. It
     /// starts unweighed.
     fn set_vouched(&self, vouched: u64) {
@@ -2598,6 +2655,22 @@ impl ElReader {
             let fate = restart_claim_fate(finalized, vouched, claim.first_finality, finality_current);
             if fate != RestartClaim::Hold {
                 *claim = RestartClaimState::default();
+            }
+            if fate == RestartClaim::Contradicted {
+                // Off DISK too, and inside this critical section. The claim is
+                // wrong, so leaving it beside the checkpoint would hand the
+                // next restart the coverage this light client just overruled —
+                // and a checkpoint whose bytes were clamped under it may be in
+                // flight right now. That one re-checks the claim under this
+                // same lock before publishing (see `publish_finality_claim`),
+                // so the two cannot cross. A checkpoint that has already
+                // published loses its claim here. Subsumed is left alone: the
+                // anchor reached it, so the claim on disk is simply true.
+                if let Some(path) = self.log_index_path.as_deref() {
+                    if let Err(e) = crate::el::logindex::remove_finality_claim(path) {
+                        tracing::warn!(error = %e, path = %path.display(), "log index: could not remove the contradicted finality claim");
+                    }
+                }
             }
             (fate, vouched)
         };
@@ -7161,31 +7234,6 @@ fn checkpoint_clamp(finalized: u64, vouched: u64, lowest_unconfirmed: Option<u64
     })
 }
 
-/// Write one checkpoint of this node's OWN index — bytes [`checkpoint_bytes`]
-/// produced at `clamp` — and record beside it the finality it may claim. The
-/// claim is best-effort: without one the next restart merely re-checks the
-/// checkpoint's top the old way. The index write is the result.
-fn write_own_checkpoint(path: &std::path::Path, bytes: &[u8], clamp: Option<u64>) -> std::io::Result<()> {
-    use crate::el::logindex::{remove_finality_claim, write_finality_claim, SnapshotId};
-    crate::el::logindex::write_atomic(path, bytes)?;
-    let recorded = match (clamp, SnapshotId::of_frame(bytes)) {
-        (Some(finalized), Some(id)) if finalized > 0 => write_finality_claim(path, &id, finalized),
-        // Unclamped: nothing bounds what the file holds, so nothing vouches.
-        // (A clamp at block 0 bounds it at genesis and vouches for nothing.)
-        _ => remove_finality_claim(path),
-    };
-    // Not silent, for the reason the checkpoint itself is not: a claim that
-    // never lands turns every restart back into the re-walk it exists to save.
-    if let Err(e) = recorded {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "log index: finality claim not recorded; the next restart re-checks the checkpoint's top"
-        );
-    }
-    Ok(())
-}
-
 /// The lowest block a tail window must reach. It has to cover every RECORDED
 /// block (so a reorg is detectable — a window starting at the coverage edge
 /// compares against records that all sit BELOW it, i.e. two disjoint ranges,
@@ -9634,6 +9682,51 @@ mod restart_claim_reader_tests {
         // Only a finality verified after that one does.
         reader.settle_restart_claim(F0 + 32, true);
         assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_in_flight_cannot_republish_a_contradicted_claim() {
+        // A checkpoint serializes under the index lock and writes outside it,
+        // and the backfill drives one from outside `log_index_drive` — so a
+        // getLogs-driven tick can contradict the claim while those bytes are
+        // in flight. Publishing the old clamp would hand the next restart the
+        // coverage this light client just overruled.
+        let dir = TempDir::new("inflight");
+        let path = run_to_shutdown(&dir.0).await;
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+
+        // A checkpoint gets as far as its bytes and clamp...
+        let clamp = reader.checkpoint_clamp_for(F0);
+        assert_eq!(clamp, Some(F1), "clamped at the claim while it still held");
+        let bytes = reader
+            .with_log_index(|ix| checkpoint_bytes(ix, &reader.chain_tag(), clamp))
+            .expect("index installed");
+
+        // ...and before it writes, a current light client overrules the claim.
+        anchor.set_finality_current(true);
+        reader.settle_restart_claim(F0, true); // weighed here
+        reader.settle_restart_claim(F0 + 16, true); // verified since, and far short
+        assert_eq!(vouched(&reader), 0);
+        assert!(!finality_claim_path(&path).exists(), "a contradicted claim stayed on disk");
+
+        // The in-flight checkpoint now lands. Its coverage may go to disk;
+        // its claim may not.
+        set_anchor(&anchor, F0 + 16, F0 + 56);
+        reader.write_own_checkpoint(&path, &bytes, clamp).unwrap();
+        assert_eq!(on_disk(&path), (Some(F1), None), "a rejected claim came back");
+
+        // ...so a start on those bytes re-checks that coverage instead of
+        // serving it. (Before this reader stops — its own checkpoint would
+        // write a fresh, and true, claim at the finality it has by then.)
+        let next = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(next.install_log_index_from_disk());
+        assert_eq!(vouched(&next), 0);
+        tick(&next).await;
+        assert_eq!(next.log_index_covered_high(), Some(F0));
+        next.stop().await;
         reader.stop().await;
     }
 

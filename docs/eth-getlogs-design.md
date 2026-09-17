@@ -213,7 +213,12 @@ covered top *vouches* for that top (`ElReader::log_index_claim`), and:
   the wall clock: a clock running hours slow makes the restored finality look
   current. (A slow clock together with a server that serves an hours-old
   finality can still drop a genuine claim. That costs the old re-walk, never
-  trust.)
+  trust.) A contradicted claim is removed from disk at once, and a checkpoint
+  re-checks the clamp before publishing its sidecar — both under the claim
+  lock. A checkpoint serializes under the index lock and writes outside it,
+  and the backfill drives one from outside `log_index_drive`, so without that
+  re-check a checkpoint already in flight could put a just-overruled claim
+  back on disk for the next restart to accept.
 
 Two refinements make "the clamp" mean *confirmed final*. First, a checkpoint
 never reaches a tail record that finality has passed but the tail has not yet
