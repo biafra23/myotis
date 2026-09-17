@@ -1035,7 +1035,15 @@ pub fn finality_claim_path(index: &Path) -> PathBuf {
 /// had verified finality at least that far. Atomic, like the index itself.
 /// Write it AFTER the index: a crash in between leaves the previous claim
 /// beside a file it does not describe, which [`read_finality_claim`] rejects.
+/// A zero `finalized` claims nothing and is refused (`InvalidInput`); remove
+/// the claim instead.
 pub fn write_finality_claim(index: &Path, id: &SnapshotId, finalized: u64) -> std::io::Result<()> {
+    if finalized == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a finality claim at block 0 claims nothing",
+        ));
+    }
     let mut out = Vec::with_capacity(CLAIM_LEN);
     out.extend_from_slice(CLAIM_MAGIC);
     put_u32(&mut out, CLAIM_VERSION);
@@ -1071,8 +1079,8 @@ pub fn read_finality_claim(index: &Path, id: &SnapshotId) -> Option<u64> {
     let checksum = c.u64()?;
     let finalized = c.u64()?;
     let claimed = SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum };
-    // Zero is never written (an unclamped checkpoint REMOVES the claim), so
-    // reading one back means the file is not what this code wrote.
+    // Zero is never written (`write_finality_claim` refuses it), so reading
+    // one back means the file is not what this code wrote.
     (claimed == *id && finalized > 0).then_some(finalized)
 }
 
@@ -2662,15 +2670,22 @@ mod finality_claim_tests {
         long.push(0);
         std::fs::write(&claim, &long).unwrap();
         assert_eq!(read_finality_claim(&path, &id), None);
-        // A consistent frame of an unknown version.
-        let mut future = good[..CLAIM_LEN - 8].to_vec();
-        future[4..8].copy_from_slice(&2u32.to_le_bytes());
-        let sum = fnv64(&future);
-        future.extend_from_slice(&sum.to_le_bytes());
-        std::fs::write(&claim, &future).unwrap();
+        // A consistent frame with one field changed, checksum redone.
+        let reframed = |at: usize, bytes: &[u8]| {
+            let mut body = good[..CLAIM_LEN - 8].to_vec();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+            let sum = fnv64(&body);
+            body.extend_from_slice(&sum.to_le_bytes());
+            body
+        };
+        // An unknown version.
+        std::fs::write(&claim, reframed(4, &2u32.to_le_bytes())).unwrap();
         assert_eq!(read_finality_claim(&path, &id), None);
-        // Zero is never written, so it is never believed.
-        write_finality_claim(&path, &id, 0).unwrap();
+        // Zero is never written...
+        let refused = write_finality_claim(&path, &id, 0).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        // ...so a well-formed zero on disk is not believed either.
+        std::fs::write(&claim, reframed(64, &0u64.to_le_bytes())).unwrap();
         assert_eq!(read_finality_claim(&path, &id), None);
     }
 

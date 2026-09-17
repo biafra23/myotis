@@ -7169,8 +7169,9 @@ fn write_own_checkpoint(path: &std::path::Path, bytes: &[u8], clamp: Option<u64>
     use crate::el::logindex::{remove_finality_claim, write_finality_claim, SnapshotId};
     crate::el::logindex::write_atomic(path, bytes)?;
     let recorded = match (clamp, SnapshotId::of_frame(bytes)) {
-        (Some(finalized), Some(id)) => write_finality_claim(path, &id, finalized),
+        (Some(finalized), Some(id)) if finalized > 0 => write_finality_claim(path, &id, finalized),
         // Unclamped: nothing bounds what the file holds, so nothing vouches.
+        // (A clamp at block 0 bounds it at genesis and vouches for nothing.)
         _ => remove_finality_claim(path),
     };
     // Not silent, for the reason the checkpoint itself is not: a claim that
