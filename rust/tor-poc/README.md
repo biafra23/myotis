@@ -88,7 +88,8 @@ Arti 0.44 needs rustc 1.91+. `rust/rust-toolchain.toml` selects `stable`, but
 rustup looks that file up from the *current directory*, not from
 `--manifest-path`: from the repo root your default toolchain applies, and an
 older one fails with "requires rustc 1.91". Use `cargo +stable run …` there, or
-`cd rust` first (then `--manifest-path tor-poc/Cargo.toml`).
+`cd rust` first (then `--manifest-path tor-poc/Cargo.toml`) — either way your
+installed `stable` must itself be 1.91+ (`rustup update stable`).
 
 ## Scope / what this is NOT
 
