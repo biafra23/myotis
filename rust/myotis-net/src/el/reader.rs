@@ -483,14 +483,25 @@ const BRIDGE_MAX_GAP: u64 = 500_000;
 const TAIL_MAX_ABOVE_FINALITY: u64 = 1024;
 
 /// Pending blocks (`edge..=head`, inclusive) the backfill tolerates before
-/// standing down. A block or two is the
-/// steady state of a live chain between tail ticks, so the floor must sit above
-/// that — but it is a TIME budget in disguise and the chains differ. Eight
-/// blocks is ~40 s on gnosis (5 s blocks) and ~96 s on mainnet (12 s): both far
-/// above the steady state, and both well inside the 10 minutes a Bee node gives
-/// its RPC before shutting down. In blocks rather than seconds because the
-/// reader has no per-network block time; revisit if one is ever added.
-const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 8;
+/// standing down. A block or two IS the steady state of a live chain sampled on
+/// the 6 s tick (gnosis produces a block every 5 s), so the floor sits exactly
+/// there: two pending blocks are normal, three mean the appender is losing
+/// ground and the walk must stand down.
+///
+/// It was eight — a time budget in disguise, justified by Bee's 10-minute
+/// shutdown clock. That framing measured the wrong thing. Bee's clock is not
+/// what a lagging edge costs: a head-reaching `eth_getLogs` is REFUSED for as
+/// long as the top lags at all, so every request in that window fails while the
+/// walk, still inside its tolerance, keeps spending the shared snap pool. A
+/// zbox Bee node died exactly there on 2026-09-17 (39 225 logs served, then 134
+/// consecutive refusals and `postage syncing stalled`). Two keeps the walk off
+/// the head's back from the first block it actually falls behind, and the
+/// fairness floor (`BACKFILL_YIELD_MAX_TICKS`) still guarantees it progress.
+///
+/// In blocks rather than seconds because the reader has no per-network block
+/// time; revisit if one is ever added — on a 12 s chain two blocks is a longer
+/// grace period than here, which is the safe direction.
+const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 2;
 
 /// Consecutive ticks the backfill may be yielded before taking one batch anyway
 /// (~5 min at 6 s). A fairness floor: head-follow states this code does not
@@ -6202,10 +6213,11 @@ mod tests {
         // the bridge holds coverage and the walk must not stand down.
         assert!(backfill_should_yield(1_000, 501_100, 501_000, 0));
         assert!(!backfill_should_yield(1_000, 501_100, 501_001, 0));
-        // The tolerance itself, counted inclusively over edge..=head: eight
-        // pending blocks stay with the walk, nine hand the tick to head-follow.
-        assert!(!backfill_should_yield(1_000, 1_007, 1_004, 0));
-        assert!(backfill_should_yield(1_000, 1_008, 1_004, 0));
+        // The tolerance itself, counted inclusively over edge..=head: two
+        // pending blocks stay with the walk (the steady state of a 5 s chain on
+        // a 6 s tick), three hand the tick to head-follow.
+        assert!(!backfill_should_yield(1_000, 1_001, 1_004, 0));
+        assert!(backfill_should_yield(1_000, 1_002, 1_004, 0));
         // Coverage past the head (edge = head + 1) is zero pending, not one.
         assert!(!backfill_should_yield(1_001, 1_000, 1_000, 0));
         // No finality yet: keep walking, there is nothing to defer to.
