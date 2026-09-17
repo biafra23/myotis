@@ -193,7 +193,7 @@ asleep part of the time) while Bee's postage sync was refused.
 Every checkpoint therefore records its clamp in a sidecar file bound to the
 exact bytes it describes (chain tag, config fingerprint, payload checksum —
 `logindex::SnapshotId`). On install, a matching claim at or above the file's
-covered top *vouches* for that top (`ElReader::log_index_vouched`), and:
+covered top *vouches* for that top (`ElReader::log_index_claim`), and:
 
 - the tail's two finality-based rules (unvouched coverage, finality too far
   below the head) measure against `max(anchor finality, vouched top)`. The

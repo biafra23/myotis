@@ -1005,28 +1005,14 @@ pub struct ElReader {
     /// so those blocks' hashes are unknown and coverage above finality must
     /// be rewound rather than trusted). See [`Self::log_index_tail_tick`].
     log_index_tail: std::sync::Mutex<Vec<(u64, [u8; 32])>>,
-    /// The covered high of the installed index that THIS NODE's own checkpoint
-    /// vouched final (0: nothing vouched) — the one fact about coverage above
-    /// the anchor's finality that survives a restart without a tail record.
-    ///
-    /// Needed because a restart restores the beacon store from a snapshot
-    /// written once per sync-committee period (~11 h on gnosis, ~27 h on
-    /// mainnet): its finality can sit hours below the checkpoint, and the tail
-    /// would otherwise rewind everything in between as "unvouched" — coverage
-    /// that was final, can never reorg, and costs a head bridge to re-walk.
-    /// Set only when an index is installed from a file whose finality claim
-    /// matches it (`logindex::read_finality_claim`). Cleared once the anchor's
-    /// finality reaches it, once a current finality verified after the claim
-    /// was first weighed contradicts it ([`RestartClaim`]), or when the index
-    /// is replaced by one that did not come from that file (an import, a fresh
-    /// index). See [`Self::log_index_tail_tick`] for what it changes.
-    log_index_vouched: std::sync::atomic::AtomicU64,
-    /// The first anchor finality the current claim was weighed against (0: not
-    /// yet). Only a finality verified AFTER it may contradict the claim — a
-    /// restored one proves nothing, however current a skewed wall clock makes
-    /// it look. Set through [`Self::set_vouched`] and
-    /// [`Self::settle_restart_claim`] only.
-    log_index_claim_first_finality: std::sync::atomic::AtomicU64,
+    /// The restart claim — see [`RestartClaimState`]. Both of its fields sit
+    /// under this one lock, so a claim can never be judged against another
+    /// claim's first finality: the pairing is structural rather than an
+    /// ordering of separate atomic stores, and it holds whatever path installs
+    /// or clears a claim, now or after a refactor. Brief holds only. LOCK
+    /// ORDER: after `log_index` where both are held (every install path),
+    /// never before it; the anchor's lock is never taken under it.
+    log_index_claim: std::sync::Mutex<RestartClaimState>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1186,8 +1172,7 @@ impl ElReader {
             log_index_rate: std::sync::Mutex::new(None),
             log_index_bridge: std::sync::Mutex::new(None),
             log_index_tail: std::sync::Mutex::new(Vec::new()),
-            log_index_vouched: std::sync::atomic::AtomicU64::new(0),
-            log_index_claim_first_finality: std::sync::atomic::AtomicU64::new(0),
+            log_index_claim: std::sync::Mutex::new(RestartClaimState::default()),
             log_index_persist: PersistClock::new(),
             log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
@@ -1286,8 +1271,7 @@ impl ElReader {
                 // Clamped like every other checkpoint — `checkpoint_clamp`,
                 // with the record already retired above.
                 Some(p) => {
-                    let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
-                    let clamp = checkpoint_clamp(finalized_now, vouched, None);
+                    let clamp = checkpoint_clamp(finalized_now, self.vouched_now(), None);
                     let r = write_own_checkpoint(p, &checkpoint_bytes(ix, &tag, clamp), clamp);
                     if let Err(e) = &r {
                         tracing::warn!(
@@ -1348,12 +1332,12 @@ impl ElReader {
             // A restart claim vouches for coverage, so it survives exactly as
             // far as the coverage did: a merge keeps it, a fresh index has
             // nothing for it to vouch for.
-            let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
-            let kept = fresh
-                .append_edge()
-                .map_or(0, |edge| vouched.min(edge.saturating_sub(1)));
-            if kept != vouched {
-                self.set_vouched(kept);
+            let high = fresh.append_edge().map(|edge| edge.saturating_sub(1));
+            if let Ok(mut claim) = self.log_index_claim.lock() {
+                let kept = high.map_or(0, |h| claim.vouched.min(h));
+                if kept != claim.vouched {
+                    *claim = RestartClaimState { vouched: kept, first_finality: 0 };
+                }
             }
             *slot = Some(fresh);
             // The checkpoint above put a full-size file on disk, so it starts
@@ -1915,7 +1899,10 @@ impl ElReader {
             }
             return;
         }
-        let finalized = self.finalized_block_number();
+        // The finality and its currency as ONE pair: the restart claim is
+        // judged on both, and the rest of this tick must run on the same
+        // finality the claim was judged against.
+        let (finalized, finality_current) = self.finalized_block_number_with_currency();
         if finalized == 0 {
             self.clear_log_index_bridge();
             self.retire_tail_record();
@@ -1926,7 +1913,7 @@ impl ElReader {
         }
         // Before routing: a claim the anchor has caught up with must not keep
         // the tail on hold, and one it never will reach must not either.
-        self.settle_restart_claim(finalized);
+        self.settle_restart_claim(finalized, finality_current);
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
         let start = match edge {
             None => finalized, // fresh index: start at the finalized head
@@ -2134,7 +2121,7 @@ impl ElReader {
     /// anchor's finality all the same: the beacon store resumes from a snapshot
     /// written once per sync-committee period, so the first finality this run
     /// sees can trail the checkpoint by hours. That coverage is final, and the
-    /// checkpoint's own finality claim says so (`log_index_vouched`). So the
+    /// checkpoint's own finality claim says so (`log_index_claim`). So the
     /// finality-based rules below measure against the vouched height where it
     /// is higher than the anchor's finality — nothing at or below it can
     /// reorg — and while the anchored head is still below it the tail holds
@@ -2171,7 +2158,7 @@ impl ElReader {
         // `final_floor`; the chain-shortened one compares the head with the
         // covered top, and only this hold keeps a head below the vouched top
         // from looking like a reorg. `finalized` stays the anchor's own.
-        let vouched = self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed);
+        let vouched = self.vouched_now();
         if head_n < vouched {
             if ticks % 100 == 0 {
                 tracing::info!(
@@ -2566,45 +2553,54 @@ impl ElReader {
             .lock()
             .ok()
             .and_then(|t| t.iter().map(|(n, _)| *n).min());
-        checkpoint_clamp(
-            finalized,
-            self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed),
-            lowest,
-        )
+        checkpoint_clamp(finalized, self.vouched_now(), lowest)
     }
 
-    /// Install a restart claim (0: none) for the index being installed. The
-    /// claim starts unweighed, so the order matters: a settle racing this
-    /// must never pair the new claim with the old one's first finality.
+    /// The vouched top of the current restart claim (0: none).
+    fn vouched_now(&self) -> u64 {
+        self.log_index_claim.lock().map(|c| c.vouched).unwrap_or(0)
+    }
+
+    /// Install a restart claim (0: none) for the index being installed. It
+    /// starts unweighed.
     fn set_vouched(&self, vouched: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.log_index_claim_first_finality.store(0, Relaxed);
-        self.log_index_vouched.store(vouched, Relaxed);
+        if let Ok(mut claim) = self.log_index_claim.lock() {
+            *claim = RestartClaimState { vouched, first_finality: 0 };
+        }
+    }
+
+    /// [`Self::finalized_block_number`] and whether the light client calls it
+    /// current, as one consistent pair (see
+    /// [`ExecAnchor::finalized_execution_with_currency`]).
+    fn finalized_block_number_with_currency(&self) -> (u64, bool) {
+        let (fin, current) = self.anchor.finalized_execution_with_currency();
+        (fin.map(|f| f.block_number).unwrap_or(0), current)
     }
 
     /// Settle a restart's finality claim against the anchor's `finalized`
-    /// (non-zero): keep holding, or retire it for good — once the anchor has
-    /// caught up with it, or once a current finality verified after the claim
-    /// was first weighed contradicts it. See [`RestartClaim`].
-    fn settle_restart_claim(&self, finalized: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let vouched = self.log_index_vouched.load(Relaxed);
-        if vouched == 0 {
-            return;
-        }
-        let first = match self.log_index_claim_first_finality.compare_exchange(0, finalized, Relaxed, Relaxed) {
-            Ok(_) => finalized,
-            Err(seen) => seen,
+    /// (non-zero) and its currency, read as one pair: keep holding, or retire
+    /// the claim for good — once the anchor has caught up with it, or once a
+    /// current finality verified after the claim was first weighed contradicts
+    /// it. See [`RestartClaim`]. One critical section, so the claim judged is
+    /// the claim retired.
+    fn settle_restart_claim(&self, finalized: u64, finality_current: bool) {
+        let (fate, vouched) = {
+            let Ok(mut claim) = self.log_index_claim.lock() else {
+                return;
+            };
+            if claim.vouched == 0 {
+                return;
+            }
+            if claim.first_finality == 0 {
+                claim.first_finality = finalized;
+            }
+            let vouched = claim.vouched;
+            let fate = restart_claim_fate(finalized, vouched, claim.first_finality, finality_current);
+            if fate != RestartClaim::Hold {
+                *claim = RestartClaimState::default();
+            }
+            (fate, vouched)
         };
-        let fate = restart_claim_fate(finalized, vouched, first, self.anchor.finality_is_current());
-        if fate == RestartClaim::Hold {
-            return;
-        }
-        // Only retire the claim this call judged: an install racing us may
-        // just have set a new one.
-        if self.log_index_vouched.compare_exchange(vouched, 0, Relaxed, Relaxed).is_err() {
-            return;
-        }
         if fate == RestartClaim::Contradicted {
             tracing::warn!(
                 finalized,
@@ -2613,7 +2609,7 @@ impl ElReader {
                  node's checkpoint vouched final; dropping the claim — coverage above finality is \
                  re-checked as usual"
             );
-        } else {
+        } else if fate == RestartClaim::Subsumed {
             tracing::info!(
                 finalized,
                 vouched,
@@ -3148,10 +3144,7 @@ impl ElReader {
         ) {
             // The finality the tail itself measures against (see its restart
             // claim), so this check keeps mirroring the tail's own.
-            let finalized = tail_final_floor(
-                self.finalized_block_number(),
-                self.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            let finalized = tail_final_floor(self.finalized_block_number(), self.vouched_now());
             if backfill_should_yield(edge, head, finalized, *yielded) {
                 *yielded = yielded.saturating_add(1);
                 // The walker's rate clock is deliberately NOT re-anchored here.
@@ -7066,8 +7059,33 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
 /// save, never trust.
 const RESTART_CLAIM_MAX_LEAD: u64 = 512;
 
-/// What a restart's finality claim (see `ElReader::log_index_vouched`) means
-/// against the anchor's finality.
+/// A restart's finality claim as the reader holds it (`ElReader::log_index_claim`).
+///
+/// Needed because a restart restores the beacon store from a snapshot written
+/// once per sync-committee period (~11 h on gnosis, ~27 h on mainnet): its
+/// finality can sit hours below the checkpoint, and the tail would otherwise
+/// rewind everything in between as "unvouched" — coverage that was final, can
+/// never reorg, and costs a head bridge to re-walk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RestartClaimState {
+    /// The covered high of the installed index that THIS NODE's own checkpoint
+    /// vouched final (0: nothing vouched) — the one fact about coverage above
+    /// the anchor's finality that survives a restart without a tail record.
+    /// Set only when an index is installed from a file whose finality claim
+    /// matches it (`logindex::read_finality_claim`). Cleared once the anchor's
+    /// finality reaches it, once a current finality verified after the claim
+    /// was first weighed contradicts it ([`RestartClaim`]), or when the index
+    /// is replaced by one that did not come from that file (an import, a fresh
+    /// index). See `ElReader::log_index_tail_tick` for what it changes.
+    vouched: u64,
+    /// The first anchor finality this claim was weighed against (0: not yet).
+    /// Only a finality verified AFTER it may contradict the claim: a restored
+    /// one proves nothing, however current a skewed wall clock makes it look.
+    first_finality: u64,
+}
+
+/// What a restart's finality claim (see [`RestartClaimState`]) means against
+/// the anchor's finality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartClaim {
     /// The anchor is still below the vouched coverage: the tail holds.
@@ -9435,7 +9453,7 @@ mod restart_claim_reader_tests {
     }
 
     fn vouched(reader: &ElReader) -> u64 {
-        reader.log_index_vouched.load(std::sync::atomic::Ordering::Relaxed)
+        reader.vouched_now()
     }
 
     /// One background appender tick, as the appender loop runs it.
@@ -9594,6 +9612,27 @@ mod restart_claim_reader_tests {
         tick(&reader).await;
         assert_eq!(vouched(&reader), 0);
         assert_eq!(reader.log_index_covered_high(), Some(F0 + 16));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_claim_is_weighed_afresh() {
+        // The pairing the claim lock exists for: a claim is judged against the
+        // first finality IT was weighed at, never against a previous claim's.
+        let dir = TempDir::new("afresh");
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &dir.0.join("logindex-gnosis.db")).await;
+        reader.set_vouched(F1);
+        reader.settle_restart_claim(F0, true); // weighed at a restored finality: no evidence
+        assert_eq!(vouched(&reader), F1);
+        // A later install replaces the claim...
+        reader.set_vouched(F1 + 100);
+        // ...so F0 + 16 — newer than the OLD claim's first finality — is this
+        // claim's first, and still proves nothing against it.
+        reader.settle_restart_claim(F0 + 16, true);
+        assert_eq!(vouched(&reader), F1 + 100, "judged against another claim's first finality");
+        // Only a finality verified after that one does.
+        reader.settle_restart_claim(F0 + 32, true);
+        assert_eq!(vouched(&reader), 0);
         reader.stop().await;
     }
 
