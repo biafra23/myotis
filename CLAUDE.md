@@ -299,6 +299,12 @@ prompt and CLAUDE.md to the base ref, never execute fork code, keep reviews
 `COMMENT`-only, and lock down runner egress — see PR #375 for the discussion
 that produced this note.
 
+- **WRITE EVERY PR IN ENGLISH** (owner ruling, 2026-09-17) — title, description,
+  review replies and any top-level PR comment, whatever language the task was
+  discussed in. PRs are the project's public record and are read by external
+  contributors and by the automated reviewers; a German description makes a
+  change unreviewable for part of that audience. Talking to the owner in German
+  is fine and unaffected; the moment it lands on GitHub it is English.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
