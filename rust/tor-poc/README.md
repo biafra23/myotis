@@ -84,6 +84,12 @@ With no populated cache it falls back to the go-ethereum bootnodes, which are
 usually discovery-only and won't serve snap — a fresh `peers.cache` from a
 short `./gradlew :app:run` is the reliable source of live snap peers.
 
+Arti 0.44 needs rustc 1.91+. `rust/rust-toolchain.toml` selects `stable`, but
+rustup looks that file up from the *current directory*, not from
+`--manifest-path`: from the repo root your default toolchain applies, and an
+older one fails with "requires rustc 1.91". Use `cargo +stable run …` there, or
+`cd rust` first (then `--manifest-path tor-poc/Cargo.toml`).
+
 ## Scope / what this is NOT
 
 - No quarantined peer pool (§5), no multi-source popularity promotion (§6.2),
