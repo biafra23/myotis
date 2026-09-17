@@ -270,6 +270,9 @@ pub unsafe extern "C" fn myotis_get_storage_at_json(
 
 /// Verified `eth_call` over the revm executor (`nativeEthCallJson` twin).
 /// `from` empty ⇒ anonymous sender; `value` is wei as a decimal string.
+/// `block` is checked by the engine (ABI ≥ 27): a number outside the window
+/// around the verified head is refused, never answered from the head (see
+/// `crate::host::eth_call_json` and the header).
 ///
 /// # Safety
 /// All pointer params must be null or valid null-terminated C strings.
@@ -316,7 +319,7 @@ pub unsafe extern "C" fn myotis_eth_call_overrides_json(
     // CLAUDE.md's apply-or-refuse rule exists to prevent. Absent and
     // undecodable must stay distinguishable.
     let Some(to) = read_string(to) else {
-        return into_c(crate::eljson::error_json(
+        return into_c(crate::eljson::invalid_params_json(
             "invalid 'to' (undecodable string; pass an empty string for contract creation)",
         ));
     };
@@ -647,6 +650,33 @@ mod tests {
         assert_eq!(unsafe { take(myotis_status_json(0)) }, "{}");
         myotis_stop(0); // unknown id: must be a silent no-op
         unsafe { myotis_string_free(std::ptr::null_mut()) };
+    }
+
+    /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent
+    /// block, i.e. latest; anything that does not decode to a servable
+    /// selector is refused as invalid params, never read as latest.
+    #[test]
+    fn eth_call_block_is_checked_across_the_c_abi() {
+        let null = std::ptr::null();
+        let to = CString::new(format!("0x{}", "11".repeat(20))).unwrap();
+        let call = |block: *const c_char| -> serde_json::Value {
+            let out = unsafe {
+                take(myotis_eth_call_json(i64::MIN, null, to.as_ptr(), null, null, block))
+            };
+            serde_json::from_str(&out).unwrap()
+        };
+        // Past the block check, to the handle lookup.
+        assert_eq!(call(null)["error"], "unknown handle");
+        assert_eq!(call(c"earliest".as_ptr())["code"], -32602);
+        // Invalid UTF-8 decodes lossily, and the result is refused.
+        let bad = [0xff_u8, 0xfe, 0];
+        assert_eq!(call(bad.as_ptr().cast())["code"], -32602);
+
+        // The overrides twin refuses a NULL `to` (an empty one is creation).
+        let out = unsafe {
+            take(myotis_eth_call_overrides_json(i64::MIN, null, null, null, null, null, null))
+        };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["code"], -32602);
     }
 }
 

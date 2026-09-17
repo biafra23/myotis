@@ -1,4 +1,5 @@
-// Addon-level API tests for createWithCheckpoint (ABI 26, #441). Run against a
+// Addon-level API tests for createWithCheckpoint (ABI 26, #441) and for
+// ethCallJson's block check (ABI 27, #452). Run against a
 // BUILT addon: node --test addon-api.test.mjs, with MYOTIS_NODE_ADDON pointing at
 // the .node (or a cargo output: libmyotis_node.so/.dylib, myotis_node.dll);
 // without one the tests skip rather than fail, so a cargo-less checkout still
@@ -89,6 +90,40 @@ test('a fresh dir binds to the anchor; only the same anchor resumes; others get 
     assert.equal(m.createWithCheckpoint('mainnet', dir, ROOT, SLOT + 1), -3, 'different slot');
     assert.equal(m.create('mainnet', dir), -3, 'plain create on a marked dir');
   } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// #452: ethCallJson's `block` used to be ignored, so a historical block got
+// head state back. The engine now refuses an unservable selector in-band, and
+// marks the refusal permanent with the JSON-RPC invalid-params code.
+test('ethCallJson refuses an unservable block as permanent invalid params (ABI 27)', { skip }, async () => {
+  assert.ok(m.init() >= 27, `init()=${m.init()}`);
+  const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
+  let h = -1;
+  try {
+    h = m.create('mainnet', join(base, 'call'));
+    assert.ok(h >= 1, `create failed: ${h}`);
+    const to = '0x' + '11'.repeat(20);
+    for (const block of ['earliest', '0xzz', '0x' + 'ab'.repeat(32)]) {
+      const r = JSON.parse(await m.ethCallJson(h, '', to, '', '', block));
+      assert.equal(typeof r.error, 'string', `${block}: ${JSON.stringify(r)}`);
+      assert.equal(r.code, -32602, `${block}: ${JSON.stringify(r)}`);
+    }
+    // A NUL byte is refused by the addon itself, before the engine, and is
+    // just as permanent.
+    for (const [from, block] of [['0x\0', 'latest'], ['', 'lat\0est']]) {
+      const r = JSON.parse(await m.ethCallJson(h, from, to, '', '', block));
+      assert.equal(r.error, 'argument contains NUL', JSON.stringify(r));
+      assert.equal(r.code, -32602, JSON.stringify(r));
+    }
+    // A well-formed number passes the parse. This handle was never started,
+    // so the call fails as a plain, retryable error, not with head state.
+    const r = JSON.parse(await m.ethCallJson(h, '', to, '', '', '0x1'));
+    assert.equal(typeof r.error, 'string', JSON.stringify(r));
+    assert.equal(r.code, undefined, JSON.stringify(r));
+  } finally {
+    if (h >= 1) m.stop(h);
     rmSync(base, { recursive: true, force: true });
   }
 });

@@ -265,7 +265,10 @@ pub fn request_account_json<'env>(env: &'env Env, handle: i64, address: String) 
 }
 
 /// Verified eth_call over the revm executor. `from` empty = anonymous sender;
-/// `value` is wei as a decimal string; `block` is a tag or 0x-number.
+/// `value` is wei as a decimal string; `block` is a tag or a block number.
+/// The engine checks `block`: the call runs against the verified head, so a
+/// number outside [head-64, head+16] is refused, never answered from the head
+/// (`{"error","code":-32602}` when it can never be served; README "Notes").
 #[napi(ts_return_type = "Promise<string>")]
 pub fn eth_call_json<'env>(env: &'env Env,
     handle: i64,
@@ -280,7 +283,9 @@ pub fn eth_call_json<'env>(env: &'env Env,
             (Ok(f), Ok(t), Ok(d), Ok(v), Ok(b)) => take(unsafe {
                 myotis_eth_call_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr(), b.as_ptr())
             }),
-            _ => r#"{"error":"argument contains NUL"}"#.to_string(),
+            // A malformed argument, refused here instead of in the engine:
+            // permanent, like the engine's own refusals for this call (README).
+            _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
         }
     })
 }

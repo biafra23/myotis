@@ -272,6 +272,17 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
     }
 
+    @Test
+    void callInvalidParamsEnvelopeIsStillAnError() {
+        // ABI 27: eth_call's permanent block refusal carries a JSON-RPC code
+        // (eljson::invalid_params_json, pinned there by invalid_params_json_shape).
+        // The second key must not make it read as a result with no status.
+        String json = "{\"error\":\"block \\\"0x1\\\" is too old\",\"code\":-32602}";
+        EngineException e = assertThrows(EngineException.class,
+                () -> RustChainHandle.callDetailedFromJson(json));
+        assertEquals("block \"0x1\" is too old", e.getMessage());
+    }
+
     // ---- eth_estimateGas (estimateGasFromJson) ----
 
     @Test
