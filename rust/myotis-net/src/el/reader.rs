@@ -2978,7 +2978,8 @@ impl ElReader {
                 // progress either, so "unknown" is the honest reading; holding
                 // the anchor at NOW would instead keep the pre-yield EMA on
                 // screen for as long as the yield lasts, which in the
-                // fairness-floor regime is ~50x optimistic.
+                // fairness-floor regime is ~10x optimistic
+                // (`BACKFILL_YIELD_MAX_TICKS`).
                 if ticks % 100 == 0 {
                     tracing::debug!(
                         edge,
@@ -6206,8 +6207,8 @@ mod tests {
     #[test]
     fn backfill_yields_only_while_head_follow_can_close_the_gap() {
         use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};
-        // A block or two behind is a live chain between tail ticks, not a stall.
-        assert!(!backfill_should_yield(1_000, 1_001, 1_000, 0));
+        // One block behind is a live chain between tail ticks, not a stall.
+        assert!(!backfill_should_yield(1_000, 1_000, 1_000, 0));
         // A real gap that head-follow can close: stand down for it.
         assert!(backfill_should_yield(1_000, 1_200, 1_150, 0));
         // Wider than the bridge will ever map: coverage holds by design, so the
@@ -6215,7 +6216,11 @@ mod tests {
         assert!(!backfill_should_yield(1_000, 1_000_000, 900_000, 0));
         // Finality stalled TAIL_MAX below the head: the tail parks — keep walking.
         assert!(!backfill_should_yield(1_000, 5_000, 1_000, 0));
-        // Fairness floor: after enough yielded ticks, take a batch regardless.
+        // Fairness floor, both sides: one tick short of it the walk still stands
+        // down, at it the walk takes a batch regardless. Pinned from below too,
+        // because the floor is the only thing between a permanently trailing
+        // head and a permanently silenced walk.
+        assert!(backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS - 1));
         assert!(!backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS));
         // The boundaries the two bugs lived on. At exactly TAIL_MAX the tail
         // parks (so keep walking); one block inside it, head-follow still owns
@@ -6230,7 +6235,7 @@ mod tests {
         // pending blocks stay with the walk (the steady state of a 5 s chain on
         // a 6 s tick), three hand the tick to head-follow.
         assert!(!backfill_should_yield(1_000, 1_001, 1_000, 0));
-        assert!(backfill_should_yield(1_000, 1_002, 1_001, 0));
+        assert!(backfill_should_yield(1_000, 1_002, 1_000, 0));
         // Coverage past the head (edge = head + 1) is zero pending, not one.
         assert!(!backfill_should_yield(1_001, 1_000, 1_000, 0));
         // No finality yet: keep walking, there is nothing to defer to.
