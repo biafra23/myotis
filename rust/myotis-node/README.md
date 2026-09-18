@@ -164,7 +164,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 27** and existing JS
+This implementation targets the current engine's **ABI 28** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now

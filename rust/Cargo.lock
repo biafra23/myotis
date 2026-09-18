@@ -4227,6 +4227,7 @@ dependencies = [
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",
+ "serde_json",
  "sha2",
  "sha3 0.10.9",
  "snap",

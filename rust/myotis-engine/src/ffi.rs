@@ -317,6 +317,14 @@ pub fn log_index_status_json(handle: i64) -> String {
     crate::host::log_index_status_json(handle)
 }
 
+/// Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
+/// / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
+/// docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+#[uniffi::export]
+pub fn read_stats_json(handle: i64) -> String {
+    crate::host::read_stats_json(handle)
+}
+
 /// Import portable log-index snapshots (JSON array of absolute file paths;
 /// each file must be a self-describing snapshot of this handle's chain).
 /// All-or-nothing merge into the node's index; importing is the opt-in, so

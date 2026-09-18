@@ -85,6 +85,7 @@ public class CommandHandler {
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
                 case "logindex-status"         -> handle.logIndexStatusJson();
+                case "read-stats"              -> handle.readStatsJson();
                 default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {

@@ -15,6 +15,7 @@ pub mod logindex;
 pub mod peercache;
 pub mod pool;
 pub mod reader;
+pub mod readstats;
 pub mod request;
 mod tasks;
 pub mod receipt;

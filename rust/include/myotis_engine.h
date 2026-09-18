@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 27
+#define MYOTIS_ABI_VERSION 28
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -210,6 +210,12 @@ void myotis_string_free(char *s);
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);
+
+/* v28: the read-fetch shadow-cache counters (docs/read-stats.md): how much of
+ * the verified account / storage / bytecode fetch traffic a cache would have
+ * served, by keying, with the wall-clock it would have saved. Counts only —
+ * nothing is served from it. {"error": ...} when the handle has no EL reader. */
+char *myotis_read_stats_json(int64_t handle);
 
 /* v24: import portable log-index snapshots. paths_json is a JSON array of
  * absolute file paths, each a self-describing snapshot of this handle's

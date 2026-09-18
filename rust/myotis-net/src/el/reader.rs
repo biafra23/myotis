@@ -18,6 +18,7 @@
 //!    in `fail_reason`, never raised.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -41,6 +42,7 @@ use crate::el::evm::{
 };
 use crate::el::peer::ManagedPeer;
 use crate::el::pool::{PeerPool, PoolConfig};
+use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
 use crate::el::tx;
@@ -239,6 +241,29 @@ pub struct VerifiedAccount {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+}
+
+/// The shadow cache's view of a verified account read (`el::readstats`).
+fn account_fact(r: &VerifiedAccount) -> AccountFact {
+    if !r.exists {
+        return AccountFact::absent();
+    }
+    AccountFact {
+        nonce: r.nonce,
+        balance: pad32(&r.balance),
+        storage_root: r.storage_root,
+        code_hash: r.code_hash,
+    }
+}
+
+/// The snap round-trip costs of one direct storage read, for the shadow cache:
+/// the account proof (always fetched — it carries the storage root) and the
+/// slot proof (skipped when the account is absent or has no storage).
+#[derive(Clone, Copy)]
+struct StorageSnapCost {
+    account: AccountFact,
+    account_elapsed: Duration,
+    slot_elapsed: Option<Duration>,
 }
 
 /// A verified storage-slot query result (twin of the Java `StorageProofResult`).
@@ -914,6 +939,12 @@ pub struct ElReader {
     /// the cache is a later dispatch-fairness refinement (EL-C-3).
     evm_proof_cache: Arc<InMemoryStateProofCache>,
     evm_bytecode_cache: Arc<InMemoryBytecodeCache>,
+    /// The read-fetch shadow cache (`el::readstats`): every verified account /
+    /// storage / bytecode fetch on this reader — the direct reads below and the
+    /// EVM oracle's — reports here so `read_stats_json` can say how much of
+    /// the traffic a cache (and which keying) would have served. Counts only;
+    /// it never serves a value.
+    read_stats: Arc<ReadStats>,
     /// Per-tx receipt scan cursors (`eth_getTransactionReceipt` /
     /// `locateMinedTx`). Outer std Mutex guards only the map (held briefly);
     /// each entry's tokio Mutex serializes the (network-slow) scan per tx hash,
@@ -1061,7 +1092,7 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cache_path: Option<std::path::PathBuf>,
     ) -> Result<ElReader, String> {
-        ElReader::start_for(anchor, cache_path, ElConfig::mainnet()).await
+        ElReader::start_for(anchor, cache_path, ElConfig::mainnet(), Arc::new(ReadStats::new())).await
     }
 
     /// Start a reader for any network's [`ElConfig`] with a freshly-generated
@@ -1071,18 +1102,31 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cache_path: Option<std::path::PathBuf>,
         base: ElConfig,
+        read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let key = generate_node_key()?;
         let cfg = ElConfig { cache_path, ..base };
-        ElReader::start(key, anchor, cfg).await
+        ElReader::start_with_stats(key, anchor, cfg, read_stats).await
     }
 
     /// Start discovery + the peer pool for `cfg`, reading verified state against
-    /// `anchor` (the beacon sync loop's execution anchor).
+    /// `anchor` (the beacon sync loop's execution anchor), with a fresh
+    /// read-fetch shadow cache.
     pub async fn start(
         key: Arc<NodeKey>,
         anchor: Arc<ExecAnchor>,
         cfg: ElConfig,
+    ) -> Result<ElReader, String> {
+        ElReader::start_with_stats(key, anchor, cfg, Arc::new(ReadStats::new())).await
+    }
+
+    /// [`start`](Self::start) reporting into an existing shadow cache — how a
+    /// resume keeps the counters the paused reader accumulated.
+    pub async fn start_with_stats(
+        key: Arc<NodeKey>,
+        anchor: Arc<ExecAnchor>,
+        cfg: ElConfig,
+        read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
         let discovery = Discv4Service::start(
@@ -1149,6 +1193,7 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
+            read_stats,
             tx_scans: std::sync::Mutex::new(TxScanMap {
                 map: std::collections::HashMap::new(),
                 last_sweep: std::time::Instant::now(),
@@ -3688,13 +3733,39 @@ impl ElReader {
         // answers before its hedge does. Accepted = a verdict, or a GLOBAL
         // failure (beacon not ready — identical for every peer); a per-peer
         // verdict failure (stale head / bad proof) becomes the fallback.
-        self.hedged_read(
-            &peers,
-            |peer| async move { self.get_account_from(&peer, address).await },
-            |r: &VerifiedAccount| r.verify_method.is_some() || is_global_fail(r.fail_reason),
-            "a verifiable account",
-        )
-        .await
+        let (result, snap_elapsed) = self
+            .hedged_read(
+                &peers,
+                |peer| async move { self.get_account_from(&peer, address).await },
+                |(r, _): &(VerifiedAccount, Duration)| {
+                    r.verify_method.is_some() || is_global_fail(r.fail_reason)
+                },
+                "a verifiable account",
+            )
+            .await?;
+        // Shadow-cache bookkeeping for the VERIFIED answer only (an unverified
+        // fallback is not a fact a cache could ever have served), costed at the
+        // winning peer's snap round-trip — not the anchoring ladder after it.
+        if result.verify_method.is_some() {
+            self.read_stats.observe_account(
+                address,
+                result.peer_state_root,
+                account_fact(&result),
+                snap_elapsed,
+            );
+        }
+        Ok(result)
+    }
+
+    /// The read-fetch shadow cache's counters as JSON (`el::readstats`).
+    pub fn read_stats_json(&self) -> String {
+        self.read_stats.to_json()
+    }
+
+    /// The shadow cache itself, so a pausing host can carry it into the reader
+    /// that resume builds (the counters are per chain handle, not per reader).
+    pub fn read_stats(&self) -> Arc<ReadStats> {
+        Arc::clone(&self.read_stats)
     }
 
     /// [`hedged_race`] plus peer-quality bookkeeping: record the winner as
@@ -3728,20 +3799,27 @@ impl ElReader {
     /// One account fetch + verdict against a single peer (no retry, no cache
     /// bookkeeping — the hedged race owns those). Any transport/proof error
     /// propagates so the race records the miss and lets another peer answer.
+    /// The second value is the snap round-trip's wall-clock (the shadow cache's
+    /// cost measure), excluding the beacon-anchoring ladder.
     async fn get_account_from(
         &self,
         peer: &ManagedPeer,
         address: [u8; 20],
-    ) -> Result<VerifiedAccount, String> {
+    ) -> Result<(VerifiedAccount, Duration), String> {
+        let started = Instant::now();
         let (state_root, block_number, outcome) =
             self.snap_account_at_best_root(peer, address).await?;
+        let snap_elapsed = started.elapsed();
         // Anchor the (proof-valid) state root to the beacon chain. The anchor
         // path's root short-circuits via the stateRootMatch fast path; the
         // fallback path's peer root runs the full ladder.
         let verdict = peer
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+        Ok((
+            self.build_verified_account(address, state_root, block_number, outcome, verdict),
+            snap_elapsed,
+        ))
     }
 
     /// Fetch + MPT-verify one account against the best available state root:
@@ -3981,20 +4059,48 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        self.hedged_read(
-            &peers,
-            |peer| async move {
-                self.get_storage_from(&peer, address, slot, holder, storage_key).await
-            },
-            |r: &VerifiedStorage| r.verify_method.is_some() || is_global_fail(r.fail_reason),
-            "verifiable storage",
-        )
-        .await
+        let (result, snap) = self
+            .hedged_read(
+                &peers,
+                |peer| async move {
+                    self.get_storage_from(&peer, address, slot, holder, storage_key).await
+                },
+                |(r, _): &(VerifiedStorage, StorageSnapCost)| {
+                    r.verify_method.is_some() || is_global_fail(r.fail_reason)
+                },
+                "verifiable storage",
+            )
+            .await?;
+        // Shadow-cache bookkeeping for the VERIFIED answer only: the account
+        // proof this path fetches to learn the storage root, then the slot
+        // proof (when the account had storage to prove), each at its own snap
+        // round-trip cost — the same two facts the EVM oracle reports.
+        if result.verify_method.is_some() {
+            self.read_stats.observe_account(
+                address,
+                result.peer_state_root,
+                snap.account,
+                snap.account_elapsed,
+            );
+            if let Some(slot_elapsed) = snap.slot_elapsed {
+                self.read_stats.observe_storage(
+                    address,
+                    storage_key,
+                    result.peer_state_root,
+                    result.storage_root,
+                    pad32(&result.value),
+                    slot_elapsed,
+                );
+            }
+        }
+        Ok(result)
     }
 
     /// One storage-slot fetch + verdict against a single peer (no retry / cache
     /// bookkeeping — the hedged race owns those). Errors propagate so the race
-    /// records the miss and another peer can answer.
+    /// records the miss and another peer can answer. The second value carries
+    /// the shadow cache's cost measure: each snap round-trip's wall-clock,
+    /// excluding the beacon-anchoring ladder.
     async fn get_storage_from(
         &self,
         peer: &ManagedPeer,
@@ -4002,12 +4108,21 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
-    ) -> Result<VerifiedStorage, String> {
+    ) -> Result<(VerifiedStorage, StorageSnapCost), String> {
         // Step 1: the proof-verified account gives the trusted storage root.
         // Root selection prefers the beacon anchor's current optimistic root
         // (issue #355 — see snap_account_at_best_root).
+        let started = Instant::now();
         let (state_root, block_number, outcome) =
             self.snap_account_at_best_root(peer, address).await?;
+        let mut snap = StorageSnapCost {
+            account: match &outcome {
+                AccountOutcome::Present(leaf) => AccountFact::from_leaf(Some(leaf)),
+                AccountOutcome::Absent => AccountFact::absent(),
+            },
+            account_elapsed: started.elapsed(),
+            slot_elapsed: None,
+        };
 
         let slot_key_hash = keccak256(&storage_key);
 
@@ -4046,14 +4161,16 @@ impl ElReader {
                 .await;
             result.storage_proof_valid = true; // exclusion proof held
             apply_verdict(&mut result, &verdict);
-            return Ok(result);
+            return Ok((result, snap));
         };
         result.storage_root = leaf.storage_root;
 
         // Step 2: verify the slot against the proof-verified storage root.
+        let started = Instant::now();
         let value = peer
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
             .await?;
+        snap.slot_elapsed = Some(started.elapsed());
         result.storage_proof_valid = true;
         // `found` means the slot holds a non-zero value (Java's convention): a
         // zero slot is pruned from the trie and indistinguishable from unset,
@@ -4069,7 +4186,7 @@ impl ElReader {
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         apply_verdict(&mut result, &verdict);
-        Ok(result)
+        Ok((result, snap))
     }
 
     /// Fetch + verify a contract's bytecode (`eth_getCode`). The account query is
@@ -4105,7 +4222,9 @@ impl ElReader {
         {
             return Ok(result);
         }
+        let started = Instant::now();
         result.code = self.fetch_bytecode(&account.code_hash).await?;
+        self.read_stats.observe_code(account.code_hash, started.elapsed());
         Ok(result)
     }
 
@@ -4508,6 +4627,7 @@ impl ElReader {
             peers,
             tokio::runtime::Handle::current(),
             Some(self.pool.quality_sink()),
+            Arc::clone(&self.read_stats),
         ));
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on

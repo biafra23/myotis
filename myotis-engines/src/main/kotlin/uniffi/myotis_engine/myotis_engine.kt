@@ -724,6 +724,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_pending_nonce_overlay(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_read_stats_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_request_account_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_resolve_ens_json(
@@ -813,6 +815,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_pending_nonce_overlay(`handle`: Long,`addressHex`: RustBuffer.ByValue,`minedNonce`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_myotis_engine_fn_func_read_stats_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_resolve_ens_json(`handle`: Long,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1032,6 +1036,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_pending_nonce_overlay() != 21732) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_read_stats_json() != 19147) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_request_account_json() != 31953) {
@@ -1745,6 +1752,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`addressHex`),
         FfiConverterLong.lower(`minedNonce`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
+         * / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
+         * docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+         */ fun `readStatsJson`(`handle`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_read_stats_json(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
 }
     )
     }

@@ -90,21 +90,24 @@ public interface StateProofCache {
         @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) {}
     }
 
+    /** An access-ordered map that evicts its least-recently-used entry past
+     *  {@code cap}. NOT synchronized — callers own the locking ({@link InMemory}
+     *  wraps it; {@link ReadStats} holds its own lock). */
+    static <K, V> Map<K, V> boundedLru(int cap) {
+        return new LinkedHashMap<>(16, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                return size() > cap;
+            }
+        };
+    }
+
     final class InMemory implements StateProofCache {
         private final Map<String, BigInteger> storage;
         private final Map<String, AccountEntry> accounts;
 
         InMemory(int maxEntriesPerKind) {
-            this.storage = boundedLru(maxEntriesPerKind);
-            this.accounts = boundedLru(maxEntriesPerKind);
-        }
-
-        private static <V> Map<String, V> boundedLru(int cap) {
-            return Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(Map.Entry<String, V> eldest) {
-                    return size() > cap;
-                }
-            });
+            this.storage = Collections.synchronizedMap(boundedLru(maxEntriesPerKind));
+            this.accounts = Collections.synchronizedMap(boundedLru(maxEntriesPerKind));
         }
 
         private static String hex(byte[] b) { return Hex.formatHex(b); }

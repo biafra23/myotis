@@ -358,6 +358,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Owned state (created here; stopped in close())
     // ---------------------------------------------------------------------
 
+    /** The read-fetch shadow cache (stack-owned). See the constructor. */
+    private final io.myotis.evm.world.ReadStats readStats;
+
     /** Bytecode is keyed by hash, so this cache is valid forever across roots. */
     private final io.myotis.evm.world.BytecodeCache bytecodeCache =
             io.myotis.evm.world.BytecodeCache.inMemory();
@@ -622,13 +625,19 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  OPTIMISATIONS_AND_LIMITATIONS.md §2.14 for why relaxing the default backfired. */
     private final long stateHeadStaleCapMs;
 
+    /** {@code readStats} — the stack-owned read-fetch shadow cache the snap oracle
+     *  reports every verified fetch to ({@link io.myotis.evm.world.ReadStats}).
+     *  Stack-owned (not backend-owned) so the counters survive the pause/resume
+     *  backend rebuild, like {@code ServeStats}. */
     public VerifiedRpcBackend(RLPxConnector connector,
                               BeaconLightClient beaconLightClient,
                               BeaconSyncState beaconSyncState,
                               io.myotis.evm.ccipread.CcipGateway ccipGateway,
                               RpcLogger log,
                               RpcClock clock,
-                              SnapQualitySink snapQuality) {
+                              SnapQualitySink snapQuality,
+                              io.myotis.evm.world.ReadStats readStats) {
+        this.readStats = java.util.Objects.requireNonNull(readStats, "readStats");
         this.connector = java.util.Objects.requireNonNull(connector, "connector");
         // Heavy-lane snap concurrency cap = half the live snap peers (dynamic). The 30s
         // wait is only a deadlock safety net — permits free as in-flight requests complete.
@@ -1846,7 +1855,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         },
                         bytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS,
-                        stateProofCache);
+                        stateProofCache,
+                        readStats);
         io.myotis.evm.DefaultEvmExecutor base =
                 new io.myotis.evm.DefaultEvmExecutor(oracle, bytecodeCache, evmPool);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =

@@ -712,6 +712,13 @@ pub unsafe extern "C" fn myotis_log_index_status_json(handle: i64) -> *mut std::
     into_c(crate::host::log_index_status_json(handle))
 }
 
+/// Read-fetch shadow-cache counters JSON (see ffi::read_stats_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_read_stats_json(handle: i64) -> *mut std::os::raw::c_char {
+    into_c(crate::host::read_stats_json(handle))
+}
+
 /// Import portable log-index snapshots (see ffi::import_log_index_files).
 /// Returned string must be freed with `myotis_string_free`.
 #[no_mangle]

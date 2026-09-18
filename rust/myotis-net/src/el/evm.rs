@@ -34,6 +34,7 @@ use myotis_evm::{
 };
 
 use crate::el::peer::ManagedPeer;
+use crate::el::readstats::{AccountFact, ReadStats};
 use crate::el::snap::fetch::AccountOutcome;
 
 /// The outcome of an `eth_call`. Mirrors the Java engine's contract, which
@@ -213,7 +214,7 @@ fn be_to_u64(bytes: &[u8]) -> u64 {
 /// A minimal big-endian scalar → `U256`. `None` if longer than 32 bytes (a
 /// proof-verified account/storage scalar never is — this only guards against a
 /// panic on adversarial input).
-fn u256_be(bytes: &[u8]) -> Option<U256> {
+pub(crate) fn u256_be(bytes: &[u8]) -> Option<U256> {
     if bytes.len() > 32 {
         None
     } else {
@@ -236,6 +237,10 @@ pub struct PoolOracle {
     /// and every `fetch_storage` on the same contract need. `Some(None)` caches a
     /// proven absence.
     leaf_memo: Mutex<HashMap<[u8; 20], Option<AccountLeaf>>>,
+    /// The reader's read-fetch shadow cache: every verified fetch this oracle
+    /// makes — including the prefetch wave's — is reported with its wall-clock
+    /// cost so `read_stats_json` covers the EVM path too.
+    stats: Arc<ReadStats>,
 }
 
 impl PoolOracle {
@@ -243,6 +248,7 @@ impl PoolOracle {
         peers: Vec<Arc<ManagedPeer>>,
         handle: Handle,
         quality: Option<crate::el::pool::SnapQualitySink>,
+        stats: Arc<ReadStats>,
     ) -> PoolOracle {
         PoolOracle {
             operation: super::request::Operation::current(),
@@ -250,7 +256,45 @@ impl PoolOracle {
             handle,
             quality,
             leaf_memo: Mutex::new(HashMap::new()),
+            stats,
         }
+    }
+
+    /// Shadow-cache bookkeeping for one verified account fetch (`None` = a
+    /// verified absence) that started at `started`.
+    fn note_account(
+        &self,
+        address: [u8; 20],
+        state_root: &[u8; 32],
+        leaf: Option<&AccountLeaf>,
+        started: std::time::Instant,
+    ) {
+        self.stats.observe_account(
+            address,
+            *state_root,
+            AccountFact::from_leaf(leaf),
+            started.elapsed(),
+        );
+    }
+
+    /// Shadow-cache bookkeeping for one verified slot fetch.
+    fn note_storage(
+        &self,
+        address: [u8; 20],
+        position: [u8; 32],
+        state_root: &[u8; 32],
+        storage_root: [u8; 32],
+        value: U256,
+        started: std::time::Instant,
+    ) {
+        self.stats.observe_storage(
+            address,
+            position,
+            *state_root,
+            storage_root,
+            value.to_be_bytes::<32>(),
+            started.elapsed(),
+        );
     }
 
     fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T, OracleError> {
@@ -286,6 +330,7 @@ impl PoolOracle {
         }
         // No lock held across the network fetch.
         let quality = self.quality.clone();
+        let started = std::time::Instant::now();
         let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer.snap_get_account(state_root, &address).await {
@@ -305,6 +350,7 @@ impl PoolOracle {
         })?;
         match fetched {
             Some(leaf) => {
+                self.note_account(address, state_root, leaf.as_ref(), started);
                 self.leaf_memo.lock().unwrap().insert(address, leaf.clone());
                 Ok(leaf)
             }
@@ -422,7 +468,16 @@ impl SnapStateOracle for PoolOracle {
                         let Ok(_permit) = sem.acquire().await else {
                             return ItemOutcome::Failed;
                         };
-                        match peer.snap_get_account(state_root, &addr).await {
+                        let started = std::time::Instant::now();
+                        let outcome = peer.snap_get_account(state_root, &addr).await;
+                        if let Ok(o) = &outcome {
+                            let leaf = match o {
+                                AccountOutcome::Present(l) => Some(l),
+                                AccountOutcome::Absent => None,
+                            };
+                            self.note_account(addr, state_root, leaf, started);
+                        }
+                        match outcome {
                             Ok(AccountOutcome::Present(leaf)) => leaf,
                             Ok(AccountOutcome::Absent) => {
                                 proof_sink.put_account(state_root, &addr, None);
@@ -456,10 +511,16 @@ impl SnapStateOracle for PoolOracle {
                         let Ok(_permit) = sem.acquire().await else {
                             return None; // closed semaphore = local failure
                         };
-                        peer.snap_get_storage(state_root, &addr, &leaf, &position)
+                        let started = std::time::Instant::now();
+                        let value = peer
+                            .snap_get_storage(state_root, &addr, &leaf, &position)
                             .await
                             .ok()
-                            .and_then(|bytes| u256_be(&bytes))
+                            .and_then(|bytes| u256_be(&bytes));
+                        if let Some(v) = value {
+                            self.note_storage(addr, position, state_root, leaf.storage_root, v, started);
+                        }
+                        value
                     }
                 }))
                 .await;
@@ -544,7 +605,9 @@ impl SnapStateOracle for PoolOracle {
                     let Ok(_permit) = sem.acquire().await else {
                         return; // closed semaphore — never bypass the bound
                     };
+                    let started = std::time::Instant::now();
                     if let Ok(code) = peer.snap_get_bytecode(hash).await {
+                        self.stats.observe_code(*hash, started.elapsed());
                         code_sink.put(hash, code.into());
                     }
                 }
@@ -578,6 +641,7 @@ impl SnapStateOracle for PoolOracle {
         }
         let position = slot.to_be_bytes::<32>();
         let quality = self.quality.clone();
+        let started = std::time::Instant::now();
         let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer
@@ -595,11 +659,15 @@ impl SnapStateOracle for PoolOracle {
         })?;
         match fetched {
             // Empty bytes = a proven-zero / absent slot.
-            Some(value) => u256_be(&value).ok_or_else(|| OracleError::InvalidProof {
-                state_root: *state_root,
-                address,
-                detail: format!("storage value scalar too long ({} bytes)", value.len()),
-            }),
+            Some(value) => {
+                let v = u256_be(&value).ok_or_else(|| OracleError::InvalidProof {
+                    state_root: *state_root,
+                    address,
+                    detail: format!("storage value scalar too long ({} bytes)", value.len()),
+                })?;
+                self.note_storage(address, position, state_root, leaf.storage_root, v, started);
+                Ok(v)
+            }
             None => Err(OracleError::StateUnavailable {
                 state_root: *state_root,
                 address,
@@ -612,6 +680,7 @@ impl SnapStateOracle for PoolOracle {
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
+        let started = std::time::Instant::now();
         let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer.snap_get_bytecode(code_hash).await {
@@ -624,9 +693,11 @@ impl SnapStateOracle for PoolOracle {
             }
             None
         })?;
-        fetched.ok_or(OracleError::BytecodeUnavailable {
+        let code = fetched.ok_or(OracleError::BytecodeUnavailable {
             code_hash: *code_hash,
-        })
+        })?;
+        self.stats.observe_code(*code_hash, started.elapsed());
+        Ok(code)
     }
 }
 

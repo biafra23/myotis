@@ -311,7 +311,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         stack.beginRequest();
         try {
             return io.myotis.node.VerifiedStorageQuery.query(
-                    conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull);
+                    conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull, stack.readStats());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new EngineException("interrupted while querying storage", e);
@@ -322,6 +322,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         } finally {
             stack.endRequest();
         }
+    }
+
+    @Override
+    public String readStatsJson() {
+        return stack.readStats().toJson();
     }
 
     @Override
