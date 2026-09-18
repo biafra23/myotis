@@ -168,7 +168,9 @@ This implementation targets the current engine's **ABI 28** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
-be refused. It is not a drop-in artifact for a host pinned to ABI 22.
+be refused, and ABI 28 added `read_stats_json` (the read-fetch shadow-cache
+counters, docs/read-stats.md — not yet wrapped here). It is not a drop-in
+artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

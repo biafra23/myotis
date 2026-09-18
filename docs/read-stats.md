@@ -47,8 +47,16 @@ Three notes on what the numbers mean:
   round-trip's time (end to end across peer retries, like the per-item paths)
   is shared out equally across the facts it verified, so a per-fact figure
   from that path is an estimate — removing one slot from a batch does not save
-  1/N of the trip. The Rust prefetch issues one request per fact and times
-  each.
+  1/N of the trip. A chunk that partially verifies and then retries on
+  another peer flushes the first attempt's facts with the first attempt's
+  time and the rest with the whole span, so the first window is counted
+  twice in that (rare) case. The Rust prefetch issues one request per fact
+  and times each.
+- A verified **absence** (exclusion proof) is observed as the empty account on
+  the Rust direct reads and on both EVM oracles, but not by the Java operator
+  `get-account` query, whose proof check does not extract exclusions — so
+  `account.fetches` for absent addresses compares across engines only on the
+  wallet paths.
 
 ## The JSON
 
