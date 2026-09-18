@@ -4170,7 +4170,13 @@ impl ElReader {
         let value = peer
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
             .await?;
-        snap.slot_elapsed = Some(started.elapsed());
+        // An empty storage trie is answered locally by the peer layer (every
+        // slot is provably zero) — no round trip, so nothing for the shadow
+        // cache to count; the EVM oracle and the Java paths short-circuit the
+        // same case before observing.
+        if leaf.storage_root != EMPTY_TRIE_ROOT {
+            snap.slot_elapsed = Some(started.elapsed());
+        }
         result.storage_proof_valid = true;
         // `found` means the slot holds a non-zero value (Java's convention): a
         // zero slot is pruned from the trie and indistinguishable from unset,

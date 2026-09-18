@@ -38,10 +38,12 @@ import java.util.Map;
  *   <li><b>byAge</b> — repeats bucketed by how long ago the key was last
  *       fetched, each with how many were value-unchanged.</li>
  * </ul>
- * Costs are wall-clock milliseconds of the snap round-trip(s) that produced
- * the observation — never the beacon-anchoring ladder that may follow an
+ * Costs are the wall-clock of the snap round-trip(s) that produced the
+ * observation — never the beacon-anchoring ladder that may follow an
  * operator query — so {@code sameStorageRootFetchMs} is literally the time a
- * storage-root-keyed cache would have saved.
+ * storage-root-keyed cache would have saved. Accumulated in nanoseconds and
+ * converted once when reported, so a sub-millisecond share (a batch response
+ * split across many facts) is never truncated to zero per fact.
  *
  * <p>Thread-safe (one lock; contention is trivial next to a network fetch).
  * Android-safe: no post-API-29 JDK APIs.
@@ -121,14 +123,14 @@ public final class ReadStats {
     private final long startedNanos;
     // account
     private long accountFetches, accountRepeats, accountSameStateRoot, accountUnchanged,
-            accountFetchMs, accountSameStateRootMs;
+            accountFetchNanos, accountSameStateRootNanos;
     private final ByAge accountByAge = new ByAge();
     // storage
     private long storageFetches, storageRepeats, storageSameStateRoot, storageSameStorageRoot,
-            storageSameValue, storageFetchMs, storageSameStorageRootMs;
+            storageSameValue, storageFetchNanos, storageSameStorageRootNanos;
     private final ByAge storageByAge = new ByAge();
     // code
-    private long codeFetches, codeRepeats, codeFetchMs, codeRepeatMs;
+    private long codeFetches, codeRepeats, codeFetchNanos, codeRepeatNanos;
 
     // Plain access-ordered LRUs, guarded by `lock` (no synchronizedMap wrapper:
     // every access already holds the lock).
@@ -192,14 +194,13 @@ public final class ReadStats {
     /** A bytecode blob fetched for {@code codeHash} (content-addressed: every
      *  repeat is avoidable by construction). */
     public void observeCode(byte[] codeHash, long elapsedNanos) {
-        long ms = elapsedNanos / 1_000_000L;
         Bytes32 key = Bytes32.wrap(codeHash.clone());
         synchronized (lock) {
             codeFetches++;
-            codeFetchMs += ms;
+            codeFetchNanos += elapsedNanos;
             if (codes.get(key) != null) {
                 codeRepeats++;
-                codeRepeatMs += ms;
+                codeRepeatNanos += elapsedNanos;
             }
             codes.put(key, Boolean.TRUE);
         }
@@ -208,16 +209,15 @@ public final class ReadStats {
     // ---- under `lock` ----
 
     private void account(Bytes address, Bytes32 stateRoot, AccountFact fact, long elapsedNanos, long now) {
-        long ms = elapsedNanos / 1_000_000L;
         accountFetches++;
-        accountFetchMs += ms;
+        accountFetchNanos += elapsedNanos;
         AccountSeen prev = accounts.get(address);
         if (prev != null) {
             accountRepeats++;
             boolean same = prev.fact().equals(fact);
             if (prev.stateRoot().equals(stateRoot)) {
                 accountSameStateRoot++;
-                accountSameStateRootMs += ms;
+                accountSameStateRootNanos += elapsedNanos;
             } else if (same) {
                 accountUnchanged++;
             }
@@ -228,10 +228,9 @@ public final class ReadStats {
 
     private void storage(SlotKey key, Bytes32 stateRoot, Bytes32 storageRoot, BigInteger value,
                          long elapsedNanos, long now) {
-        long ms = elapsedNanos / 1_000_000L;
         BigInteger v = value == null ? BigInteger.ZERO : value;
         storageFetches++;
-        storageFetchMs += ms;
+        storageFetchNanos += elapsedNanos;
         SlotSeen prev = slots.get(key);
         if (prev != null) {
             storageRepeats++;
@@ -241,7 +240,7 @@ public final class ReadStats {
                 // Includes the same-world-root case: the storage root cannot
                 // move while the world root stands still.
                 storageSameStorageRoot++;
-                storageSameStorageRootMs += ms;
+                storageSameStorageRootNanos += elapsedNanos;
             } else if (same) {
                 storageSameValue++;
             }
@@ -282,8 +281,8 @@ public final class ReadStats {
             num(sb, "repeats", accountRepeats).append(',');
             num(sb, "sameStateRoot", accountSameStateRoot).append(',');
             num(sb, "unchanged", accountUnchanged).append(',');
-            num(sb, "fetchMs", accountFetchMs).append(',');
-            num(sb, "sameStateRootFetchMs", accountSameStateRootMs);
+            num(sb, "fetchMs", ms(accountFetchNanos)).append(',');
+            num(sb, "sameStateRootFetchMs", ms(accountSameStateRootNanos));
             sb.append(",\"byAge\":");
             accountByAge.writeJson(sb);
             sb.append("},\"storage\":{");
@@ -292,15 +291,15 @@ public final class ReadStats {
             num(sb, "sameStateRoot", storageSameStateRoot).append(',');
             num(sb, "sameStorageRoot", storageSameStorageRoot).append(',');
             num(sb, "sameValue", storageSameValue).append(',');
-            num(sb, "fetchMs", storageFetchMs).append(',');
-            num(sb, "sameStorageRootFetchMs", storageSameStorageRootMs);
+            num(sb, "fetchMs", ms(storageFetchNanos)).append(',');
+            num(sb, "sameStorageRootFetchMs", ms(storageSameStorageRootNanos));
             sb.append(",\"byAge\":");
             storageByAge.writeJson(sb);
             sb.append("},\"code\":{");
             num(sb, "fetches", codeFetches).append(',');
             num(sb, "repeats", codeRepeats).append(',');
-            num(sb, "fetchMs", codeFetchMs).append(',');
-            num(sb, "repeatFetchMs", codeRepeatMs);
+            num(sb, "fetchMs", ms(codeFetchNanos)).append(',');
+            num(sb, "repeatFetchMs", ms(codeRepeatNanos));
             sb.append("},\"tracked\":{");
             num(sb, "accounts", accounts.size()).append(',');
             num(sb, "slots", slots.size()).append(',');
@@ -308,6 +307,11 @@ public final class ReadStats {
             sb.append("}}");
         }
         return sb.toString();
+    }
+
+    /** Nanoseconds → whole milliseconds, once, at report time. */
+    private static long ms(long nanos) {
+        return nanos / 1_000_000L;
     }
 
     private static StringBuilder num(StringBuilder sb, String key, long value) {

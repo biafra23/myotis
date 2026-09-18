@@ -28,10 +28,12 @@
 //!   served the value from ≤ N seconds ago, how often would it have been
 //!   correct?".
 //!
-//! Costs are wall-clock milliseconds of the snap round-trip(s) that produced
-//! the observation — never the beacon-anchoring ladder that may follow a
-//! direct read — so `sameStorageRootFetchMs` is literally the time a
-//! storage-root-keyed cache would have saved.
+//! Costs are the wall-clock of the snap round-trip(s) that produced the
+//! observation — never the beacon-anchoring ladder that may follow a direct
+//! read — so `sameStorageRootFetchMs` is literally the time a
+//! storage-root-keyed cache would have saved. Accumulated in nanoseconds and
+//! converted once when reported, so a sub-millisecond share (a batch response
+//! split across many facts) is never truncated to zero per fact.
 //!
 //! Trust posture: this module never returns a value to anyone; it only counts.
 //! It is deliberately *not* a cache so the measurement can land — and be
@@ -227,8 +229,8 @@ struct AccountCounters {
     repeats: u64,
     same_state_root: u64,
     unchanged: u64,
-    fetch_ms: u64,
-    same_state_root_ms: u64,
+    fetch_ns: u64,
+    same_state_root_ns: u64,
     by_age: ByAge,
 }
 
@@ -239,8 +241,8 @@ struct StorageCounters {
     same_state_root: u64,
     same_storage_root: u64,
     same_value: u64,
-    fetch_ms: u64,
-    same_storage_root_ms: u64,
+    fetch_ns: u64,
+    same_storage_root_ns: u64,
     by_age: ByAge,
 }
 
@@ -248,8 +250,8 @@ struct StorageCounters {
 struct CodeCounters {
     fetches: u64,
     repeats: u64,
-    fetch_ms: u64,
-    repeat_ms: u64,
+    fetch_ns: u64,
+    repeat_ns: u64,
 }
 
 /// The `Copy` part of the state: taken out under the lock, formatted outside
@@ -342,19 +344,19 @@ impl ReadStats {
         elapsed: Duration,
         now: Instant,
     ) {
-        let ms = elapsed.as_millis() as u64;
+        let ns = elapsed.as_nanos() as u64;
         let summary = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let inner = &mut *g;
             let c = &mut inner.counters.account;
             c.fetches += 1;
-            c.fetch_ms += ms;
+            c.fetch_ns += ns;
             if let Some(prev) = inner.accounts.get(&address) {
                 c.repeats += 1;
                 let unchanged = prev.fact == fact;
                 if prev.state_root == state_root {
                     c.same_state_root += 1;
-                    c.same_state_root_ms += ms;
+                    c.same_state_root_ns += ns;
                 } else if unchanged {
                     c.unchanged += 1;
                 }
@@ -401,14 +403,14 @@ impl ReadStats {
         elapsed: Duration,
         now: Instant,
     ) {
-        let ms = elapsed.as_millis() as u64;
+        let ns = elapsed.as_nanos() as u64;
         let key = (address, storage_key);
         let summary = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let inner = &mut *g;
             let c = &mut inner.counters.storage;
             c.fetches += 1;
-            c.fetch_ms += ms;
+            c.fetch_ns += ns;
             if let Some(prev) = inner.slots.get(&key) {
                 c.repeats += 1;
                 let unchanged = prev.value == value;
@@ -419,7 +421,7 @@ impl ReadStats {
                     // Includes the same-world-root case: the storage root cannot
                     // move while the world root stands still.
                     c.same_storage_root += 1;
-                    c.same_storage_root_ms += ms;
+                    c.same_storage_root_ns += ns;
                 } else if unchanged {
                     c.same_value += 1;
                 }
@@ -442,16 +444,16 @@ impl ReadStats {
     }
 
     fn observe_code_at(&self, code_hash: [u8; 32], elapsed: Duration, now: Instant) {
-        let ms = elapsed.as_millis() as u64;
+        let ns = elapsed.as_nanos() as u64;
         let summary = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let inner = &mut *g;
             let c = &mut inner.counters.code;
             c.fetches += 1;
-            c.fetch_ms += ms;
+            c.fetch_ns += ns;
             if inner.codes.get(&code_hash).is_some() {
                 c.repeats += 1;
-                c.repeat_ms += ms;
+                c.repeat_ns += ns;
             }
             inner.codes.put(code_hash, ());
             inner.summary_due(now).then(|| inner.snapshot())
@@ -493,9 +495,9 @@ impl ReadStats {
         s.push(',');
         num(&mut s, "unchanged", a.unchanged);
         s.push(',');
-        num(&mut s, "fetchMs", a.fetch_ms);
+        num(&mut s, "fetchMs", ms(a.fetch_ns));
         s.push(',');
-        num(&mut s, "sameStateRootFetchMs", a.same_state_root_ms);
+        num(&mut s, "sameStateRootFetchMs", ms(a.same_state_root_ns));
         s.push_str(",\"byAge\":");
         a.by_age.write_json(&mut s);
         let st = &c.storage;
@@ -510,9 +512,9 @@ impl ReadStats {
         s.push(',');
         num(&mut s, "sameValue", st.same_value);
         s.push(',');
-        num(&mut s, "fetchMs", st.fetch_ms);
+        num(&mut s, "fetchMs", ms(st.fetch_ns));
         s.push(',');
-        num(&mut s, "sameStorageRootFetchMs", st.same_storage_root_ms);
+        num(&mut s, "sameStorageRootFetchMs", ms(st.same_storage_root_ns));
         s.push_str(",\"byAge\":");
         st.by_age.write_json(&mut s);
         let co = &c.code;
@@ -521,9 +523,9 @@ impl ReadStats {
         s.push(',');
         num(&mut s, "repeats", co.repeats);
         s.push(',');
-        num(&mut s, "fetchMs", co.fetch_ms);
+        num(&mut s, "fetchMs", ms(co.fetch_ns));
         s.push(',');
-        num(&mut s, "repeatFetchMs", co.repeat_ms);
+        num(&mut s, "repeatFetchMs", ms(co.repeat_ns));
         s.push_str("},\"tracked\":{");
         num(&mut s, "accounts", c.tracked_accounts as u64);
         s.push(',');
@@ -533,6 +535,11 @@ impl ReadStats {
         s.push_str("}}");
         s
     }
+}
+
+/// Nanoseconds → whole milliseconds, once, at report time.
+fn ms(ns: u64) -> u64 {
+    ns / 1_000_000
 }
 
 fn num(out: &mut String, key: &str, value: u64) {
@@ -556,10 +563,10 @@ fn log_summary(c: &Counters) {
         c.storage.same_state_root,
         c.storage.same_storage_root,
         c.storage.same_value,
-        c.storage.same_storage_root_ms,
+        ms(c.storage.same_storage_root_ns),
         c.code.fetches,
         c.code.repeats,
-        c.code.repeat_ms,
+        ms(c.code.repeat_ns),
     );
 }
 
@@ -678,6 +685,19 @@ mod tests {
         assert_eq!(AccountFact::from_leaf(Some(&leaf)), AccountFact::absent());
         assert_eq!(pad32(&[0xab, 0xcd])[30..], [0xab, 0xcd]);
         assert_eq!(pad32(&[1; 33]), [0; 32], "oversized scalar pads to zero, no panic");
+    }
+
+    #[test]
+    fn sub_millisecond_costs_are_not_truncated_per_fetch() {
+        let s = ReadStats::new();
+        let t0 = s.started;
+        // 1000 fetches of 0.4 ms each = 400 ms, not 0.
+        for i in 0..1000u32 {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_be_bytes());
+            s.observe_code_at(h, Duration::from_micros(400), t0);
+        }
+        assert_eq!(parse(&s.to_json_at(t0))["code"]["fetchMs"], 400);
     }
 
     #[test]

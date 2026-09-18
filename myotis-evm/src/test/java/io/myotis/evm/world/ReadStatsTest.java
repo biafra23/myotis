@@ -156,6 +156,20 @@ class ReadStatsTest {
     }
 
     @Test
+    void subMillisecondSharesAreNotTruncatedPerFact() {
+        ReadStats s = new ReadStats(0L);
+        // A 200-fact chunk answered in 100 ms: 0.5 ms per fact, 100 ms in total — not 0.
+        java.util.List<ReadStats.SlotObs> slots = new java.util.ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            byte[] key = new byte[32];
+            key[31] = (byte) i;
+            slots.add(new ReadStats.SlotObs(fill(20, 1), key, fill(32, 9), BigInteger.ONE));
+        }
+        s.observeChunk(fill(32, 5), List.of(), slots, 100 * MS);
+        assertEquals(100, field(s.toJson(0L), "storage", "fetchMs"));
+    }
+
+    @Test
     void codeRepeatsAreAllAvoidable() {
         ReadStats s = new ReadStats(0L);
         s.observeCode(fill(32, 1), 30 * MS);
