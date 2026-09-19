@@ -28,6 +28,7 @@ answers from it while paused).
 | `eth_call` / `eth_estimateGas` state fetches (the EVM oracle, prefetch waves included) | `SnapBackedStateOracle` | `PoolOracle` |
 | `eth_getBalance` / `eth_getTransactionCount` / `eth_getCode` / `eth_getStorageAt` | via the same oracle | `ElReader::get_account` / `get_storage_at` / `get_code` |
 | operator queries `get-account` / `get-storage` | `VerifiedAccountQuery` / `VerifiedStorageQuery` | the same reader paths |
+| Tor-routed account reads (docs/privacy-and-tor.md; Rust engine, `tor` feature only) | — | `ElReader::get_account_over_tor`, costed at the snap round-trip over the circuit (never the circuit build) |
 
 Only **verified** answers are observed (an unverified fallback is not a fact a
 cache could ever have served). Existing cache hits never reach the observer:

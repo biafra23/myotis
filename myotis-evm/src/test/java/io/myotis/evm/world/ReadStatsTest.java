@@ -116,6 +116,28 @@ class ReadStatsTest {
     }
 
     @Test
+    void ageBucketsCompareTheFullDuration() {
+        // 12 s exactly is still le12s; one nanosecond more is le60s. The same
+        // at the 60 s and 5 min bounds — flooring to seconds first would put
+        // 12.9 s / 60.9 s / 300.9 s in the bucket below.
+        ReadStats s = new ReadStats(0L);
+        byte[] addr = fill(20, 0xCC);
+        long ms = MS;
+        long at = 0L;
+        s.observeAccount(addr, fill(32, 1), fact(1, 9), ms, at);
+        long[] gaps = {12 * SEC, 12 * SEC + 1, 60 * SEC, 60 * SEC + 1, 300 * SEC, 300 * SEC + 1};
+        for (int i = 0; i < gaps.length; i++) {
+            at += gaps[i];
+            s.observeAccount(addr, fill(32, i + 2), fact(1, 9), ms, at);
+        }
+        String j = s.toJson(at);
+        assertEquals(1, field(j, "account", "byAge", "le12s", "reads"));
+        assertEquals(2, field(j, "account", "byAge", "le60s", "reads"));
+        assertEquals(2, field(j, "account", "byAge", "le5m", "reads"));
+        assertEquals(1, field(j, "account", "byAge", "gt5m", "reads"));
+    }
+
+    @Test
     void absentAccountIsTheEmptyAccountOnEveryPath() {
         // An exclusion proof and a present-but-empty leaf are the same fact for
         // every caching question, so the two producers must agree.

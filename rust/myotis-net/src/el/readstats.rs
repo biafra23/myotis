@@ -193,10 +193,12 @@ struct ByAge([AgeBucket; 4]);
 
 impl ByAge {
     fn record(&mut self, age: Duration, unchanged: bool) {
-        let secs = age.as_secs();
+        // Compare the full duration: flooring to whole seconds first would file
+        // a 12.9 s age under le12s and overstate every bucket's hit rate at its
+        // boundary.
         let idx = AGE_BOUNDS_SECS
             .iter()
-            .position(|bound| secs <= *bound)
+            .position(|bound| age <= Duration::from_secs(*bound))
             .unwrap_or(AGE_BOUNDS_SECS.len());
         let b = &mut self.0[idx];
         b.reads += 1;
@@ -669,6 +671,39 @@ mod tests {
         assert_eq!(a["byAge"]["le60s"]["reads"], 2);
         assert_eq!(a["byAge"]["le60s"]["unchanged"], 1);
         assert_eq!(j["tracked"]["accounts"], 1);
+    }
+
+    #[test]
+    fn age_buckets_compare_the_full_duration() {
+        // 12 s exactly is still le12s; one nanosecond more is le60s. The
+        // same at the 60 s and 5 min bounds — flooring to seconds first would
+        // put 12.9 s / 60.9 s / 300.9 s in the bucket below.
+        let s = ReadStats::new();
+        let t0 = s.started;
+        let ms = Duration::from_millis(1);
+        let mut at = t0;
+        s.observe_code_at([0; 32], ms, at); // code has no age buckets; warm nothing
+        let addr = [0xCC; 20];
+        s.observe_account_at(addr, [1; 32], fact(1, 9), ms, at);
+        for (i, gap) in [
+            Duration::from_secs(12),
+            Duration::from_secs(12) + Duration::from_nanos(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60) + Duration::from_nanos(1),
+            Duration::from_secs(300),
+            Duration::from_secs(300) + Duration::from_nanos(1),
+        ]
+        .iter()
+        .enumerate()
+        {
+            at += *gap;
+            s.observe_account_at(addr, [i as u8 + 2; 32], fact(1, 9), ms, at);
+        }
+        let a = &parse(&s.to_json_at(t0))["account"]["byAge"];
+        assert_eq!(a["le12s"]["reads"], 1);
+        assert_eq!(a["le60s"]["reads"], 2);
+        assert_eq!(a["le5m"]["reads"], 2);
+        assert_eq!(a["gt5m"]["reads"], 1);
     }
 
     #[test]

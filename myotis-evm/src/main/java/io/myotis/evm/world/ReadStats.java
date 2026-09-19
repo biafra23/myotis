@@ -98,10 +98,12 @@ public final class ReadStats {
         final long[] unchanged = new long[AGE_LABELS.length];
 
         void record(long ageNanos, boolean same) {
-            long secs = ageNanos / 1_000_000_000L;
+            // Compare at full precision: flooring to whole seconds first would
+            // file a 12.9 s age under le12s and overstate every bucket's hit
+            // rate at its boundary.
             int idx = AGE_BOUNDS_SECS.length;
             for (int i = 0; i < AGE_BOUNDS_SECS.length; i++) {
-                if (secs <= AGE_BOUNDS_SECS[i]) { idx = i; break; }
+                if (ageNanos <= AGE_BOUNDS_SECS[i] * 1_000_000_000L) { idx = i; break; }
             }
             reads[idx]++;
             if (same) unchanged[idx]++;

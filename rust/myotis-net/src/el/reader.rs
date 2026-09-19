@@ -4248,8 +4248,23 @@ impl ElReader {
             // snap peer — striking it would poison clearnet dialing on the next run.
             // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
             match tokio::time::timeout(remaining, attempt).await {
-                Ok(Ok(result)) => {
+                Ok(Ok((result, snap_elapsed))) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        // The same shadow-cache bookkeeping as the clearnet
+                        // read: the verified answer only, costed at the snap
+                        // round-trip over the circuit (not the circuit build,
+                        // the head fetch or the anchoring ladder). A Tor read
+                        // that a cache would have served is a fetch saved just
+                        // the same — counts only, no address leaves the
+                        // process (`el::readstats`).
+                        if result.verify_method.is_some() {
+                            self.read_stats.observe_account(
+                                address,
+                                result.peer_state_root,
+                                account_fact(&result),
+                                snap_elapsed,
+                            );
+                        }
                         return Ok(result);
                     }
                     fallback.get_or_insert(result);
@@ -4266,17 +4281,24 @@ impl ElReader {
     /// One account fetch + beacon verdict over an already-connected Tor
     /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
     #[cfg(feature = "tor")]
+    /// The second value is the snap round-trip's wall-clock over the circuit
+    /// (the shadow cache's cost measure), like `get_account_from`'s.
     async fn account_from_tor_session(
         &self,
         session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
         address: [u8; 20],
-    ) -> Result<VerifiedAccount, String> {
+    ) -> Result<(VerifiedAccount, Duration), String> {
         let (state_root, block_number) = fresh_head_session(session).await?;
+        let started = Instant::now();
         let outcome = session.snap_get_account(&state_root, &address).await?;
+        let snap_elapsed = started.elapsed();
         let verdict = session
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+        Ok((
+            self.build_verified_account(address, state_root, block_number, outcome, verdict),
+            snap_elapsed,
+        ))
     }
 
     /// Fetch + verify one storage slot. `holder` switches the key to the
