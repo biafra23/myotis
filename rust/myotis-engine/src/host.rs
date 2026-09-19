@@ -3510,7 +3510,10 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         if filter.from_block < low
             && reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true)
         {
-            "backfill is paused on this node, so this range will not be filled in; resume it (logindex-backfill on) or query within the covered range"
+            // Host-neutral: this message reaches every eth_getLogs consumer, and
+            // the daemon's `logindex-backfill on` does not exist on desktop,
+            // Android or iOS, whose lever is the Index tab's pause switch.
+            "the backfill is paused on this node, so this range will not be filled in; resume it (Index tab switch, or logindex-backfill on in the daemon) or query within the covered range"
         } else {
             "retry as the index catches up"
         }

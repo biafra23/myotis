@@ -295,10 +295,17 @@ encode it and the daemon has no settings file, so a daemon restart resumes the
 walk. For a long-running node make it the boot default instead:
 
 ```bash
-./gradlew :app:run -Pnetwork=gnosis -Dmyotis.logindex.backfillPaused=true
+./gradlew :app:run -Pnetwork=gnosis -PbackfillPaused=true
 # or, in a systemd unit's ExecStart:
 java -Dmyotis.logindex.backfillPaused=true -cp '<lib>/*' com.jaeckel.ethp2p.app.Main --network gnosis
 ```
+
+Note the `-P` on the gradlew form. `:app:run` is a forked `JavaExec`, so a bare
+`-Dmyotis.logindex.backfillPaused=true` on the gradlew line sets the property on
+the *Gradle* JVM and never reaches the daemon — it would start with the walk
+running and say nothing. The run task bridges `-PbackfillPaused` to the system
+property (the same pattern as `-Pengine` and `-Pbls`) and rejects any value
+other than `true` or `false`. A raw `java` launch takes the `-D` directly.
 
 The apps persist their switch per network themselves and re-push it on every
 start, so this only concerns the daemon.

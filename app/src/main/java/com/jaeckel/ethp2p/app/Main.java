@@ -348,8 +348,10 @@ public final class Main {
                             + "is OFF; head-follow continues and queries below the covered "
                             + "range are refused", network);
                 } else {
-                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: no "
-                            + "Rust-engine log index on this network", network);
+                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
+                            + "network has no enabled log index (build or import one first); "
+                            + "the switch is refused rather than installing an empty index",
+                            network);
                 }
             }
 
