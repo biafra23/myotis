@@ -163,7 +163,7 @@ object RustEngine {
     /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
     fun readStatsJson(handle: Long): String {
         requireAbi()
-        return take(myotis_read_stats_json(handle)) ?: """{"schema":1,"windowSeconds":0}"""
+        return take(myotis_read_stats_json(handle)) ?: """{"error":"engine returned no result"}"""
     }
 
     /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */

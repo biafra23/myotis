@@ -203,10 +203,12 @@ public interface ChainHandle {
      * wall-clock it would have saved. A measurement surface: nothing is ever
      * served from it. Not gated on readiness (a status probe, like
      * {@link #logIndexStatusJson}); engines answer {@code {"error":...}} when
-     * they cannot. Default: a stable "no measurement" object.
+     * they cannot. Default: that same error shape, for a handle that does not
+     * measure — never a partial schema-1 object, which a consumer could not
+     * tell from a real one.
      */
     default String readStatsJson() {
-        return "{\"schema\":1,\"windowSeconds\":0}";
+        return "{\"error\":\"read stats not measured by this engine\"}";
     }
 
     /**
