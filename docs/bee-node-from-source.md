@@ -250,9 +250,11 @@ agent through commit → reveal → claim → sample (where `IsPlaying` reverts 
 an unstaked overlay, as designed), and every one of its calls came back
 `VERIFIED`. Typical latencies are tens of milliseconds; `eth_call`s that need
 fresh state proofs and `eth_getLogs` pages at the head edge occasionally take
-1–20 s when a peer is slow (a hedged multi-peer fetch is the tracked
-follow-up). Myotis's own log (`Logs` tab, filter `access`) shows every request
-with its outcome and latency.
+1–20 s when a peer is slow. Reads now ask a second peer after 3 s without an
+answer (6 s for a block or receipt read far behind the head), which trims
+most of that tail; the optimistic tail's own head-edge fetch is not hedged
+yet. Myotis's own log (`Logs` tab, filter `access`) shows every request with
+its outcome and latency.
 
 ## 5. The backfill: what it does and why
 
@@ -327,9 +329,11 @@ Two limits to know:
   tick on its first failed receipts read; with a bad peer set that can leave
   coverage drifting behind the head for longer than Bee's 10 minutes (seen
   once on 2026-09-16 after the optimistic tail detected a reorg and rewound).
-  The head bridge now takes over a gap the appender has stopped closing
-  (after about 18 s without progress, #450). Making the appender hedge its
-  reads across peers is still to do (not tracked yet).
+  Both halves of the fix have landed: a stalled appender now hands its gap
+  to the bridge after about 18 s (#450), and the receipts read it depends on
+  is hedged across peers (#457). Restarting the node still re-bridges in
+  seconds if you would rather not wait — and it no longer costs the coverage
+  the last checkpoint proved final (*What a restart costs* above).
 
 ## 6. Trust, in one paragraph
 

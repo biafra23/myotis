@@ -1123,9 +1123,14 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
 /// calldata is init code and the constructor's return data is the answer);
 /// `data_hex` is the calldata;
 /// `value_dec` is the wei value as a decimal string (FFI-neutral); `block` is the
-/// RPC block tag (the Java side has already gated it to the servable window, so
-/// the call runs against the verified head). Returns the call JSON
-/// (`ok`/`revert`/`unavailable`, see [`eljson::call_json`]) or `{"error": "..."}`.
+/// RPC block selector. The call always runs against the VERIFIED HEAD's state,
+/// so the block is checked HERE, once for every host (#452): a head tag (or
+/// empty) runs, a block number runs only inside the window around the head
+/// ([`check_call_block`]), and anything else is refused rather than answered
+/// from the head. Returns the call JSON (`ok`/`revert`/`unavailable`, see
+/// [`eljson::call_json`]), `{"error": "..."}`, or
+/// [`eljson::invalid_params_json`] for a request this node can never serve (a
+/// malformed argument, or a block it will never reach).
 pub fn eth_call_json(
     handle: i64,
     from_hex: &str,
@@ -1147,16 +1152,22 @@ pub fn eth_call_overrides_json(
     to_hex: &str,
     data_hex: &str,
     value_dec: &str,
-    _block: &str,
+    block: &str,
     overrides_json: &str,
 ) -> String {
+    // Every refusal of the request's own arguments is permanent (-32602): no
+    // retry changes them. The block first, as the host adapters check it.
+    let call_block = match parse_call_block(block) {
+        Ok(b) => b,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
     let overrides = match parse_state_overrides(overrides_json) {
         Ok(o) => o,
-        Err(msg) => return eljson::error_json(&msg),
+        Err(msg) => return eljson::invalid_params_json(&msg),
     };
     let target = match call_target(to_hex) {
         Ok(t) => t,
-        Err(msg) => return eljson::error_json(msg),
+        Err(msg) => return eljson::invalid_params_json(msg),
     };
     let creation = target.is_none();
     let to = target.unwrap_or([0u8; 20]);
@@ -1166,7 +1177,9 @@ pub fn eth_call_overrides_json(
     } else {
         match parse_address(from_hex) {
             Some(a) => Some(a),
-            None => return eljson::error_json("invalid 'from' address (expected 20-byte hex)"),
+            None => {
+                return eljson::invalid_params_json("invalid 'from' address (expected 20-byte hex)")
+            }
         }
     };
     // Calldata may be empty (a bare value transfer / fallback call).
@@ -1175,7 +1188,7 @@ pub fn eth_call_overrides_json(
     } else {
         match parse_hex_bytes(data_hex) {
             Some(d) => d,
-            None => return eljson::error_json("invalid call data (expected hex)"),
+            None => return eljson::invalid_params_json("invalid call data (expected hex)"),
         }
     };
     let value = if value_dec.trim().is_empty() {
@@ -1183,7 +1196,7 @@ pub fn eth_call_overrides_json(
     } else {
         match U256::from_str_radix(value_dec.trim(), 10) {
             Ok(v) => v,
-            Err(_) => return eljson::error_json("invalid value (expected decimal wei)"),
+            Err(_) => return eljson::invalid_params_json("invalid value (expected decimal wei)"),
         }
     };
     let Some(engine) = engine() else {
@@ -1193,6 +1206,10 @@ pub fn eth_call_overrides_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    // Against the head as of dispatch, like the host adapters' own check.
+    if let Err(refusal) = check_call_block(call_block, reader.optimistic_block_number()) {
+        return refusal.to_json();
+    }
     match engine
         .rt
         .block_on(async {
@@ -1225,6 +1242,128 @@ fn call_target(to_hex: &str) -> Result<Option<[u8; 20]>, &'static str> {
         Some(a) => Ok(Some(a)),
         None => Err("invalid 'to' address (expected 20-byte hex)"),
     }
+}
+
+/// How far BELOW the verified head a numbered `eth_call` block still runs
+/// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE`
+/// (jsonrpc-server), the check the JVM and iOS hosts run before calling in;
+/// `RustBlockWindowTest` reads this file and pins the two together.
+const CALL_BLOCK_LAG_TOLERANCE: u64 = 64;
+
+/// How far ABOVE the verified head a numbered `eth_call` block still runs
+/// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_TOLERANCE`.
+const CALL_BLOCK_AHEAD_TOLERANCE: u64 = 16;
+
+/// The block an `eth_call` asked for, as the head-anchored executor sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallBlock {
+    /// A head tag (`latest`/`pending`/`safe`/`finalized`), or empty — the
+    /// JSON-RPC default.
+    Head,
+    /// A block number, still to be checked against the verified head.
+    Number(u64),
+}
+
+/// Parse an `eth_call` block selector with the acceptance of the hosts'
+/// `RpcBlockWindow.blockInWindow`, so the engine does not refuse a pin they
+/// admit: head tags in any case, `0x`/`0X` hex, and bare digits read as
+/// DECIMAL (unlike [`parse_block_target`], which reads them as hex; #366 item
+/// 6). Deliberately stricter in one respect: ASCII digits only and no sign,
+/// where Kotlin's `toLongOrNull` also takes a sign and non-ASCII digits. No
+/// JSON-RPC quantity carries either.
+///
+/// `Err` is a selector no retry can make servable (`earliest`, a block hash,
+/// garbage), so the caller refuses it as invalid params.
+fn parse_call_block(block: &str) -> Result<CallBlock, String> {
+    let b = block.trim();
+    let is_tag = |t: &str| b.eq_ignore_ascii_case(t);
+    if b.is_empty() || ["latest", "pending", "safe", "finalized"].into_iter().any(is_tag) {
+        return Ok(CallBlock::Head);
+    }
+    if is_tag("earliest") {
+        return Err("earliest (genesis) is not served: eth_call runs against the verified \
+                    head's state"
+            .to_string());
+    }
+    let (digits, radix) = match b.strip_prefix("0x").or_else(|| b.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (b, 10),
+    };
+    let well_formed = !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix));
+    // Digits only, so the parse fails only on overflow: a number past i64::MAX
+    // is malformed, as the hosts' Long parse has it.
+    let number = if well_formed { i64::from_str_radix(digits, radix).ok() } else { None };
+    if let Some(n) = number.and_then(|n| u64::try_from(n).ok()) {
+        return Ok(CallBlock::Number(n));
+    }
+    if well_formed && radix == 16 && digits.len() == 64 {
+        return Err("eth_call by block hash is not supported: pass a block number or a head tag"
+            .to_string());
+    }
+    let shown: String = b.chars().take(66).collect();
+    let more = if shown.len() < b.len() { "…" } else { "" };
+    Err(format!(
+        "invalid block selector {shown:?}{more} (expected latest, pending, safe, finalized or a \
+         block number)"
+    ))
+}
+
+/// Why a numbered `eth_call` block cannot run against the verified head.
+#[derive(Debug, PartialEq, Eq)]
+enum CallBlockRefusal {
+    /// More than [`CALL_BLOCK_LAG_TOLERANCE`] below the head. Head state would
+    /// answer a different question, and the head never moves back that far:
+    /// PERMANENT (-32602).
+    Behind { block: u64, head: u64 },
+    /// More than [`CALL_BLOCK_AHEAD_TOLERANCE`] above the head: a block this
+    /// node has not verified YET. That clears as the head advances, so it is
+    /// retryable, like geth's "header not found" for a future block. Calling
+    /// it permanent would tell a client to stop asking a node that is only
+    /// lagging.
+    Ahead { block: u64, head: u64 },
+    /// No verified head yet to check the number against: not synced, retryable.
+    NoHead { block: u64 },
+}
+
+impl CallBlockRefusal {
+    fn to_json(&self) -> String {
+        match *self {
+            Self::Behind { block, head } => eljson::invalid_params_json(&format!(
+                "block {block:#x} ({block}) is more than {CALL_BLOCK_LAG_TOLERANCE} blocks \
+                 behind the verified head ({head}); eth_call runs against head state, so this \
+                 node cannot answer for that block"
+            )),
+            Self::Ahead { block, head } => eljson::error_json(&format!(
+                "block {block:#x} ({block}) is more than {CALL_BLOCK_AHEAD_TOLERANCE} blocks \
+                 ahead of the verified head ({head})"
+            )),
+            Self::NoHead { block } => eljson::error_json(&format!(
+                "beacon not synced: no verified head to check block {block:#x} against"
+            )),
+        }
+    }
+}
+
+/// Whether a call for `block` may run against the verified head `head` (0 =
+/// none yet). A number must lie in `[head - 64, head + 16]`, the hosts'
+/// window: wallets pin reads to the number `eth_blockNumber` just returned,
+/// which is at or near the head. Inside the window the call still runs against
+/// HEAD state, the documented near-head trade-off (exact-block execution is
+/// #382).
+fn check_call_block(block: CallBlock, head: u64) -> Result<(), CallBlockRefusal> {
+    let CallBlock::Number(block) = block else {
+        return Ok(());
+    };
+    if head == 0 {
+        return Err(CallBlockRefusal::NoHead { block });
+    }
+    if block < head.saturating_sub(CALL_BLOCK_LAG_TOLERANCE) {
+        return Err(CallBlockRefusal::Behind { block, head });
+    }
+    if block > head.saturating_add(CALL_BLOCK_AHEAD_TOLERANCE) {
+        return Err(CallBlockRefusal::Ahead { block, head });
+    }
+    Ok(())
 }
 
 /// Parse an `eth_call` state-override object (the JSON-RPC third parameter).
@@ -3424,6 +3563,135 @@ mod call_target_tests {
         assert!(call_target("0xZZ").is_err());
         assert!(call_target("0x1234").is_err());          // too short
         assert!(call_target("not-hex-at-all").is_err());
+    }
+}
+
+#[cfg(test)]
+mod call_block_tests {
+    use super::{
+        check_call_block, eth_call_json, eth_call_overrides_json, parse_call_block, CallBlock,
+        CallBlockRefusal, CALL_BLOCK_AHEAD_TOLERANCE, CALL_BLOCK_LAG_TOLERANCE,
+    };
+
+    /// The JVM twin's head (`RustBlockWindowTest`), so the two tables line up.
+    const HEAD: u64 = 25_000_000;
+
+    /// The hosts' `blockInWindow` verdict, as the engine reaches it.
+    fn servable(block: &str, head: u64) -> bool {
+        parse_call_block(block).is_ok_and(|b| check_call_block(b, head).is_ok())
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn head_tags_and_default_are_servable() {
+        for tag in ["latest", "pending", "safe", "finalized", "", "  ", "LATEST", "Pending"] {
+            assert_eq!(parse_call_block(tag), Ok(CallBlock::Head), "{tag:?}");
+        }
+        // A tag needs no head to be checked against; without one, the executor
+        // fails with its own not-synced error.
+        assert_eq!(check_call_block(CallBlock::Head, 0), Ok(()));
+    }
+
+    #[test]
+    fn a_number_at_or_near_the_head_is_servable() {
+        assert!(servable("0x17d7840", HEAD)); // == HEAD
+        assert!(servable("0X17D7840", HEAD));
+        assert!(servable(&HEAD.to_string(), HEAD)); // bare digits are decimal, as for the hosts
+        assert!(servable(&format!("{:#x}", HEAD - CALL_BLOCK_LAG_TOLERANCE), HEAD));
+        assert!(servable(&format!("{:#x}", HEAD + CALL_BLOCK_AHEAD_TOLERANCE), HEAD));
+        // Zero-padded to hash length, it is still a number.
+        assert!(servable(&format!("0x{HEAD:064x}"), HEAD));
+    }
+
+    #[test]
+    fn an_older_number_is_refused_for_good() {
+        let behind = HEAD - CALL_BLOCK_LAG_TOLERANCE - 1;
+        let refusal = check_call_block(CallBlock::Number(behind), HEAD).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::Behind { block: behind, head: HEAD });
+        assert_eq!(json(&refusal.to_json())["code"], -32602);
+        assert!(!servable("0x1", HEAD));
+    }
+
+    #[test]
+    fn a_number_past_the_head_is_refused_but_retryable() {
+        let ahead = HEAD + CALL_BLOCK_AHEAD_TOLERANCE + 1;
+        let refusal = check_call_block(CallBlock::Number(ahead), HEAD).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::Ahead { block: ahead, head: HEAD });
+        let v = json(&refusal.to_json());
+        assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_number_without_a_verified_head_is_refused_but_retryable() {
+        let refusal = check_call_block(CallBlock::Number(HEAD), 0).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::NoHead { block: HEAD });
+        let v = json(&refusal.to_json());
+        assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_young_chain_clamps_the_window_at_genesis() {
+        assert!(servable("0x0", 10)); // head - 64 saturates to 0
+        assert!(servable("0x1a", 10)); // 26 == head + 16
+        assert!(!servable("0x1b", 10));
+    }
+
+    #[test]
+    fn unservable_selectors_are_refused_as_malformed() {
+        for bad in [
+            "earliest",
+            "EARLIEST",
+            "0xzz",
+            "garbage",
+            "0x",
+            "0x+5",
+            "+5",
+            "-5",
+            "0x-1",
+            "1.5",
+            "0x8000000000000000", // past i64::MAX
+            r#"{"blockHash":"0x00"}"#,
+        ] {
+            assert!(parse_call_block(bad).is_err(), "{bad:?} should be refused");
+        }
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert!(parse_call_block(&hash).unwrap_err().contains("block hash"));
+        // The echo of the caller's input is bounded.
+        assert!(parse_call_block(&"z".repeat(10_000)).unwrap_err().len() < 200);
+    }
+
+    #[test]
+    fn eth_call_refuses_a_malformed_block_before_anything_else() {
+        // No engine or handle needed: both entry points refuse the selector
+        // first, as invalid params.
+        let to = format!("0x{}", "11".repeat(20));
+        for out in [
+            eth_call_json(i64::MIN, "", &to, "", "", "earliest"),
+            eth_call_overrides_json(i64::MIN, "", &to, "", "", "0xzz", ""),
+        ] {
+            assert_eq!(json(&out)["code"], -32602, "{out}");
+        }
+        // A well-formed number gets past the parse to the handle lookup.
+        let v = json(&eth_call_json(i64::MIN, "", &to, "", "", "0x1"));
+        assert_eq!(v["error"], "unknown handle");
+        assert!(v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn eth_call_refuses_every_malformed_argument_as_invalid_params() {
+        let to = format!("0x{}", "11".repeat(20));
+        for (what, out) in [
+            ("from", eth_call_json(i64::MIN, "0xnope", &to, "", "", "latest")),
+            ("to", eth_call_json(i64::MIN, "", "0x1234", "", "", "latest")),
+            ("data", eth_call_json(i64::MIN, "", &to, "0xzz", "", "latest")),
+            ("value", eth_call_json(i64::MIN, "", &to, "", "ten", "latest")),
+            ("overrides", eth_call_overrides_json(i64::MIN, "", &to, "", "", "latest", "[]")),
+        ] {
+            assert_eq!(json(&out)["code"], -32602, "{what}: {out}");
+        }
     }
 }
 
