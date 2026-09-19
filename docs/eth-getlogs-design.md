@@ -177,6 +177,67 @@ whole create→write→fsync→rename. Two mechanisms replace it.
   anyway. A skip un-stamps the clock so the next tick retries rather than
   waiting out a whole interval.
 
+**The restart claim (`<index>.final`).** A checkpoint holds coverage only up to
+the finality it was written at (the optimistic tail is re-checkable only
+against the in-memory tail record, which a restart loses). But a restart can
+still start *below* that finality. The beacon light client resumes from its
+own snapshot, and that snapshot is rewritten only when the sync-committee
+period advances: every ~11 h on Gnosis, ~27 h on mainnet. So the anchor's
+first finality can trail the checkpoint by hours. Coverage in that band is
+final, yet to the tail it looks exactly like an optimistic tail inherited from
+nowhere, and the tail's rules rewind it. Seen 2026-09-16 on the Bee PoC:
+4,266 Gnosis blocks dropped six seconds after a relaunch, and the head bridge
+was still re-walking them more than an hour later (a lossy link, the Mac
+asleep part of the time) while Bee's postage sync was refused.
+
+Every checkpoint therefore records its clamp in a sidecar file bound to the
+exact bytes it describes (chain tag, config fingerprint, payload checksum —
+`logindex::SnapshotId`). On install, a matching claim at or above the file's
+covered top *vouches* for that top (`ElReader::log_index_claim`), and:
+
+- the tail's two finality-based rules (unvouched coverage, finality too far
+  below the head) measure against `max(anchor finality, vouched top)`. The
+  third rule, chain shortened, compares the head with the covered top, so the
+  tail holds outright while the anchored head is below the vouched top: such
+  a head has nothing to add, and it is a stale anchor, not a reorg. Tail
+  records still retire only against the anchor's own finality, since the
+  claim says what the previous run proved, not what this run appended;
+- checkpoints clamp at `max(anchor finality, vouched top)`, so quitting inside
+  that window does not cut the file back to the stale finality;
+- the claim retires once the anchor's finality reaches it. It is also dropped
+  when a light client that reports `SYNCED` (`ExecAnchor::finality_is_current`)
+  sits more than 512 blocks below it with a finality verified after the claim
+  was first weighed. SYNCED bounds a genuine lag at 5 epochs (≤ 160 slots), so
+  a bigger gap can only be a corrupt value, and holding for it would stall
+  head-follow for good. The "verified after" part matters because SYNCED reads
+  the wall clock: a clock running hours slow makes the restored finality look
+  current. (A slow clock together with a server that serves an hours-old
+  finality can still drop a genuine claim. That costs the old re-walk, never
+  trust.) A contradicted claim is removed from disk at once, and a checkpoint
+  re-checks the clamp before publishing its sidecar — both under the claim
+  lock. A checkpoint serializes under the index lock and writes outside it,
+  and the backfill drives one from outside `log_index_drive`, so without that
+  re-check a checkpoint already in flight could put a just-overruled claim
+  back on disk for the next restart to accept.
+
+Two refinements make "the clamp" mean *confirmed final*. First, a checkpoint
+never reaches a tail record that finality has passed but the tail has not yet
+re-checked (the appender's checkpoint runs before the tail in the same tick);
+it stops below the lowest such record (`checkpoint_clamp`). Second, a
+config replace gives the tail record's coverage back before it drops the
+record, instead of carrying unconfirmed blocks into the merged index.
+
+The claim is never part of the portable format. An export carries none. A
+dropped-in or imported file never matches a claim this node wrote. An import
+ends the claim on disk and in memory and rewinds to the anchor's finality, as
+it always did. A config replace keeps the claim only as far as coverage
+survives. So only this node's own checkpoint path can vouch for anything. A
+file without a matching claim is handled as before: that includes every file
+written before this change, so the first restart after upgrading still
+re-walks the band once. The binding guards against accidents, not
+adversaries: anyone who can replace the index file can replace the sidecar
+too.
+
 ### 2. Head-follow appender (forward, cheap, always-on while enabled)
 
 A tokio task owned by `ElReader` (so `ElReader::stop`/pause aborts it —

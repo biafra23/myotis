@@ -287,6 +287,27 @@ all in a background task that shares the peer pool with your RPC traffic:
   what Bee's page at the head needs. It is the only path that can reorg, and
   it carries the rewind for that.
 
+**What a restart costs.** The index is checkpointed only up to the finalized
+block of the moment (the tail above it is re-fetched after a restart). Each
+checkpoint records that block beside the file, in
+`logindex-gnosis.db.final`. A restarted node resumes its beacon light client
+from a snapshot that is rewritten only about every 11 hours on Gnosis. For its
+first seconds to minutes, its idea of "finalized" can therefore be hours older
+than the checkpoint. The index keeps the checkpointed coverage through that
+window: pages up to the checkpoint are served at once, and the head bridge
+only has to cover the downtime. The same holds after *Reset sync state*,
+which restarts the light client from the build's embedded checkpoint.
+(Before this, a relaunch on 2026-09-16 discarded 4,266 blocks. The bridge was
+still re-walking them more than an hour later, over a lossy link and with the
+Mac asleep part of the time, and Bee's postage sync was refused meanwhile.)
+Pages above the checkpoint still wait for the light client to catch up and for
+the bridge.
+
+The record only counts for the exact file the node wrote itself. A seed, an
+imported file, or a file from a build older than this behaviour gets no such
+credit: whatever sits above the light client's finality is re-fetched,
+verified. That includes the first restart after upgrading.
+
 Why the walker keeps going below Bee's range: the watch entry says the
 contract has existed since 31,305,656, and the index promises verified
 coverage for its watch-list — so it walks the ~16 million blocks between the
@@ -309,9 +330,10 @@ Two limits to know:
   coverage drifting behind the head for longer than Bee's 10 minutes (seen
   once on 2026-09-16 after the optimistic tail detected a reorg and rewound).
   Both halves of the fix have landed: a stalled appender now hands its gap
-  to the bridge after about 18 s, and the receipts read it depends on is
-  hedged across peers. Restarting the node still re-bridges in seconds if
-  you would rather not wait.
+  to the bridge after about 18 s (#450), and the receipts read it depends on
+  is hedged across peers (#457). Restarting the node still re-bridges in
+  seconds if you would rather not wait — and it no longer costs the coverage
+  the last checkpoint proved final (*What a restart costs* above).
 
 ## 6. Trust, in one paragraph
 

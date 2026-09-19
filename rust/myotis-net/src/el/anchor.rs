@@ -51,6 +51,7 @@ struct Inner {
     optimistic_block_hash: Option<[u8; 32]>,
     optimistic_state_root: Option<[u8; 32]>,
     known_roots: VecDeque<SlottedStateRoot>,
+    finality_current: bool,
 }
 
 /// Shared, mutable execution anchor. Cloneable handle over one `Mutex` — the
@@ -130,19 +131,39 @@ impl ExecAnchor {
     /// atomically. `None` until the first finalized update lands (root AND hash
     /// are set together by [`Self::update_finalized`]).
     pub fn finalized_execution(&self) -> Option<FinalizedExecution> {
+        finalized_of(&self.inner.lock().expect("anchor mutex"))
+    }
+
+    /// [`Self::finalized_execution`] and [`Self::finality_is_current`] read
+    /// under ONE lock. A caller that weighs one against the other must not
+    /// pair a finality with the currency of a later update: the CL loop sets
+    /// the finality first and the flag after, so two separate reads can see an
+    /// old catch-up finality flagged current. One read sees at worst a new
+    /// finality with the previous flag.
+    pub fn finalized_execution_with_currency(&self) -> (Option<FinalizedExecution>, bool) {
         let inner = self.inner.lock().expect("anchor mutex");
-        match (inner.execution_state_root, inner.execution_block_hash) {
-            (Some(state_root), Some(block_hash)) => Some(FinalizedExecution {
-                block_number: inner.execution_block_number,
-                state_root,
-                block_hash,
-            }),
-            _ => None,
-        }
+        (finalized_of(&inner), inner.finality_current)
     }
 
     pub fn finalized_slot(&self) -> u64 {
         self.inner.lock().expect("anchor mutex").finalized_slot
+    }
+
+    /// Record whether the beacon light client considers its finality CURRENT —
+    /// its `SYNCED` gate: committee period current and the finalized header
+    /// within a few epochs of the wall clock. Set by the CL loop on every
+    /// status publish.
+    pub fn set_finality_current(&self, current: bool) {
+        self.inner.lock().expect("anchor mutex").finality_current = current;
+    }
+
+    /// Whether [`Self::finalized_execution`] is the network's finality give or
+    /// take a few epochs, rather than a value restored from a snapshot or left
+    /// behind by a light client still catching up. False until the CL loop says
+    /// otherwise. Not the same question as [`Self::is_synced`], which only asks
+    /// whether ANY finalized root has landed.
+    pub fn finality_is_current(&self) -> bool {
+        self.inner.lock().expect("anchor mutex").finality_current
     }
 
     /// The optimistic head block hash, for anchoring a header-chain walk at the
@@ -183,6 +204,18 @@ impl ExecAnchor {
 
     pub fn known_root_count(&self) -> usize {
         self.inner.lock().expect("anchor mutex").known_roots.len()
+    }
+}
+
+/// The finalized execution anchor held in `inner`, if root AND hash have landed.
+fn finalized_of(inner: &Inner) -> Option<FinalizedExecution> {
+    match (inner.execution_state_root, inner.execution_block_hash) {
+        (Some(state_root), Some(block_hash)) => Some(FinalizedExecution {
+            block_number: inner.execution_block_number,
+            state_root,
+            block_hash,
+        }),
+        _ => None,
     }
 }
 
@@ -252,6 +285,33 @@ mod tests {
         assert!(anchor.find_state_root(&root(1)).is_some());
         assert_eq!(anchor.find_state_root(&root(2)).unwrap().slot, 102);
         assert!(anchor.find_state_root(&root(9)).is_none());
+    }
+
+    #[test]
+    fn finality_is_not_current_until_the_light_client_says_so() {
+        let anchor = ExecAnchor::new();
+        assert!(!anchor.finality_is_current());
+        // A finalized root landing (e.g. a restored snapshot) is not currency.
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        assert!(anchor.is_synced());
+        assert!(!anchor.finality_is_current());
+        anchor.set_finality_current(true);
+        assert!(anchor.finality_is_current());
+        // ...and it can fall behind again (a doze, a starved pool).
+        anchor.set_finality_current(false);
+        assert!(!anchor.finality_is_current());
+    }
+
+    #[test]
+    fn finality_and_its_currency_read_as_one_pair() {
+        let anchor = ExecAnchor::new();
+        assert_eq!(anchor.finalized_execution_with_currency(), (None, false));
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        anchor.set_finality_current(true);
+        let (fin, current) = anchor.finalized_execution_with_currency();
+        assert_eq!(fin, anchor.finalized_execution());
+        assert_eq!(fin.map(|f| f.block_number), Some(21_000_000));
+        assert!(current);
     }
 
     #[test]
