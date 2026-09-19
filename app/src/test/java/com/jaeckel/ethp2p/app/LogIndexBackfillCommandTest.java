@@ -68,6 +68,46 @@ class LogIndexBackfillCommandTest {
                 () -> CommandHandler.extractBoolean("{\"other\":true}", "paused"));
     }
 
+    @Test
+    void aLiteralMustEndAtAStructuralDelimiterNotJustANonLetter() {
+        // Punctuation is neither a letter nor a digit, so a boundary test that
+        // only excluded alphanumerics would honour the prefix in `true_`.
+        assertThrows(IllegalArgumentException.class,
+                () -> CommandHandler.extractBoolean("{\"paused\":true_}", "paused"));
+        assertThrows(IllegalArgumentException.class,
+                () -> CommandHandler.extractBoolean("{\"paused\":false!}", "paused"));
+        // The real delimiters, and trailing whitespace before one, still parse.
+        assertTrue(CommandHandler.extractBoolean("{\"paused\":true,\"x\":1}", "paused"));
+        assertTrue(CommandHandler.extractBoolean("{\"paused\":true }", "paused"));
+        assertFalse(CommandHandler.extractBoolean("[{\"paused\":false}]", "paused"));
+    }
+
+    // -- the boot property ----------------------------------------------------
+
+    @Test
+    void theBootPropertyIsStrictSoATypoCannotResumeTheWalkSilently() {
+        String key = "myotis.logindex.backfillPaused";
+        String saved = System.getProperty(key);
+        try {
+            System.clearProperty(key);
+            assertFalse(Main.backfillPausedProperty(), "absent means not paused");
+            System.setProperty(key, "true");
+            assertTrue(Main.backfillPausedProperty());
+            System.setProperty(key, " TRUE ");
+            assertTrue(Main.backfillPausedProperty(), "trimmed and case-insensitive");
+            System.setProperty(key, "false");
+            assertFalse(Main.backfillPausedProperty());
+            // Boolean.getBoolean would have read this as false and booted with the
+            // walk running — the silent resume the flag exists to prevent.
+            System.setProperty(key, "tru");
+            assertThrows(IllegalArgumentException.class, Main::backfillPausedProperty);
+            System.setProperty(key, "1");
+            assertThrows(IllegalArgumentException.class, Main::backfillPausedProperty);
+        } finally {
+            if (saved == null) System.clearProperty(key); else System.setProperty(key, saved);
+        }
+    }
+
     // -- the shared push ------------------------------------------------------
 
     @Test

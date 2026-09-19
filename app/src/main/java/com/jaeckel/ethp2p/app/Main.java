@@ -155,6 +155,28 @@ public final class Main {
     }
 
 
+    /**
+     * Read {@code -Dmyotis.logindex.backfillPaused} STRICTLY.
+     *
+     * {@code Boolean.getBoolean} maps every value but "true" to false, so a typo
+     * (`-D...=tru`) would boot the daemon with the downward walk running and say
+     * nothing — the silent resume this flag exists to prevent. The Gradle bridge
+     * (`-PbackfillPaused`) already rejects such a value; the raw-java form used by
+     * systemd units must not be more forgiving. Absent means "not paused".
+     *
+     * @throws IllegalArgumentException when the property is present but is neither
+     *         {@code true} nor {@code false}
+     */
+    static boolean backfillPausedProperty() {
+        String raw = System.getProperty("myotis.logindex.backfillPaused");
+        if (raw == null) return false;
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.equals("true")) return true;
+        if (v.equals("false")) return false;
+        throw new IllegalArgumentException(
+                "-Dmyotis.logindex.backfillPaused must be true or false (got '" + raw + "')");
+    }
+
     public static void main(String[] args) throws Exception {
         // Parse --network (comma-separated list) and --port from anywhere in args.
         List<String> networkNames = new ArrayList<>();
@@ -174,6 +196,17 @@ public final class Main {
         }
         if (networkNames.isEmpty()) networkNames.add("mainnet");
         String[] cmdArgs = remaining.toArray(new String[0]);
+
+        // Validate the boot flag HERE, before any socket, lock or engine exists:
+        // a typo must stop the daemon cleanly rather than throw from the middle
+        // of network setup with resources half-acquired.
+        try {
+            backfillPausedProperty();
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.exit(2);
+            return;
+        }
 
         // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
         // -Dmyotis.engine=java|rust|auto picks the engine (default auto — Rust where it
@@ -331,7 +364,7 @@ public final class Main {
             // downward walk — which on a node serving a single consumer is exactly
             // what starves head-follow (docs/bee-rpc-service.md). Applied after
             // start(), because the engine activates a drop-in index during start.
-            boolean pauseBackfill = Boolean.getBoolean("myotis.logindex.backfillPaused");
+            boolean pauseBackfill = backfillPausedProperty();
             if (!handle.start()) {
                 System.err.println("Failed to start " + network + " node stack");
                 engine.shutdownAll();

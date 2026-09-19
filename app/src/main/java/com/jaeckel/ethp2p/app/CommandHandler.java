@@ -1047,7 +1047,13 @@ public class CommandHandler {
     private static boolean literalEndsAt(String json, int start, String literal) {
         if (!json.startsWith(literal, start)) return false;
         int after = start + literal.length();
-        return after >= json.length() || !Character.isLetterOrDigit(json.charAt(after));
+        while (after < json.length() && Character.isWhitespace(json.charAt(after))) after++;
+        // A JSON value ends at a structural delimiter. Anything else after the
+        // literal — `true_`, `false!`, `truex` — is malformed, and a strict
+        // parser must refuse it rather than honour the prefix it recognised.
+        if (after >= json.length()) return true;
+        char c = json.charAt(after);
+        return c == ',' || c == '}' || c == ']';
     }
 
     static long extractLong(String json, String field) {
