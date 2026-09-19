@@ -3457,15 +3457,22 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         }
         result = reader.with_log_index(|ix| ix.query(&filter));
     }
-    // What the caller should DO about a coverage shortfall depends on whether
-    // anything is still working on it. With the walk paused, "retry as the
-    // index catches up" would be advice that can never come true below the
-    // coverage floor — the honest line names the state instead.
-    let paused = reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true);
-    let tail = if paused {
-        "backfill is paused on this node, so this range will not be filled in;          resume it or query within the covered range"
-    } else {
-        "retry as the index catches up"
+    // What the caller should DO about a coverage shortfall depends on which side
+    // fell short, and on whether anything is still working on it.
+    //
+    // A HIGH-side shortfall is head-follow's job — the appender and the bridge
+    // are closing it right now, and the backfill OFF switch touches neither —
+    // so "retry" stays right even on a paused node, and telling that caller to
+    // resume the walk would point at the one action that makes it slower. Only
+    // a LOW-side shortfall is the walk's job, and a paused node never fills it.
+    let advice = |low: u64| -> &'static str {
+        if filter.from_block < low
+            && reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true)
+        {
+            "backfill is paused on this node, so this range will not be filled in; resume it (logindex-backfill on) or query within the covered range"
+        } else {
+            "retry as the index catches up"
+        }
     };
     match result {
         None => eljson::error_json("log index is not configured on this network"),
@@ -3479,7 +3486,8 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         }
         Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
             Some((low, high)) => eljson::error_json(&format!(
-                "requested range is not indexed yet (covered: {low}-{high}); {tail}"
+                "requested range is not indexed yet (covered: {low}-{high}); {}",
+                advice(low)
             )),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },

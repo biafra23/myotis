@@ -275,6 +275,19 @@ of it stops.
 Pausing is fingerprint-neutral: coverage already walked survives, and resuming
 continues from the stored cursor.
 
+**It is a RUNTIME bit, not persisted state.** The portable snapshot does not
+encode it and the daemon has no settings file, so a daemon restart resumes the
+walk. For a long-running node make it the boot default instead:
+
+```bash
+./gradlew :app:run -Pnetwork=gnosis -Dmyotis.logindex.backfillPaused=true
+# or, in a systemd unit's ExecStart:
+java -Dmyotis.logindex.backfillPaused=true -cp '<lib>/*' com.jaeckel.ethp2p.app.Main --network gnosis
+```
+
+The apps persist their switch per network themselves and re-push it on every
+start, so this only concerns the daemon.
+
 ## Bee PoC desktop build (`-PbeePoc`)
 
 The hand-off for the Swarm team: a macOS app that a Bee full node can point at

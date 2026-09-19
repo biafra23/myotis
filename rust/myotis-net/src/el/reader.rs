@@ -1288,6 +1288,11 @@ impl ElReader {
                         Ok((_, mut merged)) => {
                             merged.set_enabled(eff.enabled);
                             merged.set_max_speed(eff.max_speed);
+                            // Every runtime bit must cross the merge: `merge` rebuilds
+                            // the config from the unioned watch set with all of them
+                            // false, so a bit not restored here silently flips — a
+                            // paused walk would restart on the next contract added.
+                            merged.set_backfill_paused(eff.backfill_paused);
                             merged
                         }
                         // Unreachable in practice (union_with already vetted
@@ -1368,6 +1373,7 @@ impl ElReader {
                         Some((_, mut m)) => {
                             m.set_enabled(eff.enabled);
                             m.set_max_speed(eff.max_speed);
+                            m.set_backfill_paused(eff.backfill_paused);
                             m
                         }
                         None => match crate::el::logindex::LogIndex::new(config) {
@@ -1579,6 +1585,11 @@ impl ElReader {
             }
         }
         let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
+        // Carried across the import for the same reason as the pacing bit: no host
+        // re-pushes the config afterwards, so a bit dropped here stays dropped and
+        // the walk would resume behind a UI switch that still reads "paused".
+        let backfill_paused =
+            self.with_log_index(|ix| ix.config().backfill_paused).unwrap_or(false);
         if own_path.exists() {
             match crate::el::logindex::LogIndex::load_portable(&own_path) {
                 Some((t, ix)) if t == tag => sources.push((t, ix)),
@@ -1613,6 +1624,7 @@ impl ElReader {
             crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
         merged.set_enabled(true);
         merged.set_max_speed(max_speed);
+        merged.set_backfill_paused(backfill_paused);
         // Rewound to LOCAL finality like every other checkpoint: a snapshot
         // from a node further along may carry coverage above it, but the
         // tail's fork scan rewinds above-finality coverage this run did not

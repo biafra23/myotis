@@ -417,19 +417,35 @@ public class CommandHandler {
             return jsonError("log index is not enabled on this network — "
                     + "build or import one first (build-logindex / import-logindex)");
         }
-        boolean maxSpeed = status.contains("\"maxSpeed\":true");
-        String config = "{\"enabled\":true,\"maxSpeed\":" + maxSpeed
-                + ",\"backfillPaused\":" + paused + ",\"watch\":[]}";
-        if (!handle.setLogIndexConfig(config)) {
+        if (!setBackfillPaused(handle, paused)) {
             return jsonError("log index config rejected — not the Rust engine "
                     + "(start with -Pengine=rust), or the engine is not running");
         }
         return "{\"ok\":true,\"backfillPaused\":" + paused + ",\"note\":\""
                 + (paused
                     ? "downward walk stopped; head-follow continues and queries below the "
-                        + "covered range are refused, never answered empty"
+                        + "covered range are refused, never answered empty. NOT PERSISTED: "
+                        + "the engine holds this at runtime only, so a daemon restart resumes "
+                        + "the walk — pass -Dmyotis.logindex.backfillPaused=true to make it "
+                        + "the boot default"
                     : "downward walk resumed from the stored cursor")
                 + "\"}";
+    }
+
+    /**
+     * Push the backfill OFF switch, preserving the other runtime bits.
+     *
+     * The engine takes every scalar from the pushed JSON, so a push that omits
+     * {@code maxSpeed} would silently reset pacing; it is read back from the live
+     * status first. The watch array is empty on purpose — the config push is
+     * additive, so existing entries survive. Shared with {@link Main}'s boot-time
+     * {@code -Dmyotis.logindex.backfillPaused} handling.
+     */
+    static boolean setBackfillPaused(ChainHandle handle, boolean paused) {
+        String status = handle.logIndexStatusJson();
+        boolean maxSpeed = status != null && status.contains("\"maxSpeed\":true");
+        return handle.setLogIndexConfig("{\"enabled\":true,\"maxSpeed\":" + maxSpeed
+                + ",\"backfillPaused\":" + paused + ",\"watch\":[]}");
     }
 
     // -------------------------------------------------------------------------

@@ -325,6 +325,13 @@ public final class Main {
                         + "will be accepted WITHOUT the interactive warning", network);
                 handle.acceptStaleAnchor();
             }
+            // Log-index backfill OFF switch as a BOOT default. The engine holds the
+            // bit at runtime only (it is not in the portable snapshot), and the
+            // daemon has no settings file, so without this a restart resumes the
+            // downward walk — which on a node serving a single consumer is exactly
+            // what starves head-follow (docs/bee-rpc-service.md). Applied after
+            // start(), because the engine activates a drop-in index during start.
+            boolean pauseBackfill = Boolean.getBoolean("myotis.logindex.backfillPaused");
             if (!handle.start()) {
                 System.err.println("Failed to start " + network + " node stack");
                 engine.shutdownAll();
@@ -332,6 +339,18 @@ public final class Main {
                 releaseAll(fileLocks, lockChannels);
                 System.exit(1);
                 return;
+            }
+            if (pauseBackfill) {
+                // False here means the network has no Rust-engine log index at all —
+                // say so rather than let the operator believe the walk is off.
+                if (CommandHandler.setBackfillPaused(handle, true)) {
+                    log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
+                            + "is OFF; head-follow continues and queries below the covered "
+                            + "range are refused", network);
+                } else {
+                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: no "
+                            + "Rust-engine log index on this network", network);
+                }
             }
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
