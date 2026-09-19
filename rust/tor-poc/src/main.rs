@@ -58,6 +58,8 @@ fn mainnet_eth_config() -> EthConfig {
         head_hash: genesis,
         head_number: 0,
         listen_port: 30303,
+        // Outbound-only: no PeerPool, so no serve window to seed with genesis.
+        genesis_header_rlp: None,
     }
 }
 

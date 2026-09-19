@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 26; // 26: + createWithCheckpoint (caller-supplied trust anchor, #441)
+    static final int EXPECTED_ABI_VERSION = 27; // 27: eth_call refuses a block outside the head window (#452)
 
     private static final boolean AVAILABLE = load();
 

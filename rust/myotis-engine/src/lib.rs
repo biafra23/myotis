@@ -86,7 +86,12 @@ uniffi::setup_scaffolding!();
 ///      root + slot, #441; the dataDir records the anchor in
 ///      `sync-anchor[-net].json` and resumes only that generation). `create`
 ///      gained the -3 ANCHOR_MISMATCH sentinel for a marked dataDir.
-pub const ABI_VERSION: i32 = 26;
+/// v27: eth_call_json / eth_call_overrides_json now CHECK their `block`
+///      argument (#452): a number outside [head-64, head+16] is refused, never
+///      answered from the head — permanently (`{"error","code":-32602}`, a new
+///      envelope key) when it is behind the window or not a servable selector
+///      at all. A behavior change and a payload extension, no signature change.
+pub const ABI_VERSION: i32 = 27;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

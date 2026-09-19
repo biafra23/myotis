@@ -31,6 +31,11 @@ const MIN_ETH_VERSION: u64 = 66;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Parameters for our side of the eth handshake.
+///
+/// Adding a field? `rust/tor-poc/src/main.rs` also builds this with a struct
+/// literal, and tor-poc sits outside the workspace, so CI never compiles it —
+/// update it too, then run `cargo check --manifest-path tor-poc/Cargo.toml`
+/// from `rust/`.
 pub struct EthConfig {
     pub network_id: u64,
     pub genesis_hash: [u8; 32],

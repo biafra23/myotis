@@ -173,7 +173,9 @@ pub fn get_storage_at_json(handle: i64, address: String, position: String) -> St
 /// Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
 /// `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
 /// is the answer); `value` is wei as a decimal string; `block` is the RPC block
-/// tag.
+/// selector. The call runs against the verified head, so a block number
+/// outside [head-64, head+16] is refused (`{"error","code":-32602}` when it can
+/// never be served), never answered from the head.
 #[uniffi::export]
 pub fn eth_call_json(
     handle: i64,

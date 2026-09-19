@@ -28,6 +28,28 @@ pub fn error_json(message: &str) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// JSON-RPC's "invalid params" code, carried by [`invalid_params_json`].
+pub const INVALID_PARAMS: i32 = -32602;
+
+/// `{"error": "...", "code": -32602}` — a PERMANENT refusal of the request's
+/// parameters: no retry can make this request succeed on this node, so a host
+/// that speaks JSON-RPC answers it with exactly this code. Emitted by eth_call
+/// today. A plain [`error_json`] (no `code`) makes no such promise, and hosts
+/// answer it with the retryable -32000. Old hosts see an ordinary `{"error"}`
+/// and lose nothing but the classification.
+///
+/// `error` is always the FIRST key, whatever serde_json's key-order feature is,
+/// so a prefix check for `{"error"` still recognises it. NOT for the JSON-string
+/// tri-state reads (blocks, receipts, txs, feeHistory, logs): the JVM router and
+/// the iOS backend unwrap only a SINGLE-key envelope there, and would pass this
+/// one through as if it were a result.
+pub fn invalid_params_json(message: &str) -> String {
+    format!(
+        "{{\"error\":{},\"code\":{INVALID_PARAMS}}}",
+        serde_json::Value::from(message)
+    )
+}
+
 /// Serialize a verified account result to the `AccountProofResult` shape.
 /// `address_echo` is the address exactly as the caller supplied it.
 pub fn account_json(
@@ -897,6 +919,16 @@ mod tests {
     fn error_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&error_json("no snap peer")).unwrap();
         assert_eq!(v["error"], "no snap peer");
+    }
+
+    #[test]
+    fn invalid_params_json_shape() {
+        // The JVM half (RustVerifiedReadJsonTest) parses this exact literal.
+        let json = invalid_params_json("block \"0x1\" is too old");
+        assert_eq!(json, r#"{"error":"block \"0x1\" is too old","code":-32602}"#);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|o| o.len()), Some(2));
+        assert_eq!(v["code"], INVALID_PARAMS);
     }
 
     #[test]

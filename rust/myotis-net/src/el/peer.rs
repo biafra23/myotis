@@ -67,6 +67,36 @@ struct GuardedWriter {
 
 type SharedWriter = Arc<Mutex<GuardedWriter>>;
 
+tokio::task_local! {
+    /// When the enclosing hedged attempt's first request frame was written
+    /// (see [`scope_send_marker`]). Unset outside a hedged read.
+    static REQUEST_SENT: Arc<std::sync::OnceLock<tokio::time::Instant>>;
+}
+
+/// Wrap one hedged-read attempt so it records when its first request actually
+/// reached the peer's socket, as opposed to when the attempt was created. The
+/// two can differ by a lot: every request first waits for the connection's
+/// shared writer, which another frame (a large response we are serving, or a
+/// write stuck on a peer that stopped reading) can hold for up to the 30 s
+/// frame-write timeout. The hedged race judges a loser only from this mark.
+pub(crate) fn scope_send_marker<F: std::future::Future>(
+    fut: F,
+) -> (
+    Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    impl std::future::Future<Output = F::Output>,
+) {
+    let sent = Arc::new(std::sync::OnceLock::new());
+    (Arc::clone(&sent), REQUEST_SENT.scope(sent, fut))
+}
+
+/// Record, for the enclosing hedged attempt if there is one, that a request
+/// frame was just written. Only the first call per attempt counts.
+pub(crate) fn mark_request_sent() {
+    let _ = REQUEST_SENT.try_with(|sent| {
+        let _ = sent.set(tokio::time::Instant::now());
+    });
+}
+
 /// Send one frame under the writer lock, cancel-safely: a previous send that
 /// was cancelled mid-frame leaves `torn` set, which this surfaces as a write
 /// error — every call site already treats that as fatal (`fail_all` + close).
@@ -285,6 +315,7 @@ impl ManagedPeer {
             guard.armed = false; // fail_all drained the map
             return Err(e);
         }
+        mark_request_sent();
 
         let out = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
@@ -842,6 +873,28 @@ fn describe_disconnect(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_send_marker_keeps_each_attempts_first_send() {
+        use std::time::Duration;
+        // Outside any hedged attempt, marking is a no-op, not a panic.
+        mark_request_sent();
+        let (first, a) = scope_send_marker(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mark_request_sent();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mark_request_sent(); // a later request of the same attempt
+        });
+        let (never, b) = scope_send_marker(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let start = tokio::time::Instant::now();
+        // Both attempts run in ONE task, as they do inside the hedged race:
+        // each still sees only its own marker.
+        tokio::join!(a, b);
+        assert_eq!(first.get().map(|t| t.duration_since(start)), Some(Duration::from_secs(1)));
+        assert!(never.get().is_none(), "an attempt that sent nothing has no mark");
+    }
 
     fn serve_ctx(window: crate::el::served::ServedHeaders) -> ServeContext {
         ServeContext {

@@ -136,6 +136,22 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   passes it), and a fresh directory starts without the proven-LC-server cache
   — copying `cl-peers[-net].cache` from the old directory into the new one is
   safe (it holds peers, not trust) and shortens the cold start.
+- **`ethCallJson`'s `block`** (checked by the engine since ABI 27, #452): the
+  call always runs against the **verified head's** state. A head tag
+  (`latest`/`pending`/`safe`/`finalized`) or `''` runs. A block number
+  (`0x`-hex, or bare decimal digits) runs only within `[head-64, head+16]` of
+  the verified head (`statusJson().optimisticBlockNumber`), and even then it
+  is answered from head state, not from that block (exact-block execution is
+  #382). Anything else is refused rather than answered from the head:
+  - `{"error": "…", "code": -32602}` is **permanent**: a number behind the
+    window, `earliest`, a block hash, a malformed selector, a malformed
+    `from`/`to`/`data`/`value`, or a NUL byte in any argument. Answer it as
+    JSON-RPC invalid params, and do not retry.
+  - A plain `{"error": "…"}` is retryable: a number ahead of the window, or no
+    verified head yet.
+
+  Engines before ABI 27 ignore `block` and always answer from the head, so a
+  host that forwards a block number must gate on `init() >= 27`.
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but
@@ -148,9 +164,11 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 26** and existing JS
-argument/result shapes (ABI 26 only adds `createWithCheckpoint`; everything a
-host pinned to ABI 25 used is unchanged). It is not a drop-in artifact for a host pinned to ABI 22.
+This implementation targets the current engine's **ABI 27** and existing JS
+argument/result shapes. No signature has changed since ABI 25: ABI 26 added
+`createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
+argument (see Notes), so a call an older engine answered from the head can now
+be refused. It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 
