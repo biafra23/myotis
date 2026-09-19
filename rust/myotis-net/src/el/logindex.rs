@@ -898,6 +898,13 @@ impl LogIndex {
     /// watch entries (names included) with `enabled`/`max_speed` false: those
     /// are runtime bits the receiving host decides, never file content.
     pub fn deserialize_portable(data: &[u8]) -> Option<(ChainTag, Self)> {
+        Self::deserialize_portable_with_id(data).map(|(ix, id)| (id.tag, ix))
+    }
+
+    /// [`Self::deserialize_portable`], plus the [`SnapshotId`] of the bytes it
+    /// read — so a caller can match a finality claim against the very file it
+    /// loaded. Reading the header a second time could see a different file.
+    pub fn deserialize_portable_with_id(data: &[u8]) -> Option<(Self, SnapshotId)> {
         let mut c = Cursor { d: data, pos: 0 };
         if c.take(4)? != MAGIC || c.u32()? != VERSION {
             return None; // v1 files are not self-describing — not importable
@@ -910,17 +917,21 @@ impl LogIndex {
         if parsed.fingerprint != config.fingerprint() {
             return None;
         }
+        let id = SnapshotId { tag: parsed.tag, fingerprint: parsed.fingerprint, checksum: parsed.checksum };
         let ix = Self::new(config).ok()?;
-        Some((
-            parsed.tag,
-            Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix },
-        ))
+        Some((Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix }, id))
     }
 
     /// [`Self::deserialize_portable`] from a file.
     pub fn load_portable(path: &Path) -> Option<(ChainTag, Self)> {
         let data = std::fs::read(path).ok()?;
         Self::deserialize_portable(&data)
+    }
+
+    /// [`Self::deserialize_portable_with_id`] from a file.
+    pub fn load_portable_with_id(path: &Path) -> Option<(Self, SnapshotId)> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize_portable_with_id(&data)
     }
 
     /// Does `path` hold a LEGACY (v1) snapshot? Distinguishes "not portable
@@ -951,6 +962,134 @@ impl LogIndex {
     pub fn load(config: &LogIndexConfig, tag: &ChainTag, path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
         Self::deserialize(config, tag, &data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finality claim: a sidecar beside the index (`<index>.final`) recording, for
+// ONE exact file, the finality its writer clamped it at. The index file alone
+// cannot say whether its top is final: a restart restores the beacon store from
+// a snapshot that is rewritten only once per sync-committee period, so the
+// anchor's first finality can trail the checkpoint by hours, and coverage
+// between the two looks exactly like an optimistic tail nobody can re-check.
+//
+// Deliberately NOT part of the portable format. The portable file is what gets
+// exported, imported and dropped into the data dir, and a claim must never
+// travel with it: it says "THIS NODE's light client had verified finality at
+// this height when it wrote these bytes", which no other file can say. So a
+// claim counts only for the exact bytes it was written beside (`SnapshotId`),
+// and only the reader's own checkpoint path writes one.
+// ---------------------------------------------------------------------------
+
+/// The contents of one v2 snapshot file, as far as a finality claim needs to
+/// know: chain tag and config fingerprint from the header, plus the payload
+/// checksum, which covers everything after it. A replaced file — a drop-in, an
+/// import, another build's write — has a different id, so an old claim no
+/// longer applies to it.
+///
+/// The checksum is FNV-1a, an integrity tag rather than a MAC: this guards
+/// against accidents, not adversaries — anyone who can replace the index in
+/// the data dir can replace the sidecar too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotId {
+    pub tag: ChainTag,
+    pub fingerprint: u64,
+    pub checksum: u64,
+}
+
+impl SnapshotId {
+    /// The id of a serialized v2 frame, read off its header — for a writer
+    /// that holds the bytes it is about to put on disk (it produced them, so
+    /// the checksum is not re-verified). `None` for anything but a v2 frame.
+    pub fn of_frame(bytes: &[u8]) -> Option<SnapshotId> {
+        let mut c = Cursor { d: bytes, pos: 0 };
+        if c.take(4)? != MAGIC || c.u32()? != VERSION {
+            return None;
+        }
+        let network_id = c.u64()?;
+        let genesis_hash = c.arr::<32>()?;
+        let fingerprint = c.u64()?;
+        let checksum = c.u64()?;
+        Some(SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum })
+    }
+}
+
+const CLAIM_MAGIC: &[u8; 4] = b"MLXF";
+const CLAIM_VERSION: u32 = 1;
+/// magic(4) + version(4) + network_id(8) + genesis_hash(32) + fingerprint(8)
+/// + checksum(8) + finalized(8) + the sidecar's own checksum(8).
+const CLAIM_LEN: usize = 80;
+
+/// Where the finality claim for the index at `index` lives: the same name plus
+/// `.final`. Appended rather than swapped in as the extension, so it can never
+/// collide with the index's own scratch files (`next_tmp_path` replaces the
+/// extension).
+pub fn finality_claim_path(index: &Path) -> PathBuf {
+    let mut name = index.as_os_str().to_owned();
+    name.push(".final");
+    PathBuf::from(name)
+}
+
+/// Record that the index file at `index`, whose contents are `id`, holds no
+/// coverage above `finalized` and was written while this node's light client
+/// had verified finality at least that far. Atomic, like the index itself.
+/// Write it AFTER the index: a crash in between leaves the previous claim
+/// beside a file it does not describe, which [`read_finality_claim`] rejects.
+/// A zero `finalized` claims nothing and is refused (`InvalidInput`); remove
+/// the claim instead.
+pub fn write_finality_claim(index: &Path, id: &SnapshotId, finalized: u64) -> std::io::Result<()> {
+    if finalized == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a finality claim at block 0 claims nothing",
+        ));
+    }
+    let mut out = Vec::with_capacity(CLAIM_LEN);
+    out.extend_from_slice(CLAIM_MAGIC);
+    put_u32(&mut out, CLAIM_VERSION);
+    put_u64(&mut out, id.tag.network_id);
+    out.extend_from_slice(&id.tag.genesis_hash);
+    put_u64(&mut out, id.fingerprint);
+    put_u64(&mut out, id.checksum);
+    put_u64(&mut out, finalized);
+    let sum = fnv64(&out);
+    put_u64(&mut out, sum);
+    write_atomic(&finality_claim_path(index), &out)
+}
+
+/// The finality claimed for the index file whose contents are `id`, or `None`
+/// when there is no claim, it is damaged, or it describes a different file.
+/// Only an exact match means "this node wrote these bytes".
+pub fn read_finality_claim(index: &Path, id: &SnapshotId) -> Option<u64> {
+    let data = std::fs::read(finality_claim_path(index)).ok()?;
+    if data.len() != CLAIM_LEN {
+        return None;
+    }
+    let (body, stored_sum) = data.split_at(CLAIM_LEN - 8);
+    if stored_sum != fnv64(body).to_le_bytes() {
+        return None;
+    }
+    let mut c = Cursor { d: body, pos: 0 };
+    if c.take(4)? != CLAIM_MAGIC || c.u32()? != CLAIM_VERSION {
+        return None;
+    }
+    let network_id = c.u64()?;
+    let genesis_hash = c.arr::<32>()?;
+    let fingerprint = c.u64()?;
+    let checksum = c.u64()?;
+    let finalized = c.u64()?;
+    let claimed = SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum };
+    // Zero is never written (`write_finality_claim` refuses it), so reading
+    // one back means the file is not what this code wrote.
+    (claimed == *id && finalized > 0).then_some(finalized)
+}
+
+/// Remove the finality claim beside `index`, for a write that cannot vouch for
+/// what it puts on disk. Absent already is success.
+pub fn remove_finality_claim(index: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(finality_claim_path(index)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1219,6 +1358,8 @@ fn walk_resumable(
 struct ParsedV2 {
     tag: ChainTag,
     fingerprint: u64,
+    /// The payload checksum, already verified against the payload.
+    checksum: u64,
     watch: Vec<WatchEntry>,
     coverage: Vec<Coverage>,
     cursor: Option<(u64, [u8; 32])>,
@@ -1259,7 +1400,15 @@ fn parse_v2(data: &[u8], mut c: Cursor) -> Option<ParsedV2> {
     if c.pos != data.len() {
         return None; // trailing garbage → treat as corrupt
     }
-    Some(ParsedV2 { tag: ChainTag { network_id, genesis_hash }, fingerprint, watch, coverage, cursor, logs })
+    Some(ParsedV2 {
+        tag: ChainTag { network_id, genesis_hash },
+        fingerprint,
+        checksum: stored_sum,
+        watch,
+        coverage,
+        cursor,
+        logs,
+    })
 }
 
 /// Parse the coverage + cursor + log body shared by v1 and v2 frames.
@@ -2434,5 +2583,138 @@ mod bloom_match_tests {
         accrue(&mut addr_only, &addr(1));
         assert!(!ix.bloom_may_match(100, &addr_only)); // topic0-restricted entry needs a topic hit
         assert!(!ix.bloom_may_match(100, &EMPTY_BLOOM));
+    }
+}
+
+#[cfg(test)]
+mod finality_claim_tests {
+    use super::*;
+
+    /// A per-test scratch dir, removed on every exit path.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("logindex-claim-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tag() -> ChainTag {
+        ChainTag { network_id: 100, genesis_hash: [0x4f; 32] }
+    }
+
+    fn index(high: u64) -> LogIndex {
+        let watch = WatchEntry { address: [1; 20], from_block: 0, topic0s: vec![], name: String::new() };
+        let mut ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, watch: vec![watch] }).unwrap();
+        for b in 10..=high {
+            ix.append_block(b, [b as u8; 32], vec![]).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn a_claim_counts_only_beside_the_exact_file_it_was_written_for() {
+        let dir = TempDir::new("exact");
+        let path = dir.0.join("logindex-gnosis.db");
+        let bytes = index(20).serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let (_, id) = LogIndex::load_portable_with_id(&path).unwrap();
+        // The writer's view of the id (off the bytes it holds) and the loader's
+        // (off the bytes it parsed) must agree, or no claim ever matches.
+        assert_eq!(SnapshotId::of_frame(&bytes), Some(id));
+        assert_eq!(read_finality_claim(&path, &id), None, "no sidecar yet");
+        write_finality_claim(&path, &id, 20).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), Some(20));
+
+        // The index is replaced — a drop-in, an import, an older build's write.
+        // The sidecar left behind describes the old bytes and says nothing
+        // about the new ones.
+        write_atomic(&path, &index(25).serialize(&tag())).unwrap();
+        let (_, replaced) = LogIndex::load_portable_with_id(&path).unwrap();
+        assert_ne!(replaced, id);
+        assert_eq!(read_finality_claim(&path, &replaced), None);
+
+        // Same payload under another chain's tag is another file too.
+        let other_chain = SnapshotId { tag: ChainTag { network_id: 1, ..tag() }, ..id };
+        assert_eq!(read_finality_claim(&path, &other_chain), None);
+    }
+
+    #[test]
+    fn a_damaged_claim_is_no_claim() {
+        let dir = TempDir::new("damaged");
+        let path = dir.0.join("logindex-gnosis.db");
+        let id = SnapshotId::of_frame(&index(20).serialize(&tag())).unwrap();
+        let claim = finality_claim_path(&path);
+
+        write_finality_claim(&path, &id, 20).unwrap();
+        let good = std::fs::read(&claim).unwrap();
+        assert_eq!(good.len(), CLAIM_LEN);
+        // A flipped bit anywhere — including in the claimed height itself.
+        for at in [0, 8, 56, 64, CLAIM_LEN - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x01;
+            std::fs::write(&claim, &bad).unwrap();
+            assert_eq!(read_finality_claim(&path, &id), None, "bit flip at {at} accepted");
+        }
+        // Truncated, or with trailing bytes.
+        std::fs::write(&claim, &good[..CLAIM_LEN - 1]).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        let mut long = good.clone();
+        long.push(0);
+        std::fs::write(&claim, &long).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // A consistent frame with one field changed, checksum redone.
+        let reframed = |at: usize, bytes: &[u8]| {
+            let mut body = good[..CLAIM_LEN - 8].to_vec();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+            let sum = fnv64(&body);
+            body.extend_from_slice(&sum.to_le_bytes());
+            body
+        };
+        // An unknown version.
+        std::fs::write(&claim, reframed(4, &2u32.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Zero is never written...
+        let refused = write_finality_claim(&path, &id, 0).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        // ...so a well-formed zero on disk is not believed either.
+        std::fs::write(&claim, reframed(64, &0u64.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+    }
+
+    #[test]
+    fn the_claim_is_a_sidecar_the_portable_file_never_carries() {
+        let dir = TempDir::new("sidecar");
+        let path = dir.0.join("logindex-gnosis.db");
+        assert_eq!(finality_claim_path(&path), dir.0.join("logindex-gnosis.db.final"));
+        // Never one of the index's own scratch names (which REPLACE the
+        // extension), so a checkpoint's temp file cannot land on it.
+        for _ in 0..4 {
+            assert_ne!(next_tmp_path(&path), finality_claim_path(&path));
+        }
+        let ix = index(20);
+        let bytes = ix.serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let id = SnapshotId::of_frame(&bytes).unwrap();
+        write_finality_claim(&path, &id, 20).unwrap();
+        // The index bytes do not change with a claim beside them, so a copy of
+        // the file — an export, a file handed to another node — carries no
+        // claim to wherever it lands.
+        assert_eq!(std::fs::read(&path).unwrap(), ix.serialize(&tag()));
+        let elsewhere = dir.0.join("copied.db");
+        std::fs::copy(&path, &elsewhere).unwrap();
+        assert_eq!(read_finality_claim(&elsewhere, &id), None);
+
+        remove_finality_claim(&path).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Removing what is already gone is not an error.
+        remove_finality_claim(&path).unwrap();
     }
 }
