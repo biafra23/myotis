@@ -264,8 +264,8 @@ rulings, 2026-09-02 and 2026-09-11):
 
 ## Pull requests and code review
 
-These rules are for the **PR author** answering a review. The reviewer's own
-instructions live in `.github/claude-review-prompt.md` and
+These rules are for the **PR author**, opening a PR and answering its review.
+The reviewer's own instructions live in `.github/claude-review-prompt.md` and
 `.github/workflows/claude-review.yml`; a reviewer agent reads this file too
 (its prompt opens "Read CLAUDE.md first"), so note that the mechanism below is
 not addressed to it — and it could not follow it anyway, since `gh api` is not
@@ -300,11 +300,14 @@ prompt and CLAUDE.md to the base ref, never execute fork code, keep reviews
 that produced this note.
 
 - **WRITE EVERY PR IN ENGLISH** (owner ruling, 2026-09-17) — title, description,
-  review replies and any top-level PR comment, whatever language the task was
-  discussed in. PRs are the project's public record and are read by external
-  contributors and by the automated reviewers; a German description makes a
-  change unreviewable for part of that audience. Talking to the owner in German
-  is fine and unaffected; the moment it lands on GitHub it is English.
+  commit messages, review replies and any top-level PR comment: everything that
+  lands on GitHub, whatever language the task was discussed in. Commit messages
+  are in on purpose — they sit in the PR's Commits tab and stay in `git log`
+  forever, read by the same audience. PRs are the project's public record and
+  are read by external contributors and by the automated reviewers; a German
+  description makes a change unreviewable for part of that audience. Talking to
+  the owner in German is fine and unaffected; the moment it lands on GitHub it
+  is English.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
