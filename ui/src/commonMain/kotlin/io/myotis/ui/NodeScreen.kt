@@ -974,6 +974,18 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
         StatusRow("Hdr asks", "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}")
         StatusRow("Blk asks", "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}")
+        // The read-fetch shadow cache (docs/read-stats.md): verified state
+        // fetches this run, the share a sound cache keying would have served
+        // (storage-root keyed slots, per-block accounts, content-addressed
+        // code) with the storage time it would have saved, and how often a
+        // value up to a minute old would still have been right. Rows appear
+        // once the engine has observed a fetch; hidden on hosts that don't
+        // feed the JSON.
+        s.readStatsJson?.let(ReadStatsStatus::parse)?.takeIf(ReadStatsStatus::hasReads)?.let { rs ->
+            StatusRow("Reads", ReadStatsStatus.fetchesLine(rs))
+            StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs))
+            ReadStatsStatus.staleLine(rs)?.let { StatusRow("Stale ≤60s ok", it) }
+        }
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())

@@ -335,6 +335,25 @@ public final class NodeService extends Service {
         }
     }
 
+    /** The read-fetch shadow-cache counters JSON for the Status tab's Reads
+     *  rows (docs/read-stats.md), or null when the network isn't hosted. A
+     *  status probe like the log-index one: not gated on readiness. */
+    public String readStatsJsonOrNull(String network) {
+        String net = canonicalNetwork(network);
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return null;
+        }
+        try {
+            return handle.readStatsJson();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     /**
      * Import portable log-index snapshots into a RUNNING network's index.
      * {@code pathsJson} must name REAL files (the activity copies

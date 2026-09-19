@@ -14,6 +14,7 @@ Both engines implement it with the identical JSON shape (schema 1):
 |---|---|---|
 | `ChainHandle.readStatsJson()` | `ChainStack.readStats()` | `read_stats_json` (UniFFI, C ABI `myotis_read_stats_json`) |
 | daemon IPC | `./gradlew :app:run -Pargs=read-stats` | same |
+| Status tab (desktop, Android, iOS) | the `Reads` / `Cacheable` / `Stale ≤60s ok` rows (`ui/.../ReadStatsStatus.kt`), shown once a fetch was observed | same |
 | log line | — | `[read-stats] …` every 5 min while reads flow (the tracing ring hosts drain) |
 
 Reset on process start; survives pause/resume on both engines (the Java
