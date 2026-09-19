@@ -44,8 +44,9 @@ Three notes on what the numbers mean:
   follows a direct read (a header-chain walk on the fallback path) is never
   included: it is not something a state cache would have saved.
 - The batched Java prefetch wave verifies many facts from one round-trip; the
-  round-trip's time (end to end across peer retries, like the per-item paths)
-  is shared out equally across the facts it verified, so a per-fact figure
+  round-trip's time (end to end across peer retries, like the per-item paths —
+  on the Rust EVM oracle that span is the hedged race, so a hedge delay spent
+  on a silent first peer counts as cost the read paid) is shared out equally across the facts it verified, so a per-fact figure
   from that path is an estimate — removing one slot from a batch does not save
   1/N of the trip. A chunk that partially verifies and then retries on
   another peer flushes the first attempt's facts with the first attempt's
