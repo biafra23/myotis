@@ -62,7 +62,10 @@ class AndroidNodeController(
         while (true) {
             emit(serviceProvider()?.let { svc ->
                 svc.snapshots().mapValues { (net, s) ->
-                    s.toModel().copy(logIndexJson = svc.logIndexStatusJsonOrNull(net))
+                    s.toModel().copy(
+                        logIndexJson = svc.logIndexStatusJsonOrNull(net),
+                        readStatsJson = svc.readStatsJsonOrNull(net),
+                    )
                 }
             } ?: emptyMap())
             delay(2000)

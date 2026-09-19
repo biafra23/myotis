@@ -177,16 +177,19 @@ public final class VerifiedAccountQuery {
             return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         return queryProof(stack.connector(), stack.beaconSyncState(),
-                stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress);
+                stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress,
+                stack.readStats());
     }
 
     /**
      * {@link #queryProof(ChainStack, String)} for callers holding the parts rather than a
-     * stack (the JVM daemon's CommandHandler until the hosts are rewired onto the API).
+     * stack. {@code readStats} receives the verified account fact (proof-verified AND
+     * beacon-anchored — never the peer's slim body) with the snap round-trip's cost.
      */
     public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
             RLPxConnector connector, BeaconSyncState bss,
-            long clGenesisTime, int secondsPerSlot, String hexAddress) {
+            long clGenesisTime, int secondsPerSlot, String hexAddress,
+            io.myotis.evm.world.ReadStats readStats) {
         if (connector == null) {
             return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
@@ -210,13 +213,33 @@ public final class VerifiedAccountQuery {
         final Bytes32 accountHash = Hash.keccak256(address);
         final BeaconSyncState bssFinal = bss;
         final RLPxConnector conn = connector;
+        final long snapStarted = System.nanoTime();
         return connector.requestAccount(address).thenCompose(result -> {
+            // The snap round-trip's cost (the shadow cache's measure); the
+            // verify() below may add a header-chain walk, which is not
+            // something a state cache would have saved.
+            final long snapElapsedNanos = System.nanoTime() - snapStarted;
             AccountRangeMessage.AccountData found = null;
             for (AccountRangeMessage.AccountData a : result.accounts()) {
                 if (a.accountHash().equals(accountHash)) { found = a; break; }
             }
             final AccountRangeMessage.AccountData foundFinal = found;
             return verify(result, address, foundFinal, bssFinal, conn).thenApply(v -> {
+                // Shadow-cache bookkeeping for the VERIFIED answer only: the leaf
+                // proof must have verified (verifyMethod alone is not enough — the
+                // stateRootMatch fast path does not consult peerProofValid, and
+                // the hex fields below then fall back to the peer's slim body).
+                if (readStats != null && v.peerProofValid() && v.verifyMethod() != null
+                        && result.stateRoot() != null) {
+                    var fact = foundFinal == null
+                            ? io.myotis.evm.world.ReadStats.AccountFact.absent()
+                            : new io.myotis.evm.world.ReadStats.AccountFact(
+                                    foundFinal.nonce(), foundFinal.balance(),
+                                    Bytes32.fromHexString(v.verifiedStorageRootHex()),
+                                    Bytes32.fromHexString(v.verifiedCodeHashHex()));
+                    readStats.observeAccount(address.toArrayUnsafe(),
+                            result.stateRoot().toArrayUnsafe(), fact, snapElapsedNanos);
+                }
                 List<String> proofHex = new ArrayList<>(result.proof().size());
                 for (Bytes b : result.proof()) proofHex.add(b.toHexString());
                 String storageRootHex = v.verifiedStorageRootHex() != null

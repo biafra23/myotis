@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 27; // 27: eth_call refuses a block outside the head window (#452)
+    static final int EXPECTED_ABI_VERSION = 28; // 28: read_stats_json (read-fetch shadow-cache counters)
 
     private static final boolean AVAILABLE = load();
 
@@ -361,6 +361,11 @@ final class RustEngineNative {
     /** Log-index status JSON (enabled, counts, coverage per entry). */
     static String nativeLogIndexStatusJson(long handle) {
         return Myotis_engineKt.logIndexStatusJson(handle);
+    }
+
+    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    static String nativeReadStatsJson(long handle) {
+        return Myotis_engineKt.readStatsJson(handle);
     }
 
     /** Import portable log-index snapshots ({"ok":true,...} / {"error":...}). */
