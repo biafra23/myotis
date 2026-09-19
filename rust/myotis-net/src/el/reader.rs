@@ -2324,11 +2324,15 @@ impl ElReader {
     /// finality-based rules below measure against the vouched height where it
     /// is higher than the anchor's finality — nothing at or below it can
     /// reorg — and while the anchored head is still below it the tail holds
-    /// outright: that head has nothing to add, and a head below final
-    /// coverage is a stale anchor, not the shortened chain the rule for that
-    /// would take it for. Records still retire against the anchor's own
-    /// finality only: the vouched height says what the PREVIOUS run proved,
-    /// nothing about blocks this run appended.
+    /// there: that head has nothing to add, and a head below FINAL coverage is
+    /// a stale anchor, not the shortened chain the rule for that would take it
+    /// for. The hold covers the vouched region only. What this run appended
+    /// above it is ordinary optimistic coverage, so a head that no longer
+    /// reaches it gives that coverage back before the hold returns — orphaned
+    /// or merely unreachable, nothing above the vouched top may keep serving
+    /// on a chain that does not carry it. Records still retire against the
+    /// anchor's own finality only: the vouched height says what the PREVIOUS
+    /// run proved, nothing about blocks this run appended.
     ///
     /// Serving at the optimistic head matches the rest of the engine, where
     /// every verified read (`eth_call`, `getCode`, `getBalance`) answers under
@@ -2359,6 +2363,33 @@ impl ElReader {
         // from looking like a reorg. `finalized` stays the anchor's own.
         let vouched = self.vouched_now();
         if head_n < vouched {
+            // The hold protects the VOUCHED region only. Anything this run
+            // appended above it is ordinary optimistic coverage, and a head
+            // that no longer reaches it is the chain-shortened case the rule
+            // below would have caught before the hold existed — but the hold
+            // returns first, so give that coverage back here.
+            //
+            // Safe in both readings of a head under the vouched top: on a
+            // genuine reorg those blocks are orphaned and MUST go, and on a
+            // merely regressed anchor reading the appender or the bridge
+            // re-adds them verified. Neither reading can justify serving them,
+            // which is the whole point of the records. Nothing at or below
+            // `vouched` is touched: that is what the claim proved final.
+            let above = self
+                .with_log_index(|ix| ix.append_edge())
+                .flatten()
+                .is_some_and(|edge| edge > vouched.saturating_add(1));
+            if above {
+                // Guarded like the TAIL_MAX branch: `rewind_above` scans the
+                // whole log store under the index lock, and a hold repeats
+                // every tick for as long as the light client lags.
+                tracing::info!(
+                    head_n,
+                    vouched,
+                    "log index tail: head below the vouched top; dropping this run's coverage above it"
+                );
+                self.log_index_rewind_to(vouched);
+            }
             if ticks % 100 == 0 {
                 tracing::info!(
                     head_n,
@@ -10110,6 +10141,45 @@ mod restart_claim_reader_tests {
         tick(&reader).await;
         assert_eq!(reader.log_index_covered_high(), Some(F0));
         reader.stop().await;
+    }
+
+    /// A reorg DURING the hold must still drop what this run appended above the
+    /// vouched top. The hold exists so that a head under that top is not read as
+    /// a reorg of the FINAL region; it must not also shelter the optimistic
+    /// blocks above it, which no longer have a chain reaching them.
+    #[tokio::test]
+    async fn a_reorg_under_the_vouched_top_still_drops_this_runs_optimistic_coverage() {
+        let dir = TempDir::new("hold-reorg");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // Run 2: finality is still stale, but the attested head has caught up
+        // past the vouched top, so the tail follows it as it always does.
+        let anchor = anchor_at(F0, F1 + 5);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        append(&reader, F1 + 1, F1 + 5, true); // what the tail appends this run
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
+
+        // The beacon head reorgs back under the vouched top. `update_optimistic`
+        // is monotonic in SLOT, not in execution block number, so this is what
+        // the anchor reports; F1+1..=F1+5 are orphaned and must stop serving.
+        set_anchor(&anchor, F0, F1 - 3);
+        tick(&reader).await;
+        assert_eq!(
+            reader.log_index_covered_high(),
+            Some(F1),
+            "orphaned optimistic coverage kept serving through the hold"
+        );
+        assert!(
+            reader.log_index_tail.lock().unwrap().iter().all(|(n, _)| *n <= F1),
+            "records above the vouched top outlived the chain that carried them"
+        );
+        // The claim's own region is untouched, and still vouched for: this is
+        // the line between the two, and the reason the hold exists at all.
+        assert_eq!(vouched(&reader), F1);
+        reader.stop().await;
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
     }
 
     #[tokio::test]
