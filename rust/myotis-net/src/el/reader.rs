@@ -2940,6 +2940,16 @@ impl ElReader {
         // (`backfill_should_yield`) and never for longer than the fairness
         // floor: a walk switched off in a state nobody is fixing would idle the
         // index completely, which is worse than either job running slowly.
+        // OFF switch, checked before the yield logic: `backfill_paused` stops the
+        // walk outright, where yielding only defers it. A host serving a single
+        // consumer that already owns the history below coverage (the Bee PoC)
+        // gains nothing from the walk and loses the snap-pool capacity
+        // head-follow needs. Unlike raising `from_block` to the coverage floor,
+        // this keeps the coverage description honest: a query below the floor
+        // still gets `OutOfCoverage`, never a silent empty list.
+        if self.with_log_index(|ix| ix.config().backfill_paused) == Some(true) {
+            return;
+        }
         if let (Some(edge), Some(head)) = (
             self.with_log_index(|ix| ix.append_edge()).flatten(),
             self.head_block_number(),
@@ -8773,6 +8783,7 @@ mod persist_cadence_tests {
         let cfg = LogIndexConfig {
             enabled: true,
             max_speed: false,
+            backfill_paused: false,
             watch: vec![WatchEntry {
                 address: [1u8; 20],
                 from_block: 0,

@@ -104,6 +104,10 @@ class IosSettings : Settings {
         getBool("$K_LOG_INDEX_SPEED_PREFIX$network", false)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) =
         defaults.setBool(on, "$K_LOG_INDEX_SPEED_PREFIX$network")
+    override fun logIndexBackfillPaused(network: String): Boolean =
+        getBool("$K_LOG_INDEX_PAUSED_PREFIX$network", false)
+    override fun setLogIndexBackfillPaused(network: String, on: Boolean) =
+        defaults.setBool(on, "$K_LOG_INDEX_PAUSED_PREFIX$network")
     override fun logIndexConfigured(network: String): Boolean =
         defaults.objectForKey("$K_LOG_INDEX_PREFIX$network") != null
     override fun logIndexWatchJson(network: String): String {
@@ -137,6 +141,7 @@ class IosSettings : Settings {
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_LOG_INDEX_PREFIX = "logIndex."
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
+        const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"

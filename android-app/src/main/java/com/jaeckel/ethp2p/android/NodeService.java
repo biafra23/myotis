@@ -310,6 +310,15 @@ public final class NodeService extends Service {
         prefs(c).edit().putBoolean("logIndex.maxSpeed." + canonicalNetwork(network), on).apply();
     }
 
+    /** Backfill OFF switch (true = the downward walk does not run); same key scheme. */
+    public static boolean logIndexBackfillPaused(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex.backfillPaused." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexBackfillPaused(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex.backfillPaused." + canonicalNetwork(network), on).apply();
+    }
+
     public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
     }
@@ -387,7 +396,7 @@ public final class NodeService extends Service {
         boolean enabled = logIndexEnabled(this, net);
         String json = io.myotis.ui.LogIndexWatch.configJson(
                 logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
-                logIndexConfigured(this, net));
+                logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
         if (json == null) {
             return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
         }

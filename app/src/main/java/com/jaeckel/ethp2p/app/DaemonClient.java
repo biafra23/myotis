@@ -179,6 +179,13 @@ public class DaemonClient {
                 }
                 yield sb.append("]}").toString();
             }
+            case "logindex-backfill" -> {
+                // logindex-backfill on|off — the downward walk's OFF switch.
+                if (args.length < 2 || !("on".equals(args[1]) || "off".equals(args[1]))) {
+                    throw new IllegalArgumentException("Usage: logindex-backfill on|off");
+                }
+                yield "{\"cmd\":\"logindex-backfill\",\"paused\":" + "off".equals(args[1]) + "}";
+            }
             case "export-logindex" -> {
                 if (args.length < 2) throw new IllegalArgumentException(
                     "Usage: export-logindex <outFile>");

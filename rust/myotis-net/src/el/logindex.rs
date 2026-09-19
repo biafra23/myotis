@@ -57,6 +57,25 @@ pub struct LogIndexConfig {
     /// background). Deliberately NOT part of the fingerprint — flipping it
     /// must never invalidate accumulated coverage.
     pub max_speed: bool,
+    /// Backfill OFF switch: `true` = the downward walk does not run at all;
+    /// head-follow and queries are untouched. For a node that serves ONE
+    /// consumer which already owns the history below the index's coverage
+    /// (the Bee PoC: Bee embeds postage events to block 47,061,407 and never
+    /// asks below it), the walk only competes for the snap pool that
+    /// head-follow needs — measured on gnosis: the walk ran at ~1000 blocks/min
+    /// while head-follow managed 3-4.5 against a chain doing 12, so coverage
+    /// fell behind until the consumer's stall timer fired.
+    ///
+    /// Crucially this is NOT the same as raising a watch entry's `from_block`
+    /// to the coverage floor. `from_block` is the config's assertion that the
+    /// contract has no logs below it, so raising it makes a query below the
+    /// floor answer an empty list — a silent lie. Pausing leaves `from_block`
+    /// at the deployment block, so such a query still gets `OutOfCoverage`:
+    /// an honest refusal the caller can act on.
+    ///
+    /// Like [`Self::max_speed`], deliberately NOT part of the fingerprint —
+    /// flipping it must never invalidate accumulated coverage.
+    pub backfill_paused: bool,
     pub watch: Vec<WatchEntry>,
 }
 
@@ -104,7 +123,12 @@ impl LogIndexConfig {
                 None => watch.push(s.clone()),
             }
         }
-        Some(LogIndexConfig { enabled: self.enabled, max_speed: self.max_speed, watch })
+        Some(LogIndexConfig {
+            enabled: self.enabled,
+            max_speed: self.max_speed,
+            backfill_paused: self.backfill_paused,
+            watch,
+        })
     }
 
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
@@ -344,6 +368,13 @@ impl LogIndex {
     /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
     pub fn set_max_speed(&mut self, max_speed: bool) {
         self.config.max_speed = max_speed;
+    }
+
+    /// Stop or resume the downward walk. Fingerprint-neutral like
+    /// [`Self::set_max_speed`]: coverage already accumulated survives the flip,
+    /// and resuming continues from the same cursor.
+    pub fn set_backfill_paused(&mut self, paused: bool) {
+        self.config.backfill_paused = paused;
     }
 
     pub fn config(&self) -> &LogIndexConfig {
@@ -904,7 +935,7 @@ impl LogIndex {
         }
         let parsed = parse_v2(data, c)?;
         let config =
-            LogIndexConfig { enabled: false, max_speed: false, watch: parsed.watch };
+            LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: parsed.watch };
         // The stored fingerprint must actually match the stored watch-table —
         // a mismatch means the frame is inconsistent with itself.
         if parsed.fingerprint != config.fingerprint() {
@@ -1169,7 +1200,7 @@ impl LogIndex {
                 }
             }
         }
-        let config = LogIndexConfig { enabled: false, max_speed: false, watch };
+        let config = LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch };
         // Duplicates are impossible post-union; new() also re-validates.
         let ix = Self::new(config).expect("union has unique addresses");
         Ok((expected, Self { coverage, logs, cursor, ..ix }))
@@ -1437,10 +1468,30 @@ mod tests {
     }
 
     #[test]
+    fn pausing_the_backfill_is_fingerprint_neutral_and_flippable() {
+        // The pause is a runtime bit like max_speed: coverage already walked
+        // must survive the flip, and resuming continues from the same cursor.
+        let w = WatchEntry { address: [9u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
+        let running = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()],
+        };
+        let paused = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: true, watch: vec![w],
+        };
+        assert_eq!(running.fingerprint(), paused.fingerprint());
+        let mut ix = LogIndex::new(running).unwrap();
+        assert!(!ix.config().backfill_paused);
+        ix.set_backfill_paused(true);
+        assert!(ix.config().backfill_paused);
+        ix.set_backfill_paused(false);
+        assert!(!ix.config().backfill_paused);
+    }
+
+    #[test]
     fn max_speed_is_fingerprint_neutral_and_flippable() {
         let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
-        let a = LogIndexConfig { enabled: true, max_speed: false, watch: vec![w.clone()] };
-        let b = LogIndexConfig { enabled: true, max_speed: true, watch: vec![w] };
+        let a = LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()] };
+        let b = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![w] };
         // Flipping pacing must never invalidate accumulated coverage.
         assert_eq!(a.fingerprint(), b.fingerprint());
         let mut ix = LogIndex::new(a).unwrap();
@@ -1482,7 +1533,7 @@ mod tests {
     }
 
     fn config(entries: Vec<WatchEntry>) -> LogIndexConfig {
-        LogIndexConfig { enabled: true, max_speed: false, watch: entries }
+        LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: entries }
     }
 
     /// `LogIndex::new(config(...)).unwrap()` shorthand for valid configs.
@@ -1527,7 +1578,7 @@ mod tests {
         let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(10, [0xbb; 32], vec![]).unwrap();
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
-        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
+        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
         assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::Unanswerable));
     }
@@ -2090,6 +2141,7 @@ mod tests {
         let pushed = LogIndexConfig {
             enabled: true,
             max_speed: true,
+            backfill_paused: false,
             watch: vec![{
                 let mut w = watch_all(addr(1), 100); // lower from_block
                 w.name = "preset name".to_string();
@@ -2115,7 +2167,7 @@ mod tests {
         // and coverage re-pairs by address.
         let mut renamed = watch_all(addr(2), 150);
         renamed.name = "renamed.eth".to_string();
-        let eff = LogIndexConfig { enabled: true, max_speed: true, watch: vec![renamed, watch_all(addr(1), 200)] };
+        let eff = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![renamed, watch_all(addr(1), 200)] };
         assert!(ix.adopt_config(eff));
         assert!(ix.config().enabled && ix.config().max_speed);
         assert_eq!(ix.config().watch[0].from_block, 150);
@@ -2424,7 +2476,7 @@ mod bloom_match_tests {
             [b; 20]
         }
         let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
-        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, watch: vec![watch] }).unwrap();
+        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![watch] }).unwrap();
         let mut hit = EMPTY_BLOOM;
         accrue(&mut hit, &addr(1));
         accrue(&mut hit, &[7u8; 32]);

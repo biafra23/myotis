@@ -85,6 +85,7 @@ public class CommandHandler {
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
                 case "logindex-status"         -> handle.logIndexStatusJson();
+                case "logindex-backfill"       -> handleLogIndexBackfill(jsonLine);
                 default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
@@ -388,6 +389,47 @@ public class CommandHandler {
         }
         return "{\"ok\":true,\"building\":[" + building
                 + "],\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
+    }
+
+    /**
+     * {@code {"cmd":"logindex-backfill","paused":true|false}} — stop or resume the
+     * downward walk without touching anything else.
+     *
+     * The walk and head-follow share one snap-peer pool: on a node that serves a
+     * consumer which already owns the history below the index's coverage (Bee embeds
+     * postage events to block 47,061,407 and never asks below it), the walk is pure
+     * contention, and coverage falling behind the head is what makes that consumer
+     * give up. Pausing is the honest lever — raising a watch entry's fromBlock to the
+     * coverage floor would also stop the walk, but fromBlock asserts the contract has
+     * NO logs below it, so queries down there would answer an empty list instead of
+     * the {@code -32000} refusal they get while paused.
+     *
+     * The other runtime bits are READ BACK from the live status and pushed unchanged:
+     * the engine takes scalars from the pushed JSON, so omitting them here would
+     * silently reset pacing or disable the index. The watch array is empty on purpose
+     * — the config push is additive, so existing entries survive.
+     */
+    private String handleLogIndexBackfill(String jsonLine) {
+        if (!jsonLine.contains("\"paused\"")) return jsonError("paused must be true or false");
+        boolean paused = jsonLine.contains("\"paused\":true");
+        String status = handle.logIndexStatusJson();
+        if (status == null || !status.contains("\"enabled\":true")) {
+            return jsonError("log index is not enabled on this network — "
+                    + "build or import one first (build-logindex / import-logindex)");
+        }
+        boolean maxSpeed = status.contains("\"maxSpeed\":true");
+        String config = "{\"enabled\":true,\"maxSpeed\":" + maxSpeed
+                + ",\"backfillPaused\":" + paused + ",\"watch\":[]}";
+        if (!handle.setLogIndexConfig(config)) {
+            return jsonError("log index config rejected — not the Rust engine "
+                    + "(start with -Pengine=rust), or the engine is not running");
+        }
+        return "{\"ok\":true,\"backfillPaused\":" + paused + ",\"note\":\""
+                + (paused
+                    ? "downward walk stopped; head-follow continues and queries below the "
+                        + "covered range are refused, never answered empty"
+                    : "downward walk resumed from the stored cursor")
+                + "\"}";
     }
 
     // -------------------------------------------------------------------------

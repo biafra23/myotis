@@ -91,13 +91,14 @@ object LogIndexWatch {
         enabled: Boolean,
         maxSpeed: Boolean = false,
         configured: Boolean = false,
+        backfillPaused: Boolean = false,
     ): String? {
         if (!enabled && !configured) return null
         val entries = parse(watchJson)
         val watch = entries.joinToString(",") {
             """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
         }
-        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"watch":[$watch]}"""
+        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"backfillPaused":$backfillPaused,"watch":[$watch]}"""
     }
 
     /**

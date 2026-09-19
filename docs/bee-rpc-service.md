@@ -234,6 +234,47 @@ The committed data set (`data/bee/gnosis/`, 2026-09-15, zbox's Gnosis geth,
 artifact. Do not refresh it in git — the rule in the next section applies to
 any recurring data set.
 
+## Pausing the backfill
+
+The log index does two jobs on one snap-peer pool and one tick: follow the head,
+and walk down to each contract's `fromBlock`. For a node that serves **one**
+consumer which already owns the history below the index's coverage, the walk is
+pure contention. Bee is exactly that consumer: it embeds the postage events to
+block 47,061,407 (`go:embed` in Bee's `pkg/postage/snapshot`) and rebuilds its
+batch store from them, so it never asks below that height — measured on zbox
+over a full night, the lowest block Bee ever requested was 48,286,726.
+
+Measured there on 2026-09-19 with the walk running: the walk managed ~1,000
+blocks/min downward while head-follow managed 3–4.5 against a chain producing
+12. Coverage fell behind the head, every head-reaching `eth_getLogs` was refused
+while it did, and Bee shut itself down with `postage syncing stalled`.
+
+So: switch the walk off.
+
+```bash
+./gradlew :app:run -Pnetwork=gnosis -Pargs="logindex-backfill off"   # stop the walk
+./gradlew :app:run -Pnetwork=gnosis -Pargs="logindex-backfill on"    # resume it
+./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status           # backfillPaused: true|false
+```
+
+In the apps the same switch is in the **Index tab** ("Pause backfill on
+\<network\>"), and the **Bee PoC flavour ships with it ON** (`BeePoc.kt`) — the
+PoC's whole point is a node Bee can use from the first minute, and the walk only
+gets in the way of that.
+
+**Why pausing rather than raising `fromBlock`.** Both stop the walk, and raising
+the watch entry's `fromBlock` to the coverage floor looks simpler. It is not
+equivalent: `fromBlock` is the config's assertion that the contract has **no
+logs below it**, so a query below the floor would then be answered with an empty
+list — the silent-corruption case the coverage rule exists to prevent. Pausing
+leaves `fromBlock` at the deployment block, so such a query keeps getting the
+`-32000` refusal, with a message that says the walk is paused rather than
+promising it will catch up. Coverage stays honestly described; only the filling
+of it stops.
+
+Pausing is fingerprint-neutral: coverage already walked survives, and resuming
+continues from the stored cursor.
+
 ## Bee PoC desktop build (`-PbeePoc`)
 
 The hand-off for the Swarm team: a macOS app that a Bee full node can point at

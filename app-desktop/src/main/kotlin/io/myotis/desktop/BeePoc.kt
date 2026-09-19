@@ -76,6 +76,25 @@ object BeePoc {
 
     fun enabled(): Boolean = System.getProperty(PROP).toBoolean()
 
+    /**
+     * Whether a network with no stored preference should have its log-index backfill
+     * PAUSED. True in this flavour, false in a regular install.
+     *
+     * The PoC serves exactly one consumer, and Bee embeds the postage history below the
+     * seed (`go:embed` in Bee's `pkg/postage/snapshot`, events to block 47,061,407) — it
+     * has never once asked below it. The downward walk therefore fetches only data Bee
+     * cannot use, while competing for the snap pool that head-follow needs: measured on
+     * zbox 2026-09-19, the walk ran at ~1000 blocks/min while head-follow managed 3-4.5
+     * against a chain doing 12, coverage fell behind, and Bee shut itself down with
+     * "postage syncing stalled".
+     *
+     * Pausing is the honest lever here. Raising the watch entry's fromBlock to the
+     * coverage floor would stop the walk too, but `fromBlock` asserts the contract has NO
+     * logs below it, so queries down there would answer an empty list. Paused, they keep
+     * getting `OutOfCoverage` — an error the caller can act on.
+     */
+    fun backfillPausedDefault(): Boolean = enabled()
+
     /** The flavour's own data dir — it never touches a regular Myotis install's `~/.myotis`. */
     fun dataDir(): Path = Path.of(System.getProperty("user.home"), ".myotis-bee-poc")
 
@@ -187,6 +206,9 @@ object BeePoc {
         settings.setNetworkEnabled(NETWORK, true)
         settings.setLogIndexEnabled(NETWORK, true)
         settings.setLogIndexWatchJson(NETWORK, WATCH_JSON)
+        // Explicit, so the Index tab's switch shows the state the flavour runs in
+        // rather than an unset default (see backfillPausedDefault for why).
+        settings.setLogIndexBackfillPaused(NETWORK, true)
     }
 
     /**

@@ -278,6 +278,7 @@ class DesktopNodeController(
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
         val maxSpeed = settings.logIndexMaxSpeed(network)
+        val backfillPaused = settings.logIndexBackfillPaused(network)
         // Nothing to say (no watched contracts, never configured) -> never push;
         // the engine keeps eth_getLogs in its honest not-configured state. A
         // CONFIGURED network always pushes — a disable must reach the engine or
@@ -285,6 +286,7 @@ class DesktopNodeController(
         val json = LogIndexWatch.configJson(
             settings.logIndexWatchJson(network), enabled, maxSpeed,
             configured = settings.logIndexConfigured(network),
+            backfillPaused = backfillPaused,
         ) ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
@@ -676,6 +678,9 @@ class DesktopSettings(
     private val logIndexOn = HashMap<String, Boolean>()
     // Per-network backfill pacing (true = max download speed); see Settings.logIndexMaxSpeed.
     private val logIndexMax = HashMap<String, Boolean>()
+    // Per-network backfill OFF switch; see Settings.logIndexBackfillPaused. Absent
+    // means "use the flavour default" — the Bee PoC ships paused (BeePoc.kt).
+    private val logIndexPaused = HashMap<String, Boolean>()
     // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
     private val logIndexWatch = HashMap<String, String>()
 
@@ -722,6 +727,9 @@ class DesktopSettings(
     override fun logIndexMaxSpeed(network: String): Boolean =
         synchronized(this) { logIndexMax[network] ?: false }
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
+    override fun logIndexBackfillPaused(network: String): Boolean =
+        synchronized(this) { logIndexPaused[network] ?: BeePoc.backfillPausedDefault() }
+    override fun setLogIndexBackfillPaused(network: String, on: Boolean) = mutate { logIndexPaused[network] = on }
     override fun logIndexConfigured(network: String): Boolean =
         synchronized(this) { logIndexOn.containsKey(network) }
     override fun logIndexWatchJson(network: String): String =
@@ -770,6 +778,10 @@ class DesktopSettings(
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexPaused[k.removePrefix(K_LOG_INDEX_PAUSED_PREFIX)] = it }
+        }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexMax[k.removePrefix(K_LOG_INDEX_SPEED_PREFIX)] = it }
@@ -786,6 +798,7 @@ class DesktopSettings(
             .filter {
                 it.startsWith(K_LOG_INDEX_PREFIX) &&
                     !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) &&
                     !it.startsWith(K_LOG_INDEX_WATCH_PREFIX)
             }
             .forEach { k ->
@@ -844,6 +857,7 @@ class DesktopSettings(
         p.setProperty(K_TOR, torRouting.toString())
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
+        logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
         logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
         return p
     }
@@ -888,6 +902,7 @@ class DesktopSettings(
         // Distinct prefixes nested under logIndex.* so the enable-loader's
         // startsWith filter must exclude them (see load()).
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
+        const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
     }
 }

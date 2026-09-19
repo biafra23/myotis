@@ -101,6 +101,11 @@ class LogIndexWatchTest {
             listOf(LogIndexWatch.Entry("0x45a1502382541cD610CC9068e88727426b696293", 31_305_656)),
         )
         val json = LogIndexWatch.configJson(watch, enabled = true, maxSpeed = true)!!
+        // Absent means "keep walking" — a host that never sets the switch must not
+        // silently stop its backfill.
+        assertTrue(json, json.contains("\"backfillPaused\":false"))
+        val paused = LogIndexWatch.configJson(watch, enabled = true, backfillPaused = true)!!
+        assertTrue(paused, paused.contains("\"backfillPaused\":true"))
         assertTrue(json.contains("\"enabled\":true"))
         assertTrue(json.contains("\"maxSpeed\":true"))
         assertTrue(json.contains("0x45a1502382541cD610CC9068e88727426b696293"))
