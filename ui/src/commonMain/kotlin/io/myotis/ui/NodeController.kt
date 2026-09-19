@@ -315,6 +315,16 @@ interface Settings {
     fun logIndexMaxSpeed(network: String): Boolean = false
     fun setLogIndexMaxSpeed(network: String, on: Boolean) {}
 
+    /** Backfill OFF switch, per network: true = the downward walk does not run,
+     *  so coverage stays where it is and only head-follow continues. For a node
+     *  serving one consumer that already owns the history below coverage the
+     *  walk is pure contention for the snap pool head-follow needs. Unlike
+     *  raising a watch entry's fromBlock, this keeps queries below the covered
+     *  floor REFUSED rather than answered with an empty list. Fingerprint-neutral
+     *  engine-side: pausing and resuming never discards accumulated coverage. */
+    fun logIndexBackfillPaused(network: String): Boolean = false
+    fun setLogIndexBackfillPaused(network: String, on: Boolean) {}
+
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
      * (networking off, RPC listening, first request wakes it). 0 disables auto-pause.

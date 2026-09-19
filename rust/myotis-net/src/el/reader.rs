@@ -1550,6 +1550,11 @@ impl ElReader {
                         Ok((_, mut merged)) => {
                             merged.set_enabled(eff.enabled);
                             merged.set_max_speed(eff.max_speed);
+                            // Every runtime bit must cross the merge: `merge` rebuilds
+                            // the config from the unioned watch set with all of them
+                            // false, so a bit not restored here silently flips — a
+                            // paused walk would restart on the next contract added.
+                            merged.set_backfill_paused(eff.backfill_paused);
                             merged
                         }
                         // Unreachable in practice (union_with already vetted
@@ -1643,6 +1648,7 @@ impl ElReader {
                         Some((_, mut m)) => {
                             m.set_enabled(eff.enabled);
                             m.set_max_speed(eff.max_speed);
+                            m.set_backfill_paused(eff.backfill_paused);
                             claim = stored_claim;
                             m
                         }
@@ -1882,6 +1888,11 @@ impl ElReader {
             }
         }
         let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
+        // Carried across the import for the same reason as the pacing bit: no host
+        // re-pushes the config afterwards, so a bit dropped here stays dropped and
+        // the walk would resume behind a UI switch that still reads "paused".
+        let backfill_paused =
+            self.with_log_index(|ix| ix.config().backfill_paused).unwrap_or(false);
         if own_path.exists() {
             match crate::el::logindex::LogIndex::load_portable(&own_path) {
                 Some((t, ix)) if t == tag => sources.push((t, ix)),
@@ -1916,6 +1927,7 @@ impl ElReader {
             crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
         merged.set_enabled(true);
         merged.set_max_speed(max_speed);
+        merged.set_backfill_paused(backfill_paused);
         // Rewound to LOCAL finality like every other checkpoint: a snapshot
         // from a node further along may carry coverage above it, but the
         // tail's fork scan rewinds above-finality coverage this run did not
@@ -3487,6 +3499,16 @@ impl ElReader {
         // (`backfill_should_yield`) and never for longer than the fairness
         // floor: a walk switched off in a state nobody is fixing would idle the
         // index completely, which is worse than either job running slowly.
+        // OFF switch, checked before the yield logic: `backfill_paused` stops the
+        // walk outright, where yielding only defers it. A host serving a single
+        // consumer that already owns the history below coverage (the Bee PoC)
+        // gains nothing from the walk and loses the snap-pool capacity
+        // head-follow needs. Unlike raising `from_block` to the coverage floor,
+        // this keeps the coverage description honest: a query below the floor
+        // still gets `OutOfCoverage`, never a silent empty list.
+        if self.with_log_index(|ix| ix.config().backfill_paused) == Some(true) {
+            return;
+        }
         if let (Some(edge), Some(head)) = (
             self.with_log_index(|ix| ix.append_edge()).flatten(),
             self.head_block_number(),
@@ -9845,6 +9867,7 @@ mod persist_cadence_tests {
         let cfg = LogIndexConfig {
             enabled: true,
             max_speed: false,
+            backfill_paused: false,
             watch: vec![WatchEntry {
                 address: [1u8; 20],
                 from_block: 0,
@@ -10154,6 +10177,7 @@ mod restart_claim_reader_tests {
         LogIndexConfig {
             enabled: true,
             max_speed: false,
+            backfill_paused: false,
             watch: vec![WatchEntry { address: STAMP, from_block: 31_305_656, topic0s: vec![], name: String::new() }],
         }
     }

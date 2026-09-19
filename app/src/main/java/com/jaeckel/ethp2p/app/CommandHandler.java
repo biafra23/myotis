@@ -85,6 +85,7 @@ public class CommandHandler {
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
                 case "logindex-status"         -> handle.logIndexStatusJson();
+                case "logindex-backfill"       -> handleLogIndexBackfill(jsonLine);
                 case "read-stats"              -> handle.readStatsJson();
                 default                        -> jsonError("Unknown command: " + cmd);
             };
@@ -380,15 +381,117 @@ public class CommandHandler {
                  .append("\",\"fromBlock\":").append(fromBlock).append('}');
             building.append('"').append(a).append('"');
         }
-        String config = "{\"enabled\":true,\"maxSpeed\":true,\"watch\":[" + watch + "]}";
+        // CARRY the live pause across the push. The engine takes every scalar
+        // from the pushed JSON and defaults an absent backfillPaused to false, so
+        // omitting it here would RESUME a paused walk — at forced max speed, the
+        // exact contention this switch exists to stop — on a daemon the operator
+        // deliberately stood down (or booted with -PbackfillPaused=true). The
+        // note below says so, because a build that cannot descend while paused
+        // must not read as a build in progress.
+        boolean paused = backfillPaused(handle);
+        String config = "{\"enabled\":true,\"maxSpeed\":true,\"backfillPaused\":" + paused
+                + ",\"watch\":[" + watch + "]}";
         if (!handle.setLogIndexConfig(config)) {
             // False has several causes; name them all rather than misdirect.
             return jsonError("log index config rejected — not the Rust engine "
                     + "(start with -Pengine=rust), engine not running, or the config "
                     + "conflicts with the existing subscription's topic restrictions");
         }
-        return "{\"ok\":true,\"building\":[" + building
-                + "],\"note\":\"poll logindex-status until complete, then export-logindex <path>\"}";
+        return "{\"ok\":true,\"building\":[" + building + "],\"backfillPaused\":" + paused
+                + ",\"note\":\""
+                + (paused
+                    ? "the backfill is PAUSED on this daemon, so the new entries are "
+                        + "subscribed but will not descend — head-follow indexes them from "
+                        + "here on. Run logindex-backfill on to fill the history"
+                    : "poll logindex-status until complete, then export-logindex <path>")
+                + "\"}";
+    }
+
+    /**
+     * {@code {"cmd":"logindex-backfill","paused":true|false}} — stop or resume the
+     * downward walk without touching anything else.
+     *
+     * The walk and head-follow share one snap-peer pool: on a node that serves a
+     * consumer which already owns the history below the index's coverage (Bee embeds
+     * postage events to block 47,061,407 and never asks below it), the walk is pure
+     * contention, and coverage falling behind the head is what makes that consumer
+     * give up. Pausing is the honest lever — raising a watch entry's fromBlock to the
+     * coverage floor would also stop the walk, but fromBlock asserts the contract has
+     * NO logs below it, so queries down there would answer an empty list instead of
+     * the {@code -32000} refusal they get while paused.
+     *
+     * The other runtime bits are READ BACK from the live status and pushed unchanged:
+     * the engine takes scalars from the pushed JSON, so omitting them here would
+     * silently reset pacing or disable the index. The watch array is empty on purpose
+     * — the config push is additive, so existing entries survive.
+     */
+    private String handleLogIndexBackfill(String jsonLine) {
+        if (!jsonLine.contains("\"paused\"")) return jsonError("paused must be true or false");
+        // Strict, whitespace-tolerant parse. A substring match for "paused":true
+        // reads the compact form only, so `{"cmd":..., "paused": true}` — what
+        // json.dumps and jq emit — would MISS and resume the walk while echoing
+        // the caller an ok. That is worse than accepted-and-ignored: the
+        // parameter is applied INVERTED (CLAUDE.md §Trust — applied or refused).
+        // The IPC surface is JSON-Lines from any client, not just DaemonClient's
+        // compact encoder.
+        boolean paused;
+        try {
+            paused = extractBoolean(jsonLine, "paused");
+        } catch (IllegalArgumentException e) {
+            return jsonError("paused must be true or false");
+        }
+        String status = handle.logIndexStatusJson();
+        if (status == null || !status.contains("\"enabled\":true")) {
+            return jsonError("log index is not enabled on this network — "
+                    + "build or import one first (build-logindex / import-logindex)");
+        }
+        if (!setBackfillPaused(handle, paused)) {
+            return jsonError("log index config rejected — not the Rust engine "
+                    + "(start with -Pengine=rust), or the engine is not running");
+        }
+        return "{\"ok\":true,\"backfillPaused\":" + paused + ",\"note\":\""
+                + (paused
+                    ? "downward walk stopped; head-follow continues and queries below the "
+                        + "covered range are refused, never answered empty. NOT PERSISTED: "
+                        + "the engine holds this at runtime only, so a daemon restart resumes "
+                        + "the walk. Make it the boot default with -PbackfillPaused=true "
+                        + "(gradlew) or -Dmyotis.logindex.backfillPaused=true (raw java)"
+                    : "downward walk resumed from the stored cursor")
+                + "\"}";
+    }
+
+    /**
+     * Push the backfill OFF switch, preserving the other runtime bits.
+     *
+     * The engine takes every scalar from the pushed JSON, so a push that omits
+     * {@code maxSpeed} would silently reset pacing; it is read back from the live
+     * status first. The watch array is empty on purpose — the config push is
+     * additive, so existing entries survive. Shared with {@link Main}'s boot-time
+     * {@code -Dmyotis.logindex.backfillPaused} handling (bridged from
+     * {@code -PbackfillPaused} by the :app:run task).
+     */
+    static boolean setBackfillPaused(ChainHandle handle, boolean paused) {
+        String status = handle.logIndexStatusJson();
+        // REFUSE when no index is enabled, rather than push `enabled:true` at a
+        // network that has none. With no live index and no snapshot on disk the
+        // engine accepts an empty watch list (LogIndex::new only rejects
+        // duplicate addresses), so the push would INSTALL an enabled, zero-entry
+        // index and spawn its head-follow appender — and return true, which
+        // makes Main's "no log index on this network" warning unreachable and
+        // tells the operator the backfill is off on an index that never existed.
+        if (status == null || !status.contains("\"enabled\":true")) return false;
+        boolean maxSpeed = status.contains("\"maxSpeed\":true");
+        return handle.setLogIndexConfig("{\"enabled\":true,\"maxSpeed\":" + maxSpeed
+                + ",\"backfillPaused\":" + paused + ",\"watch\":[]}");
+    }
+
+    /**
+     * Read the live backfill pause bit, or {@code false} when this network has no
+     * enabled index (nothing is walking, so nothing is paused).
+     */
+    static boolean backfillPaused(ChainHandle handle) {
+        String status = handle.logIndexStatusJson();
+        return status != null && status.contains("\"backfillPaused\":true");
     }
 
     // -------------------------------------------------------------------------
@@ -918,6 +1021,39 @@ public class CommandHandler {
         int close = json.indexOf('"', open + 1);
         if (close < 0) throw new IllegalArgumentException("Unterminated string for field: " + field);
         return json.substring(open + 1, close);
+    }
+
+    /**
+     * Extract a JSON BOOLEAN. Whitespace-tolerant after the colon and strict about
+     * the token: exactly {@code true} or {@code false}, never a quoted "true" and
+     * never a silent default. A boolean that flips behaviour is a parameter like
+     * any other — applied or refused (CLAUDE.md §Trust).
+     */
+    static boolean extractBoolean(String json, String field) {
+        String key = "\"" + field + "\"";
+        int keyIdx = json.indexOf(key);
+        if (keyIdx < 0) throw new IllegalArgumentException("Missing field: " + field);
+        int colon = json.indexOf(':', keyIdx + key.length());
+        if (colon < 0) throw new IllegalArgumentException("Malformed JSON near field: " + field);
+        int start = colon + 1;
+        while (start < json.length() && Character.isWhitespace(json.charAt(start))) start++;
+        // Token boundary matters: `truthy` must not read as `true`. A JSON literal
+        // ends at a delimiter, so anything alphanumeric after it is malformed.
+        if (literalEndsAt(json, start, "true")) return true;
+        if (literalEndsAt(json, start, "false")) return false;
+        throw new IllegalArgumentException("Field '" + field + "' is not a boolean");
+    }
+
+    private static boolean literalEndsAt(String json, int start, String literal) {
+        if (!json.startsWith(literal, start)) return false;
+        int after = start + literal.length();
+        while (after < json.length() && Character.isWhitespace(json.charAt(after))) after++;
+        // A JSON value ends at a structural delimiter. Anything else after the
+        // literal — `true_`, `false!`, `truex` — is malformed, and a strict
+        // parser must refuse it rather than honour the prefix it recognised.
+        if (after >= json.length()) return true;
+        char c = json.charAt(after);
+        return c == ',' || c == '}' || c == ']';
     }
 
     static long extractLong(String json, String field) {

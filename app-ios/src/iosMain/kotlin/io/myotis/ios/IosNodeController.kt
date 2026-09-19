@@ -188,7 +188,8 @@ class IosNodeController(
         val json = io.myotis.ui.LogIndexWatch.configJson(
             settings.logIndexWatchJson(net), settings.logIndexEnabled(net),
             settings.logIndexMaxSpeed(net),
-            configured = settings.logIndexConfigured(net)) ?: return
+            configured = settings.logIndexConfigured(net),
+            backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
         if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
             logs.append("WARN log index config rejected for $net")
         }

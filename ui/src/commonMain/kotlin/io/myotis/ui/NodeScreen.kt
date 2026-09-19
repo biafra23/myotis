@@ -1958,6 +1958,29 @@ private fun IndexTab(
                 if (maxSpeed) "Backfills as fast as peers serve — heavier on network and battery."
                 else "Nice background pace — one small batch every few seconds.",
             )
+            var backfillPaused by remember(network) {
+                mutableStateOf(settings.logIndexBackfillPaused(network))
+            }
+            SwitchRow(
+                label = "Pause backfill on $network",
+                checked = backfillPaused,
+                enabled = true,
+                onChange = { on ->
+                    backfillPaused = on
+                    settings.setLogIndexBackfillPaused(network, on)
+                    // Fingerprint-neutral like the pacing bit: coverage already
+                    // walked survives, and resuming continues from the same cursor.
+                    controller.applyLogIndex(network)
+                },
+            )
+            Text(
+                if (backfillPaused)
+                    "Walking down to each contract's start is OFF — coverage stays where it is " +
+                        "and only the head is followed. Queries below the covered range are " +
+                        "REFUSED, never answered empty. Use this when the consumer already has " +
+                        "the older history."
+                else "Walks down to each contract's start block in the background.",
+            )
         }
         // Import: merge portable snapshot files (built by the daemon's
         // build-logindex tool, or exported by another node) into this

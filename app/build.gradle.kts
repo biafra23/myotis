@@ -86,6 +86,20 @@ tasks.register<JavaExec>("run") {
     // logs) — treat blank as unset so the default stands.
     (project.findProperty("rustlog") as? String)?.takeIf { it.isNotBlank() }
         ?.let { environment("RUST_LOG", it) }
+    // -PbackfillPaused=true|false → -Dmyotis.logindex.backfillPaused: boot the
+    // daemon with the log-index downward walk stopped. :app:run is a FORKED
+    // JavaExec, so a bare -D on the gradlew line lands on the Gradle JVM and
+    // never reaches the daemon — the same reason -Pbls/-Pengine/-Prustlog all
+    // have bridges. A silent no-op here would be the exact failure the flag
+    // exists to close (a restart quietly resuming the walk), so a typo is a
+    // hard error rather than a fall-through to "running".
+    (project.findProperty("backfillPaused") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
+        val v = raw.trim().lowercase()
+        if (v !in listOf("true", "false")) {
+            throw GradleException("-PbackfillPaused must be true or false (got '$raw')")
+        }
+        systemProperty("myotis.logindex.backfillPaused", v)
+    }
     // -Plcdump=<dir> → -Dmyotis.lc.dumpVectors: capture raw light-client SSZ
     // (bootstrap/updates/finality) for the rust/testdata conformance corpus.
     (project.findProperty("lcdump") as String?)?.let { systemProperty("myotis.lc.dumpVectors", it) }

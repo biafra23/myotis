@@ -3068,13 +3068,34 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
 /// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
 /// adds engine plumbing). `None` = malformed (wrong types); unknown keys are
 /// ignored for forward compatibility.
+/// A JSON boolean field that must be a boolean if it is there at all.
+///
+/// Absent (or `null`, which every host's "field omitted" encodes as) yields
+/// `default`; a real boolean yields itself; anything else yields `None`, which
+/// makes the caller refuse the config instead of applying a default the caller
+/// never asked for.
+fn strict_bool(v: &serde_json::Value, key: &str, default: bool) -> Option<bool> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(other) => other.as_bool(),
+    }
+}
+
 fn parse_log_index_config(
     v: &serde_json::Value,
 ) -> Option<myotis_net::el::logindex::LogIndexConfig> {
-    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    // Every scalar here decides what the index DOES, so a present-but-malformed
+    // value refuses the whole config rather than falling back to a default: a
+    // caller that wrote `"enabled":"true"` would otherwise get a running index
+    // silently switched off, with no way to tell (CLAUDE.md §Trust — applied or
+    // refused, never silently replaced). Absent stays the documented default.
+    let enabled = strict_bool(v, "enabled", false)?;
     // Backfill pacing (optional; absent = nice/background). Fingerprint-neutral:
     // flipping it re-applies onto the live index without resetting coverage.
-    let max_speed = v.get("maxSpeed").and_then(|e| e.as_bool()).unwrap_or(false);
+    let max_speed = strict_bool(v, "maxSpeed", false)?;
+    // Absent means "not paused": a host that predates this key keeps walking,
+    // which is the behaviour it already had.
+    let backfill_paused = strict_bool(v, "backfillPaused", false)?;
     let mut watch = Vec::new();
     if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
         return None;
@@ -3101,7 +3122,12 @@ fn parse_log_index_config(
             watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s, name });
         }
     }
-    Some(myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch })
+    Some(myotis_net::el::logindex::LogIndexConfig {
+        enabled,
+        max_speed,
+        backfill_paused,
+        watch,
+    })
 }
 
 /// Import portable log-index snapshots: `paths_json` is a JSON array of
@@ -3218,6 +3244,8 @@ fn build_log_index_status(
         }
         s.push_str(",\"maxSpeed\":");
         s.push_str(if ix.config().max_speed { "true" } else { "false" });
+        s.push_str(",\"backfillPaused\":");
+        s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
         // All optional-by-context so the shape stays honest: no cursor yet →
@@ -3488,6 +3516,42 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         }
         result = reader.with_log_index(|ix| ix.query(&filter));
     }
+    // What the caller should DO about a coverage shortfall depends on which side
+    // fell short, and on whether anything is still working on it.
+    //
+    // A HIGH-side shortfall is head-follow's job — the appender and the bridge
+    // are closing it right now, and the backfill OFF switch touches neither —
+    // so "retry" stays right even on a paused node, and telling that caller to
+    // resume the walk would point at the one action that makes it slower. Only
+    // a LOW-side shortfall is the walk's job, and a paused node never fills it.
+    //
+    // Which side fell short is decided against the EFFECTIVE floor, not the raw
+    // filter: `LogIndex::query` requires coverage only from
+    // `max(filter.from_block, entry.from_block)`, because below a watch entry's
+    // from_block the config asserts the contract has no logs. So a routine
+    // `0..head` sweep of a contract deployed at 31,305,656 whose coverage starts
+    // exactly there has NO low-side gap — only the head side is missing, and
+    // that caller must be told to retry however the walk is set.
+    // Host-neutral wording: this reaches every eth_getLogs consumer, and the
+    // daemon's `logindex-backfill on` does not exist on desktop, Android or iOS,
+    // whose lever is the Index tab's pause switch.
+    let paused = reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true);
+    let effective_from = |address: [u8; 20]| -> u64 {
+        let entry_from = reader
+            .with_log_index(|ix| {
+                ix.config().watch.iter().find(|w| w.address == address).map(|w| w.from_block)
+            })
+            .flatten()
+            .unwrap_or(0);
+        filter.from_block.max(entry_from)
+    };
+    let advice = |address: [u8; 20], low: u64| -> &'static str {
+        if paused && effective_from(address) < low {
+            "the backfill is paused on this node, so this range will not be filled in; resume it (Index tab switch, or logindex-backfill on in the daemon) or query within the covered range"
+        } else {
+            "retry as the index catches up"
+        }
+    };
     match result {
         None => eljson::error_json("log index is not configured on this network"),
         Some(Ok(logs)) => eljson::get_logs_json(&logs),
@@ -3498,10 +3562,20 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         Some(Err(QueryError::UnindexedTopic(_))) => {
             eljson::error_json("topic is outside this node's indexed signatures for that address")
         }
-        Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
+        Some(Err(QueryError::OutOfCoverage { address, covered })) => match covered.span {
             Some((low, high)) => eljson::error_json(&format!(
-                "requested range is not indexed yet (covered: {low}-{high}); retry as the index catches up"
+                "requested range is not indexed yet (covered: {low}-{high}); {}",
+                advice(address, low)
             )),
+            // No coverage at all yet, so there is no side to compare against.
+            // Head-follow still starts covering from the head as blocks arrive,
+            // which a retrying caller near the tip will see; anything further
+            // down waits on the walk, and on a paused node waits forever.
+            None if paused => eljson::error_json(
+                "log index has no coverage yet, and the backfill is paused on this node, so only \
+                 blocks indexed from here on become answerable; resume it (Index tab switch, or \
+                 logindex-backfill on in the daemon)",
+            ),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
         Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
@@ -3514,6 +3588,29 @@ mod log_index_json_tests {
 
     fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
         parse_log_index_config(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn a_present_but_non_boolean_scalar_refuses_the_whole_config() {
+        // Applied or refused, never silently replaced: `"enabled":"true"` used to
+        // parse as enabled=false, which would switch a running index off while the
+        // caller believed it had turned one on.
+        assert!(cfg(r#"{"enabled":"true","watch":[]}"#).is_none());
+        assert!(cfg(r#"{"enabled":true,"maxSpeed":1,"watch":[]}"#).is_none());
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":"true","watch":[]}"#).is_none());
+        // Absent and explicit null both keep the documented default.
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).is_some());
+        assert!(!cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).unwrap().backfill_paused);
+    }
+
+    #[test]
+    fn parses_backfill_paused_default_and_explicit() {
+        // Absent means "keep walking": a host that predates the key must not
+        // silently stop its backfill on upgrade.
+        let base = r#"{"enabled":true,"watch":[{"address":"0x4e69fD587118dFb64957d18654E3894118E9b1BF","fromBlock":5}]}"#;
+        assert!(!cfg(base).unwrap().backfill_paused, "absent backfillPaused must keep the walk running");
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":true,"watch":[]}"#).unwrap().backfill_paused);
+        assert!(!cfg(r#"{"enabled":true,"backfillPaused":false,"watch":[]}"#).unwrap().backfill_paused);
     }
 
     #[test]
@@ -3561,12 +3658,16 @@ mod log_index_json_tests {
         let cfg = myotis_net::el::logindex::LogIndexConfig {
             enabled: true,
             max_speed: true,
+            backfill_paused: false,
             watch: vec![w],
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
         let s = build_log_index_status(&ix, Some(9.44), 0);
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
+        // The pause bit rides next to maxSpeed in the fixed key order the
+        // Kotlin parser and its golden test pin.
+        assert!(s.contains("\"backfillPaused\":false"), "{s}");
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":500"), "{s}");
         assert!(s.contains("\"blocksPerSec\":9.4"), "{s}");
