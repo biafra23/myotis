@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{EnsQuery, EnsRootMode};
 use myotis_net::el::reader::ElReader;
+use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
 
@@ -74,8 +75,11 @@ enum ChainEntry {
     /// handle stays valid and `resume` re-runs the start path, which warm-starts
     /// from the persisted snapshot / peer caches under the host's dataDir (no
     /// checkpoint re-bootstrap). Carries the last `SyncStatus` observed at pause
-    /// time so status reads keep reporting the warm beacon fields while asleep.
-    Paused(Arc<ChainConfig>, SyncStatus),
+    /// time so status reads keep reporting the warm beacon fields while asleep,
+    /// and the read-fetch shadow cache so its counters outlive the torn-down
+    /// reader (they are per handle, like the Java stack's — resume hands them
+    /// to the new reader).
+    Paused(Arc<ChainConfig>, SyncStatus, Arc<ReadStats>),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -453,7 +457,7 @@ fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -
             let cfg = match entry {
                 ChainEntry::Created(c) => c,
                 ChainEntry::Running(c, _, _) => c,
-                ChainEntry::Paused(c, _) => c,
+                ChainEntry::Paused(c, ..) => c,
             };
             cfg.snapshot_path.as_deref() == Some(target)
         })
@@ -598,14 +602,19 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // Holding the map lock across block_on would serialize every other native
     // (status/stop/create) behind a potentially-slow start and invites deadlock on
     // future changes — even though SyncHandle::start is fast today (spawn + return).
-    let config = {
+    let (config, read_stats) = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return false,
         };
         match (from, map.get(&handle)) {
-            (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => Arc::clone(c),
-            (SpinUpFrom::Paused, Some(ChainEntry::Paused(c, _))) => Arc::clone(c),
+            (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => {
+                (Arc::clone(c), Arc::new(ReadStats::new()))
+            }
+            // Resume keeps the shadow cache the paused reader accumulated.
+            (SpinUpFrom::Paused, Some(ChainEntry::Paused(c, _, stats))) => {
+                (Arc::clone(c), Arc::clone(stats))
+            }
             _ => return false, // unknown id, or not in the expected state
         }
     };
@@ -651,7 +660,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
             let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
-            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
+            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg, read_stats).await
         }) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
@@ -740,7 +749,14 @@ pub fn pause(handle: i64) -> bool {
                 frozen.peer_count = 0;
                 frozen.served_peers_last_min = 0;
                 frozen.discv5_table_size = 0;
-                map.insert(handle, ChainEntry::Paused(config, frozen));
+                // The shadow cache outlives the reader; a CL-only chain
+                // (no reader) parks an empty one so resume has something to
+                // hand the reader it may then manage to start.
+                let stats = reader
+                    .as_ref()
+                    .map(|r| r.read_stats())
+                    .unwrap_or_else(|| Arc::new(ReadStats::new()));
+                map.insert(handle, ChainEntry::Paused(config, frozen, stats));
                 (sync, reader)
             }
             Some(other) => {
@@ -809,7 +825,7 @@ pub fn status_json(handle: i64) -> String {
                 config.wall_clock_period(),
                 reader.clone(),
             ),
-            Some(ChainEntry::Paused(config, frozen)) => {
+            Some(ChainEntry::Paused(config, frozen, _)) => {
                 Snap::Paused(config.name, frozen.clone(), config.wall_clock_period())
             }
             None => Snap::Unknown,
@@ -977,7 +993,7 @@ pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
     };
     match map.get(&handle) {
         Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
-        | Some(ChainEntry::Paused(c, _)) => {
+        | Some(ChainEntry::Paused(c, ..)) => {
             c.ws_policy
                 .bound_override_periods
                 .store(sane, std::sync::atomic::Ordering::Relaxed);
@@ -999,7 +1015,7 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     };
     match map.get(&handle) {
         Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
-        | Some(ChainEntry::Paused(c, _)) => {
+        | Some(ChainEntry::Paused(c, ..)) => {
             c.ws_policy
                 .accept_stale_anchor
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3165,6 +3181,31 @@ pub fn log_index_status_json(handle: i64) -> String {
     let head = reader.head_block_number().unwrap_or(0);
     let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// The read-fetch shadow cache's counters (`myotis_net::el::readstats`): how
+/// much of this handle's verified account / storage / bytecode fetch traffic
+/// a cache — and which keying — would have served. A diagnostic, not gated on
+/// readiness: like the log-index status it answers on any running handle.
+pub fn read_stats_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    // Not `snapshot_reader`: a PAUSED handle still answers, from the shadow
+    // cache parked in its entry — the counters are per handle, not per reader.
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return eljson::error_json("engine lock poisoned"),
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Running(_, _, Some(reader))) => reader.read_stats_json(),
+        Some(ChainEntry::Running(_, _, None)) => {
+            eljson::error_json("EL reader unavailable on this handle")
+        }
+        Some(ChainEntry::Paused(_, _, stats)) => stats.to_json(),
+        Some(ChainEntry::Created(_)) => eljson::error_json("handle not started"),
+        None => eljson::error_json("unknown handle"),
+    }
 }
 
 /// Pure status serializer (unit-tested): fixed key order, no whitespace —

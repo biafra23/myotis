@@ -1133,6 +1133,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return RustEngineNative.nativeLogIndexStatusJson(handle);
     }
 
+    /** Read-fetch shadow-cache counters ({"error":...} when the gate is down).
+     *  NOT gated(), for the same status-probe reasons as logIndexStatusJson. */
+    @Override
+    public String readStatsJson() {
+        return RustEngineNative.nativeReadStatsJson(handle);
+    }
+
     /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */
     @Override
     public String importLogIndexFiles(String pathsJson) {

@@ -25,6 +25,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
+- [Read Statistics](docs/read-stats.md) — The `read-stats` shadow cache: what a state-read cache (per-block, storage-root-keyed, or stale-serve) would have saved on a real session, measured without serving anything from it.
 - [Disk & Network Usage](docs/disk-and-network-usage.md) — Storage footprint of a fully synced client (peer caches, light-client snapshot — there is no on-disk block/header database) and bandwidth: initial sync, the daily cost of staying synced, and what sending a transaction costs.
 - [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.
 
@@ -516,6 +517,23 @@ Returns storage slot data for a contract with Merkle-Patricia proof verification
 | `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (same as `get-account`, only present when `beaconChainVerified=true`) |
 | `matchedBeaconSlot` | long | Beacon slot trust anchor (only present when `beaconChainVerified=true`) |
 | `blsVerified` | boolean | Whether the trust anchor has BLS verification (only present when `beaconChainVerified=true`) |
+
+### Read statistics
+
+```bash
+./gradlew :app:run -Pargs=read-stats
+```
+
+The read-fetch **shadow cache**: counters over every verified account /
+storage / bytecode fetch this daemon made (the wallet's JSON-RPC reads, the
+`eth_call` oracle, and the operator queries above), classifying each repeat by
+which cache keying would have made it unnecessary and how much wall-clock it
+cost — `sameStateRoot` (a per-block cache), `sameStorageRoot` (the sound
+cross-block scheme, keyed by the account's storage root), `sameValue` /
+`unchanged` (the ceiling no proof-based cache reaches), and `byAge` buckets
+(how often a value up to 12 s / 60 s / 5 min old would have been correct).
+Nothing is served from it; it exists to decide the next caching step on
+measured traffic. Field-by-field guide: [docs/read-stats.md](docs/read-stats.md).
 
 ### Resolve ENS name
 

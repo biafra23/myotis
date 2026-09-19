@@ -581,6 +581,7 @@ class IosNodeController(
             lcHunting = o.engineBoolean("lcHunting"),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            readStatsJson = RustEngine.readStatsJson(handle),
             elHunting = o.engineBoolean("elHunting"),
             wsBoundPeriods = o.engineLong("wsBoundPeriods", 0L),
         )

@@ -197,6 +197,21 @@ public interface ChainHandle {
     }
 
     /**
+     * Read-fetch shadow-cache counters as JSON (schema 1; docs/read-stats.md):
+     * how much of this chain's verified account / storage / bytecode fetch
+     * traffic a cache — and which keying — would have served, with the
+     * wall-clock it would have saved. A measurement surface: nothing is ever
+     * served from it. Not gated on readiness (a status probe, like
+     * {@link #logIndexStatusJson}); engines answer {@code {"error":...}} when
+     * they cannot. Default: that same error shape, for a handle that does not
+     * measure — never a partial schema-1 object, which a consumer could not
+     * tell from a real one.
+     */
+    default String readStatsJson() {
+        return "{\"error\":\"read stats not measured by this engine\"}";
+    }
+
+    /**
      * Import portable log-index snapshot files: {@code pathsJson} is a JSON
      * array of absolute file paths, each a self-describing snapshot of this
      * chain (produced by the daemon's {@code build-logindex} tool or another

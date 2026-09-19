@@ -619,6 +619,7 @@ class DesktopNodeController(
             tor = torModeFor(Engines.engineKindFor(s.network())),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            readStatsJson = runCatching { engine.get(network)?.readStatsJson() }.getOrNull(),
             wsBoundPeriods = s.wsBoundPeriods(),
         )
     }

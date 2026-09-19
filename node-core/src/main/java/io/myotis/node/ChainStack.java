@@ -164,6 +164,11 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
      *  numbers survive pause/resume connector rebuilds; see ServeStats. */
     private final ServeStats serveStats = new ServeStats();
+    /** The read-fetch shadow cache (docs/read-stats.md): every verified snap
+     *  fetch — the RPC backend's oracle and the operator queries — reports here.
+     *  Stack-owned for the same reason as ServeStats: the backend is rebuilt on
+     *  every pause/resume and the counters must not reset with it. */
+    private final io.myotis.evm.world.ReadStats readStats = new io.myotis.evm.world.ReadStats();
     private volatile RLPxConnector connector;
     private volatile DiscV4Service discV4;
     private volatile DiscV5Service discV5;
@@ -660,6 +665,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
 
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
+    public io.myotis.evm.world.ReadStats readStats() { return readStats; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
@@ -1051,7 +1057,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         };
         io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
                 connector, beaconLightClient, beaconSyncState, ccipGateway,
-                rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
+                rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink, readStats);
         backend.start();
         return backend;
     }

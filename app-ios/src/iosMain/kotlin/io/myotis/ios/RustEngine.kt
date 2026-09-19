@@ -20,6 +20,7 @@ import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
 import io.myotis.engine.capi.myotis_import_log_index_files
 import io.myotis.engine.capi.myotis_log_index_status_json
+import io.myotis.engine.capi.myotis_read_stats_json
 import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_init
@@ -157,6 +158,12 @@ object RustEngine {
     fun logIndexStatusJson(handle: Long): String {
         requireAbi()
         return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
+    }
+
+    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    fun readStatsJson(handle: Long): String {
+        requireAbi()
+        return take(myotis_read_stats_json(handle)) ?: """{"error":"engine returned no result"}"""
     }
 
     /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */

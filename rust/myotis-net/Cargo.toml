@@ -58,6 +58,8 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 tor = ["dep:arti-client", "dep:tor-rtcompat"]
 
 [dev-dependencies]
+# readstats shape tests parse their own JSON output.
+serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # test-util only: `#[tokio::test(start_paused = true)]` drives the interactive
 # read HEDGING on the paused clock, so the timing invariants are asserted

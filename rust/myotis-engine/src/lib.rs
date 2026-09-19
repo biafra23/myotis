@@ -91,7 +91,10 @@ uniffi::setup_scaffolding!();
 ///      answered from the head — permanently (`{"error","code":-32602}`, a new
 ///      envelope key) when it is behind the window or not a servable selector
 ///      at all. A behavior change and a payload extension, no signature change.
-pub const ABI_VERSION: i32 = 27;
+/// v28: added read_stats_json (UniFFI + the iOS C ABI): the read-fetch shadow
+///      cache's counters (docs/read-stats.md) — a measurement surface, no
+///      serving change.
+pub const ABI_VERSION: i32 = 28;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

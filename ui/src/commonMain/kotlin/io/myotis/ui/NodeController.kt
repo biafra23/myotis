@@ -428,6 +428,10 @@ data class NodeSnapshot(
     // Raw engine status JSON for the Index tab (null when the feature is off
     // or the engine is unavailable); parsed via [LogIndexStatus.parse].
     val logIndexJson: String? = null,
+    // Raw read-fetch shadow-cache JSON (ChainHandle.readStatsJson(), schema 1 —
+    // docs/read-stats.md) for the Status tab's "Reads" rows; null when the host
+    // didn't fetch it. Parsed via [ReadStatsStatus.parse].
+    val readStatsJson: String? = null,
     // Weak-subjectivity bound (periods) the engine enforces; 0 = host didn't say.
     // While beaconState == "STALE_ANCHOR", syncCurrentPeriod is the refused
     // anchor's period and syncTargetPeriod the wall clock, so target - current is
