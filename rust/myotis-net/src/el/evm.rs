@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
+use super::reader::{hedged_race, RaceOutcome, HEDGE_DELAY};
+
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
@@ -241,6 +243,34 @@ pub struct PoolOracle {
     /// makes — including the prefetch wave's — is reported with its wall-clock
     /// cost so `read_stats_json` covers the EVM path too.
     stats: Arc<ReadStats>,
+    /// The order this call's hedged reads ask `peers` in, as indices into
+    /// `peers`. It starts as the pool's ladder and adapts WITHIN the call (see
+    /// [`next_order`]), so a dead first peer costs one hedge delay per call
+    /// instead of one per state read. The pool's bench, fed by the same races,
+    /// only reorders the NEXT call's snapshot, and even an eviction does not
+    /// take the peer out of this one.
+    order: Mutex<Vec<usize>>,
+}
+
+/// This call's ask order after one hedged race over `asked` (the order that
+/// race used): the winner first, then every peer the race did not judge in its
+/// current order, then the peers that lost it (missed or outpaced), also in
+/// their current order. Pure, and keyed by peer id rather than by position, so
+/// a race that ran on an older order still applies cleanly.
+fn next_order<T>(order: &[usize], asked: &[usize], out: &RaceOutcome<T>) -> Vec<usize> {
+    let winner = out.accepted.as_ref().and_then(|(pos, _)| asked.get(*pos).copied());
+    let losers: Vec<usize> = out
+        .missed
+        .iter()
+        .chain(&out.outpaced)
+        .filter_map(|pos| asked.get(*pos).copied())
+        .collect();
+    let winner = winner.filter(|w| order.contains(w));
+    let mut next = Vec::with_capacity(order.len());
+    next.extend(winner);
+    next.extend(order.iter().copied().filter(|i| Some(*i) != winner && !losers.contains(i)));
+    next.extend(order.iter().copied().filter(|i| Some(*i) != winner && losers.contains(i)));
+    next
 }
 
 impl PoolOracle {
@@ -250,6 +280,7 @@ impl PoolOracle {
         quality: Option<crate::el::pool::SnapQualitySink>,
         stats: Arc<ReadStats>,
     ) -> PoolOracle {
+        let order = Mutex::new((0..peers.len()).collect());
         PoolOracle {
             operation: super::request::Operation::current(),
             peers,
@@ -257,6 +288,7 @@ impl PoolOracle {
             quality,
             leaf_memo: Mutex::new(HashMap::new()),
             stats,
+            order,
         }
     }
 
@@ -317,6 +349,44 @@ impl PoolOracle {
         }
     }
 
+    /// Feed one hedged race into the reputation sink: the winner served, every
+    /// miss failed, and every attempt the winner outpaced reported as outpaced
+    /// (benched; a repeat before the peer serves again is a failure). The same
+    /// rules as `ElReader::hedged_read`.
+    async fn record_race<T>(
+        quality: &Option<crate::el::pool::SnapQualitySink>,
+        peers: &[Arc<ManagedPeer>],
+        out: &RaceOutcome<T>,
+    ) {
+        debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
+        for idx in &out.missed {
+            Self::record(quality, &peers[*idx], false).await;
+        }
+        if let Some(q) = quality {
+            for idx in &out.outpaced {
+                q.outpaced(peers[*idx].addr()).await;
+            }
+        }
+        if let Some((idx, _)) = &out.accepted {
+            Self::record(quality, &peers[*idx], true).await;
+        }
+    }
+
+    /// The peers in this call's current ask order, with the ids that order
+    /// uses (see `order`).
+    fn ladder(&self) -> (Vec<usize>, Vec<Arc<ManagedPeer>>) {
+        let asked = self.order.lock().unwrap().clone();
+        let peers = asked.iter().map(|&i| Arc::clone(&self.peers[i])).collect();
+        (asked, peers)
+    }
+
+    /// Adapt this call's ask order to one race that asked in order `asked`.
+    fn learn_order<T>(&self, asked: &[usize], out: &RaceOutcome<T>) {
+        let mut order = self.order.lock().unwrap();
+        let next = next_order(&order, asked, out);
+        *order = next;
+    }
+
     /// The proof-verified account leaf at `address`, or `None` when proven absent.
     /// Memoised per call. `Err` only when no peer could prove it.
     fn leaf(
@@ -331,22 +401,30 @@ impl PoolOracle {
         // No lock held across the network fetch.
         let quality = self.quality.clone();
         let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer.snap_get_account(state_root, &address).await {
-                    Ok(AccountOutcome::Present(leaf)) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(Some(leaf));
-                    }
-                    Ok(AccountOutcome::Absent) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(None);
-                    }
-                    // Bad proof / transport for this peer — try the next.
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged across the call's peers (reader::hedged_race). An eth_call
+            // makes several state reads, and a silent first peer used to hold
+            // EACH of them for a full request timeout — the main source of
+            // multi-second eth_call latency on a flaky pool. Any proof-verified
+            // answer ends the race; a bad proof or transport error is a miss.
+            // The call's ask order learns from each race (see `order`).
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_account(state_root, &address).await
+                },
+                |_: &AccountOutcome| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, outcome)| match outcome {
+                AccountOutcome::Present(leaf) => Some(leaf),
+                AccountOutcome::Absent => None,
+            })
         })?;
         match fetched {
             Some(leaf) => {
@@ -642,20 +720,23 @@ impl SnapStateOracle for PoolOracle {
         let position = slot.to_be_bytes::<32>();
         let quality = self.quality.clone();
         let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
+        let leaf = &leaf;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer
-                    .snap_get_storage(state_root, &address, &leaf, &position)
-                    .await
-                {
-                    Ok(value) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(value);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged like the account leaf above.
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_storage(state_root, &address, leaf, &position).await
+                },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, value)| value)
         })?;
         match fetched {
             // Empty bytes = a proven-zero / absent slot.
@@ -681,17 +762,21 @@ impl SnapStateOracle for PoolOracle {
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
         let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
         let fetched = self.wait(async {
-            for peer in &self.peers {
-                match peer.snap_get_bytecode(code_hash).await {
-                    Ok(code) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(code);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
+            // Hedged like the account leaf above. Code is content-addressed and
+            // keyed by hash, so racing discloses nothing new about the caller.
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move { peer.snap_get_bytecode(code_hash).await },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, code)| code)
         })?;
         let code = fetched.ok_or(OracleError::BytecodeUnavailable {
             code_hash: *code_hash,
@@ -747,5 +832,80 @@ mod tests {
         let mut h = BlockHeader::default();
         h.beneficiary = vec![0x11; 19]; // not 20 bytes
         assert!(block_context(&h, 1).is_err());
+    }
+
+    /// The oracle's within-call ask order: a dead first peer in the call's
+    /// snapshot must cost one hedge delay per CALL, not one per state read.
+    mod ask_order {
+        use super::*;
+        use std::time::Duration;
+
+        fn outcome(accepted: Option<usize>, missed: Vec<usize>, outpaced: Vec<usize>) -> RaceOutcome<()> {
+            RaceOutcome {
+                accepted: accepted.map(|pos| (pos, ())),
+                fallback: None,
+                missed,
+                outpaced,
+                errors: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn the_winner_leads_and_the_losers_trail() {
+            let order = [0, 1, 2, 3];
+            // Peer 0 was outpaced by peer 1.
+            assert_eq!(next_order(&order, &order, &outcome(Some(1), vec![], vec![0])), vec![1, 2, 3, 0]);
+            // Peer 0 missed and peer 1 was outpaced; peer 2 won and peer 3 was never asked.
+            assert_eq!(next_order(&order, &order, &outcome(Some(2), vec![0], vec![1])), vec![2, 3, 0, 1]);
+            // The first peer answered at once: nothing moves.
+            assert_eq!(next_order(&order, &order, &outcome(Some(0), vec![], vec![])), vec![0, 1, 2, 3]);
+            // Nobody won and everybody missed: the order stands.
+            assert_eq!(next_order(&order, &order, &outcome(None, vec![0, 1, 2, 3], vec![])), vec![0, 1, 2, 3]);
+        }
+
+        #[test]
+        fn race_positions_map_through_the_order_the_race_used() {
+            // The race asked in order [2, 0, 1], so its position 0 is peer 2.
+            let order = [2, 0, 1];
+            assert_eq!(next_order(&order, &order, &outcome(Some(1), vec![], vec![0])), vec![0, 1, 2]);
+            // A race that ran on an older order still applies by peer id, and a
+            // position outside that order is ignored rather than trusted.
+            let asked = [0, 1, 2];
+            assert_eq!(next_order(&[1, 2, 0], &asked, &outcome(Some(2), vec![7], vec![0])), vec![2, 1, 0]);
+        }
+
+        #[test]
+        fn the_order_stays_a_permutation() {
+            let order = [3, 1, 4, 0, 2];
+            for winner in [None, Some(0), Some(4)] {
+                let next = next_order(&order, &order, &outcome(winner, vec![1, 2], vec![3]));
+                let mut sorted = next.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, vec![0, 1, 2, 3, 4], "{next:?}");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_first_peer_costs_one_hedge_delay_per_call() {
+            // Peer 0 never answers and peer 1 answers in 50 ms. Three state
+            // reads in one call, each asking in the order the previous one left.
+            let ask = |id: usize| async move {
+                crate::el::peer::mark_request_sent();
+                let wait = if id == 0 { Duration::from_secs(600) } else { Duration::from_millis(50) };
+                tokio::time::sleep(wait).await;
+                Ok::<usize, String>(id)
+            };
+            let mut order = vec![0usize, 1];
+            let mut costs = Vec::new();
+            for _ in 0..3 {
+                let started = tokio::time::Instant::now();
+                let out = hedged_race(&order, HEDGE_DELAY, ask, |_: &usize| true).await;
+                costs.push(started.elapsed());
+                assert_eq!(out.accepted.as_ref().map(|(_, id)| *id), Some(1));
+                order = next_order(&order, &order, &out);
+            }
+            let fast = Duration::from_millis(50);
+            assert_eq!(costs, vec![HEDGE_DELAY + fast, fast, fast]);
+        }
     }
 }
