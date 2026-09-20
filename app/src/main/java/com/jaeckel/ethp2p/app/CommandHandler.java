@@ -47,11 +47,25 @@ public class CommandHandler {
     private final CountDownLatch stopLatch;
     private final DebugCommands debugCommands; // nullable: streaming debug commands disabled
     private final long startTimeMs;
+    /**
+     * Set the moment an operator issues {@code logindex-backfill}, so {@link Main}'s
+     * boot-default push stands down rather than racing it. Both cross the engine's
+     * wake gate, so on a cold start both park until the stack is ready for reads and
+     * are then released in arbitrary order — without this the operator's command
+     * could be answered {@code ok} and then overwritten by the default direction.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean backfillCommanded;
 
     public CommandHandler(ChainHandle handle, CountDownLatch stopLatch, DebugCommands debugCommands) {
+        this(handle, stopLatch, debugCommands, new java.util.concurrent.atomic.AtomicBoolean());
+    }
+
+    public CommandHandler(ChainHandle handle, CountDownLatch stopLatch, DebugCommands debugCommands,
+                          java.util.concurrent.atomic.AtomicBoolean backfillCommanded) {
         this.handle = handle;
         this.stopLatch = stopLatch;
         this.debugCommands = debugCommands;
+        this.backfillCommanded = backfillCommanded;
         this.startTimeMs = System.currentTimeMillis();
     }
 
@@ -445,6 +459,10 @@ public class CommandHandler {
             return jsonError("log index is not enabled on this network — "
                     + "build or import one first (build-logindex / import-logindex)");
         }
+        // Claim the switch BEFORE pushing: Main's boot-default push checks this
+        // immediately before its own call, so an operator command that arrives
+        // during the warm-up window wins instead of being silently overwritten.
+        backfillCommanded.set(true);
         if (!setBackfillPaused(handle, paused)) {
             return jsonError("log index config rejected — not the Rust engine "
                     + "(start with -Pengine=rust), or the engine is not running");

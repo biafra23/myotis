@@ -563,7 +563,11 @@ walks further.
 below its coverage waits for a host to ask, since the file speaks for what it
 holds and not for a backfill). The engine merges all-or-nothing with its
 current index and starts catch-up immediately for every imported address via
-the existing walker/bridge/appender. Trust: an
+the existing walker/bridge/appender — unless the backfill is paused, which an
+import carries across the merge deliberately (a resumed walk behind a switch
+that still reads "paused" would be worse): head-follow runs, and coverage below
+the imported spans waits for the walk to be turned back on. Under the Bee PoC
+flavour, paused is the steady state. Trust: an
 imported file is data CLAIMED VERIFIED by whoever generated it — the same
 standing as the node's own snapshot — so import is a deliberate user act on
 the hosts, never something fetched. Two properties to state plainly

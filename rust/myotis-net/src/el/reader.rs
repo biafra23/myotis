@@ -4199,15 +4199,25 @@ impl ElReader {
         }
     }
 
-    /// Apply ONLY the backfill switch to a live index — the host's last-pushed
-    /// runtime bit, re-applied after every activation (`host::spin_up`), since a
-    /// pause drops the reader and the index comes back off disk knowing none of
-    /// them. Returns whether an index was there to take it.
-    pub fn set_log_index_backfill_paused(&self, paused: bool) -> bool {
+    /// Apply ONLY the runtime bits to a live index — the host's last push,
+    /// re-applied after every activation (`host::spin_up`). A pause drops the
+    /// reader, so the index comes back off disk knowing none of them: it is
+    /// enabled (activation's doing) with the walk paused, whatever the host had
+    /// asked for. All three travel together because all three are lost together.
+    /// The watch table is NOT touched — that part the file does carry. Returns
+    /// whether an index was there to take them.
+    pub fn apply_log_index_runtime_bits(
+        &self,
+        enabled: bool,
+        max_speed: bool,
+        backfill_paused: bool,
+    ) -> bool {
         match self.log_index.lock() {
             Ok(mut slot) => match slot.as_mut() {
                 Some(ix) => {
-                    ix.set_backfill_paused(paused);
+                    ix.set_enabled(enabled);
+                    ix.set_max_speed(max_speed);
+                    ix.set_backfill_paused(backfill_paused);
                     true
                 }
                 None => false,
@@ -10361,13 +10371,33 @@ mod restart_claim_reader_tests {
         );
         assert_eq!(reader.log_index_covered_high(), Some(F1), "nor its coverage");
 
-        // The primitive a resume re-applies the host's stashed bit through
+        // The primitive a resume re-applies the host's stashed bits through
         // (host::spin_up): a pause drops the reader, so the index comes back off
-        // disk knowing nothing of what the host asked for.
-        assert!(reader.set_log_index_backfill_paused(true));
-        assert_eq!(reader.with_log_index(|ix| ix.config().backfill_paused), Some(true));
-        assert!(reader.set_log_index_backfill_paused(false));
-        assert_eq!(reader.with_log_index(|ix| ix.config().backfill_paused), Some(false));
+        // disk at the activation defaults — enabled, walk paused — knowing
+        // nothing of what the host asked for. All three bits travel together
+        // because all three are lost together; a host-disabled index coming back
+        // ENABLED is the one that serves queries the user turned off.
+        assert!(reader.apply_log_index_runtime_bits(false, true, true));
+        assert_eq!(
+            reader.with_log_index(|ix| {
+                let c = ix.config();
+                (c.enabled, c.max_speed, c.backfill_paused)
+            }),
+            Some((false, true, true)),
+        );
+        assert!(reader.apply_log_index_runtime_bits(true, false, false));
+        assert_eq!(
+            reader.with_log_index(|ix| {
+                let c = ix.config();
+                (c.enabled, c.max_speed, c.backfill_paused)
+            }),
+            Some((true, false, false)),
+        );
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().watch.len()),
+            Some(1),
+            "the runtime bits never touch the watch table",
+        );
         reader.stop().await;
     }
 
