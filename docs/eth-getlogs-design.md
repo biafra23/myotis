@@ -559,9 +559,11 @@ walks further.
 **Import** (`import_log_index_files`, ABI v24): hosts pick snapshot files
 (desktop AWT dialog / Android SAF / iOS document picker; the daemon has
 `import-logindex <file>…` plus the zero-effort drop-in — a portable file at
-`dataDir/logindex[-net].db` activates itself at start). The engine merges
-all-or-nothing with its current index and starts catch-up immediately for
-every imported address via the existing walker/bridge/appender. Trust: an
+`dataDir/logindex[-net].db` activates itself at start, for SERVING: the walk
+below its coverage waits for a host to ask, since the file speaks for what it
+holds and not for a backfill). The engine merges all-or-nothing with its
+current index and starts catch-up immediately for every imported address via
+the existing walker/bridge/appender. Trust: an
 imported file is data CLAIMED VERIFIED by whoever generated it — the same
 standing as the node's own snapshot — so import is a deliberate user act on
 the hosts, never something fetched. Two properties to state plainly

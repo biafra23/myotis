@@ -373,19 +373,28 @@ public final class Main {
                 System.exit(1);
                 return;
             }
-            if (pauseBackfill) {
-                // False here means the network has no Rust-engine log index at all —
-                // say so rather than let the operator believe the walk is off.
-                if (CommandHandler.setBackfillPaused(handle, true)) {
+            // Pushed in BOTH directions, because the engine now activates a drop-in
+            // index with the walk paused (ElReader::install_log_index_from_disk: a
+            // file speaks for the coverage it holds, not for a backfill nobody
+            // asked for). The daemon is the host that asks: absent property = the
+            // historical default, walking. False here means the network has no
+            // Rust-engine log index at all — worth saying only when the operator
+            // asked for the switch, since with no index there is no walk either way.
+            if (CommandHandler.setBackfillPaused(handle, pauseBackfill)) {
+                if (pauseBackfill) {
                     log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
                             + "is OFF; head-follow continues and queries below the covered "
                             + "range are refused", network);
                 } else {
-                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
-                            + "network has no enabled log index (build or import one first); "
-                            + "the switch is refused rather than installing an empty index",
-                            network);
+                    log.info("[{}] log-index backfill is ON (the daemon default); pause it with "
+                            + "-Dmyotis.logindex.backfillPaused=true or the logindex-backfill "
+                            + "pause command", network);
                 }
+            } else if (pauseBackfill) {
+                log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
+                        + "network has no enabled log index (build or import one first); "
+                        + "the switch is refused rather than installing an empty index",
+                        network);
             }
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from

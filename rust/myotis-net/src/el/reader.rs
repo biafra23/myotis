@@ -1714,9 +1714,12 @@ impl ElReader {
     /// path (the drop-in path, docs/eth-getlogs-design.md): a
     /// self-describing file in the data dir IS an opt-in — someone put it
     /// there deliberately, and the daemon has no settings surface to say so
-    /// otherwise. Enabled on activation; a host's config push right after
-    /// start unions with this and applies the host's own runtime bits (a
-    /// disabled toggle wins). No-op without a path, without a portable file
+    /// otherwise. Enabled for SERVING on activation, with the downward walk
+    /// paused (see `install_log_index_from_disk`: the file speaks for its own
+    /// coverage, not for a backfill nobody asked for); a host's config push
+    /// right after start unions with this and applies the host's own runtime
+    /// bits — a disabled toggle wins, and so does a running backfill.
+    /// No-op without a path, without a portable file
     /// (legacy v1 files activate only through a config push — they name no
     /// subscription set), for a foreign chain's file, or once a config has
     /// already arrived.
@@ -1757,6 +1760,18 @@ impl ElReader {
                 return false; // a config already arrived — it wins
             }
             ix.set_enabled(true);
+            // …but NOT the downward walk. Activation is an opt-in to SERVING what
+            // the file already covers, which is all a drop-in can speak for: the
+            // file carries no runtime bits (`deserialize_portable_with_id`), so a
+            // walk started here is one nobody asked for, spending the snap pool
+            // head-follow needs. It starts on a host's config push and not before
+            // — which matters most where that push is late: hosts send it through
+            // the wake gate, so on a cold start it can trail activation by up to
+            // its ~90 s cap (`RustChainHandle.gated`), and the Bee PoC, whose
+            // bundled index IS its coverage, would walk for that whole window.
+            // A host that wants the walk asks for it (the daemon does at boot,
+            // from `-Dmyotis.logindex.backfillPaused`; apps from Settings).
+            ix.set_backfill_paused(true);
             self.set_vouched(vouched);
             *slot = Some(ix);
         }
@@ -10283,6 +10298,37 @@ mod restart_claim_reader_tests {
         tick(&reader).await;
         assert_eq!(vouched(&reader), 0, "a claim the anchor reached adds nothing");
         assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_drop_in_serves_its_coverage_without_starting_a_walk() {
+        // Activation speaks for the file's coverage only: the index serves, and
+        // the downward walk waits for a host to ask. Hosts push their config
+        // through the wake gate (RustChainHandle.gated, ~90 s cap on a cold
+        // start), so a walk started here runs unasked for that whole window —
+        // and for the Bee PoC, whose bundled index IS its coverage, it is the
+        // walk that starves head-follow of the snap pool.
+        let dir = TempDir::new("drop-in-paused");
+        let path = run_to_shutdown(&dir.0).await;
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(
+            reader.with_log_index(|ix| (ix.config().enabled, ix.config().backfill_paused)),
+            Some((true, true)),
+            "enabled for serving, with the walk paused",
+        );
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "and it serves what the file covered");
+
+        // A host that wants the walk asks for it — the daemon does this at boot
+        // (Main's -Dmyotis.logindex.backfillPaused), apps from their Settings.
+        assert!(reader.set_log_index_config(watch()));
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().backfill_paused),
+            Some(false),
+            "a config push still turns the walk on",
+        );
         reader.stop().await;
     }
 
