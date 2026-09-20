@@ -291,6 +291,12 @@ class DesktopNodeController(
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
+        } else if (enabled && backfillPaused) {
+            // The engine activates a seeded index from disk with the walk RUNNING (it
+            // has no settings surface of its own); this push is what turns it off, so
+            // say when it did. The Bee PoC lives or dies on the walk staying off
+            // (BeePoc.backfillPausedDefault), and the log is where a demo gets checked.
+            log.info("[desktop] {}: log-index backfill paused — coverage stays as seeded", network)
         }
     }
 
