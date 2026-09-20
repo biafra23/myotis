@@ -287,11 +287,11 @@ class DesktopNodeController(
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
         } else if (enabled && backfillPaused) {
-            // The engine activates an index found on disk with the walk RUNNING (it has
-            // no settings surface of its own), so this push is what turns the walk off —
-            // worth a line, because until it lands the walk is live. The Bee PoC runs
-            // this way by default (BeePoc.backfillPausedDefault) and the log is where a
-            // demo run gets checked.
+            // This push is what the engine's activation defers to: an index found on
+            // disk comes up serving with the walk paused, and stays that way unless a
+            // host asks otherwise. Worth a line, because "no walk" is a state a demo
+            // gets checked for — the Bee PoC runs this way by default
+            // (BeePoc.backfillPausedDefault).
             log.info("[desktop] {}: log-index backfill paused (no downward walk)", network)
         }
     }

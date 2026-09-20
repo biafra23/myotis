@@ -93,6 +93,14 @@ struct EngineState {
     /// spin_up (start AND resume) re-applies it after building the EL reader,
     /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
     pending_served_window: Mutex<HashMap<i64, u64>>,
+    /// Per-handle LAST-PUSHED log-index backfill switch. The bit is runtime-only
+    /// (no portable snapshot carries it) and a pause drops the EL reader with the
+    /// index in it, so without this a resume would re-activate from disk at the
+    /// activation default — walk paused — and strand a host that had asked for a
+    /// walk, while no host re-pushes on resume. Re-applied by every spin_up
+    /// (start AND resume) after activation, exactly like
+    /// [`Engine::pending_served_window`]. Dies with the handle.
+    log_index_backfill_paused: Mutex<HashMap<i64, bool>>,
     /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
     /// request signature it answered, re-servable within
     /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
@@ -141,6 +149,7 @@ fn engine() -> Option<&'static EngineState> {
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
+                    log_index_backfill_paused: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
@@ -686,6 +695,19 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         // one push their config right after start, which unions with (and
         // can disable) what this activated.
         reader.activate_log_index_from_disk(engine.rt.handle());
+        // Then re-apply the host's last-pushed backfill switch. Activation pauses
+        // the walk (a file speaks for its coverage, not for a backfill), which is
+        // right on a cold start — the host's push decides — but a RESUME has no
+        // push behind it: pause dropped the reader, the index came back off disk,
+        // and no host re-pushes on resume (Android's idle pause is the common
+        // case). Without this, one idle pause would strand a walk a host had
+        // asked for; with it, a pause the host asked for also survives, which the
+        // pre-activation-default code silently undid.
+        if let Ok(paused) = engine.log_index_backfill_paused.lock() {
+            if let Some(&p) = paused.get(&handle) {
+                reader.set_log_index_backfill_paused(p);
+            }
+        }
     }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
@@ -926,6 +948,9 @@ pub fn stop(handle: i64) {
     }
     if let Ok(mut pending) = engine.pending_served_window.lock() {
         pending.remove(&handle);
+    }
+    if let Ok(mut paused) = engine.log_index_backfill_paused.lock() {
+        paused.remove(&handle);
     }
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
@@ -3051,6 +3076,7 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let enabled = config.enabled;
+    let backfill_paused = config.backfill_paused;
     let Some(engine) = engine() else {
         return false;
     };
@@ -3058,6 +3084,13 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let installed = reader.set_log_index_config(config);
+    if installed {
+        // Remember what the host asked for, so a resume re-applies it instead of
+        // coming back at the activation default (see `Engine::log_index_backfill_paused`).
+        if let Ok(mut paused) = engine.log_index_backfill_paused.lock() {
+            paused.insert(handle, backfill_paused);
+        }
+    }
     if installed && enabled {
         // Spawn (or keep) the head-follow appender on the engine runtime.
         reader.ensure_log_index_appender(engine.rt.handle());

@@ -373,29 +373,44 @@ public final class Main {
                 System.exit(1);
                 return;
             }
-            // Pushed in BOTH directions, because the engine now activates a drop-in
-            // index with the walk paused (ElReader::install_log_index_from_disk: a
-            // file speaks for the coverage it holds, not for a backfill nobody
-            // asked for). The daemon is the host that asks: absent property = the
-            // historical default, walking. False here means the network has no
-            // Rust-engine log index at all — worth saying only when the operator
-            // asked for the switch, since with no index there is no walk either way.
-            if (CommandHandler.setBackfillPaused(handle, pauseBackfill)) {
-                if (pauseBackfill) {
-                    log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
-                            + "is OFF; head-follow continues and queries below the covered "
-                            + "range are refused", network);
-                } else {
-                    log.info("[{}] log-index backfill is ON (the daemon default); pause it with "
-                            + "-Dmyotis.logindex.backfillPaused=true or the logindex-backfill "
-                            + "pause command", network);
+            // Pushed in BOTH directions, because the engine activates a drop-in index
+            // with the walk paused (ElReader::install_log_index_from_disk: a file
+            // speaks for the coverage it holds, not for a backfill nobody asked for).
+            // The daemon is the host that asks: absent property = the historical
+            // default, walking.
+            //
+            // OFF THE STARTUP THREAD, because setLogIndexConfig crosses the Rust
+            // handle's wake gate and holds until the stack is ready for reads (~90 s
+            // cap on a cold start). Inline, that delay would land between start() and
+            // the IPC socket below — a daemon that can't answer `status` or `stop`
+            // for a minute and a half — and, with --network a,b, would hold the
+            // second network's start behind the first one's sync.
+            final ChainHandle indexHandle = handle;
+            final String indexNetwork = network;
+            final boolean pauseBackfillFinal = pauseBackfill;
+            Thread backfillSwitch = new Thread(() -> {
+                // False = this network has no Rust-engine log index at all. Worth
+                // saying only when the operator asked for the switch: with no index
+                // there is no walk either way.
+                if (CommandHandler.setBackfillPaused(indexHandle, pauseBackfillFinal)) {
+                    if (pauseBackfillFinal) {
+                        log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
+                                + "is OFF; head-follow continues and queries below the covered "
+                                + "range are refused", indexNetwork);
+                    } else {
+                        log.info("[{}] log-index backfill is ON (the daemon default); pause it with "
+                                + "-Dmyotis.logindex.backfillPaused=true or the logindex-backfill "
+                                + "pause command", indexNetwork);
+                    }
+                } else if (pauseBackfillFinal) {
+                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
+                            + "network has no enabled log index (build or import one first); "
+                            + "the switch is refused rather than installing an empty index",
+                            indexNetwork);
                 }
-            } else if (pauseBackfill) {
-                log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
-                        + "network has no enabled log index (build or import one first); "
-                        + "the switch is refused rather than installing an empty index",
-                        network);
-            }
+            }, "logindex-backfill-boot-" + network);
+            backfillSwitch.setDaemon(true);
+            backfillSwitch.start();
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
             // the API boundary — it takes the raw connector via the CONCRETE Java engine's

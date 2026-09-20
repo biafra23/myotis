@@ -4199,6 +4199,23 @@ impl ElReader {
         }
     }
 
+    /// Apply ONLY the backfill switch to a live index — the host's last-pushed
+    /// runtime bit, re-applied after every activation (`host::spin_up`), since a
+    /// pause drops the reader and the index comes back off disk knowing none of
+    /// them. Returns whether an index was there to take it.
+    pub fn set_log_index_backfill_paused(&self, paused: bool) -> bool {
+        match self.log_index.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(ix) => {
+                    ix.set_backfill_paused(paused);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Count of live snap peers (for host status).
     pub async fn snap_peer_count(&self) -> usize {
         self.pool.snap_peer_count().await
@@ -10321,14 +10338,36 @@ mod restart_claim_reader_tests {
         );
         assert_eq!(reader.log_index_covered_high(), Some(F1), "and it serves what the file covered");
 
-        // A host that wants the walk asks for it — the daemon does this at boot
-        // (Main's -Dmyotis.logindex.backfillPaused), apps from their Settings.
-        assert!(reader.set_log_index_config(watch()));
+        // A host that wants the walk asks for it. This is the DAEMON's shape —
+        // CommandHandler.setBackfillPaused sends an empty watch list, relying on
+        // the push being additive — since Main is what keeps the drop-in walk the
+        // daemon has always done.
+        let daemon_push = LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: Vec::new(),
+        };
+        assert!(reader.set_log_index_config(daemon_push));
         assert_eq!(
             reader.with_log_index(|ix| ix.config().backfill_paused),
             Some(false),
             "a config push still turns the walk on",
         );
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().watch.len()),
+            Some(1),
+            "and the empty watch list did not drop the file's own subscription",
+        );
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "nor its coverage");
+
+        // The primitive a resume re-applies the host's stashed bit through
+        // (host::spin_up): a pause drops the reader, so the index comes back off
+        // disk knowing nothing of what the host asked for.
+        assert!(reader.set_log_index_backfill_paused(true));
+        assert_eq!(reader.with_log_index(|ix| ix.config().backfill_paused), Some(true));
+        assert!(reader.set_log_index_backfill_paused(false));
+        assert_eq!(reader.with_log_index(|ix| ix.config().backfill_paused), Some(false));
         reader.stop().await;
     }
 

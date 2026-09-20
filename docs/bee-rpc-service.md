@@ -304,8 +304,18 @@ differs, and only the middle one is a default anyone can rely on:
   `-Dmyotis.logindex.backfillPaused` value (absent = walking) rather than
   because the engine started one on its own. It says which way it went in the
   log.
-- The **apps** persist their switch per network and re-push it on every start,
-  so the walk starts when that push lands, not at activation.
+- The **apps** persist their switch per network and re-push it on every start of
+  a network whose index they have configured, so there the walk starts when that
+  push lands rather than at activation. A network they have NOT configured is
+  never pushed at all (`LogIndexWatch.configJson` returns null), so a file merely
+  dropped into an app's data dir serves its coverage and never walks — turn the
+  index on for that network in the Index tab and the push follows.
+
+Across a pause/resume the engine re-applies the host's last pushed value
+(`Engine::log_index_backfill_paused`): a pause drops the EL reader, so the index
+comes back off disk knowing none of the runtime bits, and no host re-pushes on
+resume. Android's idle pause is the common case, in both directions — a walk the
+host asked for survives it, and so does a pause.
 
 For a long-running daemon make the pause the boot default instead:
 
