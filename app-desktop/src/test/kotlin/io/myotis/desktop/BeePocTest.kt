@@ -244,9 +244,9 @@ class BeePocTest {
      * The upgrade case, and the one every existing PoC install lands on: a settings
      * file written before the switch existed carries no `logIndex.backfillPaused.*`
      * key at all, so only the flavour default stands between it and a walk. Pinned
-     * down to the JSON DesktopNode.pushLogIndexConfig hands the engine right after
-     * start — the engine activates the seeded index from disk with the walk ON, and
-     * this push is what turns it off.
+     * down to the config the desktop host builds for the engine ([logIndexConfigJson],
+     * what pushLogIndexConfig sends): the engine activates the seeded index from disk
+     * with the walk ON, and that push is what turns it off.
      */
     @Test
     fun `settings written before the switch existed still start the walk off`(@TempDir dir: Path) {
@@ -261,13 +261,9 @@ class BeePocTest {
         withFlavour(true) {
             val settings = DesktopSettings(nets, file)
             assertTrue(settings.logIndexBackfillPaused("gnosis"), "no stored preference: the flavour decides")
-            val json = LogIndexWatch.configJson(
-                settings.logIndexWatchJson("gnosis"),
-                settings.logIndexEnabled("gnosis"),
-                settings.logIndexMaxSpeed("gnosis"),
-                configured = settings.logIndexConfigured("gnosis"),
-                backfillPaused = settings.logIndexBackfillPaused("gnosis"),
-            )
+            // The mapping DesktopNode.pushLogIndexConfig hands the engine, called here
+            // rather than re-spelled, so dropping the argument there fails this test.
+            val json = logIndexConfigJson(settings, "gnosis")
             assertTrue(json != null && json.contains("\"backfillPaused\":true"), "pushed config: $json")
         }
     }
