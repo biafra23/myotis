@@ -164,13 +164,16 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 28** and existing JS
+This implementation targets the current engine's **ABI 29** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
-be refused, and ABI 28 added `read_stats_json` (the read-fetch shadow-cache
-counters, docs/read-stats.md — not yet wrapped here). It is not a drop-in
-artifact for a host pinned to ABI 22.
+be refused; ABI 28 added `read_stats_json` (the read-fetch shadow-cache
+counters, docs/read-stats.md — not yet wrapped here); and ABI 29 makes the
+engine's plain-C `eth_call` refuse a NULL `to` instead of reading it as the
+empty `to` that means contract creation (this binding always passes a string,
+so nothing changes for Node callers). It is not a drop-in artifact for a host
+pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

@@ -272,7 +272,8 @@ pub unsafe extern "C" fn myotis_get_storage_at_json(
 /// `from` empty ⇒ anonymous sender; `value` is wei as a decimal string.
 /// `block` is checked by the engine (ABI ≥ 27): a number outside the window
 /// around the verified head is refused, never answered from the head (see
-/// `crate::host::eth_call_json` and the header).
+/// `crate::host::eth_call_json` and the header). A NULL `to` is refused
+/// (ABI ≥ 29); pass an empty string for contract creation.
 ///
 /// # Safety
 /// All pointer params must be null or valid null-terminated C strings.
@@ -286,7 +287,19 @@ pub unsafe extern "C" fn myotis_eth_call_json(
     block: *const c_char,
 ) -> *mut c_char {
     let from = read_string(from).unwrap_or_default();
-    let to = read_string(to).unwrap_or_default();
+    // NOT `unwrap_or_default()`, for the reason its overrides twin spells out:
+    // an EMPTY `to` means CONTRACT CREATION, so a NULL one collapsed onto the
+    // same value would run the caller's calldata as init code — a different
+    // question than the one asked, which CLAUDE.md's apply-or-refuse rule
+    // exists to prevent. `read_string` yields None for a NULL pointer only;
+    // bad UTF-8 decodes lossily and is refused by the address parser instead,
+    // which is why the message names the pointer. Both wrappers word it
+    // identically: one condition, one wording.
+    let Some(to) = read_string(to) else {
+        return into_c(crate::eljson::invalid_params_json(
+            "invalid 'to' (null pointer; pass an empty string for contract creation)",
+        ));
+    };
     let data = read_string(data).unwrap_or_default();
     let value = read_string(value).unwrap_or_default();
     let block = read_string(block).unwrap_or_default();
@@ -314,13 +327,14 @@ pub unsafe extern "C" fn myotis_eth_call_overrides_json(
 ) -> *mut c_char {
     let from = read_string(from).unwrap_or_default();
     // NOT `unwrap_or_default()`: an EMPTY `to` now means contract creation, so
-    // collapsing an UNDECODABLE one (NULL pointer, bad UTF-8) onto the same
-    // value would silently change which question is answered — the shape
-    // CLAUDE.md's apply-or-refuse rule exists to prevent. Absent and
-    // undecodable must stay distinguishable.
+    // collapsing an ABSENT one onto the same value would silently change which
+    // question is answered — the shape CLAUDE.md's apply-or-refuse rule exists
+    // to prevent. Absent and empty must stay distinguishable. `read_string` is
+    // None for a NULL pointer only (bad UTF-8 decodes lossily and is refused
+    // by the address parser), so the message names the pointer.
     let Some(to) = read_string(to) else {
         return into_c(crate::eljson::invalid_params_json(
-            "invalid 'to' (undecodable string; pass an empty string for contract creation)",
+            "invalid 'to' (null pointer; pass an empty string for contract creation)",
         ));
     };
     let data = read_string(data).unwrap_or_default();
@@ -671,12 +685,45 @@ mod tests {
         // Invalid UTF-8 decodes lossily, and the result is refused.
         let bad = [0xff_u8, 0xfe, 0];
         assert_eq!(call(bad.as_ptr().cast())["code"], -32602);
+    }
 
-        // The overrides twin refuses a NULL `to` (an empty one is creation).
-        let out = unsafe {
-            take(myotis_eth_call_overrides_json(i64::MIN, null, null, null, null, null, null))
+    /// How eth_call's `to` crosses the C ABI: an EMPTY `to` is CONTRACT
+    /// CREATION, so a NULL one must be refused rather than collapsed onto it.
+    /// Both wrappers, which disagreed about this until ABI 29.
+    #[test]
+    fn eth_call_refuses_a_null_to_on_both_wrappers() {
+        let null = std::ptr::null();
+        let empty = c"";
+        let plain = |to: *const c_char| -> serde_json::Value {
+            let out = unsafe {
+                take(myotis_eth_call_json(i64::MIN, null, to, null, null, empty.as_ptr()))
+            };
+            serde_json::from_str(&out).unwrap()
         };
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["code"], -32602);
+        let overrides = |to: *const c_char| -> serde_json::Value {
+            let out = unsafe {
+                take(myotis_eth_call_overrides_json(
+                    i64::MIN,
+                    null,
+                    to,
+                    null,
+                    null,
+                    empty.as_ptr(),
+                    null,
+                ))
+            };
+            serde_json::from_str(&out).unwrap()
+        };
+        // NULL: refused as invalid params, never run as init code.
+        for refused in [plain(null), overrides(null)] {
+            assert_eq!(refused["code"], -32602, "{refused}");
+            assert!(refused["error"].as_str().is_some_and(|e| e.contains("'to'")), "{refused}");
+        }
+        // EMPTY: creation, and it reaches the handle lookup. Absent and empty
+        // must stay distinguishable.
+        for creation in [plain(empty.as_ptr()), overrides(empty.as_ptr())] {
+            assert_eq!(creation["error"], "unknown handle", "{creation}");
+        }
     }
 }
 

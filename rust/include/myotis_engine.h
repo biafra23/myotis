@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 28
+#define MYOTIS_ABI_VERSION 29
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -141,7 +141,10 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
  *     {"error","code":-32602}, PERMANENT (JSON-RPC invalid params) — do
  *     not retry. A malformed from/to/data/value is refused the same way;
  *   - ahead of the window, or no verified head yet: a plain {"error"},
- *     retryable. */
+ *     retryable.
+ * An EMPTY `to` selects contract creation (the calldata is init code and the
+ * constructor's return data is the result), so a NULL `to` is REFUSED
+ * (ABI >= 29) rather than read as that: pass "" to create. */
 char *myotis_eth_call_json(int64_t handle, const char *from, const char *to,
                            const char *data, const char *value,
                            const char *block);

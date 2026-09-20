@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 28; // 28: read_stats_json (read-fetch shadow-cache counters)
+    static final int EXPECTED_ABI_VERSION = 29; // 29: myotis_eth_call_json refuses a NULL `to` (C ABI only)
 
     private static final boolean AVAILABLE = load();
 
