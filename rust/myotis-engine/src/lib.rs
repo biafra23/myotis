@@ -94,7 +94,13 @@ uniffi::setup_scaffolding!();
 /// v28: added read_stats_json (UniFFI + the iOS C ABI): the read-fetch shadow
 ///      cache's counters (docs/read-stats.md) — a measurement surface, no
 ///      serving change.
-pub const ABI_VERSION: i32 = 28;
+/// v29: myotis_eth_call_json refuses a NULL `to` instead of reading it as the
+///      EMPTY `to` that means CONTRACT CREATION — running the caller's
+///      calldata as init code was a different question than the one asked.
+///      Its overrides twin already refused it. Plain-C callers only (the Node
+///      and iOS bindings never pass NULL); a behavior change, no signature
+///      change.
+pub const ABI_VERSION: i32 = 29;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
