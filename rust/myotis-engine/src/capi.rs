@@ -292,11 +292,12 @@ pub unsafe extern "C" fn myotis_eth_call_json(
     // same value would run the caller's calldata as init code — a different
     // question than the one asked, which CLAUDE.md's apply-or-refuse rule
     // exists to prevent. `read_string` yields None for a NULL pointer only;
-    // bad UTF-8 decodes lossily and is refused by the address parser instead.
-    // The message is the twin's verbatim: one condition, one wording.
+    // bad UTF-8 decodes lossily and is refused by the address parser instead,
+    // which is why the message names the pointer. Both wrappers word it
+    // identically: one condition, one wording.
     let Some(to) = read_string(to) else {
         return into_c(crate::eljson::invalid_params_json(
-            "invalid 'to' (undecodable string; pass an empty string for contract creation)",
+            "invalid 'to' (null pointer; pass an empty string for contract creation)",
         ));
     };
     let data = read_string(data).unwrap_or_default();
@@ -326,13 +327,14 @@ pub unsafe extern "C" fn myotis_eth_call_overrides_json(
 ) -> *mut c_char {
     let from = read_string(from).unwrap_or_default();
     // NOT `unwrap_or_default()`: an EMPTY `to` now means contract creation, so
-    // collapsing an UNDECODABLE one (NULL pointer, bad UTF-8) onto the same
-    // value would silently change which question is answered — the shape
-    // CLAUDE.md's apply-or-refuse rule exists to prevent. Absent and
-    // undecodable must stay distinguishable.
+    // collapsing an ABSENT one onto the same value would silently change which
+    // question is answered — the shape CLAUDE.md's apply-or-refuse rule exists
+    // to prevent. Absent and empty must stay distinguishable. `read_string` is
+    // None for a NULL pointer only (bad UTF-8 decodes lossily and is refused
+    // by the address parser), so the message names the pointer.
     let Some(to) = read_string(to) else {
         return into_c(crate::eljson::invalid_params_json(
-            "invalid 'to' (undecodable string; pass an empty string for contract creation)",
+            "invalid 'to' (null pointer; pass an empty string for contract creation)",
         ));
     };
     let data = read_string(data).unwrap_or_default();
