@@ -13,9 +13,10 @@ mainnet. Building that coverage the verified way is the backfill walk — a
 descending, parent-hash-chained header walk with receipt-root verification of
 every bloom-positive block — and it is slow by construction: measured
 30–83 blk/s on Gnosis (≈41 avg, [bee-rpc-service.md §Timings](bee-rpc-service.md#timings-measured-on-zbox-an-x86-64-linux-workstation)),
-which puts the 16.5 M-block PostageStamp history at 4–5 days of continuous
-running and any mainnet history at weeks. Users will not wait that long, and
-there will be many such histories ("DLCs": one per protocol a wallet adds).
+which puts the PostageStamp history (~16.5 M blocks at measurement, ~17 M
+today) at 4–5 days of continuous running and any mainnet history at weeks.
+Users will not wait that long, and there will be many such histories
+("DLCs": one per protocol a wallet adds).
 
 What exists today is the unverified shortcut: the portable MLIX snapshot
 (PR #369 — `export-logindex` / `import-logindex` / the `dataDir` drop-in) and
@@ -50,17 +51,22 @@ So a verifiable bundle for a watch set W over blocks [a, b] is, necessarily:
 
 1. **every header in [a, b]** (the bloom is in the header; the header is
    needed in full to hash it and chain it), and
-2. **the complete receipts and the body of every block whose bloom matches
-   W** (receipts settle the hit; the body supplies the tx hashes — the same
-   reason the walker fetches bodies, `logindex.rs` `StoredLog::tx_hash`).
+2. **the complete receipts of every block whose bloom matches W** (receipts
+   settle the hit), and
+3. **the transaction list of every block that actually holds a watched log**
+   (the log's `txHash` is the keccak of the raw transaction at the receipt's
+   index — `StoredLog::tx_hash`, `logindex.rs`; the walker fetches bodies
+   for that reason). A bloom false positive needs receipts but no
+   transactions: the receipts show no watched log, so there is no hash to
+   fill in. The body is a presence witness, never an absence one.
 
-That is byte-for-byte what the walker fetches from peers today. The bundle
-changes the **transport**, not the data or the verification, which
-`architecture-doc.md` (§"Block data via IPFS or other storage") already
-sanctions: block data may come from IPFS, a CDN, a centralized API, or a USB
-stick, because it is verified against trusted headers regardless of source.
-An EL node reached over JSON-RPC by the *generator* is such a source; the
-*client* never talks RPC.
+That is byte-for-byte what the walker fetches from peers today (minus the
+bodies of false-positive blocks). The bundle changes the **transport**, not
+the data or the verification, which `architecture-doc.md` (§"Block data via
+IPFS or other storage") already sanctions: block data may come from IPFS, a
+CDN, a centralized API, or a USB stick, because it is verified against
+trusted headers regardless of source. The *client* never talks RPC; whether
+the *generator* may is the owner's call (see Open questions).
 
 The roots involved are therefore `receiptsRoot` and `transactionsRoot`, and
 the header chain's `parentHash` links up to a header the client already
@@ -73,10 +79,11 @@ trusts. State roots play no part.
   index must not lose. Useful only as a hardening of a *trusted* seed (a
   publisher could then withhold but not forge; see mainnet below).
 - **Historical accumulators** (`historical_summaries`; README roadmap, not
-  implemented — `implementation-status.md` §2). They would replace the
-  parent-hash chain as the way to trust a scattered old header, which is
-  worth having for other reasons, but they do not remove the need for every
-  header's bloom.
+  implemented — `implementation-status.md` §2). They would let each chunk's
+  top header be trusted on its own, without the walk from the head down to
+  it — which removes the "top-up" cost below and lets chunks verify in
+  parallel and in any order. They do not remove the need for every header's
+  bloom. Worth doing; a follow-up, not a prerequisite.
 - **EIP-7745** (log index committed in the header). Gives compact absence
   proofs, for blocks after activation only. Tracked as a separate follow-up
   in `eth-getlogs-design.md`; it does nothing for existing history.
@@ -95,11 +102,11 @@ any format is frozen:
 
 | | Gnosis | Mainnet |
 |---|---|---|
-| Blocks bloom-positive for one address + topic0 | a few percent (sparse blooms) | ~60–80 % (blooms saturated at ~1,500+ elements/block) |
+| Blocks bloom-positive for one address + topic0 | a few percent (sparse blooms) | ~85–95 % (2,048-bit bloom, 3 bits per element, ~2,000+ elements/block: nearly every bit set) |
 | Header, raw | ~0.5–0.6 KB (256 B bloom; empty blooms compress to nothing) | ~0.6 KB |
 | Bee range, 47.0 M–48.26 M (1.26 M blocks) | ~600 MB headers + ~1 GB receipts/bodies, raw | — |
 | Full PostageStamp history, 31.3 M–head (~17 M blocks) | ~9 GB headers + receipts of ~3 % of blocks, raw | — |
-| Tornado/privacy-pool history, 14.17 M–head (~9 M blocks) | — | receipts of most of the chain: hundreds of GB |
+| Tornado/privacy-pool history, 14.17 M–head (~9 M blocks) | — | receipts of ~90 % of blocks at 100–200 KB each: ~1 TB |
 
 For Gnosis a fully verifiable bundle fits GitHub release assets (2 GiB per
 asset, chunked) and imports at disk speed. For mainnet the verifiable form is
@@ -119,95 +126,129 @@ into the index**. It is a local cache of block data that the backfill walker
 reads **instead of asking a peer** for a batch. The walker's cursor, its
 descending parent-hash chaining, the bloom skip, the receipt and body root
 checks, the log extraction, the coverage rules and the checkpoints all stay
-exactly as they are (`log_index_backfill_batch`, `reader.rs`). The only
-change is where the bytes of a batch come from.
+exactly as they are (`log_index_backfill_batch`, `reader.rs`). What changes
+is where the bytes of a batch come from, and — because those two mechanisms
+exist only to protect the shared peer pool — the pacing of a file-served
+batch (below).
 
 What this buys:
 
 - **No new trust, no provenance.** Coverage built from a bundle is walked
   coverage. Nothing in the file is believed: a header must hash to the
   trusted cursor, every next header must be the previous one's parent, every
-  receipt list must hash to its header's `receiptsRoot`, every body to its
-  `transactionsRoot`. A bundle has the standing of a peer — one that cannot
-  be demoted, so it gets quarantined instead (below).
-- **No bridge cap, no shelf life.** The MLIX import needs the head bridge to
-  close the gap above the snapshot's top, and the bridge spans at most
-  500,000 blocks (`BRIDGE_MAX_GAP`, ~29 days of Gnosis). A bundle has no top
-  to bridge to: the walker descends from the head as always, takes the blocks
-  above the bundle from peers, and switches to the file when its cursor
-  enters the bundle's range. History is immutable, so a bundle built today
-  is as good in a year; only the walk above it grows, at the normal rate.
-- **Hosts may fetch it.** The snapshot import is a deliberate user act
-  "never something fetched" because its content is trusted. A bundle is
-  untrusted input by construction, so downloading one in-app from a release
-  URL is safe in principle. Whether hosts do so is a product decision, not a
-  trust one (open question below).
-- **Failure is cheap.** A missing block, a truncated chunk or a forged
-  receipt makes that batch fall back to a peer. The user sees a log line and
+  receipt list must hash to its header's `receiptsRoot`, every transaction
+  list to its `transactionsRoot`. A bundle has the standing of a peer — one
+  that cannot be demoted, so a bad record is skipped instead (below).
+- **No bridge cap.** The MLIX import needs the head bridge to close the gap
+  above the snapshot's top, and the bridge spans at most 500,000 blocks
+  (`BRIDGE_MAX_GAP`, ~29 days of Gnosis). A bundle has no top to bridge to:
+  the walker descends from the head as always, takes the blocks above the
+  bundle from peers, and switches to the file when its cursor enters the
+  bundle's range. A stale bundle still imports; it just costs the walk above
+  it (the "top-up" note below).
+- **Hosts may fetch it, trust-wise.** The snapshot import is a deliberate
+  user act "never something fetched" because its content is trusted. A
+  bundle is untrusted input by construction. Whether hosts download one is a
+  product decision (open question below), not a trust one.
+- **Failure is cheap, per record.** A missing block, a truncated chunk or a
+  forged receipt costs that block a peer fetch. The user sees a log line and
   a status field, never an error.
 
-### Batch source selection
+### Batch source selection and per-block mixing
 
 At each backfill tick the walker wants the batch below its cursor:
-`(cur_n, cur_hash)` and `count` (`BATCH = 1023`). Before choosing a peer it
-asks the bundle store:
+`(cur_n, cur_hash)` and up to `BATCH = 1023` blocks. Before choosing a peer
+it asks the bundle store whether a chunk holds the header at `cur_n`. If
+one does, the batch is **file-served**:
 
-> Serve `[cur_n - count, cur_n]` from a bundle iff one chunk holds **every
-> header** of the range, and holds **receipts and body for every block whose
-> bloom matches the client's own config** (`LogIndex::bloom_may_match`).
+1. `count` is clipped so the batch never leaves the chunk (a batch never
+   straddles two chunks; the walker re-slices by number and a chunk is one
+   contiguous range).
+2. The record at `cur_n` must hash to `cur_hash` — the trusted cursor.
+3. Descending `parentHash` chain, each `number` one below the previous, the
+   same loop as the peer path; the verified prefix is the batch.
+4. Bloom prefilter against the **client's own config**
+   (`LogIndex::bloom_may_match`); a miss is a definitive skip.
+5. For each candidate: receipts from the file if the record has them,
+   `verify_block_receipts`, log extraction; then, for a block with a watched
+   log, the transaction list from the file if present,
+   `verify_body_transactions`, tx hashes. **A candidate the file cannot
+   serve — no receipts, or no transactions for a block that turned out to
+   hold a log — is fetched from a peer by its (now trusted) block hash**, the
+   same way the head bridge fills logs for headers it already trusts
+   (`fetch_logs_for_known_headers`). With no peer available such candidates
+   wait; the verified headers above them still apply, so the cursor stops at
+   the first unserved candidate and resumes there.
+6. Coverage extends over the verified, fully-served prefix; the cursor moves.
 
-The second clause is what makes the generator's watch set irrelevant to
-trust: a bundle was filtered against the generator's W, the client's config
-may be a subset (fine — extra receipts are ignored) or may add an address (a
-bloom-positive block for it has no receipts in the file, so that batch goes
-to a peer). A batch is never mixed between file and peer in v1; a per-block
-mix is a follow-up if census numbers say it matters.
+Per-block mixing is v1, not a follow-up, because the all-or-nothing form is
+useless in practice: a client whose config adds one address that is
+bloom-positive in even 0.5 % of blocks would see (1 − 0.005)^1023 ≈ 0.6 % of
+batches file-served. Mixing also settles the generator/client config
+mismatch: the file was filtered against the generator's W; a client watching
+a subset of W (addresses and topics) is served entirely from the file; a
+client watching more falls back to peers only for the blocks its extra
+watches light up.
 
-The file-served batch then runs the identical verification the peer path
-runs, on the same types (`VerifiedHeader`, raw receipt bytes, `BlockBody`):
+**Chunk boundaries.** The cursor is `(number, hash)`, so the cursor block's
+header must be in the chunk that serves the batch below it. Chunks therefore
+**overlap by one block**: a chunk covering [from, to] also carries the header
+of `to + 1` (its upper neighbour's `from`), so descending from one chunk into
+the next never needs a peer. The manifest's per-chunk "top hash" is the hash
+of that `to + 1` record.
 
-1. the record at `cur_n` must hash to `cur_hash` — the trusted cursor;
-2. descending `parentHash` chain, each `number` one below the previous;
-3. bloom prefilter against the client config; a miss is a definitive skip;
-4. for each candidate: `verify_block_receipts`, `verify_body_transactions`,
-   log extraction, exactly as today;
-5. coverage extends over the verified prefix; the cursor moves.
+**Pacing.** Two mechanisms throttle the backfill to protect the shared snap
+pool: one batch per 6 s tick in nice mode (`max_speed`), and the yield rule
+that skips up to 10 of 11 ticks while the head-follow is trailing
+(`backfill_should_yield`). A file-served batch touches no peer, so both are
+exempt for it: file-served batches run back-to-back under the tick's
+wall-clock budget, and the yield rule applies only when the next batch would
+go to a peer. Without this the file path is capped at 1023 blocks per 6 s
+(≈170 blk/s, ~28 h for the full PostageStamp history) and drops to ≈15 blk/s
+while trailing. This is part of slice 2, not a follow-up. The remaining
+ceiling is the index's own checkpoint rewrite (rate-bounded, PR #380), which
+slice 3 measures.
 
-A verification failure at any step **quarantines the chunk** for the process
-lifetime (it is recorded in the status JSON with the failing block and
-reason) and the batch is retried from a peer on the next tick. The walker's
-peer-blame machinery is not involved: a file is not a peer, and its failure
-must not distort peer ranking.
+**Memory.** The peer path bounds transient memory by the peer's response
+budget and the adaptive chunk width. The file path must not lose that: a
+file-served batch reads, verifies and drops one candidate at a time (never
+the batch's receipts up front — 1,023 candidates × ~50 KB is 50 MB on a
+dense range, on a platform where the bridge plan was capped at 24 MB), does
+its file I/O off the async executor's threads, and never holds the index
+lock across a read.
 
-Expected rate: keccak of 1,023 headers plus a few receipt tries per batch is
-milliseconds; the walk becomes disk- and checkpoint-bound, thousands of
-blocks per second against 40–60 from peers. The tick structure is unchanged
-in v1; letting file-served batches be wider than `BATCH` (which only exists
-because geth caps header responses at 1,024) is a follow-up.
+**Bad records.** A verification failure at step 2, 3 or 5 marks **that
+record** bad for the process lifetime (status JSON: chunk, block, reason);
+the block goes to a peer and the chunk stays eligible above and below it. A
+single bit-rot or a non-canonical block at a bundle's top must not cost a
+100,000-block chunk — the walk would silently drop to peer speed for that
+range. Failing the whole chunk is reserved for structural damage (no valid
+footer, an offset outside the file).
 
 ### Chunk file format: `MLXB` v1
 
-One chunk = one file = one contiguous, ascending block range. Random access
-by block number is the design goal (the walker descends and re-slices by
-number), so the layout is a fixed header, a block table, and a trailing
-offset index:
+One chunk = one file = one contiguous, ascending block range, plus the one
+overlap header above it. Random access by block number is the design goal
+(the walker descends and re-slices by number), so the layout is a fixed
+header, a block table, and a trailing offset index:
 
 ```
 magic         "MLXB"
 version       u32 = 1
 chain tag     network id u64 + EL genesis hash [32]   (same tag MLIX v2 carries)
-from, to      u64, u64 (inclusive, ascending)
-watch set     count u32, then per entry: address [20], topic0 count u32, topic0s [32]…
+from, to      u64, u64 (inclusive, ascending); the table also holds to + 1
+watch set     count u32, then per entry: address [20], from_block u64,
+              topic0 count u32, topic0s [32]…
               — the filter the generator's bloom decision used; informational
               (the client re-evaluates blooms against its OWN config)
-block table   for each block from..=to, ascending:
+block table   for each block from..=to+1, ascending:
                 header_len u32, header RLP (raw consensus bytes)
                 receipts_count u32; per receipt: len u32, raw consensus bytes
-                body_len u32, body RLP (0 = absent)
-              receipts and body are present iff the generator's bloom
-              decision was positive; a header-only record is a claim of
-              "bloom miss for W", which the client checks itself
-offset index  (to - from + 1) × u64 file offsets, one per block
+                  (present iff the generator's bloom decision was positive)
+                txs_count u32; per transaction: len u32, raw tx bytes
+                  (present iff the block holds a watched log for W)
+              the to + 1 record carries the header only
+offset index  (to - from + 2) × u64 file offsets, one per record
 footer        offset of the index u64, sha256 of everything before it [32]
 ```
 
@@ -215,21 +256,52 @@ Receipts are stored in their **consensus encoding with the bloom** (the
 eth/68 wire form): `triehash::verify` hashes the raw bytes, so the bytes must
 be exactly what `receiptsRoot` commits to (an eth/69 peer strips the bloom on
 the wire and the decoder recomputes it — the file is not a wire format and
-never strips). Bodies are the block body RLP as `GetBlockBodies` serves it
-(transactions, ommers, withdrawals), so `verify_body_transactions` runs
-unchanged.
+never strips). Pre-Byzantium receipts (intermediate state root instead of a
+status) decode through the same `receipt::decode`. Only the transaction list
+is stored, because `verify_body_transactions` checks only
+`transactionsRoot`; ommers and withdrawals would be unverified filler. The
+reader rebuilds the `BlockBody` the walker's code expects from it.
 
-The sha256 is integrity, not trust — it catches a truncated download, nothing
-more. Chunk size is a generator parameter; the guideline is "well under
-2 GiB raw" (GitHub's per-asset ceiling) — 100,000 Gnosis blocks is ~50 MB of
-headers plus receipts. Transport compression is gzip or zstd of the whole
-file; the store keeps chunks decompressed so `seek` works. A phone installs
-only the chunks it needs; that is why chunks, not one file.
+The generator's bloom decision is `myotis_core::bloom::may_contain` for
+every address and topic0 in W, for **every** block of the chunk — not
+`bloom_may_match`, whose per-entry `from_block` would produce header-only
+records below a watch's deployment that are not bloom misses and that the
+client would then send to peers. `from_block` is recorded in the watch set
+so the decision is reproducible, and nothing more.
+
+**Reading is bounds-checked and lazy.** Every length and count is validated
+against the file size before any allocation (a hostile `0xFFFFFFFF` must not
+allocate), every offset against the index. Registration parses the footer
+and the fixed header only; a file with no valid footer (a truncated
+download — the index sits at the end) is not registered and is reported in
+the status JSON. The sha256 is a download-integrity check the hosts run
+once after fetching, not something the engine recomputes at every start
+(that would hash gigabytes on each Android launch); corruption inside a
+registered chunk is caught by the walker's own verification, per record.
+
+Chunk size is a generator parameter set from the census; the guideline is
+"well under 2 GiB raw" (GitHub's per-asset ceiling) — 100,000 Gnosis blocks
+is ~50 MB of headers plus receipts. Transport compression is gzip or zstd of
+the whole file; the store keeps chunks decompressed so `seek` works.
 
 A **manifest** (`bundle.json`) accompanies a set of chunks: chain, watch set,
-generator and source-client versions, fetch time, and per chunk: file name,
-range, byte size, sha256, top block hash, bottom `parentHash`. The client uses
-it only to locate chunks and to check downloads; nothing in it is believed.
+generator and source-client versions, the source's finalized block at
+generation, and per chunk: file name, range, byte size, sha256, top hash (of
+the `to + 1` record), bottom `parentHash`. A manifest may list chunks
+published at different times (see top-up). The client uses it only to locate
+chunks and to check downloads; nothing in it is believed.
+
+### Top-up cadence
+
+Everything above the bundle's top is walked from peers at ≈41 blk/s. Gnosis
+adds ~17,280 blocks a day, so a bundle N days old costs about N × 7 minutes
+of peer walking before the file is touched — 3 months ≈ 10 h, a year ≈ 40 h
+— and during that walk queries below the cursor are refused (coverage
+honesty). History is immutable, so nothing in an old bundle goes stale; but
+the publisher must keep adding **top-up chunks** (a small chunk from the
+previous top to a recent finalized block) on a cadence, and the manifest
+lists them alongside the old ones. The accumulator follow-up above is what
+would remove this cost entirely.
 
 ### Generator
 
@@ -239,57 +311,77 @@ A Rust example binary, `rust/myotis-net/examples/logindex_bundle.rs`
 EL JSON-RPC URL, a block range, the watch set (addresses, optional topic0s),
 an output directory, a chunk size.
 
-- **Raw RLP from the source, never re-encoded from JSON.** `debug_getRawHeader`,
-  `debug_getRawReceipts`, `debug_getRawBlock` (geth ≥ 1.11 — verified on the
-  Bee data set's source, Geth/v1.17.5; Nethermind, Erigon and Reth advertise
-  the same methods — confirm before relying on one). JSON → RLP re-encoding
-  across forks is precisely the drift `synth_logindex.py` had to defend
-  against, and here it would surface as a root mismatch at every client.
-- **The bloom decision is myotis's own predicate**, `myotis_core::bloom` via
-  the same `bloom_may_match` rule the walker applies, so the generator's
-  candidate set is the client's for the same W — no second implementation
-  of the bloom to drift.
+- **Raw RLP from the source, never re-encoded from JSON fields.**
+  `debug_getRawHeader`, `debug_getRawReceipts`, `debug_getRawBlock`
+  (go-ethereum since v1.10.18; the Bee data set's source runs
+  Geth/v1.17.5 per its `meta.json`, so the methods are there — they have
+  not been exercised against it yet; Nethermind, Erigon and Reth advertise
+  the same methods — confirm before relying on one). `debug_getRawBlock`
+  returns the full block `rlp([header, txs, ommers, withdrawals])`; the
+  generator takes the raw transaction items out of that list — a list
+  re-framing, no field re-encoding. Re-encoding headers or receipts from
+  JSON across forks would surface as a root mismatch at every client, which
+  is why the raw methods are a requirement, not a preference.
+- **Stops at the source's finalized block.** A chunk's top must be
+  canonical for good; a bundle cut at `latest` can carry a reorged tail
+  (Gnosis finality lags minutes) that every importer would have to skip.
+- **The bloom decision is myotis's own predicate** (`may_contain`, above),
+  so the generator's candidate set is the client's for the same W.
 - **Self-verifying at generation.** The generator runs the client's checks
   on every block before writing it (hash chain, receipts root, tx root). A
   misbehaving or pruned source fails loudly at the operator's desk, not at
   every importer's.
 - **Census mode** (`--census`): counts and byte sizes only, no writes —
-  headers, candidates per address, receipt and body bytes. This is the first
-  deliverable, because it turns the estimates above into numbers for the two
-  ranges that matter (Bee's 47.0 M–head, and the full PostageStamp history)
-  and settles the chunk size.
+  headers, candidates per address, receipt bytes, transaction bytes split
+  by "holds a watched log" vs "bloom false positive". This is the first
+  deliverable, because it turns the estimates above into numbers for the
+  two ranges that matter (Bee's 47.0 M–head, and the full PostageStamp
+  history) and settles the chunk size.
 
 The operator runs it against their own node (zbox's Gnosis geth for the Bee
-bundle). CLAUDE.md's data-source rule is untouched: JSON-RPC is used by
-tooling to *package* data that the wallet then verifies from the file; the
-wallet itself never queries an RPC node.
+bundle). Whether that is compatible with CLAUDE.md's data-source rule is the
+owner's call, recorded under Open questions; the doc does not assume it.
 
 ### Installation and status
 
-- **Drop-in directory**, `dataDir/logindex-bundles/`: every `*.mlxb` in it is
-  registered at start and on the daemon's `import-logindex-bundle <path…>`
-  (which copies or links files into the directory). Chunks for another chain
-  are ignored with one log line (the chain tag decides; the network suffix
-  rule of `host::create` does not apply since the file names its chain).
-- **Hosts** reuse the snapshot-import picker (desktop AWT / Android SAF / iOS
-  document picker) for local files. In-app download from a manifest URL is
-  the open question below.
+- **The bundle directory** `dataDir/logindex-bundles/` is owned by the
+  engine. Every `*.mlxb` in it is registered at start (footer + fixed header
+  parse only). The daemon's `import-logindex-bundle <path…>` copies files
+  in; the passive start-up scan skips a foreign-chain chunk with one log
+  line, but the **explicit command refuses one with an error** — a chunk
+  for another chain is a parameter that changes the answer, and CLAUDE.md's
+  rule is applied or refused, never accepted and ignored (the MLIX import
+  refuses a wrong chain the same way, `MergeError::ChainMismatch`).
+- **Hosts** reuse the snapshot-import picker (desktop AWT / Android SAF /
+  iOS document picker). SAF and the iOS picker hand over content URIs, not
+  seekable files, so on phones "import" means copying the chunk into the
+  bundle directory in app storage — the hosts must check free space first
+  and say what a chunk costs. In-app download from a manifest URL is the
+  open question below.
+- **Consumed chunks are deleted.** A phone cannot hold a multi-gigabyte
+  history next to the index; the flow there is top-down: install the top
+  chunk, walk it, delete it, install the next. The engine deletes a chunk
+  once the cursor has passed below its `from` and a checkpoint has recorded
+  that coverage (default on; a setting keeps chunks for operators who
+  re-import). Files the engine did not copy in itself are never touched.
 - **Status JSON** (`logindex-status`) gains: registered chunks with ranges,
-  blocks served from bundles vs peers this run, quarantined chunks with
-  reason, and per chunk whether the walk has passed below it ("consumed" —
-  safe to delete; the store never deletes a user's file).
+  blocks served from bundles vs peers this run, bad records with reason,
+  unregistered files with reason, and per chunk whether it is consumed.
 
 ### Trust statement
 
 Nothing in a bundle is trusted: not the manifest, not the watch set, not a
 single byte of block data. A record is used only after it hashes to the
-trusted cursor or chains to a record that did, and its receipts and body
-only after they hash to that header's roots. The bundle's failure modes map
-onto a peer's: **withholding** (a missing chunk or record) costs a peer
-fallback, **forging** (any altered byte) costs a root or hash mismatch and a
-quarantine, a **wrong chain** costs a tag or hash mismatch. Coverage the
-bundle helped build is indistinguishable from peer-walked coverage because
-it *is* peer-walked coverage with a different byte source.
+trusted cursor or chains to a record that did, and its receipts and
+transactions only after they hash to that header's roots. The bundle's
+failure modes map onto a peer's: **withholding** (a missing chunk or record)
+costs a peer fallback, **forging** (any altered byte) costs a root or hash
+mismatch and a bad-record mark, a **wrong chain** costs a tag or hash
+mismatch. Coverage the bundle helped build is indistinguishable from
+peer-walked coverage because it *is* peer-walked coverage with a different
+byte source. What a bundle can do is hide a dead peer pool for as long as it
+serves — the status JSON's served-from-bundle vs served-from-peers counters
+are there so that is visible.
 
 ### Out of scope
 
@@ -305,26 +397,40 @@ it *is* peer-walked coverage with a different byte source.
 
 1. **Census + format vectors.** The generator's `--census` against zbox's
    Gnosis geth for both ranges; the `MLXB` reader/writer in `myotis-net`
-   with round-trip tests and a corrupted-file test (every mutation must be a
-   quarantine, never a served log).
+   with round-trip tests, a bounds-check fuzz over lengths and offsets, and
+   a corrupted-file test (every mutation must be a bad record or an
+   unregistered file, never a served log).
 2. **Walker block source.** Abstract the batch's byte source in
-   `log_index_backfill_batch` (peer or chunk); source selection rule;
-   verification on the file path via the existing functions; quarantine and
-   peer fallback; status fields; daemon command and drop-in directory.
-3. **Generator against a live node**, the Bee bundle (47.0 M → head) as the
-   first artifact: publish as release assets per
+   `log_index_backfill_batch` (peer or chunk); clipping at chunk edges;
+   per-block mixing via the known-header fetch; the pacing and yield
+   exemptions for file-served batches; per-candidate streaming; bad-record
+   marking and peer fallback; status fields; daemon command, bundle
+   directory, consumed-chunk deletion.
+3. **Generator against a live node**, the Bee bundle (47.0 M → finalized) as
+   the first artifact: publish as release assets per
    [bee-rpc-service.md §Distributing](bee-rpc-service.md#distributing-the-prebuilt-snapshot),
-   measure import time on a laptop and a phone; then the full PostageStamp
-   history.
-4. **Hosts.** Pickers on desktop/Android/iOS; the Index tab shows bundle
-   coverage and consumed chunks.
+   measure import time and checkpoint cost on a laptop and a phone; then the
+   full PostageStamp history and the first top-up chunk.
+4. **Hosts.** Pickers on desktop/Android/iOS with the copy-in and free-space
+   check; the Index tab shows bundle coverage and consumed chunks.
 5. **Follow-ups**, each its own issue when reached: wider file-served
-   batches; per-block file/peer mixing within a batch; in-app download from
-   a manifest URL; a bundle-backed head bridge for gaps beyond
-   `BRIDGE_MAX_GAP`.
+   batches than `BATCH`; in-app download from a manifest URL; the
+   `historical_summaries` accumulator so chunks anchor without the walk from
+   the head; a bundle-backed head bridge for gaps beyond `BRIDGE_MAX_GAP`.
 
 ## Open questions for the owner
 
+- **The generator and the data-source rule.** CLAUDE.md allows HTTP to a
+  local client for debugging only, with one recorded carve-out (roost,
+  2026-08-08) for self-verifying consensus objects. A bundle is
+  self-verifying in a stronger sense — every byte is root-verified by the
+  wallet against a header chain it walked itself — and the architecture
+  doc lists "a centralized API" among acceptable block-data transports. But
+  it is production tooling reading an operator's node over JSON-RPC, and it
+  concentrates a liveness dependency the way roost does (no fresh bundle,
+  back to a 4-day walk). Deferred: extending the carve-out to bundle
+  generation is the owner's ruling to record here, not this doc's to
+  assume.
 - **In-app download.** Trust permits it; does the product want the wallet
   fetching multi-hundred-MB assets from GitHub, and on which networks
   (Wi-Fi only on phones)?
