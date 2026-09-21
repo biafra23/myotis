@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       release-tag:
-        description: "Existing release tag to upload the debs to (e.g. v0.1.0)"
+        description: "Existing release tag to upload the debs to (e.g. v0.1.0). They are named Myotis-<tag>-<arch>.deb; on a release published before that naming (up to v0.1.11) the old Myotis-<arch>.deb assets stay next to them, because --clobber only replaces an identical name."
         required: true
         type: string
 
@@ -90,8 +90,8 @@ jobs:
       # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
       # NON-minified (main, not main-release): the Java backend (Netty / Besu /
       # BouncyCastle / libp2p) is reflection-heavy and proguard would break it.
-      # Unsigned — released as Myotis-<version>-<arch>.deb and installed via
-      # `sudo apt install ./Myotis-<version>-<arch>.deb` or dpkg -i.
+      # Unsigned — released as Myotis-v<version>-<arch>.deb and installed via
+      # `sudo apt install ./Myotis-v<version>-<arch>.deb` or dpkg -i.
       # Retry to ride out transient repo-resolution blips.
       - name: Build Linux .deb (${{ matrix.arch }})
         run: |
@@ -103,8 +103,9 @@ jobs:
           echo "::error::DEB build failed after 3 attempts"
           exit 1
 
-      # jpackage names the output myotis_<version>_<debarch>.deb; rename to match the
-      # release naming convention (Myotis-<arch> like the dmgs). Assert exactly one deb
+      # jpackage names the output myotis_<version>_<debarch>.deb; rename it to the
+      # arch-only artifact name Myotis-<arch>.deb (like the dmgs; the publish job adds
+      # the tag for the release asset). Assert exactly one deb
       # — zero or multiple should fail here, not silently ship an arbitrary pick.
       - name: Tag .deb with architecture
         run: |
@@ -286,6 +287,14 @@ jobs:
             test -f "deb/Myotis-${arch}.deb" \
               || { echo "::error::missing deb/Myotis-${arch}.deb"; exit 1; }
           done
+          # Release assets carry the version, like the APK
+          # (Myotis-<tag>-android-debug.apk): Myotis-<tag>-<arch>.deb. $tag is
+          # validated above, and on a manual re-publish it is the target tag, so
+          # the name matches the release it lands on. Renamed before the release
+          # is created, so a rename can never fail after the release exists.
+          for arch in x64 arm64; do
+            mv "deb/Myotis-${arch}.deb" "deb/Myotis-${tag}-${arch}.deb"
+          done
           # Notes via a quoted heredoc + --notes-file: markdown stays literal
           # (no shell escaping of backticks/quotes) and renders as intended.
           notes=$(mktemp)
@@ -295,11 +304,11 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop macOS (`Myotis-<version>-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
-          **Bee PoC (`Myotis-<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
           ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
           Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
           seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
@@ -307,8 +316,8 @@ jobs:
           days after its fetch (the Index tab shows the block it is usable until). See
           docs/bee-rpc-service.md.
 
-          **Desktop Linux (`Myotis-<version>-<arch>.deb`)** — install with
-          `sudo apt install ./Myotis-<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
           NOTES
           # Create the release if it doesn't exist yet. The dmg/apk workflows may
@@ -325,11 +334,4 @@ jobs:
               --target "${GITHUB_SHA}" \
             || gh release view "$tag" >/dev/null 2>&1
           fi
-          # Release assets carry the version, like the APK
-          # (Myotis-<tag>-android-debug.apk): Myotis-<tag>-<arch>.deb. $tag is
-          # validated above, and on a manual re-publish it is the target tag, so
-          # the name matches the release it lands on.
-          for arch in x64 arm64; do
-            mv "deb/Myotis-${arch}.deb" "deb/Myotis-${tag}-${arch}.deb"
-          done
           gh release upload "$tag" "deb/Myotis-${tag}-x64.deb" "deb/Myotis-${tag}-arm64.deb" --clobber
