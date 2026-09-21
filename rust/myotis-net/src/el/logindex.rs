@@ -134,10 +134,13 @@ impl LogIndexConfig {
     /// The duplicate watch address this config carries, if any — the ONE
     /// reason [`LogIndex::new`] refuses a config.
     ///
-    /// Exposed separately so a caller can refuse a bad config before it costs
-    /// anything. `LogIndex::new` is the last step of a replace, by which point
-    /// the index being replaced is already gone; a caller that must not lose
-    /// it asks here first (see `ElReader::set_log_index_config`).
+    /// Exposed separately so a caller can refuse a bad config at the door,
+    /// before the push has cost anything — before any lock is taken and
+    /// before the live index is touched. `LogIndex::new` sits downstream of
+    /// steps that cannot be undone (`merge` consumes the outgoing index
+    /// outright), so a caller that must leave the installed index intact on a
+    /// refusal asks HERE first (see `ElReader::set_log_index_config`). The
+    /// deserializers ask too: they build `Self` directly, bypassing `new`.
     pub fn duplicate_address(&self) -> Option<DuplicateWatchAddress> {
         self.watch
             .iter()
@@ -2065,6 +2068,58 @@ mod tests {
         // …and it answers None for the configs `new` accepts, including empty.
         assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).duplicate_address().is_none());
         assert!(config(vec![]).duplicate_address().is_none());
+    }
+
+    /// Re-key serialized bytes to `fp` so a hand-written config the real
+    /// serializer could never have produced still gets past the fingerprint
+    /// gate. Sound without re-checksumming: the checksum covers only what
+    /// follows it, and the fingerprint sits directly ahead of it in both
+    /// layouts.
+    fn repoint_fingerprint(bytes: &mut [u8], checksum_at: usize, fp: u64) {
+        bytes[checksum_at - 8..checksum_at].copy_from_slice(&fp.to_le_bytes());
+    }
+
+    #[test]
+    fn deserializing_a_v2_file_under_a_duplicate_address_config_is_refused() {
+        // `deserialize` builds `Self` directly, bypassing `new`, so it has to
+        // re-apply the bar itself. Reachable in the field because a file is
+        // keyed by the fingerprint of the config it is read WITH: a
+        // hand-written duplicate config carries its own key, not the writer's.
+        let mut ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        ix.append_block(10, [0xbb; 32], vec![log(10, 0, addr(1), vec![topic(7)])]).unwrap();
+        let good = ix.serialize(&tag());
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        // Control: the same re-keying with a DISTINCT but duplicate-free
+        // config over the same addresses loads — so the refusal above is the
+        // duplicate check, not the fingerprint gate or the coverage re-pair.
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
+    }
+
+    #[test]
+    fn deserializing_a_legacy_v1_file_under_a_duplicate_address_config_is_refused() {
+        // Same invariant on the upgrade path, which builds `Self` directly too.
+        let ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        let good = serialize_v1(&ix);
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
     }
 
     /// `ElReader::set_log_index_config` screens the PUSHED config for

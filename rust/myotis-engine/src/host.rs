@@ -3081,7 +3081,8 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     };
     let Some(config) = parse_log_index_config(&v) else {
         tracing::warn!(
-            "log-index config refused: a field has the wrong type, or the watch list names \
+            "log-index config refused: a watch entry is missing `address` or `fromBlock`, \
+             a field has the wrong type or is not valid hex, or the watch list names \
              one address twice; ignoring the push"
         );
         return false;
@@ -3130,8 +3131,10 @@ fn strict_bool(v: &serde_json::Value, key: &str, default: bool) -> Option<bool> 
 }
 
 /// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
-/// adds engine plumbing). `None` = malformed (wrong types) or a watch-list
-/// that names one address twice; unknown keys are ignored for forward
+/// adds engine plumbing). `None` = malformed — a watch entry missing the
+/// required `address` or `fromBlock`, a field of the wrong type, an address
+/// or topic that is not valid hex of the right width, or a watch-list that
+/// names one address twice. Unknown keys are ignored for forward
 /// compatibility.
 fn parse_log_index_config(
     v: &serde_json::Value,
