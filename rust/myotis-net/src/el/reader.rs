@@ -1722,7 +1722,8 @@ impl ElReader {
                                 tracing::error!(
                                     error = ?e,
                                     "log-index merge refused the stored snapshot against the \
-                                     pushed config; re-indexing from scratch"
+                                     pushed config; re-indexing from scratch under the \
+                                     unioned watch-list"
                                 );
                                 None
                             }
@@ -1737,7 +1738,15 @@ impl ElReader {
                             claim = stored_claim;
                             m
                         }
-                        None => match crate::el::logindex::LogIndex::new(config) {
+                        // Re-index under the UNION, not the push alone: an
+                        // address only the stored snapshot watched would
+                        // otherwise leave the subscription silently, and
+                        // because the installed index is then empty this path
+                        // skips `note_checkpoint_adopted` — so the next prompt
+                        // checkpoint overwrites the very file that still held
+                        // that address's coverage. Same reasoning as the live
+                        // path's merge-failure arm.
+                        None => match crate::el::logindex::LogIndex::new(eff) {
                             Ok(fresh) => fresh,
                             Err(_) => return false,
                         },
