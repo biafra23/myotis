@@ -516,7 +516,12 @@ router/API changes in this design already accommodate it.
    `watch`-channel head notifications, EIP-7745 alignment, per-entry
    frontiers (see §Import, canonical-shape note), snapshot provenance
    (imported-coverage marker / signed snapshots) and an explicit
-   unsubscribe surface (see §Import, trust notes).
+   unsubscribe surface (see §Import, trust notes). The production answer
+   to "download a history instead of walking it" is NOT a trusted
+   snapshot but a bundle of block data the walker verifies itself —
+   [logindex-verified-bundle-design.md](logindex-verified-bundle-design.md)
+   (#472); it also explains why that form is Gnosis-sized and mainnet is
+   not.
 8. Follow-up (observability, found 2026-08-15 while building the Bee/Swarm
    index): the daemon's `peers` IPC command reads the engine-routed
    `ChainHandle`, and `RustChainHandle` stubs both `discoveredPeers()` and

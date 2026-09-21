@@ -454,6 +454,12 @@ described above, never as the wallet.
 
 ## Distributing the prebuilt snapshot
 
+(The snapshot is trusted data — the importing node cannot verify it. The
+verifiable replacement, a chunked bundle of headers and receipts the walker
+checks itself, is designed in
+[logindex-verified-bundle-design.md](logindex-verified-bundle-design.md),
+#472; the publishing rules below carry over to its release assets.)
+
 The exported index (`bee-logindex-gnosis.db`, ~247 MB raw, **~58 MB gzipped**)
 is fine to publish:
 
