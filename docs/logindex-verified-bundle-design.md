@@ -316,8 +316,9 @@ The generator's bloom decision is `myotis_core::bloom::may_contain` for
 every address and topic0 in W, for **every** block of the range — not
 `bloom_may_match`, whose per-entry `from_block` would leave blocks below a
 watch's deployment without a record although they are not bloom misses,
-and the client would then send them to peers. `from_block` is recorded in
-the watch set so the decision is reproducible, and nothing more.
+and the client would then send them to peers. The decision deliberately
+ignores `from_block`; it is recorded in the watch set as provenance (which
+subscription the operator generated for), and nothing more.
 
 **Reading is bounds-checked and lazy.** Every length and count is validated
 against the file size before any allocation (a hostile `0xFFFFFFFF` must not
@@ -331,7 +332,7 @@ registered chunk is caught by the walker's own verification, per record.
 
 Chunk size is a generator parameter set from the census; the guideline is
 "well under 2 GiB raw" (GitHub's per-asset ceiling) — 100,000 Gnosis blocks
-is ~50 MB of headers. Header and candidate chunks need not share ranges: a
+is ~55 MB of headers at ~0.55 KB each. Header and candidate chunks need not share ranges: a
 watch set's candidates for a whole history may be one file. Transport
 compression is gzip or zstd of the whole file; the store keeps chunks
 decompressed so `seek` works.
