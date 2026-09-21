@@ -93,6 +93,16 @@ struct EngineState {
     /// spin_up (start AND resume) re-applies it after building the EL reader,
     /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
     pending_served_window: Mutex<HashMap<i64, u64>>,
+    /// Per-handle LAST-PUSHED log-index runtime bits, as
+    /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
+    /// portable snapshot, and a pause drops the EL reader with the index in it,
+    /// so a resume re-activates from disk at the ACTIVATION defaults — enabled,
+    /// walk paused — no matter what the host last said, and no host re-pushes on
+    /// resume. Without this, one Android idle pause strands a walk a host asked
+    /// for, and re-enables an index a host turned off. Re-applied by every
+    /// spin_up (start AND resume) after activation, exactly like
+    /// [`Engine::pending_served_window`]. Dies with the handle.
+    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool)>>,
     /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
     /// request signature it answered, re-servable within
     /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
@@ -141,6 +151,7 @@ fn engine() -> Option<&'static EngineState> {
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
+                    log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
@@ -686,6 +697,19 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         // one push their config right after start, which unions with (and
         // can disable) what this activated.
         reader.activate_log_index_from_disk(engine.rt.handle());
+        // Then re-apply the host's last push. Activation sets its own defaults —
+        // enabled, walk paused — which are right on a cold start, where the
+        // host's push decides what happens next. A RESUME has no push behind it:
+        // pause dropped the reader, the index came back off disk, and no host
+        // re-pushes on resume (Android's idle pause is the common case). Without
+        // this, one idle pause strands a walk the host asked for, and re-enables
+        // an index the host turned off — the latter silently, since a disabled
+        // index leaves its file in place for activation to find.
+        if let Ok(bits) = engine.log_index_runtime_bits.lock() {
+            if let Some(&(enabled, max_speed, backfill_paused)) = bits.get(&handle) {
+                reader.apply_log_index_runtime_bits(enabled, max_speed, backfill_paused);
+            }
+        }
     }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
@@ -926,6 +950,9 @@ pub fn stop(handle: i64) {
     }
     if let Ok(mut pending) = engine.pending_served_window.lock() {
         pending.remove(&handle);
+    }
+    if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
+        bits.remove(&handle);
     }
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
@@ -3051,6 +3078,7 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let enabled = config.enabled;
+    let bits = (config.enabled, config.max_speed, config.backfill_paused);
     let Some(engine) = engine() else {
         return false;
     };
@@ -3058,6 +3086,20 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let installed = reader.set_log_index_config(config);
+    if installed {
+        // Remember what the host asked for, so a resume re-applies it instead of
+        // the activation defaults (see `Engine::log_index_runtime_bits`). Written
+        // under the handles lock, and only while the handle is still Running, so a
+        // push racing `stop()` cannot leave a stash entry behind a removed handle
+        // — the same discipline `set_served_block_window` keeps.
+        if let Ok(map) = engine.handles.lock() {
+            if matches!(map.get(&handle), Some(ChainEntry::Running(..))) {
+                if let Ok(mut stash) = engine.log_index_runtime_bits.lock() {
+                    stash.insert(handle, bits);
+                }
+            }
+        }
+    }
     if installed && enabled {
         // Spawn (or keep) the head-follow appender on the engine runtime.
         reader.ensure_log_index_appender(engine.rt.handle());

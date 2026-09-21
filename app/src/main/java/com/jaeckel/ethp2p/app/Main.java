@@ -373,20 +373,70 @@ public final class Main {
                 System.exit(1);
                 return;
             }
-            if (pauseBackfill) {
-                // False here means the network has no Rust-engine log index at all —
-                // say so rather than let the operator believe the walk is off.
-                if (CommandHandler.setBackfillPaused(handle, true)) {
-                    log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
-                            + "is OFF; head-follow continues and queries below the covered "
-                            + "range are refused", network);
-                } else {
+            // Pushed in BOTH directions, because the engine activates a drop-in index
+            // with the walk paused (ElReader::install_log_index_from_disk: a file
+            // speaks for the coverage it holds, not for a backfill nobody asked for).
+            // The daemon is the host that asks: absent property = the historical
+            // default, walking.
+            //
+            // OFF THE STARTUP THREAD, because setLogIndexConfig crosses the Rust
+            // handle's wake gate and holds until the stack is ready for reads (~90 s
+            // cap on a cold start). Inline, that delay would land between start() and
+            // the IPC socket below — a daemon that can't answer `status` or `stop`
+            // for a minute and a half — and, with --network a,b, would hold the
+            // second network's start behind the first one's sync.
+            final ChainHandle indexHandle = handle;
+            final String indexNetwork = network;
+            final boolean pauseBackfillFinal = pauseBackfill;
+            // Set by CommandHandler the moment an operator issues logindex-backfill.
+            final java.util.concurrent.atomic.AtomicBoolean backfillCommanded =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            Thread backfillSwitch = new Thread(() -> {
+                // The IPC socket opens while this thread is still parked on the wake
+                // gate, so an operator can issue logindex-backfill inside the warm-up
+                // window; when the gate releases, both would push in arbitrary order.
+                // A boot DEFAULT must not overwrite an explicit command that was
+                // already answered ok, so stand down as late as possible.
+                if (backfillCommanded.get()) {
+                    log.info("[{}] log-index backfill left to the logindex-backfill command "
+                            + "issued during start-up; the boot default stood down", indexNetwork);
+                    return;
+                }
+                // False = this network has no Rust-engine log index at all. Worth
+                // saying only when the operator asked for the switch: with no index
+                // there is no walk either way.
+                if (CommandHandler.setBackfillPaused(indexHandle, pauseBackfillFinal)) {
+                    if (pauseBackfillFinal) {
+                        log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
+                                + "is OFF; head-follow continues and queries below the covered "
+                                + "range are refused", indexNetwork);
+                    } else {
+                        log.info("[{}] log-index backfill is ON (the daemon default); pause it with "
+                                + "-Dmyotis.logindex.backfillPaused=true or the logindex-backfill "
+                                + "pause command", indexNetwork);
+                    }
+                } else if (pauseBackfillFinal) {
                     log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
                             + "network has no enabled log index (build or import one first); "
                             + "the switch is refused rather than installing an empty index",
-                            network);
+                            indexNetwork);
+                } else {
+                    // The refusal shape and a real failure both come back false, and
+                    // in the default direction the difference matters: a network WITH
+                    // an activated index that did not take the push is one whose walk
+                    // never started, silently. Re-probe to tell the two apart — the
+                    // status read is ungated, so it answers even if the push didn't.
+                    String probe = indexHandle.logIndexStatusJson();
+                    if (probe != null && probe.contains("\"enabled\":true")) {
+                        log.warn("[{}] log-index backfill could NOT be turned on at boot "
+                                + "(config push refused): this network has an index, so its "
+                                + "downward walk is not running — resume it with the "
+                                + "logindex-backfill on command", indexNetwork);
+                    }
                 }
-            }
+            }, "logindex-backfill-boot-" + network);
+            backfillSwitch.setDaemon(true);
+            backfillSwitch.start();
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
             // the API boundary — it takes the raw connector via the CONCRETE Java engine's
@@ -435,7 +485,10 @@ public final class Main {
                             }))
                     : null;
 
-            CommandHandler commandHandler = new CommandHandler(handle, stopLatch, debugCommands);
+            // The AtomicBoolean is how a logindex-backfill command tells the boot
+            // thread above to stand down (both cross the same wake gate).
+            CommandHandler commandHandler =
+                    new CommandHandler(handle, stopLatch, debugCommands, backfillCommanded);
             DaemonServer server = new DaemonServer(socketPath(network), commandHandler);
             try {
                 server.start();

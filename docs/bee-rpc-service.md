@@ -291,8 +291,33 @@ Pausing is fingerprint-neutral: coverage already walked survives, and resuming
 continues from the stored cursor.
 
 **It is a RUNTIME bit, not persisted state.** The portable snapshot does not
-encode it and the daemon has no settings file, so a daemon restart resumes the
-walk. For a long-running node make it the boot default instead:
+encode it, so nobody inherits a pause from a file. What each host does at start
+differs, and only the middle one is a default anyone can rely on:
+
+- The **engine** activates an index it finds on disk with the walk PAUSED
+  (`install_log_index_from_disk`). A file speaks for the coverage it holds, not
+  for a backfill; and hosts push their config through the wake gate, which on a
+  cold start can trail activation by its ~90 s cap — a walk nobody asked for
+  would have that whole window on the snap pool.
+- The **daemon** then asks for the walk at boot, so a daemon restart resumes it
+  exactly as before — now because Main pushes the resolved
+  `-Dmyotis.logindex.backfillPaused` value (absent = walking) rather than
+  because the engine started one on its own. It says which way it went in the
+  log.
+- The **apps** persist their switch per network and re-push it on every start of
+  a network whose index they have configured, so there the walk starts when that
+  push lands rather than at activation. A network they have NOT configured is
+  never pushed at all (`LogIndexWatch.configJson` returns null), so a file merely
+  dropped into an app's data dir serves its coverage and never walks — turn the
+  index on for that network in the Index tab and the push follows.
+
+Across a pause/resume the engine re-applies the host's last pushed value
+(`Engine::log_index_backfill_paused`): a pause drops the EL reader, so the index
+comes back off disk knowing none of the runtime bits, and no host re-pushes on
+resume. Android's idle pause is the common case, in both directions — a walk the
+host asked for survives it, and so does a pause.
+
+For a long-running daemon make the pause the boot default instead:
 
 ```bash
 ./gradlew :app:run -Pnetwork=gnosis -PbackfillPaused=true
@@ -302,13 +327,11 @@ java -Dmyotis.logindex.backfillPaused=true -cp '<lib>/*' com.jaeckel.ethp2p.app.
 
 Note the `-P` on the gradlew form. `:app:run` is a forked `JavaExec`, so a bare
 `-Dmyotis.logindex.backfillPaused=true` on the gradlew line sets the property on
-the *Gradle* JVM and never reaches the daemon — it would start with the walk
-running and say nothing. The run task bridges `-PbackfillPaused` to the system
-property (the same pattern as `-Pengine` and `-Pbls`) and rejects any value
-other than `true` or `false`. A raw `java` launch takes the `-D` directly.
-
-The apps persist their switch per network themselves and re-push it on every
-start, so this only concerns the daemon.
+the *Gradle* JVM and never reaches the daemon — which then starts with the walk
+running; the boot line saying `backfill is ON (the daemon default)` is the tell.
+The run task bridges `-PbackfillPaused` to the system property (the same pattern
+as `-Pengine` and `-Pbls`) and rejects any value other than `true` or `false`. A
+raw `java` launch takes the `-D` directly.
 
 ## Bee PoC desktop build (`-PbeePoc`)
 

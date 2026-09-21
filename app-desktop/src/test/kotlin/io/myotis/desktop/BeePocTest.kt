@@ -186,6 +186,7 @@ class BeePocTest {
         assertEquals("gnosis", settings.primaryNetwork())
         assertTrue(settings.logIndexEnabled("gnosis"))
         assertTrue(settings.logIndexConfigured("gnosis"))
+        assertTrue(settings.logIndexBackfillPaused("gnosis"), "the walk is off from the first start")
         assertEquals(
             listOf(LogIndexWatch.Entry(BeePoc.POSTAGE_STAMP, BeePoc.POSTAGE_STAMP_DEPLOYED)),
             LogIndexWatch.parse(settings.logIndexWatchJson("gnosis")),
@@ -207,6 +208,88 @@ class BeePocTest {
         BeePoc.applyFirstStartSettings(settings, firstStart = false)
         assertEquals(listOf("mainnet"), settings.enabledNetworks())
         assertFalse(settings.logIndexConfigured("gnosis"))
+    }
+
+    // -- the backfill OFF switch (the flavour's whole premise) -----------------
+
+    /** Run [body] with the flavour property set as a PoC / regular build has it. */
+    private fun withFlavour(on: Boolean, body: () -> Unit) {
+        val saved = System.getProperty(BeePoc.PROP)
+        try {
+            if (on) System.setProperty(BeePoc.PROP, "true") else System.clearProperty(BeePoc.PROP)
+            body()
+        } finally {
+            if (saved == null) System.clearProperty(BeePoc.PROP) else System.setProperty(BeePoc.PROP, saved)
+        }
+    }
+
+    /**
+     * The bundled seed IS the coverage: the PoC must never start the downward walk,
+     * which only competes with head-follow for the snap pool (see
+     * BeePoc.backfillPausedDefault). A regular install is untouched by that default.
+     */
+    @Test
+    fun `the flavour starts the backfill paused, a regular install leaves it running`(@TempDir dir: Path) {
+        withFlavour(true) {
+            assertTrue(BeePoc.backfillPausedDefault())
+            assertTrue(DesktopSettings(nets, dir.resolve("poc.properties")).logIndexBackfillPaused("gnosis"))
+        }
+        withFlavour(false) {
+            assertFalse(BeePoc.backfillPausedDefault())
+            assertFalse(DesktopSettings(nets, dir.resolve("regular.properties")).logIndexBackfillPaused("gnosis"))
+        }
+    }
+
+    /**
+     * The upgrade case, and the one every existing PoC install lands on: a settings
+     * file written before the switch existed carries no `logIndex.backfillPaused.*`
+     * key at all, so only the flavour default stands between it and a walk. Pinned
+     * down to the config the desktop host builds for the engine ([logIndexConfigJson],
+     * what pushLogIndexConfig sends): the engine activates the seeded index from disk
+     * with the walk ON, and that push is what turns it off.
+     */
+    @Test
+    fun `settings written before the switch existed still start the walk off`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        Files.writeString(
+            file,
+            "networks.enabled=gnosis\n" +
+                "logIndex.gnosis=true\n" +
+                """logIndex.watch.gnosis=[{"address":"${BeePoc.POSTAGE_STAMP}","fromBlock":${BeePoc.POSTAGE_STAMP_DEPLOYED}}]""" +
+                "\n",
+        )
+        withFlavour(true) {
+            val settings = DesktopSettings(nets, file)
+            assertTrue(settings.logIndexBackfillPaused("gnosis"), "no stored preference: the flavour decides")
+            // The mapping DesktopNode.pushLogIndexConfig hands the engine, called here
+            // rather than re-spelled, so dropping the argument there fails this test.
+            val json = logIndexConfigJson(settings, "gnosis")
+            assertTrue(json != null && json.contains("\"backfillPaused\":true"), "pushed config: $json")
+        }
+    }
+
+    /** First start PERSISTS the pause, so it holds however the flavour flag is read later. */
+    @Test
+    fun `first start writes the pause into the settings file`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        withFlavour(true) { BeePoc.applyFirstStartSettings(DesktopSettings(nets, file), firstStart = true) }
+        assertTrue(
+            Files.readString(file).contains("logIndex.backfillPaused.gnosis=true"),
+            "the pause must be in the file, not only in the default",
+        )
+        withFlavour(false) {
+            assertTrue(DesktopSettings(nets, file).logIndexBackfillPaused("gnosis"))
+        }
+    }
+
+    /** The Index tab's switch still wins: a default nobody can override is a bug, not a policy. */
+    @Test
+    fun `a user who turns the walk back on keeps it across a restart`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        withFlavour(true) {
+            DesktopSettings(nets, file).setLogIndexBackfillPaused("gnosis", false)
+            assertFalse(DesktopSettings(nets, file).logIndexBackfillPaused("gnosis"))
+        }
     }
 
     @Test

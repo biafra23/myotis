@@ -277,20 +277,22 @@ class DesktopNodeController(
 
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
-        val maxSpeed = settings.logIndexMaxSpeed(network)
         val backfillPaused = settings.logIndexBackfillPaused(network)
         // Nothing to say (no watched contracts, never configured) -> never push;
         // the engine keeps eth_getLogs in its honest not-configured state. A
         // CONFIGURED network always pushes — a disable must reach the engine or
         // its boot-time activate-from-disk re-enables an imported index.
-        val json = LogIndexWatch.configJson(
-            settings.logIndexWatchJson(network), enabled, maxSpeed,
-            configured = settings.logIndexConfigured(network),
-            backfillPaused = backfillPaused,
-        ) ?: return
+        val json = logIndexConfigJson(settings, network) ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
+        } else if (enabled && backfillPaused) {
+            // This push is what the engine's activation defers to: an index found on
+            // disk comes up serving with the walk paused, and stays that way unless a
+            // host asks otherwise. Worth a line, because "no walk" is a state a demo
+            // gets checked for — the Bee PoC runs this way by default
+            // (BeePoc.backfillPausedDefault).
+            log.info("[desktop] {}: log-index backfill paused (no downward walk)", network)
         }
     }
 
@@ -641,6 +643,21 @@ class DesktopNodeController(
         }
     }
 }
+
+/**
+ * The log-index config the desktop host pushes for [network] — the whole Settings →
+ * engine-JSON mapping in one place so a test can assert what the engine is actually
+ * handed (BeePocTest pins the Bee PoC's paused backfill through here). Null when there
+ * is nothing to say; see [LogIndexWatch.configJson].
+ */
+internal fun logIndexConfigJson(settings: Settings, network: String): String? =
+    LogIndexWatch.configJson(
+        settings.logIndexWatchJson(network),
+        settings.logIndexEnabled(network),
+        settings.logIndexMaxSpeed(network),
+        configured = settings.logIndexConfigured(network),
+        backfillPaused = settings.logIndexBackfillPaused(network),
+    )
 
 /**
  * Desktop settings, file-backed so every toggle survives an app restart (Android parity —
