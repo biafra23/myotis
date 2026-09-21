@@ -3071,10 +3071,19 @@ mod tests {
 /// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}]}`. False on malformed
 /// input, duplicate addresses, or an unavailable reader.
 pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    // Both refusals below were silent: the caller got a bare `false` with
+    // nothing in the engine log to say why, and since the parser screens
+    // duplicate addresses the reader's own warning never fires for a JSON
+    // caller either. Say it once, here, at the boundary that decides.
     let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        tracing::warn!("log-index config is not valid JSON; ignoring the push");
         return false;
     };
     let Some(config) = parse_log_index_config(&v) else {
+        tracing::warn!(
+            "log-index config refused: a field has the wrong type, or the watch list names \
+             one address twice; ignoring the push"
+        );
         return false;
     };
     let enabled = config.enabled;
