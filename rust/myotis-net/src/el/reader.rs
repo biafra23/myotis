@@ -1443,8 +1443,17 @@ impl ElReader {
     /// from_block). A genuinely new address or changed topic set still
     /// checkpoints the old index and re-indexes under the union — per-entry
     /// frontiers at different heights would wedge the appender.
-    /// Returns false (and installs nothing) for an invalid config
-    /// (duplicate watch addresses).
+    /// Returns false for an invalid config (duplicate watch addresses), and
+    /// then the node is EXACTLY as the push found it: same index, same
+    /// coverage, same restart claim, same tail record and bridge plan, and
+    /// nothing written to disk. A refused push is a no-op, not a partial
+    /// apply — the alternative was losing the live index to a config the
+    /// caller cannot even tell was rejected for that reason.
+    ///
+    /// That is why the replace path below builds every replacement candidate
+    /// BEFORE it takes the index out of the slot: from the take onwards it is
+    /// committed, and `LogIndex::merge` consumes the outgoing index outright,
+    /// so there is nothing left to put back.
     ///
     /// BLOCKS while another writer holds the checkpoint lock — an import
     /// merging GBs is the worst case, and it is unbounded from here. That
@@ -1452,6 +1461,22 @@ impl ElReader {
     /// decision needs the index lock and taking the checkpoint lock after it
     /// would invert the order. Hosts should not call this on a UI thread.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        // Refuse an unbuildable config HERE — before the locks, before the
+        // outgoing index is checkpointed, and before anything is taken out of
+        // the slot. Duplicate addresses are the only thing `LogIndex::new`
+        // rejects, and every `new` below is downstream of a step that cannot
+        // be undone, so catching it at the door is what makes a refused push
+        // a no-op. (Union output inherits this: `union_with` appends only
+        // addresses the pushed list lacks, and the live config was itself
+        // validated here or by `LogIndex::new`.)
+        if let Some(crate::el::logindex::DuplicateWatchAddress(a)) = config.duplicate_address() {
+            tracing::warn!(
+                address = %a.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "log-index config lists the same watch address twice; refusing it — \
+                 the installed index is unchanged"
+            );
+            return false;
+        }
         let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
         // flip changes the true rate (stale EMA → bogus ETA for minutes) and
@@ -1476,7 +1501,8 @@ impl ElReader {
             // Union against the LIVE watch-list. The live set always
             // contains the persisted file's set (it was built from it), so
             // no disk read is needed on a settings poke.
-            if let Some(eff) = config.union_with(&ix.config().watch) {
+            let effective = config.union_with(&ix.config().watch);
+            if let Some(eff) = effective.clone() {
                 if ix.adopt_config(eff) {
                     // Nothing accumulated was invalidated: coverage, the
                     // mapped gap and the tail record still describe this
@@ -1486,9 +1512,32 @@ impl ElReader {
                     return true;
                 }
             }
-            // New address or topic conflict: the index below is REPLACED,
-            // which invalidates bridge and tail — neither describes the new
-            // coverage shape.
+            // New address or topic conflict: the index below is REPLACED.
+            //
+            // Build the replacement candidates FIRST, while the live index is
+            // still in the slot and nothing around it has been spent. After
+            // this point the path is committed — it clears the bridge, retires
+            // the tail record (rewinding the coverage that record describes),
+            // checkpoints, and hands the outgoing index to `merge`, which
+            // consumes it. Both candidates are EMPTY indexes (a coverage Vec
+            // and two empty maps), so building the one the branch taken does
+            // not use costs nothing, and paying it here is what lets a failure
+            // be a clean refusal. Unreachable today — the guard at the top of
+            // this function already refused the only config `new` rejects —
+            // but "unreachable" is an argument about a function elsewhere,
+            // and the cost of it going stale was the whole live index.
+            let pushed = match effective.clone().map(crate::el::logindex::LogIndex::new) {
+                Some(Ok(p)) => Some(p),
+                Some(Err(_)) => return false,
+                None => None,
+            };
+            let replacement = match crate::el::logindex::LogIndex::new(config) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            // Committed from here: the replacement is in hand, so every step
+            // below lands or none of them were reached. The bridge and tail
+            // go because neither describes the new coverage shape.
             self.clear_log_index_bridge();
             // The tail record describes blocks this run appended and has not
             // yet proven canonical, and THE retirement rule says it may only
@@ -1529,23 +1578,15 @@ impl ElReader {
                 }
                 None => false,
             };
-            let effective = config.union_with(&ix.config().watch);
             let old = slot.take().expect("checked Some above");
-            let fresh = match effective {
+            let fresh = match (effective, pushed) {
                 // New addresses: MERGE the union config (an empty source)
                 // with the old index, so accumulated coverage — an imported
                 // snapshot's months of backfill included — survives a preset
                 // that merely grew. The merge drops the cursor when the new
                 // entries' holes sit above it; the walker then re-descends
                 // through the kept spans and closes them.
-                Some(eff) => {
-                    let pushed = match crate::el::logindex::LogIndex::new(eff.clone()) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            *slot = Some(old);
-                            return false;
-                        }
-                    };
+                (Some(eff), Some(pushed)) => {
                     match crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, old)]) {
                         Ok((_, mut merged)) => {
                             merged.set_enabled(eff.enabled);
@@ -1559,23 +1600,19 @@ impl ElReader {
                         }
                         // Unreachable in practice (union_with already vetted
                         // the topic sets); degrade to replace semantics.
-                        Err(_) => match crate::el::logindex::LogIndex::new(config) {
-                            Ok(f) => f,
-                            Err(_) => return false,
-                        },
+                        Err(_) => replacement,
                     }
                 }
                 // Topic conflict: replace with the push alone — a span's
                 // meaning includes its restriction, nothing can be kept.
-                None => {
+                // (`pushed` is None exactly when `effective` is; the pair is
+                // built from it a few lines above.)
+                _ => {
                     tracing::warn!(
                         "log-index config conflicts with the live subscription's topic \
                          restrictions; replacing — accumulated coverage re-indexes"
                     );
-                    match crate::el::logindex::LogIndex::new(config) {
-                        Ok(f) => f,
-                        Err(_) => return false,
-                    }
+                    replacement
                 }
             };
             let installed_is_empty = fresh.log_count() == 0;
@@ -10661,6 +10698,53 @@ mod restart_claim_reader_tests {
         assert!(reader.set_log_index_config(conflicting));
         assert_eq!(reader.log_index_covered_high(), None);
         assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    /// A push the index layer refuses must cost the node NOTHING: same
+    /// coverage, same claim, same tail record. This is the
+    /// variant that used to lose the whole index — a duplicate address makes
+    /// the replacement unbuildable, and the topic change means there is no
+    /// merge to fall back on, so the old index had already left the slot when
+    /// the construction failed.
+    #[tokio::test]
+    async fn a_refused_config_leaves_a_conflicting_index_exactly_as_it_was() {
+        let dir = TempDir::new("refuse-conflict");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut bad = watch();
+        bad.watch[0].topic0s = vec![[0x99; 32]]; // no union, so no merge path
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "the live index vanished");
+        assert_eq!(vouched(&reader), F1, "the restart claim did not survive the refusal");
+        assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "the tail record was retired");
+        reader.stop().await;
+    }
+
+    /// The same rule for the variant that kept the index but had already
+    /// spent what surrounds it: the union succeeds (topics match), so the old
+    /// index went back into the slot — but only after the tail record had
+    /// been retired and its unconfirmed coverage rewound away.
+    #[tokio::test]
+    async fn a_refused_config_keeps_the_unconfirmed_coverage_it_cannot_replace() {
+        let dir = TempDir::new("refuse-union");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut bad = watch();
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "unconfirmed coverage was rewound");
+        assert_eq!(vouched(&reader), F1, "the restart claim did not survive the refusal");
+        assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "the tail record was retired");
         reader.stop().await;
     }
 

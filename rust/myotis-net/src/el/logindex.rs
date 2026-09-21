@@ -131,6 +131,21 @@ impl LogIndexConfig {
         })
     }
 
+    /// The duplicate watch address this config carries, if any — the ONE
+    /// reason [`LogIndex::new`] refuses a config.
+    ///
+    /// Exposed separately so a caller can refuse a bad config before it costs
+    /// anything. `LogIndex::new` is the last step of a replace, by which point
+    /// the index being replaced is already gone; a caller that must not lose
+    /// it asks here first (see `ElReader::set_log_index_config`).
+    pub fn duplicate_address(&self) -> Option<DuplicateWatchAddress> {
+        self.watch
+            .iter()
+            .enumerate()
+            .find(|(i, w)| self.watch.iter().skip(i + 1).any(|o| o.address == w.address))
+            .map(|(_, w)| DuplicateWatchAddress(w.address))
+    }
+
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
     /// on load invalidates the persisted index (derived data — re-index
     /// rather than risk serving under a stale subscription set).
@@ -311,10 +326,8 @@ impl LogIndex {
     /// query resolution is per-address, and two entries for one address can
     /// desynchronize storage from coverage (a coverage-honesty hole).
     pub fn new(config: LogIndexConfig) -> Result<Self, DuplicateWatchAddress> {
-        for (i, w) in config.watch.iter().enumerate() {
-            if config.watch.iter().skip(i + 1).any(|o| o.address == w.address) {
-                return Err(DuplicateWatchAddress(w.address));
-            }
+        if let Some(dup) = config.duplicate_address() {
+            return Err(dup);
         }
         let n = config.watch.len();
         Ok(Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None })
@@ -2032,7 +2045,13 @@ mod tests {
     #[test]
     fn duplicate_watch_addresses_are_rejected() {
         let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![], name: String::new() }]);
+        // Askable ahead of construction, so a caller holding an index it must
+        // not lose can refuse the config before spending anything on it.
+        assert!(matches!(dup.duplicate_address(), Some(DuplicateWatchAddress(a)) if a == addr(1)));
         assert!(matches!(LogIndex::new(dup), Err(DuplicateWatchAddress(a)) if a == addr(1)));
+        // …and it answers None for the configs `new` accepts, including empty.
+        assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).duplicate_address().is_none());
+        assert!(config(vec![]).duplicate_address().is_none());
     }
 
     #[test]
