@@ -4162,7 +4162,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-bls"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blst",
  "jni",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-consensus"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blst",
  "myotis-bls",
@@ -4180,7 +4180,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "k256",
  "sha3 0.10.9",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-engine"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "myotis-consensus",
  "myotis-core",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-evm"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "myotis-core",
  "revm",
@@ -4212,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-net"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "aes",
  "arti-client",
@@ -4241,7 +4241,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-node"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "myotis-engine",
  "napi",
