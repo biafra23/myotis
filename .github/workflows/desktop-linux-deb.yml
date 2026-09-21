@@ -90,7 +90,8 @@ jobs:
       # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
       # NON-minified (main, not main-release): the Java backend (Netty / Besu /
       # BouncyCastle / libp2p) is reflection-heavy and proguard would break it.
-      # Unsigned — installed via `sudo apt install ./Myotis-<arch>.deb` or dpkg -i.
+      # Unsigned — released as Myotis-<version>-<arch>.deb and installed via
+      # `sudo apt install ./Myotis-<version>-<arch>.deb` or dpkg -i.
       # Retry to ride out transient repo-resolution blips.
       - name: Build Linux .deb (${{ matrix.arch }})
         run: |
@@ -294,11 +295,11 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
-          **Bee PoC (`Myotis-bee-poc-arm64.dmg`, when present)** — a separate app
+          **Bee PoC (`Myotis-<version>-bee-poc-arm64.dmg`, when present)** — a separate app
           ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
           Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
           seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
@@ -306,8 +307,8 @@ jobs:
           days after its fetch (the Index tab shows the block it is usable until). See
           docs/bee-rpc-service.md.
 
-          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
-          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          **Desktop Linux (`Myotis-<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
           NOTES
           # Create the release if it doesn't exist yet. The dmg/apk workflows may
@@ -324,4 +325,11 @@ jobs:
               --target "${GITHUB_SHA}" \
             || gh release view "$tag" >/dev/null 2>&1
           fi
-          gh release upload "$tag" deb/Myotis-x64.deb deb/Myotis-arm64.deb --clobber
+          # Release assets carry the version, like the APK
+          # (Myotis-<tag>-android-debug.apk): Myotis-<tag>-<arch>.deb. $tag is
+          # validated above, and on a manual re-publish it is the target tag, so
+          # the name matches the release it lands on.
+          for arch in x64 arm64; do
+            mv "deb/Myotis-${arch}.deb" "deb/Myotis-${tag}-${arch}.deb"
+          done
+          gh release upload "$tag" "deb/Myotis-${tag}-x64.deb" "deb/Myotis-${tag}-arm64.deb" --clobber
