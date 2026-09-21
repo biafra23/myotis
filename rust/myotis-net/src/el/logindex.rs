@@ -2054,6 +2054,33 @@ mod tests {
         assert!(config(vec![]).duplicate_address().is_none());
     }
 
+    /// `ElReader::set_log_index_config` screens the PUSHED config for
+    /// duplicates and then builds an index from `union_with`'s output, on a
+    /// path where a failure would have to discard an index it has already
+    /// consumed. That is only sound while the union cannot manufacture a
+    /// duplicate the screen never saw — pinned here, including for a `stored`
+    /// list that is itself duplicated (the union folds the second copy into
+    /// the entry the first one appended, rather than appending it again).
+    #[test]
+    fn a_union_never_manufactures_a_duplicate_the_pushed_config_lacked() {
+        let pushed = config(vec![watch_all(addr(1), 10), watch_all(addr(2), 10)]);
+        assert!(pushed.duplicate_address().is_none());
+        for stored in [
+            vec![watch_all(addr(2), 5), watch_all(addr(3), 5)], // overlap + new
+            vec![watch_all(addr(3), 5), watch_all(addr(3), 7)], // duplicated stored
+            vec![watch_all(addr(1), 5), watch_all(addr(1), 7)], // duplicated overlap
+            vec![],
+        ] {
+            let union = pushed.union_with(&stored).expect("no topic conflict");
+            assert!(
+                union.duplicate_address().is_none(),
+                "union_with produced a duplicate the guard could not have caught: {:?}",
+                union.watch.iter().map(|w| w.address[0]).collect::<Vec<_>>()
+            );
+            assert!(LogIndex::new(union).is_ok(), "the union config is unbuildable");
+        }
+    }
+
     #[test]
     fn rewind_below_backfill_edge_drops_cursor() {
         let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
