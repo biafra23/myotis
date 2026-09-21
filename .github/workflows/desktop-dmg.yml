@@ -346,8 +346,9 @@ jobs:
           set -eu
           tag="${GITHUB_REF_NAME}"
           # The tag goes into the asset file names below, so check its shape the
-          # way the deb job does. `gh release upload` reads everything after a
-          # `#` in a path as the asset's label, so a tag like v1.2-rc#1 would
+          # way the deb and apk jobs do. `gh release upload` reads everything
+          # after a `#` in a path as the asset's label, and the version guard
+          # accepts any v<version>-<suffix>, so a tag like v<version>-rc#1 would
           # otherwise fail the upload after the release already exists.
           printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }

@@ -222,6 +222,14 @@ jobs:
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          unverified until the walker re-fetches it, and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
           **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
           `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).

@@ -409,6 +409,13 @@ jobs:
       - name: Rename APK to a stable, versioned asset name
         run: |
           set -eu
+          # The tag goes into the asset file name, so check its shape the way the
+          # dmg and deb publish jobs do. `gh release upload` reads everything
+          # after a `#` in a path as the asset's label, and the version guard
+          # accepts any v<version>-<suffix>, so a tag like v<version>-rc#1 would
+          # otherwise create the release in the next step and then fail its upload.
+          printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
           # Glob into an array and assert exactly one apk — a stray second file
           # (or zero) should fail here, not silently ship an arbitrary pick.
           shopt -s nullglob
