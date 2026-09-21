@@ -908,7 +908,16 @@ impl LogIndex {
                     let j = parsed.watch.iter().position(|f| f.address == w.address)?;
                     coverage.push(parsed.coverage[j]);
                 }
-                Some(Self { config: config.clone(), coverage, logs: parsed.logs, cursor: parsed.cursor })
+                // Same bar as `new`: a duplicate address desynchronizes
+                // storage from coverage, and this path builds `Self` directly.
+                // Reachable with a hand-written config, since the fingerprint
+                // the file is keyed by is computed from that same config.
+                config.duplicate_address().is_none().then(|| Self {
+                    config: config.clone(),
+                    coverage,
+                    logs: parsed.logs,
+                    cursor: parsed.cursor,
+                })
             }
             _ => None,
         }
@@ -932,7 +941,11 @@ impl LogIndex {
         if c.pos != data.len() {
             return None; // trailing garbage → treat as corrupt
         }
-        Some(Self { config: config.clone(), coverage, logs, cursor })
+        // Same bar as `new` (see `deserialize`).
+        config
+            .duplicate_address()
+            .is_none()
+            .then(|| Self { config: config.clone(), coverage, logs, cursor })
     }
 
     /// Self-describing read (v2 only): reconstruct the subscription set from

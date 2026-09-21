@@ -1443,8 +1443,9 @@ impl ElReader {
     /// from_block). A genuinely new address or changed topic set still
     /// checkpoints the old index and re-indexes under the union — per-entry
     /// frontiers at different heights would wedge the appender.
-    /// Returns false for an invalid config (duplicate watch addresses), and
-    /// then the node is EXACTLY as the push found it: same index, same
+    /// Returns false for an invalid config (duplicate watch addresses) — and
+    /// whenever this returns false, for that reason or because a lock was
+    /// poisoned, the node is EXACTLY as the push found it: same index, same
     /// coverage, same restart claim, same tail record and bridge plan, and
     /// nothing written to disk. A refused push is a no-op, not a partial
     /// apply — the alternative was losing the live index to a config the
@@ -1514,24 +1515,42 @@ impl ElReader {
             }
             // New address or topic conflict: the index below is REPLACED.
             //
-            // Build the replacement candidates FIRST, while the live index is
+            // Build every replacement candidate FIRST, while the live index is
             // still in the slot and nothing around it has been spent. After
             // this point the path is committed — it clears the bridge, retires
             // the tail record (rewinding the coverage that record describes),
             // checkpoints, and hands the outgoing index to `merge`, which
-            // consumes it. Both candidates are EMPTY indexes (a coverage Vec
-            // and two empty maps), so building the one the branch taken does
-            // not use costs nothing, and paying it here is what lets a failure
-            // be a clean refusal. Unreachable today — the guard at the top of
-            // this function already refused the only config `new` rejects —
-            // but "unreachable" is an argument about a function elsewhere,
-            // and the cost of it going stale was the whole live index.
-            let pushed = match effective.clone().map(crate::el::logindex::LogIndex::new) {
-                Some(Ok(p)) => Some(p),
-                Some(Err(_)) => return false,
+            // consumes it. They are EMPTY indexes (a coverage Vec and two
+            // empty maps), so building the ones the branch taken does not use
+            // costs nothing, and paying it here is what lets a failure be a
+            // clean refusal. Unreachable today — the guard at the top of this
+            // function already refused the only config `new` rejects — but
+            // "unreachable" is an argument about a function elsewhere, and the
+            // cost of it going stale was the whole live index.
+            //
+            // The union plan is present exactly when the watch-lists union at
+            // all: the unioned config, the empty index handed to `merge`, and
+            // the one to install if `merge` refuses. Carrying the three
+            // together makes "a union with no index to merge" unrepresentable
+            // rather than merely unreachable, so the match below needs no
+            // catch-all to swallow it. Its fallback is built over the UNION
+            // too: falling back to the push alone would silently stop indexing
+            // an address only the live subscription had, which is the one
+            // thing this function's additive contract exists to prevent.
+            let union_plan = match effective {
+                Some(eff) => match (
+                    crate::el::logindex::LogIndex::new(eff.clone()),
+                    crate::el::logindex::LogIndex::new(eff.clone()),
+                ) {
+                    (Ok(pushed), Ok(fallback)) => Some((eff, pushed, fallback)),
+                    _ => return false,
+                },
                 None => None,
             };
-            let replacement = match crate::el::logindex::LogIndex::new(config) {
+            // The topic-conflict replacement: the push ALONE, since a span's
+            // meaning includes its restriction and nothing of the old
+            // subscription can be carried under a different one.
+            let conflict_replacement = match crate::el::logindex::LogIndex::new(config) {
                 Ok(r) => r,
                 Err(_) => return false,
             };
@@ -1579,14 +1598,14 @@ impl ElReader {
                 None => false,
             };
             let old = slot.take().expect("checked Some above");
-            let fresh = match (effective, pushed) {
+            let fresh = match union_plan {
                 // New addresses: MERGE the union config (an empty source)
                 // with the old index, so accumulated coverage — an imported
                 // snapshot's months of backfill included — survives a preset
                 // that merely grew. The merge drops the cursor when the new
                 // entries' holes sit above it; the walker then re-descends
                 // through the kept spans and closes them.
-                (Some(eff), Some(pushed)) => {
+                Some((eff, pushed, fallback)) => {
                     match crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, old)]) {
                         Ok((_, mut merged)) => {
                             merged.set_enabled(eff.enabled);
@@ -1598,21 +1617,31 @@ impl ElReader {
                             merged.set_backfill_paused(eff.backfill_paused);
                             merged
                         }
-                        // Unreachable in practice (union_with already vetted
-                        // the topic sets); degrade to replace semantics.
-                        Err(_) => replacement,
+                        // Unreachable in practice: `union_with` already vetted
+                        // the topic sets, and both sources carry this chain's
+                        // tag. Degrade to replace semantics — but NOT
+                        // silently. It costs every block of accumulated
+                        // coverage while still reporting success, so the one
+                        // way to tell it happened is this line; without it the
+                        // symptom is an index that is simply empty.
+                        Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                "log-index merge refused a union that union_with accepted; \
+                                 re-indexing from scratch under the unioned watch-list"
+                            );
+                            fallback
+                        }
                     }
                 }
                 // Topic conflict: replace with the push alone — a span's
                 // meaning includes its restriction, nothing can be kept.
-                // (`pushed` is None exactly when `effective` is; the pair is
-                // built from it a few lines above.)
-                _ => {
+                None => {
                     tracing::warn!(
                         "log-index config conflicts with the live subscription's topic \
                          restrictions; replacing — accumulated coverage re-indexes"
                     );
-                    replacement
+                    conflict_replacement
                 }
             };
             let installed_is_empty = fresh.log_count() == 0;
@@ -1676,11 +1705,30 @@ impl ElReader {
                     // of discarding — the snapshot's coverage survives, the
                     // new entries re-index via the walker's re-descent (the
                     // merge drops the cursor for exactly that).
-                    let merged = crate::el::logindex::LogIndex::new(eff.clone())
-                        .ok()
-                        .and_then(|pushed| {
-                            crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, stored_ix)]).ok()
-                        });
+                    // Build the pushed side BEFORE `stored_ix` is handed to
+                    // `merge`, for the same reason the live path does: an
+                    // `.ok()` here would drop the snapshot's index on the
+                    // floor and then install an EMPTY one — reporting success,
+                    // after which the next checkpoint overwrites the file that
+                    // still held the coverage. Refuse instead; the file stays
+                    // intact and the host can push a config that works.
+                    let merged = match crate::el::logindex::LogIndex::new(eff.clone()) {
+                        Ok(pushed) => match crate::el::logindex::LogIndex::merge(vec![
+                            (tag, pushed),
+                            (tag, stored_ix),
+                        ]) {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    "log-index merge refused the stored snapshot against the \
+                                     pushed config; re-indexing from scratch"
+                                );
+                                None
+                            }
+                        },
+                        Err(_) => return false,
+                    };
                     match merged {
                         Some((_, mut m)) => {
                             m.set_enabled(eff.enabled);
@@ -10745,6 +10793,42 @@ mod restart_claim_reader_tests {
         assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "unconfirmed coverage was rewound");
         assert_eq!(vouched(&reader), F1, "the restart claim did not survive the refusal");
         assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "the tail record was retired");
+        reader.stop().await;
+    }
+
+    /// The two tests above pass with EITHER layer of the fix alone (the guard
+    /// at the top, or the replace path's build-before-take), so neither pins
+    /// the guard. This does: the guard's own reason to exist is that it
+    /// answers without taking the checkpoint lock, which an in-flight import
+    /// can hold for as long as merging GBs takes. A refusal that queues behind
+    /// that is indistinguishable from the outside — except in how long the
+    /// caller waits, which is exactly what a host on a UI thread feels.
+    #[tokio::test]
+    async fn a_duplicate_config_is_refused_without_taking_the_checkpoint_lock() {
+        let dir = TempDir::new("refuse-nolock");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+
+        let mut bad = watch();
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+
+        // Held as a checkpoint write (or an import) holds it.
+        let held = reader.log_index_write.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = &reader;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _ = tx.send(r.set_log_index_config(bad));
+            });
+            let answered = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Release BEFORE asserting, so a push that did queue can still
+            // finish and be joined instead of hanging the test.
+            drop(held);
+            assert_eq!(answered.ok(), Some(false), "the push queued behind the checkpoint lock");
+        });
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "the refusal touched the index");
         reader.stop().await;
     }
 
