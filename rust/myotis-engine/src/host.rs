@@ -3071,10 +3071,20 @@ mod tests {
 /// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}]}`. False on malformed
 /// input, duplicate addresses, or an unavailable reader.
 pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    // Both refusals below were silent: the caller got a bare `false` with
+    // nothing in the engine log to say why, and since the parser screens
+    // duplicate addresses the reader's own warning never fires for a JSON
+    // caller either. Say it once, here, at the boundary that decides.
     let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        tracing::warn!("log-index config is not valid JSON; ignoring the push");
         return false;
     };
     let Some(config) = parse_log_index_config(&v) else {
+        tracing::warn!(
+            "log-index config refused: a watch entry is missing `address` or `fromBlock`, \
+             a field has the wrong type or is not valid hex, or the watch list names \
+             one address twice; ignoring the push"
+        );
         return false;
     };
     let enabled = config.enabled;
@@ -3107,9 +3117,6 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     installed
 }
 
-/// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
-/// adds engine plumbing). `None` = malformed (wrong types); unknown keys are
-/// ignored for forward compatibility.
 /// A JSON boolean field that must be a boolean if it is there at all.
 ///
 /// Absent (or `null`, which every host's "field omitted" encodes as) yields
@@ -3123,6 +3130,12 @@ fn strict_bool(v: &serde_json::Value, key: &str, default: bool) -> Option<bool> 
     }
 }
 
+/// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
+/// adds engine plumbing). `None` = malformed — a watch entry missing the
+/// required `address` or `fromBlock`, a field of the wrong type, an address
+/// or topic that is not valid hex of the right width, or a watch-list that
+/// names one address twice. Unknown keys are ignored for forward
+/// compatibility.
 fn parse_log_index_config(
     v: &serde_json::Value,
 ) -> Option<myotis_net::el::logindex::LogIndexConfig> {
@@ -3164,12 +3177,17 @@ fn parse_log_index_config(
             watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s, name });
         }
     }
-    Some(myotis_net::el::logindex::LogIndexConfig {
-        enabled,
-        max_speed,
-        backfill_paused,
-        watch,
-    })
+    let config =
+        myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, backfill_paused, watch };
+    // The one config the index layer refuses outright. The reader refuses it
+    // too (and leaves its installed index alone doing so), but catching it
+    // here keeps a malformed push off the checkpoint lock entirely — that lock
+    // can be held for as long as an import takes to merge GBs, and a caller
+    // that is going to get `false` either way should not wait behind it.
+    if config.duplicate_address().is_some() {
+        return None;
+    }
+    Some(config)
 }
 
 /// Import portable log-index snapshots: `paths_json` is a JSON array of
@@ -3643,6 +3661,30 @@ mod log_index_json_tests {
         // Absent and explicit null both keep the documented default.
         assert!(cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).is_some());
         assert!(!cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).unwrap().backfill_paused);
+    }
+
+    #[test]
+    fn a_watch_list_naming_one_address_twice_is_refused_at_the_parser() {
+        // The index layer refuses this config anyway; refusing it here keeps a
+        // push that cannot be applied from queueing behind the checkpoint lock.
+        let a = "0x4e69fD587118dFb64957d18654E3894118E9b1BF";
+        let dup = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"{a}","fromBlock":9}}]}}"#
+        );
+        assert!(cfg(&dup).is_none(), "a duplicate watch address parsed");
+        // Case is not identity here — the parser normalizes, so the same
+        // address in two spellings is still the same address.
+        let mixed = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"{}","fromBlock":9}}]}}"#,
+            a.to_lowercase()
+        );
+        assert!(cfg(&mixed).is_none(), "a duplicate watch address parsed in another case");
+        // Two genuinely different addresses still parse.
+        let two = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"0x{}","fromBlock":9}}]}}"#,
+            "ab".repeat(20)
+        );
+        assert_eq!(cfg(&two).unwrap().watch.len(), 2);
     }
 
     #[test]
