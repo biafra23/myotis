@@ -179,8 +179,55 @@ Unlike the Bee flavour it ships **no warm peer caches** — none have been captu
 for mainnet — so discovery seeds from the embedded bootnodes. That costs a slower
 first minute, not correctness.
 
-## Not built in CI
+## CI
 
-The dmg workflow builds the regular and Bee PoC flavours. This one needs seed
-data that is not in the repo, so it is a local build. Adding it to CI means
-deciding where the ~243 MB seed lives first.
+`.github/workflows/railgun-dmg.yml` builds the arm64 installer on every push to
+`main`, on `v*` tags, and on manual dispatch. It is separate from
+`desktop-dmg.yml` because this flavour's seed is not in the repo, so the runner
+has to fetch it.
+
+**Two repository variables configure it** (Settings → Secrets and variables →
+Actions → Variables):
+
+| variable | |
+|---|---|
+| `RAILGUN_SEED_URL` | a `.tar.gz` of the fetch directory — the `railgun-logs.jsonl[.gz]` and its `*.meta.json` |
+| `RAILGUN_SEED_SHA256` | the archive's sha256. Optional, and warned about when missing: the seed arrives from outside the repo and a truncated download frames "successfully" with fewer logs than it should have |
+
+Make the archive from the fetch directory:
+
+```bash
+cd "$HOME/myotis-node" && tar -czf railgun-seed.tar.gz \
+    railgun/railgun-logs.jsonl railgun/railgun-logs-*.meta.json
+shasum -a 256 railgun-seed.tar.gz
+```
+
+Host it anywhere the runner can reach with a plain `curl` — a GitHub release
+asset works, and keeps it beside the builds that consume it.
+
+**When the variable is unset**, the build is skipped with a warning on `main`
+and on a dispatch, so an unconfigured repo does not turn every merge red — and
+**fails on a tag**, because a release that quietly omits this artifact is worse
+than one that fails: nobody notices until they go looking for the download.
+
+### Artifact names
+
+| build | name |
+|---|---|
+| `main`, dispatch | `Myotis-railgun-poc-arm64.dmg` |
+| `v*` tag | `Myotis-railgun-poc-<version>-arm64.dmg` |
+
+The tag build carries the version so a downloaded file identifies itself; the
+`main` build stays unversioned so "the latest build" is a stable name. On a tag
+the dmg is also attached to the GitHub release, alongside the standard dmgs and
+the Android APK.
+
+### What CI asserts about the dmg
+
+Beyond the architecture and engine checks the standard legs make, this one opens
+the built image and requires that it carries `logindex.db` (mainnet's name, with
+no network suffix — a suffixed one would install fine and never be opened), its
+manifest, a manifest pinning `deploymentBlock=14737691`, coverage starting at
+that block, and none of the Bee flavour's files. A dmg that installs cleanly with
+no index inside is exactly the failure this artifact exists to prevent, and
+nothing at runtime would report it except a wallet getting `-32000` forever.

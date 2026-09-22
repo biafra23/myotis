@@ -1,0 +1,312 @@
+name: RAILGUN PoC DMG (macOS arm64)
+
+# The RAILGUN PoC flavour's installer (docs/railgun-poc.md). Separate from
+# desktop-dmg.yml because this flavour's seed is NOT in the repo: 426k logs over
+# 11.3M mainnet blocks, ~549 MB raw, which does not belong in a clone. The runner
+# fetches it from a location configured on the repository instead, and the job is
+# skipped — loudly — when that is not set up, so an unconfigured repo does not
+# turn every merge red.
+#
+# arm64 only. The Bee flavour ships arm64 alone for the same reason (the x64
+# Rosetta leg is a release artifact for the standard app), and this one has no
+# Intel audience to serve.
+
+on:
+  # Merge: every push to main produces a current artifact, so the demo machine
+  # can always pull the latest build without waiting for a release.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  # Manual, for rebuilding after the seed is refreshed (its shelf life is ~69
+  # mainnet days) without needing a commit.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Whether a seed is reachable decides whether the build can run at all, and the
+  # answer must never be silent. On a tag it is an ERROR: a release that quietly
+  # omits this artifact is worse than a failed release, because nobody notices
+  # until someone goes looking for the download. Anywhere else it is a warning and
+  # the build is skipped.
+  seed:
+    name: Check the seed source
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - id: check
+        env:
+          SEED_URL: ${{ vars.RAILGUN_SEED_URL }}
+        run: |
+          set -eu
+          if [ -n "${SEED_URL:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "seed source configured"
+            exit 0
+          fi
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          msg="the RAILGUN_SEED_URL repository variable is not set, so the RAILGUN PoC dmg cannot be built. \
+          It must point at a .tar.gz of the fetch directory (railgun-logs.jsonl[.gz] plus its *.meta.json) — \
+          see docs/railgun-poc.md, Building the seed."
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "::error::$msg"
+            exit 1
+          fi
+          echo "::warning::$msg Skipping this build."
+
+  build:
+    name: Build macOS .dmg (arm64, railgun-poc)
+    needs: seed
+    if: needs.seed.outputs.available == 'true'
+    runs-on: macos-14
+    permissions:
+      contents: read
+    env:
+      SEED_URL: ${{ vars.RAILGUN_SEED_URL }}
+      # Optional but strongly recommended: the seed is the whole point of this
+      # artifact and it arrives over the network from outside the repo.
+      SEED_SHA256: ${{ vars.RAILGUN_SEED_SHA256 }}
+      # The extraction ROOT. The fetch's own directory inside it is located by
+      # the fetch step and exported as SEED_DIR — deliberately a DIFFERENT name,
+      # because a job-level env var overrides whatever a step writes to
+      # $GITHUB_ENV, so reusing the name here would silently win over it.
+      SEED_ROOT: ${{ github.workspace }}/railgun-seed
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Full history: :ui stamps the app's on-screen version from the nearest
+          # v* tag, and `git describe` needs HEAD's history to REACH that tag.
+          fetch-depth: 0
+
+      # The dmg's name carries the version only on a release, per the owner's
+      # request. On main it stays unversioned so the "latest build" link is
+      # stable; on a tag it is self-identifying once downloaded, which is what
+      # matters for an artifact people keep.
+      - name: Resolve the dmg name
+        id: name
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            echo "dmg=Myotis-railgun-poc-${version}-arm64.dmg" >> "$GITHUB_OUTPUT"
+          else
+            echo "dmg=Myotis-railgun-poc-arm64.dmg" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+      # The seed arrives from outside the repository, so it is checked before it
+      # is trusted: a truncated download would otherwise surface as a seed that
+      # frames "successfully" with fewer logs than it should have, which no later
+      # step can tell from a genuine short range.
+      - name: Fetch the seed
+        run: |
+          set -eu
+          mkdir -p "$SEED_ROOT"
+          archive="$RUNNER_TEMP/railgun-seed.tar.gz"
+          curl --fail --location --show-error --silent --retry 3 --retry-delay 5 \
+            --output "$archive" "$SEED_URL"
+          if [ -n "${SEED_SHA256:-}" ]; then
+            echo "${SEED_SHA256}  ${archive}" | shasum -a 256 -c - \
+              || { echo "::error::the downloaded seed does not match RAILGUN_SEED_SHA256"; exit 1; }
+            echo "seed checksum OK"
+          else
+            echo "::warning::RAILGUN_SEED_SHA256 is not set — the seed download is unverified. \
+            Set it to the sha256 of the archive."
+            shasum -a 256 "$archive"
+          fi
+          # Extract VERBATIM and then locate the fetch inside, rather than
+          # guessing the archive's shape with --strip-components: that flag does
+          # not fail on a flat archive, it silently extracts nothing, and the
+          # build would then report a missing seed dir it was in fact handed.
+          tar -xzf "$archive" -C "$SEED_ROOT"
+          meta=$(find "$SEED_ROOT" -maxdepth 3 -name '*.meta.json' | head -n1 || true)
+          [ -n "$meta" ] || { echo "::error::the seed archive contains no *.meta.json"; find "$SEED_ROOT" -maxdepth 3; exit 1; }
+          found_dir=$(dirname "$meta")
+          ls "$found_dir"/railgun-logs.jsonl "$found_dir"/railgun-logs.jsonl.gz >/dev/null 2>&1 \
+            || { echo "::error::no railgun-logs.jsonl[.gz] beside $meta"; ls -la "$found_dir"; exit 1; }
+          # prepareRailgunPocSeed also refuses more than one meta, but saying so
+          # here names the archive as the cause rather than the build.
+          count=$(find "$SEED_ROOT" -maxdepth 3 -name '*.meta.json' | wc -l | tr -d ' ')
+          [ "$count" = "1" ] \
+            || { echo "::error::the seed archive holds $count *.meta.json files; it must hold exactly the fetch to bundle"; exit 1; }
+          echo "SEED_DIR=$found_dir" >> "$GITHUB_ENV"
+          ls -la "$found_dir"
+
+      - name: Set up JDK 21 (aarch64)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: aarch64
+
+      # The packaged app bundles the Rust engine (appResources); prepareRustAppResources
+      # fails the build if the lib is missing, so this is REQUIRED.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # Same toolchain pinning as desktop-dmg.yml: auto-detect off plus an
+      # explicit installation path, so jpackage emits an arm64 dmg rather than
+      # picking a stray pre-installed JDK. Retry rides out dependency-resolution
+      # blips, not build errors — a real failure fails all three attempts.
+      - name: Build macOS .dmg (arm64, railgun-poc)
+        env:
+          RUST_TARGET: aarch64-apple-darwin
+        run: |
+          GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
+          for attempt in 1 2 3; do
+            ./gradlew :app-desktop:packageDmg --stacktrace $GRADLE_ARGS \
+              -PrailgunPoc -PrailgunSeedDir="$SEED_DIR" && exit 0
+            echo "::warning::DMG build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::DMG build failed after 3 attempts"
+          exit 1
+
+      # Compose names the output after the app name and packageVersion; rename to
+      # the flavour- and arch-tagged name resolved above. Assert exactly one, so a
+      # leftover build is never shipped in place of the fresh one.
+      - name: Name the .dmg
+        env:
+          DMG_NAME: ${{ steps.name.outputs.dmg }}
+        run: |
+          set -eu
+          shopt -s nullglob
+          dmgs=(app-desktop/build/compose/binaries/main/dmg/*.dmg)
+          [ "${#dmgs[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 dmg, found ${#dmgs[@]}: ${dmgs[*]}"; exit 1; }
+          mv "${dmgs[0]}" "app-desktop/build/compose/binaries/main/dmg/$DMG_NAME"
+
+      # The same arch and engine assertions the standard legs make, plus the ones
+      # specific to this flavour: it must carry ITS seed, and must not carry the
+      # Bee flavour's. A dmg that builds and installs but has no index inside is
+      # exactly the failure this artifact exists to prevent, and nothing at
+      # runtime would report it except a wallet getting -32000 forever.
+      - name: Verify the .dmg
+        env:
+          DMG_NAME: ${{ steps.name.outputs.dmg }}
+        run: |
+          set -eu
+          dmg="app-desktop/build/compose/binaries/main/dmg/$DMG_NAME"
+          mnt=$(mktemp -d)
+          cleanup() { hdiutil detach "$mnt" >/dev/null 2>&1 || hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true; }
+          trap cleanup EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+
+          launcher=$(find "$mnt" -type f -path '*/Contents/MacOS/*' | head -n1)
+          [ -n "$launcher" ] || { echo "::error::no app launcher found under $dmg — bundle layout changed?"; exit 1; }
+          lipo -archs "$launcher" | tr ' ' '\n' | grep -qx arm64 \
+            || { echo "::error::arch mismatch: expected arm64, got [$(lipo -archs "$launcher")]"; exit 1; }
+          echo "OK: launcher is arm64"
+
+          rustlib=$(find "$mnt" -type f -name 'libmyotis_engine.dylib' | head -n1 || true)
+          [ -n "$rustlib" ] || { echo "::error::libmyotis_engine.dylib missing from the dmg"; exit 1; }
+          lipo -archs "$rustlib" | tr ' ' '\n' | grep -qx arm64 \
+            || { echo "::error::rust engine arch mismatch: [$(lipo -archs "$rustlib")]"; exit 1; }
+          echo "OK: bundled rust engine is arm64"
+
+          # JNA's stub must be present, arm64 and validly signed, or the Rust
+          # engine silently never loads (JNA swallows the boot-path failure).
+          jna=$(find "$mnt" -type f -name 'libjnidispatch.dylib' | head -n1 || true)
+          [ -n "$jna" ] || { echo "::error::libjnidispatch.dylib missing — the packaged app cannot load the Rust engine"; exit 1; }
+          lipo -archs "$jna" | tr ' ' '\n' | grep -qx arm64 \
+            || { echo "::error::JNA stub arch mismatch: [$(lipo -archs "$jna")]"; exit 1; }
+          codesign --verify --verbose=2 "$jna" \
+            || { echo "::error::JNA stub is not validly signed — jpackage did not sign it"; exit 1; }
+          echo "OK: bundled JNA stub is arm64 and signed"
+
+          # Mainnet's index carries no network suffix. A suffixed name would
+          # install and checksum fine and then never be opened by the engine, so
+          # assert the exact name rather than "some .db".
+          seed=$(find "$mnt" -type f -name 'logindex.db' | head -n1 || true)
+          manifest=$(find "$mnt" -type f -name 'railgun-poc-seed.properties' | head -n1 || true)
+          [ -n "$seed" ] && [ -n "$manifest" ] \
+            || { echo "::error::the railgun-poc dmg is missing its seed or manifest"; exit 1; }
+          echo "bundled seed: $seed ($(stat -f%z "$seed") bytes)"
+          cat "$manifest"
+          # The watch floor is the assertion the whole index rests on: below it
+          # the engine answers [] without consulting coverage. 14693013 circulates
+          # as the RAILGUN deployment block and is wrong — it would invent 44,678
+          # blocks of emptiness. Fail the build rather than ship that.
+          grep -qx 'deploymentBlock=14737691' "$manifest" \
+            || { echo "::error::manifest does not pin deploymentBlock=14737691"; exit 1; }
+          grep -qx 'coveredLow=14737691' "$manifest" \
+            || { echo "::error::the seed's coverage does not reach the deployment block"; exit 1; }
+          echo "OK: seed covers the contract from its deployment block"
+
+          # …and it must not carry the other flavour's files.
+          stray=$(find "$mnt" -type f \( -name 'logindex-gnosis.db' -o -name 'bee-poc-seed.properties' \) | head -n1 || true)
+          [ -z "$stray" ] || { echo "::error::the railgun-poc dmg carries Bee PoC files ($stray)"; exit 1; }
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-railgun-poc-dmg-arm64-${{ github.sha }}
+          path: app-desktop/build/compose/binaries/main/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s and the release job never runs.
+          overwrite: true
+
+  # Refuse to publish when the pushed tag disagrees with the version in the tree,
+  # the same gate the standard dmgs pass through.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
+  # Attach the dmg to the GitHub Release for the pushed tag. The android-apk and
+  # desktop-dmg workflows publish to the SAME release; whichever runs first
+  # creates it and the others upload into it.
+  release:
+    name: Publish railgun dmg to release
+    needs: [build, version-guard]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the dmg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myotis-railgun-poc-dmg-arm64-${{ github.sha }}
+          path: dmg
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — gh must be told the repo explicitly or it
+          # dies with "fatal: not a git repository".
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          dmg="dmg/Myotis-railgun-poc-${version}-arm64.dmg"
+          test -f "$dmg" || { echo "::error::missing $dmg"; ls -la dmg; exit 1; }
+          # The release may not exist yet if this workflow wins the race with the
+          # other publishers; create it only then, and tolerate losing the race.
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --prerelease --notes "Pre-release build of the Myotis wallet apps." \
+            || gh release view "$tag" >/dev/null
+          gh release upload "$tag" "$dmg" --clobber
+          echo "uploaded $dmg to $tag"
