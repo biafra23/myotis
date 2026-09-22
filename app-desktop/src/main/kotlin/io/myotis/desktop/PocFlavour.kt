@@ -57,6 +57,11 @@ enum class SeedOutcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FA
  * @param seedSource where they came from, for the Index tab line
  * @param pauseBackfillByDefault whether a network with no stored preference starts with the
  *   downward walk stopped
+ * @param rpcPort the port a first start pins for [network], or null to keep that network's
+ *   default. A flavour whose network a REGULAR install also serves must pin one: otherwise
+ *   both apps want the same port, the second to start cannot bind it, and a client aimed at
+ *   that port silently reaches whichever won — for a PoC, an install with no seeded index,
+ *   which answers the demo's own queries with -32000.
  */
 open class PocFlavour(
     val prop: String,
@@ -72,6 +77,7 @@ open class PocFlavour(
     val seedSubject: String,
     val seedSource: String,
     val pauseBackfillByDefault: Boolean,
+    val rpcPort: Int? = null,
 ) {
     /** The seed's watch entry, as the Index tab and the engine both read it. */
     val watchJson: String =
@@ -164,8 +170,29 @@ open class PocFlavour(
             val installedHigh = installed.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
             val bundledHigh = bundled.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
             if (bundledHigh <= installedHigh) return SeedOutcome.KEPT_EXISTING
+            // A NEWER bundled seed is still not automatically better than what is on
+            // disk. The engine rewrites this same file as its own checkpoint, so once it
+            // has run, the live index has followed the head well past the manifest we
+            // wrote at install time — potentially past the new seed too. Overwriting then
+            // REPLACES a further-along index with a shorter frame, and every query in the
+            // difference turns from served into -32000 until the bridge re-walks it.
+            //
+            // The manifest cannot tell us where the live index reached (only the engine
+            // can read the file's coverage), so the conservative test is whether the
+            // engine has written to it at all since we seeded it. If it has, keep what is
+            // there and say so loudly; adopting the new seed is then a deliberate act.
+            if (engineHasWrittenSince(target, installedManifest)) {
+                log.warn(
+                    "{}: a newer bundled seed (to block {}) is available, but the engine has written to {} " +
+                        "since it was seeded — keeping the live index, which may already be further along. " +
+                        "To adopt the bundled seed instead, delete that file (and {}) and restart.",
+                    logTag, bundledHigh, target.fileName, installedManifest.fileName,
+                )
+                return SeedOutcome.KEPT_EXISTING
+            }
             log.info(
-                "{}: the bundled seed (to block {}) is newer than the installed one (to block {}) — re-seeding",
+                "{}: the bundled seed (to block {}) is newer than the installed one (to block {}) " +
+                    "and the engine has not written to it — re-seeding",
                 logTag, bundledHigh, installedHigh,
             )
         }
@@ -212,6 +239,7 @@ open class PocFlavour(
         if (!firstStart) return
         for (other in OTHER_NETWORKS) if (other != network) settings.setNetworkEnabled(other, false)
         settings.setNetworkEnabled(network, true)
+        rpcPort?.let { settings.setRpcPort(network, it) }
         settings.setLogIndexEnabled(network, true)
         settings.setLogIndexWatchJson(network, watchJson)
         // Explicit, so the Index tab's switch shows the state the flavour runs in
@@ -245,6 +273,16 @@ open class PocFlavour(
             "unverified until the walker re-fetches them (the live coverage below grows from there); " +
             "usable until about block $until, after which a rebuilt app re-seeds."
     }
+
+    /**
+     * Whether the engine has rewritten the index since this flavour installed it. Install
+     * writes the seed and THEN its manifest, so a freshly seeded pair always fails this
+     * test; any later checkpoint by the engine passes it. Unreadable timestamps answer
+     * "yes", which errs toward keeping what is on disk.
+     */
+    private fun engineHasWrittenSince(index: Path, installedManifest: Path): Boolean = runCatching {
+        Files.getLastModifiedTime(index) > Files.getLastModifiedTime(installedManifest)
+    }.getOrDefault(true)
 
     private val logTag: String get() = prop.substringAfterLast('.')
 

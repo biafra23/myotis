@@ -36,9 +36,9 @@ class RailgunPocTest {
     private fun stageBundle(dir: Path, seed: ByteArray, high: Long = 26_029_586): Path {
         val res = dir.resolve("resources-$high")
         Files.createDirectories(res)
-        Files.write(res.resolve(RailgunPoc.SEED_FILE), seed)
+        Files.write(res.resolve(RailgunPoc.seedFile), seed)
         Files.writeString(
-            res.resolve(RailgunPoc.MANIFEST_FILE),
+            res.resolve(RailgunPoc.manifestFile),
             """
             network=mainnet
             address=$RAILGUN_PROXY
@@ -58,11 +58,11 @@ class RailgunPocTest {
         // rest (rust/myotis-engine/src/host.rs, log_index_path). A suffixed name here would
         // stage, install and checksum fine, and then never be opened — a "slow first start"
         // that never ends.
-        assertEquals("logindex.db", RailgunPoc.SEED_FILE)
-        assertNotEquals(BeePoc.SEED_FILE, RailgunPoc.SEED_FILE)
+        assertEquals("logindex.db", RailgunPoc.seedFile)
+        assertNotEquals(BeePoc.seedFile, RailgunPoc.seedFile)
         // The two flavours must also not share the data-dir manifest name, or one would
         // read the other's installed version when both have been run on a machine.
-        assertNotEquals(BeePoc.INSTALLED_MANIFEST_FILE, RailgunPoc.INSTALLED_MANIFEST_FILE)
+        assertNotEquals(BeePoc.installedManifestFile, RailgunPoc.installedManifestFile)
         assertNotEquals(BeePoc.dataDirName, RailgunPoc.dataDirName)
     }
 
@@ -89,6 +89,10 @@ class RailgunPocTest {
         assertTrue(settings.logIndexEnabled("mainnet"))
         assertEquals(RailgunPoc.watchJson, settings.logIndexWatchJson("mainnet"))
         assertTrue(settings.logIndexBackfillPaused("mainnet"), "decided, not left at a default")
+        // NOT mainnet's default 8545: a regular install serves that port, and a wallet
+        // aimed at it could silently reach an install with no seeded index.
+        assertEquals(RAILGUN_RPC_PORT, settings.rpcPortFor("mainnet"))
+        assertNotEquals(8545, settings.rpcPortFor("mainnet"))
 
         // A later start must never re-apply: that would push logIndex=false style resets
         // over whatever the user changed, and turning a seeded index off makes every query
@@ -105,15 +109,44 @@ class RailgunPocTest {
         val data = dir.resolve("data")
 
         assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(res, data))
-        assertTrue(Files.exists(data.resolve(RailgunPoc.SEED_FILE)))
-        assertTrue(Files.exists(data.resolve(RailgunPoc.INSTALLED_MANIFEST_FILE)))
+        assertTrue(Files.exists(data.resolve(RailgunPoc.seedFile)))
+        assertTrue(Files.exists(data.resolve(RailgunPoc.installedManifestFile)))
         // ...and not under the Bee flavour's, which would leave both dead.
-        assertFalse(Files.exists(data.resolve(BeePoc.SEED_FILE)))
+        assertFalse(Files.exists(data.resolve(BeePoc.seedFile)))
 
         val notice = RailgunPoc.seededIndexNotice(data, "mainnet")
         assertTrue(notice != null && notice.contains("426563"), "the notice states the seed size: $notice")
         assertTrue(notice!!.contains("unverified"), "the notice must not present RPC data as verified")
         assertNull(RailgunPoc.seededIndexNotice(data, "gnosis"), "other networks get no notice")
+    }
+
+    @Test
+    fun `a newer seed never overwrites an index the engine has written to`(@TempDir dir: Path) {
+        val data = dir.resolve("data")
+        val v1 = stageBundle(dir, "MLIX-v1".toByteArray(), high = 26_000_000)
+        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v1, data))
+
+        // The engine rewrites this same file as its own checkpoint, so after a run it has
+        // followed the head past the install-time manifest — possibly past a newer seed
+        // too. Overwriting would turn served queries into -32000 until the bridge
+        // re-walked the difference, so a touched index wins over a newer bundle.
+        val index = data.resolve(RailgunPoc.seedFile)
+        Files.setLastModifiedTime(
+            index,
+            java.nio.file.attribute.FileTime.fromMillis(
+                Files.getLastModifiedTime(data.resolve(RailgunPoc.installedManifestFile)).toMillis() + 5_000,
+            ),
+        )
+        val v2 = stageBundle(dir, "MLIX-v2".toByteArray(), high = 26_500_000)
+        assertEquals(SeedOutcome.KEPT_EXISTING, RailgunPoc.installSeedIfAbsent(v2, data))
+        assertEquals("MLIX-v1", Files.readString(index), "the live index must survive")
+
+        // An UNTOUCHED index is still re-seeded: that is the expired-seed path, where the
+        // app was installed, never run, and rebuilt with a fresher fetch.
+        val data2 = dir.resolve("data2")
+        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v1, data2))
+        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v2, data2))
+        assertEquals("MLIX-v2", Files.readString(data2.resolve(RailgunPoc.seedFile)))
     }
 
     @Test

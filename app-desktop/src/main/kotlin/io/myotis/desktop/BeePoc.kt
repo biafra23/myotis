@@ -45,29 +45,11 @@ object BeePoc : PocFlavour(
     // See PocFlavour.backfillPausedDefault for the measurements.
     pauseBackfillByDefault = true,
 ) {
-    /** The system property the packaged app sets. Named here because the build names it. */
+    /**
+     * The system property the packaged app sets. Duplicated from the constructor argument
+     * ONLY because tests and callers name it as a constant; everything else about this
+     * flavour is read from the [PocFlavour] properties, so there is nothing else here to
+     * drift out of sync with the configuration above.
+     */
     const val PROP = "myotis.beePoc"
-    const val NETWORK = "gnosis"
-
-    /**
-     * The seed as staged into appResources (`common/`), and the manifest beside it. The
-     * seed's name is the engine's own drop-in name for this network —
-     * `dataDir/logindex-<network>.db`, derived in `rust/myotis-engine/src/host.rs`
-     * (`log_index_path`) from the sync-snapshot path the desktop host passes, and
-     * activated at engine start by `activate_log_index_from_disk`. A rename on the
-     * engine side must be mirrored here or the seed is silently never opened.
-     */
-    const val SEED_FILE = "logindex-gnosis.db"
-    const val MANIFEST_FILE = "bee-poc-seed.properties"
-
-    /** The manifest's copy in the data dir — how the UI knows the index was seeded. */
-    const val INSTALLED_MANIFEST_FILE = "logindex-gnosis.seed.properties"
-
-    /**
-     * The seed's watch entry: the PostageStamp contract at its REAL deployment block —
-     * `from_block` is the engine's "no logs below here" assertion, so it must never be the
-     * seed's fetched low edge (docs/bee-rpc-service.md explains the difference).
-     */
-    const val POSTAGE_STAMP = "0x45a1502382541Cd610CC9068e88727426b696293"
-    const val POSTAGE_STAMP_DEPLOYED = 31_305_656L
 }

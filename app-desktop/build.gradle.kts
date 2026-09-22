@@ -311,6 +311,10 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // flavours stage their seed there, into their own flavour-specific root.
 val pocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
 
+// The PostageStamp contract at its REAL deployment block — never the seed's
+// fetched low edge (from_block is the engine's "no logs below here" assertion).
+val beePocWatch = "0x45a1502382541Cd610CC9068e88727426b696293:31305656"
+
 val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     group = "build"
     description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it, with the warm peer caches, into Compose appResources (-PbeePoc only)"
@@ -327,6 +331,10 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     val peerCaches = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
     val cacheSources = peerCaches.map { rootProject.file("data/bee/gnosis/$it") }
     inputs.files(meta, logs, script, cacheSources)
+    // Same reason as the RAILGUN task: the watch assertion is not a file and the
+    // build script is not a task input, so without this a corrected deployment block
+    // would leave the task UP-TO-DATE and ship the previous frame.
+    inputs.property("watch", beePocWatch)
     outputs.files(seed, manifest, peerCaches.map { n -> pocSeedDir.map { it.file(n) } })
     doLast {
         pocSeedDir.get().asFile.mkdirs()
@@ -340,7 +348,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
             "--logs", logs.absolutePath,
             // The REAL deployment block: from_block is the engine's "no logs
             // below here" assertion, never the seed's fetched low edge.
-            "--watch", "0x45a1502382541Cd610CC9068e88727426b696293:31305656",
+            "--watch", beePocWatch,
             "--out", seed.get().asFile.absolutePath,
             // The script describes what it wrote (coverage, usable-until block,
             // sha256) — the manifest BeePoc.kt checks before installing.
@@ -375,6 +383,12 @@ val railgunSeedDir: File = providers.gradleProperty("railgunSeedDir")
     .map { file(it) }
     .getOrElse(File(System.getProperty("user.home"), "myotis-node/railgun"))
 
+// The REAL deployment block, and the chain agrees: the proxy's first log is at
+// exactly 14737691 and a sweep from genesis found none below it. `from_block` is
+// the engine's "no logs below here" assertion, so a lower value here turns real
+// history into plausible empty answers (docs/railgun-poc.md spells this out).
+val railgunWatch = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691"
+
 val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
     group = "build"
     description = "Synthesize the RAILGUN PoC mainnet log-index seed from -PrailgunSeedDir and stage it into Compose appResources (-PrailgunPoc only)"
@@ -388,7 +402,27 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
     // validation with "an input file was expected to be present", which buries the
     // instruction the developer actually needs. Absent here means no inputs, and the
     // doLast check below is the fail-loud gate that names the fix.
-    inputs.files(provider { if (seedDir.isDirectory) fileTree(seedDir) else files() })
+    //
+    // NARROWED to the fetch's own files on purpose: the docs tell developers to run
+    // the framing script by hand in this directory to inspect the result, which drops
+    // a ~243 MB logindex.db and a manifest beside the ~549 MB jsonl. Fingerprinting
+    // the whole tree would re-hash ~800 MB on every up-to-date check and mark the
+    // task dirty after each manual inspection.
+    inputs.files(
+        provider {
+            if (seedDir.isDirectory) {
+                fileTree(seedDir) { include("*.meta.json", "railgun-logs.jsonl", "railgun-logs.jsonl.gz") }
+            } else {
+                files()
+            }
+        },
+    )
+    // The frame's OWN assertions, declared so a change to either re-runs the task.
+    // Neither is a file, and the build script is not a task input, so without these a
+    // corrected deployment block would leave the dmg shipping the previous frame —
+    // whose from_block makes the engine answer [] below the floor without consulting
+    // coverage. That is the one defect class this file keeps warning about.
+    inputs.property("watch", railgunWatch)
     outputs.files(seed, manifest)
     doLast {
         check(seedDir.isDirectory) {
@@ -409,18 +443,26 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
             ?: seedDir.resolve("railgun-logs.jsonl.gz").takeIf { it.isFile }
             ?: throw GradleException("railgun-poc: no railgun-logs.jsonl(.gz) beside $meta")
         pocSeedDir.get().asFile.mkdirs()
+        // Trimming the top is only safe to skip when the fetch ran to a block that
+        // CANNOT reorg. The meta records which tag it used; a fetch to `latest` with
+        // margin 0 would freeze a since-reorged block into the seed and the engine
+        // would serve it as fully covered — a silent wrong answer, the exact case the
+        // coverage rules exist to prevent. So the margin follows the meta rather than
+        // a convention the developer was asked to remember.
+        val toBlockTag = groovy.json.JsonSlurper().parse(meta) .let { (it as Map<*, *>)["toBlockTag"] }?.toString()
+        val margin = if (toBlockTag == "finalized") "0" else null
+        if (margin == null) {
+            logger.lifecycle(
+                "railgun-poc: ${meta.name} does not declare toBlockTag=finalized (got ${toBlockTag ?: "nothing"}) — " +
+                    "keeping the default reorg margin, so the seed's top is trimmed",
+            )
+        }
         val cmd = listOf(
             "python3", script.absolutePath,
             "--meta", meta.absolutePath,
             "--logs", logs.absolutePath,
-            // The REAL deployment block, and the chain agrees: the proxy's first
-            // log is at exactly 14737691 and a sweep from genesis found none below.
-            // from_block is the engine's "no logs below here" assertion, so a lower
-            // value here turns real history into plausible empty answers.
-            "--watch", "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691",
-            // The fetch runs to the node's `finalized` block, which cannot reorg,
-            // so nothing needs to be trimmed off the top.
-            "--finality-margin", "0",
+            "--watch", railgunWatch,
+        ) + (margin?.let { listOf("--finality-margin", it) } ?: emptyList()) + listOf(
             "--out", seed.get().asFile.absolutePath,
             "--manifest", manifest.get().asFile.absolutePath,
         )

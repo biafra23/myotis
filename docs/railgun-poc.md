@@ -8,7 +8,7 @@ machinery — see `PocFlavour.kt`, with `BeePoc.kt` and `RailgunPoc.kt` as the t
 configurations of it.
 
 ```bash
-./gradlew :app-desktop:packageDmg -PrailgunPoc -PrailgunSeedDir=~/myotis-node/railgun
+./gradlew :app-desktop:packageDmg -PrailgunPoc -PrailgunSeedDir="$HOME/myotis-node/railgun"
 ```
 
 **DEBUG / DEMO artefact, not a production path.** The bundled index is a full
@@ -70,27 +70,37 @@ logs; this one is 426k logs and 549 MB raw, which does not belong in a clone.
 Fetch it once, onto a host with a synced mainnet node, and point the build at it.
 
 ```bash
-# 1. fetch the logs from a local mainnet node, one JSON object per line
-#    exactly as returned (~36 min against geth on zbox)
-python3 fetch_logs.py <finalized-block>      # see ~/myotis-node/railgun
+SEED=$HOME/myotis-node/railgun && mkdir -p "$SEED"
 
-# 2. write the sidecar the framing script checks the JSONL against
-python3 write_meta.py 14737691 <finalized-block>
+# 1. fetch the logs, one JSON object per line exactly as returned.
+#    ~36 min against a local geth; resumable if it is interrupted.
+./scripts/fetch_contract_logs.py \
+    --rpc http://127.0.0.1:8545 \
+    --address 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9 \
+    --from-block 14737691 --to-block finalized \
+    --out "$SEED/railgun-logs.jsonl"
 
-# 3. the build frames it; or do it by hand to inspect the result first
-scripts/synth_logindex.py \
-    --meta   railgun-logs-14737691-<to>.meta.json \
-    --logs   railgun-logs.jsonl \
-    --watch  0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691 \
-    --finality-margin 0 \
-    --out    logindex.db \
-    --manifest railgun-poc-seed.properties
+# 2. write the sidecar the framing script checks the JSONL against.
+#    The command printed by step 1 has the resolved block filled in.
+./scripts/write_logs_meta.py \
+    --rpc http://127.0.0.1:8545 \
+    --address 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9 \
+    --from-block 14737691 --to-block <resolved> --to-block-tag finalized \
+    --logs "$SEED/railgun-logs.jsonl"
+
+# 3. the build frames it. Do this by hand only to inspect the result — and
+#    then delete logindex.db from the seed dir, since the build expects to
+#    find the fetch there, not its own output.
+./gradlew :app-desktop:prepareRailgunPocSeed -PrailgunPoc -PrailgunSeedDir="$SEED"
 ```
 
-Fetch to `finalized` and pass `--finality-margin 0`: a finalized range cannot
-reorg, so nothing needs trimming off the top. Fetching to `latest` instead means
-keeping the default margin, because a block that was reorged out afterwards would
-otherwise be frozen into the seed.
+**Fetch to `finalized`.** A finalized range cannot reorg, so the seed needs no
+margin trimmed off its top, and `write_logs_meta.py` records that as
+`toBlockTag`. The build reads that field and passes `--finality-margin 0` only
+when it says `finalized`; any other fetch keeps the default 128-block margin.
+This is deliberately not a convention the developer has to remember: a fetch to
+`latest` framed with no margin would freeze a since-orphaned block into the seed,
+and the engine would then serve it as fully covered — a silent wrong answer.
 
 `prepareRailgunPocSeed` expects exactly one `*.meta.json` in the seed directory
 and refuses to guess when it finds several, since the range is part of the name
@@ -110,12 +120,37 @@ usable until; rebuild the app with a fresh fetch after that.
   `io.myotis.desktop.railgunpoc`, app name *Myotis RAILGUN PoC*.
 - Installs the bundled seed into that dir before the engine starts, checking it
   against the manifest's sha256 first, and never over an index it did not install
-  itself. A newer bundled seed re-seeds; an equal or older one is left alone.
-- First start only: enables mainnet, disables gnosis, switches the log index on
-  and stores the seed's watch entry, so `http://127.0.0.1:8545` serves the
-  wallet's `eth_getLogs` pages as soon as the beacon sync reaches `SYNCED`. Later
-  starts never touch settings.
+  itself. A newer bundled seed re-seeds an untouched one; if the engine has
+  written to the index since it was seeded, the live index is kept instead and a
+  warning says so — see *Re-seeding* below.
+- First start only: enables mainnet, disables gnosis, switches the log index on,
+  stores the seed's watch entry, and **pins the RPC port to 8555**. Point the
+  wallet at `http://127.0.0.1:8555`; it serves as soon as the beacon sync reaches
+  `SYNCED`. Later starts never touch settings.
 - The Index tab states what the seed covers and that it is unverified.
+
+### Why 8555 and not 8545
+
+A regular Myotis install serves mainnet on 8545. Two installed apps would compete
+for it, only one would bind, and a wallet aimed at 8545 could silently reach the
+regular install — which has no seeded index and answers this demo's own queries
+with `-32000`, looking exactly like a broken configuration. The Bee flavour never
+had this problem because no regular install serves gnosis on 8546 by default.
+
+### Re-seeding
+
+The engine rewrites the seed file as its own checkpoint, so after the app has run
+the live index has followed the head past whatever the install-time manifest
+records. A newer bundled seed can therefore be *behind* what is on disk, and
+copying over it would turn served queries into refusals until the bridge re-walks
+the difference.
+
+The install cannot read the live index's coverage — only the engine can — so it
+uses the conservative test: if the index file has been modified since the
+manifest beside it was written, the engine has used it, and the bundled seed is
+ignored with a warning naming both files. To adopt a fresh seed deliberately,
+delete `logindex.db` and `logindex.seed.properties` from `~/.myotis-railgun-poc`
+and restart.
 
 Unlike the Bee flavour it ships **no warm peer caches** — none have been captured
 for mainnet — so discovery seeds from the embedded bootnodes. That costs a slower

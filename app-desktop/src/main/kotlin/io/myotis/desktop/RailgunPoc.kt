@@ -9,7 +9,7 @@ package io.myotis.desktop
  * rebuild its private balances, which over devp2p is a multi-day walk; the mainnet
  * log-index seed is bundled in the app bundle instead, installed into the flavour's own
  * data dir on first start, and the first start enables mainnet with the log index on, so
- * `http://127.0.0.1:8545` serves the wallet's `eth_getLogs` pages as soon as the beacon
+ * `http://127.0.0.1:8555` serves the wallet's `eth_getLogs` pages as soon as the beacon
  * sync is `SYNCED`.
  *
  * The contract is the **RailgunSmartWallet proxy**, which the CLI reaches through
@@ -57,15 +57,22 @@ object RailgunPoc : PocFlavour(
     // shows a decided state rather than an unset default, and so a later re-seed that
     // starts higher cannot quietly start a walk on a demo machine.
     pauseBackfillByDefault = true,
+    // NOT mainnet's default 8545: a regular Myotis install serves mainnet on that port, so
+    // two installed apps would fight for it and a wallet aimed at 8545 could silently reach
+    // the regular one — which has no seeded index, and answers this demo's own queries with
+    // -32000. The Bee flavour never hit this because gnosis/8546 is a port no regular
+    // install uses by default.
+    rpcPort = RAILGUN_RPC_PORT,
 ) {
-    /** The system property the packaged app sets. Named here because the build names it. */
+    /**
+     * The system property the packaged app sets. Duplicated from the constructor argument
+     * ONLY because tests and callers name it as a constant — see [BeePoc.PROP].
+     */
     const val PROP = "myotis.railgunPoc"
-    const val NETWORK = "mainnet"
-
-    const val SEED_FILE = "logindex.db"
-    const val MANIFEST_FILE = "railgun-poc-seed.properties"
-    const val INSTALLED_MANIFEST_FILE = "logindex.seed.properties"
 }
+
+/** The port this flavour serves on — see the `rpcPort` argument for why it is not 8545. */
+const val RAILGUN_RPC_PORT = 8555
 
 /**
  * The RailgunSmartWallet proxy on Ethereum mainnet, from
