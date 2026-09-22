@@ -2,10 +2,16 @@ name: RAILGUN PoC DMG (macOS arm64)
 
 # The RAILGUN PoC flavour's installer (docs/railgun-poc.md). Separate from
 # desktop-dmg.yml because this flavour's seed is NOT in the repo: 426k logs over
-# 11.3M mainnet blocks, ~549 MB raw, which does not belong in a clone. The runner
-# fetches it from a location configured on the repository instead, and the job is
-# skipped — loudly — when that is not set up, so an unconfigured repo does not
-# turn every merge red.
+# 11.3M mainnet blocks, ~549 MB raw (117 MB gzipped), which is over GitHub's
+# per-file limit for the tree and does not belong in a clone anyway. It lives as
+# an asset on the `railgun-seed` release instead — a release for DATA, separate
+# from the app releases, because an app release cannot be built until the seed
+# exists — and the runner fetches it from there. The dmg then BUNDLES it: the
+# installed app never touches the network for its index.
+#
+# Nothing needs configuring. The two repository variables below are optional
+# overrides for pointing a build at a different seed (a refresh under test, a
+# fork's own asset); the defaults are the release asset and its sidecar.
 #
 # arm64 only. The Bee flavour ships arm64 alone for the same reason (the x64
 # Rosetta leg is a release artifact for the standard app), and this one has no
@@ -26,48 +32,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Whether a seed is reachable decides whether the build can run at all, and the
-  # answer must never be silent. On a tag it is an ERROR: a release that quietly
-  # omits this artifact is worse than a failed release, because nobody notices
-  # until someone goes looking for the download. Anywhere else it is a warning and
-  # the build is skipped.
+  # Fail fast, with the cause named, when the seed asset is not where the build
+  # expects it — BEFORE spending a macOS runner on a checkout and a Rust build
+  # that will die in the fetch step anyway. A missing asset is an error on every
+  # trigger: the seed is the whole point of this artifact, and a build that went
+  # green without it would be worse than a red one.
   seed:
-    name: Check the seed source
+    name: Check the seed asset
     runs-on: ubuntu-latest
-    outputs:
-      available: ${{ steps.check.outputs.available }}
+    env:
+      SEED_URL: ${{ vars.RAILGUN_SEED_URL || format('https://github.com/{0}/releases/download/railgun-seed/railgun-seed.tar.gz', github.repository) }}
     steps:
-      - id: check
-        env:
-          SEED_URL: ${{ vars.RAILGUN_SEED_URL }}
-        run: |
+      - run: |
           set -eu
-          if [ -n "${SEED_URL:-}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "seed source configured"
-            exit 0
-          fi
-          echo "available=false" >> "$GITHUB_OUTPUT"
-          msg="the RAILGUN_SEED_URL repository variable is not set, so the RAILGUN PoC dmg cannot be built. \
-          It must point at a .tar.gz of the fetch directory (railgun-logs.jsonl[.gz] plus its *.meta.json) — \
-          see docs/railgun-poc.md, Building the seed."
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            echo "::error::$msg"
+          echo "seed: $SEED_URL"
+          # HEAD follows the redirect GitHub answers asset downloads with; a 404
+          # here is the asset missing, not a network blip.
+          code=$(curl --silent --head --location --output /dev/null --write-out '%{http_code}' --retry 3 "$SEED_URL" || echo 000)
+          [ "$code" = "200" ] || {
+            echo "::error::the seed asset is not reachable (HTTP $code): $SEED_URL — publish it to the railgun-seed release, or set RAILGUN_SEED_URL (docs/railgun-poc.md, CI)"
             exit 1
-          fi
-          echo "::warning::$msg Skipping this build."
+          }
+          echo "seed asset reachable"
 
   build:
     name: Build macOS .dmg (arm64, railgun-poc)
     needs: seed
-    if: needs.seed.outputs.available == 'true'
     runs-on: macos-14
     permissions:
       contents: read
     env:
-      SEED_URL: ${{ vars.RAILGUN_SEED_URL }}
-      # Optional but strongly recommended: the seed is the whole point of this
-      # artifact and it arrives over the network from outside the repo.
+      SEED_URL: ${{ vars.RAILGUN_SEED_URL || format('https://github.com/{0}/releases/download/railgun-seed/railgun-seed.tar.gz', github.repository) }}
+      # The checksum comes from a sidecar published BESIDE the archive, so a
+      # refreshed seed needs no change here. Travelling from the same place, it
+      # proves the download arrived intact rather than who published it;
+      # authenticity rests on GitHub's TLS and on release assets being writable
+      # only with write access to the repository. The bundled manifest the app
+      # checks at install is sealed into the dmg at build time and is the
+      # stronger check. An explicit RAILGUN_SEED_SHA256 overrides the sidecar.
+      SEED_SHA256_URL: ${{ format('{0}.sha256', vars.RAILGUN_SEED_URL || format('https://github.com/{0}/releases/download/railgun-seed/railgun-seed.tar.gz', github.repository)) }}
       SEED_SHA256: ${{ vars.RAILGUN_SEED_SHA256 }}
       # The extraction ROOT. The fetch's own directory inside it is located by
       # the fetch step and exported as SEED_DIR — deliberately a DIFFERENT name,
@@ -111,15 +114,16 @@ jobs:
           archive="$RUNNER_TEMP/railgun-seed.tar.gz"
           curl --fail --location --show-error --silent --retry 3 --retry-delay 5 \
             --output "$archive" "$SEED_URL"
-          if [ -n "${SEED_SHA256:-}" ]; then
-            echo "${SEED_SHA256}  ${archive}" | shasum -a 256 -c - \
-              || { echo "::error::the downloaded seed does not match RAILGUN_SEED_SHA256"; exit 1; }
-            echo "seed checksum OK"
-          else
-            echo "::warning::RAILGUN_SEED_SHA256 is not set — the seed download is unverified. \
-            Set it to the sha256 of the archive."
-            shasum -a 256 "$archive"
+          # The checksum is REQUIRED, from the override or the sidecar: a truncated
+          # download would otherwise frame "successfully" with fewer logs than it
+          # should have, which no later step can tell from a genuinely short range.
+          if [ -z "${SEED_SHA256:-}" ]; then
+            SEED_SHA256=$(curl --fail --location --show-error --silent --retry 3 --retry-delay 5 "$SEED_SHA256_URL" | awk '{print $1}')
+            [ -n "$SEED_SHA256" ] || { echo "::error::no checksum: the sidecar $SEED_SHA256_URL is missing or empty and RAILGUN_SEED_SHA256 is not set"; exit 1; }
           fi
+          echo "${SEED_SHA256}  ${archive}" | shasum -a 256 -c - \
+            || { echo "::error::the downloaded seed does not match its checksum ${SEED_SHA256}"; exit 1; }
+          echo "seed checksum OK"
           # Extract VERBATIM and then locate the fetch inside, rather than
           # guessing the archive's shape with --strip-components: that flag does
           # not fail on a flat archive, it silently extracts nothing, and the

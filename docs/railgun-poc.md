@@ -183,32 +183,62 @@ first minute, not correctness.
 
 `.github/workflows/railgun-dmg.yml` builds the arm64 installer on every push to
 `main`, on `v*` tags, and on manual dispatch. It is separate from
-`desktop-dmg.yml` because this flavour's seed is not in the repo, so the runner
-has to fetch it.
+`desktop-dmg.yml` because this flavour's seed is not in the tree: gzipped it is
+117 MB, over GitHub's 100 MB per-file limit, and nothing that size belongs in a
+clone anyway.
 
-**Two repository variables configure it** (Settings → Secrets and variables →
-Actions → Variables):
+**The seed lives on the `railgun-seed` release** as two assets, and the build
+fetches them from there. Nothing needs configuring.
+
+| asset | |
+|---|---|
+| `railgun-seed.tar.gz` | the fetch: `railgun-logs.jsonl` and its `*.meta.json` |
+| `railgun-seed.tar.gz.sha256` | its checksum, which the build requires and checks before framing |
+
+It is a release for data, deliberately separate from the app releases: an app
+release cannot be built until the seed exists. Its tag triggers no workflow
+(they all key on `v*`).
+
+The workflow **bundles** the framed index into the dmg. The installed app never
+touches the network for its index and works offline from the first start; the
+dmg is roughly 100 MB larger than the standard one for it.
+
+### Refreshing the seed
+
+The seed's shelf life is ~69 mainnet days (500,000 blocks, `MAX_GAP`). To
+refresh it, run the fetch again (*Building the seed* above), then replace both
+assets and rebuild:
+
+```bash
+cd "$HOME/myotis-node/railgun" && tar -czf railgun-seed.tar.gz railgun-logs.jsonl railgun-logs-*.meta.json
+sha256sum railgun-seed.tar.gz > railgun-seed.tar.gz.sha256
+gh release upload railgun-seed railgun-seed.tar.gz railgun-seed.tar.gz.sha256 --clobber
+gh workflow run railgun-dmg.yml
+```
+
+The archive may hold the files flat or under a directory; the build locates the
+`*.meta.json` inside it either way, and refuses an archive holding more than one.
+
+### Overrides
+
+Two repository variables redirect a build at a different seed, for a refresh
+under test or a fork's own asset. Both are optional.
 
 | variable | |
 |---|---|
-| `RAILGUN_SEED_URL` | a `.tar.gz` of the fetch directory — the `railgun-logs.jsonl[.gz]` and its `*.meta.json` |
-| `RAILGUN_SEED_SHA256` | the archive's sha256. Optional, and warned about when missing: the seed arrives from outside the repo and a truncated download frames "successfully" with fewer logs than it should have |
+| `RAILGUN_SEED_URL` | another `.tar.gz` of a fetch directory |
+| `RAILGUN_SEED_SHA256` | its sha256, in place of the `.sha256` sidecar the build otherwise fetches from beside the archive |
 
-Make the archive from the fetch directory:
+### What the checksums establish
 
-```bash
-cd "$HOME/myotis-node" && tar -czf railgun-seed.tar.gz \
-    railgun/railgun-logs.jsonl railgun/railgun-logs-*.meta.json
-shasum -a 256 railgun-seed.tar.gz
-```
-
-Host it anywhere the runner can reach with a plain `curl` — a GitHub release
-asset works, and keeps it beside the builds that consume it.
-
-**When the variable is unset**, the build is skipped with a warning on `main`
-and on a dispatch, so an unconfigured repo does not turn every merge red — and
-**fails on a tag**, because a release that quietly omits this artifact is worse
-than one that fails: nobody notices until they go looking for the download.
+The sidecar travels from the same place as the archive, so in CI it proves the
+download arrived intact — a truncated archive would otherwise frame
+"successfully" with fewer logs than it should have, which no later step can tell
+from a genuinely short range. It does not prove who published it; that rests on
+GitHub's TLS and on release assets being writable only with write access to the
+repository. The stronger check is the manifest inside the dmg: written at build
+time with the framed index's own hash and sealed into the bundle, it is what the
+app verifies before installing the index.
 
 ### Artifact names
 
