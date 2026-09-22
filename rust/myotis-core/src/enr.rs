@@ -7,7 +7,9 @@
 //! bytes-valued pairs are kept, list-valued pairs (`eth`, `attnets`, …) are
 //! skipped in the generic map and re-parsed on demand.
 
-use std::collections::BTreeMap;
+use alloc::format;
+use alloc::{string::String, vec::Vec};
+use alloc::collections::BTreeMap;
 
 use crate::nodekey::decompress_public_key;
 use crate::rlp::{self, Item};

@@ -5,6 +5,7 @@
 //! be verified against a trusted header without trusting the peer
 //! (docs/reimplementation/03 §2, README §11.11).
 
+use alloc::{vec::Vec};
 use crate::keccak::keccak256;
 use crate::rlp;
 use crate::trie::{hex_prefix_encode, to_nibbles, EMPTY_TRIE_ROOT};
@@ -108,7 +109,7 @@ mod tests {
     fn single_item_root_is_hash_of_leaf() {
         // One item: trie is a single leaf [HP(nibbles(0x80), leaf), value].
         let value = b"first".to_vec();
-        let root = ordered_trie_root(std::slice::from_ref(&value));
+        let root = ordered_trie_root(core::slice::from_ref(&value));
         let key = rlp::encode_bytes(&[]); // RLP(0) = 0x80
         let leaf = {
             let mut payload = rlp::encode_bytes(&hex_prefix_encode(&to_nibbles(&key), true));
