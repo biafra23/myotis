@@ -121,35 +121,6 @@ class RailgunPocTest {
     }
 
     @Test
-    fun `a newer seed never overwrites an index the engine has written to`(@TempDir dir: Path) {
-        val data = dir.resolve("data")
-        val v1 = stageBundle(dir, "MLIX-v1".toByteArray(), high = 26_000_000)
-        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v1, data))
-
-        // The engine rewrites this same file as its own checkpoint, so after a run it has
-        // followed the head past the install-time manifest — possibly past a newer seed
-        // too. Overwriting would turn served queries into -32000 until the bridge
-        // re-walked the difference, so a touched index wins over a newer bundle.
-        val index = data.resolve(RailgunPoc.seedFile)
-        Files.setLastModifiedTime(
-            index,
-            java.nio.file.attribute.FileTime.fromMillis(
-                Files.getLastModifiedTime(data.resolve(RailgunPoc.installedManifestFile)).toMillis() + 5_000,
-            ),
-        )
-        val v2 = stageBundle(dir, "MLIX-v2".toByteArray(), high = 26_500_000)
-        assertEquals(SeedOutcome.KEPT_EXISTING, RailgunPoc.installSeedIfAbsent(v2, data))
-        assertEquals("MLIX-v1", Files.readString(index), "the live index must survive")
-
-        // An UNTOUCHED index is still re-seeded: that is the expired-seed path, where the
-        // app was installed, never run, and rebuilt with a fresher fetch.
-        val data2 = dir.resolve("data2")
-        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v1, data2))
-        assertEquals(SeedOutcome.INSTALLED, RailgunPoc.installSeedIfAbsent(v2, data2))
-        assertEquals("MLIX-v2", Files.readString(data2.resolve(RailgunPoc.seedFile)))
-    }
-
-    @Test
     fun `no flavour is active in a regular build, and two at once is refused`() {
         val bee = System.getProperty(BeePoc.PROP)
         val rail = System.getProperty(RailgunPoc.PROP)

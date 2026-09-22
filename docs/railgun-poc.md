@@ -88,11 +88,24 @@ SEED=$HOME/myotis-node/railgun && mkdir -p "$SEED"
     --from-block 14737691 --to-block <resolved> --to-block-tag finalized \
     --logs "$SEED/railgun-logs.jsonl"
 
-# 3. the build frames it. Do this by hand only to inspect the result — and
-#    then delete logindex.db from the seed dir, since the build expects to
-#    find the fetch there, not its own output.
+# 3. the build frames it into build/railgunPocAppResources/common/
 ./gradlew :app-desktop:prepareRailgunPocSeed -PrailgunPoc -PrailgunSeedDir="$SEED"
+
+# ...or frame it by hand first, to inspect what it claims before packaging
+./scripts/synth_logindex.py \
+    --meta "$SEED"/railgun-logs-14737691-<resolved>.meta.json \
+    --logs "$SEED/railgun-logs.jsonl" \
+    --watch 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691 \
+    --finality-margin 0 \
+    --out /tmp/railgun-seed.db
+./scripts/synth_logindex.py --check /tmp/railgun-seed.db
 ```
+
+Step 1 is resumable: rerun it after an interruption and it continues from the
+last completed page. Pass the **resolved** high block rather than `finalized`
+when you do, since that tag has moved on in the meantime — the script refuses a
+range that does not match the partial fetch rather than silently restarting it,
+and names the arguments that resume it.
 
 **Fetch to `finalized`.** A finalized range cannot reorg, so the seed needs no
 margin trimmed off its top, and `write_logs_meta.py` records that as
@@ -101,6 +114,12 @@ when it says `finalized`; any other fetch keeps the default 128-block margin.
 This is deliberately not a convention the developer has to remember: a fetch to
 `latest` framed with no margin would freeze a since-orphaned block into the seed,
 and the engine would then serve it as fully covered — a silent wrong answer.
+
+The claim is checked, not taken on trust: `write_logs_meta.py` compares the
+fetch's high block against the node's current `finalized` height and refuses to
+record the tag when the range can still reorg. That is stronger than believing
+the tag, since a fetch that ran to `latest` yesterday is final today and
+legitimately qualifies.
 
 `prepareRailgunPocSeed` expects exactly one `*.meta.json` in the seed directory
 and refuses to guess when it finds several, since the range is part of the name
@@ -120,9 +139,8 @@ usable until; rebuild the app with a fresh fetch after that.
   `io.myotis.desktop.railgunpoc`, app name *Myotis RAILGUN PoC*.
 - Installs the bundled seed into that dir before the engine starts, checking it
   against the manifest's sha256 first, and never over an index it did not install
-  itself. A newer bundled seed re-seeds an untouched one; if the engine has
-  written to the index since it was seeded, the live index is kept instead and a
-  warning says so — see *Re-seeding* below.
+  itself. A newer bundled seed re-seeds; an equal or older one is left alone —
+  see *Re-seeding* below for a caveat.
 - First start only: enables mainnet, disables gnosis, switches the log index on,
   stores the seed's watch entry, and **pins the RPC port to 8555**. Point the
   wallet at `http://127.0.0.1:8555`; it serves as soon as the beacon sync reaches
@@ -137,20 +155,25 @@ regular install — which has no seeded index and answers this demo's own querie
 with `-32000`, looking exactly like a broken configuration. The Bee flavour never
 had this problem because no regular install serves gnosis on 8546 by default.
 
-### Re-seeding
+### Re-seeding, and a caveat worth knowing
 
-The engine rewrites the seed file as its own checkpoint, so after the app has run
-the live index has followed the head past whatever the install-time manifest
-records. A newer bundled seed can therefore be *behind* what is on disk, and
-copying over it would turn served queries into refusals until the bridge re-walks
-the difference.
+A rebuilt app whose seed reaches further than the installed manifest records
+replaces the index in the data dir. That is what makes an expired seed
+recoverable: install the newer build and the demo works again.
 
-The install cannot read the live index's coverage — only the engine can — so it
-uses the conservative test: if the index file has been modified since the
-manifest beside it was written, the engine has used it, and the bundled seed is
-ignored with a warning naming both files. To adopt a fresh seed deliberately,
-delete `logindex.db` and `logindex.seed.properties` from `~/.myotis-railgun-poc`
-and restart.
+**It can also move the index backwards.** The engine rewrites the same file as
+its own checkpoint, so after a long run head-follow has taken the live index past
+the manifest written at install time — possibly past the new seed too. Re-seeding
+then swaps a further-along index for a shorter frame, and queries in the
+difference turn from served into `-32000` until the bridge re-walks them. With a
+69-day shelf life on mainnet that window is wide.
+
+Deciding this correctly needs the live index's own coverage, which only the engine
+can read; a file-timestamp proxy was tried and rejected as platform-dependent. The
+shipped Bee flavour re-seeds unconditionally and its tests pin that, so changing
+it is a decision for the owner rather than something this flavour does differently
+on its own. Until then, the safe move before installing a rebuilt app on a machine
+that has been running for weeks is to keep a copy of `~/.myotis-railgun-poc`.
 
 Unlike the Bee flavour it ships **no warm peer caches** — none have been captured
 for mainnet — so discovery seeds from the embedded bootnodes. That costs a slower

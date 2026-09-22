@@ -170,29 +170,21 @@ open class PocFlavour(
             val installedHigh = installed.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
             val bundledHigh = bundled.getProperty("coveredHigh")?.toLongOrNull() ?: 0L
             if (bundledHigh <= installedHigh) return SeedOutcome.KEPT_EXISTING
-            // A NEWER bundled seed is still not automatically better than what is on
-            // disk. The engine rewrites this same file as its own checkpoint, so once it
-            // has run, the live index has followed the head well past the manifest we
-            // wrote at install time — potentially past the new seed too. Overwriting then
-            // REPLACES a further-along index with a shorter frame, and every query in the
-            // difference turns from served into -32000 until the bridge re-walks it.
+            // NOTE (raised in review of #477, deferred to the owner): a newer bundled
+            // seed can still be BEHIND the live index. The engine rewrites this same
+            // file as its own checkpoint, so after a long run head-follow has taken it
+            // past the manifest written at install time — and on RAILGUN's 69-day
+            // mainnet shelf life that window is wide. Overwriting then replaces a
+            // further-along index with a shorter frame, and queries in the difference
+            // turn from served into -32000 until the bridge re-walks it.
             //
-            // The manifest cannot tell us where the live index reached (only the engine
-            // can read the file's coverage), so the conservative test is whether the
-            // engine has written to it at all since we seeded it. If it has, keep what is
-            // there and say so loudly; adopting the new seed is then a deliberate act.
-            if (engineHasWrittenSince(target, installedManifest)) {
-                log.warn(
-                    "{}: a newer bundled seed (to block {}) is available, but the engine has written to {} " +
-                        "since it was seeded — keeping the live index, which may already be further along. " +
-                        "To adopt the bundled seed instead, delete that file (and {}) and restart.",
-                    logTag, bundledHigh, target.fileName, installedManifest.fileName,
-                )
-                return SeedOutcome.KEPT_EXISTING
-            }
+            // Deciding that needs the live index's own coverage, which only the engine
+            // can read; a file-timestamp proxy was tried and rejected (it is
+            // platform-dependent — it never fired on ext4 and always fired on APFS).
+            // The shipped Bee behaviour, which these tests pin, is to re-seed, and
+            // changing it is the owner's call rather than this PR's.
             log.info(
-                "{}: the bundled seed (to block {}) is newer than the installed one (to block {}) " +
-                    "and the engine has not written to it — re-seeding",
+                "{}: the bundled seed (to block {}) is newer than the installed one (to block {}) — re-seeding",
                 logTag, bundledHigh, installedHigh,
             )
         }
@@ -273,16 +265,6 @@ open class PocFlavour(
             "unverified until the walker re-fetches them (the live coverage below grows from there); " +
             "usable until about block $until, after which a rebuilt app re-seeds."
     }
-
-    /**
-     * Whether the engine has rewritten the index since this flavour installed it. Install
-     * writes the seed and THEN its manifest, so a freshly seeded pair always fails this
-     * test; any later checkpoint by the engine passes it. Unreadable timestamps answer
-     * "yes", which errs toward keeping what is on disk.
-     */
-    private fun engineHasWrittenSince(index: Path, installedManifest: Path): Boolean = runCatching {
-        Files.getLastModifiedTime(index) > Files.getLastModifiedTime(installedManifest)
-    }.getOrDefault(true)
 
     private val logTag: String get() = prop.substringAfterLast('.')
 

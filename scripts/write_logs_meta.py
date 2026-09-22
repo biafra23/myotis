@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Write the ``.meta.json`` sidecar ``synth_logindex.py`` checks a fetch against.
 
-DEBUG / DEMO ONLY. Every field is read back from the node that served the logs,
-so the frame cannot claim a range, a chain or a finality tag the fetch did not
-actually have. See docs/railgun-poc.md.
+DEBUG / DEMO ONLY. Every field is read back from the node that served the logs.
+``toBlockTag`` is the one the operator asserts, so it is VERIFIED against the
+node's current ``finalized`` height before being recorded — it is the field the
+build reads to decide whether the seed may be framed with no reorg margin. See
+docs/railgun-poc.md.
 
     ./scripts/write_logs_meta.py \\
         --rpc http://127.0.0.1:8545 \\
@@ -60,6 +62,26 @@ def main():
             if t:
                 topics[t[0]] += 1
 
+    # VERIFY the finality claim rather than recording the operator's word for it.
+    # This field is the one the build reads to decide whether the seed may be framed
+    # with no reorg margin, so a mistyped --to-block-tag would ship a non-final block
+    # frozen into a snapshot the engine then serves as fully covered. Checking the
+    # height against the node's current `finalized` is also STRONGER than trusting the
+    # tag: a fetch that ran to `latest` yesterday is final by now and qualifies.
+    to_block_tag = args.to_block_tag
+    if to_block_tag:
+        finalized = rpc(args.rpc, "eth_getBlockByNumber", ["finalized", False])
+        if finalized is None:
+            raise SystemExit("write_logs_meta: the node has no 'finalized' block; cannot verify --to-block-tag")
+        finalized_now = int(finalized["number"], 16)
+        if args.to_block > finalized_now:
+            raise SystemExit(
+                "write_logs_meta: --to-block {t} is above the node's finalized block {f}, so the "
+                "range can still reorg and must not be recorded as final. Re-run without "
+                "--to-block-tag (the seed then keeps its reorg margin), or wait for finality."
+                .format(t=args.to_block, f=finalized_now)
+            )
+
     version = rpc(args.rpc, "web3_clientVersion", []) or (rpc(args.rpc, "admin_nodeInfo", []) or {}).get("name")
     meta = {
         "rpcClientVersion": version,
@@ -70,7 +92,7 @@ def main():
         # the high edge cannot reorg. A fetch to `latest` framed that way would
         # freeze a since-orphaned block into the seed and the engine would serve
         # it as fully covered.
-        "toBlockTag": args.to_block_tag,
+        "toBlockTag": to_block_tag,
         "headHash": rpc(args.rpc, "eth_getBlockByNumber", [hex(args.to_block), False])["hash"],
         "genesisHash": rpc(args.rpc, "eth_getBlockByNumber", ["0x0", False])["hash"],
         f"block{args.from_block}Hash": rpc(args.rpc, "eth_getBlockByNumber", [hex(args.from_block), False])["hash"],

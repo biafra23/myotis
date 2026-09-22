@@ -94,7 +94,25 @@ def main():
         # Resume only into the SAME range: a different to-block is a different
         # fetch, and appending one onto another would claim coverage the file
         # does not have.
-        if p.get("toBlock") == to_block and p.get("fromBlock") == from_block and p.get("next"):
+        #
+        # A MISMATCH IS REFUSED, never silently restarted. `finalized` advances
+        # every epoch, so the documented "just rerun it" recovery would otherwise
+        # re-resolve to a new high edge, miss this check, and truncate hours of
+        # fetched pages with no signal but the absence of a line of output. State
+        # that changes the outcome is applied or refused (CLAUDE.md, Trust).
+        if p.get("next") and (p.get("toBlock") != to_block or p.get("fromBlock") != from_block):
+            tag = p.get("toBlockTag")
+            tag_note = " ({})".format(tag) if tag else ""
+            raise SystemExit(
+                "fetch_contract_logs: {prog} is a partial fetch of {pf}..{pt}{tag}, but this run "
+                "resolved {f}..{t}.\n"
+                "  To resume it:   --from-block {pf} --to-block {pt}\n"
+                "  To start over:  rm {prog} {out}".format(
+                    prog=prog_path, pf=p.get("fromBlock"), pt=p.get("toBlock"),
+                    tag=tag_note, f=from_block, t=to_block, out=out,
+                )
+            )
+        if p.get("next"):
             start, mode, count = p["next"], "a", p.get("count", 0)
             print(f"resuming at {start} ({count} logs so far)", flush=True)
 
