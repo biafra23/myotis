@@ -157,8 +157,8 @@ install and settings). A build without the flag carries none of it.
 You do not have to build it: CI produces the same artifact on every PR and
 every push to `main` (`Desktop DMG (macOS)` workflow → artifact
 `myotis-bee-poc-dmg-arm64-<sha>`)
-and attaches `Myotis-bee-poc-arm64.dmg` to each release (best-effort; v0.1.10
-has it).
+and attaches it to each release as `Myotis-v<version>-bee-poc-arm64.dmg`
+(best-effort; releases up to v0.1.11 named it `Myotis-bee-poc-arm64.dmg`).
 
 ### Route B — the daemon plus an imported seed
 

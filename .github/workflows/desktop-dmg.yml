@@ -345,12 +345,31 @@ jobs:
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"
+          # The tag goes into the asset file names below, so check its shape the
+          # way the deb and apk jobs do. `gh release upload` reads everything
+          # after a `#` in a path as the asset's label, and the version guard
+          # accepts any v<version>-<suffix>, so a tag like v<version>-rc#1 would
+          # otherwise fail the upload after the release already exists.
+          printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
           # Fail loudly if either arch dmg is missing rather than shipping a
           # half release (e.g. one matrix job was cancelled).
           for arch in arm64 x64; do
             test -f "dmg/Myotis-${arch}.dmg" \
               || { echo "::error::missing dmg/Myotis-${arch}.dmg"; exit 1; }
           done
+          # Release assets carry the version, like the APK
+          # (Myotis-<tag>-android-debug.apk): Myotis-<tag>-<arch>.dmg. The build
+          # jobs keep arch-only names so the per-PR artifacts stay stable; the
+          # tag only exists here. Renamed before the release is created, so a
+          # rename can never fail after the release exists.
+          for arch in arm64 x64; do
+            mv "dmg/Myotis-${arch}.dmg" "dmg/Myotis-${tag}-${arch}.dmg"
+          done
+          # Best-effort: the PoC leg is continue-on-error, so its dmg may be absent.
+          if [ -f dmg/Myotis-bee-poc-arm64.dmg ]; then
+            mv dmg/Myotis-bee-poc-arm64.dmg "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
+          fi
           # Notes via a quoted heredoc + --notes-file: markdown stays literal
           # (no shell escaping of backticks/quotes) and renders as intended.
           notes=$(mktemp)
@@ -360,11 +379,11 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
-          **Bee PoC (`Myotis-bee-poc-arm64.dmg`, when present)** — a separate app
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
           ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
           Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
           seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
@@ -372,8 +391,8 @@ jobs:
           days after its fetch (the Index tab shows the block it is usable until). See
           docs/bee-rpc-service.md.
 
-          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
-          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
           NOTES
           # Create the release if it doesn't exist yet. The android workflow may
@@ -388,10 +407,9 @@ jobs:
               --target "${GITHUB_SHA}" \
             || gh release view "$tag" >/dev/null 2>&1
           fi
-          gh release upload "$tag" dmg/Myotis-arm64.dmg dmg/Myotis-x64.dmg --clobber
-          # Best-effort: the PoC leg is continue-on-error, so its dmg may be absent.
-          if [ -f dmg/Myotis-bee-poc-arm64.dmg ]; then
-            gh release upload "$tag" dmg/Myotis-bee-poc-arm64.dmg --clobber
+          gh release upload "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg" --clobber
+          if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
+            gh release upload "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg" --clobber
           else
             echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
           fi

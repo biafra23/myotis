@@ -359,10 +359,11 @@ with the seed above bundled inside:
   `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`, and the
   leg fails unless the dmg carries the seed, its manifest and the peer caches
   (the standard leg fails if it carries a seed). On a tag the dmg is attached
-  to the GitHub release as a best-effort asset: the leg is
-  `continue-on-error`, so a PoC-only failure never blocks the standard dmgs,
-  and the release simply lacks the PoC in that case. Mind the shelf life: a
-  release older than ~29 days carries a PoC whose seed no longer catches up.
+  to the GitHub release as the best-effort asset
+  `Myotis-v<version>-bee-poc-arm64.dmg`: the leg is `continue-on-error`, so a
+  PoC-only failure never blocks the standard dmgs, and the release simply
+  lacks the PoC in that case. Mind the shelf life: a release older than ~29
+  days carries a PoC whose seed no longer catches up.
 - **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
   when no index file exists there yet, or when the bundled seed is newer than
   the one this flavour installed before (a rebuilt app after the shelf life;
