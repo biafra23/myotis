@@ -11,6 +11,8 @@
 //! the header HASH still covers them because it is `keccak256` of the raw
 //! encoding, never of a re-encode of what we understood.
 
+use alloc::{format, vec};
+use alloc::{vec::Vec};
 use crate::keccak::keccak256;
 use crate::rlp::{self, Item};
 use crate::{err, CoreError};

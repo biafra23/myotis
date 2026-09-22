@@ -21,6 +21,12 @@
 //! messages; decoding untrusted bytes never panics (the workspace builds with
 //! `panic = "abort"`, so a panic crossing JNI kills the host process).
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::string::String;
+
 pub mod bloom;
 pub mod enr;
 pub mod forkid;
@@ -42,7 +48,9 @@ impl core::fmt::Display for CoreError {
     }
 }
 
-impl std::error::Error for CoreError {}
+// `core::error::Error` is stable since Rust 1.81 and is the no_std-clean spelling;
+// it is the same trait `std::error::Error` re-exports, so std hosts are unaffected.
+impl core::error::Error for CoreError {}
 
 pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T, CoreError> {
     Err(CoreError(msg.into()))
