@@ -6285,14 +6285,15 @@ impl ElReader {
     /// The beacon-anchored optimistic head `(number, hash)`, or the standard
     /// not-ready errors every verified read shares.
     fn anchored_head(&self) -> Result<(u64, [u8; 32]), String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
+        // One lock for the pair: a number from one update with the hash of
+        // the next would fail every peer's correct window, and strike them.
+        if let Some(head) = self.anchor.optimistic_head() {
+            return Ok(head);
         }
-        Ok((head_num, head_hash))
+        if self.anchor.optimistic_block_hash().is_none() {
+            return Err("no beacon-anchored head yet".to_string());
+        }
+        Err("beacon not synced".to_string())
     }
 
     /// The shared locate stage (the Java `locateMinedTx` twin): resolve the tx

@@ -602,13 +602,22 @@ impl PoolInner {
 
     /// Evict a pooled peer as LAGGING — its own word, or its answers to the
     /// head probe, put it behind the anchored head — with the long backoff and
-    /// no cache verdict (lagging is not a snap-quality judgement). The address
-    /// stays claimed until the backoff is recorded, the ordering the
-    /// read-failure eviction in `record_quality` documents, so a concurrent
-    /// dial cannot re-dial it in the gap.
+    /// no cache verdict (lagging is not a snap-quality judgement). Never the
+    /// sole peer, the asymmetry `read_failure_verdict` keeps: a Behind sole
+    /// peer serves nothing now, but evicting it with the long backoff
+    /// guarantees nothing serves for ten minutes (a lagging pin, the only peer
+    /// on sepolia, would be out of the hunt's reach), while a pooled one serves
+    /// the moment its next word says it caught up — it still ranks last and
+    /// does not count for the hunt. The address stays claimed until the
+    /// backoff is recorded, the ordering the read-failure eviction in
+    /// `record_quality` documents, so a concurrent dial cannot re-dial it in
+    /// the gap.
     async fn evict_lagging(&self, addr: SocketAddr, why: &str) {
         let was_pooled = {
             let mut peers = self.peers.lock().await;
+            if peers.len() <= 1 {
+                return;
+            }
             let before = peers.len();
             peers.retain(|p| p.addr != addr);
             peers.len() != before
@@ -2079,10 +2088,12 @@ mod tests {
             None,
         );
 
-        // Failures nobody witnessed never reach the cache (#465): three of
-        // them leave the entry exactly as seeded.
-        for _ in 0..3 {
-            pool.record_snap_failure(addr, false).await;
+        // No verdict is persisted without another live peer to compare
+        // against, witnessed or not — the sole-peer shield. (The witness rule
+        // itself is pinned by the pure `persist_verdict` tests: telling the two
+        // apart through the pool takes a live second peer.)
+        for witnessed in [false, true, false, true, false, true] {
+            pool.record_snap_failure(addr, witnessed).await;
         }
         assert_eq!(ElPeerCache::load(path.clone()).peers()[0].quality, SnapQuality::Unknown);
 
