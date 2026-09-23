@@ -1021,6 +1021,16 @@ fn pool_race_verdict<T>(out: RaceOutcome<T>, coverage: &[Coverage]) -> PoolRaceV
     }
 }
 
+/// Whether a hedged race's accepted answer was a SERVE: `served` tells a
+/// verified answer from one the caller merely accepts to end the race (a
+/// global failure such as `beaconNotSynced`, identical for every peer). Only
+/// a serve witnesses the race's misses or earns the winner a serve — else a
+/// beacon hiccup would persist `snapbad` against every peer that missed
+/// alongside it, and `Confirmed` for the one that reported the hiccup.
+fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -> bool {
+    out.accepted.as_ref().is_some_and(|(_, v)| served(v))
+}
+
 /// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
@@ -4347,8 +4357,9 @@ impl ElReader {
     /// Count of live snap peers that can answer a read at the anchored head
     /// right now — their own word or a served proof put them at or near it,
     /// and they are not read-benched (see `pool::is_serving`). Unlike
-    /// [`snap_peer_count`](Self::snap_peer_count), nonzero only when a
-    /// verified read can actually succeed (#465). Intended for the hosts'
+    /// [`snap_peer_count`](Self::snap_peer_count), nonzero only once some
+    /// peer has given evidence it can serve the tip — a fresh word or a
+    /// served proof, not merely a connection (#465). Intended for the hosts'
     /// `snapServingPeers`; the status plumbing is a follow-up.
     pub async fn snap_serving_count(&self) -> usize {
         self.pool.snap_serving_count().await
@@ -4426,7 +4437,8 @@ impl ElReader {
         // full request timeout, and a slow-but-working one still wins if it
         // answers before its hedge does. Accepted = a verdict, or a GLOBAL
         // failure (beacon not ready — identical for every peer); a per-peer
-        // verdict failure (stale head / bad proof) becomes the fallback.
+        // verdict failure (stale head / bad proof) becomes the fallback. Only
+        // a verdict is a SERVE — the winner's credit and the misses' witness.
         let (result, snap_elapsed) = self
             .hedged_read(
                 &peers,
@@ -4435,6 +4447,7 @@ impl ElReader {
                 |(r, _): &(VerifiedAccount, Duration)| {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
+                |(r, _): &(VerifiedAccount, Duration)| r.verify_method.is_some(),
                 "a verifiable account",
             )
             .await?;
@@ -4469,12 +4482,19 @@ impl ElReader {
     /// other peer still in flight is left alone: it had less time than the
     /// winner, so being slower is no fault. Then return the accepted answer,
     /// else the fallback, else the last error.
+    ///
+    /// `accept` ends the race; `served` says whether the accepted answer is a
+    /// SERVE. The two differ for the account and storage reads, which accept
+    /// a global failure (`beaconNotSynced`, identical for every peer) so the
+    /// race stops asking — an answer that serves nothing, witnesses no miss,
+    /// and earns its peer no credit (see `race_served_by_winner`).
     async fn hedged_read<T, Fut>(
         &self,
         peers: &[std::sync::Arc<ManagedPeer>],
         delay: std::time::Duration,
         make: impl FnMut(std::sync::Arc<ManagedPeer>) -> Fut,
         accept: impl Fn(&T) -> bool,
+        served: impl Fn(&T) -> bool,
         what: &str,
     ) -> Result<T, String>
     where
@@ -4484,15 +4504,22 @@ impl ElReader {
         let out = hedged_race(peers, delay, make, accept).await;
         debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
         let last_err = out.last_err().to_string();
-        // A miss is WITNESSED only when another peer served the same read; a
-        // whole-pool failure is banked live but persisted nowhere (#465).
+        // A miss is WITNESSED only when another peer SERVED the same read — an
+        // accepted global failure ends the race with nobody serving anything
+        // — and a whole-pool failure is banked live but persisted nowhere
+        // (#465).
+        let winner_served = race_served_by_winner(&out, &served);
         let misses: Vec<std::net::SocketAddr> = out.missed.iter().map(|i| peers[*i].addr()).collect();
-        self.record_batch_failures(&misses, out.accepted.is_some()).await;
+        self.record_batch_failures(&misses, winner_served).await;
         for idx in &out.outpaced {
             self.pool.record_snap_outpaced(peers[*idx].addr()).await;
         }
         if let Some((idx, value)) = out.accepted {
-            self.pool.record_snap_served(peers[idx].addr()).await;
+            // Only a serve earns the credit: a global failure that won the
+            // race says nothing about this peer.
+            if winner_served {
+                self.pool.record_snap_served(peers[idx].addr()).await;
+            }
             return Ok(value);
         }
         out.fallback.map(Ok).unwrap_or_else(|| {
@@ -4854,6 +4881,7 @@ impl ElReader {
                 |(r, _): &(VerifiedStorage, StorageSnapCost)| {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
+                |(r, _): &(VerifiedStorage, StorageSnapCost)| r.verify_method.is_some(),
                 "verifiable storage",
             )
             .await?;
@@ -5037,6 +5065,7 @@ impl ElReader {
                 let hash = *code_hash;
                 async move { peer.snap_get_bytecode(&hash).await }
             },
+            |_: &Vec<u8>| true,
             |_: &Vec<u8>| true,
             "verifiable bytecode",
         )
@@ -6019,6 +6048,7 @@ impl ElReader {
                 HEDGE_DELAY,
                 |peer| async move { self.receipt_from(&peer, loc).await },
                 |_: &VerifiedReceipt| true,
+                |_: &VerifiedReceipt| true,
                 "verifiable receipts",
             )
             .await?;
@@ -6412,6 +6442,7 @@ impl ElReader {
                 .await
                 .unwrap_or_else(|_| Err("tx scan timed out".to_string()))
             },
+            |_: &Option<TxLocation>| true,
             |_: &Option<TxLocation>| true,
             "a verifiable tx scan",
         )
@@ -7663,6 +7694,30 @@ mod tests {
                 PoolRaceVerdict::Won { failed, .. } => assert_eq!(failed, vec![0]),
                 _ => panic!("a race with a winner must settle as Won"),
             }
+        }
+
+        #[test]
+        fn a_global_failure_winner_witnesses_nobody_and_serves_nothing() {
+            // The account and storage reads ACCEPT a global failure (beacon
+            // not ready) to stop the race, but it is not a serve: it neither
+            // witnesses the misses nor earns the winner a serve.
+            let won = RaceOutcome {
+                accepted: Some((1, 7u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec![],
+            };
+            assert!(race_served_by_winner(&won, |v| *v == 7));
+            assert!(!race_served_by_winner(&won, |v| *v != 7));
+            let lost = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: Some(3),
+                missed: vec![0, 1],
+                outpaced: vec![],
+                errors: vec![],
+            };
+            assert!(!race_served_by_winner(&lost, |_| true));
         }
 
         #[tokio::test(start_paused = true)]

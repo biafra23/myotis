@@ -306,14 +306,15 @@ fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
     witnessed && other_live_peer
 }
 
-/// Pure: does a pooled peer count as SERVING — able to answer a read at the
-/// anchored head right now — for the count the hosts' readiness is meant to
-/// gate on (`snapServingPeers`; the status plumbing is a follow-up)? Its own
-/// word or a served proof put it at or near our anchor (see `peer::Coverage`),
-/// and it is not read-benched. A pool of eth/68 peers therefore serves once
-/// one of them proves itself (`probe_unknown_heads`), not the moment it
-/// connects — which is the point: #465's hosts gated on a count that was true
-/// while every read failed.
+/// Pure: does a pooled peer count as SERVING — on the evidence, able to answer
+/// a read at the anchored head — for the count the hosts' readiness is meant
+/// to gate on (`snapServingPeers`; the status plumbing is a follow-up)? Its
+/// own word or a served proof put it at or near our anchor (see
+/// `peer::Coverage`), and it is not read-benched. Evidence, not a guarantee: a
+/// `Near` peer, or one whose word is minutes old, can still miss a read at the
+/// very tip. A pool of eth/68 peers therefore serves once one of them proves
+/// itself (`probe_unknown_heads`), not the moment it connects — which is the
+/// point: #465's hosts gated on a count that was true while every read failed.
 fn is_serving(benched: bool, cov: Coverage) -> bool {
     !benched && matches!(cov, Coverage::Covers | Coverage::Near)
 }

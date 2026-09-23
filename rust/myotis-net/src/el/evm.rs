@@ -338,7 +338,6 @@ impl PoolOracle {
         })
     }
 
-
     /// Feed one hedged race into the reputation sink: the winner served, every
     /// miss failed, and every attempt the winner outpaced reported as outpaced
     /// (benched; a repeat before the peer serves again is a failure). The same
