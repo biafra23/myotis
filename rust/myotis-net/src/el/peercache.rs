@@ -250,13 +250,14 @@ impl ElPeerCache {
         out
     }
 
-    /// The dial-priority verdict on one cached peer, exactly as
-    /// [`peers`](Self::peers) would report it (including the connect-failure
-    /// demotion), or `None` when the address is not cached. A map lookup: the
-    /// pool reads it at admission time without building the sorted list.
+    /// The STORED snap verdict on one cached peer, or `None` when the address
+    /// is not cached. Deliberately without the connect-failure demotion
+    /// [`peers`](Self::peers) applies: that demotion orders DIALS by recent
+    /// reachability, whereas the pool reads this at admission — the peer just
+    /// connected — to ask whether it once proved itself, which is what the
+    /// read ladder ranks on.
     pub fn quality_of(&self, addr: SocketAddr) -> Option<SnapQuality> {
-        let e = self.entries.get(&addr_key(addr))?;
-        Some(if e.fails >= CONNECT_FAILURE_DEMOTE { SnapQuality::Denied } else { e.quality })
+        self.entries.get(&addr_key(addr)).map(|e| e.quality)
     }
 
     /// Record a peer that reached a READY session with capability `snap`. New
@@ -538,14 +539,17 @@ mod tests {
         cache.record_snap_served(a);
         assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
         assert_eq!(cache.quality_of(b), Some(SnapQuality::Unknown));
-        // The connect-failure demotion `peers()` applies is applied here too.
-        for _ in 0..CONNECT_FAILURE_DEMOTE {
-            cache.record_connect_failure(a);
-        }
-        assert_eq!(cache.quality_of(a), Some(SnapQuality::Denied));
         for p in cache.peers() {
             assert_eq!(cache.quality_of(p.addr), Some(p.quality));
         }
+        // A connect-failure streak demotes the DIAL order (`peers()`), not the
+        // stored verdict: a proven server that was unreachable for a while
+        // and just connected is still a proven server.
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            cache.record_connect_failure(a);
+        }
+        assert_eq!(cache.peers().iter().find(|p| p.addr == a).unwrap().quality, SnapQuality::Denied);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
         let _ = std::fs::remove_file(&path);
     }
 

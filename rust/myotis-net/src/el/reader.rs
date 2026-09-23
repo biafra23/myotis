@@ -1403,10 +1403,10 @@ impl ElReader {
             // number AND hash, because every backfill batch must hash-chain to it.
             Some(Box::new({
                 let anchor = Arc::clone(&anchor);
-                move || {
-                    let n = anchor.optimistic_block_number();
-                    anchor.optimistic_block_hash().filter(|_| n > 0).map(|h| (n, h))
-                }
+                // One lock: a number from one update paired with the hash of
+                // the next would fail a peer's correct header (and the head
+                // probe would count that against the peer).
+                move || anchor.optimistic_head()
             })),
         );
         Ok(ElReader {
@@ -3726,7 +3726,8 @@ impl ElReader {
 
     /// Order this round's peers so the walk prefers the fastest servers.
     ///
-    /// Ranking, applied to the pool's list (which is newest-dialed first):
+    /// Ranking, applied to the pool's list (the read-ladder order, see
+    /// `PeerPool::snap_peers`):
     ///   1. peers with NO measurement — never sampled, pruned when they left
     ///      the pool, or dropped because a success could not be measured —
     ///      first, because the ranking cannot mean anything until they are
@@ -4344,10 +4345,11 @@ impl ElReader {
     }
 
     /// Count of live snap peers that can answer a read at the anchored head
-    /// right now — announced or proven to hold it, and not read-benched (the
-    /// hosts' `snapServingPeers`; see `pool::is_serving`). Unlike
-    /// [`snap_peer_count`](Self::snap_peer_count), true only when a verified
-    /// read can actually succeed (#465).
+    /// right now — their own word or a served proof put them at or near it,
+    /// and they are not read-benched (see `pool::is_serving`). Unlike
+    /// [`snap_peer_count`](Self::snap_peer_count), nonzero only when a
+    /// verified read can actually succeed (#465). Intended for the hosts'
+    /// `snapServingPeers`; the status plumbing is a follow-up.
     pub async fn snap_serving_count(&self) -> usize {
         self.pool.snap_serving_count().await
     }
@@ -4484,14 +4486,8 @@ impl ElReader {
         let last_err = out.last_err().to_string();
         // A miss is WITNESSED only when another peer served the same read; a
         // whole-pool failure is banked live but persisted nowhere (#465).
-        let witnessed = out.accepted.is_some();
-        for idx in &out.missed {
-            if witnessed {
-                self.pool.record_snap_failure(peers[*idx].addr()).await;
-            } else {
-                self.pool.record_snap_failure_unwitnessed(peers[*idx].addr()).await;
-            }
-        }
+        let misses: Vec<std::net::SocketAddr> = out.missed.iter().map(|i| peers[*i].addr()).collect();
+        self.record_batch_failures(&misses, out.accepted.is_some()).await;
         for idx in &out.outpaced {
             self.pool.record_snap_outpaced(peers[*idx].addr()).await;
         }
@@ -5510,9 +5506,9 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        // Each peer's coverage of the window top, sampled before the race
+        // Each peer's coverage of the anchored head, sampled before the race
         // (see pool_race_verdict).
-        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage_of(head_num)).collect();
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged (hedged_race): a silent first peer no longer costs a whole
         // request timeout before the next one is asked — on a flaky pool that
         // stacked up per dead peer, which is where 45-second block reads came
@@ -5635,18 +5631,25 @@ impl ElReader {
         }
         let total = peers.len();
         let mut last_err = String::new();
+        // Misses are held until the ladder settles: witnessed by a later rung
+        // that serves, unwitnessed if nobody does (#465 — a wallet polls the
+        // fee as often as the block, and this loop was poisoning the cache
+        // the same way).
+        let mut failed = Vec::new();
         for peer in &peers {
             match self.fee_estimate_from(peer, start, count, &head_hash).await {
                 Ok(est) => {
+                    self.record_batch_failures(&failed, true).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(est);
                 }
                 Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     last_err = e;
                 }
             }
         }
+        self.record_batch_failures(&failed, false).await;
         Err(format!("all {total} snap peer(s) failed to serve a verifiable fee estimate: {last_err}"))
     }
 
@@ -5754,6 +5757,8 @@ impl ElReader {
         }
         let total = peers.len();
         let mut last_err = String::new();
+        // Misses held until the ladder settles, as in fee_estimate (#465).
+        let mut failed = Vec::new();
         for peer in &peers {
             let attempt = tokio::time::timeout(
                 FEE_HISTORY_DEADLINE,
@@ -5763,15 +5768,17 @@ impl ElReader {
             .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
             match attempt {
                 Ok(history) => {
+                    self.record_batch_failures(&failed, true).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(history);
                 }
                 Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     last_err = e;
                 }
             }
         }
+        self.record_batch_failures(&failed, false).await;
         Err(format!("all {total} snap peer(s) failed to serve a verifiable feeHistory: {last_err}"))
     }
 
@@ -6185,7 +6192,7 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage_of(head_num)).collect();
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged like get_block_by_number_inner, on the same depth-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
         // this read also feeds the log-index appender, which abandons its whole
@@ -6271,11 +6278,7 @@ impl ElReader {
     /// A whole-pool failure is unwitnessed — banked live, persisted nowhere.
     async fn record_batch_failures(&self, failed: &[std::net::SocketAddr], witnessed: bool) {
         for addr in failed {
-            if witnessed {
-                self.pool.record_snap_failure(*addr).await;
-            } else {
-                self.pool.record_snap_failure_unwitnessed(*addr).await;
-            }
+            self.pool.record_snap_failure(*addr, witnessed).await;
         }
     }
 

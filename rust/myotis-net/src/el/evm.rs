@@ -338,16 +338,6 @@ impl PoolOracle {
         })
     }
 
-    /// Record one per-peer fetch outcome (no-op without a sink).
-    async fn record(quality: &Option<crate::el::pool::SnapQualitySink>, peer: &ManagedPeer, served: bool) {
-        if let Some(q) = quality {
-            if served {
-                q.served(peer.addr()).await;
-            } else {
-                q.failed(peer.addr()).await;
-            }
-        }
-    }
 
     /// Feed one hedged race into the reputation sink: the winner served, every
     /// miss failed, and every attempt the winner outpaced reported as outpaced
@@ -359,24 +349,19 @@ impl PoolOracle {
         out: &RaceOutcome<T>,
     ) {
         debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
+        let Some(q) = quality else { return };
         // A miss is WITNESSED only when another peer served the same read; a
         // whole-pool failure is banked live but persisted nowhere (#465 — the
         // same cold-pool storm that struck the block read hits these).
         let witnessed = out.accepted.is_some();
         for idx in &out.missed {
-            match quality {
-                Some(q) if witnessed => q.failed(peers[*idx].addr()).await,
-                Some(q) => q.failed_unwitnessed(peers[*idx].addr()).await,
-                None => {}
-            }
+            q.failed(peers[*idx].addr(), witnessed).await;
         }
-        if let Some(q) = quality {
-            for idx in &out.outpaced {
-                q.outpaced(peers[*idx].addr()).await;
-            }
+        for idx in &out.outpaced {
+            q.outpaced(peers[*idx].addr()).await;
         }
         if let Some((idx, _)) = &out.accepted {
-            Self::record(quality, &peers[*idx], true).await;
+            q.served(peers[*idx].addr()).await;
         }
     }
 
@@ -639,6 +624,11 @@ impl SnapStateOracle for PoolOracle {
                         // next peer (Java tryWithRetries chunk rotation).
                         let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
                         let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
+                        // Peers that failed every item they were asked, held
+                        // until a later peer serves what they could not (then
+                        // witnessed) or the rotation runs out (then not — a
+                        // root every peer pruned is about our ask; #465).
+                        let mut unwitnessed: Vec<std::net::SocketAddr> = Vec::new();
                         for attempt in 0..attempts {
                             if pending.is_empty() {
                                 break;
@@ -668,12 +658,22 @@ impl SnapStateOracle for PoolOracle {
                             }
                             if let Some(q) = &quality {
                                 if served_any {
+                                    // This peer served items the held peers
+                                    // could not: their failures are witnessed.
+                                    for addr in unwitnessed.drain(..) {
+                                        q.failed(addr, true).await;
+                                    }
                                     q.served(peer.addr()).await;
                                 } else if asked_any {
-                                    q.failed(peer.addr()).await;
+                                    unwitnessed.push(peer.addr());
                                 }
                             }
                             pending = still_failed;
+                        }
+                        if let Some(q) = &quality {
+                            for addr in unwitnessed {
+                                q.failed(addr, false).await;
+                            }
                         }
                     }
                 },
