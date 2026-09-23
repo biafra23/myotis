@@ -359,8 +359,16 @@ impl PoolOracle {
         out: &RaceOutcome<T>,
     ) {
         debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
+        // A miss is WITNESSED only when another peer served the same read; a
+        // whole-pool failure is banked live but persisted nowhere (#465 — the
+        // same cold-pool storm that struck the block read hits these).
+        let witnessed = out.accepted.is_some();
         for idx in &out.missed {
-            Self::record(quality, &peers[*idx], false).await;
+            match quality {
+                Some(q) if witnessed => q.failed(peers[*idx].addr()).await,
+                Some(q) => q.failed_unwitnessed(peers[*idx].addr()).await,
+                None => {}
+            }
         }
         if let Some(q) = quality {
             for idx in &out.outpaced {

@@ -250,6 +250,15 @@ impl ElPeerCache {
         out
     }
 
+    /// The dial-priority verdict on one cached peer, exactly as
+    /// [`peers`](Self::peers) would report it (including the connect-failure
+    /// demotion), or `None` when the address is not cached. A map lookup: the
+    /// pool reads it at admission time without building the sorted list.
+    pub fn quality_of(&self, addr: SocketAddr) -> Option<SnapQuality> {
+        let e = self.entries.get(&addr_key(addr))?;
+        Some(if e.fails >= CONNECT_FAILURE_DEMOTE { SnapQuality::Denied } else { e.quality })
+    }
+
     /// Record a peer that reached a READY session with capability `snap`. New
     /// peers enter as [`SnapQuality::Unknown`]; a re-add only updates the snap
     /// flag (quality is driven by the serve/failure signals).
@@ -513,6 +522,31 @@ mod tests {
         assert!(!peers[1].snap);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quality_of_matches_what_peers_reports() {
+        let path = std::env::temp_dir()
+            .join(format!("myotis-peercache-quality-of-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cache = ElPeerCache::load(path.clone());
+        let a: std::net::SocketAddr = "192.0.2.10:30303".parse().unwrap();
+        let b: std::net::SocketAddr = "192.0.2.11:30303".parse().unwrap();
+        assert_eq!(cache.quality_of(a), None);
+        cache.add(a, &[1u8; 64], true);
+        cache.add(b, &[2u8; 64], true);
+        cache.record_snap_served(a);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
+        assert_eq!(cache.quality_of(b), Some(SnapQuality::Unknown));
+        // The connect-failure demotion `peers()` applies is applied here too.
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            cache.record_connect_failure(a);
+        }
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Denied));
+        for p in cache.peers() {
+            assert_eq!(cache.quality_of(p.addr), Some(p.quality));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

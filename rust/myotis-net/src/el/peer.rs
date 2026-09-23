@@ -13,6 +13,8 @@
 //! * an inbound eth/snap **Get\*** request → an **empty** response (the wallet
 //!   serves no chain data, but a well-behaved empty answer beats a timeout),
 //! * a response → delivered to the waiting request by `(reqId, code)`,
+//! * an eth/69 **BlockRangeUpdate** → recorded as the peer's announced head
+//!   ([`KnownHead`]), which the pool ranks and judges reads by,
 //! * anything else (gossip, mempool) → ignored.
 //!
 //! Request methods take `&self`: the writer is an `Arc<Mutex<…>>` and the
@@ -147,6 +149,108 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Where a peer's known head came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadSource {
+    /// The peer's own word: its eth/69 Status at the handshake, or a later
+    /// BlockRangeUpdate.
+    Announced,
+    /// Proof: a beacon-anchored header window this peer actually served up to
+    /// that number.
+    Served,
+}
+
+/// A peer's chain head as of `seen_at`. Both sources only ever UNDER-report —
+/// the chain moves on between observations — so an aging value can accuse an
+/// innocent peer, which is why every judgement goes through the freshness
+/// gate in [`coverage`].
+#[derive(Debug, Clone, Copy)]
+pub struct KnownHead {
+    pub number: u64,
+    /// The hash the peer announced with the number (eth/69 Status /
+    /// BlockRangeUpdate); `None` for a served proof, whose hash the caller
+    /// already verified against the anchor.
+    pub hash: Option<[u8; 32]>,
+    /// The oldest block the peer says it serves (eth/69 only).
+    pub earliest: Option<u64>,
+    pub source: HeadSource,
+    pub seen_at: tokio::time::Instant,
+}
+
+/// How a peer's known head relates to a window top the reader wants to anchor
+/// at — the input to the read ladder, the strike policy and the hosts'
+/// `snapServingPeers` count (#465).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Coverage {
+    /// Its known head is at or above the top: it can serve the window.
+    Covers,
+    /// Its known head is within [`HEAD_COVERAGE_TOLERANCE`] below the top —
+    /// the drift a healthy peer's last announcement has between updates, so
+    /// it very likely holds the top by now.
+    Near,
+    /// Nothing usable: no numeric head (eth/68 announces none) or an
+    /// observation older than [`HEAD_SIGNAL_FRESH`].
+    Unknown,
+    /// Its fresh known head is further below the top than the tolerance: a
+    /// syncing or stalled node, whose "0 headers" for the top is the honest
+    /// answer its own announcement predicts.
+    Behind,
+}
+
+/// Blocks a peer's known head may trail a window top before it counts as
+/// BEHIND. devp2p recommends a BlockRangeUpdate "about once every two
+/// minutes", so a perfectly healthy peer's freshest number is up to ~24 blocks
+/// stale on Gnosis (5 s blocks) and ~10 on mainnet; 32 clears both with margin
+/// and is still orders of magnitude below a syncing node's lag.
+pub const HEAD_COVERAGE_TOLERANCE: u64 = 32;
+
+/// How long an observed head stays usable for a JUDGEMENT: 2.5 announcement
+/// intervals. A peer that keeps announcing is never judged on a stale number,
+/// and one that has gone quiet falls back to [`Coverage::Unknown`] rather than
+/// being blamed for a head it may long have passed.
+pub const HEAD_SIGNAL_FRESH: Duration = Duration::from_secs(300);
+
+/// Pure: classify a peer's last observed head (`(number, age)`) against the
+/// window top a read wants to anchor at. See [`Coverage`].
+pub fn coverage(observed: Option<(u64, Duration)>, top: u64) -> Coverage {
+    match observed {
+        Some((number, age)) if age <= HEAD_SIGNAL_FRESH => {
+            if number >= top {
+                Coverage::Covers
+            } else if number.saturating_add(HEAD_COVERAGE_TOLERANCE) >= top {
+                Coverage::Near
+            } else {
+                Coverage::Behind
+            }
+        }
+        _ => Coverage::Unknown,
+    }
+}
+
+/// The per-connection head cell: a std mutex, never tokio's, because the pool
+/// reads it while holding its own (tokio) peer-list lock and must not await
+/// there. Never held across an await.
+type SharedKnownHead = Arc<std::sync::Mutex<Option<KnownHead>>>;
+
+/// Merge an inbound announcement into the cell: a peer's own word replaces
+/// its previous word — higher, or lower for a peer that reset and resyncs —
+/// but never lowers a number it PROVED by serving while that proof is still
+/// fresh: proof outranks a claim, and a served number is a floor on the real
+/// head. Once the proof has aged past [`HEAD_SIGNAL_FRESH`] the claim rules
+/// again, else a peer that reset would look proven forever.
+fn merge_announced(current: Option<KnownHead>, incoming: KnownHead) -> KnownHead {
+    match current {
+        Some(cur)
+            if cur.source == HeadSource::Served
+                && incoming.number < cur.number
+                && incoming.seen_at.saturating_duration_since(cur.seen_at) <= HEAD_SIGNAL_FRESH =>
+        {
+            cur
+        }
+        _ => incoming,
+    }
+}
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
     writer: SharedWriter,
@@ -173,6 +277,10 @@ pub struct ManagedPeer {
     /// Pool-shared serving surface (window + counters); None in fixtures that
     /// spawn a peer without a pool.
     serve: Option<ServeContext>,
+    /// The peer's known head (see [`KnownHead`]): seeded from its eth/69
+    /// Status, refreshed by every BlockRangeUpdate the read loop decodes and
+    /// by every anchored window it serves.
+    head: SharedKnownHead,
 }
 
 impl ManagedPeer {
@@ -231,6 +339,18 @@ impl ManagedPeer {
         let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        // eth/69 Status carries the peer's head; eth/68 carries none (only a
+        // best hash), so such a peer starts with no known head until it serves
+        // or the pool probes it.
+        let head: SharedKnownHead = Arc::new(std::sync::Mutex::new(peer_status.latest_block.map(
+            |number| KnownHead {
+                number,
+                hash: Some(peer_status.best_hash),
+                earliest: peer_status.earliest_block,
+                source: HeadSource::Announced,
+                seen_at: tokio::time::Instant::now(),
+            },
+        )));
 
         let reader_task = tokio::spawn(read_loop(
             reader,
@@ -240,6 +360,8 @@ impl ManagedPeer {
             snap_codes,
             serve.clone(),
             tx_watch,
+            eth_version,
+            Arc::clone(&head),
         ));
 
         ManagedPeer {
@@ -256,6 +378,7 @@ impl ManagedPeer {
             addr,
             snap_codes,
             serve,
+            head,
         }
     }
 
@@ -272,6 +395,36 @@ impl ManagedPeer {
     /// error); the peer serves no further requests.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The peer's last known head — announced (eth/69 Status /
+    /// BlockRangeUpdate) or proven by a served anchored window — if any.
+    /// `None` for an eth/68 peer that has not served yet.
+    pub fn known_head(&self) -> Option<KnownHead> {
+        *self.head.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How this peer's known head relates to a window top, judged on a fresh
+    /// observation only (see [`coverage`]).
+    pub fn coverage_of(&self, top: u64) -> Coverage {
+        coverage(self.known_head().map(|h| (h.number, h.seen_at.elapsed())), top)
+    }
+
+    /// A beacon-anchored header window this peer served up to `number`: proof
+    /// of its head, recorded as a fresh observation. Monotone — a window below
+    /// an earlier observation does not lower the number, since both are floors
+    /// on the real head.
+    pub(crate) fn note_head_served(&self, number: u64) {
+        let mut cell = self.head.lock().unwrap_or_else(|e| e.into_inner());
+        let number = cell.map_or(number, |h| h.number.max(number));
+        let earliest = cell.and_then(|h| h.earliest);
+        *cell = Some(KnownHead {
+            number,
+            hash: None,
+            earliest,
+            source: HeadSource::Served,
+            seen_at: tokio::time::Instant::now(),
+        });
     }
 
     /// Send one request and await its response, correlating by request id. The
@@ -664,6 +817,7 @@ impl Drop for ManagedPeer {
 /// The background read loop: classify each inbound frame and either answer it
 /// (Ping/Get\*), deliver it to a waiting request, or ignore it. Exits on a read
 /// error or a peer Disconnect, failing every in-flight request on the way out.
+#[allow(clippy::too_many_arguments)]
 async fn read_loop(
     mut reader: RlpxReader,
     writer: SharedWriter,
@@ -672,6 +826,8 @@ async fn read_loop(
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+    eth_version: u64,
+    head: SharedKnownHead,
 ) {
     loop {
         let frame = match reader.recv().await {
@@ -710,6 +866,30 @@ async fn read_loop(
                         w.mark_seen(&hash, now);
                     }
                 }
+            }
+            continue;
+        }
+
+        // eth/69: the peer's servable range moved — its own word on its head,
+        // which the pool ranks and judges reads by (KnownHead). Gated on the
+        // negotiated version because on eth/68 absolute 0x21 is the SNAP base
+        // (GetAccountRange) — the same dispatch rule the Java EthHandler uses.
+        // A malformed or inverted update is ignored, never a disconnect. Only
+        // the peer's own cell is touched: this loop never takes a pool lock.
+        if eth_version >= 69 && code == messages::BLOCK_RANGE_UPDATE {
+            match messages::decode_block_range_update(&frame.payload) {
+                Ok(u) => {
+                    let incoming = KnownHead {
+                        number: u.latest,
+                        hash: Some(u.latest_hash),
+                        earliest: Some(u.earliest),
+                        source: HeadSource::Announced,
+                        seen_at: tokio::time::Instant::now(),
+                    };
+                    let mut cell = head.lock().unwrap_or_else(|e| e.into_inner());
+                    *cell = Some(merge_announced(*cell, incoming));
+                }
+                Err(e) => tracing::debug!(error = %e.0, "ignoring a malformed BlockRangeUpdate"),
             }
             continue;
         }
@@ -873,6 +1053,95 @@ fn describe_disconnect(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pure head classifier behind the read ladder, the strike policy and
+    /// the hosts' `snapServingPeers` (#465).
+    mod head_coverage {
+        use super::super::{
+            coverage, merge_announced, Coverage, HeadSource, KnownHead, HEAD_COVERAGE_TOLERANCE,
+            HEAD_SIGNAL_FRESH,
+        };
+        use std::time::Duration;
+
+        const FRESH: Duration = Duration::from_secs(10);
+
+        #[test]
+        fn a_head_at_or_above_the_top_covers_it() {
+            assert_eq!(coverage(Some((1_000, FRESH)), 1_000), Coverage::Covers);
+            assert_eq!(coverage(Some((1_002, FRESH)), 1_000), Coverage::Covers);
+        }
+
+        #[test]
+        fn a_head_inside_the_tolerance_is_near_not_behind() {
+            // The band a healthy peer's last announcement drifts through
+            // between updates — still asked early, never excused or evicted.
+            assert_eq!(coverage(Some((999, FRESH)), 1_000), Coverage::Near);
+            assert_eq!(coverage(Some((1_000 - HEAD_COVERAGE_TOLERANCE, FRESH)), 1_000), Coverage::Near);
+        }
+
+        #[test]
+        fn a_head_a_syncing_node_would_report_is_behind() {
+            assert_eq!(
+                coverage(Some((1_000 - HEAD_COVERAGE_TOLERANCE - 1, FRESH)), 1_000),
+                Coverage::Behind
+            );
+            assert_eq!(coverage(Some((10, FRESH)), 1_000), Coverage::Behind);
+        }
+
+        #[test]
+        fn no_numeric_head_is_unknown() {
+            // eth/68 Status carries no block number.
+            assert_eq!(coverage(None, 1_000), Coverage::Unknown);
+        }
+
+        #[test]
+        fn an_aging_announcement_is_never_used_to_accuse() {
+            let stale = HEAD_SIGNAL_FRESH + Duration::from_secs(1);
+            assert_eq!(coverage(Some((10, stale)), 1_000), Coverage::Unknown);
+            // ...nor to vouch: a stale "covers" is no evidence either.
+            assert_eq!(coverage(Some((1_000, stale)), 1_000), Coverage::Unknown);
+            assert_eq!(coverage(Some((10, HEAD_SIGNAL_FRESH)), 1_000), Coverage::Behind);
+        }
+
+        #[test]
+        fn the_tolerance_covers_a_two_minute_announcement_drift() {
+            // devp2p: an update "about once every two minutes" — ~24 Gnosis
+            // blocks (5 s) or ~10 mainnet blocks (12 s) of honest staleness.
+            assert!(HEAD_COVERAGE_TOLERANCE >= 120 / 5);
+            // ...and a syncing node is nowhere near it.
+            assert!(HEAD_COVERAGE_TOLERANCE < 1_000);
+        }
+
+        fn head(number: u64, source: HeadSource, seen_at: tokio::time::Instant) -> KnownHead {
+            KnownHead { number, hash: None, earliest: None, source, seen_at }
+        }
+
+        #[test]
+        fn an_announcement_replaces_the_peers_previous_word() {
+            let t0 = tokio::time::Instant::now();
+            let prev = head(1_000, HeadSource::Announced, t0);
+            // Higher, and — a peer that reset and resyncs — lower too.
+            assert_eq!(merge_announced(Some(prev), head(1_010, HeadSource::Announced, t0)).number, 1_010);
+            assert_eq!(merge_announced(Some(prev), head(10, HeadSource::Announced, t0)).number, 10);
+            assert_eq!(merge_announced(None, head(5, HeadSource::Announced, t0)).number, 5);
+        }
+
+        #[test]
+        fn a_fresh_served_proof_is_not_lowered_by_a_claim_but_a_stale_one_is() {
+            let t0 = tokio::time::Instant::now();
+            let proof = head(1_000, HeadSource::Served, t0);
+            let soon = t0 + Duration::from_secs(30);
+            let kept = merge_announced(Some(proof), head(990, HeadSource::Announced, soon));
+            assert_eq!((kept.number, kept.source), (1_000, HeadSource::Served));
+            // A higher claim always wins.
+            assert_eq!(merge_announced(Some(proof), head(1_001, HeadSource::Announced, soon)).number, 1_001);
+            // Once the proof has aged past the freshness gate, the peer's word
+            // rules again — otherwise a peer that reset would look proven forever.
+            let later = t0 + HEAD_SIGNAL_FRESH + Duration::from_secs(1);
+            let replaced = merge_announced(Some(proof), head(10, HeadSource::Announced, later));
+            assert_eq!((replaced.number, replaced.source), (10, HeadSource::Announced));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_send_marker_keeps_each_attempts_first_send() {

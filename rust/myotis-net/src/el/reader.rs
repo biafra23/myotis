@@ -40,7 +40,7 @@ use crate::el::evm::{
     block_context, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
     EnsRootMode, GasOutcome, PoolOracle,
 };
-use crate::el::peer::ManagedPeer;
+use crate::el::peer::{Coverage, ManagedPeer};
 use crate::el::pool::{PeerPool, PoolConfig};
 use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
@@ -369,7 +369,9 @@ const TIP_LAG_RETRY_DELAY: std::time::Duration = std::time::Duration::from_milli
 /// distinct from a transport failure (timeout/disconnect) or a genuine proof
 /// error. Kept as a string match on the phrases `fetch_anchored_window`
 /// produces (there is no typed error across its four callers); the phrases
-/// live here so the coupling is visible.
+/// live here so the coupling is visible. Since #465 this is the BATCH gate
+/// feeding a per-peer split: `pool_race_verdict` then excuses the peers whose
+/// own announced head already predicted the miss.
 fn all_tip_lag(failures: &[String]) -> bool {
     !failures.is_empty()
         && failures.iter().all(|f| {
@@ -385,8 +387,10 @@ enum PoolReadError {
     Fatal(String),
     /// Every peer failed tip-lag-shaped ([`all_tip_lag`]). The batch's
     /// strikes are DEFERRED to the caller: forgiven only for an attempt the
-    /// caller retries (the anchor advances past a transient lag), banked via
-    /// `record_batch_failures` the moment it gives up. So a blip shorter than
+    /// caller retries (the anchor advances past a transient lag), banked LIVE
+    /// — bench and eviction, never a persisted verdict, since nobody served —
+    /// via `record_batch_failures` the moment it gives up; `failed` already
+    /// excludes the peers whose own word predicted the miss (#465). So a blip shorter than
     /// the retry budget strikes nobody, while a persistently lagging pool
     /// keeps accruing one strike per peer per failed READ — the pre-retry
     /// rate the 2026-09-02 stale-pool escape (eviction + refill) depends
@@ -979,12 +983,22 @@ enum PoolRaceVerdict<T> {
     Won { idx: usize, value: T, failed: Vec<usize>, outpaced: Vec<usize> },
     /// Every peer failed and every reason was tip-lag shaped: the caller
     /// retries, and banks `failed` only when it stops (see `PoolReadError`).
-    TipLag { summary: String, failed: Vec<usize> },
+    /// `excused` are the peers whose own FRESH word had already put their
+    /// head below the window top — their "0 headers" was the honest answer
+    /// they predicted, so they are struck for nothing (#465: striking them is
+    /// what flipped 14 of 27 cache entries to `snapbad` on a cold pool).
+    TipLag { summary: String, failed: Vec<usize>, excused: Vec<usize> },
     /// Every peer failed for some other reason: bank `failed` now.
     Fatal { summary: String, failed: Vec<usize> },
 }
 
-fn pool_race_verdict<T>(out: RaceOutcome<T>) -> PoolRaceVerdict<T> {
+/// `coverage[i]` is peer `i`'s coverage of the window top, sampled BEFORE the
+/// race (an announcement arriving mid-read cannot absolve retroactively). Only
+/// the tip-lag verdict consults it: a won race's misses and a fatal failure
+/// keep their strikes — `RaceOutcome::errors` is not aligned with `missed`, so
+/// a per-peer excuse there would need a restructure, and a Behind peer rarely
+/// enters a race at all now that the ladder ranks it last.
+fn pool_race_verdict<T>(out: RaceOutcome<T>, coverage: &[Coverage]) -> PoolRaceVerdict<T> {
     match out.accepted {
         Some((idx, value)) => PoolRaceVerdict::Won {
             idx,
@@ -995,7 +1009,11 @@ fn pool_race_verdict<T>(out: RaceOutcome<T>) -> PoolRaceVerdict<T> {
         None => {
             let summary = summarize_peer_failures(&out.errors);
             if all_tip_lag(&out.errors) {
-                PoolRaceVerdict::TipLag { summary, failed: out.missed }
+                let (excused, failed): (Vec<usize>, Vec<usize>) = out
+                    .missed
+                    .into_iter()
+                    .partition(|&i| coverage.get(i) == Some(&Coverage::Behind));
+                PoolRaceVerdict::TipLag { summary, failed, excused }
             } else {
                 PoolRaceVerdict::Fatal { summary, failed: out.missed }
             }
@@ -4325,6 +4343,15 @@ impl ElReader {
         self.pool.snap_peer_count().await
     }
 
+    /// Count of live snap peers that can answer a read at the anchored head
+    /// right now — announced or proven to hold it, and not read-benched (the
+    /// hosts' `snapServingPeers`; see `pool::is_serving`). Unlike
+    /// [`snap_peer_count`](Self::snap_peer_count), true only when a verified
+    /// read can actually succeed (#465).
+    pub async fn snap_serving_count(&self) -> usize {
+        self.pool.snap_serving_count().await
+    }
+
     /// EL pool/discovery counts for the host status snapshot.
     pub async fn attempted_count(&self) -> usize {
         self.pool.attempted_count().await
@@ -4455,8 +4482,15 @@ impl ElReader {
         let out = hedged_race(peers, delay, make, accept).await;
         debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
         let last_err = out.last_err().to_string();
+        // A miss is WITNESSED only when another peer served the same read; a
+        // whole-pool failure is banked live but persisted nowhere (#465).
+        let witnessed = out.accepted.is_some();
         for idx in &out.missed {
-            self.pool.record_snap_failure(peers[*idx].addr()).await;
+            if witnessed {
+                self.pool.record_snap_failure(peers[*idx].addr()).await;
+            } else {
+                self.pool.record_snap_failure_unwitnessed(peers[*idx].addr()).await;
+            }
         }
         for idx in &out.outpaced {
             self.pool.record_snap_outpaced(peers[*idx].addr()).await;
@@ -4473,17 +4507,22 @@ impl ElReader {
     /// Apply a hedged pool read's [`PoolRaceVerdict`] to the pool and shape its
     /// result — shared by the block and receipt reads, whose strikes are
     /// DEFERRED on tip-lag. On a win: bank the peers that failed ahead of the
-    /// winner, report the ones it outpaced, credit the winner. On a
-    /// whole-pool failure: WARN with every peer's reason — the moment an
-    /// operator needs them, and hosts keep only info+ in their log rings (the
-    /// Android period-1840 / stale-pool incidents of 2026-09-01/02 were
-    /// undiagnosable on-device with debug-only reasons) — then either hand
-    /// tip-lag back UN-banked for the caller's retry loop (banking per attempt
-    /// would let one retrying read push every healthy peer to eviction; never
-    /// banking would bring back the 2026-09-02 wedge), or bank and fail.
+    /// winner (witnessed — the winner served what they could not), report the
+    /// ones it outpaced, credit the winner. On a whole-pool failure: WARN with
+    /// every peer's reason and address — the moment an operator needs them,
+    /// and hosts keep only info+ in their log rings (the Android period-1840 /
+    /// stale-pool incidents of 2026-09-01/02 were undiagnosable on-device with
+    /// debug-only reasons) — then either hand tip-lag back UN-banked for the
+    /// caller's retry loop (banking per attempt would let one retrying read
+    /// push every healthy peer to eviction; never banking would bring back the
+    /// 2026-09-02 wedge), or bank and fail. A whole-pool failure is banked
+    /// LIVE only — nobody witnessed it, so it persists no verdict (#465) — and
+    /// the tip-lag arm hands back only the peers whose own word did not
+    /// predict the miss (`coverage`, sampled before the race).
     async fn settle_pool_race<T>(
         &self,
         peers: &[std::sync::Arc<ManagedPeer>],
+        coverage: &[Coverage],
         out: RaceOutcome<T>,
         (target_num, back): (u64, u64),
         what: &str,
@@ -4491,28 +4530,32 @@ impl ElReader {
     ) -> Result<T, PoolReadError> {
         let total = peers.len();
         debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
+        debug_assert_eq!(coverage.len(), total, "coverage is sampled over the race's own peer slice");
         let addrs = |ix: &[usize]| -> Vec<std::net::SocketAddr> {
             ix.iter().map(|i| peers[*i].addr()).collect()
         };
-        match pool_race_verdict(out) {
+        match pool_race_verdict(out, coverage) {
             PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
-                self.record_batch_failures(&addrs(&failed)).await;
+                self.record_batch_failures(&addrs(&failed), true).await;
                 for i in outpaced {
                     self.pool.record_snap_outpaced(peers[i].addr()).await;
                 }
                 self.pool.record_snap_served(peers[idx].addr()).await;
                 Ok(value)
             }
-            PoolRaceVerdict::TipLag { summary, failed } => {
-                tracing::warn!(total, target_num, back, summary = %summary, "{}", label);
+            PoolRaceVerdict::TipLag { summary, failed, excused } => {
+                let failed = addrs(&failed);
+                tracing::warn!(total, target_num, back, excused = excused.len(), ?failed,
+                    summary = %summary, "{}", label);
                 Err(PoolReadError::TipLag {
                     error: format!("all {total} snap peer(s) failed to serve {what}: {summary}"),
-                    failed: addrs(&failed),
+                    failed,
                 })
             }
             PoolRaceVerdict::Fatal { summary, failed } => {
-                tracing::warn!(total, target_num, back, summary = %summary, "{}", label);
-                self.record_batch_failures(&addrs(&failed)).await;
+                let failed = addrs(&failed);
+                tracing::warn!(total, target_num, back, ?failed, summary = %summary, "{}", label);
+                self.record_batch_failures(&failed, false).await;
                 Err(PoolReadError::Fatal(format!(
                     "all {total} snap peer(s) failed to serve {what}: {summary}"
                 )))
@@ -5424,7 +5467,8 @@ impl ElReader {
                     // Giving up (or a pinned read, which never retries): bank
                     // this final attempt's deferred strikes — one per peer per
                     // failed read, the pre-retry rate (PoolReadError::TipLag).
-                    self.record_batch_failures(&failed).await;
+                    // Unwitnessed: nobody served, so nothing is persisted.
+                    self.record_batch_failures(&failed, false).await;
                     return Err(error);
                 }
                 Err(PoolReadError::Fatal(e)) => return Err(e),
@@ -5466,6 +5510,9 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
+        // Each peer's coverage of the window top, sampled before the race
+        // (see pool_race_verdict).
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage_of(head_num)).collect();
         // Hedged (hedged_race): a silent first peer no longer costs a whole
         // request timeout before the next one is asked — on a flaky pool that
         // stacked up per dead peer, which is where 45-second block reads came
@@ -5490,6 +5537,7 @@ impl ElReader {
         match self
             .settle_pool_race(
                 &peers,
+                &coverage,
                 out,
                 (target_num, back),
                 "a verifiable block",
@@ -6101,7 +6149,7 @@ impl ElReader {
                         tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
                         continue;
                     }
-                    self.record_batch_failures(&failed).await;
+                    self.record_batch_failures(&failed, false).await;
                     return Err(error);
                 }
                 Err(PoolReadError::Fatal(e)) => return Err(e),
@@ -6137,6 +6185,7 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage_of(head_num)).collect();
         // Hedged like get_block_by_number_inner, on the same depth-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
         // this read also feeds the log-index appender, which abandons its whole
@@ -6153,6 +6202,7 @@ impl ElReader {
         .await;
         self.settle_pool_race(
             &peers,
+            &coverage,
             out,
             (target_num, back),
             "verifiable block receipts",
@@ -6216,9 +6266,16 @@ impl ElReader {
     /// so a whole-pool TIP-LAG failure (our anchor ahead of the peers' imported
     /// tip — no peer's fault) strikes nobody; every other outcome banks the
     /// strikes exactly as immediate recording did.
-    async fn record_batch_failures(&self, failed: &[std::net::SocketAddr]) {
+    ///
+    /// `witnessed`: another peer served the same read (a won race's misses).
+    /// A whole-pool failure is unwitnessed — banked live, persisted nowhere.
+    async fn record_batch_failures(&self, failed: &[std::net::SocketAddr], witnessed: bool) {
         for addr in failed {
-            self.pool.record_snap_failure(*addr).await;
+            if witnessed {
+                self.pool.record_snap_failure(*addr).await;
+            } else {
+                self.pool.record_snap_failure_unwitnessed(*addr).await;
+            }
         }
     }
 
@@ -6649,6 +6706,9 @@ async fn fetch_anchored_window(
             return Err("header window is not hash-linked".to_string());
         }
     }
+    // Proof of the peer's head: it served a verified window up to the top
+    // (peer::KnownHead) — what the read ladder ranks it by from here on.
+    peer.note_head_served(window[window.len() - 1].header.number);
     Ok(window)
 }
 
@@ -7517,7 +7577,7 @@ mod tests {
                 outpaced: vec![1],
                 errors: vec!["transport timeout".to_string()],
             };
-            match pool_race_verdict(out) {
+            match pool_race_verdict(out, &[]) {
                 PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
                     assert_eq!((idx, value), (2, 9));
                     assert_eq!(failed, vec![0]);
@@ -7537,13 +7597,67 @@ mod tests {
                 outpaced: vec![],
                 errors,
             };
-            match pool_race_verdict(failed_race(vec![lag.clone(), lag.clone()])) {
-                PoolRaceVerdict::TipLag { failed, .. } => assert_eq!(failed, vec![0, 1]),
+            match pool_race_verdict(failed_race(vec![lag.clone(), lag.clone()]), &[]) {
+                PoolRaceVerdict::TipLag { failed, excused, .. } => {
+                    assert_eq!(failed, vec![0, 1]);
+                    assert!(excused.is_empty(), "no coverage sampled: nobody is excused");
+                }
                 _ => panic!("an all-tip-lag pool must defer its strikes"),
             }
-            match pool_race_verdict(failed_race(vec![lag, "connection reset".to_string()])) {
+            match pool_race_verdict(failed_race(vec![lag, "connection reset".to_string()]), &[]) {
                 PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0, 1]),
                 _ => panic!("any other reason makes the failure Fatal"),
+            }
+        }
+
+        #[test]
+        fn a_peer_that_announced_it_was_behind_is_excused_from_a_tip_lag_batch() {
+            use crate::el::peer::Coverage;
+            let lag = "peer returned 0 headers, expected 1".to_string();
+            let out = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0, 1, 2],
+                outpaced: vec![],
+                errors: vec![lag.clone(), lag.clone(), lag],
+            };
+            let coverage = [Coverage::Behind, Coverage::Unknown, Coverage::Covers];
+            match pool_race_verdict(out, &coverage) {
+                PoolRaceVerdict::TipLag { failed, excused, .. } => {
+                    assert_eq!(excused, vec![0]);
+                    // The peer nobody can vouch for keeps the deferred strike,
+                    // and so does the one that claimed the head and served nothing.
+                    assert_eq!(failed, vec![1, 2]);
+                }
+                _ => panic!("an all-tip-lag pool must settle as TipLag"),
+            }
+        }
+
+        #[test]
+        fn a_behind_peer_is_not_excused_from_a_fatal_or_won_race() {
+            // Only the tip-lag arm consults coverage (see pool_race_verdict).
+            use crate::el::peer::Coverage;
+            let fatal = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec!["connection reset".to_string()],
+            };
+            match pool_race_verdict(fatal, &[Coverage::Behind]) {
+                PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0]),
+                _ => panic!("a non-tip-lag reason is Fatal"),
+            }
+            let won = RaceOutcome {
+                accepted: Some((1, 7u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec!["peer returned 0 headers, expected 1".to_string()],
+            };
+            match pool_race_verdict(won, &[Coverage::Behind, Coverage::Covers]) {
+                PoolRaceVerdict::Won { failed, .. } => assert_eq!(failed, vec![0]),
+                _ => panic!("a race with a winner must settle as Won"),
             }
         }
 
@@ -8338,8 +8452,9 @@ const RESAMPLE_EVERY: u64 = 16;
 ///
 /// Staleness is keyed on the ADDRESS, not on a pool position. Rotating
 /// positions instead is what an earlier revision did, and it cannot deliver the
-/// per-peer guarantee: `snap_peers()` returns the pool newest-dialed first, so
-/// every dial or drop shifts the peers below it by one and `% n` changes
+/// per-peer guarantee: `snap_peers()` returns the pool in read-ladder order
+/// (reshuffled by every dial, drop, bench or head announcement), so
+/// every change shifts the peers below it by one and `% n` changes
 /// modulus with the pool size — over the ~192 rounds it takes to cycle a
 /// 12-peer pool, the peer at a given position is not the peer that was there
 /// when the cycle started. Keyed on the address, a demoted peer is re-measured
@@ -9209,8 +9324,9 @@ mod backfill_peer_rank_tests {
 
     /// The staleness clock is keyed on the ADDRESS, so the guarantee above is
     /// per-PEER and survives pool churn. Rotating pool POSITIONS — what an
-    /// earlier revision did — cannot: `snap_peers()` lists newest-dialed first,
-    /// so a single dial or drop shifts every peer below it and silently hands
+    /// earlier revision did — cannot: `snap_peers()` lists the pool in
+    /// read-ladder order (reshuffled by every dial, drop, bench or head
+    /// announcement), so a single change shifts every peer below it and silently hands
     /// the promotion to a different peer than the cycle was walking toward.
     #[test]
     fn the_promoted_peer_follows_the_address_not_the_pool_position() {
