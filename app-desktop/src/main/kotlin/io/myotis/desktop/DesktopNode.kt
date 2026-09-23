@@ -306,15 +306,15 @@ class DesktopNodeController(
 
     override val canImportLogIndex: Boolean get() = true
 
-    // Only the Bee PoC flavour seeds anything; the notice is fixed for the life of the
+    // Only a PoC flavour seeds anything; the notice is fixed for the life of the
     // process (the manifest is written before any network starts), so compute it once
     // per network rather than re-reading a file on every recomposition.
     private val seededNotices = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<String>>()
 
     override fun seededIndexNotice(network: String): String? {
-        if (!BeePoc.enabled()) return null
+        val poc = Poc.active() ?: return null
         return seededNotices
-            .computeIfAbsent(network) { java.util.Optional.ofNullable(BeePoc.seededIndexNotice(dataDir, it)) }
+            .computeIfAbsent(network) { java.util.Optional.ofNullable(poc.seededIndexNotice(dataDir, it)) }
             .orElse(null)
     }
 
@@ -746,7 +746,7 @@ class DesktopSettings(
         synchronized(this) { logIndexMax[network] ?: false }
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
     override fun logIndexBackfillPaused(network: String): Boolean =
-        synchronized(this) { logIndexPaused[network] ?: BeePoc.backfillPausedDefault() }
+        synchronized(this) { logIndexPaused[network] ?: (Poc.active()?.backfillPausedDefault() ?: false) }
     override fun setLogIndexBackfillPaused(network: String, on: Boolean) = mutate { logIndexPaused[network] = on }
     override fun logIndexConfigured(network: String): Boolean =
         synchronized(this) { logIndexOn.containsKey(network) }

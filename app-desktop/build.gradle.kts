@@ -146,22 +146,45 @@ val composeOsArchDir = run {
 // (see the Bee PoC section below), `-PbeePoc=false` a regular build. Anything
 // else is refused rather than quietly building the regular flavour — a flag
 // that changes the artifact must be applied or rejected, never ignored.
-val beePoc: Boolean = providers.gradleProperty("beePoc")
+fun flavourFlag(name: String): Boolean = providers.gradleProperty(name)
     .map { raw ->
         when (raw.trim().lowercase()) {
             "", "true" -> true
             "false" -> false
-            else -> throw GradleException("-PbeePoc must be bare, =true or =false (got '$raw')")
+            else -> throw GradleException("-P$name must be bare, =true or =false (got '$raw')")
         }
     }
     .getOrElse(false)
+
+val beePoc: Boolean = flavourFlag("beePoc")
+
+// The RAILGUN PoC flavour flag (-PrailgunPoc): bundles the mainnet
+// RailgunSmartWallet log-index seed so the RAILGUN Terminal Wallet can use the
+// app instead of a public RPC provider from the first minute (RailgunPoc.kt,
+// docs/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
+val railgunPoc: Boolean = flavourFlag("railgunPoc")
+
+// Exactly one flavour, or none. The two disagree about which network to enable
+// and which data dir to own, so a build with both would produce an app that
+// half-applies each — a packaging mistake, caught here rather than at runtime.
+if (beePoc && railgunPoc) {
+    throw GradleException("-PbeePoc and -PrailgunPoc are mutually exclusive — build one flavour at a time")
+}
+
+/** The active flavour's staging root name and the seed files only it may ship. */
+val pocFlavourName: String? = when {
+    beePoc -> "beePoc"
+    railgunPoc -> "railgunPoc"
+    else -> null
+}
 
 // Single source of truth for the staged-resources root: the staging tasks'
 // outputs, Compose's appResourcesRootDir, and the packaging tasks' input all
 // derive from it (a drifting duplicate literal would silently untrack). It is
 // FLAVOUR-SPECIFIC: the two flavours never share a staging dir, so a regular
 // build cannot ship a seed a -PbeePoc build staged earlier.
-val rustAppResourcesRoot = layout.buildDirectory.dir(if (beePoc) "beePocAppResources" else "rustAppResources")
+val rustAppResourcesRoot =
+    layout.buildDirectory.dir(pocFlavourName?.let { "${it}AppResources" } ?: "rustAppResources")
 
 val prepareRustAppResources = tasks.register("prepareRustAppResources") {
     group = "build"
@@ -190,10 +213,12 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
         // into different roots, but a root that predates that split (or a stray
         // copy) would be synced into the bundle unnoticed — scrub it here, on
         // every regular staging run.
-        if (!beePoc) {
+        if (pocFlavourName == null) {
             val common = rustAppResourcesRoot.get().dir("common").asFile
-            listOf("logindex-gnosis.db", "bee-poc-seed.properties", "peers-gnosis.cache", "cl-peers-gnosis.cache")
-                .forEach { common.resolve(it).delete() }
+            listOf(
+                "logindex-gnosis.db", "bee-poc-seed.properties", "peers-gnosis.cache", "cl-peers-gnosis.cache",
+                "logindex.db", "railgun-poc-seed.properties",
+            ).forEach { common.resolve(it).delete() }
         }
     }
 }
@@ -282,7 +307,13 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
 // resources root above keeps a regular build from ever shipping the seed.
 // ---------------------------------------------------------------------------
-val beePocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
+// Compose flattens appResources/common/ next to the os-arch dir; both
+// flavours stage their seed there, into their own flavour-specific root.
+val pocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
+
+// The PostageStamp contract at its REAL deployment block — never the seed's
+// fetched low edge (from_block is the engine's "no logs below here" assertion).
+val beePocWatch = "0x45a1502382541Cd610CC9068e88727426b696293:31305656"
 
 val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     group = "build"
@@ -291,8 +322,8 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     val meta = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json")
     val logs = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz")
     val script = rootProject.file("scripts/synth_logindex.py")
-    val seed = beePocSeedDir.map { it.file("logindex-gnosis.db") }
-    val manifest = beePocSeedDir.map { it.file("bee-poc-seed.properties") }
+    val seed = pocSeedDir.map { it.file("logindex-gnosis.db") }
+    val manifest = pocSeedDir.map { it.file("bee-poc-seed.properties") }
     // Warm peer caches (the engine's own tab/multiaddr text formats, public
     // peers only): a cold Gnosis pool is the PoC's other failure mode — on
     // 2026-09-15 it sank to one unresponsive snap peer for ten minutes, the
@@ -300,12 +331,16 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     val peerCaches = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
     val cacheSources = peerCaches.map { rootProject.file("data/bee/gnosis/$it") }
     inputs.files(meta, logs, script, cacheSources)
-    outputs.files(seed, manifest, peerCaches.map { n -> beePocSeedDir.map { it.file(n) } })
+    // Same reason as the RAILGUN task: the watch assertion is not a file and the
+    // build script is not a task input, so without this a corrected deployment block
+    // would leave the task UP-TO-DATE and ship the previous frame.
+    inputs.property("watch", beePocWatch)
+    outputs.files(seed, manifest, peerCaches.map { n -> pocSeedDir.map { it.file(n) } })
     doLast {
-        beePocSeedDir.get().asFile.mkdirs()
+        pocSeedDir.get().asFile.mkdirs()
         cacheSources.forEach { src ->
             check(src.isFile && src.length() > 0) { "bee-poc: warm peer cache missing or empty: $src" }
-            src.copyTo(beePocSeedDir.get().asFile.resolve(src.name), overwrite = true)
+            src.copyTo(pocSeedDir.get().asFile.resolve(src.name), overwrite = true)
         }
         val cmd = listOf(
             "python3", script.absolutePath,
@@ -313,7 +348,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
             "--logs", logs.absolutePath,
             // The REAL deployment block: from_block is the engine's "no logs
             // below here" assertion, never the seed's fetched low edge.
-            "--watch", "0x45a1502382541Cd610CC9068e88727426b696293:31305656",
+            "--watch", beePocWatch,
             "--out", seed.get().asFile.absolutePath,
             // The script describes what it wrote (coverage, usable-until block,
             // sha256) — the manifest BeePoc.kt checks before installing.
@@ -331,6 +366,118 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RAILGUN PoC flavour (-PrailgunPoc): bundle the mainnet RailgunSmartWallet
+// log-index seed so the RAILGUN Terminal Wallet can be pointed at this app
+// instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
+//
+// The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
+// 58 MB gzip of ~39k logs; RAILGUN's is 426k logs over 11.3M blocks — 549 MB
+// raw, and a git object nobody wants in a clone. So this task reads the fetch
+// from a directory given by -PrailgunSeedDir (default ~/myotis-node/railgun),
+// produced by the fetch described in docs/railgun-poc.md, and fails with that
+// instruction when it is not there. A missing seed must never degrade into a
+// silently seedless "RAILGUN PoC" build that then backfills for days.
+// ---------------------------------------------------------------------------
+val railgunSeedDir: File = providers.gradleProperty("railgunSeedDir")
+    .map { file(it) }
+    .getOrElse(File(System.getProperty("user.home"), "myotis-node/railgun"))
+
+// The REAL deployment block, and the chain agrees: the proxy's first log is at
+// exactly 14737691 and a sweep from genesis found none below it. `from_block` is
+// the engine's "no logs below here" assertion, so a lower value here turns real
+// history into plausible empty answers (docs/railgun-poc.md spells this out).
+val railgunWatch = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691"
+
+val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
+    group = "build"
+    description = "Synthesize the RAILGUN PoC mainnet log-index seed from -PrailgunSeedDir and stage it into Compose appResources (-PrailgunPoc only)"
+    onlyIf { railgunPoc }
+    val script = rootProject.file("scripts/synth_logindex.py")
+    val seed = pocSeedDir.map { it.file("logindex.db") }
+    val manifest = pocSeedDir.map { it.file("railgun-poc-seed.properties") }
+    val seedDir = railgunSeedDir
+    inputs.files(script)
+    // A fileTree behind a provider, NOT inputs.dir: a missing dir makes Gradle fail
+    // validation with "an input file was expected to be present", which buries the
+    // instruction the developer actually needs. Absent here means no inputs, and the
+    // doLast check below is the fail-loud gate that names the fix.
+    //
+    // NARROWED to the fetch's own files on purpose: the docs tell developers to run
+    // the framing script by hand in this directory to inspect the result, which drops
+    // a ~243 MB logindex.db and a manifest beside the ~549 MB jsonl. Fingerprinting
+    // the whole tree would re-hash ~800 MB on every up-to-date check and mark the
+    // task dirty after each manual inspection.
+    inputs.files(
+        provider {
+            if (seedDir.isDirectory) {
+                fileTree(seedDir) { include("*.meta.json", "railgun-logs.jsonl", "railgun-logs.jsonl.gz") }
+            } else {
+                files()
+            }
+        },
+    )
+    // The frame's OWN assertions, declared so a change to either re-runs the task.
+    // Neither is a file, and the build script is not a task input, so without these a
+    // corrected deployment block would leave the dmg shipping the previous frame —
+    // whose from_block makes the engine answer [] below the floor without consulting
+    // coverage. That is the one defect class this file keeps warning about.
+    inputs.property("watch", railgunWatch)
+    outputs.files(seed, manifest)
+    doLast {
+        check(seedDir.isDirectory) {
+            "railgun-poc: no seed data at $seedDir. Fetch it first (docs/railgun-poc.md, " +
+                "\"Building the seed\"), or point -PrailgunSeedDir at a directory holding the " +
+                "fetch's .jsonl and .meta.json."
+        }
+        // One pair, found by shape rather than by a pinned filename: the range is
+        // in the name and a re-fetch changes it. Two pairs would be ambiguous, so
+        // refuse rather than guess which fetch the build meant.
+        val metas = seedDir.listFiles { f: File -> f.name.endsWith(".meta.json") }?.sorted().orEmpty()
+        check(metas.size == 1) {
+            "railgun-poc: expected exactly one *.meta.json in $seedDir, found ${metas.size} " +
+                "${metas.map { it.name }} — leave only the fetch this build should bundle."
+        }
+        val meta = metas.single()
+        val logs = seedDir.resolve("railgun-logs.jsonl").takeIf { it.isFile }
+            ?: seedDir.resolve("railgun-logs.jsonl.gz").takeIf { it.isFile }
+            ?: throw GradleException("railgun-poc: no railgun-logs.jsonl(.gz) beside $meta")
+        pocSeedDir.get().asFile.mkdirs()
+        // Trimming the top is only safe to skip when the fetch ran to a block that
+        // CANNOT reorg. The meta records which tag it used; a fetch to `latest` with
+        // margin 0 would freeze a since-reorged block into the seed and the engine
+        // would serve it as fully covered — a silent wrong answer, the exact case the
+        // coverage rules exist to prevent. So the margin follows the meta rather than
+        // a convention the developer was asked to remember.
+        val toBlockTag = groovy.json.JsonSlurper().parse(meta) .let { (it as Map<*, *>)["toBlockTag"] }?.toString()
+        val margin = if (toBlockTag == "finalized") "0" else null
+        if (margin == null) {
+            logger.lifecycle(
+                "railgun-poc: ${meta.name} does not declare toBlockTag=finalized (got ${toBlockTag ?: "nothing"}) — " +
+                    "keeping the default reorg margin, so the seed's top is trimmed",
+            )
+        }
+        val cmd = listOf(
+            "python3", script.absolutePath,
+            "--meta", meta.absolutePath,
+            "--logs", logs.absolutePath,
+            "--watch", railgunWatch,
+        ) + (margin?.let { listOf("--finality-margin", it) } ?: emptyList()) + listOf(
+            "--out", seed.get().asFile.absolutePath,
+            "--manifest", manifest.get().asFile.absolutePath,
+        )
+        val proc = ProcessBuilder(cmd).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
+        val stderr = proc.errorStream.bufferedReader().readText()
+        check(proc.waitFor() == 0 && seed.get().asFile.isFile && manifest.get().asFile.isFile) {
+            "railgun-poc: scripts/synth_logindex.py failed (python3 required):\n$stderr"
+        }
+        val summary = manifest.get().asFile.readLines()
+            .filter { it.startsWith("covered") || it.startsWith("usableUntil") || it.startsWith("logs=") }
+            .joinToString(", ")
+        logger.lifecycle("railgun-poc: staged ${seed.get().asFile.name} — $summary")
+    }
+}
+
 // Compose's own internal prepareAppResources task copies appResourcesRootDir
 // into the image — our staging must run before IT (depending only on the
 // package*/createDistributable* umbrella tasks is too late: the internal copy
@@ -345,7 +492,7 @@ tasks.configureEach {
     ) {
         dependsOn(prepareRustAppResources)
         dependsOn(prepareJnaBootLib)
-        dependsOn(prepareBeePocSeed)
+        dependsOn(prepareBeePocSeed, prepareRailgunPocSeed)
         // Compose's jpackage tasks do NOT track the app-resources CONTENT as
         // an input: after a Rust-only change, prepareRustAppResources and
         // Compose's own prepareAppResources both re-run, yet
@@ -379,6 +526,7 @@ compose.desktop {
         // The Bee PoC flavour identifies itself to Main.kt/BeePoc.kt through this
         // property — baked into the package AND applied to :app-desktop:run.
         if (beePoc) jvmArgs += "-Dmyotis.beePoc=true"
+        if (railgunPoc) jvmArgs += "-Dmyotis.railgunPoc=true"
         // Pin the runtime jpackage bundles (via jlink) to the Java 21 toolchain. Our bytecode
         // is class-file 65 (jvmToolchain(21)) and the backend (:networking discv5, :myotis-evm
         // Besu) ships Java-21 classes that NEED a 21 runtime to load. Without this, jpackage
@@ -398,7 +546,11 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             // The Bee PoC flavour is a separate app (own name, own bundle id, own
             // data dir — see BeePoc.kt) so it coexists with a regular install.
-            packageName = if (beePoc) "Myotis Bee PoC" else "Myotis"
+            packageName = when {
+                beePoc -> "Myotis Bee PoC"
+                railgunPoc -> "Myotis RAILGUN PoC"
+                else -> "Myotis"
+            }
             // Applies to the dmg (and a future msi); the deb overrides it below.
             // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
@@ -413,7 +565,11 @@ compose.desktop {
             // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
             includeAllModules = true
             macOS {
-                bundleID = if (beePoc) "io.myotis.desktop.beepoc" else "io.myotis.desktop"
+                bundleID = when {
+                    beePoc -> "io.myotis.desktop.beepoc"
+                    railgunPoc -> "io.myotis.desktop.railgunpoc"
+                    else -> "io.myotis.desktop"
+                }
             }
             linux {
                 // Unlike the dmg (jpackage requires major > 0 on macOS), deb versions may

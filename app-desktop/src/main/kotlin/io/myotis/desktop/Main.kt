@@ -30,14 +30,15 @@ fun main() {
         val f = resourcesDir.resolve(lib).toFile()
         if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
     }
-    // The Bee PoC flavour (-PbeePoc → -Dmyotis.beePoc=true) lives in its own data dir and
-    // seeds its Gnosis log index from the bundle before anything reads that dir.
-    val beePoc = BeePoc.enabled()
-    val dataDir = if (beePoc) BeePoc.dataDir() else Path.of(System.getProperty("user.home"), ".myotis")
+    // A PoC flavour (-PbeePoc / -PrailgunPoc → -Dmyotis.<flavour>=true) lives in its own
+    // data dir and seeds that network's log index from the bundle before anything reads
+    // that dir. Null for a regular build, which is every build that sets neither property.
+    val poc = Poc.active()
+    val dataDir = poc?.dataDir() ?: Path.of(System.getProperty("user.home"), ".myotis")
     // Keep the PoC's logs in its own data dir too. logback-desktop.xml reads
     // myotis.logdir when the first logger is created, so this must precede
-    // every log call (BeePoc's logger is lazy for exactly this reason).
-    if (beePoc && System.getProperty("myotis.logdir") == null) {
+    // every log call (PocFlavour's logger is lazy for exactly this reason).
+    if (poc != null && System.getProperty("myotis.logdir") == null) {
         System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
     }
     // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
@@ -52,10 +53,10 @@ fun main() {
     }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
-    if (beePoc) BeePoc.installSeedIfAbsent(resourcesDir, dataDir)
+    poc?.installSeedIfAbsent(resourcesDir, dataDir)
     // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings(file = settingsFile)
-    if (beePoc) BeePoc.applyFirstStartSettings(settings, firstStart)
+    poc?.applyFirstStartSettings(settings, firstStart)
     val controller = DesktopNodeController(dataDir, settings)
     // Apply the persisted engine choice BEFORE the first network start, so a saved
     // Rust-engine preference survives a restart (Android parity: NodeService applies
@@ -80,7 +81,9 @@ fun main() {
             // Tear down the in-process node stack (Netty event loops, libp2p, sync threads)
             // before exiting so closing the window doesn't leak resources or hang shutdown.
             onCloseRequest = { controller.shutdown(); exitApplication() },
-            title = if (beePoc) "Myotis Bee PoC" else "Myotis",
+            // The window title names the flavour, so two PoC builds running side by side
+            // are distinguishable at a glance (they already own separate data dirs).
+            title = poc?.let { "Myotis ${it.label}" } ?: "Myotis",
         ) {
             NodeScreen(controller, settings, DesktopLogSource, history = history)
         }
