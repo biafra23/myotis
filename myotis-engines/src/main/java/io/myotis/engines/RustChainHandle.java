@@ -868,8 +868,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /** Package-private test seam: call JSON → the engine's three-way outcome.
      *  The Rust side emits {@code {"status":"ok","resultHex"}} /
      *  {@code {"status":"revert","dataHex"}} / {@code {"status":"unavailable",
-     *  "reason"}} (pinned by the eljson golden tests); a revert is a VERIFIED
-     *  answer whose payload the host serves as the standard code-3 error. */
+     *  "reason"}}, each with {@code blockNumber} (the block the call ran
+     *  against) and {@code verified} (ran against the beacon-finalized block)
+     *  since ABI 30 — all pinned by the eljson golden tests; the two extra keys
+     *  are not surfaced through {@link io.myotis.api.CallResult} yet. A revert
+     *  is a VERIFIED answer whose payload the host serves as the standard
+     *  code-3 error. */
     static io.myotis.api.CallResult callDetailedFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "call");
         try {

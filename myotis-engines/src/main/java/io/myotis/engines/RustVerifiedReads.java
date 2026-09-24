@@ -26,11 +26,16 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
- * of {@code latest}/{@code pending}/{@code safe}/{@code finalized}/default, OR a
- * specific number within {@code [head-64, head+16]} (wallets pin reads to the
- * just-fetched latest number), is served from the verified head. A genuinely older
- * block returns {@code null} — the head state does NOT stand in for it. So within
- * the lag window a near-head number resolves to the verified head state (standard
+ * of {@code latest}/{@code pending}/{@code safe}/default, OR a specific number
+ * within {@code [head-64, head+16]} (wallets pin reads to the just-fetched
+ * latest number), is served from the verified head. Since engine ABI 30 (#465)
+ * {@code finalized} is APPLIED by {@code call}, {@code getBlockByNumber},
+ * {@code getBlockReceipts} and {@code feeHistory}: they run against, or serve,
+ * the beacon-finalized block (and refuse, retryably, while no finalized block
+ * has landed); the account/code/storage/nonce reads still resolve
+ * {@code finalized} to the verified head (#366). A genuinely older block returns
+ * {@code null} — the head state does NOT stand in for it. So within the lag
+ * window a near-head number resolves to the verified head state (standard
  * light-client skew); a caller needing exact historical state below the window
  * gets {@code null}, never head data mislabeled as an old block.
  *

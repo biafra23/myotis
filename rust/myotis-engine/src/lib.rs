@@ -101,7 +101,18 @@ uniffi::setup_scaffolding!();
 ///      pointer in the refusal message instead of an "undecodable string".
 ///      Plain-C callers only (the Node and iOS bindings never pass NULL); a
 ///      behavior change, no signature change.
-pub const ABI_VERSION: i32 = 29;
+/// v30: eth_call_json / eth_call_overrides_json and the block-read selectors
+///      (get_block_by_number_json, get_block_receipts_json, fee_history_json)
+///      now HONOUR `finalized` (#465, #366): the call runs against the
+///      beacon-finalized block and the block reads serve it, instead of the
+///      optimistic head. The call envelope gained `blockNumber` and
+///      `verified` (= ran against the finalized block), naming the block that
+///      answered (#382; `verified` is false on `unavailable`, which ran
+///      nowhere). `safe` and `pending` still resolve to the head —
+///      documented, not silent — and so does `finalized` on the JVM hosts'
+///      state reads and on the Java engine (#366). A behavior change and a
+///      payload extension, no signature change.
+pub const ABI_VERSION: i32 = 30;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

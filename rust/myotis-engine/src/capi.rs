@@ -272,8 +272,10 @@ pub unsafe extern "C" fn myotis_get_storage_at_json(
 /// `from` empty ⇒ anonymous sender; `value` is wei as a decimal string.
 /// `block` is checked by the engine (ABI ≥ 27): a number outside the window
 /// around the verified head is refused, never answered from the head (see
-/// `crate::host::eth_call_json` and the header). A NULL `to` is refused
-/// (ABI ≥ 29); pass an empty string for contract creation.
+/// `crate::host::eth_call_json` and the header); `finalized` runs against the
+/// beacon-finalized block (ABI ≥ 30), and the result names the block it ran
+/// against. A NULL `to` is refused (ABI ≥ 29); pass an empty string for
+/// contract creation.
 ///
 /// # Safety
 /// All pointer params must be null or valid null-terminated C strings.
@@ -681,6 +683,8 @@ mod tests {
         };
         // Past the block check, to the handle lookup.
         assert_eq!(call(null)["error"], "unknown handle");
+        // `finalized` is a servable selector of its own (ABI >= 30), not a refusal.
+        assert_eq!(call(c"finalized".as_ptr())["error"], "unknown handle");
         assert_eq!(call(c"earliest".as_ptr())["code"], -32602);
         // Invalid UTF-8 decodes lossily, and the result is refused.
         let bad = [0xff_u8, 0xfe, 0];

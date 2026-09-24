@@ -266,9 +266,11 @@ pub fn request_account_json<'env>(env: &'env Env, handle: i64, address: String) 
 
 /// Verified eth_call over the revm executor. `from` empty = anonymous sender;
 /// `value` is wei as a decimal string; `block` is a tag or a block number.
-/// The engine checks `block`: the call runs against the verified head, so a
-/// number outside [head-64, head+16] is refused, never answered from the head
+/// The engine checks `block`: a head tag runs against the verified head,
+/// `finalized` (ABI >= 30) against the beacon-finalized block, and a number
+/// outside [head-64, head+16] is refused, never answered from the head
 /// (`{"error","code":-32602}` when it can never be served; README "Notes").
+/// The result names the block it ran against (`blockNumber`, `verified`).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn eth_call_json<'env>(env: &'env Env,
     handle: i64,

@@ -3,11 +3,13 @@
 //! [`myotis_evm`] is sans-I/O and its [`SnapStateOracle`] is synchronous. This
 //! module is the I/O half: [`PoolOracle`] implements that trait over the snap
 //! peer pool, bridging each verified fetch to the async network via
-//! [`Handle::block_on`], and [`ElReader::eth_call`](crate::el::reader::ElReader)
-//! drives the `revm` executor on a blocking thread so that bridge never nests a
+//! [`Handle::block_on`], and
+//! [`ElReader::eth_call_overridden`](crate::el::reader::ElReader) drives the
+//! `revm` executor on a blocking thread so that bridge never nests a
 //! `block_on` inside a runtime worker.
 //!
-//! Every fetch pins to the executor-supplied `state_root` (the verified head's),
+//! Every fetch pins to the executor-supplied `state_root` (the call's anchor:
+//! the verified head's, or the beacon-finalized block's for [`CallAnchor::Finalized`]),
 //! so all reads in one call see a single consistent block. Verification is
 //! verify-on-fetch: `snap_get_account`/`snap_get_storage` MPT-verify against that
 //! root and `snap_get_bytecode` checks `keccak(code) == code_hash`, so a peer can
@@ -53,6 +55,41 @@ pub enum CallOutcome {
     /// The call could not be executed/verified (out of gas, halt, state
     /// unavailable, unsupported fork/chain). The string is diagnostic.
     Unavailable(String),
+}
+
+/// Which verified block an `eth_call` runs against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAnchor {
+    /// The beacon OPTIMISTIC head — the `latest` (and `pending`/`safe`) tag.
+    Head,
+    /// The beacon FINALIZED execution block — the `finalized` tag: older and
+    /// never reorged, but a state peers may already have pruned, so it can be
+    /// unservable while the head serves. Never downgraded to the head: the
+    /// caller asked for finality (CLAUDE.md §Trust — applied or refused).
+    Finalized,
+}
+
+impl CallAnchor {
+    /// The anchor for a `finalized: bool` selector (the ENS entry points').
+    pub fn for_finalized(finalized: bool) -> CallAnchor {
+        if finalized {
+            CallAnchor::Finalized
+        } else {
+            CallAnchor::Head
+        }
+    }
+}
+
+/// A call's outcome plus the block it actually ran against (#382, #465): a
+/// host that asked for `finalized` can see which block answered, and one that
+/// asked for `latest` learns the head it got.
+#[derive(Debug, Clone)]
+pub struct CallAnswer {
+    pub outcome: CallOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block (the `verified` of
+    /// `ens_record_json`).
+    pub finalized: bool,
 }
 
 /// The outcome of an `estimateGas`. A REVERT is a verified chain answer (the
