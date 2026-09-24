@@ -87,17 +87,30 @@ complete on its own.
   maintainer evicts it within a tick, and an unwitnessed strike never
   persists. (The `RaceOutcome` reasons are index-aligned since the same PR,
   so the excuse is cheap if it is ever wanted.)
-- [ ] **Live cold-start checks.** (Owner's decision 2026-09-24: run now on
-  the dev Mac; results to be recorded here.) None of the automated checks
-  dial a cold peer cache. On mainnet with the Rust engine and
-  `peers.cache` moved aside: `snapServingPeers` stays 0 until a peer proves
-  the head and reads succeed within a hedge delay of it turning positive; an
-  `eth_call` at `finalized` answers (`blockNumber` = the finalized block,
-  `verified: true`) while `latest` still fails on a pool that lacks the head;
-  a known-serving enode pushed through the Node addon's `setBootEnodes` on a
-  fresh data dir connects first, and a malformed entry refuses the whole
-  push; and, since ABI 32, a state read at `finalized` (`eth_getBalance`)
-  proving on the pool at hand. Steps in the PR bodies of #481 and #482.
+- [x] **Live cold-start checks** — run 2026-09-24 on the dev Mac: mainnet,
+  Rust engine (`./gradlew :app:run -Pengine=rust`; the daemon's data dir is
+  its working dir, `app/`, so `app/peers.cache` was moved aside; the CL
+  snapshot was warm), polled every 5 s over JSON-RPC.
+  - `SYNCED` 90 s after the gradle start, and the FIRST poll after the RPC
+    came up already read `snapPeers 1, snapServingPeers 1` with
+    `eth_getBalance(latest)` answering in 0.37 s: the first pooled peer
+    proved the head at once. Three dials were refused for announcing a head
+    far behind; the cache ended with 3 `snapok` and 0 `snapbad` entries.
+  - At `finalized`: `eth_getBalance`, `eth_getTransactionCount` and
+    `eth_getCode` answered in ≤ 0.2 s, `eth_call` in 1.5 s,
+    `eth_getBlockByNumber` matched the beacon status's finalized block,
+    `eth_feeHistory` served. `latest` reads succeeded on the same pool, so
+    "finalized serves while latest fails" had no occasion to show.
+  - Weak spot seen: the pool held only 1–2 peers for 15 minutes (few
+    snap-capable peers discovered, 150+ addresses in backoff), and one peer
+    that went silent after serving cost 4–5 s reads and two retryable
+    `-32000`s over four minutes until the EL hunt engaged and evicted it —
+    the #320 latency class, on a thin pool.
+  - Seed pin through the Node addon on a fresh data dir: a DNS-named entry
+    refused (`false`), a `snapok` peer pushed (`true`), dialed on the first
+    tick (`EL pool host seed pins replaced count=1`, `snap peer connected`);
+    `snapPeers 1 / snapServingPeers 1` after 5 s in one run and after 60 s
+    in another, where the peer dropped the session five times first.
 - [x] **A seed-pin surface for the JVM hosts** — dropped until a JVM host
   asks: `myotis_set_boot_enodes` exists on the C ABI, the Node addon and the
   iOS wrapper.
