@@ -177,7 +177,14 @@ explicitly says not to open one.
 
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
 **ask these three questions first and act only on what they choose** (owner
-rulings, 2026-09-02 and 2026-09-11):
+rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
+below, mandatory, never asked about** (owner ruling, 2026-09-24). Everything a
+release needs goes into ONE release PR. **The tag is the owner's action**: after
+the merge the owner pushes it, or explicitly asks for it to be pushed — never
+push a `v*` tag on your own initiative, it is the publish trigger for every
+asset workflow and a stronger action than the merge this file already forbids.
+(v0.1.12 is the one exception to the one-PR rule: #484 carried steps 1–3 and
+#485 the bump and this rule. From v0.1.13 on, one PR.)
 
 1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
    blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
@@ -261,6 +268,49 @@ rulings, 2026-09-02 and 2026-09-11):
    Run them AFTER any checkpoint refresh from question 1, so the build under
    test is the one being shipped. A failure here is release-blocking: it means
    a fresh install cannot sync, which is the one thing a wallet must do.
+
+4. **Move the version pins. MANDATORY — not a question, and part of the SAME
+   release PR as steps 1–3** (owner ruling, 2026-09-24). Every release from
+   v0.1.8 to v0.1.11 did this inside its one release PR, but only by precedent;
+   the v0.1.12 checkpoint PR (#484) followed this list to the letter, answered
+   the three questions, and shipped no bump — `main` still declared 0.1.11, and
+   the tag would have been refused. There is no command for it yet (review
+   follow-up: a `setReleaseVersion` task); until there is, it is these six
+   files (a previous sweep commit touches these plus step 1's two checkpoint
+   files, so do not copy its file list blindly):
+
+   | file | what moves |
+   |---|---|
+   | `build.gradle.kts` | `version = "X.Y.Z-SNAPSHOT"` (root `allprojects`) |
+   | `rust/Cargo.toml` | the workspace `version` |
+   | `ios-app/Myotis/Version.xcconfig` | `MARKETING_VERSION = X.Y.Z` and `CURRENT_PROJECT_VERSION` = the root build's `releaseBuildNumber`, i.e. `X*1_000_000 + Y*1_000 + Z` (0.1.12 → 1012, 0.2.0 → 2000, 1.0.0 → 1000000; `verifyIosVersion` prints the expected value on a mismatch) |
+   | `rust/Cargo.lock`, `rust/roost/Cargo.lock`, `rust/tor-poc/Cargo.lock` | `cargo update --workspace` in each of the three manifests, so the workspace crates' own entries follow |
+
+   And, ONLY when step 3's deep walk (3c) ran from `oldest-servable.properties`'
+   entries — the dispatched workflow's default, not the `pins-only` scope and
+   not a local run from the previous tag's anchor — note in that file's comment
+   that this release's run walked from these roots. It is a servability record
+   the cold-start test trusts instead of re-probing; a note about a walk nobody
+   observed makes it lie.
+
+   Then verify. The first command is the SAME query the tag guard makes; the
+   rest cover the pins the guard does NOT see:
+
+   ```bash
+   ./gradlew -q :printReleaseVersion verifyCrateVersions verifyIosVersion   # must print releaseVersion=X.Y.Z
+   for m in rust rust/roost rust/tor-poc; do cargo update --workspace --locked --manifest-path $m/Cargo.toml; done
+   ```
+
+   `releaseVersion` must equal the tag's version core — the guard accepts
+   `vX.Y.Z` and `vX.Y.Z-<suffix>` (rc/hotfix shapes), nothing else. Know what
+   catches what: the guard refuses the tag ONLY for the Gradle pin, because it
+   compares the tag to `project.version` and nothing more. The other five are
+   PR-time failures — `./gradlew check` for the crate and iOS pins, the
+   `cargo-locks` workflow for the locks — so run them before asking for the
+   merge, or the release PR goes red after the fact. A stale `rust/Cargo.toml`
+   that slipped past both would ship a Rust engine whose devp2p and libp2p agent
+   strings advertise the previous release. The macOS dmg version is derived
+   (major + 1) and needs no edit.
 
 ## Pull requests and code review
 

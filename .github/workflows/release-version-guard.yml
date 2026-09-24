@@ -9,7 +9,7 @@
 #
 # Called as a job by every workflow that uploads assets to a `v*` tag's release:
 # android-apk, ci, desktop-dmg, desktop-linux-deb, ios-framework, ios-xcframework,
-# node-binding. Each one gates the call on startsWith(github.ref, 'refs/tags/v')
+# node-binding, railgun-dmg. Each one gates the call on startsWith(github.ref, 'refs/tags/v')
 # and makes its publishing job needs: it, so a mismatch fails the run before
 # anything is uploaded. Because it is a separate job it runs in PARALLEL with the
 # builds, and the whole step is ~30s, so the verdict lands long before a
