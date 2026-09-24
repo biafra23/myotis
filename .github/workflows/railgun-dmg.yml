@@ -132,7 +132,10 @@ jobs:
           meta=$(find "$SEED_ROOT" -maxdepth 3 -name '*.meta.json' | head -n1 || true)
           [ -n "$meta" ] || { echo "::error::the seed archive contains no *.meta.json"; find "$SEED_ROOT" -maxdepth 3; exit 1; }
           found_dir=$(dirname "$meta")
-          ls "$found_dir"/railgun-logs.jsonl "$found_dir"/railgun-logs.jsonl.gz >/dev/null 2>&1 \
+          # Either form is acceptable, so test them separately: `ls a b` exits
+          # non-zero when EITHER is missing, which rejected the first real build's
+          # correct archive for lacking the .gz it never needed.
+          [ -f "$found_dir/railgun-logs.jsonl" ] || [ -f "$found_dir/railgun-logs.jsonl.gz" ] \
             || { echo "::error::no railgun-logs.jsonl[.gz] beside $meta"; ls -la "$found_dir"; exit 1; }
           # prepareRailgunPocSeed also refuses more than one meta, but saying so
           # here names the archive as the cause rather than the build.
