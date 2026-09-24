@@ -1,0 +1,65 @@
+# Workspace clippy — deny-level lints for the engine workspace (rust/Cargo.toml).
+#
+# Nothing else in CI lints these crates. roost.yml's clippy step is scoped with
+# `--manifest-path rust/roost/Cargo.toml`, which lints roost alone, not the
+# myotis-* crates it depends on by path; and Gradle's `check` (ci.yml) runs
+# `cargo test --workspace`, never clippy. So a deny-by-default lint — code
+# clippy considers outright wrong — could land in myotis-net, myotis-engine,
+# myotis-evm, … and surface only when someone next ran clippy by hand. That is
+# how a never-looping `loop` in the eth handshake (myotis-net
+# el/eth/session.rs) failed `cargo clippy` from EL-A5 until it was fixed
+# alongside this lane.
+#
+# DENY-LEVEL ONLY, on purpose: no `-D warnings`. At introduction (2026-09,
+# clippy 1.98) the workspace carried 73 warn-level findings — style and
+# complexity, plus 3 perf and 1 suspicious — so a warnings gate would have
+# been red from day one. Ratchet from here instead of jumping: clear a group,
+# then deny it (`-D clippy::perf`), and end at `-D warnings` as roost.yml has.
+#
+# Real stable, like the sibling Rust lanes (dtolnay@stable), so a new release
+# can surface a new deny-level lint here first. That is this lane doing its
+# job: a deny-level hit names wrong code — fix it rather than pin the toolchain.
+#
+# Default features only: `myotis-engine/tor` would pull the Arti tree into CI,
+# which rust/Cargo.toml rules out.
+name: rust clippy
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "rust/**"
+      # Excluded from the workspace (rust/Cargo.toml), so nothing in them can
+      # change this lane's result; roost has its own -D warnings clippy.
+      - "!rust/roost/**"
+      - "!rust/tor-poc/**"
+      - ".github/workflows/rust-clippy.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "!rust/roost/**"
+      - "!rust/tor-poc/**"
+      - ".github/workflows/rust-clippy.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    name: Workspace clippy (deny-level lints)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Clippy (fails on deny-level lints; warnings are reported only)
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets
