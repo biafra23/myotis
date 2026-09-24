@@ -312,12 +312,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         }
     }
 
-    /** Readiness for verified reads — the serveable predicate status() ages the
-     *  head by: SYNCED, an anchored optimistic head, and a pooled snap peer that
-     *  can answer at that head ({@code snapServingPeers}, not the pooled count:
-     *  right after SYNCED a pool of peers still syncing themselves keeps
-     *  {@code snapPeers} positive for hours while every read fails, #465) — the
-     *  Rust twin of ChainStack.readyForReads. */
+    /** Readiness for verified reads — {@link #serveable(ParsedStatus)} plus the
+     *  states no amount of holding fixes (the Rust twin of
+     *  ChainStack.readyForReads). */
     private boolean readyForReads() {
         try {
             return readyForReads(readStatus());
@@ -341,7 +338,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // the bound or accept the risk), so attempt now — the refusal comes back at
         // once as the router's curated STALE_ANCHOR message (ChainStack's rule too).
         if (s.running() && s.beaconState() == BeaconState.STALE_ANCHOR) return true;
-        return s.running() && s.beaconState() == BeaconState.SYNCED
+        return s.running() && serveable(s);
+    }
+
+    /** A verified read can be served NOW: SYNCED, an anchored optimistic head, and
+     *  a pooled snap peer that can answer at that head — {@code snapServingPeers},
+     *  not the pooled count: right after SYNCED a pool of peers still syncing
+     *  themselves keeps {@code snapPeers} positive for hours while every read
+     *  fails (#465). The one predicate {@link #readyForReads} holds on and
+     *  {@link #status(ParsedStatus)} ages the verified head by. */
+    private static boolean serveable(ParsedStatus s) {
+        return s.beaconState() == BeaconState.SYNCED
                 && s.optimisticBlockNumber() > 0 && s.snapServingPeers() > 0;
     }
 
@@ -416,8 +423,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     /** The parsed native status object — CL fields plus the EL pool/discovery
      *  counts. Older natives omit the EL keys → they default to 0 (and the
-     *  paused key → false, so an older .so can only ever look RUNNING/STOPPED);
-     *  {@code snapServingPeers} (ABI ≥ 31) falls back to {@code snapPeers}. */
+     *  paused key → false, so an older .so can only ever look RUNNING/STOPPED). */
     private record ParsedStatus(
             boolean running,
             boolean paused,
@@ -480,12 +486,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         o.getInt("discv5TableSize", 0),
                         o.getLong("syncStartPeriod", -1L),
                         o.getInt("snapPeers", 0),
-                        // ABI >= 31 emits the pooled peers that can answer at the
-                        // anchored head (#465). The fallback to snapPeers protects
-                        // hand-written fixtures and release-downloaded addons in
-                        // smoke.mjs, not a live JVM: its ABI gate is exact, so a
-                        // native this wrapper loads always emits the key.
-                        o.getInt("snapServingPeers", o.getInt("snapPeers", 0)),
+                        // ABI >= 31: the pooled peers that can answer at the anchored
+                        // head (#465). Absent → 0 like every other EL key — fail
+                        // CLOSED, never the pooled count: the ABI gate is exact, so a
+                        // native this wrapper loads always emits it.
+                        o.getInt("snapServingPeers", 0),
                         o.getInt("discoveredPeers", 0),
                         o.getInt("attemptedDials", 0),
                         o.getInt("backedOffPeers", 0),
@@ -560,8 +565,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // Monotonic nanoTime — a wall-clock/NTP jump must not distort the age.
         long optHead = s.optimisticBlockNumber();
         long nowNanos = System.nanoTime();
-        boolean serveable = s.beaconState() == BeaconState.SYNCED
-                && optHead > 0 && s.snapServingPeers() > 0;
+        boolean serveable = serveable(s);
         long verifiedHeadAgeMs;
         synchronized (headAgeLock) {
             if (!serveable) {
@@ -587,7 +591,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 peers,                 // connectedPeers (CL libp2p peers)
                 s.snapPeers(),         // readyPeers (EL — pool holds only snap-ready)
                 s.snapPeers(),         // snapPeers
-                s.snapServingPeers(),  // snapServingPeers (ABI >= 31; older natives: snapPeers)
+                s.snapServingPeers(),  // snapServingPeers (ABI >= 31)
                 s.discoveredPeers(),   // discoveredPeers (discv4)
                 s.backedOffPeers(),    // backedOffPeers
                 s.blacklistedPeers(),  // blacklistedPeers

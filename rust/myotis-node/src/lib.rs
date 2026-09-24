@@ -240,15 +240,10 @@ pub fn set_ws_bound_periods(env: &Env, handle: i64, periods: i64) -> bool {
 }
 
 /// Replace this handle's HOST-SUPPLIED EL seed pins (ABI >= 31, #465):
-/// `enodes_json` is a JSON array of `enode://<128-hex pubkey>@ip:port`
-/// strings (numeric address, no DNS). The push is applied or refused AS A
-/// WHOLE — `false` for invalid JSON, a non-array, any malformed entry, a
-/// duplicate address, more than 64 entries, or an unknown handle; nothing is
-/// applied on refusal. An empty array clears the list. Kept for every
-/// start/resume and applied live to a running handle; the pins are dialed
-/// like the network's own (directly, never seeded into the peer cache;
-/// re-dialed while the pool is below its target and, above it, once proven).
-/// Per-host, never persisted.
+/// `enodes_json` is a JSON array of `enode://` URLs, applied or refused AS A
+/// WHOLE — the contract is `myotis_set_boot_enodes` in `myotis_engine.h`
+/// (README "Notes"). `false` for a refused push or an unknown handle; a NUL
+/// byte is refused here, before the engine. Per-host, never persisted.
 #[napi]
 pub fn set_boot_enodes(env: &Env, handle: i64, enodes_json: String) -> bool {
     if !scheduler::owns(env, handle) { return false; }

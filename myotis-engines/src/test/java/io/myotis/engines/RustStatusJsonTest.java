@@ -224,14 +224,16 @@ class RustStatusJsonTest {
     }
 
     @Test
-    void oldShapeWithoutSnapServingKeyFallsBackToSnapPeers() {
-        // A pre-ABI-31 native (or a hand-written fixture) has no
-        // snapServingPeers key: the pooled count stands in, as before the key.
-        String old = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+    void aShapeWithoutSnapServingKeyReadsAsNobodyServing() {
+        // No snapServingPeers key (a hand-written fixture; a loaded native
+        // always emits it, the ABI gate is exact): 0, fail closed — never the
+        // pooled count, which is the #465 false-ready this key replaces.
+        String noKey = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
                 .replace("\"snapServingPeers\":4,", "");
-        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", old);
-        assertEquals(6, s.snapServingPeers());
-        assertEquals(0L, s.verifiedHeadAgeMs());
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noKey);
+        assertEquals(6, s.snapPeers());
+        assertEquals(0, s.snapServingPeers());
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
     }
 
     @Test

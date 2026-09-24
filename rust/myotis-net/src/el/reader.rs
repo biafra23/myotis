@@ -41,7 +41,7 @@ use crate::el::evm::{
     EnsRootMode, GasOutcome, PoolOracle,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
-use crate::el::pool::{PeerPool, PoolConfig};
+use crate::el::pool::{Enode, PeerPool, PoolConfig};
 use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
@@ -77,7 +77,7 @@ pub struct ElConfig {
     /// (discv4 UDP endpoints, no key) these carry the pubkey the ECIES
     /// handshake needs, so they are dialed over RLPx directly instead of
     /// waiting for discovery to surface them.
-    pub boot_enodes: Vec<(std::net::SocketAddr, [u8; 64])>,
+    pub boot_enodes: Vec<Enode>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
@@ -88,47 +88,36 @@ const SEPOLIA_MYOTIS_ENODE: &str =
     "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405";
 
 /// Parse ONE `enode://<128 hex pubkey>@ip:port` URL, strictly: the prefix, a
-/// 128-character ASCII hex public key, `@`, then a NUMERIC `ip:port` (no DNS
-/// name — the pool dials socket addresses, and a name it cannot dial must be
-/// refused, never silently dropped). `Err` names the first rule the entry
-/// breaks, so a host's refused seed push (`myotis_set_boot_enodes`, #465)
-/// says why. The network's own pins go through it leniently
-/// (`parse_boot_enodes`).
-pub fn parse_enode(enode: &str) -> Result<(std::net::SocketAddr, [u8; 64]), &'static str> {
+/// 128-character hex public key (`peercache::parse_pubkey` — hex digits
+/// only, so a `+f` pair `from_str_radix` would take is refused, and a
+/// multi-byte character never reaches a slice: the workspace aborts on
+/// panic), `@`, then a NUMERIC `ip:port` (no DNS name — the pool dials socket
+/// addresses, and a name it cannot dial must be refused, never silently
+/// dropped). `Err` names the first rule the entry breaks, so a host's refused
+/// seed push (`myotis_set_boot_enodes`, #465) says why. The network's own
+/// pins go through it leniently (`parse_boot_enodes`).
+pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
     let Some(body) = enode.strip_prefix("enode://") else {
         return Err("missing the enode:// prefix");
     };
     let Some((pubkey_hex, host_port)) = body.split_once('@') else {
         return Err("missing the '@' between the public key and the address");
     };
-    // is_ascii() is load-bearing, not belt-and-braces: len() counts BYTES,
-    // so 64 multi-byte chars (e.g. "é" × 64 = 128 bytes) pass the length
-    // check and then panic in the slicing below at a non-char boundary —
-    // an abort, since the workspace builds panic = "abort". This parser
-    // exists to judge untrusted-ish input, so it must not.
-    if pubkey_hex.len() != 128 || !pubkey_hex.is_ascii() {
+    let Some(pubkey) = crate::el::peercache::parse_pubkey(pubkey_hex) else {
         return Err("the public key must be 128 hex characters");
-    }
-    let Ok(bytes) = (0..64)
-        .map(|i| u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-    else {
-        return Err("the public key is not hex");
     };
     let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else {
         return Err("the address must be a numeric ip:port");
     };
-    let mut pubkey = [0u8; 64];
-    pubkey.copy_from_slice(&bytes);
     Ok((addr, pubkey))
 }
 
-/// Parse the network's shipped `enode://` pins into dialable `(addr, pubkey)`
-/// pairs, skipping anything malformed — a bad pin must not panic a wallet at
-/// startup, it just leaves discovery to do the work. Twin of the Java
+/// Parse the network's shipped `enode://` pins into dialable pins, skipping
+/// anything malformed — a bad pin must not panic a wallet at startup, it just
+/// leaves discovery to do the work. Twin of the Java
 /// `ChainStack.parseBootEnodes`. (A HOST's pins are the strict case: see
 /// [`parse_enode`].)
-fn parse_boot_enodes(enodes: &[&str]) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
     enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
@@ -4410,10 +4399,11 @@ impl ElReader {
     }
 
     /// Replace the HOST-supplied EL seed pins (`myotis_set_boot_enodes`, #465):
-    /// dialed like the network's own pins — directly, now if the pool is below
-    /// target, and again by the maintainer while below target or once proven —
-    /// and never seeded into the peer cache (see `PeerPool::set_boot_enodes`).
-    pub async fn set_boot_enodes(&self, pins: Vec<(std::net::SocketAddr, [u8; 64])>) {
+    /// dialed like the network's own pins — a changed list at once, then by
+    /// the maintainer while the pool is below target or nobody serves, and
+    /// once proven above that — never seeded into the peer cache (see
+    /// `PeerPool::set_boot_enodes`).
+    pub async fn set_boot_enodes(&self, pins: Vec<Enode>) {
         self.pool.set_boot_enodes(pins).await;
     }
 
@@ -8299,14 +8289,20 @@ mod tests {
             parse_enode("enode://short@1.2.3.4:30303"),
             Err("the public key must be 128 hex characters")
         );
-        // 64 × "é" is exactly 128 bytes: refused on the ASCII check, never sliced.
+        // 64 × "é" is exactly 128 bytes: refused on the hex check, never sliced.
         assert_eq!(
             parse_enode(&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))),
             Err("the public key must be 128 hex characters")
         );
         assert_eq!(
             parse_enode(&format!("enode://{}@1.2.3.4:30303", "zz".repeat(64))),
-            Err("the public key is not hex")
+            Err("the public key must be 128 hex characters")
+        );
+        // `u8::from_str_radix` alone would read "+a" as 0x0a: 64 such pairs are
+        // 128 ASCII bytes and must still be refused, not applied as a garbage key.
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "+a".repeat(64))),
+            Err("the public key must be 128 hex characters")
         );
         assert_eq!(
             parse_enode(&format!("enode://{key}@nonsense")),

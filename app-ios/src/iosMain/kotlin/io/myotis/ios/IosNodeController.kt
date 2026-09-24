@@ -506,8 +506,9 @@ class IosNodeController(
         // The pooled peers that can answer a read at the anchored head NOW
         // (ABI >= 31, #465) — what readiness gates on: a pool of peers still
         // syncing keeps snapPeers positive for hours while every read fails.
-        // An older engine has no such key → the pooled count, as before.
-        val snapServingPeers = o.engineInt("snapServingPeers", snapPeers)
+        // Absent → 0, fail closed (the ABI gate is exact, so the linked engine
+        // always emits it) — never the pooled count.
+        val snapServingPeers = o.engineInt("snapServingPeers")
         val currentPeriod = o.engineLong("currentPeriod", 0L)
         // Older-native fallback: a missing targetPeriod parses as 0 — keep the
         // target >= current invariant.
@@ -550,7 +551,7 @@ class IosNodeController(
             connectedPeers = o.engineInt("peerCount"),        // CL libp2p peers
             readyPeers = snapPeers,                      // EL pool holds only snap-ready
             snapPeers = snapPeers,
-            snapServingPeers = snapServingPeers,         // ABI >= 31; older engines: snapPeers
+            snapServingPeers = snapServingPeers,         // ABI >= 31
             clConnectedPeers = o.engineInt("peerCount"),
             clServedPeersLastMin = o.engineInt("servedPeersLastMinute"),
             clCachedPeers = clCache.total,

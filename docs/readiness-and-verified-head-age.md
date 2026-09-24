@@ -176,7 +176,12 @@ call `myotis_wakeup` and then poll these two status methods back through the
 readiness gate (`myotis_status.state == "RUNNING"` with `snapPeers > 0`, and
 `myotis_beaconStatus.state == "SYNCED"`) **before** its first `eth_*` read —
 `myotis_wakeup` returns when the rebuild *starts*, not when the node is ready
-again (see disk-and-network-usage.md §4.1).
+again (see disk-and-network-usage.md §4.1). On the Rust engine that gate is
+necessary, not sufficient: `myotis_status` carries `snapPeers` but not
+`snapServingPeers`, so right after SYNCED a cold pool of still-syncing peers
+passes it while reads still fail (#465). The in-process hosts hold such a read
+until a serving peer exists; over JSON-RPC it comes back as the retryable
+`-32000` — keep polling and retry.
 
 ## Block tags
 

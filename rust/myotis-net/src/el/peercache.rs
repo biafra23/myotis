@@ -474,8 +474,10 @@ fn pubkey_hex(pubkey: &[u8; 64]) -> String {
 }
 
 /// Parse a `0x`-prefixed-or-bare 128-hex node id into 64 bytes. Panic-free —
-/// `None` on any malformed input (cache files are semi-trusted on disk).
-fn parse_pubkey(hex: &str) -> Option<[u8; 64]> {
+/// `None` on any malformed input (cache files are semi-trusted on disk), and
+/// strictly hex: `u8::from_str_radix` alone would accept a `+f` pair. Shared
+/// with `reader::parse_enode`, the enode URL parser.
+pub(crate) fn parse_pubkey(hex: &str) -> Option<[u8; 64]> {
     let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
     if hex.len() != 128 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

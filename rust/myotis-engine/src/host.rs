@@ -26,21 +26,17 @@
 //! create from a valid Rust value.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{CallAnchor, EnsQuery, EnsRootMode};
+use myotis_net::el::pool::Enode;
 use myotis_net::el::reader::{parse_enode, ElReader};
 use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
 
 use crate::eljson;
-
-/// One dialable EL pin — a socket address and the peer's 64-byte public key —
-/// the shape `parse_enode` produces and the pool dials.
-type Enode = (SocketAddr, [u8; 64]);
 
 /// Slots per sync-committee period (for the finalized-slot → period diagnostics
 /// the verified-read results carry).
@@ -702,20 +698,6 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 reader.set_served_block_window(w);
             }
         }
-        // Apply the host's seed pins pushed before this start (or before the
-        // pause this resume ends): the pool is rebuilt from scratch, and the
-        // pins are the host's answer to a starving pool (#465). Read under
-        // the stash lock, applied outside it (the pool call dials).
-        let pins = engine
-            .pending_boot_enodes
-            .lock()
-            .ok()
-            .and_then(|pending| pending.get(&handle).cloned())
-            .filter(|pins| !pins.is_empty());
-        if let Some(pins) = pins {
-            let reader = Arc::clone(reader);
-            engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
-        }
         // Activate a portable log-index snapshot found on disk (the drop-in
         // path): its presence in the engine's own data dir is the opt-in —
         // the daemon has no settings surface at all, and hosts that do have
@@ -741,6 +723,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // start()/resume() may have already published a Running one, while we were
     // starting. Either way, shut the handle we just started down rather than
     // orphan its tokio/libp2p host.
+    let pins_reader = reader.clone();
     let mut map = match engine.handles.lock() {
         Ok(m) => m,
         Err(_) => {
@@ -752,6 +735,15 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         (SpinUpFrom::Created, Some(ChainEntry::Created(_)))
         | (SpinUpFrom::Paused, Some(ChainEntry::Paused(..))) => {
             map.insert(handle, ChainEntry::Running(config, sync, reader));
+            drop(map);
+            // The host's seed pins, applied AFTER the entry is Running (#465):
+            // the pool was rebuilt from scratch, and the pins are the host's
+            // answer to a starving pool. After, not before, the publish: a
+            // push that lands while the reader is being built sees a
+            // Created/Paused entry and only stashes, so reading the stash
+            // here catches it, and a push from now on applies itself live.
+            // Applying twice is idle (set semantics; `try_dial` dedups).
+            apply_pending_boot_enodes(engine, handle, pins_reader.as_ref());
             true
         }
         _ => {
@@ -759,6 +751,24 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             shutdown(engine, sync, reader);
             false
         }
+    }
+}
+
+/// Hand the handle's stashed host seed pins (`set_boot_enodes_json`) to its EL
+/// reader: read under the stash lock, applied outside it (the pool call
+/// takes its own locks). No reader (the CL-only degraded mode) or no pins:
+/// nothing to do — the stash stays for the next spin_up.
+fn apply_pending_boot_enodes(engine: &EngineState, handle: i64, reader: Option<&Arc<ElReader>>) {
+    let Some(reader) = reader else { return };
+    let pins = engine
+        .pending_boot_enodes
+        .lock()
+        .ok()
+        .and_then(|pending| pending.get(&handle).cloned())
+        .filter(|pins| !pins.is_empty());
+    if let Some(pins) = pins {
+        let reader = Arc::clone(reader);
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
     }
 }
 
@@ -1091,9 +1101,11 @@ fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
 /// with one WARN naming every reason, nothing applied). Applied immediately
 /// on a RUNNING handle's EL reader and STASHED for every spin_up (start AND
 /// resume), exactly like [`set_served_block_window`]: hosts push between
-/// create() and start(), and a resume rebuilds the pool. Set semantics — a
-/// later push replaces an earlier one; an empty array clears. `false` for an
-/// unknown handle (nothing stashed).
+/// create() and start(), and a resume rebuilds the pool. A RUNNING handle
+/// whose EL reader failed to start (`elReaderAvailable` false, the CL-only
+/// degraded mode) stashes only, for the resume that rebuilds it — as the
+/// served window does. Set semantics — a later push replaces an earlier one;
+/// an empty array clears. `false` for an unknown handle (nothing stashed).
 pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
     let pins = match parse_boot_enodes_json(enodes_json) {
         Ok(pins) => pins,
@@ -1103,33 +1115,26 @@ pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
         }
     };
     let Some(engine) = engine() else { return false };
-    // Snapshot the reader under the handles lock and apply OUTSIDE it (the pool
-    // call dials), then stash under the lock again — only while the handle is
-    // still known, so a push racing stop() leaves nothing behind a removed
-    // handle (the discipline set_log_index_config_json keeps).
-    let reader = match engine.handles.lock() {
-        Ok(map) => match map.get(&handle) {
+    // Stash under the handles lock — stop() removes the entry under this same
+    // lock and clears the stash after, so an entry stashed for a known handle
+    // cannot outlive it (set_served_block_window's discipline) — and apply to
+    // the snapshotted reader OUTSIDE it (the pool call takes its own locks).
+    let reader = {
+        let Ok(map) = engine.handles.lock() else { return false };
+        let reader = match map.get(&handle) {
             Some(ChainEntry::Running(_, _, Some(reader))) => Some(Arc::clone(reader)),
-            Some(_) => None, // Created / Paused / EL-less: stash only, applied at spin_up
+            Some(_) => None, // Created / Paused / EL-less: applied at the next spin_up
             None => return false,
-        },
-        Err(_) => return false,
+        };
+        if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
+            pending.insert(handle, pins.clone());
+        }
+        reader
     };
     if let Some(reader) = reader {
-        let live = pins.clone();
-        engine.rt.block_on(async move { reader.set_boot_enodes(live).await });
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
     }
-    match engine.handles.lock() {
-        Ok(map) => {
-            if map.contains_key(&handle) {
-                if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
-                    pending.insert(handle, pins);
-                }
-            }
-            true
-        }
-        Err(_) => false,
-    }
+    true
 }
 
 /// `nativeSetWsBoundPeriods`: override the weak-subjectivity anchor-age bound

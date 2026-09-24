@@ -30,10 +30,10 @@ const h = myotis.create('mainnet', '/path/to/data-dir');  // dir is created if m
 myotis.start(h);
 
 // Optional (ABI >= 31): seed the EL pool with execution nodes the host knows to
-// be serving — dialed first, and again while the pool is below its target.
-// Applied or refused AS A WHOLE (false = invalid JSON, a malformed or DNS-named
-// entry, a duplicate address, > 64 entries, or an unknown handle); an empty
-// array clears. Before or after start(), and kept across pause/resume:
+// be serving — a changed list is dialed at once, and again while the pool is
+// below its target or no pooled peer can answer at the anchored head. Applied
+// or refused AS A WHOLE (see Notes); before or after start(), kept across
+// pause/resume:
 // myotis.setBootEnodes(h, JSON.stringify(['enode://<128-hex pubkey>@1.2.3.4:30303']));
 
 // Recovery from STALE_ANCHOR with a checkpoint the HOST authenticated (ABI >= 26):
@@ -95,11 +95,17 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   single peer there is nowhere to rotate to (this is what `smoke.mjs` gates
   on; see #372).
 - **Seed pins** (`setBootEnodes`, ABI >= 31): the engine ships no mainnet seed
-  list; a host that knows serving execution nodes can pin them per handle.
-  The push is applied or refused as a whole, is never persisted by the engine,
-  and the pins are dialed like the network's own — directly, never seeded into
-  the peer cache, re-dialed while the pool is below its target and, above it,
-  once proven to serve.
+  list; a host that knows serving execution nodes can pin them per handle
+  (`myotis_set_boot_enodes` in `myotis_engine.h` is the contract). The push is
+  applied or refused as a whole (`false`: invalid JSON, a non-array, a
+  malformed or DNS-named entry, a duplicate address, more than the header's
+  cap, or an unknown handle — nothing applied), an empty array clears, and an
+  identical re-push is a no-op. The engine never persists it. A changed list
+  is dialed at once; from then on the pins are pins like the network's own —
+  never seeded into the peer cache, re-dialed while the pool is below its
+  target or no pooled peer can answer at the anchored head, and above that
+  once proven to serve. On an address the network also pins, the host's key
+  wins.
 - **Weak-subjectivity gate**: `statusJson().beaconState` can be `STALE_ANCHOR`
   — the engine refused to walk forward from an anchor (embedded checkpoint or
   persisted snapshot) older than the network's WS bound, because from that far

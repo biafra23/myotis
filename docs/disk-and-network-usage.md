@@ -275,7 +275,10 @@ is in the serving pool. A wallet resuming from background should therefore:
    with the user's unlock), then
 2. poll `myotis_status` until `state == "RUNNING"` **and** `snapPeers > 0`, and
    `myotis_beaconStatus` until `state == "SYNCED"`, **before** issuing verified reads —
-   the same readiness gate the hosts apply (see
+   the readiness gate the hosts apply, minus one signal `myotis_status` does not
+   carry: the in-process hosts also wait for a pooled peer that can answer at the
+   anchored head (`snapServingPeers`, #465), so right after SYNCED a read can still
+   return the retryable `-32000` for a while — retry it (see
    [readiness-and-verified-head-age.md](readiness-and-verified-head-age.md)).
 
 Skipping the wake entirely still works — the first verified read on a paused stack

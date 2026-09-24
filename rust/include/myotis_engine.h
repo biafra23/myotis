@@ -237,14 +237,17 @@ char *myotis_export_log_index(int64_t handle, const char *path);
 
 /* v31: host-supplied EL seed pins (#465). enodes_json is a JSON array of
  * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS).
- * REPLACES the handle's host list (an empty array clears it); the network's
- * own pins are unaffected. Applied or refused AS A WHOLE: false for NULL,
- * invalid JSON, a non-array, any malformed entry, a duplicate address, more
- * than 64 entries, or an unknown handle — nothing is applied on refusal.
- * Kept per handle and applied on every start/resume, and live on a running
- * handle: the pins are dialed like the network's pins (directly, never seeded
- * into the peer cache; re-dialed while the pool is below its target and,
- * above it, once proven to serve snap data).
+ * REPLACES the handle's host list (an empty array clears it; an identical
+ * re-push is a no-op); on an address the network also pins, the host's key
+ * wins. Applied or refused AS A WHOLE: false for NULL, invalid JSON, a
+ * non-array, any malformed entry, a duplicate address, more than 64 entries,
+ * or an unknown handle — nothing is applied on refusal. Kept per handle and
+ * applied on every start/resume, and live on a running handle (one whose EL
+ * reader failed to start keeps it for the resume that rebuilds it): a changed
+ * list is dialed at once, whatever the pool holds, and the pins are then
+ * pins like the network's (never seeded into the peer cache; re-dialed while
+ * the pool is below its target or no pooled peer can answer at the anchored
+ * head, and above that once proven to serve snap data).
  * v31 also adds "snapServingPeers" to myotis_status_json: the pooled peers
  * that can answer a read at the anchored head NOW — gate reads on it rather
  * than on "snapPeers", which a pool of still-syncing peers satisfies for

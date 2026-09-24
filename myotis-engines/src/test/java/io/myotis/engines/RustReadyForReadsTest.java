@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RustReadyForReadsTest {
 
-    /** The ABI >= 31 shape: every pooled peer also serves. */
+    /** The ABI >= 31 shape with every pooled peer also serving. */
     private static String status(boolean running, String beaconState, long head, int snapPeers,
                                  boolean elReader) {
         return status(running, beaconState, head, snapPeers, snapPeers, elReader);
@@ -24,14 +24,6 @@ class RustReadyForReadsTest {
                 + "\"beaconState\":\"" + beaconState + "\",\"elReaderAvailable\":" + elReader
                 + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers
                 + ",\"snapServingPeers\":" + snapServing + "}";
-    }
-
-    /** The pre-ABI-31 shape: no snapServingPeers key at all. */
-    private static String oldShape(boolean running, String beaconState, long head, int snapPeers,
-                                   boolean elReader) {
-        return "{\"running\":" + running + ",\"paused\":false,\"network\":\"sepolia\","
-                + "\"beaconState\":\"" + beaconState + "\",\"elReaderAvailable\":" + elReader
-                + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers + "}";
     }
 
     private static boolean ready(String json) {
@@ -60,9 +52,13 @@ class RustReadyForReadsTest {
     }
 
     @Test
-    void anOldNativeWithoutTheServingKeyFallsBackToSnapPeers() {
-        assertTrue(ready(oldShape(true, "SYNCED", 9_000_000, 4, true)));
-        assertFalse(ready(oldShape(true, "SYNCED", 9_000_000, 0, true)));
+    void aStatusWithoutTheServingKeyIsNotReady() {
+        // Fail CLOSED: a status with no snapServingPeers key (a hand-written
+        // fixture — a loaded native always emits it, the ABI gate is exact)
+        // reads as nobody serving, never as the pooled count.
+        String noKey = status(true, "SYNCED", 9_000_000, 4, true)
+                .replace(",\"snapServingPeers\":4", "");
+        assertFalse(ready(noKey));
     }
 
     @Test

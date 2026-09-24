@@ -1,6 +1,7 @@
 //! Plain C ABI over the same `host` functions the JNI shim wraps — the iOS
 //! (Kotlin/Native cinterop) seam. Mirrors the JVM FFI surface (`ffi`, UniFFI)
-//! one-to-one: compound values
+//! one-to-one — plus the host knobs the JVM hosts have no surface for yet
+//! (`myotis_set_boot_enodes`, #465), which the Node addon also wraps: compound values
 //! cross as JSON strings with the exact same shapes the golden tests pin, and the
 //! sentinel conventions are identical (negative handle ids, `"{}"` status for an
 //! unknown handle, `{"error": ...}` objects). The header consumed by cinterop is
@@ -681,13 +682,11 @@ mod tests {
         let dir = CString::new(dir.to_str().unwrap()).unwrap();
         let handle = unsafe { myotis_create(c"mainnet".as_ptr(), dir.as_ptr()) };
         assert!(handle >= 1, "create failed: {handle}");
+        // One accept, one refuse: the rule set itself is pinned in host.rs.
         let key = "ab".repeat(64);
         let list = CString::new(format!(r#"["enode://{key}@1.2.3.4:30303"]"#)).unwrap();
         assert!(unsafe { myotis_set_boot_enodes(handle, list.as_ptr()) });
-        assert!(unsafe { myotis_set_boot_enodes(handle, c"[]".as_ptr()) });
-        for bad in [c"not json", c"{}", c"[\"nope\"]", c"[7]"] {
-            assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr()) }, "{bad:?}");
-        }
+        assert!(!unsafe { myotis_set_boot_enodes(handle, c"[7]".as_ptr()) });
         // Invalid UTF-8 decodes lossily and is then refused as not-an-enode.
         let bad = [0x5b_u8, 0x22, 0xff, 0x22, 0x5d, 0];
         assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr().cast()) });
@@ -782,13 +781,9 @@ pub unsafe extern "C" fn myotis_set_log_index_config(
     }
 }
 
-/// Replace the handle's HOST-SUPPLIED EL seed pins (ABI ≥ 31, #465):
-/// `enodes_json` is a JSON array of `enode://<128 hex pubkey>@ip:port`
-/// strings (numeric address, no DNS). Applied or refused as a whole — false
-/// for NULL, invalid JSON, a non-array, any malformed entry, a duplicate
-/// address, more than 64 entries, or an unknown handle; nothing is applied on
-/// refusal. An empty array clears the list. Stashed for every start/resume and
-/// applied live to a running handle (see host::set_boot_enodes_json).
+/// Replace the handle's HOST-SUPPLIED EL seed pins (ABI ≥ 31, #465). The
+/// contract is the header's: a JSON array of `enode://` URLs, applied or
+/// refused as a whole (see `host::set_boot_enodes_json`); NULL is a refusal.
 ///
 /// # Safety
 /// `enodes_json` must be null or a valid null-terminated C string.

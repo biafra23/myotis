@@ -149,11 +149,8 @@ object RustEngine {
     }
 
     /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a
-     *  JSON array of `enode://<128-hex pubkey>@ip:port` strings, applied or
-     *  refused as a whole (false = invalid JSON, a malformed or DNS-named entry,
-     *  a duplicate address, more than 64 entries, or an unknown handle; nothing
-     *  applied). An empty array clears. Kept for every start/resume and applied
-     *  live to a running handle; the pins are dialed like the network's own. */
+     *  JSON array of `enode://` URLs, applied or refused as a whole — the
+     *  contract is `myotis_set_boot_enodes` in `myotis_engine.h`. */
     fun setBootEnodes(handle: Long, enodesJson: String): Boolean {
         requireAbi()
         return myotis_set_boot_enodes(handle, enodesJson)
