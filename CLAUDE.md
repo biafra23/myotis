@@ -46,6 +46,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # toolchain by default (see below), or -PskipRustEngine to opt out.
 ./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
 ./gradlew cargoTest        # cargo test --workspace (part of `check`)
+./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
 # The Android app builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk

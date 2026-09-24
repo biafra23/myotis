@@ -586,6 +586,31 @@ val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
 }
 tasks.named("check") { dependsOn(cargoCheckWasm) }
 
+// no_std canary: `cargo build -p myotis-core --no-default-features` for
+// x86_64-unknown-none, a tier-2 target that ships NO std. PROVES the crate's
+// `no_std` promise (its Cargo.toml `std` feature): a `std::` import, a HashMap,
+// or a dependency whose `std` feature is left on fails here and nowhere else —
+// every host builds the crate with `std` on, and the UEFI targets the promise
+// exists for ship a partial std, so a UEFI build alone would let a leak through.
+// A BUILD rather than a check because the sha2 SIMD failure those targets share
+// (see the force-soft block in rust/myotis-core/Cargo.toml) surfaces at codegen.
+// Needs the rustup target; self-skips otherwise with one lifecycle note. CI
+// runs the same command unconditionally (.github/workflows/no-std-canary.yml).
+val noStdTargetInstalled = "x86_64-unknown-none" in installedRustupTargets
+val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
+    group = "rust"
+    description = "cargo build -p myotis-core --no-default-features for x86_64-unknown-none — the no_std canary (self-skips without cargo + the rustup target)"
+    onlyIf { rustAvailable && noStdTargetInstalled }
+    workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
+    commandLine(
+        rustTool("cargo"), "build", "--target", "x86_64-unknown-none",
+        "-p", "myotis-core", "--no-default-features",
+    )
+    // No declared outputs, same rationale as cargoTest.
+}
+tasks.named("check") { dependsOn(cargoBuildNoStd) }
+
 // The Android app builds the Rust engine (its jniLibs) FROM SOURCE — cargo,
 // cargo-ndk, the Android NDK, and the Android rustup targets are REQUIRED to
 // build :android-app by default. Making the engine a build output (not a
@@ -820,10 +845,17 @@ gradle.taskGraph.whenReady {
         // Missing-toolchain (without the flag) is handled loudly at execution by
         // requireAndroidRustEngine; here we only note the deliberate opt-out.
         logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime; boots on API 33+ only)")
-    } else if (allTasks.any { it.name == "cargoCheckWasm" } &&
-        (!wasmTargetInstalled || !clangAvailable)
-    ) {
-        logger.lifecycle("[rust] wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang")
+    } else {
+        // The two canaries share the one note so neither skip is silent.
+        val skippedCanaries = listOfNotNull(
+            "wasm32 canary skipped — needs rustup target wasm32-unknown-unknown + clang".takeIf {
+                allTasks.any { t -> t.name == "cargoCheckWasm" } && (!wasmTargetInstalled || !clangAvailable)
+            },
+            "no_std canary skipped — needs rustup target x86_64-unknown-none".takeIf {
+                allTasks.any { t -> t.name == "cargoBuildNoStd" } && !noStdTargetInstalled
+            },
+        )
+        if (skippedCanaries.isNotEmpty()) logger.lifecycle("[rust] ${skippedCanaries.joinToString("; ")}")
     }
     // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
     // is no committed fallback. With a previously built libmyotis_engine.a in
