@@ -35,6 +35,9 @@ pub struct SlottedStateRoot {
 /// keccak equals `block_hash`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalizedExecution {
+    /// The beacon slot whose finality update carried this execution block —
+    /// the `matchedBeaconSlot` of a proof verified against `state_root`.
+    pub slot: u64,
     pub block_number: u64,
     pub state_root: [u8; 32],
     pub block_hash: [u8; 32],
@@ -176,6 +179,19 @@ impl ExecAnchor {
         self.inner.lock().expect("anchor mutex").optimistic_block_number
     }
 
+    /// The optimistic head `(block_number, block_hash)` read under ONE lock,
+    /// for anchoring a header-chain walk — a number from one update paired
+    /// with the hash of the next would make a peer's correct header fail
+    /// verification. `None` until an optimistic update with a nonzero block
+    /// number lands.
+    pub fn optimistic_head(&self) -> Option<(u64, [u8; 32])> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_block_hash
+            .filter(|_| inner.optimistic_block_number > 0)
+            .map(|hash| (inner.optimistic_block_number, hash))
+    }
+
     /// The optimistic execution `(block_number, state_root)` read atomically —
     /// the CURRENT beacon-attested head state, at most a couple of slots old.
     /// `None` until the first optimistic update lands. This is the root snap
@@ -211,6 +227,7 @@ impl ExecAnchor {
 fn finalized_of(inner: &Inner) -> Option<FinalizedExecution> {
     match (inner.execution_state_root, inner.execution_block_hash) {
         (Some(state_root), Some(block_hash)) => Some(FinalizedExecution {
+            slot: inner.finalized_slot,
             block_number: inner.execution_block_number,
             state_root,
             block_hash,
@@ -275,9 +292,11 @@ mod tests {
         assert_eq!(fin.state_root, root(1));
         assert_eq!(anchor.finalized_slot(), 100);
 
+        assert_eq!(anchor.optimistic_head(), None); // no optimistic update yet
         anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2));
         assert_eq!(anchor.optimistic_block_hash(), Some(root(0xf2)));
         assert_eq!(anchor.optimistic_block_number(), 21_000_005);
+        assert_eq!(anchor.optimistic_head(), Some((21_000_005, root(0xf2))));
         // The atomic (number, root) pair snap queries prefer (issue #355).
         assert_eq!(anchor.optimistic_execution(), Some((21_000_005, root(2))));
 

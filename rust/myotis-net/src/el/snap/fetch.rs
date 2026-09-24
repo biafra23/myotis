@@ -54,6 +54,21 @@ pub fn is_unservable_root_error(error: &str) -> bool {
     error.contains(PROOF_INVALID_MARKER)
 }
 
+/// The reason `myotis_core::trie::verify_proof` gives when a peer answers a
+/// range query with NO proof nodes for a non-empty root — the shape of "I do
+/// not hold that root": pruned, or never had (a trailing peer). Kept in sync
+/// with `trie.rs`; [`is_unknown_root_error`] is the only reader.
+pub const UNKNOWN_ROOT_REASON: &str = "empty proof for non-empty root";
+
+/// Does this fetch error mean "the peer does not hold the requested root" —
+/// the empty-proof answer, as opposed to a malformed or hostile proof? The one
+/// miss a read at a root the peer is not obliged to hold (the finalized root,
+/// which execution clients keep for a bounded window) excuses: evidence about
+/// the ask, not the peer. A garbage proof stays a strike.
+pub fn is_unknown_root_error(error: &str) -> bool {
+    is_unservable_root_error(error) && error.contains(UNKNOWN_ROOT_REASON)
+}
+
 /// Verify an AccountRange response for `address` against the trusted
 /// `state_root`. A single-account query (`starting = keccak(address)`) yields a
 /// left-boundary proof that is exactly the Merkle proof for `keccak(address)`.
@@ -182,6 +197,9 @@ mod tests {
             "empty-proof error must take the fallback: {}",
             err.0
         );
+        // ...and it is the one shape a finalized read EXCUSES: the peer does
+        // not hold the root at all.
+        assert!(is_unknown_root_error(&err.0), "the real empty-proof error: {}", err.0);
         // A garbage proof (ProofResult::Invalid of another shape) also counts:
         // the peer answered; a different root may still be servable.
         let response = AccountRange {
@@ -196,6 +214,14 @@ mod tests {
         assert!(!is_unservable_root_error("request timed out"));
         assert!(!is_unservable_root_error("peer disconnected"));
         assert!(!is_unservable_root_error("connection reset by peer"));
+        // A garbage proof is NOT the excused shape, and neither is transport.
+        assert!(!is_unknown_root_error(&err.0), "garbage proof is a strike: {}", err.0);
+        let unknown = format!("account {PROOF_INVALID_MARKER}: {UNKNOWN_ROOT_REASON}");
+        assert!(is_unknown_root_error(&unknown));
+        assert!(is_unservable_root_error(&unknown));
+        assert!(!is_unknown_root_error("request timed out"));
+        let garbage = format!("storage {PROOF_INVALID_MARKER}: malformed node RLP");
+        assert!(!is_unknown_root_error(&garbage));
     }
 
     #[test]

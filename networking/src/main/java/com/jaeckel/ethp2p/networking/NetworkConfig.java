@@ -117,9 +117,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15264768, 2026-09-21, period 1863)
-            Bytes.fromHexString("9cfadfafc760bf9e4129101dcd4208cbb22b9bcd3a7d4f2f467a3f12a109cb2f").toArrayUnsafe(),
-            15264768L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15285056, 2026-09-24, period 1865)
+            Bytes.fromHexString("4f4b89524600b09292365d29f2e9266e7a004b27bccf7ed31655b88851045028").toArrayUnsafe(),
+            15285056L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -171,8 +171,10 @@ public record NetworkConfig(
                     // Re-verified 2026-09-16 at the then-shipped period-1858 anchor,
                     // run 35065042347: 4 of 5 — 91.189.182.90 closed again and
                     // 57.129.130.18 served; a third close in a row would be grounds to prune.
-                    // Re-verified 2026-09-21 at the anchor this build ships (period
-                    // 1863), run 35616056243: 5 of 5 — 91.189.182.90 served in full.
+                    // Re-verified 2026-09-21 at the then-shipped period-1863 anchor,
+                    // run 35616056243: 5 of 5 — 91.189.182.90 served in full.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 1865), run 35988133216: 5 of 5 again.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -245,9 +247,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11188992, 2026-09-21, period 1365)
-            Bytes.fromHexString("395b65094a1e28377ac2631e0084dcd226173f25aed3d8da81d4fe63b478b413").toArrayUnsafe(),
-            11188992L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11209280, 2026-09-24, period 1368)
+            Bytes.fromHexString("d9d8f57adb4ad2053a191dd566f5fb75722c09c531fb833a27cee23f077d3b36").toArrayUnsafe(),
+            11209280L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
@@ -311,8 +313,9 @@ public record NetworkConfig(
             // updates. Re-verified 2026-09-13 at the then-shipped period-1358
             // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the then-shipped
             // period-1361 anchor, run 35065049320: 4 of 4 again; 2026-09-21 at the
-            // anchor this build ships (period 1365), run 35616060242: 4 of 4 again. Re-run it after every
-            // checkpoint refresh,
+            // then-shipped period-1365 anchor, run 35616060242: 4 of 4 again;
+            // 2026-09-24 at the anchor this build ships (period 1368), run
+            // 35989152817: 4 of 4 again. Re-run it after every checkpoint refresh,
             // since a census against a superseded root says nothing about the
             // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
@@ -392,9 +395,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30201792, 2026-09-21, period 3686)
-            Bytes.fromHexString("9a409a90f6422a70ac6e6b225d6736d96880e657d1958a13e612b7281484d6ad").toArrayUnsafe(),
-            30201792L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30250464, 2026-09-24, period 3692)
+            Bytes.fromHexString("8cf978da4e896b02351fe9669d0ac82b601174bd6a413c7c975ae1a611bc29f9").toArrayUnsafe(),
+            30250464L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
@@ -436,8 +439,14 @@ public record NetworkConfig(
                     // run 34776024335: 8 of 8.
                     // Re-verified 2026-09-16 at the then-shipped period-3675 anchor,
                     // run 35065032444: 8 of 8 again.
-                    // Re-verified 2026-09-21 at the anchor this build ships (period
-                    // 3686), run 35616052466: 8 of 8 again.
+                    // Re-verified 2026-09-21 at the then-shipped period-3686 anchor,
+                    // run 35616052466: 8 of 8 again.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 3692), run 35988128286: 6 of 8 — both :9500 pins (134.65.194.144,
+                    // 164.152.161.131) failed to dial from the runner. One run from one
+                    // vantage point, and the pair has timed out on a runner before
+                    // (2026-09-13) and served every run since: a re-census signal, not
+                    // grounds to prune. Above the two-pin floor either way.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",

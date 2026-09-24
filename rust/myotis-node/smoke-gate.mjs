@@ -97,6 +97,19 @@ export function gateShortfall(status, config = gateConfigFromEnv()) {
         + 'so the reader has a peer to rotate to)',
     });
   }
+  // The pooled count says nothing about whether a read can succeed: a pool
+  // of peers still syncing themselves satisfies it for hours while every
+  // read fails (#465). snapServingPeers (ABI >= 31) counts the peers that
+  // can answer at the anchored head NOW; the floor is 1, not minSnapPeers —
+  // this is "can a read succeed at all", the rotation headroom is above.
+  // Absent on an older addon → not gated on it.
+  if (s.snapServingPeers !== undefined && !(s.snapServingPeers >= 1)) {
+    unmet.push({
+      kind: 'peers',
+      message: `snapServingPeers=${s.snapServingPeers} (want >=1: a pooled peer `
+        + 'that can answer at the anchored head)',
+    });
+  }
   // "Discovery produced candidates" is satisfied by EITHER the CL discv5
   // routing table or the EL's own discovered-peer count. Keying on discv5
   // alone would wedge the gate shut on a node whose EL peering is perfectly

@@ -273,9 +273,11 @@ is in the serving pool. A wallet resuming from background should therefore:
 
 1. call `myotis_wakeup` as its UI comes to the foreground (overlapping the rebuild
    with the user's unlock), then
-2. poll `myotis_status` until `state == "RUNNING"` **and** `snapPeers > 0`, and
-   `myotis_beaconStatus` until `state == "SYNCED"`, **before** issuing verified reads —
-   the same readiness gate the hosts apply (see
+2. poll `myotis_status` until `state == "RUNNING"` **and** `snapServingPeers > 0`
+   (a pooled peer that can answer at the anchored head — `snapPeers > 0` alone is
+   true while every read fails on a cold pool, #465), and `myotis_beaconStatus`
+   until `state == "SYNCED"`, **before** issuing verified reads — the same
+   readiness gate the hosts apply (see
    [readiness-and-verified-head-age.md](readiness-and-verified-head-age.md)).
 
 Skipping the wake entirely still works — the first verified read on a paused stack

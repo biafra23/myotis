@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 29
+#define MYOTIS_ABI_VERSION 32
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -122,19 +122,35 @@ bool myotis_accept_stale_anchor(int64_t handle);
 
 /* Verified reads — JSON results; {"error": "..."} on transport/not-running/
  * bad-input failures; verification failures carry a `failReason` inside the
- * normal result shape instead. */
-char *myotis_request_account_json(int64_t handle, const char *address);
+ * normal result shape instead.
+ * v32: the account, code and storage-position reads take the RPC block
+ * selector and APPLY OR REFUSE it, as eth_call has since v27: NULL or "" and
+ * the head tags prove at the verified head, "finalized" at the beacon-
+ * finalized block (the proof is verified against the finalized state root;
+ * refused, retryably, while no finalized block has landed or no peer still
+ * serves that state), a number only inside [head-64, head+16] (head state),
+ * anything else {"error","code":-32602}. Every result names the block it
+ * proved at: "anchor": "head" | "finalized". */
+char *myotis_request_account_json(int64_t handle, const char *address,
+                                  const char *block);
 char *myotis_get_storage_proof_json(int64_t handle, const char *address,
                                     int64_t slot, const char *holder_or_null);
-char *myotis_get_code_json(int64_t handle, const char *address);
+char *myotis_get_code_json(int64_t handle, const char *address,
+                           const char *block);
 char *myotis_get_storage_at_json(int64_t handle, const char *address,
-                                 const char *position);
+                                 const char *position, const char *block);
 /* eth_call: {"status":"ok","resultHex"} | {"status":"revert","dataHex"} |
  * {"status":"unavailable","reason"} | {"error"} | {"error","code":-32602}.
+ * Every status also carries "blockNumber" (the block the call ran against)
+ * and "verified" (true = an ok/revert that ran against the beacon-FINALIZED
+ * block; always false on unavailable), ABI >= 30.
  * `from` empty = anonymous; `value` is wei as a decimal string.
- * The call always runs against the VERIFIED HEAD's state, and the engine
- * checks `block` itself (ABI >= 27): latest/pending/safe/finalized or
- * empty/NULL run; a block number (0x-hex, or bare decimal digits) runs only
+ * The engine checks `block` itself (ABI >= 27): latest/pending/safe or
+ * empty/NULL run against the VERIFIED HEAD's state; "finalized" (ABI >= 30)
+ * runs against the beacon-finalized block — older and never reorged, but a
+ * state peers may already have pruned, so it can fail retryably while latest
+ * serves (before ABI 30 it ran against the head); safe and pending still mean
+ * the head (#366). A block number (0x-hex, or bare decimal digits) runs only
  * within [head-64, head+16], and still against head state. Anything else is
  * refused, never answered from the head:
  *   - behind that window, earliest, a block hash, or a malformed selector:
@@ -228,6 +244,28 @@ char *myotis_import_log_index_files(int64_t handle, const char *paths_json);
 /* v24: export the current index as a portable snapshot at path
  * (finality-clamped, self-describing). {"ok":true} or {"error":...}. */
 char *myotis_export_log_index(int64_t handle, const char *path);
+
+/* v31: host-supplied EL seed pins (#465). enodes_json is a JSON array of
+ * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS; a
+ * trailing "?discport=<port>", as geth prints it, is accepted and ignored).
+ * REPLACES the handle's host list (an empty array clears it; an identical
+ * re-push is a no-op); on an address the network also pins, the host's key
+ * wins. Applied or refused AS A WHOLE: false for NULL, invalid JSON, a
+ * non-array, any malformed entry, a duplicate address, more than 64 entries,
+ * or an unknown handle — nothing is applied on refusal. Kept per handle and
+ * applied on every start/resume, and live on a running handle (one whose EL
+ * reader failed to start keeps it for the resume that rebuilds it): a changed
+ * list is dialed at once, whatever the pool holds, and the pins are then
+ * pins like the network's (never seeded into the peer cache; re-dialed while
+ * the pool is below its target or, once the beacon anchor has a head, no
+ * pooled peer can answer at it, and above that once proven to serve snap
+ * data). An unspecified IP (0.0.0.0 / ::) or port 0 is refused: geth prints
+ * its own enode that way until it learns its external address.
+ * v31 also adds "snapServingPeers" to myotis_status_json: the pooled peers
+ * that can answer a read at the anchored head NOW — gate reads on it rather
+ * than on "snapPeers", which a pool of still-syncing peers satisfies for
+ * hours while every read fails. */
+bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
 
 #ifdef __cplusplus
 }

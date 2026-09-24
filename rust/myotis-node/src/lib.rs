@@ -39,7 +39,8 @@ use myotis_engine::capi::{
     myotis_estimate_gas_json,
     myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
-    myotis_send_raw_transaction_json, myotis_set_ws_bound_periods, myotis_start,
+    myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_ws_bound_periods,
+    myotis_start,
     myotis_status_json, myotis_stop, myotis_string_free,
 };
 
@@ -59,6 +60,11 @@ fn take(ptr: *mut c_char) -> String {
 /// A JS string crossing into C. Interior NULs can't appear in addresses/names/
 /// JSON, but a hostile caller must get an in-band error, not a panic (the
 /// workspace builds with `panic = "abort"`).
+/// The in-band refusal of an argument with a NUL byte on the calls whose own
+/// refusals are permanent (`eth_call`, the state reads): the same -32602 the
+/// engine gives a malformed selector.
+const NUL_INVALID_PARAMS: &str = r#"{"error":"argument contains NUL","code":-32602}"#;
+
 fn c_arg(s: &str) -> std::result::Result<CString, String> {
     CString::new(s).map_err(|_| r#"{"error":"argument contains NUL"}"#.to_string())
 }
@@ -238,6 +244,20 @@ pub fn set_ws_bound_periods(env: &Env, handle: i64, periods: i64) -> bool {
     unsafe { myotis_set_ws_bound_periods(handle, periods) }
 }
 
+/// Replace this handle's HOST-SUPPLIED EL seed pins (ABI >= 31, #465):
+/// `enodes_json` is a JSON array of `enode://` URLs, applied or refused AS A
+/// WHOLE — the contract is `myotis_set_boot_enodes` in `myotis_engine.h`
+/// (README "Notes"). `false` for a refused push or an unknown handle; a NUL
+/// byte is refused here, before the engine. Per-host, never persisted.
+#[napi]
+pub fn set_boot_enodes(env: &Env, handle: i64, enodes_json: String) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
+    match c_arg(&enodes_json) {
+        Ok(j) => unsafe { myotis_set_boot_enodes(handle, j.as_ptr()) },
+        Err(_) => false,
+    }
+}
+
 /// Accept the current over-age anchor and let sync proceed past a
 /// `STALE_ANCHOR` park — the informed-consent escape hatch a host puts behind
 /// its own UI (or an experimental tier). Run-sticky: it releases the park
@@ -255,20 +275,35 @@ pub fn accept_stale_anchor(env: &Env, handle: i64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Verified account read (balance/nonce/code hash + Merkle proof + beacon
-/// verification fields). Resolves to the AccountProofResult JSON.
+/// verification fields). Resolves to the AccountProofResult JSON. `block`
+/// (ABI >= 32, optional) is the RPC block selector the engine applies or
+/// refuses: omitted or a head tag proves at the verified head, `finalized` at
+/// the beacon-finalized block, a number only inside [head-64, head+16]
+/// (`{"error","code":-32602}` otherwise); the result names the block it
+/// proved at (`anchor`).
 #[napi(ts_return_type = "Promise<string>")]
-pub fn request_account_json<'env>(env: &'env Env, handle: i64, address: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&address) {
-        Ok(a) => take(unsafe { myotis_request_account_json(handle, a.as_ptr()) }),
-        Err(e) => e,
+pub fn request_account_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    address: String,
+    block: Option<String>,
+) -> Result<Object<'env>> {
+    let block = block.unwrap_or_default();
+    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&block)) {
+        (Ok(a), Ok(b)) => {
+            take(unsafe { myotis_request_account_json(handle, a.as_ptr(), b.as_ptr()) })
+        }
+        _ => NUL_INVALID_PARAMS.to_string(),
     })
 }
 
 /// Verified eth_call over the revm executor. `from` empty = anonymous sender;
 /// `value` is wei as a decimal string; `block` is a tag or a block number.
-/// The engine checks `block`: the call runs against the verified head, so a
-/// number outside [head-64, head+16] is refused, never answered from the head
+/// The engine checks `block`: a head tag runs against the verified head,
+/// `finalized` (ABI >= 30) against the beacon-finalized block, and a number
+/// outside [head-64, head+16] is refused, never answered from the head
 /// (`{"error","code":-32602}` when it can never be served; README "Notes").
+/// The result names the block it ran against (`blockNumber`, `verified`).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn eth_call_json<'env>(env: &'env Env,
     handle: i64,
@@ -285,7 +320,7 @@ pub fn eth_call_json<'env>(env: &'env Env,
             }),
             // A malformed argument, refused here instead of in the engine:
             // permanent, like the engine's own refusals for this call (README).
-            _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
+            _ => NUL_INVALID_PARAMS.to_string(),
         }
     })
 }

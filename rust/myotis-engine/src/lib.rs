@@ -101,7 +101,38 @@ uniffi::setup_scaffolding!();
 ///      pointer in the refusal message instead of an "undecodable string".
 ///      Plain-C callers only (the Node and iOS bindings never pass NULL); a
 ///      behavior change, no signature change.
-pub const ABI_VERSION: i32 = 29;
+/// v30: eth_call_json / eth_call_overrides_json and the block-read selectors
+///      (get_block_by_number_json, get_block_receipts_json, fee_history_json)
+///      now HONOUR `finalized` (#465, #366): the call runs against the
+///      beacon-finalized block and the block reads serve it, instead of the
+///      optimistic head. The call envelope gained `blockNumber` and
+///      `verified` (= ran against the finalized block), naming the block that
+///      answered (#382; `verified` is false on `unavailable`, which ran
+///      nowhere). `safe` and `pending` still resolve to the head —
+///      documented, not silent — and so does `finalized` on the JVM hosts'
+///      state reads and on the Java engine (#366). A behavior change and a
+///      payload extension, no signature change.
+/// v31: added myotis_set_boot_enodes (C ABI + Node; no UniFFI export — the
+///      JVM hosts have no seed-pin surface yet, so ffi.rs is untouched):
+///      host-supplied EL seed pins, a JSON array of enode:// URLs applied or
+///      refused AS A WHOLE (#465). The status JSON gained `snapServingPeers`,
+///      the pooled peers that can answer a read at the anchored head now —
+///      what the hosts' readiness gates use in place of `snapPeers`, which a
+///      pool of still-syncing peers satisfies for hours while every read
+///      fails. A key addition; older wrappers ignore it.
+/// v32: request_account_json / get_code_json / get_storage_at_json (UniFFI and
+///      the C ABI) take the RPC block selector and APPLY OR REFUSE it, as
+///      eth_call has since v27 (#465, #366): `finalized` proves the snap proof
+///      at the beacon-finalized state root (no fallback to any other root —
+///      refused, retryably, while no finalized block has landed or no peer
+///      still serves it), a number is served from head state only inside the
+///      window around the head, anything else is -32602. The three result
+///      shapes gained `anchor` ("head" | "finalized"). A signature change on
+///      three functions; the JVM `RustEngineNative` wrappers, the Node addon
+///      and the iOS wrapper moved with it. The `io.myotis.api` state reads
+///      still have no block parameter, and the Java engine still maps
+///      `finalized` to the head (#366).
+pub const ABI_VERSION: i32 = 32;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

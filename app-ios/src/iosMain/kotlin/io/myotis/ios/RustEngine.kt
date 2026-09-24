@@ -23,6 +23,7 @@ import io.myotis.engine.capi.myotis_log_index_status_json
 import io.myotis.engine.capi.myotis_read_stats_json
 import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
+import io.myotis.engine.capi.myotis_set_boot_enodes
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
@@ -147,6 +148,14 @@ object RustEngine {
         return myotis_accept_stale_anchor(handle)
     }
 
+    /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a
+     *  JSON array of `enode://` URLs, applied or refused as a whole — the
+     *  contract is `myotis_set_boot_enodes` in `myotis_engine.h`. */
+    fun setBootEnodes(handle: Long, enodesJson: String): Boolean {
+        requireAbi()
+        return myotis_set_boot_enodes(handle, enodesJson)
+    }
+
     /** Status JSON object; `"{}"` for an unknown handle. */
     /** Install the eth_getLogs watch-list config; false = invalid/unavailable. */
     fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
@@ -178,10 +187,11 @@ object RustEngine {
         return take(myotis_status_json(handle)) ?: "{}"
     }
 
-    /** AccountProofResult JSON, or `{"error": ...}`. */
-    fun requestAccountJson(handle: Long, address: String): String {
+    /** AccountProofResult JSON, or `{"error": ...}`; `block` (ABI >= 32) is the RPC
+     *  selector the engine applies or refuses (the contract is `myotis_engine.h`'s). */
+    fun requestAccountJson(handle: Long, address: String, block: String = ""): String {
         requireAbi()
-        return take(myotis_request_account_json(handle, address))
+        return take(myotis_request_account_json(handle, address, block))
             ?: """{"error":"engine returned no result"}"""
     }
 
@@ -197,11 +207,11 @@ object RustEngine {
     // not-running, status-tagged objects for call/estimate, tri-state block/tx
     // JSON (object | the literal "null" | {"error"}).
 
-    fun getCodeJson(handle: Long, address: String): String =
-        jsonCall { myotis_get_code_json(handle, address) }
+    fun getCodeJson(handle: Long, address: String, block: String = ""): String =
+        jsonCall { myotis_get_code_json(handle, address, block) }
 
-    fun getStorageAtJson(handle: Long, address: String, position32Hex: String): String =
-        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex) }
+    fun getStorageAtJson(handle: Long, address: String, position32Hex: String, block: String = ""): String =
+        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex, block) }
 
     fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
         jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }

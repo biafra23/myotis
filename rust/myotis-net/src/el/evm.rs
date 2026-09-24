@@ -3,11 +3,13 @@
 //! [`myotis_evm`] is sans-I/O and its [`SnapStateOracle`] is synchronous. This
 //! module is the I/O half: [`PoolOracle`] implements that trait over the snap
 //! peer pool, bridging each verified fetch to the async network via
-//! [`Handle::block_on`], and [`ElReader::eth_call`](crate::el::reader::ElReader)
-//! drives the `revm` executor on a blocking thread so that bridge never nests a
+//! [`Handle::block_on`], and
+//! [`ElReader::eth_call_overridden`](crate::el::reader::ElReader) drives the
+//! `revm` executor on a blocking thread so that bridge never nests a
 //! `block_on` inside a runtime worker.
 //!
-//! Every fetch pins to the executor-supplied `state_root` (the verified head's),
+//! Every fetch pins to the executor-supplied `state_root` (the call's anchor:
+//! the verified head's, or the beacon-finalized block's for [`ReadAnchor::Finalized`]),
 //! so all reads in one call see a single consistent block. Verification is
 //! verify-on-fetch: `snap_get_account`/`snap_get_storage` MPT-verify against that
 //! root and `snap_get_bytecode` checks `keccak(code) == code_hash`, so a peer can
@@ -53,6 +55,43 @@ pub enum CallOutcome {
     /// The call could not be executed/verified (out of gas, halt, state
     /// unavailable, unsupported fork/chain). The string is diagnostic.
     Unavailable(String),
+}
+
+/// Which verified block a read is anchored at: the block an `eth_call` runs
+/// against, or the state root an account / storage / code proof is verified
+/// against (ABI ≥ 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnchor {
+    /// The beacon OPTIMISTIC head — the `latest` (and `pending`/`safe`) tag.
+    Head,
+    /// The beacon FINALIZED execution block — the `finalized` tag: older and
+    /// never reorged, but a state peers may already have pruned, so it can be
+    /// unservable while the head serves. Never downgraded to the head: the
+    /// caller asked for finality (CLAUDE.md §Trust — applied or refused).
+    Finalized,
+}
+
+impl ReadAnchor {
+    /// The anchor for a `finalized: bool` selector (the ENS entry points').
+    pub fn for_finalized(finalized: bool) -> ReadAnchor {
+        if finalized {
+            ReadAnchor::Finalized
+        } else {
+            ReadAnchor::Head
+        }
+    }
+}
+
+/// A call's outcome plus the block it actually ran against (#382, #465): a
+/// host that asked for `finalized` can see which block answered, and one that
+/// asked for `latest` learns the head it got.
+#[derive(Debug, Clone)]
+pub struct CallAnswer {
+    pub outcome: CallOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block (the `verified` of
+    /// `ens_record_json`).
+    pub finalized: bool,
 }
 
 /// The outcome of an `estimateGas`. A REVERT is a verified chain answer (the
@@ -250,6 +289,13 @@ pub struct PoolOracle {
     /// only reorders the NEXT call's snapshot, and even an eviction does not
     /// take the peer out of this one.
     order: Mutex<Vec<usize>>,
+    /// The call runs against the beacon-FINALIZED state root (the `finalized`
+    /// tag; #465, #366). Two things follow, both as for the reader's own
+    /// finalized state reads: a peer answering a fetch with an empty proof
+    /// does not hold a root it is not obliged to hold — no strike, no
+    /// witnessed failure (`record_race`, the prefetch wave) — and the shadow
+    /// cache, which measures head traffic, is not fed.
+    finalized: bool,
 }
 
 /// This call's ask order after one hedged race over `asked` (the order that
@@ -279,6 +325,7 @@ impl PoolOracle {
         handle: Handle,
         quality: Option<crate::el::pool::SnapQualitySink>,
         stats: Arc<ReadStats>,
+        finalized: bool,
     ) -> PoolOracle {
         let order = Mutex::new((0..peers.len()).collect());
         PoolOracle {
@@ -289,6 +336,7 @@ impl PoolOracle {
             leaf_memo: Mutex::new(HashMap::new()),
             stats,
             order,
+            finalized,
         }
     }
 
@@ -301,6 +349,9 @@ impl PoolOracle {
         leaf: Option<&AccountLeaf>,
         started: std::time::Instant,
     ) {
+        if self.finalized {
+            return; // the shadow cache measures head traffic (see `finalized`)
+        }
         self.stats.observe_account(
             address,
             *state_root,
@@ -319,6 +370,9 @@ impl PoolOracle {
         value: U256,
         started: std::time::Instant,
     ) {
+        if self.finalized {
+            return;
+        }
         self.stats.observe_storage(
             address,
             position,
@@ -338,37 +392,41 @@ impl PoolOracle {
         })
     }
 
-    /// Record one per-peer fetch outcome (no-op without a sink).
-    async fn record(quality: &Option<crate::el::pool::SnapQualitySink>, peer: &ManagedPeer, served: bool) {
-        if let Some(q) = quality {
-            if served {
-                q.served(peer.addr()).await;
-            } else {
-                q.failed(peer.addr()).await;
-            }
-        }
-    }
-
     /// Feed one hedged race into the reputation sink: the winner served, every
     /// miss failed, and every attempt the winner outpaced reported as outpaced
     /// (benched; a repeat before the peer serves again is a failure). The same
-    /// rules as `ElReader::hedged_read`.
+    /// rules as `ElReader::hedged_read`, including its excuse: on a
+    /// `finalized` call a miss answered with an empty proof is the peer not
+    /// holding a root it is not obliged to hold, and is banked nowhere.
     async fn record_race<T>(
         quality: &Option<crate::el::pool::SnapQualitySink>,
         peers: &[Arc<ManagedPeer>],
         out: &RaceOutcome<T>,
+        finalized: bool,
     ) {
         debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
+        let Some(q) = quality else { return };
+        // A miss is WITNESSED only when another peer served the same read; a
+        // whole-pool failure is banked live but persisted nowhere (#465 — the
+        // same cold-pool storm that struck the block read hits these).
+        let witnessed = out.accepted.is_some();
+        let excused = |idx: usize| {
+            finalized
+                && out.errors.iter().any(|(i, e)| {
+                    *i == idx && crate::el::snap::fetch::is_unknown_root_error(e)
+                })
+        };
         for idx in &out.missed {
-            Self::record(quality, &peers[*idx], false).await;
-        }
-        if let Some(q) = quality {
-            for idx in &out.outpaced {
-                q.outpaced(peers[*idx].addr()).await;
+            if excused(*idx) {
+                continue;
             }
+            q.failed(peers[*idx].addr(), witnessed).await;
+        }
+        for idx in &out.outpaced {
+            q.outpaced(peers[*idx].addr()).await;
         }
         if let Some((idx, _)) = &out.accepted {
-            Self::record(quality, &peers[*idx], true).await;
+            q.served(peers[*idx].addr()).await;
         }
     }
 
@@ -419,7 +477,7 @@ impl PoolOracle {
                 |_: &AccountOutcome| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, outcome)| match outcome {
                 AccountOutcome::Present(leaf) => Some(leaf),
@@ -631,6 +689,11 @@ impl SnapStateOracle for PoolOracle {
                         // next peer (Java tryWithRetries chunk rotation).
                         let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
                         let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
+                        // Peers that failed every item they were asked, held
+                        // until a later peer serves what they could not (then
+                        // witnessed) or the rotation runs out (then not — a
+                        // root every peer pruned is about our ask; #465).
+                        let mut unwitnessed: Vec<std::net::SocketAddr> = Vec::new();
                         for attempt in 0..attempts {
                             if pending.is_empty() {
                                 break;
@@ -660,12 +723,32 @@ impl SnapStateOracle for PoolOracle {
                             }
                             if let Some(q) = &quality {
                                 if served_any {
+                                    // This peer served items the held peers
+                                    // could not: their failures are witnessed
+                                    // — unless the call runs at the finalized
+                                    // root, where an item failure is almost
+                                    // always "does not hold that root" and
+                                    // the wave keeps no reason to tell it
+                                    // from transport (the serial reads that
+                                    // follow still strike a silent peer).
+                                    for addr in unwitnessed.drain(..) {
+                                        if !self.finalized {
+                                            q.failed(addr, true).await;
+                                        }
+                                    }
                                     q.served(peer.addr()).await;
                                 } else if asked_any {
-                                    q.failed(peer.addr()).await;
+                                    unwitnessed.push(peer.addr());
                                 }
                             }
                             pending = still_failed;
+                        }
+                        if let Some(q) = &quality {
+                            for addr in unwitnessed {
+                                if !self.finalized {
+                                    q.failed(addr, false).await;
+                                }
+                            }
                         }
                     }
                 },
@@ -734,7 +817,7 @@ impl SnapStateOracle for PoolOracle {
                 |_: &Vec<u8>| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, value)| value)
         })?;
@@ -774,7 +857,7 @@ impl SnapStateOracle for PoolOracle {
                 |_: &Vec<u8>| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, code)| code)
         })?;

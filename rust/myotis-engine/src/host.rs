@@ -29,8 +29,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use myotis_net::el::evm::{EnsQuery, EnsRootMode};
-use myotis_net::el::reader::ElReader;
+use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
+use myotis_net::el::pool::Enode;
+use myotis_net::el::reader::{parse_enode, ElReader};
 use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
@@ -93,6 +94,18 @@ struct EngineState {
     /// spin_up (start AND resume) re-applies it after building the EL reader,
     /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
     pending_served_window: Mutex<HashMap<i64, u64>>,
+    /// Per-handle LAST-PUSHED host seed pins (`set_boot_enodes_json`, #465):
+    /// stashed for every spin_up (start AND resume — a resume rebuilds the
+    /// pool from scratch) and applied live to a running reader, exactly like
+    /// [`EngineState::pending_served_window`]. Dies with the handle.
+    pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
+    /// Serializes the two paths that hand a stashed seed list to a reader —
+    /// a host's live push and the post-publish replay in `spin_up` — so the
+    /// pool always ends up holding the LATEST list: without it a push could
+    /// stash and apply a newer list between the replay's stash read and its
+    /// apply, and the older list would land last. Held across the pool call
+    /// (host threads only; no runtime task takes it).
+    boot_enodes_apply: Mutex<()>,
     /// Per-handle LAST-PUSHED log-index runtime bits, as
     /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
     /// portable snapshot, and a pause drops the EL reader with the index in it,
@@ -151,6 +164,8 @@ fn engine() -> Option<&'static EngineState> {
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
+                    pending_boot_enodes: Mutex::new(HashMap::new()),
+                    boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
@@ -716,6 +731,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // start()/resume() may have already published a Running one, while we were
     // starting. Either way, shut the handle we just started down rather than
     // orphan its tokio/libp2p host.
+    let pins_reader = reader.clone();
     let mut map = match engine.handles.lock() {
         Ok(m) => m,
         Err(_) => {
@@ -727,6 +743,15 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         (SpinUpFrom::Created, Some(ChainEntry::Created(_)))
         | (SpinUpFrom::Paused, Some(ChainEntry::Paused(..))) => {
             map.insert(handle, ChainEntry::Running(config, sync, reader));
+            drop(map);
+            // The host's seed pins, applied AFTER the entry is Running (#465):
+            // the pool was rebuilt from scratch, and the pins are the host's
+            // answer to a starving pool. After, not before, the publish: a
+            // push that lands while the reader is being built sees a
+            // Created/Paused entry and only stashes, so reading the stash
+            // here catches it, and a push from now on applies itself live.
+            // Applying twice is idle (set semantics; `try_dial` dedups).
+            apply_pending_boot_enodes(engine, handle, pins_reader.as_ref());
             true
         }
         _ => {
@@ -734,6 +759,25 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             shutdown(engine, sync, reader);
             false
         }
+    }
+}
+
+/// Hand the handle's stashed host seed pins (`set_boot_enodes_json`) to its EL
+/// reader: read under the stash lock, applied outside it (the pool call
+/// takes its own locks). No reader (the CL-only degraded mode) or no pins:
+/// nothing to do — the stash stays for the next spin_up.
+fn apply_pending_boot_enodes(engine: &EngineState, handle: i64, reader: Option<&Arc<ElReader>>) {
+    let Some(reader) = reader else { return };
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
+    let pins = engine
+        .pending_boot_enodes
+        .lock()
+        .ok()
+        .and_then(|pending| pending.get(&handle).cloned())
+        .filter(|pins| !pins.is_empty());
+    if let Some(pins) = pins {
+        let reader = Arc::clone(reader);
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
     }
 }
 
@@ -867,6 +911,7 @@ pub fn status_json(handle: i64) -> String {
                         ElCounts {
                             reader_available: true,
                             snap_peers: r.snap_peer_count().await,
+                            snap_serving: r.snap_serving_count().await,
                             discovered: r.discovered_count(),
                             attempted: r.attempted_count().await,
                             backed_off: r.backoff_count().await,
@@ -903,6 +948,12 @@ struct ElCounts {
     /// fast-fails instead of holding the full wake cap.
     reader_available: bool,
     snap_peers: usize,
+    /// The subset of `snap_peers` that can answer a read at the anchored head
+    /// NOW (`ElReader::snap_serving_count`: their own word or a served proof
+    /// puts them at or near it, and they are not read-benched). What the hosts
+    /// gate readiness on since ABI 31 — a pool of peers still syncing keeps
+    /// `snap_peers` positive for hours while every read fails (#465).
+    snap_serving: usize,
     discovered: usize,
     attempted: usize,
     backed_off: usize,
@@ -949,6 +1000,9 @@ pub fn stop(handle: i64) {
         cache.remove(&handle);
     }
     if let Ok(mut pending) = engine.pending_served_window.lock() {
+        pending.remove(&handle);
+    }
+    if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
         pending.remove(&handle);
     }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
@@ -1005,6 +1059,95 @@ pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
     }
 }
 
+/// Cap on host-supplied seed pins per handle: a seed list is a handful of
+/// servers the host knows to be up, not a peer database (the cache is that).
+const MAX_HOST_ENODES: usize = 64;
+
+/// Pure: a host's seed-pin push (`myotis_set_boot_enodes`) → dialable pins,
+/// APPLIED OR REFUSED AS A WHOLE (CLAUDE.md §Trust — a push the engine
+/// half-applied is one the host cannot reason about): a non-array, any entry
+/// that is not a string or not a strict `enode://<128 hex>@ip:port` URL
+/// (`parse_enode` — a DNS name is refused, not resolved), a duplicate
+/// address, or more than [`MAX_HOST_ENODES`] entries refuses the push with
+/// every reason named. An empty array is a valid "clear".
+fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
+    let entries = match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Array(entries)) => entries,
+        Ok(_) => return Err("not a JSON array of enode:// strings".to_string()),
+        Err(e) => return Err(format!("not valid JSON: {e}")),
+    };
+    if entries.len() > MAX_HOST_ENODES {
+        return Err(format!(
+            "{} entries; at most {MAX_HOST_ENODES} seed pins are accepted",
+            entries.len()
+        ));
+    }
+    let mut pins: Vec<Enode> = Vec::with_capacity(entries.len());
+    let mut reasons = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(url) = entry.as_str() else {
+            reasons.push(format!("entry {i}: not a string"));
+            continue;
+        };
+        match parse_enode(url) {
+            Ok((addr, _)) if pins.iter().any(|(seen, _)| *seen == addr) => {
+                reasons.push(format!("entry {i}: duplicate address {addr}"));
+            }
+            Ok(pin) => pins.push(pin),
+            Err(why) => reasons.push(format!("entry {i}: {why}")),
+        }
+    }
+    if reasons.is_empty() {
+        Ok(pins)
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
+/// `myotis_set_boot_enodes` (ABI ≥ 31, #465): replace the handle's
+/// HOST-SUPPLIED EL seed pins with a JSON array of `enode://` URLs. Strict —
+/// the whole push is applied or refused ([`parse_boot_enodes_json`]; `false`
+/// with one WARN naming every reason, nothing applied). Applied immediately
+/// on a RUNNING handle's EL reader and STASHED for every spin_up (start AND
+/// resume), exactly like [`set_served_block_window`]: hosts push between
+/// create() and start(), and a resume rebuilds the pool. A RUNNING handle
+/// whose EL reader failed to start (`elReaderAvailable` false, the CL-only
+/// degraded mode) stashes only, for the resume that rebuilds it — as the
+/// served window does. Set semantics — a later push replaces an earlier one;
+/// an empty array clears. `false` for an unknown handle (nothing stashed).
+pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
+    let pins = match parse_boot_enodes_json(enodes_json) {
+        Ok(pins) => pins,
+        Err(reason) => {
+            tracing::warn!(handle, %reason, "boot enodes refused; nothing applied");
+            return false;
+        }
+    };
+    let Some(engine) = engine() else { return false };
+    // Serialized with spin_up's replay (see `EngineState::boot_enodes_apply`).
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
+    // Stash under the handles lock — stop() removes the entry under this same
+    // lock and clears the stash after, so an entry stashed for a known handle
+    // cannot outlive it (set_served_block_window's discipline) — and apply to
+    // the snapshotted reader OUTSIDE it (the pool call takes its own locks).
+    let reader = {
+        let Ok(map) = engine.handles.lock() else { return false };
+        let reader = match map.get(&handle) {
+            Some(ChainEntry::Running(_, _, Some(reader))) => Some(Arc::clone(reader)),
+            Some(_) => None, // Created / Paused / EL-less: applied at the next spin_up
+            None => return false,
+        };
+        if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
+            pending.insert(handle, pins.clone());
+        }
+        reader
+    };
+    if let Some(reader) = reader {
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
+    }
+    true
+}
+
 /// `nativeSetWsBoundPeriods`: override the weak-subjectivity anchor-age bound
 /// (periods); 0 restores the network default. No stash map needed: the knob
 /// lives in the config's shared `Arc<WsPolicy>`, which every entry state
@@ -1052,11 +1195,40 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     }
 }
 
+/// Parse a verified read's RPC block selector — BEFORE the handle lookup: a
+/// selector no retry can serve (`earliest`, a block hash, garbage) is refused
+/// as invalid params, the request's own fault, whatever state the handle is
+/// in. `Err` is the JSON to return. Shared by `eth_call` (#452) and the state
+/// reads (ABI ≥ 32, #465, #366).
+fn parse_read_block(block: &str) -> Result<BlockSelector, String> {
+    parse_call_block(block).map_err(|msg| eljson::invalid_params_json(&msg))
+}
+
+/// The anchor a parsed selector reads at, judged against the head as of
+/// dispatch: a head tag → the verified head; `finalized` → the beacon-finalized
+/// block; a number → the head, but only inside the window around it
+/// ([`check_call_block`] — head state is the near-head trade-off, exact
+/// historical state is not held), else refused as JSON rather than answered
+/// from the head. The reader itself refuses `finalized` while no finalized
+/// block has landed.
+fn read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadAnchor, String> {
+    check_call_block(selector, reader.optimistic_block_number()).map_err(|r| r.to_json())?;
+    Ok(match selector {
+        BlockSelector::Finalized => ReadAnchor::Finalized,
+        BlockSelector::Head | BlockSelector::Number(_) => ReadAnchor::Head,
+    })
+}
+
 /// Verified account query as JSON (`AccountProofResult` shape / an
-/// `{"error": ...}` object) — `nativeRequestAccountJson`.
-pub fn request_account_json(handle: i64, address_hex: &str) -> String {
+/// `{"error": ...}` object) — `nativeRequestAccountJson`. `block` is the RPC
+/// block selector, applied or refused ([`read_anchor`]).
+pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1068,7 +1240,11 @@ pub fn request_account_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_account(address).await })) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_account(anchor, address).await })) {
         Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -1117,10 +1293,15 @@ pub fn get_storage_proof_json(
 
 /// `nativeGetCodeJson`: run a verified contract-code query (`eth_getCode`) for a
 /// running handle, returning the code result JSON, or `{"error": "..."}` for a
-/// transport / not-running / bad-input failure.
-pub fn get_code_json(handle: i64, address_hex: &str) -> String {
+/// transport / not-running / bad-input failure. `block` is the RPC block
+/// selector, applied or refused ([`read_anchor`]).
+pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1129,7 +1310,11 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_code(address).await })) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_code(anchor, address).await })) {
         Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -1138,13 +1323,23 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
 /// `nativeGetStorageAtJson`: run a verified RAW-32-byte-position storage query
 /// (`eth_getStorageAt`) for a running handle. `position_hex` is the 32-byte
 /// storage position (0x-hex); the trie key is that position itself — no ERC-20
-/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`.
-pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -> String {
+/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`. `block` is the
+/// RPC block selector, applied or refused ([`read_anchor`]).
+pub fn get_storage_at_json(
+    handle: i64,
+    address_hex: &str,
+    position_hex: &str,
+    block: &str,
+) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
     };
     let Some(position) = parse_word32(position_hex) else {
         return eljson::error_json("invalid storage position (expected 32-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1153,7 +1348,14 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_storage_at(address, position).await })) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine
+        .rt
+        .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
+    {
         Ok(storage) => {
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
@@ -1166,11 +1368,13 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
 /// calldata is init code and the constructor's return data is the answer);
 /// `data_hex` is the calldata;
 /// `value_dec` is the wei value as a decimal string (FFI-neutral); `block` is the
-/// RPC block selector. The call always runs against the VERIFIED HEAD's state,
-/// so the block is checked HERE, once for every host (#452): a head tag (or
-/// empty) runs, a block number runs only inside the window around the head
-/// ([`check_call_block`]), and anything else is refused rather than answered
-/// from the head. Returns the call JSON (`ok`/`revert`/`unavailable`, see
+/// RPC block selector, checked HERE, once for every host (#452): a head tag (or
+/// empty) runs against the VERIFIED HEAD's state, `finalized` against the
+/// beacon-finalized block (ABI ≥ 30, #465), a block number runs only inside the
+/// window around the head ([`check_call_block`]) and still against head state,
+/// and anything else is refused rather than answered from the head. Returns
+/// the call JSON (`ok`/`revert`/`unavailable`, each naming the block it ran
+/// against, see
 /// [`eljson::call_json`]), `{"error": "..."}`, or
 /// [`eljson::invalid_params_json`] for a request this node can never serve (a
 /// malformed argument, or a block it will never reach).
@@ -1200,9 +1404,9 @@ pub fn eth_call_overrides_json(
 ) -> String {
     // Every refusal of the request's own arguments is permanent (-32602): no
     // retry changes them. The block first, as the host adapters check it.
-    let call_block = match parse_call_block(block) {
+    let call_block = match parse_read_block(block) {
         Ok(b) => b,
-        Err(msg) => return eljson::invalid_params_json(&msg),
+        Err(json) => return json,
     };
     let overrides = match parse_state_overrides(overrides_json) {
         Ok(o) => o,
@@ -1250,20 +1454,23 @@ pub fn eth_call_overrides_json(
         Err(msg) => return eljson::error_json(msg),
     };
     // Against the head as of dispatch, like the host adapters' own check.
-    if let Err(refusal) = check_call_block(call_block, reader.optimistic_block_number()) {
-        return refusal.to_json();
-    }
+    let anchor = match read_anchor(call_block, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
     match engine
         .rt
         .block_on(async {
             if creation {
-                reader.eth_call_create(from, data, value, chain_id, overrides).await
+                reader.eth_call_create(anchor, from, data, value, chain_id, overrides).await
             } else {
-                reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+                reader
+                    .eth_call_overridden(anchor, from, to, data, value, chain_id, overrides)
+                    .await
             }
         })
     {
-        Ok(outcome) => eljson::call_json(&outcome),
+        Ok(answer) => eljson::call_json(&answer),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -1297,13 +1504,20 @@ const CALL_BLOCK_LAG_TOLERANCE: u64 = 64;
 /// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_TOLERANCE`.
 const CALL_BLOCK_AHEAD_TOLERANCE: u64 = 16;
 
-/// The block an `eth_call` asked for, as the head-anchored executor sees it.
+/// A parsed eth block selector — for `eth_call` ([`parse_call_block`]) and the
+/// block reads ([`parse_block_target`]), whose accepted syntax differs but
+/// whose meaning is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallBlock {
-    /// A head tag (`latest`/`pending`/`safe`/`finalized`), or empty — the
-    /// JSON-RPC default.
+enum BlockSelector {
+    /// A head tag (`latest`/`pending`/`safe`), or empty — the JSON-RPC
+    /// default. `safe` and `pending` still mean the head (#366).
     Head,
-    /// A block number, still to be checked against the verified head.
+    /// The `finalized` tag: the beacon-FINALIZED block (ABI ≥ 30, #465) —
+    /// applied, not silently mapped to the head; for a block read resolved
+    /// against the anchor by [`resolve_block_target`].
+    Finalized,
+    /// A block number: for `eth_call` still to be checked against the verified
+    /// head ([`check_call_block`]); for a block read served as is.
     Number(u64),
 }
 
@@ -1317,15 +1531,18 @@ enum CallBlock {
 ///
 /// `Err` is a selector no retry can make servable (`earliest`, a block hash,
 /// garbage), so the caller refuses it as invalid params.
-fn parse_call_block(block: &str) -> Result<CallBlock, String> {
+fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
     let b = block.trim();
     let is_tag = |t: &str| b.eq_ignore_ascii_case(t);
-    if b.is_empty() || ["latest", "pending", "safe", "finalized"].into_iter().any(is_tag) {
-        return Ok(CallBlock::Head);
+    if b.is_empty() || ["latest", "pending", "safe"].into_iter().any(is_tag) {
+        return Ok(BlockSelector::Head);
+    }
+    if is_tag("finalized") {
+        return Ok(BlockSelector::Finalized);
     }
     if is_tag("earliest") {
-        return Err("earliest (genesis) is not served: eth_call runs against the verified \
-                    head's state"
+        return Err("earliest (genesis) is not served: verified reads run against the \
+                    head's state, or the finalized block's"
             .to_string());
     }
     let (digits, radix) = match b.strip_prefix("0x").or_else(|| b.strip_prefix("0X")) {
@@ -1337,10 +1554,10 @@ fn parse_call_block(block: &str) -> Result<CallBlock, String> {
     // is malformed, as the hosts' Long parse has it.
     let number = if well_formed { i64::from_str_radix(digits, radix).ok() } else { None };
     if let Some(n) = number.and_then(|n| u64::try_from(n).ok()) {
-        return Ok(CallBlock::Number(n));
+        return Ok(BlockSelector::Number(n));
     }
     if well_formed && radix == 16 && digits.len() == 64 {
-        return Err("eth_call by block hash is not supported: pass a block number or a head tag"
+        return Err("a block hash is not supported as the selector: pass a block number or a tag"
             .to_string());
     }
     let shown: String = b.chars().take(66).collect();
@@ -1373,8 +1590,8 @@ impl CallBlockRefusal {
         match *self {
             Self::Behind { block, head } => eljson::invalid_params_json(&format!(
                 "block {block:#x} ({block}) is more than {CALL_BLOCK_LAG_TOLERANCE} blocks \
-                 behind the verified head ({head}); eth_call runs against head state, so this \
-                 node cannot answer for that block"
+                 behind the verified head ({head}); verified reads run against head state, so \
+                 this node cannot answer for that block"
             )),
             Self::Ahead { block, head } => eljson::error_json(&format!(
                 "block {block:#x} ({block}) is more than {CALL_BLOCK_AHEAD_TOLERANCE} blocks \
@@ -1392,9 +1609,11 @@ impl CallBlockRefusal {
 /// window: wallets pin reads to the number `eth_blockNumber` just returned,
 /// which is at or near the head. Inside the window the call still runs against
 /// HEAD state, the documented near-head trade-off (exact-block execution is
-/// #382).
-fn check_call_block(block: CallBlock, head: u64) -> Result<(), CallBlockRefusal> {
-    let CallBlock::Number(block) = block else {
+/// #382). A tag needs no check here: `Head` runs at the head, `Finalized` at
+/// the beacon-finalized block, whose own not-synced refusal comes from the
+/// reader.
+fn check_call_block(block: BlockSelector, head: u64) -> Result<(), CallBlockRefusal> {
+    let BlockSelector::Number(block) = block else {
         return Ok(());
     };
     if head == 0 {
@@ -1701,7 +1920,8 @@ pub fn estimate_gas_json(
 /// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
 /// handle. `full_transactions` selects fully decoded tx objects instead of
 /// hashes. Returns the block JSON when found+verified, the literal `"null"` for
-/// a future/unknown block (eth's null), or `{"error": "..."}` when it can't
+/// a future/unknown block (eth's null — above the verified head and not
+/// covered by finality), or `{"error": "..."}` when it can't
 /// verify right now (which the Java side maps to a null → -32000).
 pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
     let target = match parse_block_target(block_tag) {
@@ -1714,6 +1934,10 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
     let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
+    };
+    let target = match resolve_block_target(target, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
     };
     match engine
         .rt
@@ -1909,6 +2133,10 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
             Ok(t) => t,
             Err(msg) => return eljson::error_json(msg),
         };
+        let target = match resolve_block_target(target, reader.finalized_block_number()) {
+            Ok(t) => t,
+            Err(msg) => return eljson::error_json(&msg),
+        };
         engine.rt.block_on(reader.request(async { reader.get_block_receipts(target).await }))
     };
     match outcome {
@@ -1951,6 +2179,10 @@ pub fn fee_history_json(
     let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
+    };
+    let newest = match resolve_block_target(newest, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
     };
     // The raw request strings ARE the stale-serve signature (the Java
     // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
@@ -2028,13 +2260,15 @@ fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
     Ok(Some(out))
 }
 
-/// Parse an eth block selector to a target number: `None` = latest (the head).
-/// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
-/// optimistic head; earliest (genesis) and malformed/negative are not served
-/// verified (`Err`, surfaced as an error the router turns into -32000).
-fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
+
+/// Parse an eth block selector. Pure — `finalized` resolves against the anchor
+/// in [`resolve_block_target`]. Earliest (genesis) and malformed/negative are
+/// not served verified (`Err`, surfaced as an error the router turns into
+/// -32000).
+fn parse_block_target(tag: &str) -> Result<BlockSelector, &'static str> {
     match tag {
-        "latest" | "pending" | "safe" | "finalized" => Ok(None),
+        "latest" | "pending" | "safe" => Ok(BlockSelector::Head),
+        "finalized" => Ok(BlockSelector::Finalized),
         "earliest" => Err("earliest (genesis) is not served verified"),
         hex => {
             let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
@@ -2045,10 +2279,31 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
                 // Block 0 (any hex form) is genesis — reject it up front, same as the
                 // "earliest" tag, rather than letting it fail deep in the lookback cap.
                 Ok(0) => Err("earliest (genesis) is not served verified"),
-                Ok(n) => Ok(Some(n)),
+                Ok(n) => Ok(BlockSelector::Number(n)),
                 Err(_) => Err("block number out of range"),
             }
         }
+    }
+}
+
+/// Resolve a parsed selector to the reader's target: `None` = the head,
+/// `Some(n)` = a block number. `finalized` takes the anchor's finalized block
+/// (`finalized_block_number`, 0 before one has landed) and is then refused with
+/// a plain, RETRYABLE error — it clears when the beacon syncs, and `-32602`
+/// would tell a client to stop asking a node that is merely unsynced. (The
+/// `eth_call` path lets the reader refuse the same state itself, with the same
+/// words.)
+fn resolve_block_target(
+    target: BlockSelector,
+    finalized_block_number: u64,
+) -> Result<Option<u64>, String> {
+    match target {
+        BlockSelector::Head => Ok(None),
+        BlockSelector::Number(n) => Ok(Some(n)),
+        BlockSelector::Finalized => match finalized_block_number {
+            0 => Err("no beacon-finalized execution block yet".to_string()),
+            n => Ok(Some(n)),
+        },
     }
 }
 
@@ -2342,11 +2597,15 @@ fn status_object(
     obj.insert("wsBoundPeriods".into(), s.ws_bound_periods.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
-    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
-    // elReaderAvailable distinguishes "EL warming up" from "EL reader failed to
-    // start" (the CL-only degraded mode) — the wake gate fast-fails the latter.
+    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers —
+    // both count POOLED peers. snapServingPeers (ABI >= 31) is the subset that
+    // can answer a read at the anchored head now; it is what the hosts gate
+    // on (#465). elReaderAvailable distinguishes "EL warming up" from "EL
+    // reader failed to start" (the CL-only degraded mode) — the wake gate
+    // fast-fails the latter.
     obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
+    obj.insert("snapServingPeers".into(), el.snap_serving.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
     obj.insert("attemptedDials".into(), el.attempted.into());
@@ -2381,7 +2640,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
-    r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""snapPeers":0,"snapServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
@@ -2741,9 +3000,9 @@ mod tests {
         );
         assert_eq!(v["elReaderAvailable"], false);
         // EL counts are zero for a not-started handle.
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
         }
         // Round-trips through the fallback constant too.
@@ -2793,6 +3052,7 @@ mod tests {
         let el = ElCounts {
             reader_available: true,
             snap_peers: 5,
+            snap_serving: 3,
             discovered: 240,
             attempted: 14,
             backed_off: 30,
@@ -2832,9 +3092,11 @@ mod tests {
         assert_eq!(synced["wsBoundPeriods"], 13);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
-        // readyPeers, since the pool holds only snap-capable READY peers).
+        // readyPeers, since the pool holds only snap-capable READY peers;
+        // snapServingPeers is its own count — the peers that can answer now).
         assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
+        assert_eq!(synced["snapServingPeers"], 3);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
         assert_eq!(synced["attemptedDials"], 14);
@@ -2896,9 +3158,9 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 14_560_000);
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1795);
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");
         }
     }
@@ -2924,6 +3186,104 @@ mod tests {
         // The stash dies with the handle.
         stop(handle);
         assert!(engine.pending_served_window.lock().unwrap().get(&handle).is_none());
+    }
+
+    #[test]
+    fn state_reads_apply_or_refuse_their_block_selector() {
+        // The three state reads take the RPC block selector since ABI 32 and
+        // judge it BEFORE the handle lookup would fail: a selector no retry can
+        // serve is permanent (-32602), a servable one reaches the engine (and
+        // fails here only on the unknown handle).
+        let addr = format!("0x{}", "ab".repeat(20));
+        let pos = format!("0x{}", "00".repeat(32));
+        let read = |block: &str| -> Vec<serde_json::Value> {
+            [
+                request_account_json(i64::MIN, &addr, block),
+                get_code_json(i64::MIN, &addr, block),
+                get_storage_at_json(i64::MIN, &addr, &pos, block),
+            ]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect()
+        };
+        for servable in ["", "latest", "pending", "safe", "finalized", "0x10"] {
+            for v in read(servable) {
+                assert_eq!(v["error"], "unknown handle", "{servable}: {v}");
+            }
+        }
+        for refused in ["earliest", "0xzz", &format!("0x{}", "ab".repeat(32))] {
+            for v in read(refused) {
+                assert_eq!(v["code"], -32602, "{refused}: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn boot_enodes_json_is_applied_or_refused_as_a_whole() {
+        let key = "ab".repeat(64);
+        let pin = |host: &str| format!("enode://{key}@{host}");
+        // The empty "clear", and a valid list.
+        assert_eq!(parse_boot_enodes_json("[]").unwrap(), vec![]);
+        let two = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("[2001:db8::1]:30303")
+        ))
+        .unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].1, [0xab; 64]);
+        // Refused as a whole, every reason named — a good entry beside a bad
+        // one is not applied.
+        let mixed = parse_boot_enodes_json(&format!(r#"["{}","nope",7]"#, pin("1.2.3.4:30303")))
+            .unwrap_err();
+        assert!(mixed.contains("entry 1: missing the enode:// prefix"), "{mixed}");
+        assert!(mixed.contains("entry 2: not a string"), "{mixed}");
+        let dup = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("1.2.3.4:30303")
+        ))
+        .unwrap_err();
+        assert!(dup.contains("entry 1: duplicate address 1.2.3.4:30303"), "{dup}");
+        assert!(parse_boot_enodes_json("{}").unwrap_err().contains("not a JSON array"));
+        assert!(parse_boot_enodes_json("[").unwrap_err().contains("not valid JSON"));
+        let dns = parse_boot_enodes_json(&format!(r#"["{}"]"#, pin("node.example.org:30303")))
+            .unwrap_err();
+        assert!(dns.contains("numeric ip:port"), "{dns}");
+        let many = format!(
+            "[{}]",
+            (0..=MAX_HOST_ENODES)
+                .map(|i| format!("\"{}\"", pin(&format!("10.0.0.{i}:1"))))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse_boot_enodes_json(&many).unwrap_err().contains("at most 64"));
+    }
+
+    #[test]
+    fn boot_enodes_stash_pre_start_refuse_malformed_and_clear_on_stop() {
+        let key = "ab".repeat(64);
+        let list = format!(r#"["enode://{key}@1.2.3.4:30303"]"#);
+        // Unknown handle → false, nothing stashed.
+        assert!(!set_boot_enodes_json(999_999, &list));
+        let dir = std::env::temp_dir().join("myotis-host-boot-enodes-test");
+        let handle = create("mainnet", dir.to_str().unwrap());
+        assert!(handle > 0);
+        let engine = engine().unwrap();
+        let stashed = |h: i64| engine.pending_boot_enodes.lock().unwrap().get(&h).map(|p| p.len());
+        assert!(stashed(999_999).is_none());
+        // A Created (not-started) handle stashes the pins for spin_up.
+        assert!(set_boot_enodes_json(handle, &list));
+        assert_eq!(stashed(handle), Some(1));
+        // A malformed push is refused and leaves the earlier one in place.
+        assert!(!set_boot_enodes_json(handle, r#"["nope"]"#));
+        assert_eq!(stashed(handle), Some(1));
+        // An empty array is a valid clear.
+        assert!(set_boot_enodes_json(handle, "[]"));
+        assert_eq!(stashed(handle), Some(0));
+        // The stash dies with the handle.
+        stop(handle);
+        assert!(stashed(handle).is_none());
     }
 
     #[test]
@@ -3014,10 +3374,20 @@ mod tests {
 
     #[test]
     fn parse_block_target_cases() {
-        assert_eq!(parse_block_target("latest"), Ok(None));
-        assert_eq!(parse_block_target("pending"), Ok(None));
-        assert_eq!(parse_block_target("finalized"), Ok(None));
-        assert_eq!(parse_block_target("0x1406f40"), Ok(Some(21_000_000)));
+        assert_eq!(parse_block_target("latest"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("pending"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("safe"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("finalized"), Ok(BlockSelector::Finalized));
+        assert_eq!(parse_block_target("0x1406f40"), Ok(BlockSelector::Number(21_000_000)));
+        // `finalized` resolves to the anchor's finalized block — applied — and
+        // is refused, retryably, before one has landed.
+        assert_eq!(resolve_block_target(BlockSelector::Head, 20_999_936), Ok(None));
+        assert_eq!(resolve_block_target(BlockSelector::Number(7), 20_999_936), Ok(Some(7)));
+        assert_eq!(
+            resolve_block_target(BlockSelector::Finalized, 20_999_936),
+            Ok(Some(20_999_936))
+        );
+        assert!(resolve_block_target(BlockSelector::Finalized, 0).is_err());
         assert!(parse_block_target("earliest").is_err());
         // Block 0 (genesis) is rejected up front in any hex form, like "earliest".
         assert!(parse_block_target("0x0").is_err());
@@ -3043,13 +3413,13 @@ mod tests {
     fn account_query_rejects_bad_address_and_unknown_handle() {
         // Bad address → error before any handle lookup.
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(1, "0xnothex")).unwrap();
+            serde_json::from_str(&request_account_json(1, "0xnothex", "")).unwrap();
         assert!(v["error"].as_str().unwrap().contains("invalid address"));
 
         // Valid address, unknown handle → "unknown handle" error.
         let addr = format!("0x{}", "ab".repeat(20));
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(i64::MIN, &addr)).unwrap();
+            serde_json::from_str(&request_account_json(i64::MIN, &addr, "")).unwrap();
         assert_eq!(v["error"], "unknown handle");
     }
 
@@ -3795,7 +4165,7 @@ mod call_target_tests {
 #[cfg(test)]
 mod call_block_tests {
     use super::{
-        check_call_block, eth_call_json, eth_call_overrides_json, parse_call_block, CallBlock,
+        check_call_block, eth_call_json, eth_call_overrides_json, parse_call_block, BlockSelector,
         CallBlockRefusal, CALL_BLOCK_AHEAD_TOLERANCE, CALL_BLOCK_LAG_TOLERANCE,
     };
 
@@ -3813,12 +4183,25 @@ mod call_block_tests {
 
     #[test]
     fn head_tags_and_default_are_servable() {
-        for tag in ["latest", "pending", "safe", "finalized", "", "  ", "LATEST", "Pending"] {
-            assert_eq!(parse_call_block(tag), Ok(CallBlock::Head), "{tag:?}");
+        for tag in ["latest", "pending", "safe", "", "  ", "LATEST", "Pending"] {
+            assert_eq!(parse_call_block(tag), Ok(BlockSelector::Head), "{tag:?}");
         }
         // A tag needs no head to be checked against; without one, the executor
         // fails with its own not-synced error.
-        assert_eq!(check_call_block(CallBlock::Head, 0), Ok(()));
+        assert_eq!(check_call_block(BlockSelector::Head, 0), Ok(()));
+    }
+
+    #[test]
+    fn finalized_is_its_own_anchor() {
+        // Applied, not mapped to the head (#465, #366): the call runs against
+        // the beacon-finalized block.
+        for tag in ["finalized", "FINALIZED", " finalized "] {
+            assert_eq!(parse_call_block(tag), Ok(BlockSelector::Finalized), "{tag:?}");
+        }
+        // Like a head tag it needs no window check; the reader refuses it
+        // itself while there is no finalized block.
+        assert_eq!(check_call_block(BlockSelector::Finalized, 0), Ok(()));
+        assert!(servable("finalized", HEAD));
     }
 
     #[test]
@@ -3835,7 +4218,7 @@ mod call_block_tests {
     #[test]
     fn an_older_number_is_refused_for_good() {
         let behind = HEAD - CALL_BLOCK_LAG_TOLERANCE - 1;
-        let refusal = check_call_block(CallBlock::Number(behind), HEAD).unwrap_err();
+        let refusal = check_call_block(BlockSelector::Number(behind), HEAD).unwrap_err();
         assert_eq!(refusal, CallBlockRefusal::Behind { block: behind, head: HEAD });
         assert_eq!(json(&refusal.to_json())["code"], -32602);
         assert!(!servable("0x1", HEAD));
@@ -3844,7 +4227,7 @@ mod call_block_tests {
     #[test]
     fn a_number_past_the_head_is_refused_but_retryable() {
         let ahead = HEAD + CALL_BLOCK_AHEAD_TOLERANCE + 1;
-        let refusal = check_call_block(CallBlock::Number(ahead), HEAD).unwrap_err();
+        let refusal = check_call_block(BlockSelector::Number(ahead), HEAD).unwrap_err();
         assert_eq!(refusal, CallBlockRefusal::Ahead { block: ahead, head: HEAD });
         let v = json(&refusal.to_json());
         assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");
@@ -3852,7 +4235,7 @@ mod call_block_tests {
 
     #[test]
     fn a_number_without_a_verified_head_is_refused_but_retryable() {
-        let refusal = check_call_block(CallBlock::Number(HEAD), 0).unwrap_err();
+        let refusal = check_call_block(BlockSelector::Number(HEAD), 0).unwrap_err();
         assert_eq!(refusal, CallBlockRefusal::NoHead { block: HEAD });
         let v = json(&refusal.to_json());
         assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");

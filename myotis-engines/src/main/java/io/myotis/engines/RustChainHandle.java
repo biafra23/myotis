@@ -312,9 +312,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         }
     }
 
-    /** Readiness for verified reads — the serveable predicate status() ages the
-     *  head by: SYNCED, an anchored optimistic head, and snap peers to query
-     *  (the Rust twin of ChainStack.readyForReads). */
+    /** Readiness for verified reads — {@link #serveable(ParsedStatus)} plus the
+     *  states no amount of holding fixes (the Rust twin of
+     *  ChainStack.readyForReads). */
     private boolean readyForReads() {
         try {
             return readyForReads(readStatus());
@@ -338,8 +338,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // the bound or accept the risk), so attempt now — the refusal comes back at
         // once as the router's curated STALE_ANCHOR message (ChainStack's rule too).
         if (s.running() && s.beaconState() == BeaconState.STALE_ANCHOR) return true;
-        return s.running() && s.beaconState() == BeaconState.SYNCED
-                && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0;
+        return s.running() && serveable(s);
+    }
+
+    /** A verified read can be served NOW: SYNCED, an anchored optimistic head, and
+     *  a pooled snap peer that can answer at that head — {@code snapServingPeers},
+     *  not the pooled count: right after SYNCED a pool of peers still syncing
+     *  themselves keeps {@code snapPeers} positive for hours while every read
+     *  fails (#465). The one predicate {@link #readyForReads} holds on and
+     *  {@link #status(ParsedStatus)} ages the verified head by. */
+    private static boolean serveable(ParsedStatus s) {
+        return s.beaconState() == BeaconState.SYNCED
+                && s.optimisticBlockNumber() > 0 && s.snapServingPeers() > 0;
     }
 
     /** Package-private test seam: the readiness predicate over a status JSON, without JNI. */
@@ -350,8 +360,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /** Why reads aren't answerable yet, for the wake gate's slow-hold WARN. */
     private String notReadyDetail() {
         ParsedStatus s = readStatus();
+        // Both counts: "6 pooled, 0 serving" is the diagnosis of a pool of
+        // peers that are still syncing themselves (#465).
         return "beacon " + s.beaconState() + ", snapPeers " + s.snapPeers()
-                + ", head " + s.optimisticBlockNumber();
+                + " (" + s.snapServingPeers() + " serving), head " + s.optimisticBlockNumber();
     }
 
     /** {@link NodeStatusReads}: node uptime for the JSON-RPC myotis_status result. Monotonic
@@ -427,6 +439,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             int discv5TableSize,
             long syncStartPeriod,
             int snapPeers,
+            int snapServingPeers,
             int discoveredPeers,
             int attemptedDials,
             int backedOffPeers,
@@ -473,6 +486,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         o.getInt("discv5TableSize", 0),
                         o.getLong("syncStartPeriod", -1L),
                         o.getInt("snapPeers", 0),
+                        // ABI >= 31: the pooled peers that can answer at the anchored
+                        // head (#465). Absent → 0 like every other EL key — fail
+                        // CLOSED, never the pooled count: the ABI gate is exact, so a
+                        // native this wrapper loads always emits it.
+                        o.getInt("snapServingPeers", 0),
                         o.getInt("discoveredPeers", 0),
                         o.getInt("attemptedDials", 0),
                         o.getInt("backedOffPeers", 0),
@@ -495,7 +513,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L);
         }
     }
 
@@ -530,8 +548,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // invariant holds against any .so vintage.
         long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
         // EL pool/discovery counts now come from the Rust status JSON. The pool
-        // keeps only snap-capable READY peers, so readyPeers == snapPeers (and
-        // snapServingPeers is approximated by the same). Execution block numbers
+        // keeps only snap-capable READY peers, so readyPeers == snapPeers;
+        // snapServingPeers is the engine's own count of the pooled peers that can
+        // answer at the anchored head now (ABI >= 31). Execution block numbers
         // (optimistic head + finalized) come from the beacon anchor via the status.
         //
         // verifiedHeadAgeMs drives the host's readiness dot (< 45 s = ready/green).
@@ -546,8 +565,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // Monotonic nanoTime — a wall-clock/NTP jump must not distort the age.
         long optHead = s.optimisticBlockNumber();
         long nowNanos = System.nanoTime();
-        boolean serveable = s.beaconState() == BeaconState.SYNCED
-                && optHead > 0 && s.snapPeers() > 0;
+        boolean serveable = serveable(s);
         long verifiedHeadAgeMs;
         synchronized (headAgeLock) {
             if (!serveable) {
@@ -573,7 +591,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 peers,                 // connectedPeers (CL libp2p peers)
                 s.snapPeers(),         // readyPeers (EL — pool holds only snap-ready)
                 s.snapPeers(),         // snapPeers
-                s.snapPeers(),         // snapServingPeers (approx)
+                s.snapServingPeers(),  // snapServingPeers (ABI >= 31)
                 s.discoveredPeers(),   // discoveredPeers (discv4)
                 s.backedOffPeers(),    // backedOffPeers
                 s.blacklistedPeers(),  // blacklistedPeers
@@ -730,10 +748,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
-        JsonObject o = parseResultOrThrow(
-                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress)),
-                "account");
-        return accountFromJson(hexAddress, o);
+        return accountVerified(hexAddress, "");
     }
 
     /** Package-private test seam: JSON → {@link AccountProofResult} without JNI. */
@@ -789,13 +804,30 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // ---- VerifiedReads helpers (used by RustVerifiedReads; not ChainHandle API) ----
 
     /**
-     * Verified contract bytecode for {@code hexAddress} (eth_getCode), or null when
+     * {@link #requestAccount(String)} at a block selector (ABI >= 32): a head tag or
+     * empty reads the verified head, {@code finalized} the beacon-finalized block
+     * (applied, never mapped to the head — #465, #366), a number only inside the
+     * window around the head; anything else the engine refuses. Package-private:
+     * the {@code io.myotis.api} surface has no block parameter yet, so only the
+     * JSON-RPC adapter ({@link RustVerifiedReads}) reaches this.
+     */
+    AccountProofResult accountVerified(String hexAddress, String block) {
+        JsonObject o = parseResultOrThrow(
+                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),
+                "account");
+        return accountFromJson(hexAddress, o);
+    }
+
+    /**
+     * Verified contract bytecode for {@code hexAddress} (eth_getCode) at the block
+     * selector {@code block} (a head tag, {@code finalized}, or a near-head number —
+     * the engine checks it, ABI >= 32), or null when
      * the query produced no verdict (can't answer verified). A verified EOA /
      * empty-code account yields an empty array. Throws {@link EngineException} on a
      * transport / not-running failure (the adapter maps that to null).
      */
-    byte[] codeVerified(String hexAddress) {
-        return codeFromJson(gated(() -> RustEngineNative.nativeGetCodeJson(handle, hexAddress)));
+    byte[] codeVerified(String hexAddress, String block) {
+        return codeFromJson(gated(() -> RustEngineNative.nativeGetCodeJson(handle, hexAddress, block)));
     }
 
     /** Package-private test seam: code JSON → verified bytecode (or null) without JNI. */
@@ -868,8 +900,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /** Package-private test seam: call JSON → the engine's three-way outcome.
      *  The Rust side emits {@code {"status":"ok","resultHex"}} /
      *  {@code {"status":"revert","dataHex"}} / {@code {"status":"unavailable",
-     *  "reason"}} (pinned by the eljson golden tests); a revert is a VERIFIED
-     *  answer whose payload the host serves as the standard code-3 error. */
+     *  "reason"}}, each with {@code blockNumber} (the block the call ran
+     *  against) and {@code verified} (ran against the beacon-finalized block)
+     *  since ABI 30 — all pinned by the eljson golden tests; the two extra keys
+     *  are not surfaced through {@link io.myotis.api.CallResult} yet. A revert
+     *  is a VERIFIED answer whose payload the host serves as the standard
+     *  code-3 error. */
     static io.myotis.api.CallResult callDetailedFromJson(String json) {
         JsonObject o = parseResultOrThrow(json, "call");
         try {
@@ -1016,9 +1052,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * zero/unset slot → 32 zero bytes). {@code position32Hex} is the 0x-hex 32-byte
      * position. Throws {@link EngineException} on a transport / not-running failure.
      */
-    byte[] storageAtVerified(String hexAddress, String position32Hex) {
+    byte[] storageAtVerified(String hexAddress, String position32Hex, String block) {
         return storageValueFromJson(gated(() -> RustEngineNative.nativeGetStorageAtJson(
-                handle, hexAddress, position32Hex)));
+                handle, hexAddress, position32Hex, block)));
     }
 
     /**

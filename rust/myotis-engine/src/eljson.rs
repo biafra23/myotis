@@ -8,7 +8,9 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
+use myotis_net::el::evm::{
+    CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome,
+};
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
     VerifiedStorage, VerifiedTransaction,
@@ -92,7 +94,19 @@ pub fn account_json(
     obj.insert("wallClockPeriod".into(), json_u64(wall_clock_period));
     obj.insert("finalizedBlockNumber".into(), json_u64(a.finalized_block_number));
     obj.insert("optimisticBlockNumber".into(), json_u64(a.optimistic_block_number));
+    obj.insert("anchor".into(), anchor_name(a.finalized).into());
     serde_json::Value::Object(obj).to_string()
+}
+
+/// The block a state read proved against (ABI ≥ 32, #465): `"finalized"` for
+/// the `finalized` tag, else `"head"`. Additive on every state-read shape; the
+/// hosts read `verifyMethod` and the data keys only.
+fn anchor_name(finalized: bool) -> &'static str {
+    if finalized {
+        "finalized"
+    } else {
+        "head"
+    }
 }
 
 /// Serialize a verified storage result to the `StorageProofResult` shape.
@@ -134,6 +148,7 @@ pub fn storage_json(
     obj.insert("finalizedSlot".into(), json_u64(finalized_slot));
     obj.insert("optimisticSlot".into(), json_u64(optimistic_slot));
     obj.insert("maxHeaderChainGap".into(), json_i64(MAX_HEADER_CHAIN_GAP));
+    obj.insert("anchor".into(), anchor_name(s.finalized).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -162,6 +177,7 @@ pub fn code_json(
     obj.insert("wallClockPeriod".into(), json_u64(wall_clock_period));
     obj.insert("finalizedBlockNumber".into(), json_u64(c.finalized_block_number));
     obj.insert("optimisticBlockNumber".into(), json_u64(c.optimistic_block_number));
+    obj.insert("anchor".into(), anchor_name(c.finalized).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -552,12 +568,17 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// Serialize a broadcast transaction hash (`eth_sendRawTransaction`).
 /// `eth_call` result: `{"status":"ok","resultHex":"0x…"}` on success,
 /// `{"status":"revert","dataHex":"0x…"}` on a revert, or
-/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified.
+/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified
+/// — each also carrying `"blockNumber":N`, the block the call ran against, and
+/// `"verified":b`, true when the call RAN (`ok`/`revert`) against the
+/// beacon-FINALIZED block (the `finalized` tag; the vocabulary of
+/// `ens_record_json`). ABI ≥ 30, additive: the hosts read `status` and the
+/// data keys only.
 /// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
 /// (matching the reference engine, which treats revert/unavailable as "no answer").
-pub fn call_json(outcome: &CallOutcome) -> String {
+pub fn call_json(answer: &CallAnswer) -> String {
     let mut obj = serde_json::Map::new();
-    match outcome {
+    match &answer.outcome {
         CallOutcome::Success(data) => {
             obj.insert("status".into(), "ok".into());
             obj.insert("resultHex".into(), hex0x_var(data).into());
@@ -571,6 +592,11 @@ pub fn call_json(outcome: &CallOutcome) -> String {
             obj.insert("reason".into(), reason.as_str().into());
         }
     }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    // "Ran against the finalized block": an `unavailable` call ran nowhere, so
+    // it is never `verified`, whatever anchor it asked for.
+    let ran = !matches!(answer.outcome, CallOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -813,6 +839,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         }
     }
 
@@ -841,6 +868,12 @@ mod tests {
         assert_eq!(v["wallClockPeriod"], 1795);
         assert_eq!(v["finalizedBlockNumber"], 20_999_000);
         assert_eq!(v["optimisticBlockNumber"], 21_000_010);
+        // ABI >= 32: the block the proof was anchored at, "head" or "finalized".
+        assert_eq!(v["anchor"], "head");
+        let fin = VerifiedAccount { finalized: true, ..sample_account() };
+        let json = account_json("0xabc", &fin, 1777, 1795);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["anchor"], "finalized");
     }
 
     #[test]
@@ -896,6 +929,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&storage_json("0xC0", None, &s, 14_560_000, 14_560_032)).unwrap();
@@ -933,30 +967,54 @@ mod tests {
 
     #[test]
     fn call_json_shapes() {
-        // ok → status + resultHex
+        let at_head = |outcome: CallOutcome| CallAnswer { outcome, block_number: 21_000_000, finalized: false };
+        // ok → status + resultHex, plus the block the call ran against
         let ok: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Success(vec![0xde, 0xad]))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Success(vec![0xde, 0xad])))).unwrap();
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["resultHex"], "0xdead");
+        assert_eq!(ok["blockNumber"], 21_000_000);
+        assert_eq!(ok["verified"], false);
 
         // empty success data serializes as 0x
         let empty: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Success(Vec::new()))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Success(Vec::new())))).unwrap();
         assert_eq!(empty["resultHex"], "0x");
 
         // revert → status + dataHex (the raw revert payload)
         let rev: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Revert(vec![0x08, 0xc3]))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Revert(vec![0x08, 0xc3])))).unwrap();
         assert_eq!(rev["status"], "revert");
         assert_eq!(rev["dataHex"], "0x08c3");
+        assert_eq!(rev["blockNumber"], 21_000_000);
 
         // unavailable → status + reason (a diagnostic string; the Java side nulls it)
-        let un: serde_json::Value = serde_json::from_str(&call_json(&CallOutcome::Unavailable(
+        let un: serde_json::Value = serde_json::from_str(&call_json(&at_head(CallOutcome::Unavailable(
             "out of gas".to_string(),
-        )))
+        ))))
         .unwrap();
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "out of gas");
+        assert_eq!(un["verified"], false);
+
+        // a `finalized` call names the finalized block and says so...
+        let at_fin = |outcome: CallOutcome| CallAnswer {
+            outcome,
+            block_number: 20_999_936,
+            finalized: true,
+        };
+        let fin: serde_json::Value =
+            serde_json::from_str(&call_json(&at_fin(CallOutcome::Success(vec![0x01])))).unwrap();
+        assert_eq!(fin["blockNumber"], 20_999_936);
+        assert_eq!(fin["verified"], true);
+        let rev: serde_json::Value =
+            serde_json::from_str(&call_json(&at_fin(CallOutcome::Revert(vec![0x08])))).unwrap();
+        assert_eq!(rev["verified"], true);
+        // ...but a call that could not run is never "verified", whatever it asked for.
+        let unavailable = at_fin(CallOutcome::Unavailable("state unavailable".to_string()));
+        let un: serde_json::Value = serde_json::from_str(&call_json(&unavailable)).unwrap();
+        assert_eq!(un["verified"], false);
+        assert_eq!(un["blockNumber"], 20_999_936);
     }
 
     #[test]
@@ -1097,6 +1155,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         }
     }
 

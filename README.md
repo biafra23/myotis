@@ -167,7 +167,9 @@ const h = myotis.create('mainnet', '/path/to/data-dir');
 // or, to recover a STALE_ANCHOR install from a checkpoint the host authenticated itself
 // (ABI >= 26): myotis.createWithCheckpoint('mainnet', freshDir, blockRoot, headerSlot)
 myotis.start(h);
-// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and snapPeers > 0:
+// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and
+// snapServingPeers > 0 (ABI >= 31: a pooled peer that can answer at the anchored
+// head — a pool of still-syncing peers keeps snapPeers > 0 while every read fails):
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 ```
 
@@ -177,7 +179,7 @@ This is how the [Freedom browser](https://github.com/solardev-xyz/freedom-browse
 
 For Swift hosts that embed the engine **without** the Kotlin/Native `MyotisKit` framework, [`rust/build-xcframework.sh`](rust/build-xcframework.sh) packages the engine's plain C ABI as a static **`MyotisEngine.xcframework`** (device arm64 + fat simulator slice, header + Clang modulemap included — `import MyotisEngine` from Swift). Releases ship the zip + SHA256 alongside the napi addons, and CI builds the iOS targets on every `rust/` change so they stay green.
 
-The host contract is the same as everywhere else: gate on `myotis_init()` returning the header's `MYOTIS_ABI_VERSION`, run the blocking verified reads off the main thread, free every returned string with `myotis_string_free`, and treat `myotis_pause`/`myotis_resume` as the scenePhase background/foreground hooks (warm resume is ~10 s back to `SYNCED`). Wait for `statusJson` to report `beaconState == "SYNCED"` **and** `snapPeers > 0` before attempting reads — right after sync the EL side can still be hunting a snap peer and reads fail with "state unavailable".
+The host contract is the same as everywhere else: gate on `myotis_init()` returning the header's `MYOTIS_ABI_VERSION`, run the blocking verified reads off the main thread, free every returned string with `myotis_string_free`, and treat `myotis_pause`/`myotis_resume` as the scenePhase background/foreground hooks (warm resume is ~10 s back to `SYNCED`). Wait for `statusJson` to report `beaconState == "SYNCED"` **and** `snapServingPeers > 0` before attempting reads — right after sync the pool can hold only peers that are still syncing themselves (`snapPeers > 0`, yet every read fails until one of them covers the anchored head, #465). A host that knows a serving execution node can hand it to the engine with `myotis_set_boot_enodes` (ABI ≥ 31, a JSON array of `enode://` URLs, applied or refused as a whole) to shortcut a cold start; the engine ships no mainnet seed list of its own.
 
 One caveat: an app that already links **another** Rust staticlib (another embedded node) must not add this xcframework next to it — two Rust staticlibs in one binary collide on the runtime/allocator. Build a single aggregator staticlib crate that depends on both engines as rlibs and re-exports their C symbols instead (one std/allocator/tokio/libp2p). That is how the Freedom iOS browser embeds Myotis alongside its Swarm and IPFS nodes: [freedom-mobile-ffi](https://github.com/solardev-xyz/freedom-mobile-ffi).
 
@@ -304,6 +306,7 @@ Returns daemon operational metrics.
 | `connectedPeers` | int | Total active TCP (RLPx) connections |
 | `readyPeers` | long | Peers that completed the eth handshake |
 | `snapPeers` | long | Ready peers that also support snap/1 |
+| `snapServingPeers` | int | Snap peers in the serving pool right now — gate reads on this, not on `snapPeers` (#465). Rust engine: peers whose announced or served head is at or near the anchored head; Java engine: active snap sessions |
 | `backedOffPeers` | long | Peers in temporary exponential backoff |
 | `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 

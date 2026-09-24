@@ -209,6 +209,27 @@ class RustVerifiedReadJsonTest {
     // ---- eth_call (callResultFromJson) ----
 
     @Test
+    void abi30CallEnvelopeKeysParseAndAreNotMistakenForData() {
+        // ABI 30 added blockNumber + verified to every call status (#465); the
+        // three-way mapping must read past them, and a finalized-block answer
+        // is still an ordinary ok/revert/unavailable to the API.
+        io.myotis.api.CallResult ok = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x2a\",\"blockNumber\":21000000,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.OK, ok.status());
+        assertArrayEquals(new byte[] {0x2a}, ok.data());
+        io.myotis.api.CallResult fin = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08\",\"blockNumber\":20999936,\"verified\":true}");
+        assertEquals(io.myotis.api.CallResult.Status.REVERTED, fin.status());
+        assertArrayEquals(new byte[] {0x08}, fin.data());
+        io.myotis.api.CallResult un = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"state unavailable\","
+                + "\"blockNumber\":20999936,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, un.status());
+        assertNull(un.data());
+        assertEquals("state unavailable", un.detail());
+    }
+
+    @Test
     void okCallReturnsResultBytes() {
         String json = "{\"status\":\"ok\",\"resultHex\":\"0x00000000000000000000000000000000"
                 + "0000000000000000000000000000002a\"}";

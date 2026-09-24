@@ -89,6 +89,38 @@ pub fn encode_block_range_update(earliest: u64, latest: u64, latest_hash: &[u8; 
     ]))
 }
 
+/// A decoded eth/69 BlockRangeUpdate: the peer's servable block range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRangeUpdate {
+    pub earliest: u64,
+    pub latest: u64,
+    pub latest_hash: [u8; 32],
+}
+
+/// Decode an inbound eth/69 BlockRangeUpdate (absolute 0x21):
+/// `[earliestBlock, latestBlock, latestBlockHash]`. Twin of the Java
+/// `BlockRangeUpdateMessage.decode`, pinned to the same golden vector as the
+/// encoder. An inverted range (`earliest > latest`) is an error too: EIP-7642
+/// calls it a protocol violation, and a range that cannot be true must not
+/// become a fact about the peer. Callers IGNORE the frame on an error, as the
+/// Java `EthHandler` does, rather than disconnect — a peer's malformed
+/// notification must never decide that we drop a usable connection. (The Java
+/// engine decodes and logs the update but does not yet route requests by it;
+/// the Rust pool does — see `peer::KnownHead`.)
+pub fn decode_block_range_update(rlp_bytes: &[u8]) -> Result<BlockRangeUpdate, CoreError> {
+    let top = rlp::decode(rlp_bytes)?;
+    let items = top.as_list()?;
+    if items.len() < 3 {
+        return Err(CoreError(format!("BlockRangeUpdate: expected 3 items, got {}", items.len())));
+    }
+    let earliest = items[0].as_u64()?;
+    let latest = items[1].as_u64()?;
+    if earliest > latest {
+        return Err(CoreError(format!("BlockRangeUpdate: earliest {earliest} above latest {latest}")));
+    }
+    Ok(BlockRangeUpdate { earliest, latest, latest_hash: fixed32(&items[2])? })
+}
+
 /// Encode our Status for eth/69: `[version, networkId, genesis, [forkHash,
 /// forkNext], earliestBlock, latestBlock, latestBlockHash]` (no td).
 ///
@@ -615,6 +647,48 @@ mod tests {
         assert_eq!(rlp::decode(items[0]).unwrap().as_u64().unwrap(), 20_999_968);
         assert_eq!(rlp::decode(items[1]).unwrap().as_u64().unwrap(), 21_000_000);
         assert_eq!(rlp::decode(items[2]).unwrap().as_bytes().unwrap(), &h[..]);
+    }
+
+    #[test]
+    /// The decoder is pinned to the SAME cross-engine golden vector as the
+    /// encoder, so the Java `BlockRangeUpdateMessageTest` now covers both
+    /// directions of the Rust codec.
+    fn block_range_update_decodes_the_java_golden_vector() {
+        let bytes: Vec<u8> = (0..BLOCK_RANGE_UPDATE_GOLDEN_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&BLOCK_RANGE_UPDATE_GOLDEN_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            decode_block_range_update(&bytes).unwrap(),
+            BlockRangeUpdate { earliest: 100, latest: 131, latest_hash: [0x11; 32] }
+        );
+        // ...and the encoder's own output, so the pair cannot drift apart.
+        let enc = encode_block_range_update(20_999_968, 21_000_000, &[0xab; 32]);
+        assert_eq!(
+            decode_block_range_update(&enc).unwrap(),
+            BlockRangeUpdate { earliest: 20_999_968, latest: 21_000_000, latest_hash: [0xab; 32] }
+        );
+    }
+
+    #[test]
+    fn a_malformed_block_range_update_is_an_error_not_a_panic() {
+        assert!(decode_block_range_update(b"junk").is_err());
+        let short = rlp::encode(&Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]));
+        assert!(decode_block_range_update(&short).is_err());
+        let bad_hash = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![1]),
+            Item::Bytes(vec![2]),
+            Item::Bytes(vec![0xab; 31]),
+        ]));
+        assert!(decode_block_range_update(&bad_hash).is_err());
+    }
+
+    #[test]
+    fn an_inverted_block_range_is_rejected() {
+        // EIP-7642 calls earliest > latest a violation; a range that cannot be
+        // true must never become a fact about the peer.
+        let enc = encode_block_range_update(131, 100, &[0x11; 32]);
+        assert!(decode_block_range_update(&enc).is_err());
     }
 
     #[test]

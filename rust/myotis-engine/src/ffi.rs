@@ -140,10 +140,15 @@ pub fn resume_handle(handle: i64) -> bool {
 // failures the Java side raises as EngineException.
 // ---------------------------------------------------------------------------
 
-/// Verified account query (`AccountProofResult` shape). `address` is 0x-hex.
+/// Verified account query (`AccountProofResult` shape). `address` is 0x-hex;
+/// `block` is the RPC block selector (ABI ≥ 32): empty or a head tag proves at
+/// the verified head, `finalized` at the beacon-finalized block, a number only
+/// inside the window around the head — refused (`{"error","code":-32602}`)
+/// otherwise, never answered from the head. The result names the anchor
+/// (`anchor`).
 #[uniffi::export]
-pub fn request_account_json(handle: i64, address: String) -> String {
-    crate::host::request_account_json(handle, &address)
+pub fn request_account_json(handle: i64, address: String, block: String) -> String {
+    crate::host::request_account_json(handle, &address, &block)
 }
 
 /// Verified storage-slot query (`StorageProofResult` shape). A non-None `holder`
@@ -158,24 +163,33 @@ pub fn get_storage_proof_json(
     crate::host::get_storage_proof_json(handle, &address, slot, holder.as_deref())
 }
 
-/// Verified contract-code query (`eth_getCode`).
+/// Verified contract-code query (`eth_getCode`); `block` as in
+/// [`request_account_json`].
 #[uniffi::export]
-pub fn get_code_json(handle: i64, address: String) -> String {
-    crate::host::get_code_json(handle, &address)
+pub fn get_code_json(handle: i64, address: String, block: String) -> String {
+    crate::host::get_code_json(handle, &address, &block)
 }
 
-/// Verified RAW-32-byte-position storage query (`eth_getStorageAt`).
+/// Verified RAW-32-byte-position storage query (`eth_getStorageAt`); `block`
+/// as in [`request_account_json`].
 #[uniffi::export]
-pub fn get_storage_at_json(handle: i64, address: String, position: String) -> String {
-    crate::host::get_storage_at_json(handle, &address, &position)
+pub fn get_storage_at_json(
+    handle: i64,
+    address: String,
+    position: String,
+    block: String,
+) -> String {
+    crate::host::get_storage_at_json(handle, &address, &position, &block)
 }
 
 /// Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
 /// `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
 /// is the answer); `value` is wei as a decimal string; `block` is the RPC block
-/// selector. The call runs against the verified head, so a block number
-/// outside [head-64, head+16] is refused (`{"error","code":-32602}` when it can
-/// never be served), never answered from the head.
+/// selector: a head tag runs against the verified head, `finalized` (ABI ≥ 30)
+/// against the beacon-finalized block, and a block number outside
+/// [head-64, head+16] is refused (`{"error","code":-32602}` when it can never
+/// be served), never answered from the head. The result names the block it ran
+/// against (`blockNumber`, `verified`).
 #[uniffi::export]
 pub fn eth_call_json(
     handle: i64,

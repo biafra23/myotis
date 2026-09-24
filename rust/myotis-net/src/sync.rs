@@ -233,11 +233,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15264768, 2026-09-21, period 1863)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15285056, 2026-09-24, period 1865)
             checkpoint_root: hex32(
-                "9cfadfafc760bf9e4129101dcd4208cbb22b9bcd3a7d4f2f467a3f12a109cb2f",
+                "4f4b89524600b09292365d29f2e9266e7a004b27bccf7ed31655b88851045028",
             ),
-            checkpoint_slot: 15_264_768,
+            checkpoint_slot: 15_285_056,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -293,11 +293,11 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11188992, 2026-09-21, period 1365)
+            // trusted checkpoint: recent finalized sepolia block root (slot 11209280, 2026-09-24, period 1368)
             checkpoint_root: hex32(
-                "395b65094a1e28377ac2631e0084dcd226173f25aed3d8da81d4fe63b478b413",
+                "d9d8f57adb4ad2053a191dd566f5fb75722c09c531fb833a27cee23f077d3b36",
             ),
-            checkpoint_slot: 11_188_992,
+            checkpoint_slot: 11_209_280,
             // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -362,11 +362,11 @@ impl ChainConfig {
             // anything older than a few periods anyway — and use `-Pperiod=<n>`
             // only to pin a retained state for testing, never one below the floor.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30201792, 2026-09-21, period 3686)
+            // trusted checkpoint: recent finalized gnosis block root (slot 30250464, 2026-09-24, period 3692)
             checkpoint_root: hex32(
-                "9a409a90f6422a70ac6e6b225d6736d96880e657d1958a13e612b7281484d6ad",
+                "8cf978da4e896b02351fe9669d0ac82b601174bd6a413c7c975ae1a611bc29f9",
             ),
-            checkpoint_slot: 30_201_792,
+            checkpoint_slot: 30_250_464,
             // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -541,11 +541,16 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // live_pins_alive run 35065049320 on a GitHub-hosted runner, 4 of 4
     // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
     // from the recorded period-1323 anchor reached SYNCED in 55 s.
-    // Re-verified 2026-09-21 against the anchor this build ships (period
-    // 1365): live_pins_alive run 35616060242 on a GitHub-hosted runner, 4 of 4
+    // Re-verified 2026-09-21 against the then-shipped period-1365 anchor:
+    // live_pins_alive run 35616060242 on a GitHub-hosted runner, 4 of 4
     // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
     // from the recorded period-1323 anchor (42 periods behind) reached SYNCED
     // in 21 s.
+    // Re-verified 2026-09-24 against the anchor this build ships (period
+    // 1368): live_pins_alive run 35989152817 on a GitHub-hosted runner, 4 of 4
+    // again; the bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
+    // from the recorded period-1323 anchor (45 periods behind) reached SYNCED
+    // in 55 s.
     // Re-run it after every checkpoint refresh — a census against
     // a superseded root says nothing about the anchor a fresh install actually
     // starts from, which is the #422 shape: every check green while no pinned
@@ -629,11 +634,19 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // again, both :9500 pins included; the bootnodes seeded discv5 (21
     // entries, SYNCED), and a cold start from the recorded period-3596 anchor
     // (79 periods behind) reached SYNCED in 85 s.
-    // Re-verified 2026-09-21 against the anchor this build ships (period
-    // 3686): live_pins_alive run 35616052466 on a GitHub-hosted runner, 8 of 8
+    // Re-verified 2026-09-21 against the then-shipped period-3686 anchor:
+    // live_pins_alive run 35616052466 on a GitHub-hosted runner, 8 of 8
     // again, both :9500 pins included; the bootnodes seeded discv5 (21
     // entries, SYNCED), and a cold start from the recorded period-3596 anchor
     // (90 periods behind) reached SYNCED in 76 s.
+    // Re-verified 2026-09-24 against the anchor this build ships (period
+    // 3692): live_pins_alive run 35988128286 on a GitHub-hosted runner, 6 of 8
+    // — both :9500 pins (134.65.194.144, 164.152.161.131) failed to dial from
+    // the runner. One run from one vantage point, and the pair has timed out
+    // on a runner before (2026-09-13) and served every run since, so this is
+    // a re-census signal, not grounds to prune; the floor is two pins. The
+    // bootnodes seeded discv5 (25 entries), and a cold start from the
+    // recorded period-3596 anchor (96 periods behind) reached SYNCED in 55 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -754,12 +767,17 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // grounds to prune, but a third close in a row should be. The bootnodes
     // seeded discv5 (23 entries), and a cold start from the recorded
     // period-1825 anchor reached SYNCED in 45 s.
-    // Re-verified 2026-09-21 against the anchor this build ships (period
-    // 1863): live_pins_alive run 35616056243 on a GitHub-hosted runner, 5 of 5
+    // Re-verified 2026-09-21 against the then-shipped period-1863 anchor:
+    // live_pins_alive run 35616056243 on a GitHub-hosted runner, 5 of 5
     // — 91.189.182.90 served in full this time, so there is no third close in
     // a row. The bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
     // from the recorded period-1825 anchor (38 periods behind) reached SYNCED
     // in 26 s.
+    // Re-verified 2026-09-24 against the anchor this build ships (period
+    // 1865): live_pins_alive run 35988133216 on a GitHub-hosted runner, 5 of 5
+    // again; the bootnodes seeded discv5 (32 entries), and a cold start from
+    // the recorded period-1825 anchor (40 periods behind) reached SYNCED in
+    // 10 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
@@ -3874,10 +3892,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_264_768);
+        assert_eq!(c.checkpoint_slot, 15_285_056);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "9cfadfafc760bf9e4129101dcd4208cbb22b9bcd3a7d4f2f467a3f12a109cb2f"
+            "4f4b89524600b09292365d29f2e9266e7a004b27bccf7ed31655b88851045028"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -4018,10 +4036,10 @@ mod tests {
             ]
         );
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 11_188_992);
+        assert_eq!(c.checkpoint_slot, 11_209_280);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "395b65094a1e28377ac2631e0084dcd226173f25aed3d8da81d4fe63b478b413"
+            "d9d8f57adb4ad2053a191dd566f5fb75722c09c531fb833a27cee23f077d3b36"
         );
         // @checkpoint:sepolia:test:end
         assert_eq!(
@@ -4106,10 +4124,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_008), [0x05, 0, 0, 0x64]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_009), [0x06, 0, 0, 0x64]);
         // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 30_201_792);
+        assert_eq!(c.checkpoint_slot, 30_250_464);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "9a409a90f6422a70ac6e6b225d6736d96880e657d1958a13e612b7281484d6ad"
+            "8cf978da4e896b02351fe9669d0ac82b601174bd6a413c7c975ae1a611bc29f9"
         );
         // @checkpoint:gnosis:test:end
         assert_eq!(

@@ -1,6 +1,7 @@
 //! Plain C ABI over the same `host` functions the JNI shim wraps — the iOS
 //! (Kotlin/Native cinterop) seam. Mirrors the JVM FFI surface (`ffi`, UniFFI)
-//! one-to-one: compound values
+//! one-to-one — plus the host knobs the JVM hosts have no surface for yet
+//! (`myotis_set_boot_enodes`, #465), which the Node addon also wraps: compound values
 //! cross as JSON strings with the exact same shapes the golden tests pin, and the
 //! sentinel conventions are identical (negative handle ids, `"{}"` status for an
 //! unknown handle, `{"error": ...}` objects). The header consumed by cinterop is
@@ -204,17 +205,22 @@ pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
 }
 
 /// Verified account read (`nativeRequestAccountJson` twin). Blocking — may take
-/// up to ~90 s for a header-chain walk; never call from the UI thread.
+/// up to ~90 s for a header-chain walk; never call from the UI thread. `block`
+/// (ABI ≥ 32) is the RPC block selector the engine applies or refuses: NULL or
+/// empty proves at the verified head, `finalized` at the beacon-finalized
+/// block, a number only inside the window around the head.
 ///
 /// # Safety
-/// `address` must be null or a valid null-terminated C string.
+/// `address` and `block` must each be null or a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_request_account_json(
     handle: i64,
     address: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
-    into_c(crate::host::request_account_json(handle, &address))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::request_account_json(handle, &address, &block))
 }
 
 /// Verified storage proof (`nativeGetStorageProofJson` twin). A null `holder`
@@ -239,41 +245,50 @@ pub unsafe extern "C" fn myotis_get_storage_proof_json(
     ))
 }
 
-/// Verified `eth_getCode` (`nativeGetCodeJson` twin).
+/// Verified `eth_getCode` (`nativeGetCodeJson` twin); `block` as in
+/// `myotis_request_account_json` (ABI ≥ 32).
 ///
 /// # Safety
-/// `address` must be null or a valid null-terminated C string.
+/// `address` and `block` must each be null or a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_get_code_json(
     handle: i64,
     address: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
-    into_c(crate::host::get_code_json(handle, &address))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::get_code_json(handle, &address, &block))
 }
 
 /// Verified `eth_getStorageAt` with a RAW 32-byte position
-/// (`nativeGetStorageAtJson` twin).
+/// (`nativeGetStorageAtJson` twin); `block` as in `myotis_request_account_json`
+/// (ABI ≥ 32).
 ///
 /// # Safety
-/// `address` and `position` must each be null or valid null-terminated C strings.
+/// `address`, `position` and `block` must each be null or valid null-terminated
+/// C strings.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_get_storage_at_json(
     handle: i64,
     address: *const c_char,
     position: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
     let position = read_string(position).unwrap_or_default();
-    into_c(crate::host::get_storage_at_json(handle, &address, &position))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::get_storage_at_json(handle, &address, &position, &block))
 }
 
 /// Verified `eth_call` over the revm executor (`nativeEthCallJson` twin).
 /// `from` empty ⇒ anonymous sender; `value` is wei as a decimal string.
 /// `block` is checked by the engine (ABI ≥ 27): a number outside the window
 /// around the verified head is refused, never answered from the head (see
-/// `crate::host::eth_call_json` and the header). A NULL `to` is refused
-/// (ABI ≥ 29); pass an empty string for contract creation.
+/// `crate::host::eth_call_json` and the header); `finalized` runs against the
+/// beacon-finalized block (ABI ≥ 30), and the result names the block it ran
+/// against. A NULL `to` is refused (ABI ≥ 29); pass an empty string for
+/// contract creation.
 ///
 /// # Safety
 /// All pointer params must be null or valid null-terminated C strings.
@@ -664,6 +679,56 @@ mod tests {
         assert_eq!(unsafe { take(myotis_status_json(0)) }, "{}");
         myotis_stop(0); // unknown id: must be a silent no-op
         unsafe { myotis_string_free(std::ptr::null_mut()) };
+        // A NULL seed list is a refusal, not a crash — and so is a valid list
+        // for an unknown handle.
+        assert!(!unsafe { myotis_set_boot_enodes(0, std::ptr::null()) });
+        assert!(!unsafe { myotis_set_boot_enodes(i64::MIN, c"[]".as_ptr()) });
+    }
+
+    /// How a host's seed pins cross the C ABI (ABI 31): the push is applied or
+    /// refused as a whole, and a handle that has not started keeps it for its
+    /// start.
+    #[test]
+    fn boot_enodes_are_applied_or_refused_across_the_c_abi() {
+        let dir = std::env::temp_dir().join("myotis-capi-boot-enodes-test");
+        let dir = CString::new(dir.to_str().unwrap()).unwrap();
+        let handle = unsafe { myotis_create(c"mainnet".as_ptr(), dir.as_ptr()) };
+        assert!(handle >= 1, "create failed: {handle}");
+        // One accept, one refuse: the rule set itself is pinned in host.rs.
+        let key = "ab".repeat(64);
+        let list = CString::new(format!(r#"["enode://{key}@1.2.3.4:30303"]"#)).unwrap();
+        assert!(unsafe { myotis_set_boot_enodes(handle, list.as_ptr()) });
+        assert!(!unsafe { myotis_set_boot_enodes(handle, c"[7]".as_ptr()) });
+        // Invalid UTF-8 decodes lossily and is then refused as not-an-enode.
+        let bad = [0x5b_u8, 0x22, 0xff, 0x22, 0x5d, 0];
+        assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr().cast()) });
+        myotis_stop(handle);
+    }
+
+    /// How the state reads' `block` crosses the C ABI (ABI 32): NULL is the
+    /// head; `finalized` is its own anchor; a selector no retry can serve is
+    /// refused as invalid params, never read as the head.
+    #[test]
+    fn state_reads_check_their_block_across_the_c_abi() {
+        let addr = CString::new(format!("0x{}", "ab".repeat(20))).unwrap();
+        let pos = CString::new(format!("0x{}", "00".repeat(32))).unwrap();
+        let account = |block: *const c_char| -> serde_json::Value {
+            let out = unsafe { take(myotis_request_account_json(i64::MIN, addr.as_ptr(), block)) };
+            serde_json::from_str(&out).unwrap()
+        };
+        assert_eq!(account(std::ptr::null())["error"], "unknown handle");
+        assert_eq!(account(c"finalized".as_ptr())["error"], "unknown handle");
+        assert_eq!(account(c"earliest".as_ptr())["code"], -32602);
+        let parse = |out: String| -> serde_json::Value { serde_json::from_str(&out).unwrap() };
+        let code = parse(unsafe {
+            take(myotis_get_code_json(i64::MIN, addr.as_ptr(), c"earliest".as_ptr()))
+        });
+        assert_eq!(code["code"], -32602);
+        let null = std::ptr::null();
+        let storage = parse(unsafe {
+            take(myotis_get_storage_at_json(i64::MIN, addr.as_ptr(), pos.as_ptr(), null))
+        });
+        assert_eq!(storage["error"], "unknown handle");
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent
@@ -681,6 +746,8 @@ mod tests {
         };
         // Past the block check, to the handle lookup.
         assert_eq!(call(null)["error"], "unknown handle");
+        // `finalized` is a servable selector of its own (ABI >= 30), not a refusal.
+        assert_eq!(call(c"finalized".as_ptr())["error"], "unknown handle");
         assert_eq!(call(c"earliest".as_ptr())["code"], -32602);
         // Invalid UTF-8 decodes lossily, and the result is refused.
         let bad = [0xff_u8, 0xfe, 0];
@@ -748,6 +815,23 @@ pub unsafe extern "C" fn myotis_set_log_index_config(
 ) -> bool {
     match read_string(config_json) {
         Some(c) => crate::host::set_log_index_config_json(handle, &c),
+        None => false,
+    }
+}
+
+/// Replace the handle's HOST-SUPPLIED EL seed pins (ABI ≥ 31, #465). The
+/// contract is the header's: a JSON array of `enode://` URLs, applied or
+/// refused as a whole (see `host::set_boot_enodes_json`); NULL is a refusal.
+///
+/// # Safety
+/// `enodes_json` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_boot_enodes(
+    handle: i64,
+    enodes_json: *const std::os::raw::c_char,
+) -> bool {
+    match read_string(enodes_json) {
+        Some(j) => crate::host::set_boot_enodes_json(handle, &j),
         None => false,
     }
 }

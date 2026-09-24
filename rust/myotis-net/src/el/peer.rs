@@ -13,6 +13,8 @@
 //! * an inbound eth/snap **Get\*** request → an **empty** response (the wallet
 //!   serves no chain data, but a well-behaved empty answer beats a timeout),
 //! * a response → delivered to the waiting request by `(reqId, code)`,
+//! * an eth/69 **BlockRangeUpdate** → recorded as the peer's announced head
+//!   ([`KnownHead`]), which the pool ranks and judges reads by,
 //! * anything else (gossip, mempool) → ignored.
 //!
 //! Request methods take `&self`: the writer is an `Arc<Mutex<…>>` and the
@@ -147,6 +149,125 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Where a peer's known head came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadSource {
+    /// The peer's own word: its eth/69 Status at the handshake, or a later
+    /// BlockRangeUpdate.
+    Announced,
+    /// Proof: a beacon-anchored header window this peer actually served up to
+    /// that number.
+    Served,
+}
+
+/// One observation of a peer's head, judged against OUR beacon-anchored head
+/// at the moment it was made.
+#[derive(Debug, Clone, Copy)]
+pub struct KnownHead {
+    /// The peer's head number as observed: its own word (eth/69 Status,
+    /// BlockRangeUpdate) or the top of a beacon-anchored window it served.
+    pub number: u64,
+    /// Our anchored head when the observation was made, if the anchor had one
+    /// — the yardstick `number` is judged against. Comparing the two at the
+    /// same instant makes the judgement independent of how long ago it was
+    /// made: a peer at par when it spoke has moved with the chain since,
+    /// exactly as our anchor has, and a syncing node has not. (Judging an
+    /// aging number against TODAY's anchor would need a per-network drift
+    /// model — 300 s is 25 mainnet blocks but 60 Gnosis blocks — and would
+    /// turn every idle peer into a laggard.)
+    pub anchored_then: Option<u64>,
+    pub source: HeadSource,
+    pub seen_at: tokio::time::Instant,
+}
+
+impl KnownHead {
+    /// How far behind our anchor the peer was when observed, if judgeable.
+    pub fn lag(&self) -> Option<u64> {
+        self.anchored_then.map(|a| a.saturating_sub(self.number))
+    }
+}
+
+/// How a peer's last observed head relates to our anchored head — the input
+/// to the read ladder, the admission and eviction bar, the strike policy and
+/// the serving count (#465). Variant order is the ladder order (the derived
+/// `Ord` is what `pool::LadderKey` sorts on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Coverage {
+    /// At or above our anchor when observed: it can serve the tip.
+    Covers,
+    /// Within [`HEAD_LAG_TOLERANCE`] below our anchor when observed: a peer
+    /// that was momentarily behind, or an announcement that trailed the
+    /// peer's real head — very likely serving the tip by now.
+    Near,
+    /// Nothing usable: no observation (eth/68 announces no number), one made
+    /// before our anchor had a head, or one older than [`HEAD_SIGNAL_FRESH`].
+    Unknown,
+    /// Further below our anchor than the tolerance when observed: a syncing
+    /// or stalled node, whose "0 headers" for the tip is the honest answer
+    /// its own word predicts.
+    Behind,
+}
+
+/// Blocks a peer's word may trail our anchor, at the moment it spoke, before
+/// it counts as BEHIND — not serving the tip. A synced peer is within a slot
+/// or two of our anchor (the light client's own lag, so it usually reads
+/// AHEAD); a syncing node is thousands behind. Generous on purpose: a wrong
+/// Behind refuses or evicts a peer, a wrong Near costs one hedge delay.
+/// Network-independent, since both numbers are read at the same instant.
+pub const HEAD_LAG_TOLERANCE: u64 = 32;
+
+/// How long an observation stays usable for a judgement. A peer that has gone
+/// quiet is Unknown — neither blamed nor vouched for on an old word — until it
+/// announces, serves, or is probed again (devp2p recommends an update about
+/// every two minutes; the pool's backfill and head probe refresh proofs).
+pub const HEAD_SIGNAL_FRESH: Duration = Duration::from_secs(300);
+
+/// Pure: classify one observation `(number, anchored_then, age)`. See
+/// [`Coverage`].
+pub fn coverage(observed: Option<(u64, Option<u64>, Duration)>) -> Coverage {
+    match observed {
+        Some((number, Some(anchored), age)) if age <= HEAD_SIGNAL_FRESH => {
+            let lag = anchored.saturating_sub(number);
+            if lag == 0 {
+                Coverage::Covers
+            } else if lag <= HEAD_LAG_TOLERANCE {
+                Coverage::Near
+            } else {
+                Coverage::Behind
+            }
+        }
+        _ => Coverage::Unknown,
+    }
+}
+
+/// Pure: the lag that REFUSES a peer at the handshake, or evicts a pooled
+/// one — its fresh word puts it [`Coverage::Behind`] — as `Some(lag)`, else
+/// `None`. One bar for both, so a peer is never admitted into a state the
+/// maintainer would evict it from. eth/68 announces no number and a pre-sync
+/// anchor is no yardstick: never refused.
+pub fn refusing_lag(announced: Option<u64>, anchored: Option<u64>) -> Option<u64> {
+    let (a, h) = (announced?, anchored?);
+    let lag = h.saturating_sub(a);
+    (lag > HEAD_LAG_TOLERANCE).then_some(lag)
+}
+
+/// The pool's view of the beacon-anchored head `(number, hash)`, shared with
+/// every peer's read loop so an announcement can be stamped with the anchor it
+/// is judged against. `None` before the anchor has one. A sync closure over
+/// the anchor's own mutex; never called with a pool lock held.
+pub type AnchorSource = Arc<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>;
+
+/// The anchored head number an observation is stamped with (0 = none yet).
+fn anchored_head_number(anchor: &Option<AnchorSource>) -> Option<u64> {
+    anchor.as_ref().and_then(|f| f()).map(|(n, _)| n).filter(|&n| n > 0)
+}
+
+/// The per-connection head cell: a std mutex, never tokio's, because the pool
+/// reads it while holding its own (tokio) peer-list lock and must not await
+/// there. Never held across an await. The newest observation always wins —
+/// a served proof says where the peer WAS, and so does its next announcement.
+type SharedKnownHead = Arc<std::sync::Mutex<Option<KnownHead>>>;
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
     writer: SharedWriter,
@@ -155,6 +276,12 @@ pub struct ManagedPeer {
     /// Set once the read loop terminates (disconnect / read error); requests
     /// short-circuit instead of hanging until timeout.
     closed: Arc<AtomicBool>,
+    /// Consecutive request timeouts with no answer in between — the log
+    /// throttle: the first of a silent streak is a WARN naming the peer, the
+    /// rest are DEBUG (an EVM prefetch has dozens of requests in flight
+    /// against one peer; one line says which peer went silent, the next 47
+    /// would only repeat it). Reset by any delivered response.
+    timeout_streak: AtomicU64,
     reader_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Negotiated eth version (66-69).
@@ -173,6 +300,10 @@ pub struct ManagedPeer {
     /// Pool-shared serving surface (window + counters); None in fixtures that
     /// spawn a peer without a pool.
     serve: Option<ServeContext>,
+    /// The peer's known head (see [`KnownHead`]): seeded from its eth/69
+    /// Status, refreshed by every BlockRangeUpdate the read loop decodes and
+    /// by every anchored window it serves.
+    head: SharedKnownHead,
 }
 
 impl ManagedPeer {
@@ -190,7 +321,7 @@ impl ManagedPeer {
     /// requests and answers Ping/Get\* on its own.
     pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None, None)
+        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None, None, None)
     }
 
     /// As [`spawn`](Self::spawn), wiring the pool's shared serving surface so this
@@ -202,6 +333,7 @@ impl ManagedPeer {
         addr: SocketAddr,
         serve: ServeContext,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+        anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
         let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
         Self::from_connection(
@@ -213,9 +345,11 @@ impl ManagedPeer {
             addr,
             Some(serve),
             tx_watch,
+            anchor,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_connection(
         conn: RlpxConnection,
         eth_version: u64,
@@ -225,12 +359,25 @@ impl ManagedPeer {
         addr: SocketAddr,
         serve: Option<ServeContext>,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+        anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
         let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        // eth/69 Status carries the peer's head, judged against our anchored
+        // head as of now; eth/68 carries none (only a best hash), so such a
+        // peer starts with no known head until it serves or the pool probes it.
+        let anchored_now = anchored_head_number(&anchor);
+        let head: SharedKnownHead = Arc::new(std::sync::Mutex::new(peer_status.latest_block.map(
+            |number| KnownHead {
+                number,
+                anchored_then: anchored_now,
+                source: HeadSource::Announced,
+                seen_at: tokio::time::Instant::now(),
+            },
+        )));
 
         let reader_task = tokio::spawn(read_loop(
             reader,
@@ -240,6 +387,9 @@ impl ManagedPeer {
             snap_codes,
             serve.clone(),
             tx_watch,
+            eth_version,
+            Arc::clone(&head),
+            anchor,
         ));
 
         ManagedPeer {
@@ -247,6 +397,7 @@ impl ManagedPeer {
             pending,
             next_id: AtomicU64::new(1),
             closed,
+            timeout_streak: AtomicU64::new(0),
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
             snap,
@@ -256,6 +407,7 @@ impl ManagedPeer {
             addr,
             snap_codes,
             serve,
+            head,
         }
     }
 
@@ -272,6 +424,30 @@ impl ManagedPeer {
     /// error); the peer serves no further requests.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The peer's last known head — announced (eth/69 Status /
+    /// BlockRangeUpdate) or proven by a served anchored window — if any.
+    /// `None` for an eth/68 peer that has not served yet.
+    pub fn known_head(&self) -> Option<KnownHead> {
+        *self.head.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How this peer's last observed head relates to our anchored head, judged
+    /// as of the observation (see [`coverage`]).
+    pub fn coverage(&self) -> Coverage {
+        coverage(self.known_head().map(|h| (h.number, h.anchored_then, h.seen_at.elapsed())))
+    }
+
+    /// A beacon-anchored header window this peer served up to `number` — our
+    /// anchored head at the time — recorded as a fresh observation at par.
+    pub(crate) fn note_head_served(&self, number: u64) {
+        *self.head.lock().unwrap_or_else(|e| e.into_inner()) = Some(KnownHead {
+            number,
+            anchored_then: Some(number),
+            source: HeadSource::Served,
+            seen_at: tokio::time::Instant::now(),
+        });
     }
 
     /// Send one request and await its response, correlating by request id. The
@@ -318,11 +494,37 @@ impl ManagedPeer {
         mark_request_sent();
 
         let out = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                self.timeout_streak.store(0, Ordering::Relaxed);
+                result
+            }
             // The read loop dropped the sender (disconnect drained the map).
             Ok(Err(_)) => Err("peer connection closed".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                // Name the silent peer at WARN — once per silent streak (#465):
+                // the pool-level whole-pool WARNs list the peers that failed,
+                // but a single peer going silent under a prefetch or a probe
+                // left no trace at info+, the level the hosts' log rings keep.
+                // (A hedged loser never reaches this arm — the race drops it
+                // when a winner answers; that event logs in the pool's
+                // `record_outpaced`.)
+                let streak = self.timeout_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak == 1 {
+                    tracing::warn!(
+                        addr = %self.addr,
+                        code = %format_args!("0x{want_code:02x}"),
+                        timeout_s = REQUEST_TIMEOUT.as_secs(),
+                        "peer request timed out"
+                    );
+                } else {
+                    tracing::debug!(
+                        addr = %self.addr,
+                        code = %format_args!("0x{want_code:02x}"),
+                        streak,
+                        "peer request timed out (silent streak continues)"
+                    );
+                }
                 Err(format!("timed out awaiting code 0x{want_code:02x}"))
             }
         };
@@ -664,6 +866,7 @@ impl Drop for ManagedPeer {
 /// The background read loop: classify each inbound frame and either answer it
 /// (Ping/Get\*), deliver it to a waiting request, or ignore it. Exits on a read
 /// error or a peer Disconnect, failing every in-flight request on the way out.
+#[allow(clippy::too_many_arguments)]
 async fn read_loop(
     mut reader: RlpxReader,
     writer: SharedWriter,
@@ -672,6 +875,9 @@ async fn read_loop(
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
+    eth_version: u64,
+    head: SharedKnownHead,
+    anchor: Option<AnchorSource>,
 ) {
     loop {
         let frame = match reader.recv().await {
@@ -710,6 +916,30 @@ async fn read_loop(
                         w.mark_seen(&hash, now);
                     }
                 }
+            }
+            continue;
+        }
+
+        // eth/69: the peer's servable range moved — its own word on its head,
+        // which the pool ranks and judges reads by (KnownHead). Gated on the
+        // negotiated version because on eth/68 absolute 0x21 is the SNAP base
+        // (GetAccountRange) — the same dispatch rule the Java EthHandler uses.
+        // A malformed or inverted update is ignored, never a disconnect. Only
+        // the peer's own cell is touched: this loop never takes a pool lock.
+        if eth_version >= 69 && code == messages::BLOCK_RANGE_UPDATE {
+            match messages::decode_block_range_update(&frame.payload) {
+                Ok(u) => {
+                    // Stamped with our anchored head AS OF NOW, so the lag it
+                    // implies stays valid however old the observation gets.
+                    let observation = KnownHead {
+                        number: u.latest,
+                        anchored_then: anchored_head_number(&anchor),
+                        source: HeadSource::Announced,
+                        seen_at: tokio::time::Instant::now(),
+                    };
+                    *head.lock().unwrap_or_else(|e| e.into_inner()) = Some(observation);
+                }
+                Err(e) => tracing::debug!(error = %e.0, "ignoring a malformed BlockRangeUpdate"),
             }
             continue;
         }
@@ -873,6 +1103,83 @@ fn describe_disconnect(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pure head classifier behind the read ladder, the admission and
+    /// eviction bar, the strike policy and the serving count (#465).
+    mod head_coverage {
+        use super::super::{coverage, refusing_lag, Coverage, HEAD_LAG_TOLERANCE, HEAD_SIGNAL_FRESH};
+        use std::time::Duration;
+
+        const FRESH: Duration = Duration::from_secs(10);
+        const ANCHOR: u64 = 1_000;
+
+        fn observed(number: u64, age: Duration) -> Option<(u64, Option<u64>, Duration)> {
+            Some((number, Some(ANCHOR), age))
+        }
+
+        #[test]
+        fn a_head_at_or_above_the_anchor_covers_it() {
+            assert_eq!(coverage(observed(ANCHOR, FRESH)), Coverage::Covers);
+            // A synced peer usually reads AHEAD: our anchor trails the network
+            // by the light client's own lag.
+            assert_eq!(coverage(observed(ANCHOR + 2, FRESH)), Coverage::Covers);
+        }
+
+        #[test]
+        fn a_head_inside_the_tolerance_is_near_not_behind() {
+            assert_eq!(coverage(observed(ANCHOR - 1, FRESH)), Coverage::Near);
+            assert_eq!(coverage(observed(ANCHOR - HEAD_LAG_TOLERANCE, FRESH)), Coverage::Near);
+        }
+
+        #[test]
+        fn a_head_a_syncing_node_would_report_is_behind() {
+            assert_eq!(coverage(observed(ANCHOR - HEAD_LAG_TOLERANCE - 1, FRESH)), Coverage::Behind);
+            assert_eq!(coverage(observed(10, FRESH)), Coverage::Behind);
+        }
+
+        #[test]
+        fn no_observation_and_no_anchor_at_observation_are_unknown() {
+            // eth/68 Status carries no block number...
+            assert_eq!(coverage(None), Coverage::Unknown);
+            // ...and a word spoken before the beacon side had a head cannot be judged.
+            assert_eq!(coverage(Some((10, None, FRESH))), Coverage::Unknown);
+        }
+
+        #[test]
+        fn the_judgement_does_not_age_but_a_stale_observation_is_unknown() {
+            // The lag was measured at one instant on both sides, so it stays
+            // what it was — until the observation is too old to lean on at
+            // all, in either direction.
+            assert_eq!(coverage(observed(ANCHOR, HEAD_SIGNAL_FRESH)), Coverage::Covers);
+            assert_eq!(coverage(observed(10, HEAD_SIGNAL_FRESH)), Coverage::Behind);
+            let stale = HEAD_SIGNAL_FRESH + Duration::from_secs(1);
+            assert_eq!(coverage(observed(ANCHOR, stale)), Coverage::Unknown);
+            assert_eq!(coverage(observed(10, stale)), Coverage::Unknown);
+        }
+
+        #[test]
+        fn refusal_is_the_behind_bar_and_nothing_else() {
+            // eth/68 (no number) and a pre-sync anchor (no yardstick) are never refused.
+            assert_eq!(refusing_lag(None, Some(ANCHOR)), None);
+            assert_eq!(refusing_lag(Some(10), None), None);
+            assert_eq!(refusing_lag(Some(ANCHOR), Some(ANCHOR)), None);
+            assert_eq!(refusing_lag(Some(ANCHOR + 3), Some(ANCHOR)), None);
+            assert_eq!(refusing_lag(Some(ANCHOR - HEAD_LAG_TOLERANCE), Some(ANCHOR)), None);
+            assert_eq!(
+                refusing_lag(Some(ANCHOR - HEAD_LAG_TOLERANCE - 1), Some(ANCHOR)),
+                Some(HEAD_LAG_TOLERANCE + 1)
+            );
+            assert_eq!(refusing_lag(Some(0), Some(ANCHOR)), Some(ANCHOR));
+        }
+
+        #[test]
+        fn variant_order_is_the_ladder_order() {
+            // The read ladder sorts on the derived Ord (pool::LadderKey).
+            assert!(Coverage::Covers < Coverage::Near);
+            assert!(Coverage::Near < Coverage::Unknown);
+            assert!(Coverage::Unknown < Coverage::Behind);
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_send_marker_keeps_each_attempts_first_send() {
