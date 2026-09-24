@@ -107,7 +107,10 @@ public class BeaconLightClient implements AutoCloseable {
     /** Finalized head older than this many epochs behind wall clock (while the
      *  committee period is current) → finality starvation → hunt. The SYNCED
      *  gate's own slack, so the hunt engages at the same staleness that ends
-     *  SYNCED (Rust's hunt_due reads SYNCED_SLOT_SLACK_EPOCHS the same way). */
+     *  SYNCED (Rust's hunt_due reads SYNCED_SLOT_SLACK_EPOCHS the same way).
+     *  Same threshold, not always the same input: updateHunting reads the
+     *  fresher of the store's and the published finality, so for the one cycle
+     *  after a late-BLS heal the status can read CATCHING_UP with the hunt off. */
     static final int HUNT_SLACK_EPOCHS = BeaconSyncState.SYNCED_SLOT_SLACK_EPOCHS;
     /** Catch-up (period behind wall clock) with zero store progress for this
      *  long → the catch-up fan-out itself is starved → hunt. A progressing

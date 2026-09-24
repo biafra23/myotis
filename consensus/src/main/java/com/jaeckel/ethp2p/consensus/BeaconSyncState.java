@@ -45,8 +45,9 @@ public class BeaconSyncState {
      * committee's period (up to ~27.3 h on mainnet, ~11.4 h on Gnosis). Twin of the
      * Rust engine's {@code SYNCED_SLOT_SLACK_EPOCHS}
      * ({@code rust/myotis-net/src/sync.rs}, {@code sync_state_at}); keep the two equal.
-     * {@code BeaconLightClient.HUNT_SLACK_EPOCHS} is this value, so the LC hunt engages at
-     * the same staleness that ends SYNCED.
+     * {@code BeaconLightClient.HUNT_SLACK_EPOCHS} is this value, so the LC hunt's finality
+     * trigger uses the same threshold (its input, the fresher of store and published
+     * finality, can lead this gate's for one cycle after a late-BLS heal; see there).
      */
     public static final int SYNCED_SLOT_SLACK_EPOCHS = 5;
 
