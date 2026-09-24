@@ -985,8 +985,15 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 1b: catch up sync committee if bootstrap is from an older period
         if (store.isInitialized()) {
             catchUpSyncCommittee();
-            // Fill state roots immediately so verification works before the first finality update
-            fillChainStateRootsFromAnyPeer(true);
+            // After a fresh bootstrap, fill state roots immediately so verification works
+            // before the first finality update. A resumed store skips it: its roots window
+            // survives in memory or comes back from the sidecar, every applied update adds
+            // its finalized and optimistic roots, and the first one also runs the same fill
+            // from its winner (any peer as fallback) — over a fresh range instead of the
+            // resumed store's stale one. Filling first only delayed that update, and with it
+            // SYNCED and the wake gate's release: the sequential walk over peers took ~40 s
+            // on a live gnosis pool after a pause (2026-09-25).
+            if (!resumed) fillChainStateRootsFromAnyPeer(true);
         }
 
         // Phase 2: fall back to seeding without BLS if bootstrap failed
