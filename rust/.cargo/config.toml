@@ -18,23 +18,3 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
 
 [target.armv7-linux-androideabi]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
-
-# --- UEFI targets -----------------------------------------------------------
-#
-# UEFI firmware runs before any OS has enabled the SSE/AVX register state, so
-# vector code rustc/LLVM would otherwise emit for these targets faults (#UD/#NM)
-# before main. Disable the vector target-features and force the RustCrypto
-# software backends. Per-target, so no other build is affected.
-
-[target.x86_64-unknown-uefi]
-rustflags = [
-    "--cfg", "chacha20_force_soft",
-    "--cfg", "poly1305_force_soft",
-    "-C", "target-feature=-sse2,-ssse3,-sse4.1,-avx,-avx2,-aes,-pclmulqdq",
-]
-
-[target.aarch64-unknown-uefi]
-rustflags = [
-    "--cfg", "chacha20_force_soft",
-    "--cfg", "poly1305_force_soft",
-]

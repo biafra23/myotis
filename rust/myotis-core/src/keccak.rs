@@ -26,6 +26,7 @@ pub fn keccak256_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{format, string::String};
 
     #[test]
     fn empty_input_matches_known_vector() {

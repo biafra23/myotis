@@ -344,6 +344,7 @@ fn hex32(b: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use crate::rlp::Item;
 
     fn leaf_node(key_nibbles: &[u8], value: &[u8]) -> Vec<u8> {

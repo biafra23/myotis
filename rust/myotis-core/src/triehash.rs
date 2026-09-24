@@ -98,6 +98,7 @@ fn common_prefix_end(entries: &[(Vec<u8>, &[u8])], depth: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{format, vec};
 
     #[test]
     fn empty_list_is_empty_root() {

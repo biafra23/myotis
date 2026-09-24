@@ -3945,6 +3945,7 @@ name = "myotis-core"
 version = "0.1.11"
 dependencies = [
  "k256",
+ "sha2",
  "sha3 0.10.9",
 ]
 
