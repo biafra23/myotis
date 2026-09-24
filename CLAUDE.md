@@ -192,6 +192,30 @@ asset workflow and a stronger action than the merge this file already forbids.
    fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
    gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
    host consents.
+
+   **A shipped anchor's remaining freshness is NOT a release deadline, and
+   nothing may gate a tag on it** (owner ruling, 2026-09-24). Gnosis periods are
+   8192 slots of 5 s — 11.4 h — so its 3-period bound gives a fresh install at
+   least a **~34-hour** window from the anchor's slot, and at most ~45.5 h: the
+   gate is period-granular (`ws_anchor_stale`: `wall - anchor > bound`), so an
+   anchor expires only when the wall clock ENTERS period `anchor + 4`, never
+   mid-period, and a refresh at head lands anywhere in its period. No release cadence can stay inside that: holding the
+   tag to it would mean daily releases, and daily releases would mean expecting
+   users to update daily, which trains them to click through updates without
+   reading them. Mainnet's 13 periods of 27.3 h (~15 days) is the same
+   phenomenon with a kinder constant. Quote the floor, not a fixed width — the
+   v0.1.12 tag message quoted an expiry to the second, which is how a
+   period-granular bound turns into a deadline nobody can meet.
+
+   So: refresh the anchors because a fresher one serves more installs, never
+   because a clock is running out. Do not compute, quote or act on an
+   "anchor goes stale at <time>" deadline when preparing a release, and do NOT
+   build the `verifyReleaseAnchorFresh` tag gate a review proposed for exactly
+   this (#485) — it would refuse correct releases on a schedule no release
+   process can meet. On gnosis in particular, `STALE_ANCHOR` on a fresh install
+   is the ORDINARY case within two days of any release, not an incident: the
+   consent path is the product surface that has to be good, and that is a
+   separate design question from how often we tag.
 2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
    truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
    `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
