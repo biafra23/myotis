@@ -106,7 +106,7 @@ public class BeaconLightClient implements AutoCloseable {
     static final long HUNT_BOOTSTRAP_STALL_MS = 60_000;
     /** Finalized head older than this many epochs behind wall clock (while the
      *  committee period is current) → finality starvation → hunt. The SYNCED
-     *  gate's own slack, so the hunt engages exactly when starved finality ends
+     *  gate's own slack, so the hunt engages at the same staleness that ends
      *  SYNCED (Rust's hunt_due reads SYNCED_SLOT_SLACK_EPOCHS the same way). */
     static final int HUNT_SLACK_EPOCHS = BeaconSyncState.SYNCED_SLOT_SLACK_EPOCHS;
     /** Catch-up (period behind wall clock) with zero store progress for this
@@ -173,10 +173,8 @@ public class BeaconLightClient implements AutoCloseable {
      *  transition. Never throws (a hook failure must not kill the sync loop). */
     private void updateHunting(long syncStartNanos) {
         long sinceStartMs = (System.nanoTime() - syncStartNanos) / 1_000_000L;
-        // Clamp at 0: a badly-set clock (behind genesis) must degrade to
-        // "slot 0 / no hunt", never a negative slot (Rust: saturating_sub).
-        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000 - clGenesisTime)
-                / Math.max(1, secondsPerSlot);
+        // Clamped at 0: a clock behind genesis degrades to "slot 0 / no hunt".
+        long wallSlot = BeaconChainSpec.wallClockSlot(clGenesisTime, secondsPerSlot);
         // Read the freshest of store/syncState: after a late-BLS "heal" win
         // the store can lead syncState for one cycle, and lagging would
         // spuriously engage the hunt for that cycle.

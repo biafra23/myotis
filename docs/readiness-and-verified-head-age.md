@@ -66,12 +66,12 @@ The state reported by `beacon-status`, `myotis_beaconStatus`, and the UI:
 |---|---|
 | `STARTING` | The network handle exists but hasn't started syncing yet. |
 | `SYNCING` | No trust anchor yet: bootstrapping from the checkpoint, no finalized execution state root landed. Verified queries fail (`beaconNotSynced`). |
-| `CATCHING_UP` | Trust anchor present but not dependable: the light client is replaying sync-committee periods, hasn't accumulated enough recent finalized roots, or its finalized head is more than 5 epochs behind the wall clock (a stalled or withheld light-client feed, or a warm start whose finality is still the snapshot's). |
+| `CATCHING_UP` | Trust anchor present but not dependable: the light client is replaying sync-committee periods, hasn't accumulated enough recent finalized roots, or its finalized head is more than 5 epochs behind the wall clock (a stalled or withheld light-client feed, a chain that has stopped finalizing, or a warm start whose finality is still the snapshot's). |
 | `SYNCED` | Verification-ready: the sync committee is current and the finalized head is recent. **Not latched** — a node can regress to `CATCHING_UP` (e.g. after sleeping across a committee-period boundary, or when finality stops arriving) and come back. |
 | `STALE_ANCHOR` | Syncing **refused**: at sync start (cold, or a warm resume from idle-pause — a pause longer than the bound ages the held committee the same way) the best available trust anchor (embedded checkpoint or persisted snapshot, whichever is newer; on warm resume the store's held committee) was older than the network's weak-subjectivity bound — every later bootstrap attempt re-faces the gate against the embedded checkpoint, and every steady-state poll cycle re-checks the HELD committee's age, so a node that stays awake but starved past the bound parks too (restart-vs-stay-running never decides whether the gate applies) (README §Weak-subjectivity age bound; mainnet 13 periods ≈ two weeks). Past that window a forged continuation signed by since-exited committee members would BLS-verify, so the engine parks fail-closed and waits for a decision: update the binary / refresh the checkpoint, raise the bound (Settings / `-Dmyotis.beacon.wsBoundPeriods` / `ChainHandle.setWsBoundPeriods` — applied live), or accept the risk for this run (the apps' dialog / `accept-stale-anchor` / `ChainHandle.acceptStaleAnchor`). While parked, `currentPeriod` is the refused anchor's period, `targetPeriod` the wall clock, and `wsBoundPeriods` the enforced bound. The check trusts the device wall clock (a backwards clock reads as fresh) — clock integrity is outside this threat model, consistent with `SYNCED`'s wall-clock criteria. |
 
-Both engines require the held sync-committee period to be the wall clock's
-**and** the finalized slot to be within **5 epochs** of the wall-clock slot
+Both engines require the held sync-committee period to have caught up with the
+wall clock's **and** the finalized slot to be within **5 epochs** of the wall-clock slot
 (`SYNCED_SLOT_SLACK_EPOCHS`, counted in the network's own epochs: 32 min on
 mainnet and sepolia, ~7 min on gnosis; finality itself trails ~2 epochs), so a
 stalled light-client feed drops either engine out of SYNCED once its last
@@ -210,9 +210,9 @@ stall), a `finalized` state read keeps answering at the last-known finalized
 root for as long as a deep-state peer still proves it — verified and labeled
 as such (`anchor: "finalized"`, `matchedBeaconSlot` = that finality's slot),
 but stale. `latest` does not refuse either: `beaconNotSynced`, like
-`beaconSynced: false` on a result, only means no finalized root has ever
-landed. So keep honoring the SYNCED gate for `finalized` reads too;
-staleness does not always surface as `-32000`. On the JVM host the
+`beaconSynced: false` on a result, only means no finalized root has landed
+since the node started. So keep honoring the SYNCED gate for `finalized`
+reads too; staleness does not always surface as `-32000`. On the JVM host the
 start/resume warm-up hold applies to `finalized` reads too (it waits for a
 head-serving peer that a finalized read does not need — at most 90 s).
 The Java engine still resolves `finalized` to the head (#366).

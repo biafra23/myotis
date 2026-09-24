@@ -512,11 +512,11 @@ that produced this note.
     stalled relay drops the beacon status to `CATCHING_UP` once its last
     finality is more than 5 epochs old (32 min on mainnet, ~7 min on gnosis)
     and the hosts show "not ready". Reads do NOT start failing with
-    `beaconNotSynced` — that token only means no finalized root has ever
-    landed — they keep answering against the last anchor until peers can no
-    longer prove against it or the header chain passes 8192 blocks
-    (`headerChainGapTooLarge`). So the signal is the beacon status, not a read
-    error: anything that must not act on a stale anchor has to gate on it.
+    `beaconNotSynced` — that token only fires before the first finalized root
+    lands after a start — they keep answering against the last anchor until
+    peers can no longer prove against it or the header chain passes 8192
+    blocks (`headerChainGapTooLarge`). The signal is the beacon status, not a
+    read error.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

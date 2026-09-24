@@ -39,10 +39,11 @@ public class BeaconSyncState {
     /**
      * SYNCED also needs the finalized header within this many epochs of the wall clock.
      * Finality trails the head by ~2 epochs, so a live feed stays well inside it; a frozen
-     * one — a withheld or stalled light-client feed, or a fork this build cannot follow —
-     * drops out within 5 epochs of its last finality, instead of staying SYNCED until the
-     * wall clock leaves the held committee's period (up to ~27.3 h on mainnet, ~11.4 h on
-     * Gnosis). Twin of the Rust engine's {@code SYNCED_SLOT_SLACK_EPOCHS}
+     * one — a withheld or stalled light-client feed, a fork this build cannot follow, or
+     * a chain that has stopped finalizing — drops out within 5 epochs of its last
+     * finality, instead of staying SYNCED until the wall clock leaves the held
+     * committee's period (up to ~27.3 h on mainnet, ~11.4 h on Gnosis). Twin of the
+     * Rust engine's {@code SYNCED_SLOT_SLACK_EPOCHS}
      * ({@code rust/myotis-net/src/sync.rs}, {@code sync_state_at}); keep the two equal.
      * {@code BeaconLightClient.HUNT_SLACK_EPOCHS} is this value, so the LC hunt engages at
      * the same staleness that ends SYNCED.
@@ -292,11 +293,8 @@ public class BeaconSyncState {
      *                       freshness slack — the network's own, not the mainnet preset's
      */
     public State getSyncState(long clGenesisTime, int secondsPerSlot, int slotsPerEpoch) {
-        // Clamped at 0: a clock set before genesis reads as slot 0, never a negative slot
-        // (Rust twin: ChainConfig::current_slot_estimate, saturating).
-        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000L - clGenesisTime)
-                / Math.max(1, secondsPerSlot);
-        return syncStateAt(wallSlot, slotsPerEpoch);
+        return syncStateAt(BeaconChainSpec.wallClockSlot(clGenesisTime, secondsPerSlot),
+                slotsPerEpoch);
     }
 
     /**
