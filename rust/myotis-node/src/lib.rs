@@ -39,7 +39,8 @@ use myotis_engine::capi::{
     myotis_estimate_gas_json,
     myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
-    myotis_send_raw_transaction_json, myotis_set_ws_bound_periods, myotis_start,
+    myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_ws_bound_periods,
+    myotis_start,
     myotis_status_json, myotis_stop, myotis_string_free,
 };
 
@@ -236,6 +237,20 @@ pub fn stop(env: &Env, handle: i64) -> Result<()> {
 pub fn set_ws_bound_periods(env: &Env, handle: i64, periods: i64) -> bool {
     if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_set_ws_bound_periods(handle, periods) }
+}
+
+/// Replace this handle's HOST-SUPPLIED EL seed pins (ABI >= 31, #465):
+/// `enodes_json` is a JSON array of `enode://` URLs, applied or refused AS A
+/// WHOLE — the contract is `myotis_set_boot_enodes` in `myotis_engine.h`
+/// (README "Notes"). `false` for a refused push or an unknown handle; a NUL
+/// byte is refused here, before the engine. Per-host, never persisted.
+#[napi]
+pub fn set_boot_enodes(env: &Env, handle: i64, enodes_json: String) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
+    match c_arg(&enodes_json) {
+        Ok(j) => unsafe { myotis_set_boot_enodes(handle, j.as_ptr()) },
+        Err(_) => false,
+    }
 }
 
 /// Accept the current over-age anchor and let sync proceed past a

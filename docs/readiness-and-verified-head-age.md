@@ -32,9 +32,15 @@ when all three of these hold:
    against it. Without it, queries fail with `failReason: "beaconNotSynced"`.
 
 2. **At least one snap-serving EL peer is connected** — account/storage data is
-   fetched as snap/1 Merkle-Patricia proofs from execution-layer peers. The
-   `snapPeers` count in `status` output shows this; the UI shows it as the
-   EL peers line.
+   fetched as snap/1 Merkle-Patricia proofs from execution-layer peers. Two
+   counts describe this: `snapPeers` is every snap-capable peer in the pool,
+   and `snapServingPeers` (Rust engine, ABI ≥ 31) is the subset that can answer
+   a read at the anchored head *now* — their announced or served head is at or
+   near ours and they are not benched after a failed read. The Rust hosts gate
+   on `snapServingPeers`: right after SYNCED a cold pool can be full of peers
+   that are still syncing themselves, which keep `snapPeers` positive for hours
+   while every read fails with `peer returned 0 headers` (#465). The UI shows
+   both on the EL peers line ("snap N · serving M").
 
 3. **A verified head context has been built** — the node has recently anchored a
    peer-reported head block to the beacon-finalized block via a contiguous,
@@ -44,7 +50,10 @@ when all three of these hold:
 The engine-internal check is gates 1 + 3, plus the stack actually running
 (`ChainStack.readyForReads()`: stack `RUNNING`, state == `SYNCED`, **and**
 `verifiedHeadAgeMs != Long.MAX_VALUE`); gate 2 is implied because a head context
-cannot be built or refreshed without snap peers.
+cannot be built or refreshed without snap peers. On the Rust engine there is no
+separate head context (see the age measurement below), so the check is gates
+1 + 2 with `snapServingPeers > 0` standing in for gate 3: a pooled peer whose
+head is behind ours satisfies neither.
 
 ## Beacon sync states
 
@@ -90,8 +99,9 @@ The measurement differs per engine:
   or clock changes don't corrupt it.
 - **Rust engine**: milliseconds since the optimistic head **block number last
   advanced** — a new block roughly every 12 s (mainnet) resets it to 0. If the
-  engine is not currently serveable (not SYNCED, no head, or no snap peers) it
-  reports `Long.MAX_VALUE`, and the timer restarts from 0 when serving resumes.
+  engine is not currently serveable (not SYNCED, no head, or no *serving* snap
+  peer — `snapServingPeers == 0`) it reports `Long.MAX_VALUE`, and the timer
+  restarts from 0 when serving resumes.
 
 In both cases: **fresh = ready, stale = warming up or wedged**. The shared UI
 draws the line at **45 s** (`READY_HEAD_WARM_MS`): beyond that the strip turns
@@ -166,7 +176,26 @@ call `myotis_wakeup` and then poll these two status methods back through the
 readiness gate (`myotis_status.state == "RUNNING"` with `snapPeers > 0`, and
 `myotis_beaconStatus.state == "SYNCED"`) **before** its first `eth_*` read —
 `myotis_wakeup` returns when the rebuild *starts*, not when the node is ready
-again (see disk-and-network-usage.md §4.1).
+again (see disk-and-network-usage.md §4.1). On the Rust engine that gate is
+necessary, not sufficient: `myotis_status` carries `snapPeers` but not
+`snapServingPeers`, so right after SYNCED a cold pool of still-syncing peers
+passes it while reads still fail (#465). The in-process hosts hold such a read
+only around a start or resume warm-up, and for at most 90 s
+(`WAKE_WAIT_CAP_MS`); on a stack that has been running, the read proceeds at
+once and fails in-band (#312). Over JSON-RPC it is the same retryable
+`-32000` either way — keep polling and retry.
+
+## Block tags
+
+Readiness is judged at the optimistic head, and so are `latest`, `safe` and
+`pending` (the light client has no justified anchor to apply, so `safe` and
+`pending` resolve to the head — documented, not silent; #366). The `finalized`
+tag is **applied** since engine ABI 30 (#465): `eth_call`, `eth_getBlockByNumber`,
+`eth_getBlockReceipts` and `eth_feeHistory` run against, or serve, the
+beacon-finalized block, whose header window needs no path to the optimistic
+head — so a finalized read can succeed while a `latest` read still fails on a
+pool that lacks the head. The state reads (`eth_getBalance` and friends) and the
+Java engine still resolve `finalized` to the head (#366).
 
 ## Code pointers
 

@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 30
+#define MYOTIS_ABI_VERSION 31
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -234,6 +234,28 @@ char *myotis_import_log_index_files(int64_t handle, const char *paths_json);
 /* v24: export the current index as a portable snapshot at path
  * (finality-clamped, self-describing). {"ok":true} or {"error":...}. */
 char *myotis_export_log_index(int64_t handle, const char *path);
+
+/* v31: host-supplied EL seed pins (#465). enodes_json is a JSON array of
+ * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS; a
+ * trailing "?discport=<port>", as geth prints it, is accepted and ignored).
+ * REPLACES the handle's host list (an empty array clears it; an identical
+ * re-push is a no-op); on an address the network also pins, the host's key
+ * wins. Applied or refused AS A WHOLE: false for NULL, invalid JSON, a
+ * non-array, any malformed entry, a duplicate address, more than 64 entries,
+ * or an unknown handle — nothing is applied on refusal. Kept per handle and
+ * applied on every start/resume, and live on a running handle (one whose EL
+ * reader failed to start keeps it for the resume that rebuilds it): a changed
+ * list is dialed at once, whatever the pool holds, and the pins are then
+ * pins like the network's (never seeded into the peer cache; re-dialed while
+ * the pool is below its target or, once the beacon anchor has a head, no
+ * pooled peer can answer at it, and above that once proven to serve snap
+ * data). An unspecified IP (0.0.0.0 / ::) or port 0 is refused: geth prints
+ * its own enode that way until it learns its external address.
+ * v31 also adds "snapServingPeers" to myotis_status_json: the pooled peers
+ * that can answer a read at the anchored head NOW — gate reads on it rather
+ * than on "snapPeers", which a pool of still-syncing peers satisfies for
+ * hours while every read fails. */
+bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
 
 #ifdef __cplusplus
 }

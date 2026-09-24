@@ -83,6 +83,7 @@ let lastLine = '';
 const poll = setInterval(() => {
   const s = JSON.parse(m.statusJson(handle));
   const line = `beacon=${s.beaconState} peers=${s.peerCount} snapPeers=${s.snapPeers} ` +
+    `serving=${s.snapServingPeers} ` +
     `discv5=${s.discv5TableSize} period=${s.currentPeriod}/${s.targetPeriod} ` +
     `finalizedSlot=${s.finalizedSlot} el=${s.elReaderAvailable}`;
   if (line !== lastLine) { log(line); lastLine = line; }
@@ -125,6 +126,7 @@ async function timed(label, promise) {
 
 async function queries(status) {
   log(`gate open (snapPeers=${status.snapPeers}>=${GATE.minSnapPeers}, ` +
+    `serving=${status.snapServingPeers}, ` +
     `discv5TableSize=${status.discv5TableSize}) — running verified reads`,
     JSON.stringify(status));
   let failures = 0;

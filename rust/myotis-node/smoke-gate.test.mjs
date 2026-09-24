@@ -24,7 +24,7 @@ test('run A (linux, warm) — snapPeers=2, the run that passed — opens the gat
   // one: with any discovery signal the historically-passing run still opens
   // the gate, and in the cache-only case it is deliberately held back (a run
   // that discovered nothing cannot vouch for the engine either).
-  const base = { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2 };
+  const base = { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2, snapServingPeers: 2 };
   assert.deepEqual(gateShortfall({ ...base, discoveredPeers: 30 }, DEFAULTS), []);
   const cacheOnly = gateShortfall(
     { ...base, discv5TableSize: 0, discoveredPeers: 0 }, DEFAULTS);
@@ -67,8 +67,31 @@ test('a cache-only warm start with enough peers is still gated on discovery', ()
   assert.ok(isPeerStarvation(unmet));
 });
 
+test('pooled but non-serving peers gate as peer starvation (#465)', () => {
+  // The cold-start shape from the issue: SYNCED, a full pool of peers still
+  // syncing themselves, none able to answer at the anchored head.
+  const unmet = gateShortfall(
+    { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 6, snapServingPeers: 0, discoveredPeers: 30 },
+    DEFAULTS);
+  assert.equal(unmet.length, 1);
+  assert.match(unmet[0].message, /snapServingPeers=0 \(want >=1/);
+  assert.ok(isPeerStarvation(unmet));
+  // One serving peer is enough for this condition (rotation headroom is snapPeers').
+  assert.deepEqual(gateShortfall(
+    { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2, snapServingPeers: 1, discoveredPeers: 30 },
+    DEFAULTS), []);
+});
+
+test('an older addon without the serving key is not gated on it', () => {
+  // Pre-ABI-31 status: no snapServingPeers key at all — the gate must not
+  // read the missing key as zero.
+  assert.deepEqual(gateShortfall(
+    { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2, discoveredPeers: 30 },
+    DEFAULTS), []);
+});
+
 test('either discovery signal alone opens that condition (CL discv5 OR EL discovered)', () => {
-  const base = { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2 };
+  const base = { beaconState: 'SYNCED', elReaderAvailable: true, snapPeers: 2, snapServingPeers: 2 };
   assert.deepEqual(gateShortfall({ ...base, discv5TableSize: 5, discoveredPeers: 0 }, DEFAULTS), []);
   assert.deepEqual(gateShortfall({ ...base, discv5TableSize: 0, discoveredPeers: 5 }, DEFAULTS), []);
 });

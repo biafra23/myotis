@@ -41,7 +41,7 @@ use crate::el::evm::{
     EnsRootMode, GasOutcome, PoolOracle,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
-use crate::el::pool::{PeerPool, PoolConfig};
+use crate::el::pool::{Enode, PeerPool, PoolConfig};
 use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
@@ -77,7 +77,7 @@ pub struct ElConfig {
     /// (discv4 UDP endpoints, no key) these carry the pubkey the ECIES
     /// handshake needs, so they are dialed over RLPx directly instead of
     /// waiting for discovery to surface them.
-    pub boot_enodes: Vec<(std::net::SocketAddr, [u8; 64])>,
+    pub boot_enodes: Vec<Enode>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
@@ -87,35 +87,67 @@ pub struct ElConfig {
 const SEPOLIA_MYOTIS_ENODE: &str =
     "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405";
 
-/// Parse `enode://<128 hex pubkey>@host:port` entries into dialable
-/// `(addr, pubkey)` pairs, skipping anything malformed — a bad pin must not
-/// panic a wallet at startup, it just leaves discovery to do the work. Twin of
-/// the Java `ChainStack.parseBootEnodes`.
-fn parse_boot_enodes(enodes: &[&str]) -> Vec<(std::net::SocketAddr, [u8; 64])> {
-    let mut out = Vec::new();
-    for e in enodes {
-        let Some(body) = e.strip_prefix("enode://") else { continue };
-        let Some((pubkey_hex, host_port)) = body.split_once('@') else { continue };
-        // is_ascii() is load-bearing, not belt-and-braces: len() counts BYTES,
-        // so 64 multi-byte chars (e.g. "é" × 64 = 128 bytes) pass the length
-        // check and then panic in the slicing below at a non-char boundary —
-        // an abort, since the workspace builds panic = "abort". This parser
-        // exists to be lenient with untrusted-ish input, so it must not.
-        if pubkey_hex.len() != 128 || !pubkey_hex.is_ascii() {
-            continue;
-        }
-        let Ok(bytes) = (0..64)
-            .map(|i| u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-        else {
-            continue;
-        };
-        let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else { continue };
-        let mut pubkey = [0u8; 64];
-        pubkey.copy_from_slice(&bytes);
-        out.push((addr, pubkey));
+/// Parse ONE `enode://<128 hex pubkey>@ip:port` URL, strictly: the prefix, a
+/// 128-character hex public key (`peercache::parse_pubkey` — hex digits
+/// only, so a `+f` pair `from_str_radix` would take is refused, and a
+/// multi-byte character never reaches a slice: the workspace aborts on
+/// panic), `@`, then a NUMERIC `ip:port` (no DNS name — the pool dials socket
+/// addresses, and a name it cannot dial must be refused, never silently
+/// dropped). `Err` names the first rule the entry breaks, so a host's refused
+/// seed push (`myotis_set_boot_enodes`, #465) says why. The network's own
+/// pins go through it leniently (`parse_boot_enodes`).
+pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
+    let Some(body) = enode.strip_prefix("enode://") else {
+        return Err("missing the enode:// prefix");
+    };
+    let Some((pubkey_hex, host_port)) = body.split_once('@') else {
+        return Err("missing the '@' between the public key and the address");
+    };
+    // Exactly 128 characters: `parse_pubkey` would also take a `0x` prefix,
+    // which no enode URL form carries.
+    if pubkey_hex.len() != 128 {
+        return Err("the public key must be 128 hex characters");
     }
-    out
+    let Some(pubkey) = crate::el::peercache::parse_pubkey(pubkey_hex) else {
+        return Err("the public key must be 128 hex characters");
+    };
+    // geth prints `?discport=<udp port>` whenever a node's UDP port differs
+    // from its TCP one, so that is what a host copies from `admin.nodeInfo`
+    // or a static-nodes.json. The pool dials TCP only: accept the query and
+    // ignore it; any other query is refused by name, not as a bad address.
+    let host_port = match host_port.split_once('?') {
+        None => host_port,
+        Some((host_port, query))
+            if query
+                .strip_prefix("discport=")
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            host_port
+        }
+        Some(_) => return Err("only a ?discport=<port> query is accepted after the address"),
+    };
+    let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else {
+        return Err("the address must be a numeric ip:port");
+    };
+    // geth prints its own enode as `@0.0.0.0:30303` until it learns its
+    // external address, so a host copying it from its node's log hits this:
+    // an unspecified IP or port 0 names no dialable remote (on Linux,
+    // connect() to 0.0.0.0 even reaches loopback — possibly a different local
+    // node). Refused by name; loopback stays allowed, fronting a local node
+    // is a legitimate use.
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return Err("the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0");
+    }
+    Ok((addr, pubkey))
+}
+
+/// Parse the network's shipped `enode://` pins into dialable pins, skipping
+/// anything malformed — a bad pin must not panic a wallet at startup, it just
+/// leaves discovery to do the work. Twin of the Java
+/// `ChainStack.parseBootEnodes`. (A HOST's pins are the strict case: see
+/// [`parse_enode`].)
+fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
+    enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
 impl ElConfig {
@@ -4372,8 +4404,9 @@ impl ElReader {
     /// and they are not read-benched (see `pool::is_serving`). Unlike
     /// [`snap_peer_count`](Self::snap_peer_count), nonzero only once some
     /// peer has given evidence it can serve the tip — a fresh word or a
-    /// served proof, not merely a connection (#465). Intended for the hosts'
-    /// `snapServingPeers`; the status plumbing is a follow-up.
+    /// served proof, not merely a connection (#465). The hosts'
+    /// `snapServingPeers` status key (ABI ≥ 31), which their readiness gates
+    /// use in place of the pooled count.
     pub async fn snap_serving_count(&self) -> usize {
         self.pool.snap_serving_count().await
     }
@@ -4392,6 +4425,15 @@ impl ElReader {
     /// Live-adjust the eth/69 served-block window (Settings knob).
     pub fn set_served_block_window(&self, blocks: u64) {
         self.pool.set_served_block_window(blocks);
+    }
+
+    /// Replace the HOST-supplied EL seed pins (`myotis_set_boot_enodes`, #465):
+    /// dialed like the network's own pins — a changed list at once, then by
+    /// the maintainer while the pool is below target or nobody serves, and
+    /// once proven above that — never seeded into the peer cache (see
+    /// `PeerPool::set_boot_enodes`).
+    pub async fn set_boot_enodes(&self, pins: Vec<Enode>) {
+        self.pool.set_boot_enodes(pins).await;
     }
 
     /// EL hunt engaged on the pool (serving pool empty past the stall window).
@@ -8261,6 +8303,76 @@ mod tests {
         // check and would panic (→ abort) when sliced at a non-char boundary.
         assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))]).is_empty());
         assert_eq!(parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]).len(), 1);
+    }
+
+    #[test]
+    fn parse_enode_names_each_refusal() {
+        let key = "ab".repeat(64);
+        assert!(parse_enode(SEPOLIA_MYOTIS_ENODE).is_ok());
+        assert_eq!(parse_enode("not-an-enode"), Err("missing the enode:// prefix"));
+        assert_eq!(
+            parse_enode(&format!("enode://{key}")),
+            Err("missing the '@' between the public key and the address")
+        );
+        assert_eq!(
+            parse_enode("enode://short@1.2.3.4:30303"),
+            Err("the public key must be 128 hex characters")
+        );
+        // 64 × "é" is exactly 128 bytes: refused on the hex check, never sliced.
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "zz".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        // `u8::from_str_radix` alone would read "+a" as 0x0a: 64 such pairs are
+        // 128 ASCII bytes and must still be refused, not applied as a garbage key.
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "+a".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@nonsense")),
+            Err("the address must be a numeric ip:port")
+        );
+        // A DNS name is refused, not resolved: the pool dials socket addresses,
+        // and a host must learn its pin cannot be dialed rather than lose it.
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@node.example.org:30303")),
+            Err("the address must be a numeric ip:port")
+        );
+        let (addr, pubkey) = parse_enode(&format!("enode://{key}@[2001:db8::1]:30303")).unwrap();
+        assert_eq!(addr.port(), 30303);
+        assert!(addr.is_ipv6());
+        assert_eq!(pubkey, [0xab; 64]);
+        // No enode URL form carries a `0x` prefix: 130 characters are refused
+        // even though the shared decoder would strip it.
+        assert_eq!(
+            parse_enode(&format!("enode://0x{key}@1.2.3.4:30303")),
+            Err("the public key must be 128 hex characters")
+        );
+        // geth prints `@0.0.0.0:<port>` for its own node until it learns its
+        // external address; that and port 0 name no dialable remote. Loopback does.
+        let undialable = "the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0";
+        assert_eq!(parse_enode(&format!("enode://{key}@0.0.0.0:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@[::]:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@1.2.3.4:0")), Err(undialable));
+        assert!(parse_enode(&format!("enode://{key}@127.0.0.1:30303")).is_ok());
+        // geth's `?discport=` form (UDP port ≠ TCP port) is accepted and ignored;
+        // any other query is refused by name.
+        let with_discport = format!("enode://{key}@1.2.3.4:30303?discport=30301");
+        let (addr, _) = parse_enode(&with_discport).unwrap();
+        assert_eq!(addr.port(), 30303);
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?discport=")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?foo=bar")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
     }
 
 #[test]

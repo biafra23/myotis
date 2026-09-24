@@ -112,7 +112,15 @@ uniffi::setup_scaffolding!();
 ///      documented, not silent — and so does `finalized` on the JVM hosts'
 ///      state reads and on the Java engine (#366). A behavior change and a
 ///      payload extension, no signature change.
-pub const ABI_VERSION: i32 = 30;
+/// v31: added myotis_set_boot_enodes (C ABI + Node; no UniFFI export — the
+///      JVM hosts have no seed-pin surface yet, so ffi.rs is untouched):
+///      host-supplied EL seed pins, a JSON array of enode:// URLs applied or
+///      refused AS A WHOLE (#465). The status JSON gained `snapServingPeers`,
+///      the pooled peers that can answer a read at the anchored head now —
+///      what the hosts' readiness gates use in place of `snapPeers`, which a
+///      pool of still-syncing peers satisfies for hours while every read
+///      fails. A key addition; older wrappers ignore it.
+pub const ABI_VERSION: i32 = 31;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

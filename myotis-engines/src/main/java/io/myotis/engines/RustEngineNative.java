@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 30; // 30: eth_call and the block reads honour `finalized`
+    static final int EXPECTED_ABI_VERSION = 31; // 31: myotis_set_boot_enodes (C ABI + Node); snapServingPeers in the status JSON
 
     private static final boolean AVAILABLE = load();
 

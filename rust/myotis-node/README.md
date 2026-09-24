@@ -29,13 +29,20 @@ myotis.init();   // ABI handshake — returns the engine ABI version; gate on
 const h = myotis.create('mainnet', '/path/to/data-dir');  // dir is created if missing
 myotis.start(h);
 
+// Optional (ABI >= 31): seed the EL pool with execution nodes the host knows to
+// be serving — a changed list is dialed at once, and again while the pool is
+// below its target or no pooled peer can answer at the anchored head. Applied
+// or refused AS A WHOLE (see Notes); before or after start(), kept across
+// pause/resume:
+// myotis.setBootEnodes(h, JSON.stringify(['enode://<128-hex pubkey>@1.2.3.4:30303']));
+
 // Recovery from STALE_ANCHOR with a checkpoint the HOST authenticated (ABI >= 26):
 // bootstraps a fresh dir from that root/slot instead of the embedded checkpoint.
 // const h = myotis.createWithCheckpoint('mainnet', '/path/to/fresh-dir',
 //   '0x<32-byte beacon block root>', 15208352 /* that block header's slot */);
 
 // Lifecycle and status are synchronous (stop/pause can wait for native work):
-JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, ... }
+JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, snapServingPeers, ... }
 
 // Verified reads run on bounded Myotis workers, with a 90 s operation budget
 // including queue wait. Cancellation drains native work before completion:
@@ -58,7 +65,8 @@ cold/warm timing:
 node smoke.mjs ./data-dir ../target/debug/myotis-node.node
 ```
 
-It begins the reads only once the peer set is worth judging — `snapPeers >= 2`
+It begins the reads only once the peer set is worth judging — `snapServingPeers >= 1`
+(a pooled peer that can answer at the anchored head; #465) and `snapPeers >= 2`
 (the reader rotates, so one peer means one dud peer looks like a broken
 engine) and discovery has produced candidates. Exit codes distinguish the two
 verdicts that used to be one: **0** all checks passed, **1** the engine
@@ -75,12 +83,30 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 ## Notes
 
 - **Readiness**: serve verified reads only when `statusJson` shows
-  `beaconState === 'SYNCED'` and `elReaderAvailable`; before that, reads
-  honestly error rather than guess. `snapPeers > 0` is the minimum to answer
-  at all, but a host that wants a read to SURVIVE one silent peer should wait
+  `beaconState === 'SYNCED'`, `elReaderAvailable`, and `snapServingPeers >= 1`;
+  before that, reads honestly error rather than guess. `snapServingPeers`
+  (ABI >= 31) counts the pooled peers that can answer a read at the anchored
+  head *now*; `snapPeers` counts every pooled snap peer, and right after SYNCED
+  a cold pool can be full of peers still syncing themselves — `snapPeers > 0`
+  for hours while every read fails with `peer returned 0 headers` (#465). On
+  an addon older than ABI 31 the key is absent: fall back to `snapPeers`. A
+  host that wants a read to SURVIVE one silent peer should additionally wait
   for `snapPeers >= 2` — the reader rotates over the snap set, and with a
   single peer there is nowhere to rotate to (this is what `smoke.mjs` gates
   on; see #372).
+- **Seed pins** (`setBootEnodes`, ABI >= 31): the engine ships no mainnet seed
+  list; a host that knows serving execution nodes can pin them per handle
+  (`myotis_set_boot_enodes` in `myotis_engine.h` is the contract). The push is
+  applied or refused as a whole (`false`: invalid JSON, a non-array, a
+  malformed or DNS-named entry, a duplicate address, more than the header's
+  cap, or an unknown handle — nothing applied), an empty array clears, and an
+  identical re-push is a no-op. The engine never persists it. A changed list
+  is dialed at once; from then on the pins are pins like the network's own —
+  never seeded into the peer cache, re-dialed while the pool is below its
+  target or, once the beacon anchor has a head, no pooled peer can answer at
+  it, and above that once proven to serve. On an address the network also
+  pins, the host's key wins. An unspecified IP (`0.0.0.0`, geth's own enode
+  before it learns its external address) or port 0 is refused.
 - **Weak-subjectivity gate**: `statusJson().beaconState` can be `STALE_ANCHOR`
   — the engine refused to walk forward from an anchor (embedded checkpoint or
   persisted snapshot) older than the network's WS bound, because from that far
@@ -170,7 +196,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 30** and existing JS
+This implementation targets the current engine's **ABI 31** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
@@ -181,8 +207,9 @@ empty `to` that means contract creation (this binding always passes a string,
 so nothing changes for Node callers); and ABI 30 makes `finalized` run
 against the beacon-finalized block and adds `blockNumber` / `verified` to the
 call result (the block string passes through unchanged; a host that relied on
-`finalized` answering from the head must now pass `latest`). It is not a
-drop-in artifact for a host pinned to ABI 22.
+`finalized` answering from the head must now pass `latest`); ABI 31 adds
+`setBootEnodes` and the `snapServingPeers` status key (a key addition — older
+readers ignore it). It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

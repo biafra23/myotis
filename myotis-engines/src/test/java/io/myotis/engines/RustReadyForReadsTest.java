@@ -12,11 +12,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RustReadyForReadsTest {
 
+    /** The ABI >= 31 shape with every pooled peer also serving. */
     private static String status(boolean running, String beaconState, long head, int snapPeers,
                                  boolean elReader) {
+        return status(running, beaconState, head, snapPeers, snapPeers, elReader);
+    }
+
+    private static String status(boolean running, String beaconState, long head, int snapPeers,
+                                 int snapServing, boolean elReader) {
         return "{\"running\":" + running + ",\"paused\":false,\"network\":\"sepolia\","
                 + "\"beaconState\":\"" + beaconState + "\",\"elReaderAvailable\":" + elReader
-                + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers + "}";
+                + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers
+                + ",\"snapServingPeers\":" + snapServing + "}";
     }
 
     private static boolean ready(String json) {
@@ -33,6 +40,25 @@ class RustReadyForReadsTest {
         assertFalse(ready(status(true, "CATCHING_UP", 9_000_000, 4, true)));
         assertFalse(ready(status(true, "SYNCED", 9_000_000, 0, true)));
         assertFalse(ready(status(true, "SYNCED", 0, 4, true)));
+    }
+
+    @Test
+    void syncedWithPooledButNonServingPeersIsNotReady() {
+        // The #465 shape: SYNCED, a full pool of peers still syncing themselves,
+        // none able to answer at the anchored head — holding is right, a read
+        // now fails with "peer returned 0 headers".
+        assertFalse(ready(status(true, "SYNCED", 9_000_000, 6, 0, true)));
+        assertTrue(ready(status(true, "SYNCED", 9_000_000, 6, 1, true)));
+    }
+
+    @Test
+    void aStatusWithoutTheServingKeyIsNotReady() {
+        // Fail CLOSED: a status with no snapServingPeers key (a hand-written
+        // fixture — a loaded native always emits it, the ABI gate is exact)
+        // reads as nobody serving, never as the pooled count.
+        String noKey = status(true, "SYNCED", 9_000_000, 4, true)
+                .replace(",\"snapServingPeers\":4", "");
+        assertFalse(ready(noKey));
     }
 
     @Test

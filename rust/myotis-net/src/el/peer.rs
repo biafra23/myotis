@@ -276,6 +276,12 @@ pub struct ManagedPeer {
     /// Set once the read loop terminates (disconnect / read error); requests
     /// short-circuit instead of hanging until timeout.
     closed: Arc<AtomicBool>,
+    /// Consecutive request timeouts with no answer in between — the log
+    /// throttle: the first of a silent streak is a WARN naming the peer, the
+    /// rest are DEBUG (an EVM prefetch has dozens of requests in flight
+    /// against one peer; one line says which peer went silent, the next 47
+    /// would only repeat it). Reset by any delivered response.
+    timeout_streak: AtomicU64,
     reader_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Negotiated eth version (66-69).
@@ -391,6 +397,7 @@ impl ManagedPeer {
             pending,
             next_id: AtomicU64::new(1),
             closed,
+            timeout_streak: AtomicU64::new(0),
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
             snap,
@@ -487,11 +494,37 @@ impl ManagedPeer {
         mark_request_sent();
 
         let out = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                self.timeout_streak.store(0, Ordering::Relaxed);
+                result
+            }
             // The read loop dropped the sender (disconnect drained the map).
             Ok(Err(_)) => Err("peer connection closed".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                // Name the silent peer at WARN — once per silent streak (#465):
+                // the pool-level whole-pool WARNs list the peers that failed,
+                // but a single peer going silent under a prefetch or a probe
+                // left no trace at info+, the level the hosts' log rings keep.
+                // (A hedged loser never reaches this arm — the race drops it
+                // when a winner answers; that event logs in the pool's
+                // `record_outpaced`.)
+                let streak = self.timeout_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak == 1 {
+                    tracing::warn!(
+                        addr = %self.addr,
+                        code = %format_args!("0x{want_code:02x}"),
+                        timeout_s = REQUEST_TIMEOUT.as_secs(),
+                        "peer request timed out"
+                    );
+                } else {
+                    tracing::debug!(
+                        addr = %self.addr,
+                        code = %format_args!("0x{want_code:02x}"),
+                        streak,
+                        "peer request timed out (silent streak continues)"
+                    );
+                }
                 Err(format!("timed out awaiting code 0x{want_code:02x}"))
             }
         };
