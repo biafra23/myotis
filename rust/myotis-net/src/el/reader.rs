@@ -37,7 +37,7 @@ use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
 use crate::el::evm::{
-    block_context, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
+    block_context, CallAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
     EnsRootMode, GasOutcome, PoolOracle,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
@@ -5104,27 +5104,51 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallOutcome, String> {
-        self.request(self.eth_call_create_inner(from, init_code, value, chain_id, overrides)).await
+        Ok(self
+            .eth_call_create_at(CallAnchor::Head, from, init_code, value, chain_id, overrides)
+            .await?
+            .outcome)
     }
 
-    async fn eth_call_create_inner(
+    /// [`Self::eth_call_create`] against `anchor` (see
+    /// [`Self::eth_call_overridden_at`]).
+    pub async fn eth_call_create_at(
         &self,
+        anchor: CallAnchor,
         from: Option<[u8; 20]>,
         init_code: Vec<u8>,
         value: U256,
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
-    ) -> Result<CallOutcome, String> {
-        let (ctx, executor) = self.evm_setup(chain_id, "eth_call (create)").await?;
+    ) -> Result<CallAnswer, String> {
+        self.request(self.eth_call_create_inner(anchor, from, init_code, value, chain_id, overrides))
+            .await
+    }
+
+    async fn eth_call_create_inner(
+        &self,
+        anchor: CallAnchor,
+        from: Option<[u8; 20]>,
+        init_code: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call (create)").await?;
+        let block_number = ctx.block_number;
         let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.create_view(sender, &init_code, value, &ctx, overrides)
         })
         .await?;
-        Ok(match joined {
-            Ok(bytes) => CallOutcome::Success(bytes),
-            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
-            Err(other) => CallOutcome::Unavailable(other.to_string()),
+        Ok(CallAnswer {
+            outcome: match joined {
+                Ok(bytes) => CallOutcome::Success(bytes),
+                Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+                Err(other) => CallOutcome::Unavailable(other.to_string()),
+            },
+            block_number,
+            finalized: anchor == CallAnchor::Finalized,
         })
     }
 
@@ -5141,19 +5165,47 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallOutcome, String> {
-        self.request(self.eth_call_overridden_inner(from, to, data, value, chain_id, overrides)).await
+        Ok(self
+            .eth_call_overridden_at(CallAnchor::Head, from, to, data, value, chain_id, overrides)
+            .await?
+            .outcome)
     }
 
-    async fn eth_call_overridden_inner(
+    /// [`Self::eth_call_overridden`] against `anchor` — the optimistic head, or
+    /// the beacon-finalized block for the `finalized` tag (#465) — answering
+    /// with the block it ran against (#382). A finalized call is never
+    /// downgraded to the head: it fails, retryably, when no peer still serves
+    /// the finalized state (CLAUDE.md §Trust — applied or refused).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn eth_call_overridden_at(
         &self,
+        anchor: CallAnchor,
         from: Option<[u8; 20]>,
         to: [u8; 20],
         data: Vec<u8>,
         value: U256,
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
-    ) -> Result<CallOutcome, String> {
-        let (ctx, executor) = self.evm_setup(chain_id, "eth_call").await?;
+    ) -> Result<CallAnswer, String> {
+        self.request(
+            self.eth_call_overridden_inner(anchor, from, to, data, value, chain_id, overrides),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn eth_call_overridden_inner(
+        &self,
+        anchor: CallAnchor,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let block_number = ctx.block_number;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
         let joined = super::request::blocking(move || {
@@ -5164,10 +5216,14 @@ impl ElReader {
             executor.call_view_overridden(sender, to, &data, value, &ctx, overrides)
         })
         .await?;
-        Ok(match joined {
-            Ok(bytes) => CallOutcome::Success(bytes),
-            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
-            Err(other) => CallOutcome::Unavailable(other.to_string()),
+        Ok(CallAnswer {
+            outcome: match joined {
+                Ok(bytes) => CallOutcome::Success(bytes),
+                Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+                Err(other) => CallOutcome::Unavailable(other.to_string()),
+            },
+            block_number,
+            finalized: anchor == CallAnchor::Finalized,
         })
     }
 
@@ -5378,13 +5434,29 @@ impl ElReader {
         }
     }
 
+    /// [`Self::evm_setup`] or [`Self::evm_setup_finalized`], by `anchor`.
+    async fn evm_setup_at(
+        &self,
+        anchor: CallAnchor,
+        chain_id: u64,
+        what: &str,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        match anchor {
+            CallAnchor::Head => self.evm_setup(chain_id, what).await,
+            CallAnchor::Finalized => self.evm_setup_finalized(chain_id, what).await,
+        }
+    }
+
     /// [`Self::evm_setup`], anchored at the beacon-FINALIZED execution block
-    /// instead of the optimistic head. The header is fetched over the verified
-    /// hash-chain window and then CROSS-CHECKED against the finalized anchor's
-    /// own hash + state root, so the context provably IS the finalized state.
-    /// Note the servable-edge caveat: execution peers prune state, so a
+    /// instead of the optimistic head. The header comes over a verified window
+    /// anchored at the finalized block itself (`choose_window_top`: one header,
+    /// no path to the optimistic head — so this serves while a `latest` read
+    /// still cannot, #465) and is then CROSS-CHECKED against the finalized
+    /// anchor's own hash + state root: belt and braces, redundant by
+    /// construction today, kept as the defence should the window top ever
+    /// change. Note the servable-edge caveat: execution peers prune state, so a
     /// finalized root (~2 epochs back) can be unservable — that fails closed
-    /// here or in the oracle, and AUTO falls back to the optimistic head.
+    /// here or in the oracle, and ENS's AUTO falls back to the optimistic head.
     async fn evm_setup_finalized(
         &self,
         chain_id: u64,
@@ -5399,9 +5471,9 @@ impl ElReader {
                 fin.block_number
             ));
         };
-        // The window walk verified hash-linkage to the optimistic head; also pin
-        // the header to the finalized anchor itself (belt and braces — the
-        // finalized payload is the trust anchor this mode advertises).
+        // The window was anchored at the finalized hash itself; pin the header
+        // to the finalized anchor once more (belt and braces — the finalized
+        // payload is the trust anchor this mode advertises).
         if block.hash != fin.block_hash {
             return Err(format!(
                 "finalized-block hash mismatch at {} for {what}",
@@ -5535,22 +5607,27 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
+        // The window top: the finalized block when the target is at or below
+        // it — a top every roughly synced peer holds, unlike the optimistic
+        // head a peer one slot behind honestly lacks (#465) — else the head.
+        let (top_num, top) = self.window_top(target_num, (head_num, head_hash));
+        let span = top_num - target_num;
         // Each peer's coverage of the anchored head, sampled before the race
         // (see pool_race_verdict).
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged (hedged_race): a silent first peer no longer costs a whole
         // request timeout before the next one is asked — on a flaky pool that
         // stacked up per dead peer, which is where 45-second block reads came
-        // from. The delay follows the window depth (block_hedge_delay): a deep
+        // from. The delay follows the window SPAN (block_hedge_delay): a deep
         // window is a large download that should not be duplicated too
         // eagerly, while `latest`, which every eth_call starts with, is one
         // header. Any Ok ends the race: a verified block, or an undecodable
         // body. Block reads carry no address, so racing widens no disclosure.
         let out = hedged_race(
             &peers,
-            block_hedge_delay(back),
+            block_hedge_delay(span),
             |peer: std::sync::Arc<ManagedPeer>| async move {
-                match self.get_block_from(&peer, target_num, back, &head_hash, full_transactions).await {
+                match self.get_block_from(&peer, target_num, span, top, full_transactions).await {
                     Ok(block) => Ok(BlockAttempt::Block(Box::new(block))),
                     Err(BlockFromError::Undecodable(e)) => Ok(BlockAttempt::Undecodable(e)),
                     Err(BlockFromError::Peer(e)) => Err(e),
@@ -5578,28 +5655,28 @@ impl ElReader {
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
-    /// [target..head], checks it hash-links up to the beacon-anchored head hash,
-    /// then fetches the target's body and verifies its transactions against the
-    /// header's `transactions_root`. A [`BlockFromError::Peer`] (mismatch /
-    /// transport) is this peer's failure — the caller loop tries the next one;
-    /// a [`BlockFromError::Undecodable`] is deterministic across peers and must
-    /// short-circuit the loop.
+    /// [target..top] (`top` = the beacon-anchored block the window chains up
+    /// to, see `choose_window_top`), then fetches the target's body and verifies
+    /// its transactions against the header's `transactions_root`. A
+    /// [`BlockFromError::Peer`] (mismatch / transport) is this peer's failure —
+    /// the caller loop tries the next one; a [`BlockFromError::Undecodable`] is
+    /// deterministic across peers and must short-circuit the loop.
     async fn get_block_from(
         &self,
         peer: &ManagedPeer,
         target_num: u64,
-        back: u64,
-        head_hash: &[u8; 32],
+        span: u64,
+        top: WindowTop,
         full_transactions: bool,
     ) -> Result<VerifiedBlock, BlockFromError> {
-        // The contiguous forward window [target .. head] (back + 1 headers), in one
-        // request. back < BLOCK_LOOKBACK_MAX (512) bounds this to ~300 KB, within the
-        // eth response soft limit; a peer that caps its response below back+1 fails
+        // The contiguous forward window [target .. top] (span + 1 headers), in one
+        // request. span < BLOCK_LOOKBACK_MAX (512) bounds this to ~300 KB, within the
+        // eth response soft limit; a peer that caps its response below span+1 fails
         // the anchored-window length check and is skipped (fails closed — the caller
         // tries the next peer), so deep pins carry a slightly higher liveness risk
         // than a batched fetch would. The common case (latest / a few blocks back) is
         // one small response.
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash)
+        let window = fetch_anchored_window(peer, target_num, span + 1, top)
             .await
             .map_err(BlockFromError::Peer)?;
         let vh = &window[0];
@@ -5693,7 +5770,7 @@ impl ElReader {
         count: u64,
         head_hash: &[u8; 32],
     ) -> Result<FeeEstimate, String> {
-        let window = fetch_anchored_window(peer, start, count, head_hash).await?;
+        let window = fetch_anchored_window(peer, start, count, WindowTop::Head(*head_hash)).await?;
         let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
         let bodies = peer.get_block_bodies(&hashes).await?;
         if bodies.len() != window.len() {
@@ -5828,7 +5905,8 @@ impl ElReader {
         reward_percentiles: Option<&[f64]>,
     ) -> Result<FeeHistory, String> {
         let window_len = head_num - oldest + 1;
-        let window = fetch_anchored_window(peer, oldest, window_len, head_hash).await?;
+        let window =
+            fetch_anchored_window(peer, oldest, window_len, WindowTop::Head(*head_hash)).await?;
         let count = count as usize;
 
         let mut base_fee_per_gas: Vec<u128> =
@@ -6222,17 +6300,22 @@ impl ElReader {
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
+        // The window top as in get_block_by_number_inner: finalized when the
+        // target is at or below it (#465) — the log-index appender and fill
+        // read at or just below finality, so they now need no path to the head.
+        let (top_num, top) = self.window_top(target_num, (head_num, head_hash));
+        let span = top_num - target_num;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
-        // Hedged like get_block_by_number_inner, on the same depth-scaled delay
+        // Hedged like get_block_by_number_inner, on the same span-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
         // this read also feeds the log-index appender, which abandons its whole
         // tick on a single failed read, and the on-demand eth_getLogs fill,
         // which has LOG_INDEX_FILL_DEADLINE in total.
         let out = hedged_race(
             &peers,
-            block_hedge_delay(back),
+            block_hedge_delay(span),
             |peer: std::sync::Arc<ManagedPeer>| async move {
-                self.block_receipts_from(&peer, target_num, back, &head_hash).await
+                self.block_receipts_from(&peer, target_num, span, top).await
             },
             |_: &([u8; 32], Vec<VerifiedReceipt>)| true,
         )
@@ -6255,10 +6338,10 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         target_num: u64,
-        back: u64,
-        head_hash: &[u8; 32],
+        span: u64,
+        top: WindowTop,
     ) -> Result<([u8; 32], Vec<VerifiedReceipt>), String> {
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let window = fetch_anchored_window(peer, target_num, span + 1, top).await?;
         let vh = &window[0];
         let (bodies, receipt_blocks) = futures::future::join(
             peer.get_block_bodies(&[vh.hash]),
@@ -6310,6 +6393,14 @@ impl ElReader {
         for addr in failed {
             self.pool.record_snap_failure(*addr, witnessed).await;
         }
+    }
+
+    /// The window top a by-number read at `target_num` anchors at (see
+    /// `choose_window_top`): the finalized block when the target is at or
+    /// below it, else the optimistic head.
+    fn window_top(&self, target_num: u64, head: (u64, [u8; 32])) -> (u64, WindowTop) {
+        let fin = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash));
+        choose_window_top(target_num, head, fin)
     }
 
     /// The beacon-anchored optimistic head `(number, hash)`, or the standard
@@ -6534,7 +6625,8 @@ impl ElReader {
         count: u64,
         head_hash: &[u8; 32],
     ) -> Result<bool, String> {
-        let window = fetch_anchored_window(peer, loc.header.number, count, head_hash).await?;
+        let window =
+            fetch_anchored_window(peer, loc.header.number, count, WindowTop::Head(*head_hash)).await?;
         Ok(window[0].hash == loc.block_hash)
     }
 
@@ -6556,7 +6648,7 @@ impl ElReader {
         want: &[u8; 32],
     ) -> Result<Option<TxLocation>, String> {
         let count = head_num - from + 1;
-        let window = fetch_anchored_window(peer, from, count, head_hash).await?;
+        let window = fetch_anchored_window(peer, from, count, WindowTop::Head(*head_hash)).await?;
         // One single-hash request per block (bounded per-response size), all in
         // flight at once on this peer's multiplexed connection.
         let all_bodies = futures::future::join_all(window.iter().map(|vh| {
@@ -6700,18 +6792,60 @@ fn build_one_receipt(
     }
 }
 
+/// What a verified header window is anchored at — and so what serving it
+/// proves about the peer (`peer::KnownHead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowTop {
+    /// The beacon OPTIMISTIC head: serving a window up to it proves the peer
+    /// holds the tip.
+    Head([u8; 32]),
+    /// The beacon FINALIZED execution block: a stronger anchor (finality is
+    /// never reorged) that every roughly synced peer holds — which is why a
+    /// by-number read at or below it anchors here and no longer needs the
+    /// head (#465). Serving it proves nothing about the tip, so the peer's
+    /// head observation is left alone.
+    Finalized([u8; 32]),
+}
+
+impl WindowTop {
+    fn hash(&self) -> &[u8; 32] {
+        match self {
+            WindowTop::Head(h) | WindowTop::Finalized(h) => h,
+        }
+    }
+}
+
+/// Pure: the top a by-number window anchors at — the finalized block when the
+/// target is at or below it (and finality is below the head), else the
+/// optimistic head. `latest` has `target == head`, so it never takes the
+/// finalized anchor: the tip-lag retry's domain is unchanged, and a short
+/// finalized-anchored window is a pruned or lagging peer, never a race.
+fn choose_window_top(
+    target: u64,
+    head: (u64, [u8; 32]),
+    fin: Option<(u64, [u8; 32])>,
+) -> (u64, WindowTop) {
+    match fin {
+        Some((fin_num, fin_hash)) if target <= fin_num && fin_num < head.0 => {
+            (fin_num, WindowTop::Finalized(fin_hash))
+        }
+        _ => (head.0, WindowTop::Head(head.1)),
+    }
+}
+
 /// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
 /// and run the trust gate every anchored read shares: exact length, the right
-/// starting number, the window head IS the beacon-anchored head hash, and every
-/// header hash-links to the next. This is the sole gate that turns
-/// peer-supplied headers into trusted ones — one implementation, four callers
-/// (block serve, fee estimate, receipt scan, canonicality re-check), so a
-/// hardening never has to be applied in four places.
+/// starting number, the window top IS the beacon-anchored hash (`top`), and
+/// every header hash-links to the next. This is the sole gate that turns
+/// peer-supplied headers into trusted ones — one implementation, six callers
+/// (block serve, fee estimate, fee history, receipts, receipt scan,
+/// canonicality re-check), so a hardening never has to be applied in six
+/// places.
 async fn fetch_anchored_window(
     peer: &ManagedPeer,
     from: u64,
     count: u64,
-    head_hash: &[u8; 32],
+    top: WindowTop,
 ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, String> {
     let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
     // Distinct messages on purpose: a SHORT window is tip-lag-shaped (the peer
@@ -6730,10 +6864,10 @@ async fn fetch_anchored_window(
     if window[0].header.number != from {
         return Err("peer returned the wrong starting block number".to_string());
     }
-    // The window's head must BE the beacon-anchored head, and each header must
+    // The window's top must BE the beacon-anchored block, and each header must
     // hash-link to the next — proving every header in it chains to the verified
-    // head (the trust gate: head_hash is the light-client-attested exec hash).
-    if &window[window.len() - 1].hash != head_hash {
+    // anchor (the trust gate: the hash is light-client-attested).
+    if &window[window.len() - 1].hash != top.hash() {
         return Err("window head does not match the beacon-anchored head hash".to_string());
     }
     for i in 0..window.len() - 1 {
@@ -6741,9 +6875,13 @@ async fn fetch_anchored_window(
             return Err("header window is not hash-linked".to_string());
         }
     }
-    // Proof of the peer's head: it served a verified window up to the top
-    // (peer::KnownHead) — what the read ladder ranks it by from here on.
-    peer.note_head_served(window[window.len() - 1].header.number);
+    // Proof of the peer's head, only when the window reached the tip: it
+    // served a verified window up to our optimistic head (peer::KnownHead),
+    // what the read ladder ranks it by from here on. A finalized-anchored
+    // window proves it holds an older block, which says nothing about the tip.
+    if let WindowTop::Head(_) = top {
+        peer.note_head_served(window[window.len() - 1].header.number);
+    }
     Ok(window)
 }
 
@@ -7254,6 +7392,43 @@ mod tests {
         #[test]
         fn empty_input_yields_the_defensive_placeholder() {
             assert_eq!(summarize_peer_failures(&[]), "no failures recorded");
+        }
+    }
+
+    /// Where a by-number window anchors (#465): at the finalized block when the
+    /// target is at or below it, so the read needs no path to the optimistic
+    /// head; `latest` never takes it.
+    mod finalized_anchor {
+        use super::super::{choose_window_top, WindowTop};
+
+        const HEAD: (u64, [u8; 32]) = (1_000, [0xaa; 32]);
+        const FIN: Option<(u64, [u8; 32])> = Some((900, [0xff; 32]));
+
+        #[test]
+        fn a_target_at_or_below_finality_anchors_at_the_finalized_block() {
+            assert_eq!(choose_window_top(900, HEAD, FIN), (900, WindowTop::Finalized([0xff; 32])));
+            assert_eq!(choose_window_top(500, HEAD, FIN), (900, WindowTop::Finalized([0xff; 32])));
+        }
+
+        #[test]
+        fn a_target_above_finality_anchors_at_the_optimistic_head() {
+            assert_eq!(choose_window_top(901, HEAD, FIN), (1_000, WindowTop::Head([0xaa; 32])));
+        }
+
+        #[test]
+        fn latest_never_takes_the_finalized_anchor() {
+            // target == head: the tip-lag retry loop's domain is unchanged...
+            assert_eq!(choose_window_top(1_000, HEAD, FIN), (1_000, WindowTop::Head([0xaa; 32])));
+            // ...even if finality reports at the head.
+            assert_eq!(
+                choose_window_top(1_000, HEAD, Some((1_000, [0xff; 32]))),
+                (1_000, WindowTop::Head([0xaa; 32]))
+            );
+        }
+
+        #[test]
+        fn no_finalized_anchor_falls_back_to_the_head() {
+            assert_eq!(choose_window_top(500, HEAD, None), (1_000, WindowTop::Head([0xaa; 32])));
         }
     }
 

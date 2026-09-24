@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use myotis_net::el::evm::{EnsQuery, EnsRootMode};
+use myotis_net::el::evm::{CallAnchor, EnsQuery, EnsRootMode};
 use myotis_net::el::reader::ElReader;
 use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
@@ -1253,17 +1253,26 @@ pub fn eth_call_overrides_json(
     if let Err(refusal) = check_call_block(call_block, reader.optimistic_block_number()) {
         return refusal.to_json();
     }
+    // `finalized` runs against the beacon-finalized block; a head tag or a
+    // number inside the window runs against the head (the near-head trade-off
+    // documented on check_call_block).
+    let anchor = match call_block {
+        CallBlock::Finalized => CallAnchor::Finalized,
+        CallBlock::Head | CallBlock::Number(_) => CallAnchor::Head,
+    };
     match engine
         .rt
         .block_on(async {
             if creation {
-                reader.eth_call_create(from, data, value, chain_id, overrides).await
+                reader.eth_call_create_at(anchor, from, data, value, chain_id, overrides).await
             } else {
-                reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+                reader
+                    .eth_call_overridden_at(anchor, from, to, data, value, chain_id, overrides)
+                    .await
             }
         })
     {
-        Ok(outcome) => eljson::call_json(&outcome),
+        Ok(answer) => eljson::call_json(&answer),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -1297,12 +1306,15 @@ const CALL_BLOCK_LAG_TOLERANCE: u64 = 64;
 /// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_TOLERANCE`.
 const CALL_BLOCK_AHEAD_TOLERANCE: u64 = 16;
 
-/// The block an `eth_call` asked for, as the head-anchored executor sees it.
+/// The block an `eth_call` asked for, as the executor sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallBlock {
-    /// A head tag (`latest`/`pending`/`safe`/`finalized`), or empty — the
-    /// JSON-RPC default.
+    /// A head tag (`latest`/`pending`/`safe`), or empty — the JSON-RPC
+    /// default. `safe` and `pending` still mean the head (#366).
     Head,
+    /// The `finalized` tag: the call runs against the beacon-FINALIZED block
+    /// (ABI ≥ 30, #465) — applied, not silently mapped to the head.
+    Finalized,
     /// A block number, still to be checked against the verified head.
     Number(u64),
 }
@@ -1320,8 +1332,11 @@ enum CallBlock {
 fn parse_call_block(block: &str) -> Result<CallBlock, String> {
     let b = block.trim();
     let is_tag = |t: &str| b.eq_ignore_ascii_case(t);
-    if b.is_empty() || ["latest", "pending", "safe", "finalized"].into_iter().any(is_tag) {
+    if b.is_empty() || ["latest", "pending", "safe"].into_iter().any(is_tag) {
         return Ok(CallBlock::Head);
+    }
+    if is_tag("finalized") {
+        return Ok(CallBlock::Finalized);
     }
     if is_tag("earliest") {
         return Err("earliest (genesis) is not served: eth_call runs against the verified \
@@ -1392,7 +1407,9 @@ impl CallBlockRefusal {
 /// window: wallets pin reads to the number `eth_blockNumber` just returned,
 /// which is at or near the head. Inside the window the call still runs against
 /// HEAD state, the documented near-head trade-off (exact-block execution is
-/// #382).
+/// #382). A tag needs no check here: `Head` runs at the head, `Finalized` at
+/// the beacon-finalized block, whose own not-synced refusal comes from the
+/// reader.
 fn check_call_block(block: CallBlock, head: u64) -> Result<(), CallBlockRefusal> {
     let CallBlock::Number(block) = block else {
         return Ok(());
@@ -1715,6 +1732,10 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    let target = match resolve_block_target(target, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
+    };
     match engine
         .rt
         .block_on(reader.request(async { reader.get_block_by_number(target, full_transactions).await }))
@@ -1909,6 +1930,10 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
             Ok(t) => t,
             Err(msg) => return eljson::error_json(msg),
         };
+        let target = match resolve_block_target(target, reader.finalized_block_number()) {
+            Ok(t) => t,
+            Err(msg) => return eljson::error_json(&msg),
+        };
         engine.rt.block_on(reader.request(async { reader.get_block_receipts(target).await }))
     };
     match outcome {
@@ -1951,6 +1976,10 @@ pub fn fee_history_json(
     let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
+    };
+    let newest = match resolve_block_target(newest, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
     };
     // The raw request strings ARE the stale-serve signature (the Java
     // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
@@ -2028,13 +2057,28 @@ fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
     Ok(Some(out))
 }
 
-/// Parse an eth block selector to a target number: `None` = latest (the head).
-/// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
-/// optimistic head; earliest (genesis) and malformed/negative are not served
-/// verified (`Err`, surfaced as an error the router turns into -32000).
-fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
+/// An eth block selector for the block reads (`eth_getBlockByNumber`,
+/// `eth_getBlockReceipts`, `eth_feeHistory`), before the anchor resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTarget {
+    /// `latest`, `pending`, `safe`: the optimistic head (`safe` and `pending`
+    /// still mean the head — #366).
+    Head,
+    /// `finalized`: the beacon-finalized block (ABI ≥ 30, #465), resolved by
+    /// [`resolve_block_target`] — applied, not silently mapped to the head.
+    Finalized,
+    /// A block number (hex).
+    Number(u64),
+}
+
+/// Parse an eth block selector. Pure — `finalized` resolves against the anchor
+/// in [`resolve_block_target`]. Earliest (genesis) and malformed/negative are
+/// not served verified (`Err`, surfaced as an error the router turns into
+/// -32000).
+fn parse_block_target(tag: &str) -> Result<BlockTarget, &'static str> {
     match tag {
-        "latest" | "pending" | "safe" | "finalized" => Ok(None),
+        "latest" | "pending" | "safe" => Ok(BlockTarget::Head),
+        "finalized" => Ok(BlockTarget::Finalized),
         "earliest" => Err("earliest (genesis) is not served verified"),
         hex => {
             let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
@@ -2045,10 +2089,26 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
                 // Block 0 (any hex form) is genesis — reject it up front, same as the
                 // "earliest" tag, rather than letting it fail deep in the lookback cap.
                 Ok(0) => Err("earliest (genesis) is not served verified"),
-                Ok(n) => Ok(Some(n)),
+                Ok(n) => Ok(BlockTarget::Number(n)),
                 Err(_) => Err("block number out of range"),
             }
         }
+    }
+}
+
+/// Resolve a parsed selector to the reader's target: `None` = the head,
+/// `Some(n)` = a block number. `finalized` takes the anchor's finalized block
+/// (`finalized_block_number`, 0 before one has landed) and is then refused with
+/// a plain, RETRYABLE error — it clears when the beacon syncs, and `-32602`
+/// would tell a client to stop asking a node that is merely unsynced.
+fn resolve_block_target(target: BlockTarget, finalized_block_number: u64) -> Result<Option<u64>, String> {
+    match target {
+        BlockTarget::Head => Ok(None),
+        BlockTarget::Number(n) => Ok(Some(n)),
+        BlockTarget::Finalized => match finalized_block_number {
+            0 => Err("beacon not synced: no finalized execution block yet".to_string()),
+            n => Ok(Some(n)),
+        },
     }
 }
 
@@ -3014,10 +3074,17 @@ mod tests {
 
     #[test]
     fn parse_block_target_cases() {
-        assert_eq!(parse_block_target("latest"), Ok(None));
-        assert_eq!(parse_block_target("pending"), Ok(None));
-        assert_eq!(parse_block_target("finalized"), Ok(None));
-        assert_eq!(parse_block_target("0x1406f40"), Ok(Some(21_000_000)));
+        assert_eq!(parse_block_target("latest"), Ok(BlockTarget::Head));
+        assert_eq!(parse_block_target("pending"), Ok(BlockTarget::Head));
+        assert_eq!(parse_block_target("safe"), Ok(BlockTarget::Head));
+        assert_eq!(parse_block_target("finalized"), Ok(BlockTarget::Finalized));
+        assert_eq!(parse_block_target("0x1406f40"), Ok(BlockTarget::Number(21_000_000)));
+        // `finalized` resolves to the anchor's finalized block — applied — and
+        // is refused, retryably, before one has landed.
+        assert_eq!(resolve_block_target(BlockTarget::Head, 20_999_936), Ok(None));
+        assert_eq!(resolve_block_target(BlockTarget::Number(7), 20_999_936), Ok(Some(7)));
+        assert_eq!(resolve_block_target(BlockTarget::Finalized, 20_999_936), Ok(Some(20_999_936)));
+        assert!(resolve_block_target(BlockTarget::Finalized, 0).is_err());
         assert!(parse_block_target("earliest").is_err());
         // Block 0 (genesis) is rejected up front in any hex form, like "earliest".
         assert!(parse_block_target("0x0").is_err());
@@ -3813,12 +3880,25 @@ mod call_block_tests {
 
     #[test]
     fn head_tags_and_default_are_servable() {
-        for tag in ["latest", "pending", "safe", "finalized", "", "  ", "LATEST", "Pending"] {
+        for tag in ["latest", "pending", "safe", "", "  ", "LATEST", "Pending"] {
             assert_eq!(parse_call_block(tag), Ok(CallBlock::Head), "{tag:?}");
         }
         // A tag needs no head to be checked against; without one, the executor
         // fails with its own not-synced error.
         assert_eq!(check_call_block(CallBlock::Head, 0), Ok(()));
+    }
+
+    #[test]
+    fn finalized_is_its_own_anchor() {
+        // Applied, not mapped to the head (#465, #366): the call runs against
+        // the beacon-finalized block.
+        for tag in ["finalized", "FINALIZED", " finalized "] {
+            assert_eq!(parse_call_block(tag), Ok(CallBlock::Finalized), "{tag:?}");
+        }
+        // Like a head tag it needs no window check; the reader refuses it
+        // itself while there is no finalized block.
+        assert_eq!(check_call_block(CallBlock::Finalized, 0), Ok(()));
+        assert!(servable("finalized", HEAD));
     }
 
     #[test]

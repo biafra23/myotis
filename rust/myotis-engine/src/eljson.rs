@@ -8,7 +8,9 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
-use myotis_net::el::evm::{CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome};
+use myotis_net::el::evm::{
+    CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome,
+};
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
     VerifiedStorage, VerifiedTransaction,
@@ -552,12 +554,16 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// Serialize a broadcast transaction hash (`eth_sendRawTransaction`).
 /// `eth_call` result: `{"status":"ok","resultHex":"0x…"}` on success,
 /// `{"status":"revert","dataHex":"0x…"}` on a revert, or
-/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified.
+/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified
+/// — each also carrying `"blockNumber":N`, the block the call ran against, and
+/// `"verified":b`, true when that was the beacon-FINALIZED block (the
+/// `finalized` tag; the vocabulary of `ens_record_json`). ABI ≥ 30, additive:
+/// the hosts read `status` and the data keys only.
 /// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
 /// (matching the reference engine, which treats revert/unavailable as "no answer").
-pub fn call_json(outcome: &CallOutcome) -> String {
+pub fn call_json(answer: &CallAnswer) -> String {
     let mut obj = serde_json::Map::new();
-    match outcome {
+    match &answer.outcome {
         CallOutcome::Success(data) => {
             obj.insert("status".into(), "ok".into());
             obj.insert("resultHex".into(), hex0x_var(data).into());
@@ -571,6 +577,8 @@ pub fn call_json(outcome: &CallOutcome) -> String {
             obj.insert("reason".into(), reason.as_str().into());
         }
     }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    obj.insert("verified".into(), answer.finalized.into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -933,30 +941,45 @@ mod tests {
 
     #[test]
     fn call_json_shapes() {
-        // ok → status + resultHex
+        let at_head = |outcome: CallOutcome| CallAnswer { outcome, block_number: 21_000_000, finalized: false };
+        // ok → status + resultHex, plus the block the call ran against
         let ok: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Success(vec![0xde, 0xad]))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Success(vec![0xde, 0xad])))).unwrap();
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["resultHex"], "0xdead");
+        assert_eq!(ok["blockNumber"], 21_000_000);
+        assert_eq!(ok["verified"], false);
 
         // empty success data serializes as 0x
         let empty: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Success(Vec::new()))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Success(Vec::new())))).unwrap();
         assert_eq!(empty["resultHex"], "0x");
 
         // revert → status + dataHex (the raw revert payload)
         let rev: serde_json::Value =
-            serde_json::from_str(&call_json(&CallOutcome::Revert(vec![0x08, 0xc3]))).unwrap();
+            serde_json::from_str(&call_json(&at_head(CallOutcome::Revert(vec![0x08, 0xc3])))).unwrap();
         assert_eq!(rev["status"], "revert");
         assert_eq!(rev["dataHex"], "0x08c3");
+        assert_eq!(rev["blockNumber"], 21_000_000);
 
         // unavailable → status + reason (a diagnostic string; the Java side nulls it)
-        let un: serde_json::Value = serde_json::from_str(&call_json(&CallOutcome::Unavailable(
+        let un: serde_json::Value = serde_json::from_str(&call_json(&at_head(CallOutcome::Unavailable(
             "out of gas".to_string(),
-        )))
+        ))))
         .unwrap();
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "out of gas");
+        assert_eq!(un["verified"], false);
+
+        // a `finalized` call names the finalized block and says so
+        let fin = CallAnswer {
+            outcome: CallOutcome::Success(vec![0x01]),
+            block_number: 20_999_936,
+            finalized: true,
+        };
+        let fin: serde_json::Value = serde_json::from_str(&call_json(&fin)).unwrap();
+        assert_eq!(fin["blockNumber"], 20_999_936);
+        assert_eq!(fin["verified"], true);
     }
 
     #[test]

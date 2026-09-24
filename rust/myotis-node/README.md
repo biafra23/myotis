@@ -136,9 +136,14 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   passes it), and a fresh directory starts without the proven-LC-server cache
   — copying `cl-peers[-net].cache` from the old directory into the new one is
   safe (it holds peers, not trust) and shortens the cold start.
-- **`ethCallJson`'s `block`** (checked by the engine since ABI 27, #452): the
-  call always runs against the **verified head's** state. A head tag
-  (`latest`/`pending`/`safe`/`finalized`) or `''` runs. A block number
+- **`ethCallJson`'s `block`** (checked by the engine since ABI 27, #452): a
+  head tag (`latest`/`pending`/`safe`) or `''` runs against the **verified
+  head's** state. `finalized` (since ABI 30, #465) runs against the
+  **beacon-finalized block** — older and never reorged, but a state peers may
+  already have pruned, so it can fail retryably while `latest` serves (engines
+  before ABI 30 ran it against the head). Every result carries `blockNumber`
+  (the block the call ran against) and `verified` (`true` = the finalized
+  block). A block number
   (`0x`-hex, or bare decimal digits) runs only within `[head-64, head+16]` of
   the verified head (`statusJson().optimisticBlockNumber`), and even then it
   is answered from head state, not from that block (exact-block execution is
@@ -164,16 +169,19 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 29** and existing JS
+This implementation targets the current engine's **ABI 30** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
 be refused; ABI 28 added `read_stats_json` (the read-fetch shadow-cache
-counters, docs/read-stats.md — not yet wrapped here); and ABI 29 makes the
+counters, docs/read-stats.md — not yet wrapped here); ABI 29 makes the
 engine's plain-C `eth_call` refuse a NULL `to` instead of reading it as the
 empty `to` that means contract creation (this binding always passes a string,
-so nothing changes for Node callers). It is not a drop-in artifact for a host
-pinned to ABI 22.
+so nothing changes for Node callers); and ABI 30 makes `finalized` run
+against the beacon-finalized block and adds `blockNumber` / `verified` to the
+call result (the block string passes through unchanged; a host that relied on
+`finalized` answering from the head must now pass `latest`). It is not a
+drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

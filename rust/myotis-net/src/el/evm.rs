@@ -55,6 +55,30 @@ pub enum CallOutcome {
     Unavailable(String),
 }
 
+/// Which verified block an `eth_call` runs against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAnchor {
+    /// The beacon OPTIMISTIC head — the `latest` (and `pending`/`safe`) tag.
+    Head,
+    /// The beacon FINALIZED execution block — the `finalized` tag: older and
+    /// never reorged, but a state peers may already have pruned, so it can be
+    /// unservable while the head serves. Never downgraded to the head: the
+    /// caller asked for finality (CLAUDE.md §Trust — applied or refused).
+    Finalized,
+}
+
+/// A call's outcome plus the block it actually ran against (#382, #465): a
+/// host that asked for `finalized` can see which block answered, and one that
+/// asked for `latest` learns the head it got.
+#[derive(Debug, Clone)]
+pub struct CallAnswer {
+    pub outcome: CallOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block (the `verified` of
+    /// `ens_record_json`).
+    pub finalized: bool,
+}
+
 /// The outcome of an `estimateGas`. A REVERT is a verified chain answer (the
 /// transaction being estimated cannot succeed) and carries its raw payload so
 /// the host can serve the standard JSON-RPC code-3 `execution reverted` error;
