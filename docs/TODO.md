@@ -63,3 +63,90 @@ Asked of the author in review; tracked here in case they don't land there.
 - [x] **Misleading Java-side error message.** Landed with #262:
   `RustMyotisEngine.java` now throws "could not initialize the runtime or
   create the dataDir for <network>".
+
+## From PRs #480, #481, #482 — issue #465 (verified reads fail after SYNCED)
+
+Open questions and deferrals collected from the three PRs' "Decisions for the
+owner" sections and their review threads, 2026-09-24. The decisions the owner
+took while the work was in flight are listed at the end so this section is
+complete on its own.
+
+### Still open
+
+- [x] **`snapServingPeers` on the wallet-facing status surfaces.** Done
+  (owner's decision 2026-09-24): the JSON-RPC `myotis_status`, the iOS
+  `IosRpcStatusSource` and the daemon IPC `status` now carry it right after
+  `snapPeers`, and the wake-up guidance in `readiness-and-verified-head-age.md`
+  / `disk-and-network-usage.md` gates on it. A key addition, no ABI bump.
+- [x] **`finalized` on the state reads — Rust engine** (owner's decision
+  2026-09-24: Rust now, Java stays on #366). ABI 32: `request_account_json`,
+  `get_code_json` and `get_storage_at_json` take the RPC block selector and
+  apply or refuse it as `eth_call` has since #452; `finalized` verifies the
+  snap proof against the beacon-finalized state root with no fallback (a peer
+  that pruned it fails the attempt; a whole-pool miss is retryable); the
+  results carry `anchor`. The JVM adapter, the Node addon and the iOS wrapper
+  pass the selector through; the `io.myotis.api` state reads still have no
+  block parameter.
+  - [ ] **Java engine**: `VerifiedRpcBackend` still maps `finalized` to the
+    head for the state reads, `eth_call` and the block reads — #366 item 5.
+- [x] **`Behind` peers in a race another peer won** — dropped consciously
+  (owner's decision 2026-09-24): the ladder ranks a `Behind` peer last, the
+  maintainer evicts it within a tick, and a strike nobody witnessed never
+  persists, so the residual cost is one live strike on a peer that is about
+  to leave anyway. The tip-lag arm keeps excusing them; the `RaceOutcome`
+  restructure is not worth its risk.
+- [ ] **Live cold-start checks.** (Owner's decision 2026-09-24: run now on
+  the dev Mac; results to be recorded here.) None of the automated checks
+  dial a cold peer cache. On mainnet with the Rust engine and
+  `peers.cache` moved aside: `snapServingPeers` stays 0 until a peer proves
+  the head and reads succeed within a hedge delay of it turning positive; an
+  `eth_call` at `finalized` answers (`blockNumber` = the finalized block,
+  `verified: true`) while `latest` still fails on a pool that lacks the head;
+  a known-serving enode pushed through the Node addon's `setBootEnodes` on a
+  fresh data dir connects first, and a malformed entry refuses the whole
+  push. Steps in the PR bodies of #481 and #482.
+- [ ] **A seed-pin surface for the JVM hosts** (`io.myotis.api` / UniFFI).
+  `myotis_set_boot_enodes` exists on the C ABI, the Node addon and the iOS
+  wrapper only; no JVM host has asked.
+- [ ] **Smoke-gate classification.** `smoke-gate.mjs` files a full but
+  non-serving pool (`snapPeers >= 2`, `snapServingPeers == 0`) under peer
+  starvation — an environment result, like the other peer conditions. An
+  engine-side regression in the head probe would produce the same
+  annotation; the job still fails, only the label differs.
+- [ ] **Parity entries for #342.** Rust-only behaviour introduced by the
+  three PRs, to be listed there as differs-fixed or differs-accepted:
+  admission by announced head and lag eviction (the Java `EthHandler`
+  decodes `BlockRangeUpdate` but does not route by it); the witness rule for
+  persisted `snapbad` verdicts; `finalized` honoured on `eth_call` and the
+  block reads; pins served up to 511 blocks below FINALITY (Java measures
+  its lookback from the head, so pins in `[fin − 511, head − 512)` serve on
+  the Rust engine only); `snapServingPeers` as a real count (Java has no
+  serving count); host seed pins.
+- [ ] **`verified` in the call envelope** means "ran against the finalized
+  block", not "unverified data" — it follows `ens_record_json`'s vocabulary.
+  If the key ever graduates into `io.myotis.api.CallResult`, land it as an
+  anchor enum (head / finalized), not a boolean named `verified`.
+
+### Accepted as tuning, revisit on live data
+
+- `HEAD_LAG_TOLERANCE = 32` blocks (judged at the moment the peer spoke),
+  `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (not cleared by the
+  hunt's backoff bypass), `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
+- A warm resume's first read can cost up to one maintainer tick (~10 s) on
+  an eth/68-only pool, since proving a peer now needs a probe round-trip;
+  eth/69 peers prove at the handshake.
+- A dead pin costs one SYN per backoff window while the pool is below target
+  or, once the anchor has a head, nobody serves at it.
+
+### Decided while the work was in flight (for the record)
+
+- `safe` and `pending` resolve to the optimistic head (2026-09-23): the
+  light client has no justified anchor to apply, and substituting the
+  finalized block for `safe` would answer a third question.
+- No shipped mainnet seed list; hosts supply pins through the ABI.
+- No head-minus-k fallback for `latest`; the tip-lag retry constants stay.
+- Nothing persists a `snapbad` verdict without a witness; a probe hit
+  persists `Confirmed`.
+- On an address the network also pins, the host's key wins; DNS names and
+  unspecified addresses are refused, not resolved or dropped.
+- A missing `snapServingPeers` key reads as 0 on the JVM and iOS hosts.

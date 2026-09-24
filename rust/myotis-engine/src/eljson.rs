@@ -94,7 +94,19 @@ pub fn account_json(
     obj.insert("wallClockPeriod".into(), json_u64(wall_clock_period));
     obj.insert("finalizedBlockNumber".into(), json_u64(a.finalized_block_number));
     obj.insert("optimisticBlockNumber".into(), json_u64(a.optimistic_block_number));
+    obj.insert("anchor".into(), anchor_name(a.finalized).into());
     serde_json::Value::Object(obj).to_string()
+}
+
+/// The block a state read proved against (ABI ≥ 32, #465): `"finalized"` for
+/// the `finalized` tag, else `"head"`. Additive on every state-read shape; the
+/// hosts read `verifyMethod` and the data keys only.
+fn anchor_name(finalized: bool) -> &'static str {
+    if finalized {
+        "finalized"
+    } else {
+        "head"
+    }
 }
 
 /// Serialize a verified storage result to the `StorageProofResult` shape.
@@ -136,6 +148,7 @@ pub fn storage_json(
     obj.insert("finalizedSlot".into(), json_u64(finalized_slot));
     obj.insert("optimisticSlot".into(), json_u64(optimistic_slot));
     obj.insert("maxHeaderChainGap".into(), json_i64(MAX_HEADER_CHAIN_GAP));
+    obj.insert("anchor".into(), anchor_name(s.finalized).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -164,6 +177,7 @@ pub fn code_json(
     obj.insert("wallClockPeriod".into(), json_u64(wall_clock_period));
     obj.insert("finalizedBlockNumber".into(), json_u64(c.finalized_block_number));
     obj.insert("optimisticBlockNumber".into(), json_u64(c.optimistic_block_number));
+    obj.insert("anchor".into(), anchor_name(c.finalized).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -825,6 +839,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         }
     }
 
@@ -853,6 +868,12 @@ mod tests {
         assert_eq!(v["wallClockPeriod"], 1795);
         assert_eq!(v["finalizedBlockNumber"], 20_999_000);
         assert_eq!(v["optimisticBlockNumber"], 21_000_010);
+        // ABI >= 32: the block the proof was anchored at, "head" or "finalized".
+        assert_eq!(v["anchor"], "head");
+        let fin = VerifiedAccount { finalized: true, ..sample_account() };
+        let json = account_json("0xabc", &fin, 1777, 1795);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["anchor"], "finalized");
     }
 
     #[test]
@@ -908,6 +929,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&storage_json("0xC0", None, &s, 14_560_000, 14_560_032)).unwrap();
@@ -1133,6 +1155,7 @@ mod tests {
             beacon_synced: true,
             finalized_block_number: 20_999_000,
             optimistic_block_number: 21_000_010,
+            finalized: false,
         }
     }
 

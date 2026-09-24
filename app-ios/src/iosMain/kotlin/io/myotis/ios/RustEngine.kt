@@ -188,9 +188,12 @@ object RustEngine {
     }
 
     /** AccountProofResult JSON, or `{"error": ...}`. */
-    fun requestAccountJson(handle: Long, address: String): String {
+    /** Verified account read. `block` (ABI >= 32) is the RPC selector the engine
+     *  checks: empty or a head tag reads the verified head, `finalized` the
+     *  beacon-finalized block, a number only near the head. */
+    fun requestAccountJson(handle: Long, address: String, block: String = ""): String {
         requireAbi()
-        return take(myotis_request_account_json(handle, address))
+        return take(myotis_request_account_json(handle, address, block))
             ?: """{"error":"engine returned no result"}"""
     }
 
@@ -206,11 +209,11 @@ object RustEngine {
     // not-running, status-tagged objects for call/estimate, tri-state block/tx
     // JSON (object | the literal "null" | {"error"}).
 
-    fun getCodeJson(handle: Long, address: String): String =
-        jsonCall { myotis_get_code_json(handle, address) }
+    fun getCodeJson(handle: Long, address: String, block: String = ""): String =
+        jsonCall { myotis_get_code_json(handle, address, block) }
 
-    fun getStorageAtJson(handle: Long, address: String, position32Hex: String): String =
-        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex) }
+    fun getStorageAtJson(handle: Long, address: String, position32Hex: String, block: String = ""): String =
+        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex, block) }
 
     fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
         jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }

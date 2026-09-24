@@ -173,17 +173,16 @@ should treat it as retryable.
 
 An out-of-process wallet that idle-pauses the node with `myotis_pause` should
 call `myotis_wakeup` and then poll these two status methods back through the
-readiness gate (`myotis_status.state == "RUNNING"` with `snapPeers > 0`, and
-`myotis_beaconStatus.state == "SYNCED"`) **before** its first `eth_*` read —
+readiness gate (`myotis_status.state == "RUNNING"` with `snapServingPeers > 0`,
+and `myotis_beaconStatus.state == "SYNCED"`) **before** its first `eth_*` read —
 `myotis_wakeup` returns when the rebuild *starts*, not when the node is ready
-again (see disk-and-network-usage.md §4.1). On the Rust engine that gate is
-necessary, not sufficient: `myotis_status` carries `snapPeers` but not
-`snapServingPeers`, so right after SYNCED a cold pool of still-syncing peers
-passes it while reads still fail (#465). The in-process hosts hold such a read
-only around a start or resume warm-up, and for at most 90 s
+again (see disk-and-network-usage.md §4.1). Gate on `snapServingPeers`, not on
+`snapPeers`: right after SYNCED a cold pool of still-syncing peers keeps
+`snapPeers` positive for hours while every read fails (#465). Even so a read
+can still come back as the retryable `-32000` — the in-process hosts hold such
+a read only around a start or resume warm-up, and for at most 90 s
 (`WAKE_WAIT_CAP_MS`); on a stack that has been running, the read proceeds at
-once and fails in-band (#312). Over JSON-RPC it is the same retryable
-`-32000` either way — keep polling and retry.
+once and fails in-band (#312) — so keep polling and retry.
 
 ## Block tags
 
@@ -194,8 +193,12 @@ tag is **applied** since engine ABI 30 (#465): `eth_call`, `eth_getBlockByNumber
 `eth_getBlockReceipts` and `eth_feeHistory` run against, or serve, the
 beacon-finalized block, whose header window needs no path to the optimistic
 head — so a finalized read can succeed while a `latest` read still fails on a
-pool that lacks the head. The state reads (`eth_getBalance` and friends) and the
-Java engine still resolve `finalized` to the head (#366).
+pool that lacks the head. Since ABI 32 the state reads (`eth_getBalance`,
+`eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`) apply it too on
+the Rust engine: the snap proof is verified against the finalized state root,
+and a peer that has pruned that state fails the attempt rather than answer
+from another block. The Java engine still resolves `finalized` to the head
+(#366).
 
 ## Code pointers
 

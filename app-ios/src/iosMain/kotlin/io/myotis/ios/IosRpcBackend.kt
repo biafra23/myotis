@@ -52,7 +52,7 @@ class IosRpcBackend(
 
     override fun getBalance(address: ByteArray, block: String): String? {
         if (!isServableBlock(block)) return null
-        val r = queryAccount(address) ?: return null
+        val r = queryAccount(address, block) ?: return null
         if (!r.verified) return null
         // Verified-absent account → balance "0": the proof of exclusion IS the
         // verified answer (same convention as RustVerifiedReads).
@@ -61,7 +61,7 @@ class IosRpcBackend(
 
     override fun getTransactionCount(address: ByteArray, block: String): Long? {
         if (!isServableBlock(block)) return null
-        val r = queryAccount(address) ?: return null
+        val r = queryAccount(address, block) ?: return null
         if (!r.verified) return null
         val mined = if (r.exists) r.nonce else 0L
         // ONLY the pending tag consults the sent-tx overlay (RustVerifiedReads
@@ -78,7 +78,7 @@ class IosRpcBackend(
         if (!isServableBlock(block)) return null
         if (address.size != 20) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.getCodeJson(handle, hex(address))) ?: return null
+        val o = resultOrNull(RustEngine.getCodeJson(handle, hex(address), block)) ?: return null
         if (o.engineString("verifyMethod") == null) return null // unverified → can't answer
         return hexToBytes(o.engineString("codeHex")) // 0x / empty → empty bytecode (verified EOA)
     }
@@ -87,7 +87,7 @@ class IosRpcBackend(
         if (!isServableBlock(block)) return null
         if (address.size != 20 || slot32.size != 32) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32))) ?: return null
+        val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32), block)) ?: return null
         if (o.engineString("verifyMethod") == null) return null
         // Left-pad to the full 32-byte word (a zero/unset slot → 32 zero bytes).
         // A value WIDER than a word is engine shape drift — fail closed rather
@@ -307,10 +307,10 @@ class IosRpcBackend(
 
     private class Account(val exists: Boolean, val nonce: Long, val balanceWei: String?, val verified: Boolean)
 
-    private fun queryAccount(address: ByteArray): Account? {
+    private fun queryAccount(address: ByteArray, block: String): Account? {
         if (address.size != 20) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.requestAccountJson(handle, hex(address))) ?: return null
+        val o = resultOrNull(RustEngine.requestAccountJson(handle, hex(address), block)) ?: return null
         return Account(
             exists = o.engineBoolean("exists"),
             nonce = o.engineLong("nonce", -1L),

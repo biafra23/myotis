@@ -167,6 +167,9 @@ public class CommandHandler {
                 + ",\"connectedPeers\":" + s.connectedPeers()
                 + ",\"readyPeers\":" + s.readyPeers()
                 + ",\"snapPeers\":" + s.snapPeers()
+                // The snap peers that can answer a verified read at the anchored head
+                // now (#465) — the readiness signal; snapPeers alone is not one.
+                + ",\"snapServingPeers\":" + s.snapServingPeers()
                 + ",\"backedOffPeers\":" + s.backedOffPeers()
                 + ",\"blacklistedPeers\":" + s.blacklistedPeers()
                 + ",\"peerHeaderRequests\":" + s.peerHeaderRequests()

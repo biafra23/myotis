@@ -270,12 +270,25 @@ pub fn accept_stale_anchor(env: &Env, handle: i64) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Verified account read (balance/nonce/code hash + Merkle proof + beacon
-/// verification fields). Resolves to the AccountProofResult JSON.
+/// verification fields). Resolves to the AccountProofResult JSON. `block`
+/// (ABI >= 32, optional) is the RPC block selector the engine applies or
+/// refuses: omitted or a head tag proves at the verified head, `finalized` at
+/// the beacon-finalized block, a number only inside [head-64, head+16]
+/// (`{"error","code":-32602}` otherwise); the result names the block it
+/// proved at (`anchor`).
 #[napi(ts_return_type = "Promise<string>")]
-pub fn request_account_json<'env>(env: &'env Env, handle: i64, address: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&address) {
-        Ok(a) => take(unsafe { myotis_request_account_json(handle, a.as_ptr()) }),
-        Err(e) => e,
+pub fn request_account_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    address: String,
+    block: Option<String>,
+) -> Result<Object<'env>> {
+    let block = block.unwrap_or_default();
+    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&block)) {
+        (Ok(a), Ok(b)) => {
+            take(unsafe { myotis_request_account_json(handle, a.as_ptr(), b.as_ptr()) })
+        }
+        _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
     })
 }
 

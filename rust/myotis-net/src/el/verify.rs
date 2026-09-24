@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 impl Verdict {
-    fn verified(method: &'static str, slot: i64, bls: bool) -> Verdict {
+    pub(crate) fn verified(method: &'static str, slot: i64, bls: bool) -> Verdict {
         Verdict {
             beacon_chain_verified: true,
             bls_verified: bls,

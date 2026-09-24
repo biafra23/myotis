@@ -9,7 +9,7 @@
 //! `block_on` inside a runtime worker.
 //!
 //! Every fetch pins to the executor-supplied `state_root` (the call's anchor:
-//! the verified head's, or the beacon-finalized block's for [`CallAnchor::Finalized`]),
+//! the verified head's, or the beacon-finalized block's for [`ReadAnchor::Finalized`]),
 //! so all reads in one call see a single consistent block. Verification is
 //! verify-on-fetch: `snap_get_account`/`snap_get_storage` MPT-verify against that
 //! root and `snap_get_bytecode` checks `keccak(code) == code_hash`, so a peer can
@@ -57,9 +57,11 @@ pub enum CallOutcome {
     Unavailable(String),
 }
 
-/// Which verified block an `eth_call` runs against.
+/// Which verified block a read is anchored at: the block an `eth_call` runs
+/// against, or the state root an account / storage / code proof is verified
+/// against (ABI ≥ 32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallAnchor {
+pub enum ReadAnchor {
     /// The beacon OPTIMISTIC head — the `latest` (and `pending`/`safe`) tag.
     Head,
     /// The beacon FINALIZED execution block — the `finalized` tag: older and
@@ -69,13 +71,13 @@ pub enum CallAnchor {
     Finalized,
 }
 
-impl CallAnchor {
+impl ReadAnchor {
     /// The anchor for a `finalized: bool` selector (the ENS entry points').
-    pub fn for_finalized(finalized: bool) -> CallAnchor {
+    pub fn for_finalized(finalized: bool) -> ReadAnchor {
         if finalized {
-            CallAnchor::Finalized
+            ReadAnchor::Finalized
         } else {
-            CallAnchor::Head
+            ReadAnchor::Head
         }
     }
 }

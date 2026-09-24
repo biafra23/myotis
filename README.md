@@ -306,6 +306,7 @@ Returns daemon operational metrics.
 | `connectedPeers` | int | Total active TCP (RLPx) connections |
 | `readyPeers` | long | Peers that completed the eth handshake |
 | `snapPeers` | long | Ready peers that also support snap/1 |
+| `snapServingPeers` | long | Snap peers that can answer a verified read at the anchored head right now — gate reads on this, not on `snapPeers` (#465) |
 | `backedOffPeers` | long | Peers in temporary exponential backoff |
 | `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 

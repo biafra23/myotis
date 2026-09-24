@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use myotis_net::el::evm::{CallAnchor, EnsQuery, EnsRootMode};
+use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
 use myotis_net::el::pool::Enode;
 use myotis_net::el::reader::{parse_enode, ElReader};
 use myotis_net::el::readstats::ReadStats;
@@ -1195,11 +1195,39 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     }
 }
 
+/// Parse a state read's RPC block selector (ABI ≥ 32, #465, #366) — BEFORE the
+/// handle lookup, as `eth_call` does: a selector no retry can serve (`earliest`,
+/// a block hash, garbage) is refused as invalid params, the request's own
+/// fault, whatever state the handle is in. `Err` is the JSON to return.
+fn parse_state_read_block(block: &str) -> Result<BlockSelector, String> {
+    parse_call_block(block).map_err(|msg| eljson::invalid_params_json(&msg))
+}
+
+/// The anchor a parsed state-read selector proves against: a head tag → the
+/// verified head; `finalized` → the beacon-finalized block; a number → the
+/// head, but only inside the window around it ([`check_call_block`], the same
+/// rule as `eth_call` since #452 — head state is the near-head trade-off,
+/// exact historical state is not held), else refused as JSON rather than
+/// answered from the head. The reader itself refuses `finalized` while no
+/// finalized block has landed.
+fn state_read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadAnchor, String> {
+    check_call_block(selector, reader.optimistic_block_number()).map_err(|r| r.to_json())?;
+    Ok(match selector {
+        BlockSelector::Finalized => ReadAnchor::Finalized,
+        BlockSelector::Head | BlockSelector::Number(_) => ReadAnchor::Head,
+    })
+}
+
 /// Verified account query as JSON (`AccountProofResult` shape / an
-/// `{"error": ...}` object) — `nativeRequestAccountJson`.
-pub fn request_account_json(handle: i64, address_hex: &str) -> String {
+/// `{"error": ...}` object) — `nativeRequestAccountJson`. `block` is the RPC
+/// block selector, applied or refused ([`state_read_anchor`]).
+pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_state_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1211,7 +1239,11 @@ pub fn request_account_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_account(address).await })) {
+    let anchor = match state_read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_account(anchor, address).await })) {
         Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -1260,10 +1292,15 @@ pub fn get_storage_proof_json(
 
 /// `nativeGetCodeJson`: run a verified contract-code query (`eth_getCode`) for a
 /// running handle, returning the code result JSON, or `{"error": "..."}` for a
-/// transport / not-running / bad-input failure.
-pub fn get_code_json(handle: i64, address_hex: &str) -> String {
+/// transport / not-running / bad-input failure. `block` is the RPC block
+/// selector, applied or refused ([`state_read_anchor`]).
+pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_state_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1272,7 +1309,11 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_code(address).await })) {
+    let anchor = match state_read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_code(anchor, address).await })) {
         Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -1281,13 +1322,23 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
 /// `nativeGetStorageAtJson`: run a verified RAW-32-byte-position storage query
 /// (`eth_getStorageAt`) for a running handle. `position_hex` is the 32-byte
 /// storage position (0x-hex); the trie key is that position itself — no ERC-20
-/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`.
-pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -> String {
+/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`. `block` is the
+/// RPC block selector, applied or refused ([`state_read_anchor`]).
+pub fn get_storage_at_json(
+    handle: i64,
+    address_hex: &str,
+    position_hex: &str,
+    block: &str,
+) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
     };
     let Some(position) = parse_word32(position_hex) else {
         return eljson::error_json("invalid storage position (expected 32-byte hex)");
+    };
+    let selector = match parse_state_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -1296,7 +1347,14 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.get_storage_at(address, position).await })) {
+    let anchor = match state_read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine
+        .rt
+        .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
+    {
         Ok(storage) => {
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
@@ -1402,8 +1460,8 @@ pub fn eth_call_overrides_json(
     // number inside the window runs against the head (the near-head trade-off
     // documented on check_call_block).
     let anchor = match call_block {
-        BlockSelector::Finalized => CallAnchor::Finalized,
-        BlockSelector::Head | BlockSelector::Number(_) => CallAnchor::Head,
+        BlockSelector::Finalized => ReadAnchor::Finalized,
+        BlockSelector::Head | BlockSelector::Number(_) => ReadAnchor::Head,
     };
     match engine
         .rt
@@ -1488,8 +1546,8 @@ fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
         return Ok(BlockSelector::Finalized);
     }
     if is_tag("earliest") {
-        return Err("earliest (genesis) is not served: eth_call runs against the verified \
-                    head's state"
+        return Err("earliest (genesis) is not served: verified reads run against the \
+                    head's state, or the finalized block's"
             .to_string());
     }
     let (digits, radix) = match b.strip_prefix("0x").or_else(|| b.strip_prefix("0X")) {
@@ -1504,7 +1562,7 @@ fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
         return Ok(BlockSelector::Number(n));
     }
     if well_formed && radix == 16 && digits.len() == 64 {
-        return Err("eth_call by block hash is not supported: pass a block number or a head tag"
+        return Err("a block hash is not supported as the selector: pass a block number or a tag"
             .to_string());
     }
     let shown: String = b.chars().take(66).collect();
@@ -1537,8 +1595,8 @@ impl CallBlockRefusal {
         match *self {
             Self::Behind { block, head } => eljson::invalid_params_json(&format!(
                 "block {block:#x} ({block}) is more than {CALL_BLOCK_LAG_TOLERANCE} blocks \
-                 behind the verified head ({head}); eth_call runs against head state, so this \
-                 node cannot answer for that block"
+                 behind the verified head ({head}); verified reads run against head state, so \
+                 this node cannot answer for that block"
             )),
             Self::Ahead { block, head } => eljson::error_json(&format!(
                 "block {block:#x} ({block}) is more than {CALL_BLOCK_AHEAD_TOLERANCE} blocks \
@@ -3136,6 +3194,36 @@ mod tests {
     }
 
     #[test]
+    fn state_reads_apply_or_refuse_their_block_selector() {
+        // The three state reads take the RPC block selector since ABI 32 and
+        // judge it BEFORE the handle lookup would fail: a selector no retry can
+        // serve is permanent (-32602), a servable one reaches the engine (and
+        // fails here only on the unknown handle).
+        let addr = format!("0x{}", "ab".repeat(20));
+        let pos = format!("0x{}", "00".repeat(32));
+        let read = |block: &str| -> Vec<serde_json::Value> {
+            [
+                request_account_json(i64::MIN, &addr, block),
+                get_code_json(i64::MIN, &addr, block),
+                get_storage_at_json(i64::MIN, &addr, &pos, block),
+            ]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect()
+        };
+        for servable in ["", "latest", "pending", "safe", "finalized", "0x10"] {
+            for v in read(servable) {
+                assert_eq!(v["error"], "unknown handle", "{servable}: {v}");
+            }
+        }
+        for refused in ["earliest", "0xzz", &format!("0x{}", "ab".repeat(32))] {
+            for v in read(refused) {
+                assert_eq!(v["code"], -32602, "{refused}: {v}");
+            }
+        }
+    }
+
+    #[test]
     fn boot_enodes_json_is_applied_or_refused_as_a_whole() {
         let key = "ab".repeat(64);
         let pin = |host: &str| format!("enode://{key}@{host}");
@@ -3330,13 +3418,13 @@ mod tests {
     fn account_query_rejects_bad_address_and_unknown_handle() {
         // Bad address → error before any handle lookup.
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(1, "0xnothex")).unwrap();
+            serde_json::from_str(&request_account_json(1, "0xnothex", "")).unwrap();
         assert!(v["error"].as_str().unwrap().contains("invalid address"));
 
         // Valid address, unknown handle → "unknown handle" error.
         let addr = format!("0x{}", "ab".repeat(20));
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(i64::MIN, &addr)).unwrap();
+            serde_json::from_str(&request_account_json(i64::MIN, &addr, "")).unwrap();
         assert_eq!(v["error"], "unknown handle");
     }
 

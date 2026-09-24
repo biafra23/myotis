@@ -47,6 +47,8 @@ JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, snap
 // Verified reads run on bounded Myotis workers, with a 90 s operation budget
 // including queue wait. Cancellation drains native work before completion:
 const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
+// ...or at the beacon-finalized block (ABI >= 32; a number near the head also works):
+const fin = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045', 'finalized'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 const ch = JSON.parse(await myotis.ensRecordJson(h, JSON.stringify({
   method: 'contenthash', name: 'vitalik.eth',
@@ -196,7 +198,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 31** and existing JS
+This implementation targets the current engine's **ABI 32** and existing JS
 argument/result shapes. No signature has changed since ABI 25: ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
@@ -209,7 +211,10 @@ against the beacon-finalized block and adds `blockNumber` / `verified` to the
 call result (the block string passes through unchanged; a host that relied on
 `finalized` answering from the head must now pass `latest`); ABI 31 adds
 `setBootEnodes` and the `snapServingPeers` status key (a key addition — older
-readers ignore it). It is not a drop-in artifact for a host pinned to ABI 22.
+readers ignore it); ABI 32 gives `requestAccountJson` an optional `block`
+selector (`finalized` proves at the beacon-finalized block; a number only near
+the head; the result carries `anchor`). It is not a drop-in artifact for a host
+pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

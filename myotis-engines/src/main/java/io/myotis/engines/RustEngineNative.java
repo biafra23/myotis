@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 31; // 31: myotis_set_boot_enodes (C ABI + Node); snapServingPeers in the status JSON
+    static final int EXPECTED_ABI_VERSION = 32; // 32: the state reads take a block selector (`finalized` applied)
 
     private static final boolean AVAILABLE = load();
 
@@ -243,8 +243,11 @@ final class RustEngineNative {
     // ---- EL verified-read surface. See RustChainHandle for the JSON contracts. ----
 
     /** Verified account query as JSON (AccountProofResult shape / {@code error} object). */
-    static String nativeRequestAccountJson(long handle, String address) {
-        return Myotis_engineKt.requestAccountJson(handle, nz(address));
+    /** {@code block} is the RPC block selector the engine checks (ABI >= 32): a head
+     *  tag or empty reads the verified head, {@code finalized} the beacon-finalized
+     *  block, a number only inside the window around the head. */
+    static String nativeRequestAccountJson(long handle, String address, String block) {
+        return Myotis_engineKt.requestAccountJson(handle, nz(address), nz(block));
     }
 
     /** Verified storage-slot query as JSON; non-null {@code holderOrNull} selects the
@@ -257,13 +260,13 @@ final class RustEngineNative {
     }
 
     /** Verified contract-code query (`eth_getCode`) as JSON. */
-    static String nativeGetCodeJson(long handle, String address) {
-        return Myotis_engineKt.getCodeJson(handle, nz(address));
+    static String nativeGetCodeJson(long handle, String address, String block) {
+        return Myotis_engineKt.getCodeJson(handle, nz(address), nz(block));
     }
 
     /** Verified RAW-32-byte-position storage query (`eth_getStorageAt`) as JSON. */
-    static String nativeGetStorageAtJson(long handle, String address, String position) {
-        return Myotis_engineKt.getStorageAtJson(handle, nz(address), nz(position));
+    static String nativeGetStorageAtJson(long handle, String address, String position, String block) {
+        return Myotis_engineKt.getStorageAtJson(handle, nz(address), nz(position), nz(block));
     }
 
     /** Verified {@code eth_call} over the revm executor, as JSON. */

@@ -106,7 +106,8 @@ class MyotisStatusRpcTest {
     @Test fun statusJson_mirrorsIpcStatusShape() {
         assertEquals(
             """{"ok":true,"state":"RUNNING","uptimeSeconds":42,"discoveredPeers":5,""" +
-                """"connectedPeers":4,"readyPeers":3,"snapPeers":2,"backedOffPeers":1,""" +
+                """"connectedPeers":4,"readyPeers":3,"snapPeers":2,"snapServingPeers":2,""" +
+                """"backedOffPeers":1,""" +
                 """"blacklistedPeers":0,"pauseCount":7,"totalPausedMs":1000,""" +
                 """"lastPauseEpochMs":111,"lastResumeEpochMs":222,"lastWakeReason":"REQUEST"}""",
             encode(StatusJson.status(statusSnapshot(), 42L)),

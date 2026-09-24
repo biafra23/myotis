@@ -120,7 +120,19 @@ uniffi::setup_scaffolding!();
 ///      what the hosts' readiness gates use in place of `snapPeers`, which a
 ///      pool of still-syncing peers satisfies for hours while every read
 ///      fails. A key addition; older wrappers ignore it.
-pub const ABI_VERSION: i32 = 31;
+/// v32: request_account_json / get_code_json / get_storage_at_json (UniFFI and
+///      the C ABI) take the RPC block selector and APPLY OR REFUSE it, as
+///      eth_call has since v27 (#465, #366): `finalized` proves the snap proof
+///      at the beacon-finalized state root (no fallback to any other root —
+///      refused, retryably, while no finalized block has landed or no peer
+///      still serves it), a number is served from head state only inside the
+///      window around the head, anything else is -32602. The three result
+///      shapes gained `anchor` ("head" | "finalized"). A signature change on
+///      three functions; the JVM `RustEngineNative` wrappers, the Node addon
+///      and the iOS wrapper moved with it. The `io.myotis.api` state reads
+///      still have no block parameter, and the Java engine still maps
+///      `finalized` to the head (#366).
+pub const ABI_VERSION: i32 = 32;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
