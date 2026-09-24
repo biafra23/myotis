@@ -205,17 +205,22 @@ pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
 }
 
 /// Verified account read (`nativeRequestAccountJson` twin). Blocking — may take
-/// up to ~90 s for a header-chain walk; never call from the UI thread.
+/// up to ~90 s for a header-chain walk; never call from the UI thread. `block`
+/// (ABI ≥ 32) is the RPC block selector the engine applies or refuses: NULL or
+/// empty proves at the verified head, `finalized` at the beacon-finalized
+/// block, a number only inside the window around the head.
 ///
 /// # Safety
-/// `address` must be null or a valid null-terminated C string.
+/// `address` and `block` must each be null or a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_request_account_json(
     handle: i64,
     address: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
-    into_c(crate::host::request_account_json(handle, &address))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::request_account_json(handle, &address, &block))
 }
 
 /// Verified storage proof (`nativeGetStorageProofJson` twin). A null `holder`
@@ -240,33 +245,40 @@ pub unsafe extern "C" fn myotis_get_storage_proof_json(
     ))
 }
 
-/// Verified `eth_getCode` (`nativeGetCodeJson` twin).
+/// Verified `eth_getCode` (`nativeGetCodeJson` twin); `block` as in
+/// `myotis_request_account_json` (ABI ≥ 32).
 ///
 /// # Safety
-/// `address` must be null or a valid null-terminated C string.
+/// `address` and `block` must each be null or a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_get_code_json(
     handle: i64,
     address: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
-    into_c(crate::host::get_code_json(handle, &address))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::get_code_json(handle, &address, &block))
 }
 
 /// Verified `eth_getStorageAt` with a RAW 32-byte position
-/// (`nativeGetStorageAtJson` twin).
+/// (`nativeGetStorageAtJson` twin); `block` as in `myotis_request_account_json`
+/// (ABI ≥ 32).
 ///
 /// # Safety
-/// `address` and `position` must each be null or valid null-terminated C strings.
+/// `address`, `position` and `block` must each be null or valid null-terminated
+/// C strings.
 #[no_mangle]
 pub unsafe extern "C" fn myotis_get_storage_at_json(
     handle: i64,
     address: *const c_char,
     position: *const c_char,
+    block: *const c_char,
 ) -> *mut c_char {
     let address = read_string(address).unwrap_or_default();
     let position = read_string(position).unwrap_or_default();
-    into_c(crate::host::get_storage_at_json(handle, &address, &position))
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::get_storage_at_json(handle, &address, &position, &block))
 }
 
 /// Verified `eth_call` over the revm executor (`nativeEthCallJson` twin).
@@ -691,6 +703,32 @@ mod tests {
         let bad = [0x5b_u8, 0x22, 0xff, 0x22, 0x5d, 0];
         assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr().cast()) });
         myotis_stop(handle);
+    }
+
+    /// How the state reads' `block` crosses the C ABI (ABI 32): NULL is the
+    /// head; `finalized` is its own anchor; a selector no retry can serve is
+    /// refused as invalid params, never read as the head.
+    #[test]
+    fn state_reads_check_their_block_across_the_c_abi() {
+        let addr = CString::new(format!("0x{}", "ab".repeat(20))).unwrap();
+        let pos = CString::new(format!("0x{}", "00".repeat(32))).unwrap();
+        let account = |block: *const c_char| -> serde_json::Value {
+            let out = unsafe { take(myotis_request_account_json(i64::MIN, addr.as_ptr(), block)) };
+            serde_json::from_str(&out).unwrap()
+        };
+        assert_eq!(account(std::ptr::null())["error"], "unknown handle");
+        assert_eq!(account(c"finalized".as_ptr())["error"], "unknown handle");
+        assert_eq!(account(c"earliest".as_ptr())["code"], -32602);
+        let parse = |out: String| -> serde_json::Value { serde_json::from_str(&out).unwrap() };
+        let code = parse(unsafe {
+            take(myotis_get_code_json(i64::MIN, addr.as_ptr(), c"earliest".as_ptr()))
+        });
+        assert_eq!(code["code"], -32602);
+        let null = std::ptr::null();
+        let storage = parse(unsafe {
+            take(myotis_get_storage_at_json(i64::MIN, addr.as_ptr(), pos.as_ptr(), null))
+        });
+        assert_eq!(storage["error"], "unknown handle");
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent

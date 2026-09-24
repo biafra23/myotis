@@ -7,9 +7,11 @@
 //! trust bridge). A query:
 //!
 //! 1. picks a live snap peer from the pool,
-//! 2. fetches the peer's FRESH head header → its state root + block number (peers
-//!    prune state beyond ~128 blocks, so a beacon-finalized root is usually too
-//!    stale to serve),
+//! 2. picks the state root: the beacon anchor's optimistic root (a head read),
+//!    or the finalized root (a `finalized` read, ABI ≥ 32 — servable while
+//!    the peer's state window, ~128 blocks on geth, still holds it: finality
+//!    trails the head by two epochs, 64–96 blocks, so a finality delay puts
+//!    it out of reach), with the peer's own head as the head read's fallback,
 //! 3. snap-fetches the account/slot and MPT-verifies it against that state root
 //!    (the proof is the trust anchor, never the peer's slim body),
 //! 4. anchors the state root to the beacon chain via the verified ladder
@@ -33,12 +35,12 @@ use myotis_evm::{
     InMemoryStateProofCache, U256,
 };
 
-use crate::el::anchor::ExecAnchor;
+use crate::el::anchor::{ExecAnchor, FinalizedExecution};
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
 use crate::el::evm::{
-    block_context, CallAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
-    EnsRootMode, GasOutcome, PoolOracle,
+    block_context, ReadAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
+    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
 use crate::el::pool::{Enode, PeerPool, PoolConfig};
@@ -273,6 +275,9 @@ pub struct VerifiedAccount {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`, the
+    /// `finalized` tag) rather than the optimistic head.
+    pub finalized: bool,
 }
 
 /// The shadow cache's view of a verified account read (`el::readstats`).
@@ -326,6 +331,8 @@ pub struct VerifiedStorage {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`).
+    pub finalized: bool,
 }
 
 /// A verified contract-code query result (for `eth_getCode`). The bytecode is
@@ -348,6 +355,8 @@ pub struct VerifiedCode {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`).
+    pub finalized: bool,
 }
 
 /// A verified block result (`eth_getBlockByNumber`, transactions as hashes). The
@@ -408,9 +417,9 @@ const TIP_LAG_RETRY_DELAY: std::time::Duration = std::time::Duration::from_milli
 /// live here so the coupling is visible. Since #465 this is the BATCH gate
 /// feeding a per-peer split: `pool_race_verdict` then excuses the peers whose
 /// own announced head already predicted the miss.
-fn all_tip_lag(failures: &[String]) -> bool {
+fn all_tip_lag(failures: &[(usize, String)]) -> bool {
     !failures.is_empty()
-        && failures.iter().all(|f| {
+        && failures.iter().all(|(_, f)| {
             f.contains("headers, expected")
                 || f.contains("window head does not match the beacon-anchored head hash")
         })
@@ -862,10 +871,11 @@ pub(crate) struct RaceOutcome<T> {
     /// shows up here, so callers report these (`PeerPool::record_snap_outpaced`),
     /// which benches the peer and counts a repeat as a failure.
     pub(crate) outpaced: Vec<usize>,
-    /// Every failure reason, in arrival order. The block and receipt reads
-    /// summarise the whole pool and classify tip-lag across it, so they need
-    /// all of them, not just the last.
-    pub(crate) errors: Vec<String>,
+    /// Every failure reason with the peer position it came from, in arrival
+    /// order. The block and receipt reads summarise the whole pool and
+    /// classify tip-lag across it, so they need all of them, not just the
+    /// last; the state reads excuse a miss by its reason (`hedged_read`).
+    pub(crate) errors: Vec<(usize, String)>,
 }
 
 impl<T> RaceOutcome<T> {
@@ -880,7 +890,7 @@ impl<T> RaceOutcome<T> {
 
     /// The most recent failure reason ("" when nothing failed).
     pub(crate) fn last_err(&self) -> &str {
-        self.errors.last().map(String::as_str).unwrap_or("")
+        self.errors.last().map(|(_, e)| e.as_str()).unwrap_or("")
     }
 }
 
@@ -986,7 +996,7 @@ where
                 }
                 Err(e) => {
                     out.missed.push(idx);
-                    out.errors.push(e);
+                    out.errors.push((idx, e));
                 }
             }},
             // Nobody answered in time and a candidate remains: wake the loop,
@@ -1030,9 +1040,10 @@ enum PoolRaceVerdict<T> {
 /// `coverage[i]` is peer `i`'s coverage of the anchored HEAD, sampled BEFORE
 /// the race (an announcement arriving mid-read cannot absolve retroactively).
 /// Only the tip-lag verdict consults it: a won race's misses and a fatal
-/// failure keep their strikes — `RaceOutcome::errors` is not aligned with
-/// `missed`, so a per-peer excuse there would need a restructure, and a Behind
-/// peer rarely enters a race at all now that the ladder ranks it last.
+/// failure keep their strikes — the reasons in `RaceOutcome::errors` carry
+/// their peer position, so a per-peer excuse there would be cheap now, but a
+/// Behind peer rarely enters a race at all now that the ladder ranks it last
+/// (dropped consciously, docs/TODO.md).
 /// `head_anchored` = the window's top was the optimistic head. Only such a
 /// window can lose the one-slot race with the peers' imports; a window
 /// anchored at the FINALIZED block (`WindowTop::Finalized`) is minutes old, so
@@ -1132,14 +1143,14 @@ enum BlockFromError {
 /// the pattern that matters in a whole-pool failure — "all timeouts" (stale
 /// connections) reads very differently from "all window mismatches" (our head
 /// is ahead of the peers').
-fn summarize_peer_failures(failures: &[String]) -> String {
+fn summarize_peer_failures(failures: &[(usize, String)]) -> String {
     const MAX_REASON_CHARS: usize = 120;
     const MAX_DISTINCT: usize = 4;
     if failures.is_empty() {
         return "no failures recorded".to_string();
     }
     let mut counts: Vec<(String, usize)> = Vec::new();
-    for f in failures {
+    for (_, f) in failures {
         let short: String = f.chars().take(MAX_REASON_CHARS).collect();
         match counts.iter_mut().find(|(s, _)| *s == short) {
             Some((_, n)) => *n += 1,
@@ -4476,14 +4487,29 @@ impl ElReader {
     /// (→ deprioritized); peers the winner outpaced are reported as such
     /// (benched, a repeat counts as a strike); any other peer still in flight is
     /// left untouched.
-    pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+    ///
+    /// `anchor` selects the state: the optimistic head, or the beacon-FINALIZED
+    /// block for the `finalized` tag (#465, #366) — the snap proof is then
+    /// verified against the anchor's own finalized state root, with no
+    /// fallback to any other root (a peer that pruned it fails this attempt;
+    /// a whole-pool miss is retryable), so the answer is the block asked for
+    /// or nothing (CLAUDE.md §Trust).
+    pub async fn get_account(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
         // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
         // pool's clearnet connections. Fail-closed if no aged peer is available.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
+            if anchor == ReadAnchor::Finalized {
+                return Err("finalized state reads are not routed over Tor (head only)".to_string());
+            }
             return self.get_account_over_tor(address).await;
         }
+        let fin = self.finalized_anchor_for(anchor, "a finalized account read")?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -4498,18 +4524,21 @@ impl ElReader {
             .hedged_read(
                 &peers,
                 HEDGE_DELAY,
-                |peer| async move { self.get_account_from(&peer, address).await },
+                |peer| async move { self.get_account_from(&peer, address, fin).await },
                 |(r, _): &(VerifiedAccount, Duration)| {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
                 |(r, _): &(VerifiedAccount, Duration)| r.verify_method.is_some(),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
                 "a verifiable account",
             )
             .await?;
         // Shadow-cache bookkeeping for the VERIFIED answer only (an unverified
         // fallback is not a fact a cache could ever have served), costed at the
         // winning peer's snap round-trip — not the anchoring ladder after it.
-        if result.verify_method.is_some() {
+        // Head reads only: the cache measures the head-state traffic, and a
+        // finalized root interleaved with head roots would read as churn.
+        if result.verify_method.is_some() && fin.is_none() {
             self.read_stats.observe_account(
                 address,
                 result.peer_state_root,
@@ -4542,7 +4571,15 @@ impl ElReader {
     /// SERVE. The two differ for the account and storage reads, which accept
     /// a global failure (`beaconNotSynced`, identical for every peer) so the
     /// race stops asking — an answer that serves nothing, witnesses no miss,
-    /// and earns its peer no credit (see `race_served_by_winner`).
+    /// and earns its peer no credit (see `race_served_by_winner`). `excused`
+    /// names, by its reason, a miss that is evidence about OUR ask rather
+    /// than the peer — a finalized read answered with an empty proof
+    /// (`is_unknown_root_error`: the peer does not hold a root it is not
+    /// obliged to hold) — and is banked nowhere: neither a strike nor a
+    /// witnessed failure, so polling `finalized` cannot bench, evict or flip
+    /// the cache verdict of a peer that serves the head perfectly. A garbage
+    /// proof at that root stays a strike, as on the head path.
+    #[allow(clippy::too_many_arguments)]
     async fn hedged_read<T, Fut>(
         &self,
         peers: &[std::sync::Arc<ManagedPeer>],
@@ -4550,6 +4587,7 @@ impl ElReader {
         make: impl FnMut(std::sync::Arc<ManagedPeer>) -> Fut,
         accept: impl Fn(&T) -> bool,
         served: impl Fn(&T) -> bool,
+        excused: impl Fn(&str) -> bool,
         what: &str,
     ) -> Result<T, String>
     where
@@ -4564,7 +4602,21 @@ impl ElReader {
         // — and a whole-pool failure is banked live but persisted nowhere
         // (#465).
         let winner_served = race_served_by_winner(&out, &served);
-        let misses: Vec<std::net::SocketAddr> = out.missed.iter().map(|i| peers[*i].addr()).collect();
+        let pardoned: Vec<usize> =
+            out.errors.iter().filter(|(_, e)| excused(e)).map(|(i, _)| *i).collect();
+        if !pardoned.is_empty() {
+            tracing::debug!(
+                excused = pardoned.len(),
+                what,
+                "misses excused: the root was ours to ask, not the peer's to hold"
+            );
+        }
+        let misses: Vec<std::net::SocketAddr> = out
+            .missed
+            .iter()
+            .filter(|i| !pardoned.contains(i))
+            .map(|i| peers[*i].addr())
+            .collect();
         self.record_batch_failures(&misses, winner_served).await;
         for idx in &out.outpaced {
             self.pool.record_snap_outpaced(peers[*idx].addr()).await;
@@ -4655,21 +4707,99 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         address: [u8; 20],
+        fin: Option<FinalizedExecution>,
     ) -> Result<(VerifiedAccount, Duration), String> {
         let started = Instant::now();
-        let (state_root, block_number, outcome) =
-            self.snap_account_at_best_root(peer, address).await?;
+        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
         let snap_elapsed = started.elapsed();
         // Anchor the (proof-valid) state root to the beacon chain. The anchor
         // path's root short-circuits via the stateRootMatch fast path; the
-        // fallback path's peer root runs the full ladder.
-        let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-            .await;
+        // fallback path's peer root runs the full ladder; the finalized root
+        // is attested by construction.
+        let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
         Ok((
-            self.build_verified_account(address, state_root, block_number, outcome, verdict),
+            self.build_verified_account(
+                address,
+                state_root,
+                block_number,
+                outcome,
+                verdict,
+                fin.is_some(),
+            ),
             snap_elapsed,
         ))
+    }
+
+    /// The beacon-finalized execution block, or the one refusal every
+    /// finalized read shares while none has landed (not synced: retryable,
+    /// and identical for every peer, so no race is worth running).
+    fn require_finalized_execution(&self, what: &str) -> Result<FinalizedExecution, String> {
+        self.anchor
+            .finalized_execution()
+            .ok_or_else(|| format!("no beacon-finalized execution block for {what}"))
+    }
+
+    /// The finalized anchor a read at `anchor` proves against: `None` at the
+    /// head; at `Finalized`, the beacon-finalized execution block — read ONCE
+    /// here, before any peer is asked, so every attempt, the verdict and the
+    /// reported block number name the same finality.
+    fn finalized_anchor_for(
+        &self,
+        anchor: ReadAnchor,
+        what: &str,
+    ) -> Result<Option<FinalizedExecution>, String> {
+        match anchor {
+            ReadAnchor::Head => Ok(None),
+            ReadAnchor::Finalized => self.require_finalized_execution(what).map(Some),
+        }
+    }
+
+    /// Fetch + MPT-verify one account at the read's anchor: the best available
+    /// root for a head read ([`Self::snap_account_at_best_root`]), or exactly
+    /// the beacon-FINALIZED state root for a finalized read — with NO fallback
+    /// to any other root, since answering from another block would be the
+    /// silent substitution CLAUDE.md §Trust forbids. A peer that cannot prove
+    /// at the finalized root (pruned it, most likely: execution clients keep
+    /// on the order of a hundred recent states, and finality trails the head
+    /// by two epochs or more) fails this attempt with an empty proof;
+    /// `hedged_read` excuses that miss — the root is our ask, not the peer's
+    /// fault — and lets the next peer answer, and a whole-pool miss surfaces
+    /// as a retryable error.
+    async fn snap_account_at(
+        &self,
+        peer: &ManagedPeer,
+        address: [u8; 20],
+        fin: Option<FinalizedExecution>,
+    ) -> Result<([u8; 32], u64, AccountOutcome), String> {
+        let Some(fin) = fin else {
+            return self.snap_account_at_best_root(peer, address).await;
+        };
+        let outcome = peer
+            .snap_get_account(&fin.state_root, &address)
+            .await
+            .map_err(|e| format!("finalized-root query failed ({e})"))?;
+        Ok((fin.state_root, fin.block_number, outcome))
+    }
+
+    /// The beacon verdict for a proof-verified state root: the ladder for a
+    /// head read; for a finalized read the root IS the finality update's own,
+    /// so the verdict is `stateRootMatch` at that update's slot by
+    /// construction (`verify::finalized_root_verdict`) — from the same `fin`
+    /// the proof was verified against, never a second anchor read.
+    async fn anchored_verdict(
+        &self,
+        peer: &ManagedPeer,
+        fin: Option<FinalizedExecution>,
+        state_root: &[u8; 32],
+        block_number: u64,
+    ) -> crate::el::verify::Verdict {
+        match fin {
+            None => {
+                let block = to_ladder_block(block_number);
+                peer.verified_state_root(&self.anchor, state_root, block, true).await
+            }
+            Some(fin) => crate::el::verify::finalized_root_verdict(fin.slot),
+        }
     }
 
     /// Fetch + MPT-verify one account against the best available state root:
@@ -4746,6 +4876,7 @@ impl ElReader {
         block_number: u64,
         outcome: AccountOutcome,
         verdict: crate::el::verify::Verdict,
+        finalized: bool,
     ) -> VerifiedAccount {
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let account_hash = keccak256(&address);
@@ -4768,6 +4899,7 @@ impl ElReader {
             beacon_synced: synced,
             finalized_block_number: fin_num,
             optimistic_block_number: opt_num,
+            finalized,
         };
         if let AccountOutcome::Present(leaf) = outcome {
             result.exists = true;
@@ -4884,7 +5016,7 @@ impl ElReader {
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         Ok((
-            self.build_verified_account(address, state_root, block_number, outcome, verdict),
+            self.build_verified_account(address, state_root, block_number, outcome, verdict, false),
             snap_elapsed,
         ))
     }
@@ -4898,7 +5030,8 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
     ) -> Result<VerifiedStorage, String> {
-        self.get_storage_keyed(address, slot, holder, storage_key(slot, holder)).await
+        let key = storage_key(slot, holder);
+        self.get_storage_keyed(ReadAnchor::Head, address, slot, holder, key).await
     }
 
     /// Fetch + verify a RAW 32-byte storage position (`eth_getStorageAt`): the
@@ -4907,10 +5040,11 @@ impl ElReader {
     /// meaningful u64 index.
     pub async fn get_storage_at(
         &self,
+        anchor: ReadAnchor,
         address: [u8; 20],
         position: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
-        self.get_storage_keyed(address, 0, None, position).await
+        self.get_storage_keyed(anchor, address, 0, None, position).await
     }
 
     /// The hedged cross-peer read shared by `get_storage` / `get_storage_at`,
@@ -4922,11 +5056,13 @@ impl ElReader {
     /// ever returned when NO peer verifies, and each is independently checked).
     async fn get_storage_keyed(
         &self,
+        anchor: ReadAnchor,
         address: [u8; 20],
         slot: u64,
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
+        let fin = self.finalized_anchor_for(anchor, "a finalized storage read")?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
@@ -4936,20 +5072,22 @@ impl ElReader {
                 &peers,
                 HEDGE_DELAY,
                 |peer| async move {
-                    self.get_storage_from(&peer, address, slot, holder, storage_key).await
+                    self.get_storage_from(&peer, address, slot, holder, storage_key, fin).await
                 },
                 |(r, _): &(VerifiedStorage, StorageSnapCost)| {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
                 |(r, _): &(VerifiedStorage, StorageSnapCost)| r.verify_method.is_some(),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
                 "verifiable storage",
             )
             .await?;
         // Shadow-cache bookkeeping for the VERIFIED answer only: the account
         // proof this path fetches to learn the storage root, then the slot
         // proof (when the account had storage to prove), each at its own snap
-        // round-trip cost — the same two facts the EVM oracle reports.
-        if result.verify_method.is_some() {
+        // round-trip cost — the same two facts the EVM oracle reports. Head
+        // reads only, as for the account read.
+        if result.verify_method.is_some() && fin.is_none() {
             self.read_stats.observe_account(
                 address,
                 result.peer_state_root,
@@ -4982,13 +5120,14 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
+        fin: Option<FinalizedExecution>,
     ) -> Result<(VerifiedStorage, StorageSnapCost), String> {
         // Step 1: the proof-verified account gives the trusted storage root.
         // Root selection prefers the beacon anchor's current optimistic root
-        // (issue #355 — see snap_account_at_best_root).
+        // (issue #355 — see snap_account_at_best_root), or IS the finalized
+        // root for a finalized read (see snap_account_at).
         let started = Instant::now();
-        let (state_root, block_number, outcome) =
-            self.snap_account_at_best_root(peer, address).await?;
+        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
         let mut snap = StorageSnapCost {
             account: match &outcome {
                 AccountOutcome::Present(leaf) => AccountFact::from_leaf(Some(leaf)),
@@ -5021,6 +5160,7 @@ impl ElReader {
             beacon_synced: synced,
             finalized_block_number: fin_num,
             optimistic_block_number: opt_num,
+            finalized: fin.is_some(),
         };
 
         // An absent account has no storage: every slot is provably zero, and the
@@ -5030,9 +5170,7 @@ impl ElReader {
         // verdict.
         let AccountOutcome::Present(leaf) = outcome else {
             // Still anchor the state root so the verdict reflects the beacon tie.
-            let verdict = peer
-                .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-                .await;
+            let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
             result.storage_proof_valid = true; // exclusion proof held
             apply_verdict(&mut result, &verdict);
             return Ok((result, snap));
@@ -5062,9 +5200,7 @@ impl ElReader {
         }
 
         // Step 3: anchor the account's state root to the beacon chain.
-        let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-            .await;
+        let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
         apply_verdict(&mut result, &verdict);
         Ok((result, snap))
     }
@@ -5076,8 +5212,12 @@ impl ElReader {
     /// inherited from the account. A verified EOA / empty-code / absent account has
     /// provably empty code (no round trip). An unverified account returns empty code
     /// with `verify_method: None` (the caller surfaces that as "can't answer").
-    pub async fn get_code(&self, address: [u8; 20]) -> Result<VerifiedCode, String> {
-        let account = self.get_account(address).await?;
+    pub async fn get_code(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+    ) -> Result<VerifiedCode, String> {
+        let account = self.get_account(anchor, address).await?;
         let mut result = VerifiedCode {
             address,
             exists: account.exists,
@@ -5092,6 +5232,7 @@ impl ElReader {
             beacon_synced: account.beacon_synced,
             finalized_block_number: account.finalized_block_number,
             optimistic_block_number: account.optimistic_block_number,
+            finalized: account.finalized,
         };
         // No bytecode to fetch when the answer isn't verified, the account is
         // absent, or the code hash is empty (an EOA / empty-code contract): a
@@ -5127,6 +5268,7 @@ impl ElReader {
             },
             |_: &Vec<u8>| true,
             |_: &Vec<u8>| true,
+            |_: &str| false,
             "verifiable bytecode",
         )
         .await
@@ -5137,7 +5279,7 @@ impl ElReader {
     /// use). `anchor` selects the block, as for [`Self::eth_call_overridden`].
     pub async fn eth_call_create(
         &self,
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         init_code: Vec<u8>,
         value: U256,
@@ -5150,7 +5292,7 @@ impl ElReader {
 
     async fn eth_call_create_inner(
         &self,
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         init_code: Vec<u8>,
         value: U256,
@@ -5189,7 +5331,7 @@ impl ElReader {
     #[allow(clippy::too_many_arguments)]
     pub async fn eth_call_overridden(
         &self,
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         to: [u8; 20],
         data: Vec<u8>,
@@ -5206,7 +5348,7 @@ impl ElReader {
     #[allow(clippy::too_many_arguments)]
     async fn eth_call_overridden_inner(
         &self,
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         to: [u8; 20],
         data: Vec<u8>,
@@ -5360,7 +5502,7 @@ impl ElReader {
         wrapped: bool,
     ) -> Result<EnsQueryOutcome, String> {
         let attempt = async {
-            let anchor = CallAnchor::for_finalized(finalized);
+            let anchor = ReadAnchor::for_finalized(finalized);
             let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
             let block_number = ctx.block_number;
             let walk = super::request::blocking(move || {
@@ -5408,7 +5550,7 @@ impl ElReader {
     }
 
     async fn ens_attempt_inner(&self, query: EnsQuery, chain_id: u64, finalized: bool) -> Result<EnsQueryOutcome, String> {
-        let anchor = CallAnchor::for_finalized(finalized);
+        let anchor = ReadAnchor::for_finalized(finalized);
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
         let block_number = ctx.block_number;
         let walk = super::request::blocking(move || {
@@ -5433,7 +5575,7 @@ impl ElReader {
     /// The executor's verdict as a [`CallAnswer`] for the block it ran against
     /// — one mapping for both call shapes.
     fn call_answer(
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         block_number: u64,
         joined: Result<Vec<u8>, EvmError>,
     ) -> CallAnswer {
@@ -5444,20 +5586,20 @@ impl ElReader {
                 Err(other) => CallOutcome::Unavailable(other.to_string()),
             },
             block_number,
-            finalized: anchor == CallAnchor::Finalized,
+            finalized: anchor == ReadAnchor::Finalized,
         }
     }
 
     /// [`Self::evm_setup`] or [`Self::evm_setup_finalized`], by `anchor`.
     async fn evm_setup_at(
         &self,
-        anchor: CallAnchor,
+        anchor: ReadAnchor,
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         match anchor {
-            CallAnchor::Head => self.evm_setup(chain_id, what).await,
-            CallAnchor::Finalized => self.evm_setup_finalized(chain_id, what).await,
+            ReadAnchor::Head => self.evm_setup(chain_id, what).await,
+            ReadAnchor::Finalized => self.evm_setup_finalized(chain_id, what).await,
         }
     }
 
@@ -5479,9 +5621,7 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some(fin) = self.anchor.finalized_execution() else {
-            return Err(format!("no beacon-finalized execution block for {what}"));
-        };
+        let fin = self.require_finalized_execution(what)?;
         let Some(block) = self.get_block_by_number(Some(fin.block_number), false).await? else {
             return Err(format!(
                 "finalized block {} not fetchable for {what}",
@@ -5504,7 +5644,7 @@ impl ElReader {
             ));
         }
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, true).await
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
@@ -5519,15 +5659,18 @@ impl ElReader {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, false).await
     }
 
     /// The executor half of the EVM setup: a fresh snap-peer snapshot + the
-    /// reader's cross-call caches bound over the given context.
+    /// reader's cross-call caches bound over the given context. `finalized` =
+    /// the context's state root is the beacon-finalized one, which the oracle
+    /// needs to know for its reputation and shadow-cache bookkeeping.
     async fn evm_executor_for(
         &self,
         ctx: myotis_evm::BlockContext,
         what: &str,
+        finalized: bool,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         // Snapshot the snap peers once: one consistent set for the whole call.
         let peers = self.pool.snap_peers().await;
@@ -5539,6 +5682,7 @@ impl ElReader {
             tokio::runtime::Handle::current(),
             Some(self.pool.quality_sink()),
             Arc::clone(&self.read_stats),
+            finalized,
         ));
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
@@ -6156,6 +6300,7 @@ impl ElReader {
                 |peer| async move { self.receipt_from(&peer, loc).await },
                 |_: &VerifiedReceipt| true,
                 |_: &VerifiedReceipt| true,
+                |_: &str| false,
                 "verifiable receipts",
             )
             .await?;
@@ -6571,6 +6716,7 @@ impl ElReader {
             },
             |_: &Option<TxLocation>| true,
             |_: &Option<TxLocation>| true,
+            |_: &str| false,
             "a verifiable tx scan",
         )
         .await
@@ -7413,11 +7559,16 @@ mod tests {
     mod failure_summaries {
         use super::*;
 
+        /// Reasons as the race records them: paired with the peer position.
+        fn indexed(reasons: Vec<String>) -> Vec<(usize, String)> {
+            reasons.into_iter().enumerate().collect()
+        }
+
         #[test]
         fn identical_reasons_collapse_with_a_count() {
             let f = vec!["peer returned 0 headers, expected 1".to_string(); 8];
             assert_eq!(
-                summarize_peer_failures(&f),
+                summarize_peer_failures(&indexed(f)),
                 "8x peer returned 0 headers, expected 1"
             );
         }
@@ -7430,7 +7581,7 @@ mod tests {
                 "request timed out".to_string(),
             ];
             assert_eq!(
-                summarize_peer_failures(&f),
+                summarize_peer_failures(&indexed(f)),
                 "2x request timed out; peer disconnected"
             );
         }
@@ -7438,14 +7589,14 @@ mod tests {
         #[test]
         fn overflow_beyond_the_distinct_cap_is_counted_not_dropped_silently() {
             let f: Vec<String> = (0..6).map(|i| format!("reason {i}")).collect();
-            let s = summarize_peer_failures(&f);
+            let s = summarize_peer_failures(&indexed(f));
             assert!(s.contains("(+2 more distinct reasons)"), "{s}");
         }
 
         #[test]
         fn long_reasons_are_truncated() {
             let f = vec!["x".repeat(500)];
-            let s = summarize_peer_failures(&f);
+            let s = summarize_peer_failures(&indexed(f));
             assert!(s.len() <= 130, "len {}", s.len());
         }
 
@@ -7534,8 +7685,9 @@ mod tests {
     mod tip_lag {
         use super::*;
 
-        fn s(v: &[&str]) -> Vec<String> {
-            v.iter().map(|x| x.to_string()).collect()
+        /// Reasons as the race records them: paired with the peer position.
+        fn s(v: &[&str]) -> Vec<(usize, String)> {
+            v.iter().enumerate().map(|(i, x)| (i, x.to_string())).collect()
         }
 
         #[test]
@@ -7879,7 +8031,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0],
                 outpaced: vec![1],
-                errors: vec!["transport timeout".to_string()],
+                errors: vec![(0, "transport timeout".to_string())],
             };
             match pool_race_verdict(out, &[], true) {
                 PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
@@ -7899,7 +8051,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0, 1],
                 outpaced: vec![],
-                errors,
+                errors: errors.into_iter().enumerate().collect(),
             };
             match pool_race_verdict(failed_race(vec![lag.clone(), lag.clone()]), &[], true) {
                 PoolRaceVerdict::TipLag { failed, excused, .. } => {
@@ -7924,7 +8076,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0, 1, 2],
                 outpaced: vec![],
-                errors: vec![lag.clone(), lag.clone(), lag],
+                errors: vec![(0, lag.clone()), (1, lag.clone()), (2, lag)],
             };
             let coverage = [Coverage::Behind, Coverage::Unknown, Coverage::Covers];
             match pool_race_verdict(out, &coverage, true) {
@@ -7947,7 +8099,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0],
                 outpaced: vec![],
-                errors: vec!["connection reset".to_string()],
+                errors: vec![(0, "connection reset".to_string())],
             };
             match pool_race_verdict(fatal, &[Coverage::Behind], true) {
                 PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0]),
@@ -7958,7 +8110,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0],
                 outpaced: vec![],
-                errors: vec!["peer returned 0 headers, expected 1".to_string()],
+                errors: vec![(0, "peer returned 0 headers, expected 1".to_string())],
             };
             match pool_race_verdict(won, &[Coverage::Behind, Coverage::Covers], true) {
                 PoolRaceVerdict::Won { failed, .. } => assert_eq!(failed, vec![0]),
@@ -7978,7 +8130,7 @@ mod tests {
                 fallback: None,
                 missed: vec![0, 1],
                 outpaced: vec![],
-                errors: vec![lag.clone(), lag],
+                errors: vec![(0, lag.clone()), (1, lag)],
             };
             match pool_race_verdict(out, &[Coverage::Behind, Coverage::Covers], false) {
                 PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0, 1]),

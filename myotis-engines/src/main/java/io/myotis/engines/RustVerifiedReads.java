@@ -28,12 +28,12 @@ import org.slf4j.LoggerFactory;
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
  * of {@code latest}/{@code pending}/{@code safe}/default, OR a specific number
  * within {@code [head-64, head+16]} (wallets pin reads to the just-fetched
- * latest number), is served from the verified head. Since engine ABI 30 (#465)
- * {@code finalized} is APPLIED by {@code call}, {@code getBlockByNumber},
- * {@code getBlockReceipts} and {@code feeHistory}: they run against, or serve,
- * the beacon-finalized block (and refuse, retryably, while no finalized block
- * has landed); the account/code/storage/nonce reads still resolve
- * {@code finalized} to the verified head (#366). A genuinely older block returns
+ * latest number), is served from the verified head. {@code finalized} is
+ * APPLIED everywhere on this engine: by {@code call}, {@code getBlockByNumber},
+ * {@code getBlockReceipts} and {@code feeHistory} since ABI 30 (#465), and by the
+ * account/code/storage/nonce reads since ABI 32 (#366) — they run against, or
+ * prove at, the beacon-finalized block, and refuse (retryably) while no finalized
+ * block has landed or no peer still serves its state. A genuinely older block returns
  * {@code null} — the head state does NOT stand in for it. So within the lag
  * window a near-head number resolves to the verified head state (standard
  * light-client skew); a caller needing exact historical state below the window
@@ -111,7 +111,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public String getBalance(byte[] address, String block) {
         if (!isServableBlock(block)) return null;
-        AccountProofResult r = queryAccount(address);
+        AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // A verified-absent account has balance 0 (eth semantics), even though the
         // proof-of-exclusion carries a null balanceWei.
@@ -121,7 +121,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public Long getTransactionCount(byte[] address, String block) {
         if (!isServableBlock(block)) return null;
-        AccountProofResult r = queryAccount(address);
+        AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists).
         //
@@ -149,7 +149,7 @@ final class RustVerifiedReads implements VerifiedReads {
         if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         try {
-            return handle.codeVerified(toHex(address));
+            return handle.codeVerified(toHex(address), block);
         } catch (RuntimeException e) {
             log.info("[engines] verified code read unavailable: {}", e.getMessage());
             return null;
@@ -164,7 +164,7 @@ final class RustVerifiedReads implements VerifiedReads {
         // call; reject anything else defensively.
         if (slot32 == null || slot32.length != 32) return null;
         try {
-            return handle.storageAtVerified(toHex(address), toHex(slot32));
+            return handle.storageAtVerified(toHex(address), toHex(slot32), block);
         } catch (RuntimeException e) {
             log.info("[engines] verified storage read unavailable: {}", e.getMessage());
             return null;
@@ -460,14 +460,15 @@ final class RustVerifiedReads implements VerifiedReads {
 
     // ---- helpers ----
 
-    /** Run the verified account query, mapping a transport/not-running failure to null. */
-    private AccountProofResult queryAccount(byte[] address) {
+    /** Run the verified account query at {@code block} (the engine applies or refuses
+     *  the selector, ABI >= 32), mapping a transport/not-running failure to null. */
+    private AccountProofResult queryAccount(byte[] address, String block) {
         // An eth address is exactly 20 bytes. Reject any other length (incl. null) up
         // front — "can't answer" (null) rather than round-tripping a bogus key through
         // the native query — so a malformed address never crosses the JNI boundary.
         if (address == null || address.length != 20) return null;
         try {
-            return handle.requestAccount(toHex(address));
+            return handle.accountVerified(toHex(address), block);
         } catch (RuntimeException e) {
             // Contain any unchecked failure (transport/not-running EngineException,
             // or a raw unchecked throwable off the native path) as "can't answer

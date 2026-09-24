@@ -748,10 +748,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
-        JsonObject o = parseResultOrThrow(
-                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress)),
-                "account");
-        return accountFromJson(hexAddress, o);
+        return accountVerified(hexAddress, "");
     }
 
     /** Package-private test seam: JSON → {@link AccountProofResult} without JNI. */
@@ -807,13 +804,30 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // ---- VerifiedReads helpers (used by RustVerifiedReads; not ChainHandle API) ----
 
     /**
-     * Verified contract bytecode for {@code hexAddress} (eth_getCode), or null when
+     * {@link #requestAccount(String)} at a block selector (ABI >= 32): a head tag or
+     * empty reads the verified head, {@code finalized} the beacon-finalized block
+     * (applied, never mapped to the head — #465, #366), a number only inside the
+     * window around the head; anything else the engine refuses. Package-private:
+     * the {@code io.myotis.api} surface has no block parameter yet, so only the
+     * JSON-RPC adapter ({@link RustVerifiedReads}) reaches this.
+     */
+    AccountProofResult accountVerified(String hexAddress, String block) {
+        JsonObject o = parseResultOrThrow(
+                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),
+                "account");
+        return accountFromJson(hexAddress, o);
+    }
+
+    /**
+     * Verified contract bytecode for {@code hexAddress} (eth_getCode) at the block
+     * selector {@code block} (a head tag, {@code finalized}, or a near-head number —
+     * the engine checks it, ABI >= 32), or null when
      * the query produced no verdict (can't answer verified). A verified EOA /
      * empty-code account yields an empty array. Throws {@link EngineException} on a
      * transport / not-running failure (the adapter maps that to null).
      */
-    byte[] codeVerified(String hexAddress) {
-        return codeFromJson(gated(() -> RustEngineNative.nativeGetCodeJson(handle, hexAddress)));
+    byte[] codeVerified(String hexAddress, String block) {
+        return codeFromJson(gated(() -> RustEngineNative.nativeGetCodeJson(handle, hexAddress, block)));
     }
 
     /** Package-private test seam: code JSON → verified bytecode (or null) without JNI. */
@@ -1038,9 +1052,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * zero/unset slot → 32 zero bytes). {@code position32Hex} is the 0x-hex 32-byte
      * position. Throws {@link EngineException} on a transport / not-running failure.
      */
-    byte[] storageAtVerified(String hexAddress, String position32Hex) {
+    byte[] storageAtVerified(String hexAddress, String position32Hex, String block) {
         return storageValueFromJson(gated(() -> RustEngineNative.nativeGetStorageAtJson(
-                handle, hexAddress, position32Hex)));
+                handle, hexAddress, position32Hex, block)));
     }
 
     /**

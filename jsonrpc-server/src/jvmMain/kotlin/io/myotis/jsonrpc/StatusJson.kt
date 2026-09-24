@@ -36,6 +36,11 @@ internal object StatusJson {
         put("connectedPeers", s.connectedPeers())
         put("readyPeers", s.readyPeers())
         put("snapPeers", s.snapPeers())
+        // The pooled snap peers that can answer a verified read at the anchored
+        // head NOW (#465): what a wallet should gate its first read on — a pool
+        // of peers still syncing themselves keeps snapPeers positive for hours
+        // while every read fails. Same position as the IPC shape.
+        put("snapServingPeers", s.snapServingPeers())
         put("backedOffPeers", s.backedOffPeers())
         put("blacklistedPeers", s.blacklistedPeers())
         put("pauseCount", s.pauseCount())

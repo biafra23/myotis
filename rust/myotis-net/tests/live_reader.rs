@@ -49,7 +49,7 @@ async fn reader_runs_a_verified_account_query() {
     let mut peak_snap_peers = 0usize;
     while tokio::time::Instant::now() < deadline {
         peak_snap_peers = peak_snap_peers.max(reader.snap_peer_count().await);
-        match reader.get_account(probe).await {
+        match reader.get_account(myotis_net::el::evm::ReadAnchor::Head, probe).await {
             Ok(acct) => {
                 eprintln!(
                     "[live_reader] account 0x{}: exists={} nonce={} verifyMethod={:?} \

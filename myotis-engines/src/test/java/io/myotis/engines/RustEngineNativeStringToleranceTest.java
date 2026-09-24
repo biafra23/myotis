@@ -44,7 +44,7 @@ class RustEngineNativeStringToleranceTest {
     void malformedAddressOnVerifiedReadStaysInBandError() {
         // Unknown handle + sanitized-to-empty address: the engine answers with its
         // in-band {"error": ...} object; the boundary must not throw.
-        String json = RustEngineNative.nativeRequestAccountJson(-12345, MALFORMED);
+        String json = RustEngineNative.nativeRequestAccountJson(-12345, MALFORMED, "");
         assertTrue(json.contains("\"error\""), "expected in-band error JSON, got: " + json);
     }
 
