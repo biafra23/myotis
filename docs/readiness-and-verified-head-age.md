@@ -201,9 +201,16 @@ from another block — a miss that is not held against the peer. Best effort by
 nature: execution clients keep on the order of a hundred recent states (geth:
 ~128 blocks) and finality trails the head by two epochs (64–96 blocks), so a
 finality delay puts the finalized state out of every peer's reach and the read
-comes back as the retryable `-32000` until finality catches up. On the JVM
-host the start/resume warm-up hold applies to `finalized` reads too (it waits
-for a head-serving peer that a finalized read does not need — at most 90 s).
+comes back as the retryable `-32000` until finality catches up. The converse
+also holds: while the beacon status has regressed out of SYNCED (a CL-side
+stall), a `finalized` state read keeps answering at the last-known finalized
+root for as long as a deep-state peer still proves it — verified and labeled
+as such (`anchor: "finalized"`, `beaconSynced: false`, `matchedBeaconSlot` =
+that finality's slot), but stale, where `latest` on the same node refuses with
+`beaconNotSynced`. So keep honoring the SYNCED gate for `finalized` reads too;
+staleness does not always surface as `-32000`. On the JVM host the
+start/resume warm-up hold applies to `finalized` reads too (it waits for a
+head-serving peer that a finalized read does not need — at most 90 s).
 The Java engine still resolves `finalized` to the head (#366).
 
 ## Code pointers

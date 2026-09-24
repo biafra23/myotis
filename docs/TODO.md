@@ -118,6 +118,16 @@ complete on its own.
   full but non-serving pool under peer starvation (an environment result,
   like the other peer conditions); an engine-side regression in the head
   probe would carry the same label, and the job still fails either way.
+- [ ] **A permanent engine refusal flattens to a retryable `-32000` on the
+  hosts' state reads.** `RustChainHandle.parseResultOrThrow` and the iOS
+  `resultOrNull` drop the engine's `code`, so a `-32602` from
+  `request_account_json` / `get_code_json` / `get_storage_at_json` reaches
+  the wallet as the retryable `-32000` a client is documented to spin on.
+  Reachable today only in the one-block race between the hosts' window
+  pre-check and the engine's head; a real loop the moment the state reads
+  accept a selector the hosts do not pre-filter. Decide deliberately (a typed
+  refusal the router maps to `-32602`, as `eth_call`'s `CallResult` does)
+  rather than inherit (review of #483).
 - [ ] **Parity entries for #342.** Rust-only behaviour introduced by the
   three PRs, to be listed there as differs-fixed or differs-accepted:
   admission by announced head and lag eviction (the Java `EthHandler`

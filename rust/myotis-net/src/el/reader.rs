@@ -5125,7 +5125,7 @@ impl ElReader {
         // Step 1: the proof-verified account gives the trusted storage root.
         // Root selection prefers the beacon anchor's current optimistic root
         // (issue #355 — see snap_account_at_best_root), or IS the finalized
-        // root for a finalized read (see snap_account_at_finalized).
+        // root for a finalized read (see snap_account_at).
         let started = Instant::now();
         let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
         let mut snap = StorageSnapCost {
