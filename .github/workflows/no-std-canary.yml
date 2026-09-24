@@ -2,15 +2,22 @@
 #
 # `cargo build -p myotis-core --no-default-features` for x86_64-unknown-none, a
 # tier-2 target that ships NO std: a `std::` import, a HashMap, or a dependency
-# whose `std` feature is left on fails here and nowhere else. Every host builds
-# the crate with `std` on, the workspace's Rust tests run in CI only on manual
-# dispatch (node-binding.yml's smoke jobs), and the UEFI targets the promise
-# exists for ship a partial std, so a UEFI build alone would let a leak through.
-# A BUILD rather than a check because the sha2 SIMD failure those targets share
-# (the force-soft block in the crate's Cargo.toml) surfaces at codegen. The
-# second step builds the UEFI target itself, the embedding the feature exists
-# for; the third runs the crate's tests on the host with default features off,
-# so the no_std configuration is tested, not only built.
+# whose `std` feature is left on fails here and nowhere else. Every other Rust
+# build in CI turns the default feature on (ci.yml's Gradle `check` runs
+# `cargo test --workspace` on every PR, with std), the wasm32 canary uses default
+# features too (and self-skips in CI, which has no wasm32 target), and the UEFI
+# targets the promise exists for ship a partial std, so a UEFI build alone would
+# let a leak through. A BUILD rather than a check because the sha2 SIMD failure
+# those targets share (the force-soft block in the crate's Cargo.toml) surfaces
+# at codegen. The second step builds the UEFI target itself, the embedding the
+# feature exists for; the third runs the crate's tests on the host with default
+# features off, so the no_std configuration is tested, not only built.
+#
+# The EL conformance corpus those tests replay (rust/testdata/el/) is outside
+# the paths filter on purpose: a corpus change cannot introduce a std leak, and
+# ci.yml's `cargo test --workspace` replays it on every PR. Nothing in the crate
+# depends on the feature except the `no_std` attribute itself, so a vector that
+# passes there passes here.
 #
 # Gradle's `check` runs the same x86_64-unknown-none build (`cargoBuildNoStd`)
 # when the rustup target is installed; this job is where it always runs.
