@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 30
+#define MYOTIS_ABI_VERSION 31
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -234,6 +234,22 @@ char *myotis_import_log_index_files(int64_t handle, const char *paths_json);
 /* v24: export the current index as a portable snapshot at path
  * (finality-clamped, self-describing). {"ok":true} or {"error":...}. */
 char *myotis_export_log_index(int64_t handle, const char *path);
+
+/* v31: host-supplied EL seed pins (#465). enodes_json is a JSON array of
+ * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS).
+ * REPLACES the handle's host list (an empty array clears it); the network's
+ * own pins are unaffected. Applied or refused AS A WHOLE: false for NULL,
+ * invalid JSON, a non-array, any malformed entry, a duplicate address, more
+ * than 64 entries, or an unknown handle — nothing is applied on refusal.
+ * Kept per handle and applied on every start/resume, and live on a running
+ * handle: the pins are dialed like the network's pins (directly, never seeded
+ * into the peer cache; re-dialed while the pool is below its target and,
+ * above it, once proven to serve snap data).
+ * v31 also adds "snapServingPeers" to myotis_status_json: the pooled peers
+ * that can answer a read at the anchored head NOW — gate reads on it rather
+ * than on "snapPeers", which a pool of still-syncing peers satisfies for
+ * hours while every read fails. */
+bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
 
 #ifdef __cplusplus
 }

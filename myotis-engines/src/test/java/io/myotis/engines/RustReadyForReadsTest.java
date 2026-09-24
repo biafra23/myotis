@@ -12,8 +12,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RustReadyForReadsTest {
 
+    /** The ABI >= 31 shape: every pooled peer also serves. */
     private static String status(boolean running, String beaconState, long head, int snapPeers,
                                  boolean elReader) {
+        return status(running, beaconState, head, snapPeers, snapPeers, elReader);
+    }
+
+    private static String status(boolean running, String beaconState, long head, int snapPeers,
+                                 int snapServing, boolean elReader) {
+        return "{\"running\":" + running + ",\"paused\":false,\"network\":\"sepolia\","
+                + "\"beaconState\":\"" + beaconState + "\",\"elReaderAvailable\":" + elReader
+                + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers
+                + ",\"snapServingPeers\":" + snapServing + "}";
+    }
+
+    /** The pre-ABI-31 shape: no snapServingPeers key at all. */
+    private static String oldShape(boolean running, String beaconState, long head, int snapPeers,
+                                   boolean elReader) {
         return "{\"running\":" + running + ",\"paused\":false,\"network\":\"sepolia\","
                 + "\"beaconState\":\"" + beaconState + "\",\"elReaderAvailable\":" + elReader
                 + ",\"optimisticBlockNumber\":" + head + ",\"snapPeers\":" + snapPeers + "}";
@@ -33,6 +48,21 @@ class RustReadyForReadsTest {
         assertFalse(ready(status(true, "CATCHING_UP", 9_000_000, 4, true)));
         assertFalse(ready(status(true, "SYNCED", 9_000_000, 0, true)));
         assertFalse(ready(status(true, "SYNCED", 0, 4, true)));
+    }
+
+    @Test
+    void syncedWithPooledButNonServingPeersIsNotReady() {
+        // The #465 shape: SYNCED, a full pool of peers still syncing themselves,
+        // none able to answer at the anchored head — holding is right, a read
+        // now fails with "peer returned 0 headers".
+        assertFalse(ready(status(true, "SYNCED", 9_000_000, 6, 0, true)));
+        assertTrue(ready(status(true, "SYNCED", 9_000_000, 6, 1, true)));
+    }
+
+    @Test
+    void anOldNativeWithoutTheServingKeyFallsBackToSnapPeers() {
+        assertTrue(ready(oldShape(true, "SYNCED", 9_000_000, 4, true)));
+        assertFalse(ready(oldShape(true, "SYNCED", 9_000_000, 0, true)));
     }
 
     @Test

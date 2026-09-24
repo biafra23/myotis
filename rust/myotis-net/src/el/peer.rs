@@ -492,6 +492,18 @@ impl ManagedPeer {
             Ok(Err(_)) => Err("peer connection closed".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                // WARN, with the address (#465): the pool-level whole-pool
+                // WARNs name the peers that failed, but a single silent peer
+                // inside a race that another peer won leaves no trace at
+                // info+, the level the hosts' log rings keep. Bounded: a hedged
+                // loser is dropped when a winner answers, so this fires only
+                // for a request still awaited after the full timeout.
+                tracing::warn!(
+                    addr = %self.addr,
+                    code = %format_args!("0x{want_code:02x}"),
+                    timeout_s = REQUEST_TIMEOUT.as_secs(),
+                    "peer request timed out"
+                );
                 Err(format!("timed out awaiting code 0x{want_code:02x}"))
             }
         };

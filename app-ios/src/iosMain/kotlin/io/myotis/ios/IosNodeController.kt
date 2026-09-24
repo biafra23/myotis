@@ -503,6 +503,11 @@ class IosNodeController(
         val paused = o.engineBoolean("paused")
         val beaconState = o.engineString("beaconState") ?: "STARTING"
         val snapPeers = o.engineInt("snapPeers")
+        // The pooled peers that can answer a read at the anchored head NOW
+        // (ABI >= 31, #465) — what readiness gates on: a pool of peers still
+        // syncing keeps snapPeers positive for hours while every read fails.
+        // An older engine has no such key → the pooled count, as before.
+        val snapServingPeers = o.engineInt("snapServingPeers", snapPeers)
         val currentPeriod = o.engineLong("currentPeriod", 0L)
         // Older-native fallback: a missing targetPeriod parses as 0 — keep the
         // target >= current invariant.
@@ -514,7 +519,7 @@ class IosNodeController(
         // only while a verified read can actually be served; otherwise the
         // Long.MAX_VALUE "no verified head yet" sentinel, with the advance clock
         // pinned to now so the age starts fresh once serveable.
-        val serveable = beaconState == "SYNCED" && optimisticBlock > 0 && snapPeers > 0
+        val serveable = beaconState == "SYNCED" && optimisticBlock > 0 && snapServingPeers > 0
         val verifiedHeadAgeMs = locked {
             val age = headAges.getOrPut(network) {
                 HeadAge(optimisticBlock, TimeSource.Monotonic.markNow())
@@ -545,7 +550,7 @@ class IosNodeController(
             connectedPeers = o.engineInt("peerCount"),        // CL libp2p peers
             readyPeers = snapPeers,                      // EL pool holds only snap-ready
             snapPeers = snapPeers,
-            snapServingPeers = snapPeers,                // approximation, as over JNI
+            snapServingPeers = snapServingPeers,         // ABI >= 31; older engines: snapPeers
             clConnectedPeers = o.engineInt("peerCount"),
             clServedPeersLastMin = o.engineInt("servedPeersLastMinute"),
             clCachedPeers = clCache.total,

@@ -23,6 +23,7 @@ import io.myotis.engine.capi.myotis_log_index_status_json
 import io.myotis.engine.capi.myotis_read_stats_json
 import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
+import io.myotis.engine.capi.myotis_set_boot_enodes
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
@@ -145,6 +146,17 @@ object RustEngine {
     fun acceptStaleAnchor(handle: Long): Boolean {
         requireAbi()
         return myotis_accept_stale_anchor(handle)
+    }
+
+    /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a
+     *  JSON array of `enode://<128-hex pubkey>@ip:port` strings, applied or
+     *  refused as a whole (false = invalid JSON, a malformed or DNS-named entry,
+     *  a duplicate address, more than 64 entries, or an unknown handle; nothing
+     *  applied). An empty array clears. Kept for every start/resume and applied
+     *  live to a running handle; the pins are dialed like the network's own. */
+    fun setBootEnodes(handle: Long, enodesJson: String): Boolean {
+        requireAbi()
+        return myotis_set_boot_enodes(handle, enodesJson)
     }
 
     /** Status JSON object; `"{}"` for an unknown handle. */

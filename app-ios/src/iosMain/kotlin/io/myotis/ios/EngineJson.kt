@@ -23,5 +23,5 @@ internal fun JsonObject.engineBoolean(key: String): Boolean =
 internal fun JsonObject.engineLong(key: String, default: Long = 0L): Long =
     (this[key] as? JsonPrimitive)?.longOrNull ?: default
 
-internal fun JsonObject.engineInt(key: String): Int =
-    (this[key] as? JsonPrimitive)?.intOrNull ?: 0
+internal fun JsonObject.engineInt(key: String, default: Int = 0): Int =
+    (this[key] as? JsonPrimitive)?.intOrNull ?: default

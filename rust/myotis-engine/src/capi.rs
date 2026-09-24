@@ -666,6 +666,32 @@ mod tests {
         assert_eq!(unsafe { take(myotis_status_json(0)) }, "{}");
         myotis_stop(0); // unknown id: must be a silent no-op
         unsafe { myotis_string_free(std::ptr::null_mut()) };
+        // A NULL seed list is a refusal, not a crash — and so is a valid list
+        // for an unknown handle.
+        assert!(!unsafe { myotis_set_boot_enodes(0, std::ptr::null()) });
+        assert!(!unsafe { myotis_set_boot_enodes(i64::MIN, c"[]".as_ptr()) });
+    }
+
+    /// How a host's seed pins cross the C ABI (ABI 31): the push is applied or
+    /// refused as a whole, and a handle that has not started keeps it for its
+    /// start.
+    #[test]
+    fn boot_enodes_are_applied_or_refused_across_the_c_abi() {
+        let dir = std::env::temp_dir().join("myotis-capi-boot-enodes-test");
+        let dir = CString::new(dir.to_str().unwrap()).unwrap();
+        let handle = unsafe { myotis_create(c"mainnet".as_ptr(), dir.as_ptr()) };
+        assert!(handle >= 1, "create failed: {handle}");
+        let key = "ab".repeat(64);
+        let list = CString::new(format!(r#"["enode://{key}@1.2.3.4:30303"]"#)).unwrap();
+        assert!(unsafe { myotis_set_boot_enodes(handle, list.as_ptr()) });
+        assert!(unsafe { myotis_set_boot_enodes(handle, c"[]".as_ptr()) });
+        for bad in [c"not json", c"{}", c"[\"nope\"]", c"[7]"] {
+            assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr()) }, "{bad:?}");
+        }
+        // Invalid UTF-8 decodes lossily and is then refused as not-an-enode.
+        let bad = [0x5b_u8, 0x22, 0xff, 0x22, 0x5d, 0];
+        assert!(!unsafe { myotis_set_boot_enodes(handle, bad.as_ptr().cast()) });
+        myotis_stop(handle);
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent
@@ -752,6 +778,27 @@ pub unsafe extern "C" fn myotis_set_log_index_config(
 ) -> bool {
     match read_string(config_json) {
         Some(c) => crate::host::set_log_index_config_json(handle, &c),
+        None => false,
+    }
+}
+
+/// Replace the handle's HOST-SUPPLIED EL seed pins (ABI ≥ 31, #465):
+/// `enodes_json` is a JSON array of `enode://<128 hex pubkey>@ip:port`
+/// strings (numeric address, no DNS). Applied or refused as a whole — false
+/// for NULL, invalid JSON, a non-array, any malformed entry, a duplicate
+/// address, more than 64 entries, or an unknown handle; nothing is applied on
+/// refusal. An empty array clears the list. Stashed for every start/resume and
+/// applied live to a running handle (see host::set_boot_enodes_json).
+///
+/// # Safety
+/// `enodes_json` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_boot_enodes(
+    handle: i64,
+    enodes_json: *const std::os::raw::c_char,
+) -> bool {
+    match read_string(enodes_json) {
+        Some(j) => crate::host::set_boot_enodes_json(handle, &j),
         None => false,
     }
 }

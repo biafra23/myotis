@@ -95,6 +95,41 @@ test('a fresh dir binds to the anchor; only the same anchor resumes; others get 
 });
 
 // #452: ethCallJson's `block` used to be ignored, so a historical block got
+// setBootEnodes (ABI 31, #465): a host's seed pins are applied or refused as
+// a whole, and a handle that has not started keeps them for its start. No
+// network is needed: a Created handle only stashes.
+test('setBootEnodes applies or refuses a seed list as a whole (ABI 31)', { skip }, () => {
+  assert.ok(m.init() >= 31, `init()=${m.init()}`);
+  assert.equal(typeof m.setBootEnodes, 'function');
+  const key = 'ab'.repeat(64);
+  const pin = (host) => `enode://${key}@${host}`;
+  assert.equal(m.setBootEnodes(-1, JSON.stringify([pin('1.2.3.4:30303')])), false, 'unknown handle');
+  const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
+  let h = -1;
+  try {
+    h = m.create('mainnet', join(base, 'pins'));
+    assert.ok(h >= 1, `create failed: ${h}`);
+    assert.equal(m.setBootEnodes(h, JSON.stringify([pin('1.2.3.4:30303'), pin('[2001:db8::1]:30303')])), true);
+    assert.equal(m.setBootEnodes(h, '[]'), true, 'an empty array clears the list');
+    const refused = [
+      'not json',
+      '{}',
+      JSON.stringify(['nope']),
+      JSON.stringify([pin('node.example.org:30303')]),        // DNS names are refused, not resolved
+      JSON.stringify([pin('1.2.3.4:1'), pin('1.2.3.4:1')]),  // duplicate address
+      JSON.stringify([pin('1.2.3.4:1'), 7]),                  // one bad entry refuses the whole push
+    ];
+    for (const bad of refused) {
+      assert.equal(m.setBootEnodes(h, bad), false, bad);
+    }
+    // A NUL byte is refused by the addon itself, before the engine.
+    assert.equal(m.setBootEnodes(h, '["enode://\0"]'), false);
+  } finally {
+    if (h >= 1) m.stop(h);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // head state back. The engine now refuses an unservable selector in-band, and
 // marks the refusal permanent with the JSON-RPC invalid-params code.
 test('ethCallJson refuses an unservable block as permanent invalid params (ABI 27)', { skip }, async () => {

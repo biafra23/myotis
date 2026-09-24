@@ -26,16 +26,21 @@
 //! create from a valid Rust value.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{CallAnchor, EnsQuery, EnsRootMode};
-use myotis_net::el::reader::ElReader;
+use myotis_net::el::reader::{parse_enode, ElReader};
 use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
 
 use crate::eljson;
+
+/// One dialable EL pin — a socket address and the peer's 64-byte public key —
+/// the shape `parse_enode` produces and the pool dials.
+type Enode = (SocketAddr, [u8; 64]);
 
 /// Slots per sync-committee period (for the finalized-slot → period diagnostics
 /// the verified-read results carry).
@@ -93,6 +98,11 @@ struct EngineState {
     /// spin_up (start AND resume) re-applies it after building the EL reader,
     /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
     pending_served_window: Mutex<HashMap<i64, u64>>,
+    /// Per-handle LAST-PUSHED host seed pins (`set_boot_enodes_json`, #465):
+    /// stashed for every spin_up (start AND resume — a resume rebuilds the
+    /// pool from scratch) and applied live to a running reader, exactly like
+    /// [`EngineState::pending_served_window`]. Dies with the handle.
+    pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
     /// Per-handle LAST-PUSHED log-index runtime bits, as
     /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
     /// portable snapshot, and a pause drops the EL reader with the index in it,
@@ -151,6 +161,7 @@ fn engine() -> Option<&'static EngineState> {
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
+                    pending_boot_enodes: Mutex::new(HashMap::new()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
@@ -691,6 +702,20 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 reader.set_served_block_window(w);
             }
         }
+        // Apply the host's seed pins pushed before this start (or before the
+        // pause this resume ends): the pool is rebuilt from scratch, and the
+        // pins are the host's answer to a starving pool (#465). Read under
+        // the stash lock, applied outside it (the pool call dials).
+        let pins = engine
+            .pending_boot_enodes
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&handle).cloned())
+            .filter(|pins| !pins.is_empty());
+        if let Some(pins) = pins {
+            let reader = Arc::clone(reader);
+            engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
+        }
         // Activate a portable log-index snapshot found on disk (the drop-in
         // path): its presence in the engine's own data dir is the opt-in —
         // the daemon has no settings surface at all, and hosts that do have
@@ -867,6 +892,7 @@ pub fn status_json(handle: i64) -> String {
                         ElCounts {
                             reader_available: true,
                             snap_peers: r.snap_peer_count().await,
+                            snap_serving: r.snap_serving_count().await,
                             discovered: r.discovered_count(),
                             attempted: r.attempted_count().await,
                             backed_off: r.backoff_count().await,
@@ -903,6 +929,12 @@ struct ElCounts {
     /// fast-fails instead of holding the full wake cap.
     reader_available: bool,
     snap_peers: usize,
+    /// The subset of `snap_peers` that can answer a read at the anchored head
+    /// NOW (`ElReader::snap_serving_count`: their own word or a served proof
+    /// puts them at or near it, and they are not read-benched). What the hosts
+    /// gate readiness on since ABI 31 — a pool of peers still syncing keeps
+    /// `snap_peers` positive for hours while every read fails (#465).
+    snap_serving: usize,
     discovered: usize,
     attempted: usize,
     backed_off: usize,
@@ -949,6 +981,9 @@ pub fn stop(handle: i64) {
         cache.remove(&handle);
     }
     if let Ok(mut pending) = engine.pending_served_window.lock() {
+        pending.remove(&handle);
+    }
+    if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
         pending.remove(&handle);
     }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
@@ -1002,6 +1037,98 @@ pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Cap on host-supplied seed pins per handle: a seed list is a handful of
+/// servers the host knows to be up, not a peer database (the cache is that).
+const MAX_HOST_ENODES: usize = 64;
+
+/// Pure: a host's seed-pin push (`myotis_set_boot_enodes`) → dialable pins,
+/// APPLIED OR REFUSED AS A WHOLE (CLAUDE.md §Trust — a push the engine
+/// half-applied is one the host cannot reason about): a non-array, any entry
+/// that is not a string or not a strict `enode://<128 hex>@ip:port` URL
+/// (`parse_enode` — a DNS name is refused, not resolved), a duplicate
+/// address, or more than [`MAX_HOST_ENODES`] entries refuses the push with
+/// every reason named. An empty array is a valid "clear".
+fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
+    let entries = match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Array(entries)) => entries,
+        Ok(_) => return Err("not a JSON array of enode:// strings".to_string()),
+        Err(e) => return Err(format!("not valid JSON: {e}")),
+    };
+    if entries.len() > MAX_HOST_ENODES {
+        return Err(format!(
+            "{} entries; at most {MAX_HOST_ENODES} seed pins are accepted",
+            entries.len()
+        ));
+    }
+    let mut pins: Vec<Enode> = Vec::with_capacity(entries.len());
+    let mut reasons = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(url) = entry.as_str() else {
+            reasons.push(format!("entry {i}: not a string"));
+            continue;
+        };
+        match parse_enode(url) {
+            Ok((addr, _)) if pins.iter().any(|(seen, _)| *seen == addr) => {
+                reasons.push(format!("entry {i}: duplicate address {addr}"));
+            }
+            Ok(pin) => pins.push(pin),
+            Err(why) => reasons.push(format!("entry {i}: {why}")),
+        }
+    }
+    if reasons.is_empty() {
+        Ok(pins)
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
+/// `myotis_set_boot_enodes` (ABI ≥ 31, #465): replace the handle's
+/// HOST-SUPPLIED EL seed pins with a JSON array of `enode://` URLs. Strict —
+/// the whole push is applied or refused ([`parse_boot_enodes_json`]; `false`
+/// with one WARN naming every reason, nothing applied). Applied immediately
+/// on a RUNNING handle's EL reader and STASHED for every spin_up (start AND
+/// resume), exactly like [`set_served_block_window`]: hosts push between
+/// create() and start(), and a resume rebuilds the pool. Set semantics — a
+/// later push replaces an earlier one; an empty array clears. `false` for an
+/// unknown handle (nothing stashed).
+pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
+    let pins = match parse_boot_enodes_json(enodes_json) {
+        Ok(pins) => pins,
+        Err(reason) => {
+            tracing::warn!(handle, %reason, "boot enodes refused; nothing applied");
+            return false;
+        }
+    };
+    let Some(engine) = engine() else { return false };
+    // Snapshot the reader under the handles lock and apply OUTSIDE it (the pool
+    // call dials), then stash under the lock again — only while the handle is
+    // still known, so a push racing stop() leaves nothing behind a removed
+    // handle (the discipline set_log_index_config_json keeps).
+    let reader = match engine.handles.lock() {
+        Ok(map) => match map.get(&handle) {
+            Some(ChainEntry::Running(_, _, Some(reader))) => Some(Arc::clone(reader)),
+            Some(_) => None, // Created / Paused / EL-less: stash only, applied at spin_up
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    if let Some(reader) = reader {
+        let live = pins.clone();
+        engine.rt.block_on(async move { reader.set_boot_enodes(live).await });
+    }
+    match engine.handles.lock() {
+        Ok(map) => {
+            if map.contains_key(&handle) {
+                if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
+                    pending.insert(handle, pins);
+                }
+            }
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -2401,11 +2528,15 @@ fn status_object(
     obj.insert("wsBoundPeriods".into(), s.ws_bound_periods.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
-    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
-    // elReaderAvailable distinguishes "EL warming up" from "EL reader failed to
-    // start" (the CL-only degraded mode) — the wake gate fast-fails the latter.
+    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers —
+    // both count POOLED peers. snapServingPeers (ABI >= 31) is the subset that
+    // can answer a read at the anchored head now; it is what the hosts gate
+    // on (#465). elReaderAvailable distinguishes "EL warming up" from "EL
+    // reader failed to start" (the CL-only degraded mode) — the wake gate
+    // fast-fails the latter.
     obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
+    obj.insert("snapServingPeers".into(), el.snap_serving.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
     obj.insert("attemptedDials".into(), el.attempted.into());
@@ -2440,7 +2571,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
-    r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""snapPeers":0,"snapServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
@@ -2800,9 +2931,9 @@ mod tests {
         );
         assert_eq!(v["elReaderAvailable"], false);
         // EL counts are zero for a not-started handle.
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
         }
         // Round-trips through the fallback constant too.
@@ -2852,6 +2983,7 @@ mod tests {
         let el = ElCounts {
             reader_available: true,
             snap_peers: 5,
+            snap_serving: 3,
             discovered: 240,
             attempted: 14,
             backed_off: 30,
@@ -2891,9 +3023,11 @@ mod tests {
         assert_eq!(synced["wsBoundPeriods"], 13);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
-        // readyPeers, since the pool holds only snap-capable READY peers).
+        // readyPeers, since the pool holds only snap-capable READY peers;
+        // snapServingPeers is its own count — the peers that can answer now).
         assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
+        assert_eq!(synced["snapServingPeers"], 3);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
         assert_eq!(synced["attemptedDials"], 14);
@@ -2955,9 +3089,9 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 14_560_000);
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1795);
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");
         }
     }
@@ -2983,6 +3117,74 @@ mod tests {
         // The stash dies with the handle.
         stop(handle);
         assert!(engine.pending_served_window.lock().unwrap().get(&handle).is_none());
+    }
+
+    #[test]
+    fn boot_enodes_json_is_applied_or_refused_as_a_whole() {
+        let key = "ab".repeat(64);
+        let pin = |host: &str| format!("enode://{key}@{host}");
+        // The empty "clear", and a valid list.
+        assert_eq!(parse_boot_enodes_json("[]").unwrap(), vec![]);
+        let two = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("[2001:db8::1]:30303")
+        ))
+        .unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].1, [0xab; 64]);
+        // Refused as a whole, every reason named — a good entry beside a bad
+        // one is not applied.
+        let mixed = parse_boot_enodes_json(&format!(r#"["{}","nope",7]"#, pin("1.2.3.4:30303")))
+            .unwrap_err();
+        assert!(mixed.contains("entry 1: missing the enode:// prefix"), "{mixed}");
+        assert!(mixed.contains("entry 2: not a string"), "{mixed}");
+        let dup = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("1.2.3.4:30303")
+        ))
+        .unwrap_err();
+        assert!(dup.contains("entry 1: duplicate address 1.2.3.4:30303"), "{dup}");
+        assert!(parse_boot_enodes_json("{}").unwrap_err().contains("not a JSON array"));
+        assert!(parse_boot_enodes_json("[").unwrap_err().contains("not valid JSON"));
+        let dns = parse_boot_enodes_json(&format!(r#"["{}"]"#, pin("node.example.org:30303")))
+            .unwrap_err();
+        assert!(dns.contains("numeric ip:port"), "{dns}");
+        let many = format!(
+            "[{}]",
+            (0..=MAX_HOST_ENODES)
+                .map(|i| format!("\"{}\"", pin(&format!("10.0.0.{i}:1"))))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse_boot_enodes_json(&many).unwrap_err().contains("at most 64"));
+    }
+
+    #[test]
+    fn boot_enodes_stash_pre_start_refuse_malformed_and_clear_on_stop() {
+        let key = "ab".repeat(64);
+        let list = format!(r#"["enode://{key}@1.2.3.4:30303"]"#);
+        // Unknown handle → false, nothing stashed.
+        assert!(!set_boot_enodes_json(999_999, &list));
+        let dir = std::env::temp_dir().join("myotis-host-boot-enodes-test");
+        let handle = create("mainnet", dir.to_str().unwrap());
+        assert!(handle > 0);
+        let engine = engine().unwrap();
+        let stashed = |h: i64| engine.pending_boot_enodes.lock().unwrap().get(&h).map(|p| p.len());
+        assert!(stashed(999_999).is_none());
+        // A Created (not-started) handle stashes the pins for spin_up.
+        assert!(set_boot_enodes_json(handle, &list));
+        assert_eq!(stashed(handle), Some(1));
+        // A malformed push is refused and leaves the earlier one in place.
+        assert!(!set_boot_enodes_json(handle, r#"["nope"]"#));
+        assert_eq!(stashed(handle), Some(1));
+        // An empty array is a valid clear.
+        assert!(set_boot_enodes_json(handle, "[]"));
+        assert_eq!(stashed(handle), Some(0));
+        // The stash dies with the handle.
+        stop(handle);
+        assert!(stashed(handle).is_none());
     }
 
     #[test]

@@ -38,7 +38,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
             + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,"
             + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
@@ -52,7 +52,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,\"elHunting\":true,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":true,"
-            + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
+            + "\"snapPeers\":6,\"snapServingPeers\":4,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
             + "\"executionBlockNumber\":20999000,"
@@ -73,7 +73,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":0,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,"
             + "\"optimisticBlockNumber\":0,\"finalizedBlockNumber\":0,\"executionBlockNumber\":0}";
 
@@ -170,9 +170,11 @@ class RustStatusJsonTest {
         assertTrue(s.lcHunting());
         assertTrue(s.elHunting());
         // EL pool/discovery counts now flow through (not hardcoded 0). The pool
-        // holds only snap-capable READY peers, so readyPeers == snapPeers.
+        // holds only snap-capable READY peers, so readyPeers == snapPeers;
+        // snapServingPeers is the engine's own count (ABI >= 31), not a mirror.
         assertEquals(6, s.snapPeers());
         assertEquals(6, s.readyPeers());
+        assertEquals(4, s.snapServingPeers());
         assertEquals(240, s.discoveredPeers());
         assertEquals(14, s.attemptedDials());
         assertEquals(30, s.backedOffPeers());
@@ -198,11 +200,38 @@ class RustStatusJsonTest {
 
     @Test
     void syncedButNoSnapPeersHasNoVerifiedHead() {
-        // SYNCED but zero snap peers → a verified read can't be served → MAX sentinel.
+        // SYNCED but an empty pool (and so nobody serving — the serving count is
+        // a subset of the pooled one) → a verified read can't be served → MAX
+        // sentinel.
         String noPeers = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
-                .replace("\"snapPeers\":6", "\"snapPeers\":0");
+                .replace("\"snapPeers\":6", "\"snapPeers\":0")
+                .replace("\"snapServingPeers\":4", "\"snapServingPeers\":0");
         StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noPeers);
         assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedWithPeersButNoneServingHasNoVerifiedHead() {
+        // SYNCED with a full pool of peers that cannot answer at the anchored
+        // head (#465) → a verified read can't be served → MAX sentinel; the
+        // pooled count alone no longer vouches for readiness.
+        String noneServing = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapServingPeers\":4", "\"snapServingPeers\":0");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noneServing);
+        assertEquals(6, s.snapPeers());
+        assertEquals(0, s.snapServingPeers());
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void oldShapeWithoutSnapServingKeyFallsBackToSnapPeers() {
+        // A pre-ABI-31 native (or a hand-written fixture) has no
+        // snapServingPeers key: the pooled count stands in, as before the key.
+        String old = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapServingPeers\":4,", "");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", old);
+        assertEquals(6, s.snapServingPeers());
+        assertEquals(0L, s.verifiedHeadAgeMs());
     }
 
     @Test
