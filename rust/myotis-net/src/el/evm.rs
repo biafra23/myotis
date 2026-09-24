@@ -3,11 +3,13 @@
 //! [`myotis_evm`] is sans-I/O and its [`SnapStateOracle`] is synchronous. This
 //! module is the I/O half: [`PoolOracle`] implements that trait over the snap
 //! peer pool, bridging each verified fetch to the async network via
-//! [`Handle::block_on`], and [`ElReader::eth_call`](crate::el::reader::ElReader)
-//! drives the `revm` executor on a blocking thread so that bridge never nests a
+//! [`Handle::block_on`], and
+//! [`ElReader::eth_call_overridden`](crate::el::reader::ElReader) drives the
+//! `revm` executor on a blocking thread so that bridge never nests a
 //! `block_on` inside a runtime worker.
 //!
-//! Every fetch pins to the executor-supplied `state_root` (the verified head's),
+//! Every fetch pins to the executor-supplied `state_root` (the call's anchor:
+//! the verified head's, or the beacon-finalized block's for [`CallAnchor::Finalized`]),
 //! so all reads in one call see a single consistent block. Verification is
 //! verify-on-fetch: `snap_get_account`/`snap_get_storage` MPT-verify against that
 //! root and `snap_get_bytecode` checks `keccak(code) == code_hash`, so a peer can

@@ -336,9 +336,13 @@ pub struct VerifiedBlock {
     pub full_transactions: Option<Vec<VerifiedTransaction>>,
 }
 
-/// How far below the beacon head a block pin may be and still verify cheaply
-/// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
-/// [target..head] is fetched in one request, so this bounds its size.
+/// How far below its window's anchor a block pin may be and still verify
+/// cheaply: the header window `[target ..= top]` is fetched in one request, so
+/// this bounds its size. The top is the finalized block for a pin at or below
+/// finality, else the optimistic head (`choose_window_top`, #465) — so a pin
+/// up to this far below FINALITY is served, which is deeper than the Java
+/// `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX` this value mirrors (Java measures
+/// from the head; a pin in `[fin − 511, head − 512)` serves here, not there).
 ///
 /// 512, not 256: Swarm's bee reads the previous redistribution round's start
 /// header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
@@ -775,8 +779,9 @@ const LOG_INDEX_FILL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// The fill's reads are shallow by construction: they append blocks at or
 /// below finality, and such a window anchors at the finalized block itself
 /// (`choose_window_top`), so its span never grows with a finality delay. Only
-/// a tail more than [`BULK_HEDGE_MIN_BACK`] below finality would take the bulk
-/// delay, and the tail's own window keeps it far inside that.
+/// a window of [`BULK_HEDGE_MIN_BACK`] headers or more takes the bulk delay,
+/// and the appender hands any gap deeper than [`APPEND_WINDOW`] (the same
+/// 128) to the bridge — so at most its boundary block can meet it.
 const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_millis());
 
 /// Cap on concurrently hedged attempts for one read. Two reasons to keep it
@@ -2386,8 +2391,8 @@ impl ElReader {
         if deep {
             // On-demand only — the background tick returned above. This path
             // cannot bridge (see the gate), and the per-block loop is not built
-            // for a deep gap: its verify window grows with the distance to the
-            // head, and past BLOCK_LOOKBACK_MAX it cannot succeed at all. Leave
+            // for a deep gap: its verify window grows with the distance to
+            // finality, and past BLOCK_LOOKBACK_MAX it cannot succeed at all. Leave
             // the gap to the background tick instead of burning the caller's
             // deadline on fetches that get slower the further behind we are.
             return;
@@ -5802,20 +5807,17 @@ impl ElReader {
         // falls to the stale-serve), unlike the request rejects below.
         let (head_num, head_hash) = self.anchored_head().map_err(FeeHistoryError::Build)?;
         let newest = newest_block.unwrap_or(head_num);
-        if newest > head_num {
-            return Err(FeeHistoryError::Reject(
-                "newest block is beyond the verified head".to_string(),
-            ));
-        }
-        let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
-        let oldest = newest + 1 - count;
-        // The window's top: the finalized block when `newest` is at or below
-        // it (#465), else the head — `newest <= head` here, so a top exists.
+        // The window's top, as for the other by-number reads: the finalized
+        // block when `newest` is at or below it (#465) — also while finality
+        // reports above a stale optimistic head — else the head; `None` is a
+        // block the node does not hold yet.
         let Some(top) = self.window_top(newest, (head_num, head_hash)) else {
             return Err(FeeHistoryError::Reject(
                 "newest block is beyond the verified head".to_string(),
             ));
         };
+        let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
+        let oldest = newest + 1 - count;
         if top.number() - oldest >= BLOCK_LOOKBACK_MAX {
             return Err(FeeHistoryError::Reject(format!(
                 "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
@@ -5866,8 +5868,9 @@ impl ElReader {
     }
 
     /// Build the fee history against one peer: one anchored window
-    /// `[oldest..head]` (the span past `newest` is what anchors it — and gives
-    /// the ACTUAL next-block base fee), then, when percentiles were requested,
+    /// `[oldest ..= top]` — the finalized block when `newest` is at or below
+    /// it, else the head (the span past `newest` is what anchors it — and
+    /// gives the ACTUAL next-block base fee), then, when percentiles were requested,
     /// every block's body + receipts fetched CONCURRENTLY (the Java pipelined
     /// `verifiedBlockTipsAsync` — sequential per-block round-trips blew the
     /// wallet's fee-poll timeout) and verified against `transactionsRoot` /
