@@ -96,11 +96,16 @@ pub type Enode = (SocketAddr, [u8; 64]);
 ///   state, and the pin was never re-dialed — account proofs failed until a
 ///   restart. A dropped pin must reconnect even while the pool is "full" of
 ///   peers that cannot serve.
-/// - NOBODY SERVING (`serving` == 0: no pooled peer can answer a read at the
-///   anchored head, `is_serving`): all of them, whatever the pool holds. A
-///   pool full of peers still syncing themselves is the #465 outage, and a
-///   pin — the network's or the host's, pushed for exactly this state — must
-///   not wait for evictions to make room.
+/// - NOBODY SERVING (`serving` == `Some(0)`: the beacon anchor has a head and
+///   no pooled peer can answer a read at it, `is_serving`): all of them,
+///   whatever the pool holds. A pool full of peers still syncing themselves
+///   is the #465 outage, and a pin — the network's or the host's, pushed for
+///   exactly this state — must not wait for evictions to make room. `None`
+///   = no anchored head yet (bootstrap, a cold checkpoint walk, offline):
+///   every peer's coverage is Unknown then and no read can succeed anyway,
+///   so this arm stays OFF and the two rules around it decide — a dead pin
+///   must not cost one SYN per backoff window through a 30-minute walk on a
+///   phone.
 /// - Otherwise (at/above target with someone serving): only pins ALREADY
 ///   PROVEN to serve snap data (cache `Confirmed`). A healthy pool would
 ///   otherwise perpetually re-handshake a pin that has never served —
@@ -111,13 +116,13 @@ pub type Enode = (SocketAddr, [u8; 64]);
 ///   costs nothing; only a proven pin that has DROPPED is re-dialed.
 fn pins_to_dial(
     live: usize,
-    serving: usize,
+    serving: Option<usize>,
     target: usize,
     pins: &[Enode],
     confirmed: &std::collections::HashSet<SocketAddr>,
 ) -> Vec<Enode> {
     pins.iter()
-        .filter(|(addr, _)| live < target || serving == 0 || confirmed.contains(addr))
+        .filter(|(addr, _)| live < target || serving == Some(0) || confirmed.contains(addr))
         .copied()
         .collect()
 }
@@ -402,10 +407,10 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
     /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start; and on a
-    /// maintainer tick when below target, when no pooled peer can answer at
-    /// the anchored head, or when a PROVEN snap server has dropped even with
-    /// a full pool — see `pins_to_dial`), NOT seeded into the cache: see the
-    /// warm-start comment in `dialer_loop`.
+    /// maintainer tick when below target, when the anchor has a head that no
+    /// pooled peer can answer at, or when a PROVEN snap server has dropped
+    /// even with a full pool — see `pins_to_dial`), NOT seeded into the cache:
+    /// see the warm-start comment in `dialer_loop`.
     boot_enodes: Vec<Enode>,
     /// The HOST's seed pins (`PeerPool::set_boot_enodes`, #465): the same
     /// semantics as `boot_enodes`, joined to it by `all_pins` in every pin
@@ -996,8 +1001,9 @@ impl PeerPool {
     /// host that re-pushes on every status poll costs nothing). From here on
     /// they are pins like the network's own (`all_pins`): dialed directly and
     /// never seeded into the cache (see `dialer_loop`), re-dialed by the
-    /// maintainer while the pool is below target or nobody serves and, above
-    /// that, once proven (`pins_to_dial`). A CHANGED list is dialed NOW,
+    /// maintainer while the pool is below target or, once the anchor has a
+    /// head, nobody serves at it and, above that, once proven
+    /// (`pins_to_dial`). A CHANGED list is dialed NOW,
     /// whatever the pool holds: the host pushed because its pool cannot
     /// serve, and a pool full of still-syncing peers must not stand in the
     /// way. One shot, so no re-handshake churn; `try_dial` skips a pin that
@@ -1620,10 +1626,13 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
             .filter(|c| c.quality == SnapQuality::Confirmed)
             .map(|c| c.addr)
             .collect();
-        // ...and (#465) whenever NO pooled peer can answer at the anchored
-        // head — judged on `is_serving`, stricter than the hunt's count: a
-        // peer whose head is still Unknown cannot answer yet either.
-        let serving_now = inner.count_where(is_serving).await;
+        // ...and (#465) whenever the anchor has a head and NO pooled peer can
+        // answer at it — judged on `is_serving`, stricter than the hunt's
+        // count: a peer whose head is still Unknown cannot answer yet either.
+        // No anchored head (bootstrap, a cold walk, offline) → `None`: nobody
+        // could serve a read then, and the arm stays off.
+        let anchored = inner.head_source.as_ref().and_then(|f| f()).is_some();
+        let serving_now = if anchored { Some(inner.count_where(is_serving).await) } else { None };
         let pins = inner.all_pins().await;
         let target = inner.pool_cfg.target_snap_peers;
         let due = pins_to_dial(live, serving_now, target, &pins, &confirmed);
@@ -2256,24 +2265,29 @@ mod tests {
 
         // Below target: every pin, proven or not — a dropped pin must reconnect
         // even when the pool is "full" of peers that cannot serve state.
-        assert_eq!(pins_to_dial(3, 3, 8, &pins, &none).len(), 2);
-        assert_eq!(pins_to_dial(0, 0, 8, &pins, &none).len(), 2);
+        assert_eq!(pins_to_dial(3, Some(3), 8, &pins, &none).len(), 2);
+        assert_eq!(pins_to_dial(0, None, 8, &pins, &none).len(), 2);
 
         // At/above target with someone serving: only pins already proven to
         // serve snap data, so a healthy pool doesn't perpetually re-handshake
         // a never-serving pin.
-        assert_eq!(pins_to_dial(8, 8, 8, &pins, &none).len(), 0);
-        let only = pins_to_dial(9, 9, 8, &pins, &confirmed_a);
+        assert_eq!(pins_to_dial(8, Some(8), 8, &pins, &none).len(), 0);
+        let only = pins_to_dial(9, Some(9), 8, &pins, &confirmed_a);
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].0, a); // the confirmed one, not b
 
         // The incident shape: a proven pin (the dedicated node) dropped while the
         // pool is at target with non-serving peers — it is still dialed.
-        assert_eq!(pins_to_dial(8, 1, 8, &pins, &confirmed_a).len(), 1);
+        assert_eq!(pins_to_dial(8, Some(1), 8, &pins, &confirmed_a).len(), 1);
 
-        // The #465 shape: the pool is full of peers that cannot answer at the
-        // anchored head — nobody serves — so every pin is due, proven or not.
-        assert_eq!(pins_to_dial(8, 0, 8, &pins, &none).len(), 2);
+        // The #465 shape: the anchor has a head and the pool is full of peers
+        // that cannot answer at it — nobody serves — so every pin is due,
+        // proven or not.
+        assert_eq!(pins_to_dial(8, Some(0), 8, &pins, &none).len(), 2);
+        // ...but not before the anchor has a head: every peer is Unknown then
+        // and no read could succeed, so a full pool keeps the proven-only rule.
+        assert_eq!(pins_to_dial(8, None, 8, &pins, &none).len(), 0);
+        assert_eq!(pins_to_dial(8, None, 8, &pins, &confirmed_a).len(), 1);
     }
 
     #[test]
@@ -2291,8 +2305,8 @@ mod tests {
         assert_eq!(all[0].1, [9u8; 64]);
         // The union feeds the same policy as the shipped pins.
         let none: std::collections::HashSet<SocketAddr> = Default::default();
-        assert_eq!(pins_to_dial(0, 0, 8, &all, &none).len(), 3);
-        assert_eq!(pins_to_dial(8, 8, 8, &all, &none).len(), 0);
+        assert_eq!(pins_to_dial(0, None, 8, &all, &none).len(), 3);
+        assert_eq!(pins_to_dial(8, Some(8), 8, &all, &none).len(), 0);
         // No network pins (mainnet, gnosis): the host list stands alone, its
         // own duplicate collapsed.
         assert_eq!(union_pins(&[], &host).len(), 2);

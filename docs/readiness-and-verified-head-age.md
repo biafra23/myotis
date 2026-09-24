@@ -180,8 +180,10 @@ again (see disk-and-network-usage.md §4.1). On the Rust engine that gate is
 necessary, not sufficient: `myotis_status` carries `snapPeers` but not
 `snapServingPeers`, so right after SYNCED a cold pool of still-syncing peers
 passes it while reads still fail (#465). The in-process hosts hold such a read
-until a serving peer exists; over JSON-RPC it comes back as the retryable
-`-32000` — keep polling and retry.
+only around a start or resume warm-up, and for at most 90 s
+(`WAKE_WAIT_CAP_MS`); on a stack that has been running, the read proceeds at
+once and fails in-band (#312). Over JSON-RPC it is the same retryable
+`-32000` either way — keep polling and retry.
 
 ## Block tags
 

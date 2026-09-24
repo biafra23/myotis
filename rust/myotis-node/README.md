@@ -103,9 +103,10 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   identical re-push is a no-op. The engine never persists it. A changed list
   is dialed at once; from then on the pins are pins like the network's own —
   never seeded into the peer cache, re-dialed while the pool is below its
-  target or no pooled peer can answer at the anchored head, and above that
-  once proven to serve. On an address the network also pins, the host's key
-  wins.
+  target or, once the beacon anchor has a head, no pooled peer can answer at
+  it, and above that once proven to serve. On an address the network also
+  pins, the host's key wins. An unspecified IP (`0.0.0.0`, geth's own enode
+  before it learns its external address) or port 0 is refused.
 - **Weak-subjectivity gate**: `statusJson().beaconState` can be `STALE_ANCHOR`
   — the engine refused to walk forward from an anchor (embedded checkpoint or
   persisted snapshot) older than the network's WS bound, because from that far

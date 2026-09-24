@@ -103,6 +103,11 @@ pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
     let Some((pubkey_hex, host_port)) = body.split_once('@') else {
         return Err("missing the '@' between the public key and the address");
     };
+    // Exactly 128 characters: `parse_pubkey` would also take a `0x` prefix,
+    // which no enode URL form carries.
+    if pubkey_hex.len() != 128 {
+        return Err("the public key must be 128 hex characters");
+    }
     let Some(pubkey) = crate::el::peercache::parse_pubkey(pubkey_hex) else {
         return Err("the public key must be 128 hex characters");
     };
@@ -124,6 +129,15 @@ pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
     let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else {
         return Err("the address must be a numeric ip:port");
     };
+    // geth prints its own enode as `@0.0.0.0:30303` until it learns its
+    // external address, so a host copying it from its node's log hits this:
+    // an unspecified IP or port 0 names no dialable remote (on Linux,
+    // connect() to 0.0.0.0 even reaches loopback — possibly a different local
+    // node). Refused by name; loopback stays allowed, fronting a local node
+    // is a legitimate use.
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return Err("the address must be dialable: an unspecified IP (0.0.0.0 / ::) or port 0 is refused");
+    }
     Ok((addr, pubkey))
 }
 
@@ -8333,6 +8347,19 @@ mod tests {
         assert_eq!(addr.port(), 30303);
         assert!(addr.is_ipv6());
         assert_eq!(pubkey, [0xab; 64]);
+        // No enode URL form carries a `0x` prefix: 130 characters are refused
+        // even though the shared decoder would strip it.
+        assert_eq!(
+            parse_enode(&format!("enode://0x{key}@1.2.3.4:30303")),
+            Err("the public key must be 128 hex characters")
+        );
+        // geth prints `@0.0.0.0:<port>` for its own node until it learns its
+        // external address; that and port 0 name no dialable remote. Loopback does.
+        let undialable = "the address must be dialable: an unspecified IP (0.0.0.0 / ::) or port 0 is refused";
+        assert_eq!(parse_enode(&format!("enode://{key}@0.0.0.0:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@[::]:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@1.2.3.4:0")), Err(undialable));
+        assert!(parse_enode(&format!("enode://{key}@127.0.0.1:30303")).is_ok());
         // geth's `?discport=` form (UDP port ≠ TCP port) is accepted and ignored;
         // any other query is refused by name.
         let with_discport = format!("enode://{key}@1.2.3.4:30303?discport=30301");
