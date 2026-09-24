@@ -1195,22 +1195,23 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     }
 }
 
-/// Parse a state read's RPC block selector (ABI ≥ 32, #465, #366) — BEFORE the
-/// handle lookup, as `eth_call` does: a selector no retry can serve (`earliest`,
-/// a block hash, garbage) is refused as invalid params, the request's own
-/// fault, whatever state the handle is in. `Err` is the JSON to return.
-fn parse_state_read_block(block: &str) -> Result<BlockSelector, String> {
+/// Parse a verified read's RPC block selector — BEFORE the handle lookup: a
+/// selector no retry can serve (`earliest`, a block hash, garbage) is refused
+/// as invalid params, the request's own fault, whatever state the handle is
+/// in. `Err` is the JSON to return. Shared by `eth_call` (#452) and the state
+/// reads (ABI ≥ 32, #465, #366).
+fn parse_read_block(block: &str) -> Result<BlockSelector, String> {
     parse_call_block(block).map_err(|msg| eljson::invalid_params_json(&msg))
 }
 
-/// The anchor a parsed state-read selector proves against: a head tag → the
-/// verified head; `finalized` → the beacon-finalized block; a number → the
-/// head, but only inside the window around it ([`check_call_block`], the same
-/// rule as `eth_call` since #452 — head state is the near-head trade-off,
-/// exact historical state is not held), else refused as JSON rather than
-/// answered from the head. The reader itself refuses `finalized` while no
-/// finalized block has landed.
-fn state_read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadAnchor, String> {
+/// The anchor a parsed selector reads at, judged against the head as of
+/// dispatch: a head tag → the verified head; `finalized` → the beacon-finalized
+/// block; a number → the head, but only inside the window around it
+/// ([`check_call_block`] — head state is the near-head trade-off, exact
+/// historical state is not held), else refused as JSON rather than answered
+/// from the head. The reader itself refuses `finalized` while no finalized
+/// block has landed.
+fn read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadAnchor, String> {
     check_call_block(selector, reader.optimistic_block_number()).map_err(|r| r.to_json())?;
     Ok(match selector {
         BlockSelector::Finalized => ReadAnchor::Finalized,
@@ -1220,12 +1221,12 @@ fn state_read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadA
 
 /// Verified account query as JSON (`AccountProofResult` shape / an
 /// `{"error": ...}` object) — `nativeRequestAccountJson`. `block` is the RPC
-/// block selector, applied or refused ([`state_read_anchor`]).
+/// block selector, applied or refused ([`read_anchor`]).
 pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
     };
-    let selector = match parse_state_read_block(block) {
+    let selector = match parse_read_block(block) {
         Ok(selector) => selector,
         Err(json) => return json,
     };
@@ -1239,7 +1240,7 @@ pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> Stri
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    let anchor = match state_read_anchor(selector, &reader) {
+    let anchor = match read_anchor(selector, &reader) {
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
@@ -1293,12 +1294,12 @@ pub fn get_storage_proof_json(
 /// `nativeGetCodeJson`: run a verified contract-code query (`eth_getCode`) for a
 /// running handle, returning the code result JSON, or `{"error": "..."}` for a
 /// transport / not-running / bad-input failure. `block` is the RPC block
-/// selector, applied or refused ([`state_read_anchor`]).
+/// selector, applied or refused ([`read_anchor`]).
 pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
     };
-    let selector = match parse_state_read_block(block) {
+    let selector = match parse_read_block(block) {
         Ok(selector) => selector,
         Err(json) => return json,
     };
@@ -1309,7 +1310,7 @@ pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    let anchor = match state_read_anchor(selector, &reader) {
+    let anchor = match read_anchor(selector, &reader) {
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
@@ -1323,7 +1324,7 @@ pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
 /// (`eth_getStorageAt`) for a running handle. `position_hex` is the 32-byte
 /// storage position (0x-hex); the trie key is that position itself — no ERC-20
 /// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`. `block` is the
-/// RPC block selector, applied or refused ([`state_read_anchor`]).
+/// RPC block selector, applied or refused ([`read_anchor`]).
 pub fn get_storage_at_json(
     handle: i64,
     address_hex: &str,
@@ -1336,7 +1337,7 @@ pub fn get_storage_at_json(
     let Some(position) = parse_word32(position_hex) else {
         return eljson::error_json("invalid storage position (expected 32-byte hex)");
     };
-    let selector = match parse_state_read_block(block) {
+    let selector = match parse_read_block(block) {
         Ok(selector) => selector,
         Err(json) => return json,
     };
@@ -1347,7 +1348,7 @@ pub fn get_storage_at_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    let anchor = match state_read_anchor(selector, &reader) {
+    let anchor = match read_anchor(selector, &reader) {
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
@@ -1403,9 +1404,9 @@ pub fn eth_call_overrides_json(
 ) -> String {
     // Every refusal of the request's own arguments is permanent (-32602): no
     // retry changes them. The block first, as the host adapters check it.
-    let call_block = match parse_call_block(block) {
+    let call_block = match parse_read_block(block) {
         Ok(b) => b,
-        Err(msg) => return eljson::invalid_params_json(&msg),
+        Err(json) => return json,
     };
     let overrides = match parse_state_overrides(overrides_json) {
         Ok(o) => o,
@@ -1453,15 +1454,9 @@ pub fn eth_call_overrides_json(
         Err(msg) => return eljson::error_json(msg),
     };
     // Against the head as of dispatch, like the host adapters' own check.
-    if let Err(refusal) = check_call_block(call_block, reader.optimistic_block_number()) {
-        return refusal.to_json();
-    }
-    // `finalized` runs against the beacon-finalized block; a head tag or a
-    // number inside the window runs against the head (the near-head trade-off
-    // documented on check_call_block).
-    let anchor = match call_block {
-        BlockSelector::Finalized => ReadAnchor::Finalized,
-        BlockSelector::Head | BlockSelector::Number(_) => ReadAnchor::Head,
+    let anchor = match read_anchor(call_block, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
     };
     match engine
         .rt

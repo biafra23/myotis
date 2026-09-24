@@ -73,28 +73,20 @@ complete on its own.
 
 ### Still open
 
-- [x] **`snapServingPeers` on the wallet-facing status surfaces.** Done
-  (owner's decision 2026-09-24): the JSON-RPC `myotis_status`, the iOS
-  `IosRpcStatusSource` and the daemon IPC `status` now carry it right after
-  `snapPeers`, and the wake-up guidance in `readiness-and-verified-head-age.md`
-  / `disk-and-network-usage.md` gates on it. A key addition, no ABI bump.
-- [x] **`finalized` on the state reads — Rust engine** (owner's decision
-  2026-09-24: Rust now, Java stays on #366). ABI 32: `request_account_json`,
-  `get_code_json` and `get_storage_at_json` take the RPC block selector and
-  apply or refuse it as `eth_call` has since #452; `finalized` verifies the
-  snap proof against the beacon-finalized state root with no fallback (a peer
-  that pruned it fails the attempt; a whole-pool miss is retryable); the
-  results carry `anchor`. The JVM adapter, the Node addon and the iOS wrapper
-  pass the selector through; the `io.myotis.api` state reads still have no
-  block parameter.
+- [x] **`snapServingPeers` on the wallet-facing status surfaces.** Done in
+  the #465 follow-ups PR (owner's decision 2026-09-24): JSON-RPC, iOS RPC
+  and daemon IPC status, and the wake-up guidance gates on it.
+- [x] **`finalized` on the state reads — Rust engine.** Done in the same PR
+  (owner's decision 2026-09-24: Rust now, Java stays on #366): ABI 32, the
+  three state reads take the selector, a finalized proof is verified at the
+  finalized state root with no fallback, results carry `anchor`.
   - [ ] **Java engine**: `VerifiedRpcBackend` still maps `finalized` to the
     head for the state reads, `eth_call` and the block reads — #366 item 5.
 - [x] **`Behind` peers in a race another peer won** — dropped consciously
-  (owner's decision 2026-09-24): the ladder ranks a `Behind` peer last, the
-  maintainer evicts it within a tick, and a strike nobody witnessed never
-  persists, so the residual cost is one live strike on a peer that is about
-  to leave anyway. The tip-lag arm keeps excusing them; the `RaceOutcome`
-  restructure is not worth its risk.
+  (owner's decision 2026-09-24): the ladder ranks such a peer last, the
+  maintainer evicts it within a tick, and an unwitnessed strike never
+  persists. (The `RaceOutcome` reasons are index-aligned since the same PR,
+  so the excuse is cheap if it is ever wanted.)
 - [ ] **Live cold-start checks.** (Owner's decision 2026-09-24: run now on
   the dev Mac; results to be recorded here.) None of the automated checks
   dial a cold peer cache. On mainnet with the Rust engine and
@@ -104,15 +96,15 @@ complete on its own.
   `verified: true`) while `latest` still fails on a pool that lacks the head;
   a known-serving enode pushed through the Node addon's `setBootEnodes` on a
   fresh data dir connects first, and a malformed entry refuses the whole
-  push. Steps in the PR bodies of #481 and #482.
-- [ ] **A seed-pin surface for the JVM hosts** (`io.myotis.api` / UniFFI).
-  `myotis_set_boot_enodes` exists on the C ABI, the Node addon and the iOS
-  wrapper only; no JVM host has asked.
-- [ ] **Smoke-gate classification.** `smoke-gate.mjs` files a full but
-  non-serving pool (`snapPeers >= 2`, `snapServingPeers == 0`) under peer
-  starvation — an environment result, like the other peer conditions. An
-  engine-side regression in the head probe would produce the same
-  annotation; the job still fails, only the label differs.
+  push; and, since ABI 32, a state read at `finalized` (`eth_getBalance`)
+  proving on the pool at hand. Steps in the PR bodies of #481 and #482.
+- [x] **A seed-pin surface for the JVM hosts** — dropped until a JVM host
+  asks: `myotis_set_boot_enodes` exists on the C ABI, the Node addon and the
+  iOS wrapper.
+- [x] **Smoke-gate classification** — accepted: `smoke-gate.mjs` files a
+  full but non-serving pool under peer starvation (an environment result,
+  like the other peer conditions); an engine-side regression in the head
+  probe would carry the same label, and the job still fails either way.
 - [ ] **Parity entries for #342.** Rust-only behaviour introduced by the
   three PRs, to be listed there as differs-fixed or differs-accepted:
   admission by announced head and lag eviction (the Java `EthHandler`

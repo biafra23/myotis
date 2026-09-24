@@ -748,22 +748,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
-        return accountVerifiedAt(hexAddress, "");
-    }
-
-    /**
-     * {@link #requestAccount(String)} at a block selector (ABI >= 32): a head tag or
-     * empty reads the verified head, {@code finalized} the beacon-finalized block
-     * (applied, never mapped to the head — #465, #366), a number only inside the
-     * window around the head; anything else the engine refuses. Package-private:
-     * the {@code io.myotis.api} surface has no block parameter yet, so only the
-     * JSON-RPC adapter ({@link RustVerifiedReads}) reaches this.
-     */
-    AccountProofResult accountVerifiedAt(String hexAddress, String block) {
-        JsonObject o = parseResultOrThrow(
-                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),
-                "account");
-        return accountFromJson(hexAddress, o);
+        return accountVerified(hexAddress, "");
     }
 
     /** Package-private test seam: JSON → {@link AccountProofResult} without JNI. */
@@ -817,6 +802,21 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     // ---- VerifiedReads helpers (used by RustVerifiedReads; not ChainHandle API) ----
+
+    /**
+     * {@link #requestAccount(String)} at a block selector (ABI >= 32): a head tag or
+     * empty reads the verified head, {@code finalized} the beacon-finalized block
+     * (applied, never mapped to the head — #465, #366), a number only inside the
+     * window around the head; anything else the engine refuses. Package-private:
+     * the {@code io.myotis.api} surface has no block parameter yet, so only the
+     * JSON-RPC adapter ({@link RustVerifiedReads}) reaches this.
+     */
+    AccountProofResult accountVerified(String hexAddress, String block) {
+        JsonObject o = parseResultOrThrow(
+                gated(() -> RustEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),
+                "account");
+        return accountFromJson(hexAddress, o);
+    }
 
     /**
      * Verified contract bytecode for {@code hexAddress} (eth_getCode) at the block

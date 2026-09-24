@@ -60,6 +60,11 @@ fn take(ptr: *mut c_char) -> String {
 /// A JS string crossing into C. Interior NULs can't appear in addresses/names/
 /// JSON, but a hostile caller must get an in-band error, not a panic (the
 /// workspace builds with `panic = "abort"`).
+/// The in-band refusal of an argument with a NUL byte on the calls whose own
+/// refusals are permanent (`eth_call`, the state reads): the same -32602 the
+/// engine gives a malformed selector.
+const NUL_INVALID_PARAMS: &str = r#"{"error":"argument contains NUL","code":-32602}"#;
+
 fn c_arg(s: &str) -> std::result::Result<CString, String> {
     CString::new(s).map_err(|_| r#"{"error":"argument contains NUL"}"#.to_string())
 }
@@ -288,7 +293,7 @@ pub fn request_account_json<'env>(
         (Ok(a), Ok(b)) => {
             take(unsafe { myotis_request_account_json(handle, a.as_ptr(), b.as_ptr()) })
         }
-        _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
+        _ => NUL_INVALID_PARAMS.to_string(),
     })
 }
 
@@ -315,7 +320,7 @@ pub fn eth_call_json<'env>(env: &'env Env,
             }),
             // A malformed argument, refused here instead of in the engine:
             // permanent, like the engine's own refusals for this call (README).
-            _ => r#"{"error":"argument contains NUL","code":-32602}"#.to_string(),
+            _ => NUL_INVALID_PARAMS.to_string(),
         }
     })
 }

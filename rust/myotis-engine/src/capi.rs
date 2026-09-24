@@ -724,8 +724,9 @@ mod tests {
             take(myotis_get_code_json(i64::MIN, addr.as_ptr(), c"earliest".as_ptr()))
         });
         assert_eq!(code["code"], -32602);
+        let null = std::ptr::null();
         let storage = parse(unsafe {
-            take(myotis_get_storage_at_json(i64::MIN, addr.as_ptr(), pos.as_ptr(), std::ptr::null()))
+            take(myotis_get_storage_at_json(i64::MIN, addr.as_ptr(), pos.as_ptr(), null))
         });
         assert_eq!(storage["error"], "unknown handle");
     }

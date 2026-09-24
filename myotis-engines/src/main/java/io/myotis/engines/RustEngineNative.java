@@ -242,10 +242,9 @@ final class RustEngineNative {
 
     // ---- EL verified-read surface. See RustChainHandle for the JSON contracts. ----
 
-    /** Verified account query as JSON (AccountProofResult shape / {@code error} object). */
-    /** {@code block} is the RPC block selector the engine checks (ABI >= 32): a head
-     *  tag or empty reads the verified head, {@code finalized} the beacon-finalized
-     *  block, a number only inside the window around the head. */
+    /** Verified account query as JSON (AccountProofResult shape / {@code error} object);
+     *  {@code block} is the RPC block selector the engine applies or refuses (ABI >= 32:
+     *  the contract is {@code myotis_engine.h}'s). */
     static String nativeRequestAccountJson(long handle, String address, String block) {
         return Myotis_engineKt.requestAccountJson(handle, nz(address), nz(block));
     }

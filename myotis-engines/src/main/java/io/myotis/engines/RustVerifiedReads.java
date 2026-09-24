@@ -468,7 +468,7 @@ final class RustVerifiedReads implements VerifiedReads {
         // the native query — so a malformed address never crosses the JNI boundary.
         if (address == null || address.length != 20) return null;
         try {
-            return handle.accountVerifiedAt(toHex(address), block);
+            return handle.accountVerified(toHex(address), block);
         } catch (RuntimeException e) {
             // Contain any unchecked failure (transport/not-running EngineException,
             // or a raw unchecked throwable off the native path) as "can't answer

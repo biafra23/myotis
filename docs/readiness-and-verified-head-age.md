@@ -197,8 +197,14 @@ pool that lacks the head. Since ABI 32 the state reads (`eth_getBalance`,
 `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`) apply it too on
 the Rust engine: the snap proof is verified against the finalized state root,
 and a peer that has pruned that state fails the attempt rather than answer
-from another block. The Java engine still resolves `finalized` to the head
-(#366).
+from another block — a miss that is not held against the peer. Best effort by
+nature: execution clients keep on the order of a hundred recent states (geth:
+~128 blocks) and finality trails the head by two epochs (64–96 blocks), so a
+finality delay puts the finalized state out of every peer's reach and the read
+comes back as the retryable `-32000` until finality catches up. On the JVM
+host the start/resume warm-up hold applies to `finalized` reads too (it waits
+for a head-serving peer that a finalized read does not need — at most 90 s).
+The Java engine still resolves `finalized` to the head (#366).
 
 ## Code pointers
 

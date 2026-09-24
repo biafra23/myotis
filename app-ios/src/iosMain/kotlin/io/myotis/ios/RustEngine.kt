@@ -187,10 +187,8 @@ object RustEngine {
         return take(myotis_status_json(handle)) ?: "{}"
     }
 
-    /** AccountProofResult JSON, or `{"error": ...}`. */
-    /** Verified account read. `block` (ABI >= 32) is the RPC selector the engine
-     *  checks: empty or a head tag reads the verified head, `finalized` the
-     *  beacon-finalized block, a number only near the head. */
+    /** AccountProofResult JSON, or `{"error": ...}`; `block` (ABI >= 32) is the RPC
+     *  selector the engine applies or refuses (the contract is `myotis_engine.h`'s). */
     fun requestAccountJson(handle: Long, address: String, block: String = ""): String {
         requireAbi()
         return take(myotis_request_account_json(handle, address, block))

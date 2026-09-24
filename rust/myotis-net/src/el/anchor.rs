@@ -35,6 +35,9 @@ pub struct SlottedStateRoot {
 /// keccak equals `block_hash`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalizedExecution {
+    /// The beacon slot whose finality update carried this execution block —
+    /// the `matchedBeaconSlot` of a proof verified against `state_root`.
+    pub slot: u64,
     pub block_number: u64,
     pub state_root: [u8; 32],
     pub block_hash: [u8; 32],
@@ -224,6 +227,7 @@ impl ExecAnchor {
 fn finalized_of(inner: &Inner) -> Option<FinalizedExecution> {
     match (inner.execution_state_root, inner.execution_block_hash) {
         (Some(state_root), Some(block_hash)) => Some(FinalizedExecution {
+            slot: inner.finalized_slot,
             block_number: inner.execution_block_number,
             state_root,
             block_hash,
