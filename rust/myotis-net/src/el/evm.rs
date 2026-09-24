@@ -289,6 +289,13 @@ pub struct PoolOracle {
     /// only reorders the NEXT call's snapshot, and even an eviction does not
     /// take the peer out of this one.
     order: Mutex<Vec<usize>>,
+    /// The call runs against the beacon-FINALIZED state root (the `finalized`
+    /// tag; #465, #366). Two things follow, both as for the reader's own
+    /// finalized state reads: a peer answering a fetch with an empty proof
+    /// does not hold a root it is not obliged to hold — no strike, no
+    /// witnessed failure (`record_race`, the prefetch wave) — and the shadow
+    /// cache, which measures head traffic, is not fed.
+    finalized: bool,
 }
 
 /// This call's ask order after one hedged race over `asked` (the order that
@@ -318,6 +325,7 @@ impl PoolOracle {
         handle: Handle,
         quality: Option<crate::el::pool::SnapQualitySink>,
         stats: Arc<ReadStats>,
+        finalized: bool,
     ) -> PoolOracle {
         let order = Mutex::new((0..peers.len()).collect());
         PoolOracle {
@@ -328,6 +336,7 @@ impl PoolOracle {
             leaf_memo: Mutex::new(HashMap::new()),
             stats,
             order,
+            finalized,
         }
     }
 
@@ -340,6 +349,9 @@ impl PoolOracle {
         leaf: Option<&AccountLeaf>,
         started: std::time::Instant,
     ) {
+        if self.finalized {
+            return; // the shadow cache measures head traffic (see `finalized`)
+        }
         self.stats.observe_account(
             address,
             *state_root,
@@ -358,6 +370,9 @@ impl PoolOracle {
         value: U256,
         started: std::time::Instant,
     ) {
+        if self.finalized {
+            return;
+        }
         self.stats.observe_storage(
             address,
             position,
@@ -380,11 +395,14 @@ impl PoolOracle {
     /// Feed one hedged race into the reputation sink: the winner served, every
     /// miss failed, and every attempt the winner outpaced reported as outpaced
     /// (benched; a repeat before the peer serves again is a failure). The same
-    /// rules as `ElReader::hedged_read`.
+    /// rules as `ElReader::hedged_read`, including its excuse: on a
+    /// `finalized` call a miss answered with an empty proof is the peer not
+    /// holding a root it is not obliged to hold, and is banked nowhere.
     async fn record_race<T>(
         quality: &Option<crate::el::pool::SnapQualitySink>,
         peers: &[Arc<ManagedPeer>],
         out: &RaceOutcome<T>,
+        finalized: bool,
     ) {
         debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
         let Some(q) = quality else { return };
@@ -392,7 +410,16 @@ impl PoolOracle {
         // whole-pool failure is banked live but persisted nowhere (#465 — the
         // same cold-pool storm that struck the block read hits these).
         let witnessed = out.accepted.is_some();
+        let excused = |idx: usize| {
+            finalized
+                && out.errors.iter().any(|(i, e)| {
+                    *i == idx && crate::el::snap::fetch::is_unknown_root_error(e)
+                })
+        };
         for idx in &out.missed {
+            if excused(*idx) {
+                continue;
+            }
             q.failed(peers[*idx].addr(), witnessed).await;
         }
         for idx in &out.outpaced {
@@ -450,7 +477,7 @@ impl PoolOracle {
                 |_: &AccountOutcome| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, outcome)| match outcome {
                 AccountOutcome::Present(leaf) => Some(leaf),
@@ -697,9 +724,17 @@ impl SnapStateOracle for PoolOracle {
                             if let Some(q) = &quality {
                                 if served_any {
                                     // This peer served items the held peers
-                                    // could not: their failures are witnessed.
+                                    // could not: their failures are witnessed
+                                    // — unless the call runs at the finalized
+                                    // root, where an item failure is almost
+                                    // always "does not hold that root" and
+                                    // the wave keeps no reason to tell it
+                                    // from transport (the serial reads that
+                                    // follow still strike a silent peer).
                                     for addr in unwitnessed.drain(..) {
-                                        q.failed(addr, true).await;
+                                        if !self.finalized {
+                                            q.failed(addr, true).await;
+                                        }
                                     }
                                     q.served(peer.addr()).await;
                                 } else if asked_any {
@@ -710,7 +745,9 @@ impl SnapStateOracle for PoolOracle {
                         }
                         if let Some(q) = &quality {
                             for addr in unwitnessed {
-                                q.failed(addr, false).await;
+                                if !self.finalized {
+                                    q.failed(addr, false).await;
+                                }
                             }
                         }
                     }
@@ -780,7 +817,7 @@ impl SnapStateOracle for PoolOracle {
                 |_: &Vec<u8>| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, value)| value)
         })?;
@@ -820,7 +857,7 @@ impl SnapStateOracle for PoolOracle {
                 |_: &Vec<u8>| true,
             )
             .await;
-            Self::record_race(&quality, peers, &out).await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
             self.learn_order(&asked, &out);
             out.accepted.map(|(_, code)| code)
         })?;

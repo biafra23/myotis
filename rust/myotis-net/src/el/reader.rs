@@ -1040,9 +1040,10 @@ enum PoolRaceVerdict<T> {
 /// `coverage[i]` is peer `i`'s coverage of the anchored HEAD, sampled BEFORE
 /// the race (an announcement arriving mid-read cannot absolve retroactively).
 /// Only the tip-lag verdict consults it: a won race's misses and a fatal
-/// failure keep their strikes — `RaceOutcome::errors` is not aligned with
-/// `missed`, so a per-peer excuse there would need a restructure, and a Behind
-/// peer rarely enters a race at all now that the ladder ranks it last.
+/// failure keep their strikes — the reasons in `RaceOutcome::errors` carry
+/// their peer position, so a per-peer excuse there would be cheap now, but a
+/// Behind peer rarely enters a race at all now that the ladder ranks it last
+/// (dropped consciously, docs/TODO.md).
 /// `head_anchored` = the window's top was the optimistic head. Only such a
 /// window can lose the one-slot race with the peers' imports; a window
 /// anchored at the FINALIZED block (`WindowTop::Finalized`) is minutes old, so
@@ -4528,7 +4529,7 @@ impl ElReader {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
                 |(r, _): &(VerifiedAccount, Duration)| r.verify_method.is_some(),
-                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unservable_root_error(e),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
                 "a verifiable account",
             )
             .await?;
@@ -4572,10 +4573,12 @@ impl ElReader {
     /// race stops asking — an answer that serves nothing, witnesses no miss,
     /// and earns its peer no credit (see `race_served_by_winner`). `excused`
     /// names, by its reason, a miss that is evidence about OUR ask rather
-    /// than the peer — a finalized read at a root the peer is not obliged to
-    /// hold — and is banked nowhere: neither a strike nor a witnessed
-    /// failure, so polling `finalized` cannot bench, evict or flip the cache
-    /// verdict of a peer that serves the head perfectly.
+    /// than the peer — a finalized read answered with an empty proof
+    /// (`is_unknown_root_error`: the peer does not hold a root it is not
+    /// obliged to hold) — and is banked nowhere: neither a strike nor a
+    /// witnessed failure, so polling `finalized` cannot bench, evict or flip
+    /// the cache verdict of a peer that serves the head perfectly. A garbage
+    /// proof at that root stays a strike, as on the head path.
     #[allow(clippy::too_many_arguments)]
     async fn hedged_read<T, Fut>(
         &self,
@@ -4758,9 +4761,10 @@ impl ElReader {
     /// silent substitution CLAUDE.md §Trust forbids. A peer that cannot prove
     /// at the finalized root (pruned it, most likely: execution clients keep
     /// on the order of a hundred recent states, and finality trails the head
-    /// by two epochs or more) fails this attempt; `hedged_read` excuses that
-    /// miss — the root is our ask, not the peer's fault — and lets the next
-    /// peer answer, and a whole-pool miss surfaces as a retryable error.
+    /// by two epochs or more) fails this attempt with an empty proof;
+    /// `hedged_read` excuses that miss — the root is our ask, not the peer's
+    /// fault — and lets the next peer answer, and a whole-pool miss surfaces
+    /// as a retryable error.
     async fn snap_account_at(
         &self,
         peer: &ManagedPeer,
@@ -5074,7 +5078,7 @@ impl ElReader {
                     r.verify_method.is_some() || is_global_fail(r.fail_reason)
                 },
                 |(r, _): &(VerifiedStorage, StorageSnapCost)| r.verify_method.is_some(),
-                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unservable_root_error(e),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
                 "verifiable storage",
             )
             .await?;
@@ -5640,7 +5644,7 @@ impl ElReader {
             ));
         }
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, true).await
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
@@ -5655,15 +5659,18 @@ impl ElReader {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, false).await
     }
 
     /// The executor half of the EVM setup: a fresh snap-peer snapshot + the
-    /// reader's cross-call caches bound over the given context.
+    /// reader's cross-call caches bound over the given context. `finalized` =
+    /// the context's state root is the beacon-finalized one, which the oracle
+    /// needs to know for its reputation and shadow-cache bookkeeping.
     async fn evm_executor_for(
         &self,
         ctx: myotis_evm::BlockContext,
         what: &str,
+        finalized: bool,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         // Snapshot the snap peers once: one consistent set for the whole call.
         let peers = self.pool.snap_peers().await;
@@ -5675,6 +5682,7 @@ impl ElReader {
             tokio::runtime::Handle::current(),
             Some(self.pool.quality_sink()),
             Arc::clone(&self.read_stats),
+            finalized,
         ));
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
