@@ -37,15 +37,29 @@ public class BeaconSyncState {
     public static final int FILL_THRESHOLD = 4;
 
     /**
+     * SYNCED also needs the finalized header within this many epochs of the wall clock.
+     * Finality trails the head by ~2 epochs, so a live feed stays well inside it; a frozen
+     * one — a withheld or stalled light-client feed, or a fork this build cannot follow —
+     * drops out within 5 epochs of its last finality, instead of staying SYNCED until the
+     * wall clock leaves the held committee's period (up to ~27.3 h on mainnet, ~11.4 h on
+     * Gnosis). Twin of the Rust engine's {@code SYNCED_SLOT_SLACK_EPOCHS}
+     * ({@code rust/myotis-net/src/sync.rs}, {@code sync_state_at}); keep the two equal.
+     * {@code BeaconLightClient.HUNT_SLACK_EPOCHS} is this value, so the LC hunt engages at
+     * the same staleness that ends SYNCED.
+     */
+    public static final int SYNCED_SLOT_SLACK_EPOCHS = 5;
+
+    /**
      * Coarse-grained sync state for the beacon light client, exposed via {@code beacon-status}.
      * <ul>
      *   <li>{@link #SYNCING} — no trust anchor yet; verification queries fail with
      *       {@code beaconNotSynced}.</li>
-     *   <li>{@link #CATCHING_UP} — trust anchor present but verification isn't dependable yet,
-     *       either because the state-root window is still sparse or because wall-clock has
-     *       crossed into a sync-committee period we don't hold.</li>
-     *   <li>{@link #SYNCED} — verification-ready: window populated and committee current.
-     *       Can regress back to {@link #CATCHING_UP} if we fall behind; not latched.</li>
+     *   <li>{@link #CATCHING_UP} — trust anchor present but verification isn't dependable: the
+     *       state-root window is still sparse, wall-clock has crossed into a sync-committee
+     *       period we don't hold, or the finalized head is more than
+     *       {@link #SYNCED_SLOT_SLACK_EPOCHS} epochs behind the wall clock.</li>
+     *   <li>{@link #SYNCED} — verification-ready: window populated, committee current, finality
+     *       recent. Can regress back to {@link #CATCHING_UP} if we fall behind; not latched.</li>
      *   <li>{@link #STALE_ANCHOR} — syncing is REFUSED: the best available trust anchor
      *       (embedded checkpoint or persisted snapshot, whichever is newer) is older than
      *       the weak-subjectivity bound, so an attacker holding keys of since-exited sync
@@ -224,9 +238,9 @@ public class BeaconSyncState {
 
     /**
      * Returns true if the beacon sync state has been populated with at least one update.
-     * <p>Note: this is true as soon as bootstrap completes. It does <em>not</em> imply the
-     * sync committee is current; use {@link #getFinalizedPeriod()} and compare against
-     * {@link BeaconChainSpec#currentMainnetPeriod()} to detect stale catch-up.
+     * <p>Note: this is true as soon as bootstrap completes, and it latches — it does
+     * <em>not</em> imply the sync committee is current or finality recent. The SYNCED gate
+     * for both is {@link #getSyncState}.
      */
     public boolean isSynced() {
         return state.get().executionStateRoot() != null;
@@ -268,24 +282,47 @@ public class BeaconSyncState {
     }
 
     /**
-     * Compute the coarse-grained sync state. Intended for {@code beacon-status} output
-     * and for clients deciding whether to issue verification queries.
+     * Compute the coarse-grained sync state at the wall clock. Intended for
+     * {@code beacon-status} output and for clients deciding whether to issue verification
+     * queries.
      *
-     * @param clGenesisTime CL genesis time (seconds since epoch) for the active network
-     * @param secondsPerSlot network slot time (mainnet 12, Gnosis 5) for wall-clock period estimation
+     * @param clGenesisTime  CL genesis time (seconds since epoch) for the active network
+     * @param secondsPerSlot network slot time (mainnet 12, Gnosis 5) for the wall-clock slot
+     * @param slotsPerEpoch  network epoch length (mainnet 32, Gnosis 16) for the finality
+     *                       freshness slack — the network's own, not the mainnet preset's
      */
-    public State getSyncState(long clGenesisTime, int secondsPerSlot) {
+    public State getSyncState(long clGenesisTime, int secondsPerSlot, int slotsPerEpoch) {
+        // Clamped at 0: a clock set before genesis reads as slot 0, never a negative slot
+        // (Rust twin: ChainConfig::current_slot_estimate, saturating).
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000L - clGenesisTime)
+                / Math.max(1, secondsPerSlot);
+        return syncStateAt(wallSlot, slotsPerEpoch);
+    }
+
+    /**
+     * {@link #getSyncState} at a given wall-clock slot: the SYNCED gate itself, pure in the
+     * clock so it is unit-testable (the Rust twin is {@code sync_state_at} in
+     * {@code rust/myotis-net/src/sync.rs}). SYNCED needs a finalized execution state root,
+     * {@link #FILL_THRESHOLD} known state roots, a committee period not behind the wall
+     * clock's, and a finalized slot at most {@link #SYNCED_SLOT_SLACK_EPOCHS} epochs behind
+     * {@code wallSlot}; a stale-anchor park overrides all of it.
+     */
+    State syncStateAt(long wallSlot, int slotsPerEpoch) {
         if (staleAnchorPeriod >= 0) {
             return State.STALE_ANCHOR;
         }
-        if (!isSynced()) {
+        // One read, so the root and the finalized slot come from the same update.
+        InnerState s = state.get();
+        if (s.executionStateRoot() == null) {
             return State.SYNCING;
         }
         if (getKnownStateRootCount() < FILL_THRESHOLD) {
             return State.CATCHING_UP;
         }
-        long wallPeriod = BeaconChainSpec.currentPeriod(clGenesisTime, secondsPerSlot);
-        if (currentSyncCommitteePeriod < wallPeriod) {
+        if (currentSyncCommitteePeriod < BeaconChainSpec.computeSyncCommitteePeriod(wallSlot)) {
+            return State.CATCHING_UP;
+        }
+        if (s.finalizedSlot() + (long) SYNCED_SLOT_SLACK_EPOCHS * slotsPerEpoch < wallSlot) {
             return State.CATCHING_UP;
         }
         return State.SYNCED;
@@ -374,9 +411,11 @@ public class BeaconSyncState {
      * dedup/cap path as live recording. Lets a warm restart reach SYNCED without first
      * re-observing {@link #FILL_THRESHOLD} live finality polls. Soundness: this only
      * pre-fills the "have we seen enough finality" counter — {@code getSyncState} still
-     * gates SYNCED on {@link #isSynced()} (a fresh post-restart update) and on the sync
-     * committee period being current, so a long-offline restart can't report SYNCED on
-     * stale roots alone.
+     * gates SYNCED on the sync committee period being current and on the finalized slot
+     * being within {@link #SYNCED_SLOT_SLACK_EPOCHS} epochs of the wall clock. The
+     * snapshot's own finality counts only while it is that recent, so a restart after any
+     * longer downtime reports SYNCED once a fresh finality update lands, never on stale
+     * roots alone.
      */
     public void importKnownStateRoots(Collection<SlottedStateRoot> roots) {
         if (roots == null) return;

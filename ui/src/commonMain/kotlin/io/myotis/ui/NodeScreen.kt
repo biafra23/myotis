@@ -811,8 +811,8 @@ private fun StatusTab(
 
 /** LC hunt banner: shown while the light client is starved of servers and hunting
  *  aggressively (boosted discovery + probing). Sits ABOVE the sync progress bar
- *  when both are visible, and shows on its own when the bar is gone (e.g. finality
- *  starvation while the state still reads SYNCED on the Java engine). */
+ *  when both are visible, and shows on its own when the bar is gone (e.g. a
+ *  snap-peer hunt on a SYNCED node). */
 @Composable
 private fun HuntBanner(s: NodeSnapshot) {
     if (!s.running) return

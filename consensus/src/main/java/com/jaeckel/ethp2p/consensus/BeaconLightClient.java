@@ -105,9 +105,10 @@ public class BeaconLightClient implements AutoCloseable {
     /** Still un-bootstrapped this long after the sync loop started → hunt. */
     static final long HUNT_BOOTSTRAP_STALL_MS = 60_000;
     /** Finalized head older than this many epochs behind wall clock (while the
-     *  committee period is current) → finality starvation → hunt. Matches the
-     *  Rust engine's SYNCED_SLOT_SLACK_EPOCHS. */
-    static final int HUNT_SLACK_EPOCHS = 5;
+     *  committee period is current) → finality starvation → hunt. The SYNCED
+     *  gate's own slack, so the hunt engages exactly when starved finality ends
+     *  SYNCED (Rust's hunt_due reads SYNCED_SLOT_SLACK_EPOCHS the same way). */
+    static final int HUNT_SLACK_EPOCHS = BeaconSyncState.SYNCED_SLOT_SLACK_EPOCHS;
     /** Catch-up (period behind wall clock) with zero store progress for this
      *  long → the catch-up fan-out itself is starved → hunt. A progressing
      *  catch-up never hunts. Matches the Rust HUNT_CATCHUP_STALL. */

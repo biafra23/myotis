@@ -326,7 +326,9 @@ The store tracks `currentSyncCommitteePeriod` **separately** from the finalized 
 
 - `SYNCING` — no verified EL state root yet (not bootstrapped).
 - `CATCHING_UP` — verified-state-root window has fewer than `FILL_THRESHOLD = 4` entries, **or**
-  `currentSyncCommitteePeriod < wallClockPeriod`.
+  `currentSyncCommitteePeriod < wallClockPeriod`, **or** the finalized slot is more than
+  `SYNCED_SLOT_SLACK_EPOCHS = 5` epochs (the network's own epoch length) behind the wall-clock
+  slot — the Rust engine's gate too, so a frozen finality feed leaves SYNCED on both.
 - `SYNCED` — otherwise.
 
 `BeaconSyncState` is lock-free for reads (an `AtomicReference` to an immutable state record) plus

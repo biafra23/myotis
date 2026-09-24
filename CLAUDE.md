@@ -506,9 +506,17 @@ that produced this note.
     cannot check against sync-committee signatures — proxying
     `beacon_blocks_by_range` is the live example — needs its own decision.
   - **Withholding is a liveness attack and this concentrates it.** It is
-    *detected*, not silently wrong: `BeaconSyncState` regresses out of SYNCED
-    and queries fail with `beaconNotSynced`, so a stalled relay surfaces as
-    "not ready" rather than as a confidently wrong balance.
+    *detected*, not silently wrong: both engines' SYNCED gate needs the
+    finalized header within 5 epochs of the wall clock
+    (`SYNCED_SLOT_SLACK_EPOCHS` in `BeaconSyncState` and `sync.rs`), so a
+    stalled relay drops the beacon status to `CATCHING_UP` once its last
+    finality is more than 5 epochs old (32 min on mainnet, ~7 min on gnosis)
+    and the hosts show "not ready". Reads do NOT start failing with
+    `beaconNotSynced` — that token only means no finalized root has ever
+    landed — they keep answering against the last anchor until peers can no
+    longer prove against it or the header chain passes 8192 blocks
+    (`headerChainGapTooLarge`). So the signal is the beacon status, not a read
+    error: anything that must not act on a stale anchor has to gate on it.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

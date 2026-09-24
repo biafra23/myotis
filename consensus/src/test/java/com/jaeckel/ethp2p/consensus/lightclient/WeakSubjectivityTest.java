@@ -41,19 +41,19 @@ class WeakSubjectivityTest {
         BeaconSyncState state = new BeaconSyncState();
         // Pre-bootstrap a fresh state reports SYNCING…
         assertEquals(BeaconSyncState.State.SYNCING,
-                state.getSyncState(1_606_824_023L, 12));
+                state.getSyncState(1_606_824_023L, 12, 32));
         // …a marked park reports STALE_ANCHOR and remembers the refused anchor…
         state.markStaleAnchor(1825L);
         state.setWsBoundPeriods(13L);
         assertEquals(BeaconSyncState.State.STALE_ANCHOR,
-                state.getSyncState(1_606_824_023L, 12));
+                state.getSyncState(1_606_824_023L, 12, 32));
         assertEquals(1825L, state.getStaleAnchorPeriod());
         assertEquals(13L, state.getWsBoundPeriods());
         // …and clearing it (bound raised / risk accepted / anchor fresh) returns
         // the machine to its normal derivation.
         state.clearStaleAnchor();
         assertEquals(BeaconSyncState.State.SYNCING,
-                state.getSyncState(1_606_824_023L, 12));
+                state.getSyncState(1_606_824_023L, 12, 32));
         assertEquals(-1L, state.getStaleAnchorPeriod());
     }
 }

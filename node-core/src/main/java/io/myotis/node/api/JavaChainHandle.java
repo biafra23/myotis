@@ -117,7 +117,8 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
         BeaconState beaconState = bss == null
                 ? BeaconState.STARTING
-                : BeaconState.valueOf(bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name());
+                : BeaconState.valueOf(bss.getSyncState(
+                        net.clGenesisTime(), net.secondsPerSlot(), net.slotsPerEpoch()).name());
 
         List<RLPxConnector.PeerInfo> active = conn != null ? conn.getActivePeers() : List.of();
         List<RLPxConnector.PeerInfo> ready = new ArrayList<>();
@@ -239,8 +240,8 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         }
         io.myotis.api.BeaconState state = bss == null
                 ? io.myotis.api.BeaconState.STARTING
-                : io.myotis.api.BeaconState.valueOf(
-                        bss.getSyncState(net.clGenesisTime(), net.secondsPerSlot()).name());
+                : io.myotis.api.BeaconState.valueOf(bss.getSyncState(
+                        net.clGenesisTime(), net.secondsPerSlot(), net.slotsPerEpoch()).name());
         byte[] stateRoot = bss != null ? bss.getVerifiedExecutionStateRoot() : null;
         byte[] blockHash = bss != null ? bss.getExecutionBlockHash() : null;
         long finalizedSlot = bss != null ? bss.getFinalizedSlot() : 0L;

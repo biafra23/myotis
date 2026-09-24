@@ -598,7 +598,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         BeaconSyncState bss = beaconSyncState;
         io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
         if (bss == null || b == null) return false;
-        BeaconSyncState.State s = bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+        BeaconSyncState.State s = bss.getSyncState(
+                network.clGenesisTime(), network.secondsPerSlot(), network.slotsPerEpoch());
         if (s == BeaconSyncState.State.STALE_ANCHOR) return true;
         return s == BeaconSyncState.State.SYNCED && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
     }
@@ -608,7 +609,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         BeaconSyncState bss = beaconSyncState;
         io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
         String beacon = bss == null ? "no beacon client"
-                : "beacon " + bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+                : "beacon " + bss.getSyncState(
+                        network.clGenesisTime(), network.secondsPerSlot(), network.slotsPerEpoch());
         String head = b == null ? "no RPC backend"
                 : b.verifiedHeadAgeMs() == Long.MAX_VALUE ? "no verified head yet" : "verified head warm";
         return beacon + ", " + head;
