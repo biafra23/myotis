@@ -171,8 +171,10 @@ public record NetworkConfig(
                     // Re-verified 2026-09-16 at the then-shipped period-1858 anchor,
                     // run 35065042347: 4 of 5 — 91.189.182.90 closed again and
                     // 57.129.130.18 served; a third close in a row would be grounds to prune.
-                    // Re-verified 2026-09-21 at the anchor this build ships (period
-                    // 1863), run 35616056243: 5 of 5 — 91.189.182.90 served in full.
+                    // Re-verified 2026-09-21 at the then-shipped period-1863 anchor,
+                    // run 35616056243: 5 of 5 — 91.189.182.90 served in full.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 1865), run 35988133216: 5 of 5 again.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -311,8 +313,9 @@ public record NetworkConfig(
             // updates. Re-verified 2026-09-13 at the then-shipped period-1358
             // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the then-shipped
             // period-1361 anchor, run 35065049320: 4 of 4 again; 2026-09-21 at the
-            // anchor this build ships (period 1365), run 35616060242: 4 of 4 again. Re-run it after every
-            // checkpoint refresh,
+            // then-shipped period-1365 anchor, run 35616060242: 4 of 4 again;
+            // 2026-09-24 at the anchor this build ships (period 1368), run
+            // 35989152817: 4 of 4 again. Re-run it after every checkpoint refresh,
             // since a census against a superseded root says nothing about the
             // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
@@ -436,8 +439,14 @@ public record NetworkConfig(
                     // run 34776024335: 8 of 8.
                     // Re-verified 2026-09-16 at the then-shipped period-3675 anchor,
                     // run 35065032444: 8 of 8 again.
-                    // Re-verified 2026-09-21 at the anchor this build ships (period
-                    // 3686), run 35616052466: 8 of 8 again.
+                    // Re-verified 2026-09-21 at the then-shipped period-3686 anchor,
+                    // run 35616052466: 8 of 8 again.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 3692), run 35988128286: 6 of 8 — both :9500 pins (134.65.194.144,
+                    // 164.152.161.131) failed to dial from the runner. One run from one
+                    // vantage point, and the pair has timed out on a runner before
+                    // (2026-09-13) and served every run since: a re-census signal, not
+                    // grounds to prune. Above the two-pin floor either way.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
