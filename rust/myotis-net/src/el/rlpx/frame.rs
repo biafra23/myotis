@@ -317,33 +317,9 @@ impl KeccakMac {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myotis_core::keccak::keccak256;
 
     fn pair() -> (FrameCodec, FrameCodec) {
-        // Fixed channel material; auth/ack "wire" are opaque MAC seeds here.
-        let aes_secret = keccak256(b"frame:aes");
-        let mac_secret = keccak256(b"frame:mac");
-        let a_nonce = keccak256(b"frame:A-nonce");
-        let b_nonce = keccak256(b"frame:B-nonce");
-        let auth_wire = b"AUTH-wire-bytes-opaque".to_vec();
-        let ack_wire = b"ACK-wire-bytes-opaque".to_vec();
-        let initiator = SessionSecrets {
-            aes_secret,
-            mac_secret,
-            egress_nonce: a_nonce,
-            ingress_nonce: b_nonce,
-            auth_wire: auth_wire.clone(),
-            ack_wire: ack_wire.clone(),
-        };
-        // Responder: swap nonce + wire roles.
-        let responder = SessionSecrets {
-            aes_secret,
-            mac_secret,
-            egress_nonce: b_nonce,
-            ingress_nonce: a_nonce,
-            auth_wire: ack_wire,
-            ack_wire: auth_wire,
-        };
+        let (initiator, responder) = SessionSecrets::test_pair();
         (FrameCodec::new(&initiator), FrameCodec::new(&responder))
     }
 

@@ -61,7 +61,10 @@ const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 /// freed by `prune_closed` with no backoff. (2) The Java hunt log reports a
 /// rolling distinct-busy-peer count; the Rust hunt log doesn't (the per-dial
 /// `busy` debug field is the Rust-side signal).
-fn is_busy_disconnect(e: &str) -> bool {
+///
+/// `pub(crate)` so the eth handshake's Status-stage test can assert that a
+/// Disconnect there lands in this class, end to end.
+pub(crate) fn is_busy_disconnect(e: &str) -> bool {
     e.starts_with("peer disconnected") && e.ends_with("reason=4")
 }
 /// How often the maintainer checks the pool and tops it back up to target
