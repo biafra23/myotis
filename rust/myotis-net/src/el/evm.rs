@@ -67,6 +67,17 @@ pub enum CallAnchor {
     Finalized,
 }
 
+impl CallAnchor {
+    /// The anchor for a `finalized: bool` selector (the ENS entry points').
+    pub fn for_finalized(finalized: bool) -> CallAnchor {
+        if finalized {
+            CallAnchor::Finalized
+        } else {
+            CallAnchor::Head
+        }
+    }
+}
+
 /// A call's outcome plus the block it actually ran against (#382, #465): a
 /// host that asked for `finalized` can see which block answered, and one that
 /// asked for `latest` learns the head it got.

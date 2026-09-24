@@ -556,9 +556,10 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// `{"status":"revert","dataHex":"0x…"}` on a revert, or
 /// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified
 /// — each also carrying `"blockNumber":N`, the block the call ran against, and
-/// `"verified":b`, true when that was the beacon-FINALIZED block (the
-/// `finalized` tag; the vocabulary of `ens_record_json`). ABI ≥ 30, additive:
-/// the hosts read `status` and the data keys only.
+/// `"verified":b`, true when the call RAN (`ok`/`revert`) against the
+/// beacon-FINALIZED block (the `finalized` tag; the vocabulary of
+/// `ens_record_json`). ABI ≥ 30, additive: the hosts read `status` and the
+/// data keys only.
 /// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
 /// (matching the reference engine, which treats revert/unavailable as "no answer").
 pub fn call_json(answer: &CallAnswer) -> String {
@@ -578,7 +579,10 @@ pub fn call_json(answer: &CallAnswer) -> String {
         }
     }
     obj.insert("blockNumber".into(), json_u64(answer.block_number));
-    obj.insert("verified".into(), answer.finalized.into());
+    // "Ran against the finalized block": an `unavailable` call ran nowhere, so
+    // it is never `verified`, whatever anchor it asked for.
+    let ran = !matches!(answer.outcome, CallOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -971,15 +975,24 @@ mod tests {
         assert_eq!(un["reason"], "out of gas");
         assert_eq!(un["verified"], false);
 
-        // a `finalized` call names the finalized block and says so
-        let fin = CallAnswer {
-            outcome: CallOutcome::Success(vec![0x01]),
+        // a `finalized` call names the finalized block and says so...
+        let at_fin = |outcome: CallOutcome| CallAnswer {
+            outcome,
             block_number: 20_999_936,
             finalized: true,
         };
-        let fin: serde_json::Value = serde_json::from_str(&call_json(&fin)).unwrap();
+        let fin: serde_json::Value =
+            serde_json::from_str(&call_json(&at_fin(CallOutcome::Success(vec![0x01])))).unwrap();
         assert_eq!(fin["blockNumber"], 20_999_936);
         assert_eq!(fin["verified"], true);
+        let rev: serde_json::Value =
+            serde_json::from_str(&call_json(&at_fin(CallOutcome::Revert(vec![0x08])))).unwrap();
+        assert_eq!(rev["verified"], true);
+        // ...but a call that could not run is never "verified", whatever it asked for.
+        let unavailable = at_fin(CallOutcome::Unavailable("state unavailable".to_string()));
+        let un: serde_json::Value = serde_json::from_str(&call_json(&unavailable)).unwrap();
+        assert_eq!(un["verified"], false);
+        assert_eq!(un["blockNumber"], 20_999_936);
     }
 
     #[test]

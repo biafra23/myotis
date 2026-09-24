@@ -107,9 +107,11 @@ uniffi::setup_scaffolding!();
 ///      beacon-finalized block and the block reads serve it, instead of the
 ///      optimistic head. The call envelope gained `blockNumber` and
 ///      `verified` (= ran against the finalized block), naming the block that
-///      answered (#382). `safe` and `pending` still resolve to the head —
-///      documented, not silent. A behavior change and a payload extension,
-///      no signature change.
+///      answered (#382; `verified` is false on `unavailable`, which ran
+///      nowhere). `safe` and `pending` still resolve to the head —
+///      documented, not silent — and so does `finalized` on the JVM hosts'
+///      state reads and on the Java engine (#366). A behavior change and a
+///      payload extension, no signature change.
 pub const ABI_VERSION: i32 = 30;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the

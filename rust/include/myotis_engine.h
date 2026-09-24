@@ -132,7 +132,8 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
 /* eth_call: {"status":"ok","resultHex"} | {"status":"revert","dataHex"} |
  * {"status":"unavailable","reason"} | {"error"} | {"error","code":-32602}.
  * Every status also carries "blockNumber" (the block the call ran against)
- * and "verified" (true = it ran against the beacon-FINALIZED block), ABI >= 30.
+ * and "verified" (true = an ok/revert that ran against the beacon-FINALIZED
+ * block; always false on unavailable), ABI >= 30.
  * `from` empty = anonymous; `value` is wei as a decimal string.
  * The engine checks `block` itself (ABI >= 27): latest/pending/safe or
  * empty/NULL run against the VERIFIED HEAD's state; "finalized" (ABI >= 30)

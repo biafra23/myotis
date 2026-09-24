@@ -142,8 +142,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   **beacon-finalized block** — older and never reorged, but a state peers may
   already have pruned, so it can fail retryably while `latest` serves (engines
   before ABI 30 ran it against the head). Every result carries `blockNumber`
-  (the block the call ran against) and `verified` (`true` = the finalized
-  block). A block number
+  (the block the call ran against) and `verified` (`true` = an `ok`/`revert`
+  that ran against the finalized block; always `false` on `unavailable`). A
+  block number
   (`0x`-hex, or bare decimal digits) runs only within `[head-64, head+16]` of
   the verified head (`statusJson().optimisticBlockNumber`), and even then it
   is answered from head state, not from that block (exact-block execution is
