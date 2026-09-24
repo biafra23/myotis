@@ -147,8 +147,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             // Read the peer's Status. `recv_answering_ping` answers any Ping in
             // between; the first other frame must be the Status (or a
             // Disconnect). Anything else fails the handshake instead of being
-            // skipped — like the Hello stage above and geth's `readStatusMsg`,
-            // and unlike the Java `EthHandler`, which logs it and keeps waiting.
+            // skipped — like the Hello stage above and, for eth messages,
+            // geth's `readStatusMsg` (geth's p2p layer also drops a stray Pong;
+            // we send no Ping here, so none is due) — and unlike the Java
+            // `EthHandler`, which logs it and keeps waiting.
             let frame = recv_answering_ping(&mut conn).await?;
             let peer_status = match frame.message_code {
                 messages::STATUS => messages::decode_status(&frame.payload, eth_version)
@@ -680,10 +682,35 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_stage_rejects_any_other_first_frame() {
-        // Gossip where the Status must be fails the handshake; it is not skipped
-        // to wait for a Status that may follow.
-        let (outcome, _) = handshake_against(vec![(messages::TRANSACTIONS, vec![0xc0])]).await;
-        assert_eq!(outcome.unwrap_err(), "expected Status, got code 0x12");
+        // Gossip, an eth/69 BlockRangeUpdate or a stray Pong where the Status
+        // must be fails the handshake, unanswered; it is not skipped to wait
+        // for a Status that may follow.
+        for code in [
+            messages::TRANSACTIONS,
+            messages::NEW_POOLED_TRANSACTION_HASHES,
+            messages::BLOCK_RANGE_UPDATE,
+            P2P_PONG,
+        ] {
+            let (outcome, answered) = handshake_against(vec![(code, vec![0xc0])]).await;
+            assert_eq!(outcome.unwrap_err(), format!("expected Status, got code 0x{code:02x}"));
+            assert!(answered.is_empty(), "code 0x{code:02x}: answered {answered:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_undecodable_or_foreign_status_is_incompatible() {
+        // The pool's dial arm blacklists on exactly these PREFIXES (the
+        // `incompatible` check in pool.rs) — a rewording here would demote a
+        // foreign-chain peer to a transient redial.
+        let (outcome, _) = handshake_against(vec![(messages::STATUS, vec![0xc0])]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("peer Status decode"), "{err}");
+
+        let foreign =
+            messages::encode_status69(69, 137, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+        let (outcome, _) = handshake_against(vec![(messages::STATUS, foreign)]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("incompatible peer"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
