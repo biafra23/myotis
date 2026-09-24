@@ -177,7 +177,9 @@ explicitly says not to open one.
 
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
 **ask these three questions first and act only on what they choose** (owner
-rulings, 2026-09-02 and 2026-09-11):
+rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
+below, mandatory, never asked about** (owner ruling, 2026-09-24). Everything a
+release needs goes into ONE release PR; the tag follows its merge.
 
 1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
    blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
@@ -261,6 +263,38 @@ rulings, 2026-09-02 and 2026-09-11):
    Run them AFTER any checkpoint refresh from question 1, so the build under
    test is the one being shipped. A failure here is release-blocking: it means
    a fresh install cannot sync, which is the one thing a wallet must do.
+
+4. **Move the version pins. MANDATORY — not a question, and part of the SAME
+   release PR as steps 1–3** (owner ruling, 2026-09-24). Every release from
+   v0.1.8 to v0.1.11 did this in its one release PR, but only by precedent; the
+   v0.1.12 checkpoint PR (#484) followed this list to the letter, answered the
+   three questions, and shipped no bump — `main` still declared 0.1.11, and the
+   tag would have been refused by `release-version-guard.yml`, which asks the
+   build for its version and compares it to the tag. That guard is the safety
+   net; this step is the mechanism. There is no command for it yet (review
+   follow-up: a `setReleaseVersion` task); until there is, it is these seven
+   files, mirrored from the previous release commit:
+
+   | file | what moves |
+   |---|---|
+   | `build.gradle.kts` | `version = "X.Y.Z-SNAPSHOT"` (root `allprojects`) |
+   | `rust/Cargo.toml` | the workspace `version` |
+   | `ios-app/Myotis/Version.xcconfig` | `MARKETING_VERSION = X.Y.Z` and `CURRENT_PROJECT_VERSION` (= `X*1000 + Y*100 + Z`, e.g. 0.1.12 → 1012; must stay monotonic) |
+   | `rust/Cargo.lock`, `rust/roost/Cargo.lock`, `rust/tor-poc/Cargo.lock` | `cargo update --workspace` in each of the three manifests, so the workspace crates' own entries follow |
+   | `rust/testdata/anchors/oldest-servable.properties` | the comment noting that this release's cold-start run (step 3) walked from these roots |
+
+   Then verify with the SAME query the guard makes, plus the two verifiers:
+
+   ```bash
+   ./gradlew -q :printReleaseVersion verifyCrateVersions verifyIosVersion   # must print releaseVersion=X.Y.Z
+   ```
+
+   `releaseVersion` must equal the tag without its `v`. A pin left behind is
+   not a cosmetic slip: the guard refuses the tag, and if it did not, the
+   release would ship a `vX.Y.Z`-named apk reporting the previous version in
+   Settings, next to a dmg stamped with it — the exact failure that produced the
+   guard (v0.1.5). The macOS dmg version is derived (major + 1) and needs no
+   edit.
 
 ## Pull requests and code review
 
