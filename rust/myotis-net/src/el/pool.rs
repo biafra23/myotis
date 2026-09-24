@@ -335,8 +335,8 @@ fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
 }
 
 /// Pure: does a pooled peer count as SERVING — on the evidence, able to answer
-/// a read at the anchored head — for the count the hosts' readiness is meant
-/// to gate on (`snapServingPeers`; the status plumbing is a follow-up)? Its
+/// a read at the anchored head — for the count the hosts' readiness gates on
+/// (the `snapServingPeers` status key, ABI ≥ 31)? Its
 /// own word or a served proof put it at or near our anchor (see
 /// `peer::Coverage`), and it is not read-benched. Evidence, not a guarantee: a
 /// `Near` peer, or one whose word is minutes old, can still miss a read at the
@@ -402,9 +402,10 @@ struct PoolInner {
     cache: Mutex<ElPeerCache>,
     /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
     /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start; and on a
-    /// maintainer tick when below target, or when a PROVEN snap server has
-    /// dropped even with a full pool — see `pins_to_dial`), NOT seeded into the
-    /// cache: see the warm-start comment in `dialer_loop`.
+    /// maintainer tick when below target, when no pooled peer can answer at
+    /// the anchored head, or when a PROVEN snap server has dropped even with
+    /// a full pool — see `pins_to_dial`), NOT seeded into the cache: see the
+    /// warm-start comment in `dialer_loop`.
     boot_enodes: Vec<Enode>,
     /// The HOST's seed pins (`PeerPool::set_boot_enodes`, #465): the same
     /// semantics as `boot_enodes`, joined to it by `all_pins` in every pin
@@ -473,17 +474,24 @@ impl PoolInner {
             let Some(p) = peers.iter_mut().find(|p| p.addr == addr) else {
                 return;
             };
+            let first = p.outpaced == 0;
             let (streak, strike) = outpace_verdict(p.outpaced);
             p.outpaced = streak;
             p.benched_until = Some(Instant::now() + READ_FAIL_BENCH);
             // The silent-loser event itself (#465): a request timeout never
             // fires for a hedged loser — the race drops it the moment a winner
             // answers — so this is where it is visible at info+, the level the
-            // hosts' log rings keep.
-            tracing::info!(
-                %addr, streak, strike,
-                "snap peer outpaced — silent while another peer served"
-            );
+            // hosts' log rings keep. Once per streak (an EVM prefetch has
+            // dozens of races in flight against the same first peer) and on
+            // the strike; the repeats in between stay at DEBUG.
+            if first || strike {
+                tracing::info!(
+                    %addr, streak, strike,
+                    "snap peer outpaced — silent while another peer served"
+                );
+            } else {
+                tracing::debug!(%addr, streak, "snap peer outpaced again (streak continues)");
+            }
             strike
         };
         // Outside the lock: record_quality takes it again (tokio's Mutex is

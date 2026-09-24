@@ -99,6 +99,13 @@ struct EngineState {
     /// pool from scratch) and applied live to a running reader, exactly like
     /// [`EngineState::pending_served_window`]. Dies with the handle.
     pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
+    /// Serializes the two paths that hand a stashed seed list to a reader —
+    /// a host's live push and the post-publish replay in `spin_up` — so the
+    /// pool always ends up holding the LATEST list: without it a push could
+    /// stash and apply a newer list between the replay's stash read and its
+    /// apply, and the older list would land last. Held across the pool call
+    /// (host threads only; no runtime task takes it).
+    boot_enodes_apply: Mutex<()>,
     /// Per-handle LAST-PUSHED log-index runtime bits, as
     /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
     /// portable snapshot, and a pause drops the EL reader with the index in it,
@@ -158,6 +165,7 @@ fn engine() -> Option<&'static EngineState> {
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
                     pending_boot_enodes: Mutex::new(HashMap::new()),
+                    boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
@@ -760,6 +768,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
 /// nothing to do — the stash stays for the next spin_up.
 fn apply_pending_boot_enodes(engine: &EngineState, handle: i64, reader: Option<&Arc<ElReader>>) {
     let Some(reader) = reader else { return };
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
     let pins = engine
         .pending_boot_enodes
         .lock()
@@ -1115,6 +1124,8 @@ pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
         }
     };
     let Some(engine) = engine() else { return false };
+    // Serialized with spin_up's replay (see `EngineState::boot_enodes_apply`).
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
     // Stash under the handles lock — stop() removes the entry under this same
     // lock and clears the stash after, so an entry stashed for a known handle
     // cannot outlive it (set_served_block_window's discipline) — and apply to

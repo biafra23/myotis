@@ -236,7 +236,8 @@ char *myotis_import_log_index_files(int64_t handle, const char *paths_json);
 char *myotis_export_log_index(int64_t handle, const char *path);
 
 /* v31: host-supplied EL seed pins (#465). enodes_json is a JSON array of
- * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS).
+ * "enode://<128-hex pubkey>@ip:port" strings (numeric address, no DNS; a
+ * trailing "?discport=<port>", as geth prints it, is accepted and ignored).
  * REPLACES the handle's host list (an empty array clears it; an identical
  * re-push is a no-op); on an address the network also pins, the host's key
  * wins. Applied or refused AS A WHOLE: false for NULL, invalid JSON, a

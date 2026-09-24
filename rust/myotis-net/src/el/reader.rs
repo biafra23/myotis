@@ -106,6 +106,21 @@ pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
     let Some(pubkey) = crate::el::peercache::parse_pubkey(pubkey_hex) else {
         return Err("the public key must be 128 hex characters");
     };
+    // geth prints `?discport=<udp port>` whenever a node's UDP port differs
+    // from its TCP one, so that is what a host copies from `admin.nodeInfo`
+    // or a static-nodes.json. The pool dials TCP only: accept the query and
+    // ignore it; any other query is refused by name, not as a bad address.
+    let host_port = match host_port.split_once('?') {
+        None => host_port,
+        Some((host_port, query))
+            if query
+                .strip_prefix("discport=")
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            host_port
+        }
+        Some(_) => return Err("only a ?discport=<port> query is accepted after the address"),
+    };
     let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else {
         return Err("the address must be a numeric ip:port");
     };
@@ -8318,6 +8333,19 @@ mod tests {
         assert_eq!(addr.port(), 30303);
         assert!(addr.is_ipv6());
         assert_eq!(pubkey, [0xab; 64]);
+        // geth's `?discport=` form (UDP port ≠ TCP port) is accepted and ignored;
+        // any other query is refused by name.
+        let with_discport = format!("enode://{key}@1.2.3.4:30303?discport=30301");
+        let (addr, _) = parse_enode(&with_discport).unwrap();
+        assert_eq!(addr.port(), 30303);
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?discport=")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?foo=bar")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
     }
 
 #[test]
