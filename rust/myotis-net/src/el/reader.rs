@@ -5514,7 +5514,10 @@ impl ElReader {
     /// a silent hash fallback.
     ///
     /// Returns `Ok(Some(block))` when a block is fetched and verified; `Ok(None)`
-    /// for a number ABOVE the verified head (a future/unknown block → eth `null`);
+    /// for a number the node does not hold — ABOVE the verified head AND not
+    /// covered by finality (`choose_window_top`: while finality briefly reports
+    /// above a stale head, a number up to the finalized block still serves,
+    /// anchored at the finalized hash) — a future/unknown block → eth `null`;
     /// and `Err` when it can't verify right now (no anchor, too far back, or every
     /// peer failed → the host maps this to an error the router surfaces as -32000).
     pub async fn get_block_by_number(
@@ -5567,7 +5570,8 @@ impl ElReader {
         // The window top: the finalized block when the target is at or below
         // it — a top every roughly synced peer holds, unlike the optimistic
         // head a peer one slot behind honestly lacks (#465) — else the head.
-        // A pin above the verified head is future/unknown, not an error.
+        // A pin above the verified head that finality does not cover either
+        // is future/unknown, not an error.
         let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
             return Ok(None);
         };
@@ -5791,9 +5795,13 @@ impl ElReader {
     /// the result reflects what was served.
     ///
     /// The error carries the Java tri-state split: a [`FeeHistoryError::Reject`]
-    /// is a bad request AGAINST THE CURRENT HEAD (Java answers these -32000,
-    /// never stale); a [`FeeHistoryError::Build`] is a transport/verify failure
-    /// the host may answer from its last-good same-signature snapshot.
+    /// is a bad request AGAINST THE CURRENT ANCHOR (Java answers these -32000,
+    /// never stale) — a zero count, a `newest_block` the node does not hold
+    /// (above the verified head AND not covered by finality, see
+    /// [`Self::get_block_by_number`]), or an oldest block beyond the verify
+    /// window of the top the window anchors at; a [`FeeHistoryError::Build`]
+    /// is a transport/verify failure the host may answer from its last-good
+    /// same-signature snapshot.
     pub async fn fee_history(
         &self,
         block_count: u64,
@@ -6197,7 +6205,9 @@ impl ElReader {
     /// Verified `eth_getBlockReceipts` by number/tag (`None` = latest): every
     /// receipt of the block, each carrying the same verified fields as
     /// [`Self::get_transaction_receipt`] (the Java `rpcGetBlockReceipts` twin).
-    /// `Ok(None)` = a verified future/unknown block (eth's null).
+    /// `Ok(None)` = a verified future/unknown block (eth's null): above the
+    /// verified head and not covered by finality, as for
+    /// [`Self::get_block_by_number`].
     pub async fn get_block_receipts(
         &self,
         target: Option<u64>,
@@ -6270,7 +6280,7 @@ impl ElReader {
         // target is at or below it (#465) — the log-index appender and fill
         // read at or just below finality, so they now need no path to the head.
         let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
-            return Ok(None); // future/unknown block → eth null
+            return Ok(None); // above the head, not final: future/unknown → eth null
         };
         let span = top.number() - target_num;
         if span >= BLOCK_LOOKBACK_MAX {

@@ -1724,7 +1724,8 @@ pub fn estimate_gas_json(
 /// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
 /// handle. `full_transactions` selects fully decoded tx objects instead of
 /// hashes. Returns the block JSON when found+verified, the literal `"null"` for
-/// a future/unknown block (eth's null), or `{"error": "..."}` when it can't
+/// a future/unknown block (eth's null — above the verified head and not
+/// covered by finality), or `{"error": "..."}` when it can't
 /// verify right now (which the Java side maps to a null → -32000).
 pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
     let target = match parse_block_target(block_tag) {
