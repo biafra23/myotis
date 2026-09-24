@@ -176,6 +176,19 @@ impl ExecAnchor {
         self.inner.lock().expect("anchor mutex").optimistic_block_number
     }
 
+    /// The optimistic head `(block_number, block_hash)` read under ONE lock,
+    /// for anchoring a header-chain walk — a number from one update paired
+    /// with the hash of the next would make a peer's correct header fail
+    /// verification. `None` until an optimistic update with a nonzero block
+    /// number lands.
+    pub fn optimistic_head(&self) -> Option<(u64, [u8; 32])> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_block_hash
+            .filter(|_| inner.optimistic_block_number > 0)
+            .map(|hash| (inner.optimistic_block_number, hash))
+    }
+
     /// The optimistic execution `(block_number, state_root)` read atomically —
     /// the CURRENT beacon-attested head state, at most a couple of slots old.
     /// `None` until the first optimistic update lands. This is the root snap
@@ -275,9 +288,11 @@ mod tests {
         assert_eq!(fin.state_root, root(1));
         assert_eq!(anchor.finalized_slot(), 100);
 
+        assert_eq!(anchor.optimistic_head(), None); // no optimistic update yet
         anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2));
         assert_eq!(anchor.optimistic_block_hash(), Some(root(0xf2)));
         assert_eq!(anchor.optimistic_block_number(), 21_000_005);
+        assert_eq!(anchor.optimistic_head(), Some((21_000_005, root(0xf2))));
         // The atomic (number, root) pair snap queries prefer (issue #355).
         assert_eq!(anchor.optimistic_execution(), Some((21_000_005, root(2))));
 

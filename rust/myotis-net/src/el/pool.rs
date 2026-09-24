@@ -29,7 +29,7 @@ use myotis_core::nodekey::NodeKey;
 
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
-use crate::el::peer::ManagedPeer;
+use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
 use crate::el::peercache::{ElPeerCache, SnapQuality};
 use crate::el::rlpx::transport::RlpxConnection;
@@ -155,6 +155,15 @@ const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 /// in lockstep, so an evicted laggard flips to `Denied` in the same beat and
 /// the hunt's confirmed-peer backoff bypass won't instantly re-dial it. Drift
 /// between the two constants would silently reopen that re-admit churn.
+///
+/// Since #465 the lockstep holds for WITNESSED failures only (see
+/// [`QualityOutcome`]): a failure no other peer contradicted still counts
+/// here, so the live pool rotates, but persists nothing — the peer it evicts
+/// is not flipped to `Denied`, and a hunt may re-dial it after one transient
+/// window. That re-dial costs one handshake and, while the hunt stays
+/// engaged, the few failed reads it takes to evict it again — the price of
+/// never poisoning the cache with a verdict nobody witnessed (14 of 27
+/// entries in #465's cold-start cache were such verdicts).
 const READ_FAILS_EVICT: u32 = 3;
 
 /// Enforce the equality the doc above calls load-bearing at COMPILE time, not
@@ -192,16 +201,70 @@ struct PooledPeer {
     read_fails: u32,
     /// Outpaces since the last successful serve (see [`OUTPACES_BEFORE_STRIKE`]).
     outpaced: u32,
+    /// Verified reads this peer has served this session.
+    served: u32,
+    /// The peer was cache-Confirmed (`snapok`) when dialed: a prior from an
+    /// earlier run, kept apart from `served` so a warm-start peer is not
+    /// ranked as unproven before its first read of this session.
+    cache_confirmed: bool,
+    /// When `probe_unknown_heads` last asked this peer for the anchored head;
+    /// `None` = never.
+    last_probe: Option<Instant>,
+    /// Consecutive head probes this peer ANSWERED without the anchored head
+    /// (see `probe_unknown_heads`); reset by any serve.
+    probe_misses: u32,
 }
 
-/// Read-ladder order over newest-first bench flags: unbenched peers first
-/// (newest first), benched ones behind them (newest first). Pure — the
-/// ordering is the rotation, so it is pinned by tests.
-fn ladder_order(benched_newest_first: &[bool]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..benched_newest_first.len())
-        .filter(|&i| !benched_newest_first[i])
-        .collect();
-    order.extend((0..benched_newest_first.len()).filter(|&i| benched_newest_first[i]));
+impl PooledPeer {
+    fn is_benched(&self, now: Instant) -> bool {
+        self.benched_until.is_some_and(|t| t > now)
+    }
+
+    /// Neither served this session nor cache-Confirmed when dialed.
+    fn unproven(&self) -> bool {
+        self.served == 0 && !self.cache_confirmed
+    }
+}
+
+/// One peer's read-ladder sort key. FIELD ORDER IS THE POLICY — the derived
+/// `Ord` sorts lexicographically:
+///  1. `behind`: a peer whose fresh word says it lacks the anchored head goes
+///     last, whatever else is true of it — its "0 headers" is the answer it
+///     predicted (#465), and asking it first is what made a cold pool fail
+///     every read;
+///  2. `benched`: a peer that just failed a read trails those that did not —
+///     a preference, never a veto, so the sole server stays reachable;
+///  3. `coverage`: its own word or a served proof put it at our anchor
+///     (Covers), near it (Near), or said nothing usable (Unknown) —
+///     `peer::Coverage`'s variant order;
+///  4. `unproven`: a peer that has neither served this session nor was
+///     cache-Confirmed when dialed trails one that has — the persisted cache
+///     now pays off on the READ path, not just the dial path (before #465 a
+///     warm start dialed its proven servers first, which made them the OLDEST
+///     connections and put them at the bottom of a newest-first ladder).
+///
+/// Ties keep the pool's newest-connection-first order — the pre-#465 ladder —
+/// because `ladder_order` sorts stably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LadderKey {
+    behind: bool,
+    benched: bool,
+    coverage: Coverage,
+    unproven: bool,
+}
+
+impl LadderKey {
+    fn new(benched: bool, coverage: Coverage, unproven: bool) -> LadderKey {
+        LadderKey { behind: coverage == Coverage::Behind, benched, coverage, unproven }
+    }
+}
+
+/// Read-ladder order over the pool's per-peer keys (newest connection first):
+/// the positions STABLY sorted by [`LadderKey`]. Pure — the ordering IS the
+/// rotation, so it is pinned by tests.
+fn ladder_order(keys: &[LadderKey]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| keys[i]);
     order
 }
 
@@ -221,6 +284,76 @@ fn read_failure_verdict(fails_before: u32, pool_len: usize) -> (u32, bool) {
     }
     let fails = fails_before.saturating_add(1);
     (fails, fails >= READ_FAILS_EVICT)
+}
+
+/// Cool-off for a peer refused or evicted as lagging (see `peer::refusing_lag`
+/// and `evict_lagging_peers`). A syncing node needs hours, but ten minutes
+/// re-checks often enough to re-admit one that caught up. Deliberately LONGER
+/// than `BACKOFF_TRANSIENT`: the EL hunt's backoff bypass (`maintainer_loop`)
+/// clears only transient-length entries, so a hunt never re-dials a known
+/// laggard — it cannot serve, and the dial budget is better spent on discovery.
+const BACKOFF_LAGGING: Duration = Duration::from_secs(10 * 60);
+
+/// Pure: may a verified-read FAILURE be persisted as a snap verdict against
+/// the peer? Generalises the sole-peer shield in `record_quality`: a failure
+/// nobody contradicted is evidence about OUR ask (a head no peer has yet, a
+/// root every peer pruned), not about the peer. `witnessed` = another peer
+/// served the same read; `other_live_peer` = the pool holds a peer at a
+/// different address. Both must hold. #465 watched a cold pool's whole-batch
+/// tip-lag failures flip 14 of 27 cache entries to `snapbad`, so the next
+/// cold start dialed its proven servers last.
+fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
+    witnessed && other_live_peer
+}
+
+/// Pure: does a pooled peer count as SERVING — on the evidence, able to answer
+/// a read at the anchored head — for the count the hosts' readiness is meant
+/// to gate on (`snapServingPeers`; the status plumbing is a follow-up)? Its
+/// own word or a served proof put it at or near our anchor (see
+/// `peer::Coverage`), and it is not read-benched. Evidence, not a guarantee: a
+/// `Near` peer, or one whose word is minutes old, can still miss a read at the
+/// very tip. A pool of eth/68 peers therefore serves once one of them proves
+/// itself (`probe_unknown_heads`), not the moment it connects — which is the
+/// point: #465's hosts gated on a count that was true while every read failed.
+fn is_serving(benched: bool, cov: Coverage) -> bool {
+    !benched && matches!(cov, Coverage::Covers | Coverage::Near)
+}
+
+/// Pure: does a pooled peer count toward the EL hunt's "somebody could
+/// serve" tally? Looser than `is_serving`: `Unknown` counts (no evidence is
+/// not evidence of absence, and before the anchor lands every peer is
+/// Unknown — the hunt must not engage on a pool that is merely waiting for
+/// the beacon side). Only a read-benched peer or one whose fresh word says it
+/// lacks the head is excluded — a pool of nothing but those is a serving
+/// outage, exactly like an empty one.
+fn counts_for_hunt(benched: bool, cov: Coverage) -> bool {
+    !benched && cov != Coverage::Behind
+}
+
+/// A verified-read outcome against one peer, as the pool's quality accounting
+/// records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QualityOutcome {
+    /// Usable, verified data came back.
+    Served,
+    /// The read failed and another peer served the same read: WITNESSED —
+    /// evidence about this peer, banked live and persisted (under the
+    /// sole-peer shield).
+    Failed,
+    /// The read failed and no peer served it: benched and counted toward
+    /// eviction, so the live pool still rotates, but persisted NOWHERE (see
+    /// `persist_verdict`).
+    FailedUnwitnessed,
+}
+
+impl QualityOutcome {
+    fn failed(witnessed: bool) -> QualityOutcome {
+        if witnessed {
+            QualityOutcome::Failed
+        } else {
+            QualityOutcome::FailedUnwitnessed
+        }
+    }
 }
 
 struct PoolInner {
@@ -248,9 +381,12 @@ struct PoolInner {
     /// Recent headers we can serve to peers + the eth/69 advertised range source.
     served: Arc<ServedHeaders>,
     /// The beacon-anchored head (number, hash) to backfill toward — the batch
-    /// anchor. None (or a None result) → no backfill (fixtures; pre-sync). A
-    /// closure, not the anchor itself — the pool stays anchor-free.
-    head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
+    /// anchor — and the yardstick every peer's head observation is stamped
+    /// with (shared with each pooled peer's read loop, see `peer::KnownHead`).
+    /// None (or a None result) → no backfill, no judgement (fixtures;
+    /// pre-sync). A closure, not the anchor itself — the pool stays
+    /// anchor-free.
+    head_source: Option<AnchorSource>,
     /// Round-robin cursor for backfill peer selection.
     backfill_rr: std::sync::atomic::AtomicUsize,
     /// True while a spawned backfill fetch is in flight: the 10 s tick is
@@ -305,13 +441,15 @@ impl PoolInner {
         // shield, may evict, and feeds the persisted verdict, exactly as a
         // failed read does.
         if strike {
-            self.record_quality(addr, false).await;
+            // Witnessed by construction: outpaced means another peer answered.
+            self.record_quality(addr, QualityOutcome::Failed).await;
         }
     }
 
     /// The single quality-recording path (dirty-gated flush inside) — shared by
     /// the pool's public sinks and [`SnapQualitySink`] so behavior can't drift.
-    async fn record_quality(&self, addr: SocketAddr, served: bool) {
+    async fn record_quality(&self, addr: SocketAddr, outcome: QualityOutcome) {
+        let served = outcome == QualityOutcome::Served;
         // LIVE-POOL accounting first (this is the rotation the 2026-09-02
         // stale-pool wedge was missing — 8 lagging cached peers held every
         // slot because a failed read cost them nothing here): a success
@@ -335,6 +473,8 @@ impl PoolInner {
                     p.benched_until = None;
                     p.read_fails = 0;
                     p.outpaced = 0;
+                    p.probe_misses = 0;
+                    p.served = p.served.saturating_add(1);
                 } else {
                     let (fails, evict) = read_failure_verdict(p.read_fails, len);
                     if evict {
@@ -352,7 +492,7 @@ impl PoolInner {
                         self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
                         self.attempted.lock().await.remove(&addr);
                         // fall through to the persisted verdict below
-                        return self.record_quality_cache(addr, served).await;
+                        return self.persist_quality(addr, outcome).await;
                     }
                     // Not evicting: bank the strike and bench the peer so the
                     // read ladder tries others first. (On the evict branch the
@@ -362,26 +502,38 @@ impl PoolInner {
                 }
             }
         }
-        // Never demote the LAST live snap peer: an empty/failed fetch against
-        // the sole server usually means WE asked for a root outside its
-        // snapshot window (stale local head), not that the peer is bad — and
-        // three such strikes would persist a snapbad verdict against the one
-        // peer still serving us. Twin of the Java benchUnlessLastServing scan
-        // (`h != failed`): the guard keys on whether any OTHER peer is live,
-        // not on pool size — a lone pooled peer at a DIFFERENT address means
-        // the failing one isn't our last resort and the strike must count.
-        // (Deliberate asymmetry with Java: this skips a PERSISTED verdict
-        // step, Java skips a transient 30s bench — the transient bench above
-        // now exists here too, but the persisted verdict keeps its guard.)
-        if !served && !self.peers.lock().await.iter().any(|p| p.addr != addr) {
-            tracing::debug!(%addr, "skipping snap-failure verdict — no other serving peer");
-            return;
-        }
-        self.record_quality_cache(addr, served).await;
+        self.persist_quality(addr, outcome).await;
     }
 
-    /// The persisted half of [`record_quality`] (cache verdict + flush).
-    async fn record_quality_cache(&self, addr: SocketAddr, served: bool) {
+    /// The persisted half of [`record_quality`](Self::record_quality). A serve
+    /// always confirms. A failure reaches the cache only under
+    /// [`persist_verdict`]: witnessed by another peer serving the same read,
+    /// AND with another peer live. The second half is the older sole-peer
+    /// shield — never demote the LAST live snap peer: an empty/failed fetch
+    /// against the sole server usually means WE asked for a root outside its
+    /// snapshot window (stale local head), not that the peer is bad, and three
+    /// such strikes would persist a snapbad verdict against the one peer still
+    /// serving us. Twin of the Java benchUnlessLastServing scan (`h != failed`):
+    /// it keys on whether any OTHER peer is live, not on pool size — a lone
+    /// pooled peer at a DIFFERENT address means the failing one isn't our last
+    /// resort. (Deliberate asymmetry with Java: this skips a PERSISTED verdict,
+    /// Java skips a transient 30 s bench — the transient bench exists here too,
+    /// in the live half.) The first half is #465's generalisation of it to a
+    /// whole batch nobody served.
+    async fn persist_quality(&self, addr: SocketAddr, outcome: QualityOutcome) {
+        let served = match outcome {
+            QualityOutcome::Served => true,
+            // Nobody served: nothing to persist, no lock to take.
+            QualityOutcome::FailedUnwitnessed => return,
+            QualityOutcome::Failed => {
+                let other_live = self.peers.lock().await.iter().any(|p| p.addr != addr);
+                if !persist_verdict(true, other_live) {
+                    tracing::debug!(%addr, "skipping the persisted snap-failure verdict — no other peer live");
+                    return;
+                }
+                false
+            }
+        };
         let mut cache = self.cache.lock().await;
         if served {
             cache.record_snap_served(addr);
@@ -429,6 +581,70 @@ impl PoolInner {
             }
         }
         peers.len()
+    }
+
+    /// The beacon-anchored head `(number, hash)`, or `None` before the anchor
+    /// has one (fixtures; pre-sync). A sync closure over the anchor's std
+    /// mutex: call it BEFORE taking any pool lock, never inside.
+    fn anchored_head(&self) -> Option<(u64, [u8; 32])> {
+        self.head_source.as_ref().and_then(|f| f()).filter(|&(n, _)| n > 0)
+    }
+
+    fn anchored_head_number(&self) -> Option<u64> {
+        self.anchored_head().map(|(n, _)| n)
+    }
+
+    /// Live peers satisfying `pred(benched, coverage)` — `is_serving` for the
+    /// hosts' count, `counts_for_hunt` for the EL hunt.
+    async fn count_where(&self, pred: fn(bool, Coverage) -> bool) -> usize {
+        let now = Instant::now();
+        self.peers.lock().await.iter().filter(|p| pred(p.is_benched(now), p.peer.coverage())).count()
+    }
+
+    /// Evict a pooled peer as LAGGING — its own word, or its answers to the
+    /// head probe, put it behind the anchored head — with the long backoff and
+    /// no cache verdict (lagging is not a snap-quality judgement). Never the
+    /// sole peer, the asymmetry `read_failure_verdict` keeps: a Behind sole
+    /// peer serves nothing now, but evicting it with the long backoff
+    /// guarantees nothing serves for ten minutes (a lagging pin, the only peer
+    /// on sepolia, would be out of the hunt's reach), while a pooled one serves
+    /// the moment its next word says it caught up — it still ranks last and
+    /// does not count for the hunt. The address stays claimed until the
+    /// backoff is recorded, the ordering the read-failure eviction in
+    /// `record_quality` documents, so a concurrent dial cannot re-dial it in
+    /// the gap.
+    async fn evict_lagging(&self, addr: SocketAddr, why: &str) {
+        let was_pooled = {
+            let mut peers = self.peers.lock().await;
+            if peers.len() <= 1 {
+                return;
+            }
+            let before = peers.len();
+            peers.retain(|p| p.addr != addr);
+            peers.len() != before
+        };
+        if !was_pooled {
+            return;
+        }
+        tracing::info!(%addr, "evicting snap peer as lagging: {why}");
+        self.record_backoff(addr, BACKOFF_LAGGING, Instant::now()).await;
+        self.attempted.lock().await.remove(&addr);
+    }
+
+    /// A head probe the peer ANSWERED without the anchored head (see
+    /// `probe_unknown_heads`): count it, and at [`PROBE_MISSES_EVICT`] in a
+    /// row evict the peer as lagging.
+    async fn note_probe_miss(&self, addr: SocketAddr) {
+        let misses = {
+            let mut peers = self.peers.lock().await;
+            let Some(p) = peers.iter_mut().find(|p| p.addr == addr) else { return };
+            p.probe_misses = p.probe_misses.saturating_add(1);
+            p.probe_misses
+        };
+        if misses >= PROBE_MISSES_EVICT {
+            self.evict_lagging(addr, &format!("it answered {misses} head probes without the anchored head"))
+                .await;
+        }
     }
 
     /// Record an address backoff for `window` (one of the BACKOFF_* consts).
@@ -492,11 +708,39 @@ impl PoolInner {
         }
         match result {
             Ok(session) if session.snap => {
+                // Admission by announced head (#465): a peer whose fresh Status
+                // puts its head far below our anchored one is syncing or
+                // stalled — it would answer "0 headers" to every tip read and
+                // hold a slot for hours. Not a verdict on its snap quality (no
+                // cache strike): a lagging backoff, and discovery moves on. The
+                // address stays claimed until the backoff is recorded — the
+                // ordering the eviction path in record_quality documents.
+                let anchored = self.anchored_head_number();
+                if let Some(lag) = refusing_lag(session.peer_status.latest_block, anchored) {
+                    tracing::info!(%addr, lag, eth = session.eth_version,
+                        "el dial: peer announces a head far behind the anchored one — not pooling");
+                    {
+                        // Reachable — clear any connect-failure streak, as the
+                        // no-snap arm does. Not `add`ed: it proved nothing
+                        // worth dialing first next run.
+                        let mut cache = self.cache.lock().await;
+                        cache.record_connect_success(addr);
+                        cache.flush();
+                    }
+                    self.record_backoff(addr, BACKOFF_LAGGING, now).await;
+                    self.attempted.lock().await.remove(&addr);
+                    return;
+                }
                 // INFO: the operator-visible signal that the EL found a usable
                 // snap peer (bounded to ~target occurrences per run). Per-peer
                 // failures/non-snap stay at debug to avoid the discv4 cross-chain
                 // noise (most discovered peers are other networks or full).
                 tracing::info!(%addr, eth = session.eth_version, "el dial: snap peer connected");
+                // The cache's verdict on this peer from earlier runs, read in
+                // its own statement BEFORE the peers lock (never two pool locks
+                // at once — the maintainer takes them in the other order).
+                let cache_confirmed =
+                    self.cache.lock().await.quality_of(addr) == Some(SnapQuality::Confirmed);
                 let peer = Arc::new(ManagedPeer::spawn_serving(
                     session,
                     addr,
@@ -505,6 +749,7 @@ impl PoolInner {
                         stats: Arc::clone(&self.serve_stats),
                     },
                     self.tx_watch.clone(),
+                    self.head_source.clone(),
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
                 // prune_closed when the peer later closes.
@@ -514,6 +759,10 @@ impl PoolInner {
                     benched_until: None,
                     read_fails: 0,
                     outpaced: 0,
+                    served: 0,
+                    cache_confirmed,
+                    last_probe: None,
+                    probe_misses: 0,
                 });
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
@@ -620,7 +869,7 @@ impl PeerPool {
             cache: Mutex::new(cache),
             boot_enodes,
             served,
-            head_source,
+            head_source: head_source.map(|f| -> AnchorSource { Arc::from(f) }),
             backfill_rr: std::sync::atomic::AtomicUsize::new(0),
             backfill_inflight: std::sync::atomic::AtomicBool::new(false),
             last_broadcast_range: Mutex::new(None),
@@ -638,32 +887,31 @@ impl PeerPool {
         PeerPool { inner }
     }
 
-    /// A live snap-capable peer for a verified read, or `None` if the pool has
-    /// none yet. Prunes closed peers first; returns the newest live peer (most
-    /// likely to still retain recent state).
+    /// The read ladder's first peer (see [`snap_peers`](Self::snap_peers)), or
+    /// `None` if the pool has none yet.
     pub async fn snap_peer(&self) -> Option<Arc<ManagedPeer>> {
-        self.inner.prune_closed().await;
-        self.inner.peers.lock().await.last().map(|p| Arc::clone(&p.peer))
+        self.snap_peers().await.into_iter().next()
     }
 
-    /// All live snap peers, NEWEST first (freshest head → most likely to still
-    /// retain the state a query needs), with read-benched peers moved BEHIND
-    /// the rest (see [`READ_FAIL_BENCH`]) — every peer stays reachable as the
-    /// last resort, but the ladder rotates away from ones that just failed a
-    /// verified read instead of re-asking them first forever. The
-    /// verified-read ladder tries them in order, moving to the next on a
-    /// failure — twin of the Java `RLPxConnector.trySnapPeer` retry loop with
-    /// its transient bench. Prunes closed peers first.
+    /// All live snap peers in READ-LADDER order (see [`LadderKey`]): peers
+    /// whose fresh word says they lack the anchored head last, read-benched
+    /// peers (see [`READ_FAIL_BENCH`]) behind unbenched ones, then by how well
+    /// their known head covers the anchored one, proven servers before
+    /// unproven ones, newest connection first. Every peer stays reachable as
+    /// the last resort. The verified-read ladder tries them in order, moving
+    /// to the next on a failure — twin of the Java `RLPxConnector.trySnapPeer`
+    /// retry loop with its transient bench, plus the head and proof keys #465
+    /// added. Prunes closed peers first.
     pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         let now = Instant::now();
         let peers = self.inner.peers.lock().await;
         let newest_first: Vec<&PooledPeer> = peers.iter().rev().collect();
-        let benched: Vec<bool> = newest_first
+        let keys: Vec<LadderKey> = newest_first
             .iter()
-            .map(|p| p.benched_until.is_some_and(|t| t > now))
+            .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
             .collect();
-        ladder_order(&benched)
+        ladder_order(&keys)
             .into_iter()
             .map(|i| Arc::clone(&newest_first[i].peer))
             .collect()
@@ -672,6 +920,14 @@ impl PeerPool {
     /// Count of live snap peers (prunes closed peers first).
     pub async fn snap_peer_count(&self) -> usize {
         self.inner.prune_closed().await
+    }
+
+    /// Count of live snap peers that can answer a read at the anchored head
+    /// right now (see `is_serving`) — the hosts' `snapServingPeers`. 0 while
+    /// the anchor has no head. Prunes closed peers first.
+    pub async fn snap_serving_count(&self) -> usize {
+        self.inner.prune_closed().await;
+        self.inner.count_where(is_serving).await
     }
 
     /// Addresses dialed and not yet failed (in-flight or connected).
@@ -711,13 +967,16 @@ impl PeerPool {
     /// cached peer CONFIRMED (dial-first next run). Persists only on a quality
     /// transition (dirty-gated flush), so repeated serves don't re-write.
     pub async fn record_snap_served(&self, addr: SocketAddr) {
-        self.inner.record_quality(addr, true).await;
+        self.inner.record_quality(addr, QualityOutcome::Served).await;
     }
 
-    /// A snap fetch against `addr` failed — after the failure threshold the
-    /// cached peer is marked DENIED (deprioritized next run). Dirty-gated flush.
-    pub async fn record_snap_failure(&self, addr: SocketAddr) {
-        self.inner.record_quality(addr, false).await;
+    /// A snap fetch against `addr` failed. `witnessed` = another peer served
+    /// the same read: then, after the failure threshold, the cached peer is
+    /// marked DENIED (deprioritized next run; dirty-gated flush). Unwitnessed
+    /// — no peer served — it is benched and counted toward eviction like any
+    /// failure, but never persisted (see [`QualityOutcome::FailedUnwitnessed`]).
+    pub async fn record_snap_failure(&self, addr: SocketAddr, witnessed: bool) {
+        self.inner.record_quality(addr, QualityOutcome::failed(witnessed)).await;
     }
 
     /// A hedged read was answered by a peer whose request went out no earlier
@@ -1037,10 +1296,111 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
                 inner2.served.evict_below(from);
             }
         }
+        // A batch that anchored at the beacon head is proof this peer holds
+        // it — the same evidence a served read gives (peer::KnownHead).
+        if let BatchAnchor::Head(_) = anchor {
+            peer.note_head_served(anchored.0);
+        }
         for vh in &headers {
             inner2.served.put(vh.header.number, vh.hash, vh.header.parent_hash, vh.raw_rlp.clone());
         }
     });
+}
+
+/// Evict pooled peers whose FRESH word says they have fallen behind the
+/// anchored head (`peer::Coverage::Behind` — the same bar that refuses a peer
+/// at the handshake), at most [`MAX_LAG_EVICTIONS_PER_TICK`] per tick, so a
+/// runaway local anchor cannot churn the whole pool in one beat. Only the
+/// peer's own announcement can say so: a served proof is at par by
+/// construction, and an aging observation is Unknown, never Behind. Since
+/// #465 a peer is no longer struck for lacking a head it SAID it lacks, so
+/// this — with the admission check in `dial_one` — is what keeps a lagging
+/// peer from holding a slot (the 2026-09-02 stale-pool wedge, by another
+/// route: eight lagging peers held every slot through days of failing reads).
+/// Corroborating the anchor against the served window before evicting was
+/// considered and rejected: on a cold pool of syncing peers the backfill never
+/// succeeds, so corroboration never arrives and the pool wedges — the very bug.
+const MAX_LAG_EVICTIONS_PER_TICK: usize = 2;
+
+async fn evict_lagging_peers(inner: &Arc<PoolInner>) {
+    let victims: Vec<(SocketAddr, u64)> = inner
+        .peers
+        .lock()
+        .await
+        .iter()
+        .filter(|p| !p.peer.is_closed() && p.peer.coverage() == Coverage::Behind)
+        .map(|p| (p.addr, p.peer.known_head().and_then(|h| h.lag()).unwrap_or(0)))
+        .take(MAX_LAG_EVICTIONS_PER_TICK)
+        .collect();
+    for (addr, lag) in victims {
+        inner
+            .evict_lagging(addr, &format!("its announced head is {lag} blocks behind the anchored one"))
+            .await;
+    }
+}
+
+/// The cheapest possible proof that a peer can serve reads at the anchored
+/// head: one header, admitted through the same `batch_anchored` gate the
+/// backfill uses. For peers with no usable head observation
+/// (`peer::Coverage::Unknown`): eth/68 announces none, a word spoken before
+/// the anchor had a head cannot be judged, and any observation goes stale
+/// after `HEAD_SIGNAL_FRESH`. A hit counts as a served read for the peer's
+/// standing; a miss the peer ANSWERED (no header, or not the anchored one) is
+/// a lagging signal — [`PROBE_MISSES_EVICT`] in a row evict it as lagging (the
+/// long backoff, no cache verdict), not one, because a single miss can be the
+/// one-slot race between the optimistic head and the peer's import; a
+/// transport failure is an ordinary unwitnessed read failure. Bounded per tick
+/// and per peer; spawned through `tasks` so a stopping pool never has a probe
+/// writing to a peer it is closing. A probe carries no address, so it widens
+/// no disclosure (docs/privacy-and-tor.md).
+const HEAD_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const HEAD_PROBE_PER_TICK: usize = 2;
+const PROBE_MISSES_EVICT: u32 = 3;
+
+async fn probe_unknown_heads(inner: &Arc<PoolInner>) {
+    let Some((head, head_hash)) = inner.anchored_head() else { return };
+    let now = Instant::now();
+    let candidates: Vec<(SocketAddr, Arc<ManagedPeer>)> = inner
+        .peers
+        .lock()
+        .await
+        .iter_mut()
+        .filter(|p| {
+            let recently =
+                p.last_probe.is_some_and(|t| now.duration_since(t) < HEAD_PROBE_MIN_INTERVAL);
+            !recently
+                && !p.is_benched(now)
+                && !p.peer.is_closed()
+                && p.peer.coverage() == Coverage::Unknown
+        })
+        .take(HEAD_PROBE_PER_TICK)
+        .map(|p| {
+            // Stamped under the SAME lock that picked it: two ticks (or a tick
+            // overlapping a slow probe) cannot double-ask a peer.
+            p.last_probe = Some(now);
+            (p.addr, Arc::clone(&p.peer))
+        })
+        .collect();
+    for (addr, peer) in candidates {
+        let inner2 = Arc::clone(inner);
+        inner.tasks.spawn(async move {
+            match peer.get_block_headers_by_number_raw(head, 1).await {
+                Ok(h) if batch_anchored(&h, head, &BatchAnchor::Head(head_hash)) => {
+                    tracing::debug!(%addr, head, "head probe: peer serves the anchored head");
+                    peer.note_head_served(head);
+                    inner2.record_quality(addr, QualityOutcome::Served).await;
+                }
+                Ok(_) => {
+                    tracing::debug!(%addr, head, "head probe: peer answered without the anchored head");
+                    inner2.note_probe_miss(addr).await;
+                }
+                Err(e) => {
+                    tracing::debug!(%addr, head, error = %e, "head probe: request failed");
+                    inner2.record_quality(addr, QualityOutcome::FailedUnwitnessed).await;
+                }
+            }
+        });
+    }
 }
 
 /// Send BlockRangeUpdate to all live eth/69 peers when our servable range has
@@ -1114,30 +1474,29 @@ async fn maintainer_loop(inner: Arc<PoolInner>, dial_slots: Arc<Semaphore>) {
         // the anchored head (one bounded request per tick), then broadcast the
         // (possibly grown) range.
         backfill_served_headers(&inner).await;
+        // #465: drop peers whose fresh word says they fell far behind the
+        // head, and learn the heads of peers that announce none.
+        evict_lagging_peers(&inner).await;
+        probe_unknown_heads(&inner).await;
         // Keep the eth/69 advertised range honest over a connection's lifetime:
         // a peer told a narrow range at handshake would otherwise get empty
         // answers once the window slides forward. Broadcast on change (deduped).
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
-        // The HUNT keys on peers that can actually serve reads right now:
-        // read-benched peers don't count. A pool whose every slot is held by
-        // read-failing laggards is a serving outage exactly like an empty one
-        // — before this, 8 such peers suppressed the hunt through days of
-        // failing reads (2026-09-02) because "live" looked healthy. Fill and
-        // pin decisions below keep using the TOTAL live count: eviction (see
-        // record_quality) frees the slots within READ_FAILS_EVICT failed
-        // reads, so the two counts converge quickly.
-        let serving = {
-            let now = Instant::now();
-            inner
-                .peers
-                .lock()
-                .await
-                .iter()
-                .filter(|p| !p.benched_until.is_some_and(|t| t > now))
-                .count()
-        };
+        // The HUNT keys on peers that could actually serve reads right now:
+        // read-benched peers don't count, and neither (since #465) does a
+        // peer whose fresh announcement says it lacks the anchored head —
+        // such a peer is no longer struck for the "0 headers" it predicted,
+        // so it is never benched, and counting it would hide a pool of
+        // laggards from the hunt. A pool whose every slot is held by laggards
+        // is a serving outage exactly like an empty one — before this, 8 such
+        // peers suppressed the hunt through days of failing reads
+        // (2026-09-02) because "live" looked healthy. Fill and pin decisions
+        // below keep using the TOTAL live count: eviction (see record_quality
+        // and evict_lagging_peers) frees the slots quickly, so the two counts
+        // converge.
+        let serving = inner.count_where(counts_for_hunt).await;
         // target == 0 = maintainer deliberately idle: an empty pool is the
         // EXPECTED state — never engage the hunt (Java maintainSnapPeers twin).
         if inner.pool_cfg.target_snap_peers == 0 {
@@ -1267,12 +1626,14 @@ pub struct SnapQualitySink {
 impl SnapQualitySink {
     /// A snap fetch against `addr` returned usable proof material.
     pub async fn served(&self, addr: SocketAddr) {
-        self.inner.record_quality(addr, true).await;
+        self.inner.record_quality(addr, QualityOutcome::Served).await;
     }
 
-    /// A snap fetch against `addr` failed (bad proof / transport / timeout).
-    pub async fn failed(&self, addr: SocketAddr) {
-        self.inner.record_quality(addr, false).await;
+    /// A snap fetch against `addr` failed (bad proof / transport / timeout);
+    /// `witnessed` = another peer served the same read (see
+    /// [`PeerPool::record_snap_failure`]).
+    pub async fn failed(&self, addr: SocketAddr, witnessed: bool) {
+        self.inner.record_quality(addr, QualityOutcome::failed(witnessed)).await;
     }
 
     /// A hedged snap fetch against `addr` was outpaced by a peer whose request
@@ -1290,14 +1651,21 @@ mod tests {
     /// repeated read failures evict — except the sole peer.
     mod read_rotation {
         use super::super::{
-            ladder_order, outpace_verdict, read_failure_verdict, OUTPACES_BEFORE_STRIKE, READ_FAILS_EVICT,
+            ladder_order, outpace_verdict, read_failure_verdict, Coverage, LadderKey,
+            OUTPACES_BEFORE_STRIKE, READ_FAILS_EVICT,
         };
+
+        /// Keys with no head evidence and no proof — the pre-#465 ladder,
+        /// which the bench flag alone ordered.
+        fn bench_only(benched: &[bool]) -> Vec<LadderKey> {
+            benched.iter().map(|&b| LadderKey::new(b, Coverage::Unknown, true)).collect()
+        }
 
         #[test]
         fn unbenched_lead_benched_trail_newest_first_within_each() {
             //                          n     n-1    n-2    n-3
             let benched = [false, true, false, true];
-            assert_eq!(ladder_order(&benched), vec![0, 2, 1, 3]);
+            assert_eq!(ladder_order(&bench_only(&benched)), vec![0, 2, 1, 3]);
         }
 
         #[test]
@@ -1305,12 +1673,59 @@ mod tests {
             // The sole-server semantics: benched is a preference, not a veto —
             // a wallet with only failing peers must still ask them rather
             // than answer nothing while the maintainer refills.
-            assert_eq!(ladder_order(&[true, true, true]), vec![0, 1, 2]);
+            assert_eq!(ladder_order(&bench_only(&[true, true, true])), vec![0, 1, 2]);
         }
 
         #[test]
         fn nothing_benched_keeps_the_newest_first_order() {
-            assert_eq!(ladder_order(&[false, false]), vec![0, 1]);
+            // Stable sort: equal keys stay newest first.
+            assert_eq!(ladder_order(&bench_only(&[false, false])), vec![0, 1]);
+        }
+
+        #[test]
+        fn a_covering_peer_leads_a_behind_one_even_when_benched() {
+            // #465: the peer whose own word says it lacks the head goes last,
+            // whatever else is true — one transient failure by a peer that
+            // HAS the head must not drop it below peers that provably do not.
+            let keys = [
+                LadderKey::new(false, Coverage::Behind, false),
+                LadderKey::new(true, Coverage::Covers, false),
+                LadderKey::new(false, Coverage::Unknown, true),
+            ];
+            assert_eq!(ladder_order(&keys), vec![2, 1, 0]);
+        }
+
+        #[test]
+        fn head_evidence_orders_the_unbenched_covers_near_unknown() {
+            let keys = [
+                LadderKey::new(false, Coverage::Unknown, false),
+                LadderKey::new(false, Coverage::Near, false),
+                LadderKey::new(false, Coverage::Covers, false),
+            ];
+            assert_eq!(ladder_order(&keys), vec![2, 1, 0]);
+        }
+
+        #[test]
+        fn never_proven_peers_trail_proven_ones_within_a_bucket() {
+            // The warm-start case: the cache-Confirmed peer is the OLDEST
+            // connection (dialed first) and used to sit at the bottom.
+            let keys = [
+                LadderKey::new(false, Coverage::Unknown, true),
+                LadderKey::new(false, Coverage::Unknown, true),
+                LadderKey::new(false, Coverage::Unknown, false),
+            ];
+            assert_eq!(ladder_order(&keys), vec![2, 0, 1]);
+        }
+
+        #[test]
+        fn a_pool_that_is_entirely_behind_still_serves_the_full_ladder() {
+            // Behind is a ranking, never an exclusion: the read still asks
+            // everyone, and the retry loop rides out a genuine tip-lag race.
+            let keys = [
+                LadderKey::new(true, Coverage::Behind, true),
+                LadderKey::new(false, Coverage::Behind, true),
+            ];
+            assert_eq!(ladder_order(&keys), vec![1, 0]);
         }
 
         #[test]
@@ -1354,6 +1769,46 @@ mod tests {
             }
             assert_eq!(evicted_at, Some(OUTPACES_BEFORE_STRIKE + READ_FAILS_EVICT));
             assert_eq!(evicted_at, Some(4));
+        }
+    }
+
+    /// The pure head policies #465 added: the witness rule for persisted
+    /// verdicts and the two serving tallies (the admission/eviction bar lives
+    /// with `peer::coverage`).
+    mod head_policy {
+        use super::super::{counts_for_hunt, is_serving, persist_verdict, Coverage};
+
+        #[test]
+        fn a_whole_pool_failure_persists_nothing_against_anyone() {
+            assert!(!persist_verdict(false, true));
+            assert!(!persist_verdict(false, false));
+        }
+
+        #[test]
+        fn the_sole_peer_shield_still_holds() {
+            assert!(!persist_verdict(true, false));
+        }
+
+        #[test]
+        fn a_witnessed_failure_with_another_live_peer_persists() {
+            assert!(persist_verdict(true, true));
+        }
+
+        #[test]
+        fn serving_needs_evidence_but_the_hunt_only_needs_hope() {
+            for cov in [Coverage::Covers, Coverage::Near] {
+                assert!(is_serving(false, cov));
+                assert!(counts_for_hunt(false, cov));
+                assert!(!is_serving(true, cov));
+                assert!(!counts_for_hunt(true, cov));
+            }
+            // No evidence: not serving for the hosts, but the hunt must not
+            // engage on it (before the anchor lands EVERY peer is Unknown).
+            assert!(!is_serving(false, Coverage::Unknown));
+            assert!(counts_for_hunt(false, Coverage::Unknown));
+            // Said it lacks the head: neither.
+            assert!(!is_serving(false, Coverage::Behind));
+            assert!(!counts_for_hunt(false, Coverage::Behind));
         }
     }
 
@@ -1633,6 +2088,15 @@ mod tests {
             None,
             None,
         );
+
+        // No verdict is persisted without another live peer to compare
+        // against, witnessed or not — the sole-peer shield. (The witness rule
+        // itself is pinned by the pure `persist_verdict` tests: telling the two
+        // apart through the pool takes a live second peer.)
+        for witnessed in [false, true, false, true, false, true] {
+            pool.record_snap_failure(addr, witnessed).await;
+        }
+        assert_eq!(ElPeerCache::load(path.clone()).peers()[0].quality, SnapQuality::Unknown);
 
         // A served outcome promotes the cached peer to Confirmed and persists it.
         pool.record_snap_served(addr).await;
