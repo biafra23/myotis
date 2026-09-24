@@ -17,8 +17,10 @@
 # then deny it (`-D clippy::perf`), and end at `-D warnings` as roost.yml has.
 #
 # Real stable, like the sibling Rust lanes (dtolnay@stable), so a new release
-# can surface a new deny-level lint here first. That is this lane doing its
-# job: a deny-level hit names wrong code — fix it rather than pin the toolchain.
+# can surface a new deny-level lint here. The weekly run on main is what makes
+# it surface on main first, rather than on whichever PR next touches rust/.
+# That is this lane doing its job: a deny-level hit names wrong code — fix it
+# rather than pin the toolchain.
 #
 # Default features only: `myotis-engine/tor` would pull the Arti tree into CI,
 # which rust/Cargo.toml rules out.
@@ -40,6 +42,11 @@ on:
       - "!rust/roost/**"
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
+  # Fridays: Rust stable releases ship on Thursdays, so a new release's
+  # deny-level lints show up on main within a day, whatever the diffs touch.
+  schedule:
+    - cron: "23 6 * * 5"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -60,6 +67,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # --keep-going: a red run lists every independent target's deny-level
+      # hits at once instead of stopping at the first failing crate.
       - name: Clippy (fails on deny-level lints; warnings are reported only)
         working-directory: rust
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --keep-going
