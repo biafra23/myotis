@@ -9,6 +9,7 @@ import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.LifecycleState;
@@ -161,6 +162,9 @@ public final class ChainStack {
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
      *  numbers survive pause/resume connector rebuilds; see ServeStats. */
     private final ServeStats serveStats = new ServeStats();
+    /** EIP-2124 stale-software detector over peers' Status fork ids; stack-owned for the
+     *  same reason as serveStats. Null where not enabled (staged rollout: Sepolia). */
+    private final ForkWatch forkWatch;
     private volatile RLPxConnector connector;
     private volatile DiscV4Service discV4;
     private volatile DiscV5Service discV5;
@@ -198,6 +202,7 @@ public final class ChainStack {
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
         this.gossipsubEnabled = gossipsubEnabled;
+        this.forkWatch = ForkWatch.enabledFor(network) ? ForkWatch.forNetwork(network) : null;
         this.wakeGate = new WakeGate(phase::get, this::readyForReads,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
                 System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
@@ -599,6 +604,8 @@ public final class ChainStack {
 
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
+    /** The fork watch, or null where it is not enabled for this network. */
+    public ForkWatch forkWatch() { return forkWatch; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
@@ -774,7 +781,7 @@ public final class ChainStack {
                     // discovery nudge must never break the READY path
                 }
             }
-        }, serveStats);
+        }, serveStats, forkWatch);
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);

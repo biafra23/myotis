@@ -2694,6 +2694,12 @@ impl ElReader {
         self.pool.set_served_block_window(blocks);
     }
 
+    /// Attach the host-owned fork watch to this reader's peer pool (see
+    /// `PeerPool::set_fork_watch`).
+    pub fn set_fork_watch(&self, watch: std::sync::Arc<crate::el::fork_watch::ForkWatch>) {
+        self.pool.set_fork_watch(watch);
+    }
+
     /// EL hunt engaged on the pool (serving pool empty past the stall window).
     pub fn el_hunting(&self) -> bool {
         self.pool.el_hunting()

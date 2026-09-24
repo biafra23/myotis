@@ -5,6 +5,8 @@ import io.myotis.api.BeaconStatus;
 import io.myotis.api.EngineConfig;
 import io.myotis.api.EngineException;
 import io.myotis.api.StatusSnapshot;
+import io.myotis.api.UpgradeAdvisory;
+import io.myotis.api.UpgradePhase;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -35,14 +37,14 @@ class RustStatusJsonTest {
             "{\"running\":false,\"paused\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
-            + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,"
+            + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,\"lcHunting\":false,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
             + "\"elReaderAvailable\":false,"
             + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
-            + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,"
+            + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,\"elHunting\":false,"
             + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
-            + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0}";
+            + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0,\"upgradeAdvisory\":null}";
 
     /** A synthetic catching-up shape (real running numbers, incl. EL counts). */
     private static final String CATCHING_UP_JSON =
@@ -266,6 +268,47 @@ class RustStatusJsonTest {
         assertEquals(1777L, s.wallClockPeriod());
         BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", OLD_SHAPE_CATCHING_UP_JSON);
         assertEquals(1777L, bs.targetPeriod());
+    }
+
+    /** A running Sepolia status whose peers announce Glamsterdam (ethereum/pm#2205). */
+    private static final String SCHEDULED_ADVISORY_JSON =
+            "{\"running\":true,\"network\":\"sepolia\",\"beaconState\":\"SYNCED\","
+            + "\"bootstrapped\":true,\"finalizedSlot\":11000000,\"optimisticSlot\":11000032,"
+            + "\"currentPeriod\":1342,\"targetPeriod\":1342,\"peerCount\":5,"
+            + "\"upgradeAdvisory\":{\"phase\":\"SCHEDULED\",\"activationTime\":1791294816,"
+            + "\"forkId\":\"0x6c1d9423\",\"observedPeers\":4}}";
+
+    @Test
+    void upgradeAdvisoryIsParsed() {
+        StatusSnapshot s = RustChainHandle.statusFromJson("sepolia", SCHEDULED_ADVISORY_JSON);
+        UpgradeAdvisory a = s.upgradeAdvisory();
+        assertEquals(UpgradePhase.SCHEDULED, a.phase());
+        assertEquals(1_791_294_816L, a.activationTime());
+        assertEquals("0x6c1d9423", a.forkId());
+        assertEquals(4, a.observedPeers());
+    }
+
+    @Test
+    void upgradeAdvisoryAbsentOrNullIsNull() {
+        // JSON null (current natives, nothing detected) and an absent key (older natives).
+        assertNull(RustChainHandle.statusFromJson("mainnet", NOT_STARTED_JSON).upgradeAdvisory());
+        assertNull(RustChainHandle.statusFromJson("mainnet", CATCHING_UP_JSON).upgradeAdvisory());
+        assertNull(RustChainHandle.statusFromJson("mainnet", "{}").upgradeAdvisory());
+    }
+
+    @Test
+    void unknownUpgradePhaseDropsTheAdvisoryNotTheStatus() {
+        // A newer native with a phase this wrapper doesn't know: the status must still
+        // parse (an advisory is display-only), just without the advisory.
+        StatusSnapshot s = RustChainHandle.statusFromJson("sepolia",
+                SCHEDULED_ADVISORY_JSON.replace("SCHEDULED", "IMMINENT"));
+        assertTrue(s.running());
+        assertNull(s.upgradeAdvisory());
+        assertNull(RustChainHandle.statusFromJson("sepolia",
+                SCHEDULED_ADVISORY_JSON.replaceFirst("\\{\"phase\".*?\\}", "\"soon\"")).upgradeAdvisory());
+        // A wrong-typed field inside the object (a buggy native): still no status failure.
+        assertNull(RustChainHandle.statusFromJson("sepolia",
+                SCHEDULED_ADVISORY_JSON.replace("\"SCHEDULED\"", "5")).upgradeAdvisory());
     }
 
     @Test

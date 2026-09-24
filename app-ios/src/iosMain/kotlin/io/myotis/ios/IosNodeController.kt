@@ -7,6 +7,7 @@ import io.myotis.ui.EnsResult
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.Settings
+import io.myotis.ui.UpgradeNotice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 // On Kotlin/Native, Dispatchers.IO is an extension property — this import is load-bearing.
@@ -558,7 +559,22 @@ class IosNodeController(
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
             elHunting = o.engineBoolean("elHunting"),
+            upgrade = upgradeNoticeOf(o["upgradeAdvisory"] as? JsonObject),
         )
     }
 }
 
+/** The status JSON's nested `upgradeAdvisory` (RustChainHandle.parseAdvisory twin):
+ *  absent (older natives), JSON null, a non-object, or a phase this build doesn't
+ *  know → null. Display-only, so it must never fail the status mapping. */
+private fun upgradeNoticeOf(a: JsonObject?): UpgradeNotice? {
+    if (a == null) return null
+    val phase = a.engineString("phase") ?: return null
+    if (phase != "SCHEDULED" && phase != "ACTIVE") return null
+    return UpgradeNotice(
+        phase = phase,
+        activationEpochSec = a.engineLong("activationTime", 0L),
+        forkId = a.engineString("forkId") ?: "",
+        observedPeers = a.engineInt("observedPeers"),
+    )
+}

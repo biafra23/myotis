@@ -76,6 +76,16 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   for `snapPeers >= 2` — the reader rotates over the snap set, and with a
   single peer there is nowhere to rotate to (this is what `smoke.mjs` gates
   on; see #372).
+- **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
+  `{ phase, activationTime, forkId, observedPeers }` when peers announce
+  (`"SCHEDULED"`, `activationTime` ahead) or have already activated
+  (`"ACTIVE"`) a network upgrade this engine build does not support (EIP-2124
+  stale-software detection over the peers' eth Status; enabled on Sepolia for
+  now). Tell the user an update is required — with the date while it is
+  SCHEDULED; once ACTIVE the engine can no longer verify the network. It is
+  advisory only (derived from what peers announce, never from anything
+  verification reads), so it can raise a false alarm but never make an
+  unverified answer look verified. It survives `pause()`.
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but

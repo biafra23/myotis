@@ -1,7 +1,8 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
-Status: PLANNING — written 2026-08-19, before the Sepolia fork. All dates below
-except mainnet are projections and move whenever testing finds something.
+Status: PLANNING — written 2026-08-19; updated 2026-09-24 (Sepolia date and
+parameters now decided; A.2's EL detector implemented, Sepolia-gated). Dates
+without a decision are projections and move whenever testing finds something.
 Sources of truth to re-check while executing: `ethereum/consensus-specs`
 (`specs/gloas/light-client/`), the EF fork announcement blog posts (they carry
 the final epochs, timestamps and fork versions per network), and a fork
@@ -37,19 +38,24 @@ What survives untouched: the trust model itself. Sync-committee BLS signatures
 stay the anchor (Altair machinery is not modified), the EL state remains
 committed under the signed header (the proof path moves, the chain of custody
 does not), and a withholding builder is a liveness problem, not a safety one —
-same class as roost withholding (`BeaconSyncState` regresses, queries fail
-with `beaconNotSynced`; nothing verifies wrong). Bandwidth/storage on mobile
+same class as roost withholding: nothing verifies wrong. (Caveat found while
+building A.2: detection is slower than CLAUDE.md suggests. The Rust engine
+drops out of SYNCED ~5 epochs after finality stalls; the Java engine has no
+finality-freshness gate and stays SYNCED until the next sync-committee period
+— up to ~27 h. And `beaconNotSynced` only fires on a store that never
+finalized, in both engines; a stalled one keeps serving the last finalized
+head until `headerChainGapTooLarge`. Tracked as a separate fix.) Bandwidth/storage on mobile
 are unaffected: BALs (~70 KB/block) are a full-node artifact never fetched by
 the LC path, and PeerDAS-style data is not in this fork.
 
-## Schedule (as of 2026-08-19)
+## Schedule (as of 2026-09-24)
 
 | Stage | Date | Status |
 |---|---|---|
-| Platåberget (public test network) | 2026-08-20 | forking now — first public Gloas network |
-| **Sepolia** | **2026-09-21** | projected |
-| Hoodi | 2026-10-05 | projected |
-| **Mainnet** | **2026-11-04** | target (ACD-anchored; already slipped once from H1) |
+| Platåberget (public test network) | 2026-08-20 | forked — first public Gloas network |
+| **Sepolia** | **2026-10-06 13:53:36 UTC** | **decided** (ethereum/pm#2205, ACD 2026-09-17): epoch 353024, slot 11296768, EL timestamp 1791294816, `GLOAS_FORK_VERSION 0x90000076`, EIP-2124 fork id → `0x6c1d9423` |
+| Hoodi | ~2026-10-27 | tentative |
+| **Mainnet** | TBD | was targeted 2026-11-04; Sepolia slipped two weeks from its 2026-09-21 projection, expect mainnet to move too |
 | Gnosis | TBD | own beacon chain, own schedule — track separately |
 
 **Sepolia is our real deadline**: Myotis supports `-Pnetwork=sepolia`, so
@@ -68,9 +74,10 @@ architecture already guarantees that — a misparsed Gloas update produces a
 wrong root, fails BLS/Merkle verification, and is rejected; the failure mode
 is a stall, never corruption).
 
-**Non-goal:** verified reads past the fork. Without Package B, `get-account`
-etc. on a forked network correctly fail with `beaconNotSynced` once the
-finalized head can no longer advance.
+**Non-goal:** verified reads past the fork. Without Package B, reads on a
+forked network stop succeeding once the finalized head can no longer advance
+(eventually `headerChainGapTooLarge` — not `beaconNotSynced`, see the caveat
+above); the A.2 advisory is what tells the user why.
 
 ### A.1 Fork-schedule entries in network config (both engines)
 
@@ -81,6 +88,11 @@ it lands (do NOT guess them):
 - Amsterdam EL activation timestamp + post-fork EIP-2124 `forkIdHash`.
 - Gloas epoch + `GLOAS_FORK_VERSION` (per network) for digest/domain use.
 - Updated BPO params if the announcement changes them.
+
+Sepolia's values are now decided (see Schedule): Amsterdam 1791294816, fork id
+`0x268956b6` → `0x6c1d9423` (verified: it is exactly `ForkIds.successor` of our
+pin at that timestamp), Gloas epoch 353024, version `0x90000076`. No BPO change
+was announced with it.
 
 Today the fork ID is a single static pin (`NetworkConfig.forkIdHash`,
 `rust/myotis-core/src/forkid.rs`), which cannot straddle a boundary: before
@@ -94,56 +106,74 @@ B.3's fork schedule — build it once, in config, and let B consume it.
 
 Re-pin the cross-engine golden conformance bytes for the fork-ID values.
 
-### A.2 Fork detection & upgrade advisory (schedule-known AND schedule-unknown)
+### A.2 Fork detection & upgrade advisory
 
-Without this, an un-updated client past the fork is a wallet that looks
-"stuck syncing" — indistinguishable from a network outage. Safety already
-holds (misparsed post-fork objects produce wrong roots and fail BLS/Merkle
-verification; nothing verifies wrong), but the liveness failure is mute.
-Two cases:
+**Status: IMPLEMENTED for the EL signal, in both engines, enabled on Sepolia
+(2026-09-24).**
 
-**Schedule known (this binary carries the A.1 entries):** when the head
-crosses a configured fork epoch the client does not implement,
-`beacon-status` reports it (`reason: "unsupportedFork(gloas)"`) and
-verified-read errors name it too — the CLAUDE.md trust rule applied to
-time: refuse loudly, never degrade silently.
+Without it, an un-updated client past the fork is a wallet that looks "stuck
+syncing" — indistinguishable from a network outage. Safety already holds
+(misparsed post-fork objects produce wrong roots and fail BLS/Merkle
+verification), but the liveness failure is mute.
 
-**Schedule unknown (the binary shipped before the date was announced):**
-detect the fork from the wire — the network announces it, and both raw
-signals are ALREADY decoded today, just unused:
+**What shipped**
 
-- *EL, pre-fork:* upgraded peers put `forkNext = activation time` in their
-  eth `Status` weeks ahead (EIP-2124's stale-software mechanism).
-  `StatusMessage` already decodes it ("for debug"). Trigger: ≥N distinct
-  peers announce a `forkNext` not in our `NetworkConfig` schedule →
-  advisory "unknown fork scheduled at T, upgrade before then".
-- *CL, post-fork:* every req/resp response carries 4 context bytes (fork
-  digest), already extracted by `ReqRespCodec`. An unknown digest — while
-  data keeps arriving but the finalized head froze at a specific epoch —
-  is the unambiguous "a fork I don't know is live" signature,
-  distinguishable from a plain outage.
+- *Detector:* `networking/.../eth/ForkWatch` + `ForkIds` (Java) ↔
+  `rust/myotis-net/src/el/fork_watch.rs` + `rust/myotis-core/src/forkid.rs`
+  (Rust). Same constants, same rules, same Sepolia vectors in both suites.
+- *Signals* — EIP-2124 fork ids from the eth `Status` of peers that already
+  passed the network-id + genesis gate:
+  - SCHEDULED: our hash with an unknown `forkNext = T` (upgraded clients
+    announce it from the day their release carries the fork);
+  - ACTIVE: a hash that is provably `successor(ourHash, T)` — CRC32 resumes
+    from its checksum, so the peer's hash pins both the relation to ours and
+    `T`. `T` comes from announcements seen earlier, else from a search over
+    the epoch-aligned activation times of the last 400 days, so a wallet that
+    was offline for the whole announcement window still recognises the fork
+    (upgraded peers send their Status before dropping our stale one).
+  - Threshold ≥3 distinct peers; 24 h observation TTL; 6 h grace after `T`
+    without proof (bridges the rollover, ages out a moved date); a fork the
+    build knows (its own `forkNext`) never raises it. Advisory only —
+    nothing in verification reads it.
+- *Vectors:* the full mainnet chain Frontier → BPO2 reproduces our pinned
+  `0x07c9462e`; Sepolia `0x268956b6` → `0x6c1d9423` at 1791294816 (the
+  published Glamsterdam fork id).
+- *Ownership:* Java ChainStack-owned (survives pause/resume connector
+  rebuilds); Rust handle-owned (`EngineState.fork_watches`, attached to every
+  rebuilt pool). Both report the advisory in every lifecycle state, PAUSED
+  included.
+- *Gate:* `ENABLED_NETWORKS = {sepolia}` in both engines (staged rollout).
+- *Surfacing:* `myotis-api` `UpgradeAdvisory`/`UpgradePhase` as nullable
+  `StatusSnapshot.upgradeAdvisory`; Rust status-JSON key `upgradeAdvisory`
+  (null | object — older wrappers ignore it, the JVM and iOS parsers treat
+  absent/null/unknown-phase as "none" rather than failing the status read);
+  daemon `status` + `beacon-status` (with a human-readable `message`) and a
+  WARN log on transitions; UI `NodeSnapshot.upgrade` → Status + Query banner
+  and a red readiness strip when ACTIVE (desktop, Android and iOS producers);
+  the Node.js module gets it through the same status JSON (README documents
+  it). No JSON-RPC surface (owner decision).
 
-The advisory is NOT a trust decision: a lying peer can at most cause a
-false warning, never wrong data — verification is untouched. Use a
-multi-peer threshold + hysteresis against single-peer noise.
+**Still open**
 
-**Surfacing** (one implementation, all hosts):
+- CL signals (would additionally catch a CL-only fork; Ethereum forks are
+  coordinated EL+CL, BPO forks included, so the EL signal covers today's
+  cases): pre-fork, the discv5 ENR `eth2.next_fork_version/next_fork_epoch`
+  (decoded by Java `Enr.eth2()` but unused; Rust parses only the digest) plus
+  `nfd`; post-fork, the peers' libp2p Status `fork_digest` (decoded and
+  logged, never compared). The req/resp context bytes are extracted in
+  `ReqRespCodec` but dropped at every call site, so they need plumbing first.
+- Schedule-known mode (an explicit `unsupportedFork` once a configured epoch
+  is crossed) — depends on A.1.
+- A peer two or more forks ahead is not proven (single-step search).
+- Dropped: sharpening the verified-read error to `upgradeRequired`. The RPC
+  surface is out of scope (owner), and `beaconNotSynced` doesn't fire on an
+  already-synced node in either engine, so there was nothing to sharpen — the
+  status advisory is the signal.
+- Rollout: flip `ENABLED_NETWORKS` for mainnet/Gnosis in both engines once the
+  Sepolia fork (2026-10-06) has validated it, ahead of their activations.
 
-- `myotis-api`: a flat, FFI-portable field on the status shape (e.g.
-  `UpgradeAdvisory(source, activatesAt, observedPeers)` on
-  `BeaconStatus`/`StatusSnapshot`), so it crosses UniFFI/C-ABI identically
-  — daemon, Android, iOS, desktop all read the same seam.
-- `:ui` via the `NetworkStatus` seam: pre-fork banner "network upgrade at
-  ~T — app update required"; post-fork "this version can no longer verify
-  the network" instead of an eternal spinner.
-- `:app` daemon: advisory in `status`/`beacon-status` JSON + a WARN log.
-- RPC/query surface: no proactive warning channel — queries already fail
-  honestly; only upgrade the error reason from generic `beaconNotSynced`
-  to `upgradeRequired`/`unsupportedFork` where the advisory is active.
-
-Ship this generic (no fork date baked in): it only protects binaries that
-carry it, field apps update slowly, and built this way it covers Hegotá
-and every fork after — one detector, forever.
+Correction to the original plan: the UI seam is `NodeController.snapshots()` →
+`NodeSnapshot`; `NetworkStatus` is device connectivity only.
 
 ### A.3 Confirm the EL path is genuinely inert
 
@@ -157,7 +187,7 @@ with a synthetic Amsterdam header (extra trailing field) to pin that.
 peers past the boundary (fork-ID accepted both sides), EL header fetch works
 on post-fork headers, `beacon-status` shows the explicit unsupported-fork
 reason (until B lands), and no verified-read path returns data it cannot
-verify. Rollout: Sepolia by ~Sep 21, mainnet by ~Nov 4, Gnosis when its date
+verify. Rollout: Sepolia by 2026-10-06, mainnet once its date is set, Gnosis when its date
 is announced.
 
 **Effort:** small — config plumbing ×2 engines + surfacing + tests; the only

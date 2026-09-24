@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
+import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ServedHeaderWindow;
 import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.eth.TxGossipObserver;
@@ -78,6 +79,9 @@ public final class RLPxConnector implements AutoCloseable {
     private final ServedHeaderWindow servedWindow;
     /** Stack-owned serve counters (nullable); passed to every handler. */
     private final ServeStats serveStats;
+    /** Stack-owned fork watch (nullable = not enabled on this network); every handler
+     *  reports its peer's Status fork id into it. */
+    private final ForkWatch forkWatch;
     /** Last eth/69 range we broadcast, to suppress duplicate BlockRangeUpdate spam.
      *  Guarded by {@link #rangeBroadcastLock} (event-loop threads race to update it). */
     private long lastBroadcastEarliest = -1;
@@ -120,6 +124,15 @@ public final class RLPxConnector implements AutoCloseable {
     public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
                          Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                          PeerReadyCallback peerReadyCallback, ServeStats serveStats) {
+        this(localKey, tcpPort, network, onHeaders, peerReadyCallback, serveStats, null);
+    }
+
+    /** @param forkWatch stack-owned {@link ForkWatch} (survives connector rebuilds, like
+     *                   serveStats); null → fork ids are not watched on this network */
+    public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
+                         Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
+                         PeerReadyCallback peerReadyCallback, ServeStats serveStats,
+                         ForkWatch forkWatch) {
         this.localKey = localKey;
         this.tcpPort = tcpPort;
         this.network = network;
@@ -128,6 +141,7 @@ public final class RLPxConnector implements AutoCloseable {
         this.onHeaders = onHeaders;
         this.peerReadyCallback = peerReadyCallback;
         this.serveStats = serveStats;
+        this.forkWatch = forkWatch;
         // Seed genesis (always servable for fork probes) where we embed its RLP.
         byte[] genesisRlp = "mainnet".equals(network.name())
                 ? NetworkConfig.MAINNET_GENESIS_HEADER_RLP : null;
@@ -189,6 +203,11 @@ public final class RLPxConnector implements AutoCloseable {
         // tell already-connected eth/69 peers via BlockRangeUpdate.
         ethHandler.setWindowUpdateListener(this::broadcastRangeIfChanged);
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
+        ForkWatch watch = forkWatch;
+        if (watch != null) {
+            // Keyed by node id, so a peer counts once however often we redial it.
+            ethHandler.setForkIdObserver((hash, next) -> watch.observe(pubKeyHex, hash, next));
+        }
 
         Bootstrap bootstrap = new Bootstrap()
             .group(group)

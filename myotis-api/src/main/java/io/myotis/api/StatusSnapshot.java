@@ -57,6 +57,10 @@ import java.util.List;
  * @param rpcServing            true = bound and serving on {@code 127.0.0.1:rpcPort};
  *                              false with a non-zero port = the bind failed or the
  *                              listener died (hosts render this as an error)
+ * @param upgradeAdvisory       peers announce (or have already activated) a network
+ *                              upgrade this build does not support — hosts tell the
+ *                              user to update; null = none detected / watch not enabled
+ *                              for this network. Advisory only (see {@link UpgradeAdvisory})
  */
 public record StatusSnapshot(
         boolean running,
@@ -95,5 +99,6 @@ public record StatusSnapshot(
         boolean lcHunting,
         boolean elHunting,
         int rpcPort,
-        boolean rpcServing) {
+        boolean rpcServing,
+        UpgradeAdvisory upgradeAdvisory) {
 }

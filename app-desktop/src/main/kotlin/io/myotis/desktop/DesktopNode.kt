@@ -31,6 +31,7 @@ import io.myotis.ui.PeerRow
 import io.myotis.ui.Settings
 import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
+import io.myotis.ui.UpgradeNotice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -571,6 +572,9 @@ class DesktopNodeController(
             tor = torModeFor(Engines.engineKindFor(s.network())),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            upgrade = s.upgradeAdvisory()?.let {
+                UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
+            },
         )
     }
 

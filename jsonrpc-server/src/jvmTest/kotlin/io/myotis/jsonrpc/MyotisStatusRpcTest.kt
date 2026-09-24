@@ -71,6 +71,7 @@ class MyotisStatusRpcTest {
         /* elHunting */ false,
         /* rpcPort */ 8545,
         /* rpcServing */ true,
+        /* upgradeAdvisory */ null,
     )
 
     private fun beaconStatus(

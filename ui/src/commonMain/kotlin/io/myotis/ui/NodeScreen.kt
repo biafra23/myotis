@@ -259,6 +259,9 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        s.upgrade?.active == true ->
+            Triple(Color(0xFFD32F2F), 3.dp,
+                "Node readiness: update required — this version can no longer verify the network")
         s.beaconState != "SYNCED" ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
@@ -612,6 +615,10 @@ private fun StatusTab(
         if (snap == null) {
             Text("Node stopped — no data for $primary")
         } else {
+            snap.upgrade?.let {
+                UpgradeBanner(it)
+                Spacer(Modifier.height(16.dp))
+            }
             HuntBanner(snap)
             SyncProgressBar(snap)
             StatusView(snap, hostSleeps = settings.supportsIdleSleep())
@@ -731,6 +738,52 @@ private fun PeerRowView(p: PeerRow) {
             fontFamily = FontFamily.Monospace, fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * Update-required banner (Status + Query): peers announce — or have already activated — a
+ * network upgrade this build doesn't support. SCHEDULED is a heads-up with the date;
+ * ACTIVE means this version can no longer verify the network. Nothing it shows feeds
+ * verification (advisory only), so a false alarm can't make a wrong answer look right.
+ */
+@Composable
+private fun UpgradeBanner(u: UpgradeNotice) {
+    val tz = remember { TimeZone.currentSystemDefault() }
+    val at = formatDateTime(u.activationEpochSec * 1000, tz)
+    val container = if (u.active) MaterialTheme.colorScheme.errorContainer
+        else MaterialTheme.colorScheme.tertiaryContainer
+    val onContainer = if (u.active) MaterialTheme.colorScheme.onErrorContainer
+        else MaterialTheme.colorScheme.onTertiaryContainer
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(container)
+            .padding(12.dp)
+            .semantics(mergeDescendants = true) {},
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            if (u.active) "Update required" else "Network upgrade ahead — update required",
+            style = MaterialTheme.typography.titleSmall,
+            color = onContainer,
+        )
+        Text(
+            if (u.active) {
+                "The network upgraded on $at. This version can no longer follow it — verified " +
+                    "balances and reads stay unavailable until you update the app."
+            } else {
+                "The network upgrades on $at, and this version doesn't support it. Update the " +
+                    "app before then — otherwise it stops verifying at the upgrade."
+            },
+            fontSize = 13.sp,
+            color = onContainer,
+        )
+        Text(
+            "Reported by ${u.observedPeers} peers · fork id ${u.forkId}",
+            fontSize = 11.sp,
+            color = onContainer,
         )
     }
 }
@@ -988,6 +1041,10 @@ private fun QueryTab(
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        snap?.upgrade?.let {
+            UpgradeBanner(it)
+            Spacer(Modifier.height(12.dp))
+        }
         if (!running) {
             Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer).padding(12.dp)) {
                 Text(
@@ -1644,6 +1701,12 @@ private fun formatDuration(ms: Long): String {
         else -> "${sec}s"
     }
 }
+
+/** yyyy-MM-dd HH:mm in [tz] (a date the user plans around, not a log stamp) — cut from
+ *  the ISO-8601 form, which is stable across kotlinx-datetime's field renames. */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun formatDateTime(ms: Long, tz: TimeZone): String =
+    Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
 // kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still

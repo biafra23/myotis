@@ -5,6 +5,8 @@ import io.myotis.api.BlockResult;
 import io.myotis.api.HeaderInfo;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.StorageProofResult;
+import io.myotis.api.UpgradeAdvisory;
+import io.myotis.api.UpgradePhase;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -336,5 +338,31 @@ class CommandHandlerJsonGoldenTest {
                 + ",\"gasLimit\":12500000}"
                 + "]}",
                 CommandHandler.buildHeadersJson(r));
+    }
+
+    // -- status / beacon-status: the fork-watch upgrade advisory -------------
+
+    @Test
+    void upgradeAdvisoryAbsentIsNull() {
+        assertEquals("null", CommandHandler.buildUpgradeAdvisoryJson(null));
+    }
+
+    @Test
+    void upgradeAdvisoryScheduled() {
+        // Sepolia's Glamsterdam activation, as peers announce it before the fork.
+        assertEquals("{\"phase\":\"SCHEDULED\",\"activationTime\":1791294816,\"forkId\":\"0x6c1d9423\","
+                        + "\"observedPeers\":4,\"message\":\"network upgrade scheduled at 2026-10-06T13:53:36Z"
+                        + " is not supported by this build - update before then\"}",
+                CommandHandler.buildUpgradeAdvisoryJson(
+                        new UpgradeAdvisory(UpgradePhase.SCHEDULED, 1_791_294_816L, "0x6c1d9423", 4)));
+    }
+
+    @Test
+    void upgradeAdvisoryActive() {
+        assertEquals("{\"phase\":\"ACTIVE\",\"activationTime\":1791294816,\"forkId\":\"0x6c1d9423\","
+                        + "\"observedPeers\":3,\"message\":\"the network upgraded at 2026-10-06T13:53:36Z"
+                        + " - this build can no longer follow it; update required\"}",
+                CommandHandler.buildUpgradeAdvisoryJson(
+                        new UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3)));
     }
 }
