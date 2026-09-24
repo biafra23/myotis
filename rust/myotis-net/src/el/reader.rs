@@ -136,7 +136,7 @@ pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
     // node). Refused by name; loopback stays allowed, fronting a local node
     // is a legitimate use.
     if addr.ip().is_unspecified() || addr.port() == 0 {
-        return Err("the address must be dialable: an unspecified IP (0.0.0.0 / ::) or port 0 is refused");
+        return Err("the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0");
     }
     Ok((addr, pubkey))
 }
@@ -8355,7 +8355,7 @@ mod tests {
         );
         // geth prints `@0.0.0.0:<port>` for its own node until it learns its
         // external address; that and port 0 name no dialable remote. Loopback does.
-        let undialable = "the address must be dialable: an unspecified IP (0.0.0.0 / ::) or port 0 is refused";
+        let undialable = "the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0";
         assert_eq!(parse_enode(&format!("enode://{key}@0.0.0.0:30303")), Err(undialable));
         assert_eq!(parse_enode(&format!("enode://{key}@[::]:30303")), Err(undialable));
         assert_eq!(parse_enode(&format!("enode://{key}@1.2.3.4:0")), Err(undialable));

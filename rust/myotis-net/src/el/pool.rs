@@ -1631,8 +1631,10 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         // count: a peer whose head is still Unknown cannot answer yet either.
         // No anchored head (bootstrap, a cold walk, offline) → `None`: nobody
         // could serve a read then, and the arm stays off.
-        let anchored = inner.head_source.as_ref().and_then(|f| f()).is_some();
-        let serving_now = if anchored { Some(inner.count_where(is_serving).await) } else { None };
+        let serving_now = match inner.anchored_head() {
+            Some(_) => Some(inner.count_where(is_serving).await),
+            None => None,
+        };
         let pins = inner.all_pins().await;
         let target = inner.pool_cfg.target_snap_peers;
         let due = pins_to_dial(live, serving_now, target, &pins, &confirmed);
