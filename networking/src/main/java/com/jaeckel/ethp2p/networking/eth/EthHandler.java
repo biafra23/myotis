@@ -1141,6 +1141,31 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
+     * Fetch the header of block {@code hash} from THIS peer (GetBlockHeaders by hash, one
+     * header), with an in-method {@code deadlineMs}. Nothing is trusted here: the caller
+     * hashes the returned raw RLP itself — the execution anchor adopts a header only when
+     * its keccak IS the hash it waited for (Gloas: {@code BeaconSyncState.resolveHeader}).
+     * Registered through {@link #trackHeaderRequest}, so the one header whose hash matches
+     * the request is also admitted to the serve caches, like every by-hash probe.
+     *
+     * @return the served headers (possibly empty), or a failed future if not READY
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeaderByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 hash, long deadlineMs) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) {
+            return Futures.failedFuture(new IllegalStateException("EthHandler not READY"));
+        }
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), deadlineMs);
+        byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.debug("[eth] GetBlockHeaders (by hash {}) reqId={}", hash.toShortHexString(), reqId);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
+    }
+
+    /**
      * Probe THIS peer for the header at its own current best-block hash.
      *
      * <p>This is the right primitive to use before any snap/1 query: peers

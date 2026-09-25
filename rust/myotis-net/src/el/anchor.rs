@@ -155,7 +155,10 @@ impl ExecAnchor {
                     push_root(&mut inner.known_roots, slot, root, true);
                 }
             }
-            inner.pending_finalized = None; // this IS the newest finality
+            // This IS the newest finality — unless a newer one is already pending.
+            if inner.pending_finalized.is_some_and(|(s, _)| s <= slot) {
+                inner.pending_finalized = None;
+            }
             return;
         }
         if slot < inner.finalized_slot || inner.pending_finalized.is_some_and(|(s, _)| s > slot) {
@@ -177,7 +180,9 @@ impl ExecAnchor {
                     push_root(&mut inner.known_roots, slot, root, true);
                 }
             }
-            inner.pending_optimistic = None;
+            if inner.pending_optimistic.is_some_and(|(s, _)| s <= slot) {
+                inner.pending_optimistic = None;
+            }
             return;
         }
         if slot < inner.optimistic_slot || inner.pending_optimistic.is_some_and(|(s, _)| s > slot) {
@@ -600,6 +605,28 @@ mod tests {
                 .map(|f| (f.slot, f.block_number)),
             Some((132, 7))
         );
+    }
+
+    /// Re-noting the resolved block at a slot below a NEWER pending finality
+    /// must not clear it (the store only moves forward, so this is defensive).
+    #[test]
+    fn re_noting_the_resolved_block_keeps_a_newer_pending_one() {
+        let anchor = ExecAnchor::new();
+        let (a, b) = (header(1, root(1)), header(2, root(2)));
+        anchor.note_finalized_hash(10, a.hash);
+        assert!(anchor.resolve_header(&a));
+        anchor.note_finalized_hash(20, b.hash);
+        anchor.note_finalized_hash(15, a.hash);
+        assert_eq!(anchor.pending_hashes(), vec![b.hash]);
+        // ...while a re-note at or past the pending slot does supersede it.
+        anchor.note_finalized_hash(20, a.hash);
+        assert!(anchor.pending_hashes().is_empty());
+
+        anchor.note_optimistic_hash(10, a.hash);
+        assert!(anchor.resolve_header(&a));
+        anchor.note_optimistic_hash(20, b.hash);
+        anchor.note_optimistic_hash(15, a.hash);
+        assert_eq!(anchor.pending_hashes(), vec![b.hash]);
     }
 
     #[test]

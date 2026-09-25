@@ -298,6 +298,78 @@ public final class RLPxConnector implements AutoCloseable {
         return null;
     }
 
+    /** Round-robin cursor for {@link #fetchHeaderByHash}: successive rounds start at
+     *  different ready peers (the Rust resolver loop's {@code rotation}). */
+    private final java.util.concurrent.atomic.AtomicInteger headerByHashRr =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Ask up to {@code maxPeers} READY peers — in rotation, one at a time, each with
+     * {@code perPeerTimeoutMs} — for the header of block {@code hash}, handing the raw RLP
+     * of each served header with that hash to {@code accept} until it takes one. Nothing
+     * here trusts a peer: {@code accept} is the verifier (the execution anchor adopts a
+     * header only when the keccak of its raw RLP IS the hash —
+     * {@code BeaconSyncState.resolveHeader}), so a peer serving another header, none, or
+     * nothing in time just hands the turn to the next. BLOCKING: for a background resolver
+     * thread, never an event loop.
+     *
+     * @return true once {@code accept} took a served header; false when every asked peer
+     *         failed, none was ready, or the thread was interrupted
+     */
+    public boolean fetchHeaderByHash(Bytes32 hash, int maxPeers, long perPeerTimeoutMs,
+                                     java.util.function.Predicate<byte[]> accept) {
+        List<EthHandler> ready = new ArrayList<>();
+        for (EthHandler h : activeHandlers) {
+            if (h.isReady()) ready.add(h);
+        }
+        if (ready.isEmpty()) return false;
+        int asks = Math.min(ready.size(), Math.max(1, maxPeers));
+        int start = Math.floorMod(headerByHashRr.getAndIncrement(), ready.size());
+        List<Supplier<CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>> attempts =
+                new ArrayList<>(asks);
+        for (int i = 0; i < asks; i++) {
+            EthHandler h = ready.get((start + i) % ready.size());
+            attempts.add(() -> {
+                log.debug("[rlpx] GetBlockHeaders by hash {} -> {}", hash.toShortHexString(), h.getRemoteAddress());
+                return h.requestBlockHeaderByHashAsync(hash, perPeerTimeoutMs);
+            });
+        }
+        return firstAcceptedHeader(hash, attempts, perPeerTimeoutMs, accept);
+    }
+
+    /**
+     * Pure policy behind {@link #fetchHeaderByHash} (no EthHandler, unit-testable): run the
+     * attempts in order, one at a time, until {@code accept} takes the raw RLP of a served
+     * header whose hash is {@code hash}. A failed or timed-out attempt, an empty reply, a
+     * header for another block, or one {@code accept} refuses all rotate to the next; a null
+     * future (peer gone) is skipped. BLOCKING.
+     */
+    static boolean firstAcceptedHeader(
+            Bytes32 hash, List<Supplier<CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>> attempts,
+            long perAttemptTimeoutMs, java.util.function.Predicate<byte[]> accept) {
+        for (Supplier<CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>> attempt : attempts) {
+            if (Thread.currentThread().isInterrupted()) return false;
+            try {
+                CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> f = attempt.get();
+                if (f == null) continue;
+                List<BlockHeadersMessage.VerifiedHeader> headers =
+                        f.get(perAttemptTimeoutMs + 1_000L, TimeUnit.MILLISECONDS);
+                for (BlockHeadersMessage.VerifiedHeader vh : headers) {
+                    if (hash.equals(vh.hash()) && accept.test(vh.rawRlp().toArray())) {
+                        log.debug("[rlpx] header by hash {} accepted", hash.toShortHexString());
+                        return true;
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (Exception e) {
+                log.debug("[rlpx] header by hash {}: attempt failed: {}", hash.toShortHexString(), failureKind(e));
+            }
+        }
+        return false;
+    }
+
     /**
      * Request block headers from any active READY peer.
      *

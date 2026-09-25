@@ -1587,21 +1587,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
-     *  beacon-finalized execution root (same headerChain method as get-account). */
+     *  beacon-finalized execution root (same headerChain method as get-account). The
+     *  finalized (number, root) pair is BeaconSyncState's — one atomic read — so it holds
+     *  before and after Gloas (where the light-client header proves only a block hash and
+     *  the pair appears once the EL header behind it is resolved). */
     private boolean anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot) throws Exception {
         BeaconLightClient blc = beaconLightClient;
         RLPxConnector conn = connector;
         if (blc == null || conn == null) return false;
-        com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
-                blc.getStore().getFinalizedHeader();
-        if (fin == null) return false;
-        com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-        if (exec.blockNumber() == peerBlock) {
+        if (blc.getStore().getFinalizedHeader() == null) return false;
+        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+        if (fin.stateRoot() == null) return false; // Gloas finality not resolved yet
+        if (fin.blockNumber() == peerBlock) {
             // Head is exactly the finalized block — roots must match directly.
-            return java.util.Arrays.equals(exec.stateRoot(), peerStateRoot);
+            return java.util.Arrays.equals(fin.stateRoot(), peerStateRoot);
         }
-        return verifyHeaderChainBatched(conn, exec.blockNumber(), peerBlock,
-                exec.stateRoot(), peerStateRoot)
+        return verifyHeaderChainBatched(conn, fin.blockNumber(), peerBlock,
+                fin.stateRoot(), peerStateRoot)
                 .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
     }
 
@@ -1641,23 +1643,50 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             com.jaeckel.ethp2p.consensus.types.LightClientHeader fin = blc.getStore().getFinalizedHeader();
             if (fin == null) throw new IllegalStateException("no beacon-verified finalized header yet");
             com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-            Bytes32 finRoot = Bytes32.wrap(exec.stateRoot());
-            pinned = firstPeerServing(snapPeers, finRoot);
-            if (pinned == null) {
-                throw new IllegalStateException(
-                        "no snap peer retains the beacon-finalized state (block #"
-                        + exec.blockNumber() + ")");
+            if (exec != null) {
+                Bytes32 finRoot = Bytes32.wrap(exec.stateRoot());
+                pinned = firstPeerServing(snapPeers, finRoot);
+                if (pinned == null) {
+                    throw new IllegalStateException(
+                            "no snap peer retains the beacon-finalized state (block #"
+                            + exec.blockNumber() + ")");
+                }
+                blockCtx = new io.myotis.evm.BlockContext(
+                        exec.stateRoot(),
+                        exec.blockNumber(),
+                        exec.timestamp(),
+                        leUint256ToBigInteger(exec.baseFeePerGas()),
+                        io.myotis.evm.Address.of(exec.feeRecipient()),
+                        exec.prevRandao(),
+                        java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                        exec.gasLimit());
+                blockNumber = exec.blockNumber();
+            } else {
+                // Gloas: the light-client header proves only the execution block hash; the
+                // EL header that hashes to it — resolved by BeaconSyncState, every field
+                // bound to the proven hash by its keccak — carries the block context. It
+                // lags the store's finality until resolved: still final, only older.
+                BlockHeader el = beaconSyncState.getFinalizedExecutionHeader();
+                if (el == null) {
+                    throw new IllegalStateException(
+                            "beacon-finalized execution header not resolved yet (Gloas: only its hash is proven)");
+                }
+                pinned = firstPeerServing(snapPeers, el.stateRoot);
+                if (pinned == null) {
+                    throw new IllegalStateException(
+                            "no snap peer retains the beacon-finalized state (block #" + el.number + ")");
+                }
+                blockCtx = new io.myotis.evm.BlockContext(
+                        el.stateRoot.toArrayUnsafe(),
+                        el.number,
+                        el.timestamp,
+                        el.baseFeePerGas,
+                        io.myotis.evm.Address.of(el.beneficiary.toArrayUnsafe()),
+                        el.mixHashOrPrevRandao.toArrayUnsafe(),
+                        java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                        el.gasLimit);
+                blockNumber = el.number;
             }
-            blockCtx = new io.myotis.evm.BlockContext(
-                    exec.stateRoot(),
-                    exec.blockNumber(),
-                    exec.timestamp(),
-                    leUint256ToBigInteger(exec.baseFeePerGas()),
-                    io.myotis.evm.Address.of(exec.feeRecipient()),
-                    exec.prevRandao(),
-                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                    exec.gasLimit());
-            blockNumber = exec.blockNumber();
             verified = true;
         } else {
             // PEER_HEAD: each peer's bleeding-edge head root is frequently NOT yet
@@ -1676,14 +1705,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // head for 5+ min starved number-pinned reads.
             long finalizedFloor = -1;
             long optimisticHeadNum = -1;
+            // BeaconSyncState's resolved numbers: before Gloas they are the store's headers'
+            // own, after it the EL headers the proven block hashes resolved to.
             BeaconLightClient blcFloor = beaconLightClient;
             if (blcFloor != null) {
-                com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
-                        blcFloor.getStore().getFinalizedHeader();
-                if (finHdr != null) finalizedFloor = finHdr.execution().blockNumber();
-                com.jaeckel.ethp2p.consensus.types.LightClientHeader optHdr =
-                        blcFloor.getStore().getOptimisticHeader();
-                if (optHdr != null) optimisticHeadNum = optHdr.execution().blockNumber();
+                if (blcFloor.getStore().getFinalizedHeader() != null) {
+                    BeaconSyncState.FinalizedExecution finExec = beaconSyncState.getFinalizedExecution();
+                    if (finExec.stateRoot() != null) finalizedFloor = finExec.blockNumber();
+                }
+                if (blcFloor.getStore().getOptimisticHeader() != null
+                        && beaconSyncState.getOptimisticBlockHash() != null) {
+                    optimisticHeadNum = beaconSyncState.getOptimisticBlockNumber();
+                }
             }
             final long headFloor = Math.max(minHead, finalizedFloor);
             // When we have a beacon finalized anchor, probe each peer for its LIVE head by
@@ -2757,9 +2790,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         BeaconLightClient blc = beaconLightClient;
         if (blc == null) return -1;
         try {
-            com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
-                    blc.getStore().getFinalizedHeader();
-            return fin != null ? fin.execution().blockNumber() : -1;
+            if (blc.getStore().getFinalizedHeader() == null) return -1;
+            // BeaconSyncState's resolved finality (before Gloas: the store header's own).
+            BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+            return fin.stateRoot() != null ? fin.blockNumber() : -1;
         } catch (Exception e) {
             return -1;
         }
