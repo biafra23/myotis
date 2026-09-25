@@ -14,8 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The Gloas light-client decoders (consensus-specs v1.7.0-beta.2, mainnet preset).
- * Rust twin: {@code rust/myotis-consensus/src/types.rs} unit tests
- * ({@code gloas_sizes_are_exact}, {@code gloas_and_pre_gloas_sizes_do_not_collide}).
+ * Rust twin: {@code rust/myotis-consensus/src/types.rs} — its unit tests
+ * ({@code gloas_sizes_are_exact}, {@code gloas_and_pre_gloas_sizes_do_not_collide}) and,
+ * for the size bound, the compile-time asserts beside {@code MIN_PRE_GLOAS_HEADER_SIZE}.
  */
 class GloasLightClientTypesTest {
 
@@ -63,19 +64,35 @@ class GloasLightClientTypesTest {
     }
 
     /**
-     * No Gloas size falls inside a pre-Gloas decoder's accepted range or vice versa — so
-     * a wrong context digest is a clean rejection, not a misparse (the fork-keyed
-     * dispatch is the rule; this is the belt to its braces).
+     * Every Gloas container is SMALLER than the smallest canonical pre-Gloas encoding of
+     * its type, so no pre-Gloas object is ever Gloas-sized: a Gloas decoder (exactly one
+     * size) refuses every one of them, and a Gloas-sized payload is never a pre-Gloas one
+     * — a wrong context digest is a clean rejection, not a misparse (the fork-keyed
+     * dispatch is the rule; this is the belt to its braces). The smallest pre-Gloas header
+     * is the fixed part plus a Capella payload header with empty {@code extra_data} (568
+     * bytes; Deneb's and Electra's are larger), and the smallest container carries the
+     * shortest (pre-Electra) branches, which is what each {@code FIXED_SIZE} counts.
+     * {@code BeaconLightClientGloasTest.aGloasObjectIsNeverTheSizeOfAPreGloasOne} pins
+     * the same bound for the containers the client tells apart by size.
      */
     @Test
     void gloasAndPreGloasSizesDoNotCollide() {
-        assertTrue(LightClientFinalityUpdate.GLOAS_SIZE > LightClientFinalityUpdate.FIXED_SIZE);
+        int minPreGloasHeader = LightClientHeader.FIXED_SIZE + 568;
+        int minPreGloasBootstrap = LightClientBootstrap.FIXED_SIZE + minPreGloasHeader;
+        int minPreGloasUpdate = LightClientUpdate.FIXED_SIZE + 2 * minPreGloasHeader;
+        int minPreGloasFinality = LightClientFinalityUpdate.FIXED_SIZE + 2 * minPreGloasHeader;
+        assertTrue(LightClientHeader.GLOAS_SIZE < minPreGloasHeader);
+        assertTrue(LightClientBootstrap.GLOAS_SIZE < minPreGloasBootstrap);
+        assertTrue(LightClientUpdate.GLOAS_SIZE < minPreGloasUpdate);
+        assertTrue(LightClientFinalityUpdate.GLOAS_SIZE < minPreGloasFinality);
         assertThrows(IllegalArgumentException.class,
-                () -> LightClientHeader.decodeGloas(new byte[LightClientHeader.FIXED_SIZE]));
+                () -> LightClientHeader.decodeGloas(new byte[minPreGloasHeader]));
         assertThrows(IllegalArgumentException.class,
-                () -> LightClientBootstrap.decodeGloas(new byte[LightClientBootstrap.FIXED_SIZE]));
+                () -> LightClientBootstrap.decodeGloas(new byte[minPreGloasBootstrap]));
         assertThrows(IllegalArgumentException.class,
-                () -> LightClientUpdate.decodeGloas(new byte[LightClientUpdate.FIXED_SIZE]));
+                () -> LightClientUpdate.decodeGloas(new byte[minPreGloasUpdate]));
+        assertThrows(IllegalArgumentException.class,
+                () -> LightClientFinalityUpdate.decodeGloas(new byte[minPreGloasFinality]));
     }
 
     /** Each field sits where the Gloas layout puts it: beacon, block hash, then 11 nodes. */

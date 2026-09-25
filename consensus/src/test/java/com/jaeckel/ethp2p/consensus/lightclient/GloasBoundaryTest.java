@@ -1,6 +1,8 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
 import com.jaeckel.ethp2p.consensus.TestUtil;
+import com.jaeckel.ethp2p.consensus.bls.BlsBackend;
+import com.jaeckel.ethp2p.consensus.bls.BlsBackends;
 import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor.BootstrapReject;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
@@ -25,21 +27,24 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The processor across the Fulu→Gloas boundary: synthetic committee, real BLS,
  * synthetic state/body trees with the leaves at the Gloas gindices. Covers the shape
- * gate, the per-slot proof selection (2856 for a Gloas header, 812 with zero padding
- * for a pre-Gloas finalized header in the Gloas shape), the Gloas state gindices
+ * gate (and that it runs before the BLS verify, counted on the calling thread), the
+ * per-slot proof selection (2856 for a Gloas header, 812 with zero padding for a
+ * pre-Gloas finalized header in the Gloas shape), the Gloas state gindices
  * (735 / 2946 / 2945), and the rejections around each. Rust twin:
- * {@code rust/myotis-consensus/tests/gloas_boundary.rs}.
+ * {@code rust/myotis-consensus/tests/gloas_boundary.rs} (which has no BLS counter to
+ * read, so it pins the order by the rejection reason, in a test of its own).
  *
  * <p>Signed the way {@code LightClientProcessorTest}'s boundary tests are: Milagro keys
  * from {@link TestUtil#generateSecretKey}, and the smallest participation the 2/3 rule
@@ -156,6 +161,11 @@ class GloasBoundaryTest {
 
     /** Gloas shape of a PRE-Gloas header: the block hash at 812, zero-padded to 11. */
     private static LightClientHeader upgradedHeader(long slot, byte[] blockHash) {
+        return upgradedHeader(slot, new byte[32], blockHash);
+    }
+
+    /** {@link #upgradedHeader(long, byte[])} over a given state root. */
+    private static LightClientHeader upgradedHeader(long slot, byte[] stateRoot, byte[] blockHash) {
         int g = BeaconChainSpec.EXECUTION_BLOCK_HASH_GINDEX_DENEB;
         Sparse body = new Sparse().put(g, blockHash);
         byte[][] proof = body.branch(g);
@@ -163,7 +173,7 @@ class GloasBoundaryTest {
         branch[0] = new byte[32];
         branch[1] = new byte[32];
         System.arraycopy(proof, 0, branch, 2, proof.length);
-        return LightClientHeader.gloas(beacon(slot, new byte[32], body.root()), blockHash, branch);
+        return LightClientHeader.gloas(beacon(slot, stateRoot, body.root()), blockHash, branch);
     }
 
     private static SyncAggregate sign(LightClientHeader attested, byte[] forkVersion) {
@@ -210,6 +220,112 @@ class GloasBoundaryTest {
         return new LightClientProcessor(store, schedule(), GVR);
     }
 
+    /**
+     * A Gloas-format finality update at a FULU attested slot, built to pass every check the
+     * processor runs after its shape gate: the finality leaf sits at the gindex a pre-Gloas
+     * slot derives from the 9-node branch (553, not 735), and the attested header proves its
+     * block hash at 812, the pre-Gloas slots' rule.
+     */
+    private static LightClientFinalityUpdate gloasFormatAtAFuluSlot() {
+        LightClientHeader finalized = upgradedHeader(G - 64, fill(0xf1));
+        int fg = BeaconChainSpec.finalizedRootGindex(BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN);
+        Sparse state = new Sparse().put(fg, finalized.beacon().hashTreeRoot());
+        LightClientHeader attested = upgradedHeader(G - 10, state.root(), fill(0xaa));
+        long signatureSlot = G - 9;
+        return new LightClientFinalityUpdate(attested, finalized, state.branch(fg),
+                sign(attested, schedule().versionForSignatureSlot(signatureSlot)), signatureSlot);
+    }
+
+    /**
+     * A Gloas-format catch-up update attested at G + 40 whose state proves {@code finalized}
+     * at 735 and {@code next} at 2946 (depths 9 and 11, one root).
+     */
+    private static LightClientUpdate gloasCatchUp(LightClientHeader finalized, SyncCommittee next) {
+        int fg = BeaconChainSpec.FINALIZED_ROOT_GINDEX_GLOAS;
+        int ng = BeaconChainSpec.NEXT_SYNC_COMMITTEE_GINDEX_GLOAS;
+        Sparse state = new Sparse().put(fg, finalized.beacon().hashTreeRoot()).put(ng, next.hashTreeRoot());
+        LightClientHeader attested = gloasHeader(G + 40, state.root(), fill(0xab));
+        return new LightClientUpdate(attested, next, state.branch(ng), finalized, state.branch(fg),
+                sign(attested, GLOAS_VERSION), G + 41);
+    }
+
+    /** A committee of fresh keys from {@code seed} on; used by root only, it never signs. */
+    private static SyncCommittee committeeFrom(int seed) {
+        byte[][] pubkeys = new byte[SyncCommittee.PUBKEY_COUNT][];
+        for (int i = 0; i < pubkeys.length; i++) {
+            pubkeys[i] = TestUtil.getPublicKey(TestUtil.generateSecretKey(seed + i));
+        }
+        ECP agg = BlsVerifier.deserializeG1(pubkeys[0]);
+        for (int i = 1; i < pubkeys.length; i++) agg.add(BlsVerifier.deserializeG1(pubkeys[i]));
+        agg.affine();
+        return new SyncCommittee(pubkeys, BlsVerifier.serializeG1(agg));
+    }
+
+    /**
+     * Asserts that every check the processor runs AFTER its shape gate passes: the signature
+     * under the signature slot's version, the finality branch at the gindex the attested
+     * slot's fork selects, and each header's execution proof under its own slot's rule. An
+     * update like this can only be refused by the gate (the committee gate before it passes
+     * for every update in this class).
+     */
+    private static void passesEveryCheckAfterTheShapeGate(LightClientProcessor p, LightClientHeader attested,
+            LightClientHeader finalized, byte[][] finalityBranch, SyncAggregate aggregate, long signatureSlot) {
+        assertTrue(SyncCommitteeVerifier.verify(aggregate, p.getStore().getCurrentSyncCommittee(),
+                attested.beacon(), schedule().versionForSignatureSlot(signatureSlot), GVR), "signature");
+        boolean gloas = p.lcForkAtSlot(attested.beacon().slot()) == LcFork.GLOAS;
+        int depth = gloas ? BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN : finalityBranch.length;
+        int gindex = gloas ? BeaconChainSpec.FINALIZED_ROOT_GINDEX_GLOAS : BeaconChainSpec.finalizedRootGindex(depth);
+        assertTrue(SszUtil.verifyMerkleBranch(finalized.beacon().hashTreeRoot(), finalityBranch, depth, gindex,
+                attested.beacon().stateRoot()), "finality branch");
+        assertTrue(p.verifyHeader(attested), "attested execution proof");
+        assertTrue(p.verifyHeader(finalized), "finalized execution proof");
+    }
+
+    /** A processor verdict, and how many BLS verifies reaching it ran on the calling thread. */
+    private record Verdict(boolean applied, long blsVerifies) {}
+
+    /**
+     * Runs {@code process} with the active BLS backend wrapped to count the verifies made on
+     * this thread (a stray background verify elsewhere in the JVM is passed through, not
+     * counted), then restores the backend.
+     */
+    private static Verdict counted(BooleanSupplier process) {
+        BlsBackend active = BlsBackends.active();
+        Thread caller = Thread.currentThread();
+        AtomicLong verifies = new AtomicLong();
+        BlsBackends.set(new BlsBackend() {
+            @Override
+            public boolean fastAggregateVerify(List<byte[]> pubkeys, byte[] message, byte[] signature) {
+                if (Thread.currentThread() == caller) verifies.incrementAndGet();
+                return active.fastAggregateVerify(pubkeys, message, signature);
+            }
+
+            @Override
+            public void warmPubkeyCache(List<byte[]> pubkeys) {
+                active.warmPubkeyCache(pubkeys);
+            }
+
+            @Override
+            public String name() {
+                return active.name();
+            }
+        });
+        try {
+            return new Verdict(process.getAsBoolean(), verifies.get());
+        } finally {
+            BlsBackends.set(active);
+        }
+    }
+
+    /**
+     * Refused, and before the BLS verify — the shape gate's value on Android, where one
+     * verify costs ~17-30 s on ART.
+     */
+    private static void assertRefusedBeforeBls(Verdict v, String what) {
+        assertFalse(v.applied(), what);
+        assertEquals(0, v.blsVerifies(), what + ": refused before the BLS verify");
+    }
+
     @Test
     void finalityWalksFromFuluIntoGloas() {
         LightClientProcessor p = processor();
@@ -239,19 +355,14 @@ class GloasBoundaryTest {
     @Test
     void aGloasCatchUpUpdateProvesTheNextCommitteeAt2946() {
         LightClientProcessor p = processor();
-        SyncCommittee next = committee;
-        LightClientHeader fin = gloasHeader(G, new byte[32], fill(0xf3));
-        int fg = BeaconChainSpec.FINALIZED_ROOT_GINDEX_GLOAS;
-        int ng = BeaconChainSpec.NEXT_SYNC_COMMITTEE_GINDEX_GLOAS;
-        // One attested state proving both leaves, at depths 9 and 11.
-        Sparse state = new Sparse().put(fg, fin.beacon().hashTreeRoot()).put(ng, next.hashTreeRoot());
-        LightClientHeader attested = gloasHeader(G + 40, state.root(), fill(0xab));
-        LightClientUpdate update = new LightClientUpdate(attested, next, state.branch(ng), fin, state.branch(fg),
-                sign(attested, GLOAS_VERSION), G + 41);
+        // Not the store's own committee, so storing the wrong one would show.
+        SyncCommittee next = committeeFrom(20_000);
+        assertFalse(Arrays.equals(committee.hashTreeRoot(), next.hashTreeRoot()));
+        LightClientUpdate update = gloasCatchUp(gloasHeader(G, new byte[32], fill(0xf3)), next);
         assertEquals(11, update.nextSyncCommitteeBranch().length);
         assertEquals(9, update.finalityBranch().length);
         assertTrue(p.processUpdate(update));
-        assertNotNull(p.getStore().getNextSyncCommittee());
+        assertArrayEquals(next.hashTreeRoot(), p.getStore().getNextSyncCommittee().hashTreeRoot());
         assertEquals(G, p.getStore().getFinalizedSlot());
     }
 
@@ -260,17 +371,27 @@ class GloasBoundaryTest {
         LightClientProcessor p = processor();
         int fg = BeaconChainSpec.FINALIZED_ROOT_GINDEX_GLOAS;
 
-        // Gloas format with a pre-Gloas attested slot: the shape gate (before BLS).
+        // Gloas format at a Fulu attested slot, with the proofs a Fulu slot's rules check:
+        // only the shape gate can refuse it, and it does so before the BLS verify.
+        LightClientFinalityUpdate atFulu = gloasFormatAtAFuluSlot();
+        passesEveryCheckAfterTheShapeGate(p, atFulu.attestedHeader(), atFulu.finalizedHeader(),
+                atFulu.finalityBranch(), atFulu.syncAggregate(), atFulu.signatureSlot());
+        assertRefusedBeforeBls(counted(() -> p.processFinalityUpdate(atFulu)), "Gloas shape at a Fulu attested slot");
+
+        // Electra format with a Gloas attested slot. No build of this passes the later checks
+        // (a payload header at a Gloas slot fails its execution proof by construction), so the
+        // BLS count is what pins the gate's part.
+        LightClientFinalityUpdate electraAtGloas = electraFinality(256, G + 2);
+        assertRefusedBeforeBls(counted(() -> p.processFinalityUpdate(electraAtGloas)),
+                "payload shape at a Gloas slot");
+
+        // Gloas format, finality proven at the depth-derived gindex (553). Past the gate, so
+        // the verify runs — the count's control — and the finality branch refuses it.
         LightClientHeader fin = upgradedHeader(G - 64, fill(0xf1));
-        assertFalse(p.processFinalityUpdate(gloasFinality(fin, G - 10, fg)),
-                "Gloas shape at a Fulu attested slot");
-
-        // Electra format with a Gloas attested slot.
-        assertFalse(p.processFinalityUpdate(electraFinality(256, G + 2)), "payload shape at a Gloas slot");
-
-        // Gloas format, finality proven at the depth-derived gindex (553).
-        assertFalse(p.processFinalityUpdate(gloasFinality(fin, G + 2, BeaconChainSpec.finalizedRootGindex(9))),
-                "the depth-derived gindex is not Gloas'");
+        LightClientFinalityUpdate depthDerived = gloasFinality(fin, G + 2, BeaconChainSpec.finalizedRootGindex(9));
+        Verdict pastTheGate = counted(() -> p.processFinalityUpdate(depthDerived));
+        assertFalse(pastTheGate.applied(), "the depth-derived gindex is not Gloas'");
+        assertEquals(1, pastTheGate.blsVerifies(), "past the gate, the BLS verify runs");
 
         // The pre-Gloas finalized header with a non-zero pad node.
         byte[][] dirtyBranch = new byte[11][];
@@ -285,11 +406,27 @@ class GloasBoundaryTest {
         assertFalse(p.processFinalityUpdate(gloasFinality(at812, G + 40, fg)),
                 "812 is the pre-Gloas slots' rule only");
 
-        // A payload-shaped finalized header inside a Gloas-format update.
-        assertFalse(p.processFinalityUpdate(gloasFinality(payloadHeader(G - 32, new byte[32]), G + 2, fg)),
+        // A payload-shaped finalized header inside a Gloas-format update: its proof is the one
+        // its pre-Gloas slot uses, so again only the gate refuses it.
+        LightClientFinalityUpdate payloadFinalized = gloasFinality(payloadHeader(G - 32, new byte[32]), G + 2, fg);
+        passesEveryCheckAfterTheShapeGate(p, payloadFinalized.attestedHeader(), payloadFinalized.finalizedHeader(),
+                payloadFinalized.finalityBranch(), payloadFinalized.syncAggregate(), payloadFinalized.signatureSlot());
+        assertRefusedBeforeBls(counted(() -> p.processFinalityUpdate(payloadFinalized)),
                 "every header of a Gloas update is Gloas-shaped");
 
+        // The same in a catch-up update, whose next committee also proves at 2946:
+        // processUpdate runs the same gate.
+        LightClientUpdate catchUp = gloasCatchUp(payloadHeader(G - 32, new byte[32]), committee);
+        passesEveryCheckAfterTheShapeGate(p, catchUp.attestedHeader(), catchUp.finalizedHeader(),
+                catchUp.finalityBranch(), catchUp.syncAggregate(), catchUp.signatureSlot());
+        assertTrue(SszUtil.verifyMerkleBranch(catchUp.nextSyncCommittee().hashTreeRoot(),
+                catchUp.nextSyncCommitteeBranch(), BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN,
+                BeaconChainSpec.NEXT_SYNC_COMMITTEE_GINDEX_GLOAS, catchUp.attestedHeader().beacon().stateRoot()));
+        assertRefusedBeforeBls(counted(() -> p.processUpdate(catchUp)),
+                "every header of a Gloas catch-up update is Gloas-shaped");
+
         assertEquals(100L, p.getStore().getFinalizedSlot(), "nothing applied");
+        assertNull(p.getStore().getNextSyncCommittee());
     }
 
     @Test

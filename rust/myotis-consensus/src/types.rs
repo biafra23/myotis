@@ -794,6 +794,7 @@ const MIN_PRE_GLOAS_HEADER_SIZE: usize = LightClientHeader::FIXED_SIZE + 568; //
 // loop read a Gloas object under a fork digest it does not compute (a later
 // blob-parameter fork) without ever misreading a pre-Gloas one
 // (`ChainConfig::lc_fork_of_chunk` in myotis-net).
+const _: () = assert!(LightClientHeader::GLOAS_SIZE < MIN_PRE_GLOAS_HEADER_SIZE);
 const _: () = assert!(
     LightClientBootstrap::GLOAS_SIZE
         < LightClientBootstrap::MIN_FIXED_SIZE + MIN_PRE_GLOAS_HEADER_SIZE
@@ -908,19 +909,23 @@ mod tests {
         assert_eq!(f.finality_branch.len(), 9);
     }
 
-    /// No Gloas size falls inside a pre-Gloas decoder's accepted range or vice
-    /// versa — so a wrong context digest is a clean rejection, not a misparse
-    /// (the fork-keyed dispatch is the rule; this is the belt to its braces).
+    /// Every Gloas container is SMALLER than the smallest canonical pre-Gloas
+    /// encoding of its type (the compile-time asserts beside
+    /// `MIN_PRE_GLOAS_HEADER_SIZE`), so a Gloas decoder — exactly one size —
+    /// refuses the smallest pre-Gloas object of each type: a wrong context
+    /// digest is a clean rejection, not a misparse (the fork-keyed dispatch is
+    /// the rule; this is the belt to its braces). Java twin:
+    /// `GloasLightClientTypesTest.gloasAndPreGloasSizesDoNotCollide`.
     #[test]
     fn gloas_and_pre_gloas_sizes_do_not_collide() {
-        assert!(LightClientHeader::decode_gloas(&[0u8; LightClientHeader::FIXED_SIZE]).is_err());
-        assert!(
-            LightClientBootstrap::decode_gloas(&[0u8; LightClientBootstrap::MIN_FIXED_SIZE])
-                .is_err()
-        );
-        assert!(
-            LightClientUpdate::decode_gloas(&[0u8; LightClientUpdate::MIN_FIXED_SIZE]).is_err()
-        );
+        let header = MIN_PRE_GLOAS_HEADER_SIZE;
+        assert!(LightClientHeader::decode_gloas(&vec![0u8; header]).is_err());
+        let bootstrap = LightClientBootstrap::MIN_FIXED_SIZE + header;
+        assert!(LightClientBootstrap::decode_gloas(&vec![0u8; bootstrap]).is_err());
+        let update = LightClientUpdate::MIN_FIXED_SIZE + 2 * header;
+        assert!(LightClientUpdate::decode_gloas(&vec![0u8; update]).is_err());
+        let finality = LightClientFinalityUpdate::MIN_FIXED_SIZE + 2 * header;
+        assert!(LightClientFinalityUpdate::decode_gloas(&vec![0u8; finality]).is_err());
     }
 
     /// Bootstrap with a header offset pointing past the buffer must be rejected.
