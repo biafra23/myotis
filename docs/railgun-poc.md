@@ -61,9 +61,19 @@ the low edge of whatever range was fetched.
 **14,693,013 circulates as "the RAILGUN deployment block" and is wrong for this
 purpose.** Both the SDK config and the chain say 14,737,691: the proxy's first
 log falls on exactly that block, and a sweep from genesis to it found no logs at
-all (zbox, 2026-09-22). Using the lower number would turn 44,678 blocks of real
-history into plausible empty answers — the silent-corruption case the coverage
-rules exist to prevent.
+all (zbox, 2026-09-22).
+
+Had the watch entry used the lower number, the seed would still hold every
+RAILGUN log — there are none in between — but the index would stop treating it
+as complete: `from_block` would claim a history starting 44,678 blocks before
+the seed's coverage does, so a query reaching into that span would be refused as
+out of coverage, and under this flavour's paused backfill
+(`pauseBackfillByDefault = true`, `RailgunPoc.kt`) it would stay refused. Safe,
+but not free. The direction that corrupts is the other one: a `from_block`
+*above* the real deployment turns the history below it into plausible empty
+answers (`LogIndex::query` clamps its coverage check to `from_block`,
+`el/logindex.rs:563`), which is why `synth_logindex.py` refuses a deployment
+block above the fetch's low edge.
 
 Because coverage starts *at* the deployment block, this seed's coverage is
 complete downward. Nothing is left for the walker to fill, and every query is
