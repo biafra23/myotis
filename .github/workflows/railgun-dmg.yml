@@ -266,9 +266,12 @@ jobs:
           echo "bundled seed: $seed ($(stat -f%z "$seed") bytes)"
           cat "$manifest"
           # The watch floor is the assertion the whole index rests on: below it
-          # the engine answers [] without consulting coverage. 14693013 circulates
-          # as the RAILGUN deployment block and is wrong — it would invent 44,678
-          # blocks of emptiness. Fail the build rather than ship that.
+          # the engine answers [] without consulting coverage, so a floor above
+          # the real deployment hides history. 14693013 circulates as the RAILGUN
+          # deployment block and is wrong the other way: 44,678 blocks below the
+          # seed's coverage would be refused, and with this flavour's backfill
+          # paused nothing walks them.
+          # Fail the build unless both pin the exact block.
           grep -qx 'deploymentBlock=14737691' "$manifest" \
             || { echo "::error::manifest does not pin deploymentBlock=14737691"; exit 1; }
           grep -qx 'coveredLow=14737691' "$manifest" \

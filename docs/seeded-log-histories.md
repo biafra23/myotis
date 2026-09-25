@@ -92,7 +92,7 @@ first.
 | withholds, alters, inserts or reorders a commitment | the tree stops at the last good batch: balance **understated** | no |
 | sets `from_block` above the real deployment | the index answers `[]` below it without consulting coverage, so the tree misses its start: **understated** (tree 0 silently; a later tree left empty fails loudly) | only for a later tree |
 | declares coverage past what it holds | myotis walks only above the declared top, so the gap is never walked: **understated** | no |
-| stops early, with an honest top | none while the top is within 500,000 blocks of the finalized block: myotis walks the rest. Further back, it imports and never catches up (`BRIDGE_MAX_GAP`, measured from finalized, `el/reader.rs:622`) | — |
+| stops early, with an honest top | none while the top is within 500,000 blocks of the finalized block: myotis walks the rest. Further back, it imports and never catches up (`BRIDGE_MAX_GAP`, measured from finalized; the bridge's hold in `log_index_bridge_step`, `el/reader.rs:3304`) | — |
 | replaces a Transact note's ciphertext | the note fails to decrypt or to re-hash to its leaf and is dropped (`wallet/abstract-wallet.ts:567-573`): **understated** | no |
 | replaces a Shield note's `shieldKey` / `encryptedBundle` (event data, outside the leaf) | a note encrypted to the victim's viewing key — public in their 0zk address — appears as theirs: the Shield branch rebuilds it from the event's preimage and never checks that its `npk` derives from the wallet's own key (`abstract-wallet.ts:632-670`). A phantom, unspendable note: balance **overstated** | no |
 | withholds a nullifier (RAILGUN `Nullified`) | a spent note looks unspent: balance **overstated**; the engine makes no on-chain nullifier check | no |
