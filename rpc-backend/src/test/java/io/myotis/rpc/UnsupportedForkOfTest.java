@@ -39,6 +39,22 @@ class UnsupportedForkOfTest {
         assertTrue(reason.contains("Amsterdam"), reason);
     }
 
+    /**
+     * The head-build warm-up gate: primeConfirmContracts / replayHotCalls run only when
+     * {@code evmRefusalOf} is null. It reads the factory's own refusal — a head past
+     * Sepolia's Amsterdam (every call there is REFUSED) is not warmed, the block before
+     * it is, and a head below the fork floor is not — and it never throws.
+     */
+    @Test
+    void theHeadWarmGateSkipsAHeadTheFactoryRefuses() {
+        String amsterdam = VerifiedRpcBackend.evmRefusalOf(sepolia(EvmFactory.SEPOLIA_AMSTERDAM_TIME));
+        assertNotNull(amsterdam);
+        assertTrue(amsterdam.contains("Amsterdam"), amsterdam);
+        assertNull(VerifiedRpcBackend.evmRefusalOf(sepolia(EvmFactory.SEPOLIA_AMSTERDAM_TIME - 1)));
+        assertNotNull(VerifiedRpcBackend.evmRefusalOf(sepolia(EvmFactory.SEPOLIA_SHANGHAI_TIME - 1)));
+        assertNotNull(VerifiedRpcBackend.evmRefusalOf(null));
+    }
+
     @Test
     void otherFailuresAreNotRefusals() {
         assertNull(VerifiedRpcBackend.unsupportedForkOf(new RuntimeException("timeout")));

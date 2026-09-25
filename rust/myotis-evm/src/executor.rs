@@ -497,11 +497,20 @@ impl EvmExecutor {
 /// number would run SLOTNUM against a made-up 0 — a well-formed wrong answer —
 /// so it fails with the permanent [`EvmError::MissingSlotNumber`] before any
 /// state is fetched. Before Amsterdam the slot is not needed (SLOTNUM is an
-/// invalid opcode there).
+/// invalid opcode there) — and a header that carries one anyway is an
+/// Amsterdam block this build's fork table does not know about, refused the
+/// same way ([`EvmError::UnexpectedSlotNumber`]) rather than run under the
+/// older fork's rules.
 fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
     let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
-    if spec.is_enabled_in(SpecId::AMSTERDAM) && ctx.slot_number.is_none() {
+    let amsterdam = spec.is_enabled_in(SpecId::AMSTERDAM);
+    if amsterdam && ctx.slot_number.is_none() {
         return Err(EvmError::MissingSlotNumber {
+            block_number: ctx.block_number,
+        });
+    }
+    if !amsterdam && ctx.slot_number.is_some() {
+        return Err(EvmError::UnexpectedSlotNumber {
             block_number: ctx.block_number,
         });
     }
@@ -1419,6 +1428,56 @@ mod tests {
             exec.estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &c)
                 .map(drop),
         );
+    }
+
+    #[test]
+    fn a_slot_before_amsterdam_is_refused_before_any_fetch() {
+        // A slot number in the header means an Amsterdam block. If the fork
+        // table disagrees — no Amsterdam date (mainnet), or a later one — the
+        // network moved the fork after this build shipped: refused for good
+        // rather than answered under the older fork's opcodes and gas.
+        let exec = EvmExecutor::new(
+            Arc::new(NoFetchOracle),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let mut before = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME - 1);
+        before.slot_number = Some(SEPOLIA_AMSTERDAM_SLOT - 1);
+        let mut mainnet = ctx(10_000_000, crate::fork::SEPOLIA_AMSTERDAM_TIME + 1);
+        mainnet.slot_number = Some(1);
+        for c in [before, mainnet] {
+            let refused = |r: Result<(), EvmError>| {
+                let e = r.unwrap_err();
+                assert!(
+                    matches!(
+                        e,
+                        EvmError::UnexpectedSlotNumber {
+                            block_number: 10_000_000
+                        }
+                    ),
+                    "{e:?}"
+                );
+                assert!(
+                    e.is_refusal(),
+                    "an unscheduled Amsterdam block is permanent: {e:?}"
+                );
+            };
+            refused(exec.call_view(TARGET, &[], &c).map(drop));
+            refused(
+                exec.create_view(
+                    [0u8; 20],
+                    &SLOTNUM_CODE,
+                    U256::ZERO,
+                    &c,
+                    StateOverrides::new(),
+                )
+                .map(drop),
+            );
+            refused(
+                exec.estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &c)
+                    .map(drop),
+            );
+        }
     }
 
     #[test]

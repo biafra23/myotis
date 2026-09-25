@@ -17,8 +17,9 @@ import kotlinx.serialization.json.longOrNull
  * throwing ("cannot answer verified right now"), block-number pins are only
  * served inside the [BLOCK_NUM_LAG_TOLERANCE]..[BLOCK_NUM_TOLERANCE] window
  * around the anchored head, verified-absent accounts read as balance "0" /
- * nonce 0, and plain transfers to verified-codeless EOAs take the 21000
- * fast-path without running the EVM.
+ * nonce 0, and the engine's permanent refusal (`{"error","code":-32602}`)
+ * reaches the detailed call/estimate as REFUSED. A plain transfer's estimate
+ * is the engine's own (no host-side 21000 shortcut).
  *
  * [handleProvider] resolves the network's engine handle at call time (null =
  * not running → every method answers null).
@@ -149,6 +150,10 @@ class IosRpcBackend(
                     stateOverridesJson,
                 )
             }
+        // The permanent -32602 envelope (a block the engine will never serve, an
+        // executor refusal): REFUSED, which the router serves as -32602 — never
+        // the retryable -32000 a client would spin on (JVM-adapter parity).
+        permanentRefusalOrNull(json)?.let { return RpcCallResult.refused(it) }
         val o = resultOrNull(json) ?: return RpcCallResult.unavailable("engine error")
         return when (o.engineString("status")) {
             // A revert is a VERIFIED chain answer — the router serves it as the
@@ -194,7 +199,7 @@ class IosRpcBackend(
 
     override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?, valueWei: String?): Long? {
         // Legacy two-state view of estimateGasDetailed (single source for the
-        // guards + 21000 fast path) — a revert reads as null here.
+        // guards) — a revert or refusal reads as null here.
         val r = estimateGasDetailed(from, to, data, valueWei)
         return if (r.kind == RpcCallResult.Kind.OK) r.gas else null
     }
@@ -205,21 +210,23 @@ class IosRpcBackend(
         data: ByteArray?,
         valueWei: String?,
     ): RpcEstimateResult {
-        // Same guards + 21000 fast path as estimateGas(); all "cannot answer", not reverts.
+        // Same guards as estimateGas(); both "cannot answer", not reverts. No
+        // host-side 21000 shortcut for a plain transfer: the engine decides (its
+        // executor answers 21000 only where that is the real cost — before
+        // Amsterdam, not to a precompile; JVM-adapter parity).
         if (to == null || to.size != 20) return RpcEstimateResult.unavailable("contract creation not estimated")
         if (from != null && from.size != 20) return RpcEstimateResult.unavailable("malformed from")
-        if (data == null || data.isEmpty()) {
-            val code = getCode(to, "latest") ?: return RpcEstimateResult.unavailable("recipient unverifiable")
-            if (code.isEmpty()) return RpcEstimateResult.ok(21_000L)
-        }
         val handle = handleProvider() ?: return RpcEstimateResult.unavailable("engine not running")
-        val o = resultOrNull(RustEngine.estimateGasJson(
+        val json = RustEngine.estimateGasJson(
             handle,
             from?.let(::hex) ?: "",
             hex(to),
             data?.let { if (it.isEmpty()) "" else hex(it) } ?: "",
             valueWei ?: "",
-        )) ?: return RpcEstimateResult.unavailable("engine error")
+        )
+        // An executor refusal is the permanent -32602 envelope: REFUSED, as in callDetailed.
+        permanentRefusalOrNull(json)?.let { return RpcEstimateResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcEstimateResult.unavailable("engine error")
         return when (o.engineString("status")) {
             "ok" -> {
                 val gas = (o["gas"] as? JsonPrimitive)?.longOrNull
@@ -331,6 +338,20 @@ class IosRpcBackend(
         return o
     }
 
+    /** The message of the engine's PERMANENT refusal, `{"error": "...", "code":
+     *  -32602}` (eljson::invalid_params_json), or null for anything else — a
+     *  result, a plain `{"error"}` (retryable), or another code. The engine
+     *  always writes `error` first, so a normal result skips the parse. */
+    private fun permanentRefusalOrNull(json: String): String? {
+        val t = json.trim()
+        if (!t.startsWith("{\"error\"")) return null
+        val o = runCatching { engineJson.parseToJsonElement(t).jsonObject }.getOrNull() ?: return null
+        val code = (o["code"] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull ?: return null
+        if (code != INVALID_PARAMS) return null
+        val error = o["error"]?.takeIf { it !is JsonNull } ?: return null
+        return (error as? JsonPrimitive)?.takeIf { it.isString }?.content ?: error.toString()
+    }
+
     /** Tri-state JSON passthrough: object string | literal "null" | null (can't
      *  verify). A single-key `{"error": ...}` envelope PASSES THROUGH — the
      *  shared router unwraps it into a -32000 carrying the engine's reason
@@ -395,5 +416,8 @@ class IosRpcBackend(
 
     private companion object {
         val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+        /** JSON-RPC's "invalid params" code: the engine's permanent refusal. */
+        const val INVALID_PARAMS = -32602L
     }
 }

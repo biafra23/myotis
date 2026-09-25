@@ -43,6 +43,13 @@ pub enum EvmError {
     /// says (e.g. the fork was postponed after this build shipped) — no retry
     /// can fix that. A refusal ([`EvmError::is_refusal`]).
     MissingSlotNumber { block_number: u64 },
+    /// The mirror image: the header carries an EIP-7843 slot number, which only
+    /// Amsterdam headers have, but the fork table puts the block before
+    /// AMSTERDAM — the network scheduled or moved the fork after this build
+    /// shipped. Running it under the older fork's opcodes and gas model would
+    /// be a well-formed wrong answer, and no retry can fix that. A refusal
+    /// ([`EvmError::is_refusal`]).
+    UnexpectedSlotNumber { block_number: u64 },
 }
 
 impl EvmError {
@@ -50,7 +57,10 @@ impl EvmError {
     /// serve a PERMANENT error (JSON-RPC -32602), never the retryable
     /// "unavailable" a client would spin on (CLAUDE.md apply-or-refuse).
     pub fn is_refusal(&self) -> bool {
-        matches!(self, EvmError::MissingSlotNumber { .. })
+        matches!(
+            self,
+            EvmError::MissingSlotNumber { .. } | EvmError::UnexpectedSlotNumber { .. }
+        )
     }
 }
 
@@ -85,6 +95,12 @@ impl std::fmt::Display for EvmError {
                 f,
                 "block {block_number} is an Amsterdam block but its header has no slot number \
                  (EIP-7843); refusing to run SLOTNUM against a made-up value"
+            ),
+            EvmError::UnexpectedSlotNumber { block_number } => write!(
+                f,
+                "block {block_number} carries an EIP-7843 slot number, so it is an Amsterdam \
+                 block, but this build's fork table puts it before Amsterdam; refusing to run \
+                 it under the older fork's rules"
             ),
         }
     }

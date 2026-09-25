@@ -1490,18 +1490,29 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         RpcCallContext ctx = buildAnchoredHead();
                         lastGoodHead.set(new HeadWithTimestamp(ctx, clock.elapsedMillis()));
                         f.complete(ctx);
-                        // After the future is completed (readers unblocked), prime the
-                        // confirm-critical contracts at this root so a wallet's first
-                        // confirm-screen calls start from warm state — see the method doc.
-                        primeConfirmContracts(ctx);
-                        // ...then replay the wallet's recurring calls against this head
-                        // (async, heavy lane) so its next poll hits the result cache.
-                        // Guarded: an escaping throw here would land in the build's
-                        // catch and null out rpcCallCtx even though the head is good.
-                        try {
-                            replayHotCalls(ctx);
-                        } catch (Throwable t) {
-                            log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                        // Warm only a head the EVM will run against: past a fork this
+                        // engine refuses (Sepolia past Amsterdam on Besu 26.4) every call
+                        // and estimate is REFUSED, so the prime would spend snap fetches
+                        // on contracts nothing will execute and the replay would only
+                        // start every hot shape's backoff. evmRefusalOf never throws.
+                        String evmRefusal = evmRefusalOf(ctx.blockCtx());
+                        if (evmRefusal != null) {
+                            log.info("[rpc] head warm skipped at block #" + ctx.blockNumber()
+                                    + ": " + evmRefusal);
+                        } else {
+                            // After the future is completed (readers unblocked), prime the
+                            // confirm-critical contracts at this root so a wallet's first
+                            // confirm-screen calls start from warm state — see the method doc.
+                            primeConfirmContracts(ctx);
+                            // ...then replay the wallet's recurring calls against this head
+                            // (async, heavy lane) so its next poll hits the result cache.
+                            // Guarded: an escaping throw here would land in the build's
+                            // catch and null out rpcCallCtx even though the head is good.
+                            try {
+                                replayHotCalls(ctx);
+                            } catch (Throwable t) {
+                                log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                            }
                         }
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
@@ -1553,6 +1564,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // Fallback: the beacon-finalized execution root, verified directly by the
         // light client (no headerChain needed). Throws if no peer retains it.
         return prepareEnsCall(io.myotis.ens.EnsResolutionRoot.FINALIZED);
+    }
+
+    /**
+     * Why the EVM would refuse to run against {@code blockCtx} — the refusal of
+     * {@link io.myotis.evm.besu.EvmFactory#requireSupported} (an unknown chain, a block
+     * below the fork floor, or a fork this engine cannot price, e.g. Sepolia past
+     * Amsterdam on Besu 26.4) — or null when it would run. Cheap: selects the fork,
+     * builds nothing. Never throws, so the head-build thread can gate its warm-up on it.
+     */
+    static String evmRefusalOf(io.myotis.evm.BlockContext blockCtx) {
+        try {
+            io.myotis.evm.besu.EvmFactory.requireSupported(blockCtx);
+            return null;
+        } catch (RuntimeException e) {
+            return e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+        }
     }
 
     /**

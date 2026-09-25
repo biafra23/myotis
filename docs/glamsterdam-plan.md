@@ -376,9 +376,12 @@ it already stamps each object's context bytes from the fork schedule.
 
 Consume A.1's schedule everywhere a fork constant is used at runtime: BLS
 signing domain by epoch (done in #295's `version_for_signature_slot`), the
-decoder by the chunk's context bytes (`ChainConfig::lc_fork_of_digest`;
+decoder by the chunk's context bytes (`ChainConfig::lc_fork_of_chunk`;
 `codec::decode_multi_chunk_response_with_digests` keeps the per-chunk digest,
-since one range response can span the fork), gossip topic re-subscription at
+since one range response can span the fork) — or by its exact Gloas size, which
+no pre-Gloas object has, so a later blob-parameter fork's digest (one the
+single-BPO config does not compute) still reads as Gloas; Java twin
+`BeaconLightClient.lcForkOf`. Gossip topic re-subscription at
 the boundary (Java; the Rust engine consumes no LC gossip), req/resp context
 handling. `rust/roost/src/forks.rs` is the in-repo model for the shape of this.
 The Java chain fill (`fillChainStateRoots`, the one `BeaconBlockBody`
@@ -447,6 +450,36 @@ Amsterdam also ships eth/70 (EIP-7975 partial receipts) and eth/71
 (EIP-8159 BAL exchange). eth/66–69 keep negotiating for a transition window,
 so nothing breaks on day one, but track deprecation — the receipts path (log
 index) eventually needs eth/70. Separate ticket, not part of A or B DoD.
+
+### Known limitations after review (tracked, not fork-day-critical)
+
+- **One BPO in the digest model.** Both engines fold a single blob-parameter
+  entry into the fork digest. A BPO fork scheduled after Gloas changes the
+  network's digest without changing the fork version: light-client decoding
+  survives it (a Gloas object is recognised by its exact size, which no
+  pre-Gloas object has), but the Status digest and the Java engine's LC gossip
+  topics would follow the wrong digest until the schedule model holds the full
+  BPO list. Extend it when Sepolia or mainnet schedule a post-Gloas BPO.
+- **Finalized slot in the Rust status.** Read results report the EL anchor's
+  resolved finalized slot (the finality they proved against) in both engines.
+  The Rust status object keeps the light client's finalized slot, paired with
+  its `finalizedRootHex`; the Java status reports the resolved slot. The two
+  differ only while a Gloas finality waits for its execution header.
+- **ENS at `FINALIZED` right after the fork (Java).** Once the store's
+  finalized header is Gloas-shaped, `prepareEnsCall(FINALIZED)` builds its
+  block context from the resolved EL header, so until the first Gloas finality
+  resolves (seconds; longer if no EL peer serves that header, or after a
+  restart from a Gloas-shaped snapshot) it fails with "not resolved yet"
+  instead of serving the older resolved finality as the Rust engine does. An
+  error, never a wrong answer — and about two epochs after the fork the
+  finalized block is an Amsterdam block, which the Java EVM refuses anyway.
+  Revisit with the Besu upgrade.
+- **Too-old blocks: host and engine disagree.** Both hosts pre-check the block
+  window and answer UNAVAILABLE (-32000) for a block the Rust engine would
+  refuse permanently (-32602), so that refusal rarely reaches a wallet. The
+  engine's executor refusals (ABI 33) and malformed arguments do arrive as
+  -32602. Which classification a block behind the window deserves is a
+  separate decision.
 
 ### Test strategy
 

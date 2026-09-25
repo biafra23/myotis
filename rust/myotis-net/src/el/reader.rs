@@ -4489,6 +4489,14 @@ impl ElReader {
         self.anchor.finalized_execution().map(|f| f.block_number).unwrap_or(0)
     }
 
+    /// The beacon slot of the finality the reads prove against. Before Gloas
+    /// it is the light client's finalized slot; after, it trails that slot
+    /// while the newest finalized block's header is still being resolved — the
+    /// same finality [`Self::finalized_block_number`] reports.
+    pub fn finalized_slot(&self) -> u64 {
+        self.anchor.finalized_slot()
+    }
+
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     ///
     /// HEDGED across live snap peers (see [`ElReader::hedged_read`]): starts the

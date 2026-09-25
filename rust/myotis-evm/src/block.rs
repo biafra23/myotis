@@ -34,7 +34,9 @@ pub struct BlockContext {
     /// `None` before Amsterdam, whose headers carry no such field. The executor
     /// refuses an AMSTERDAM-spec context without it
     /// ([`EvmError::MissingSlotNumber`](crate::EvmError::MissingSlotNumber))
-    /// rather than run SLOTNUM against a made-up 0.
+    /// rather than run SLOTNUM against a made-up 0, and an earlier-spec context
+    /// with it ([`EvmError::UnexpectedSlotNumber`](crate::EvmError::UnexpectedSlotNumber)):
+    /// an Amsterdam block the fork table does not know about.
     pub slot_number: Option<u64>,
 }
 

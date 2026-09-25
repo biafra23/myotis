@@ -2423,16 +2423,21 @@ fn snapshot_reader(
 }
 
 /// Snapshot `(reader, finalizedSlot, optimisticSlot)` for a running handle.
+/// The finalized slot is the EL anchor's — the finality the read proves
+/// against, paired with the `finalizedBlockNumber` beside it — not the light
+/// client's, which runs ahead of it while a Gloas finality waits for its
+/// execution header (the Java engine reports the same resolved slot).
 fn snapshot_reader_slots(
     engine: &EngineState,
     handle: i64,
 ) -> Result<(Arc<ElReader>, u64, u64), &'static str> {
     let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
     match map.get(&handle) {
-        Some(ChainEntry::Running(_, sync, Some(reader))) => {
-            let s = sync.status();
-            Ok((Arc::clone(reader), s.finalized_slot, s.optimistic_slot))
-        }
+        Some(ChainEntry::Running(_, sync, Some(reader))) => Ok((
+            Arc::clone(reader),
+            reader.finalized_slot(),
+            sync.status().optimistic_slot,
+        )),
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
         Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
