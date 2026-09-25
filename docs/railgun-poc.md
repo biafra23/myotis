@@ -244,7 +244,7 @@ app verifies before installing the index.
 
 | build | name |
 |---|---|
-| `main`, dispatch on a branch | `Myotis-railgun-poc-arm64.dmg` |
+| `main`, dispatch on a branch or a non-`v` tag | `Myotis-railgun-poc-arm64.dmg` |
 | `v*` tag | `Myotis-v<version>-railgun-poc-arm64.dmg` |
 
 The tag build carries the version so a downloaded file identifies itself; the
