@@ -83,13 +83,16 @@ const val RAILGUN_PROXY = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
 
 /**
  * Its REAL deployment block: `from_block` is the engine's "no logs below here" assertion,
- * and below it the engine answers `[]` WITHOUT consulting coverage — so a value that is
- * merely "low enough" turns a band of history into plausible empty answers instead of the
- * honest `-32000` refusal.
+ * and below it the engine answers `[]` WITHOUT consulting coverage — so a value ABOVE the
+ * real deployment turns the history below it into plausible empty answers instead of the
+ * honest `-32000` refusal. A value below it is safe but not free: the seed's coverage
+ * starts at the fetch, so the span in between is refused as out of coverage, and under
+ * this flavour's paused backfill it stays refused.
  *
  * 14,737,691 is what the SDK config states AND what the chain shows: the contract's first
  * log falls on exactly that block, and a sweep from genesis to it found no logs at all
  * (zbox, 2026-09-22). Note that 14,693,013 circulates as "the RAILGUN deployment block" and
- * is wrong for this purpose — it would make 44,678 blocks answer empty.
+ * is wrong for this purpose — it would leave 44,678 blocks, which hold no logs, refused as
+ * out of coverage for as long as the backfill stays paused.
  */
 const val RAILGUN_PROXY_DEPLOYED = 14_737_691L

@@ -72,9 +72,10 @@ class RailgunPocTest {
         assertEquals(1, entries.size, "one contract: the wallet reads only the proxy")
         assertEquals(RAILGUN_PROXY.lowercase(), entries[0].address.lowercase())
         // 14693013 circulates as "the RAILGUN deployment block" and is WRONG for a watch
-        // floor: the chain's first log from this proxy is at 14737691, and from_block is
-        // the engine's "no logs below here" assertion — below it queries are answered []
-        // without consulting coverage, so a low floor invents 44678 blocks of emptiness.
+        // floor: the chain's first log from this proxy is at 14737691. A floor below that
+        // is safe but leaves the 44678 blocks between it and the seed's coverage refused as
+        // out of coverage (and this flavour's backfill is paused, so they stay refused); a
+        // floor above it would answer [] without consulting coverage and hide real history.
         assertEquals(14_737_691L, entries[0].fromBlock)
         assertNotEquals(14_693_013L, entries[0].fromBlock)
     }
