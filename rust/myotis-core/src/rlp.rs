@@ -522,6 +522,7 @@ mod tests {
         assert!(accepted > 5_000 && rejected > 5_000, "accepted={accepted} rejected={rejected}");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn corpus_is_found_when_present() {
         // A moved `testdata` must fail here, not quietly shrink the
@@ -655,7 +656,15 @@ mod tests {
     }
 
     /// Every `.rlp` and `.bin` file under `rust/testdata/el` (not all of them
-    /// are well-formed RLP, which suits a differential test).
+    /// are well-formed RLP, which suits a differential test). Reading them
+    /// takes `std`: the no_std test run (no-std-canary.yml) gets only the
+    /// generated inputs, and the std run replays the corpus as well.
+    #[cfg(not(feature = "std"))]
+    fn corpus_files() -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "std")]
     fn corpus_files() -> Vec<Vec<u8>> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/el");
         let mut out = Vec::new();
