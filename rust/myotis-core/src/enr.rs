@@ -7,7 +7,9 @@
 //! bytes-valued pairs are kept, list-valued pairs (`eth`, `attnets`, …) are
 //! skipped in the generic map and re-parsed on demand.
 
-use std::collections::BTreeMap;
+use alloc::format;
+use alloc::{string::String, vec::Vec};
+use alloc::collections::BTreeMap;
 
 use crate::nodekey::decompress_public_key;
 use crate::rlp::{self, Item};
@@ -213,6 +215,7 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// The EIP-778 example record (seq 1, ip4 127.0.0.1, udp 30303).
     const EIP778_EXAMPLE: &str = "enr:-IS4QHCYrYZbAKWCBRlAy5zzaDZXJBGkcnh4MHcBFZntXNFrdvJjX04jRzjzCBOonrkTfj499SZuOh8R33Ls8RRcy5wBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_oxVtw0RW_QAdpzBQA8yWM0xOIN1ZHCCdl8";

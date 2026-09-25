@@ -13,6 +13,7 @@
 //! I/O crates generate 32 secret bytes from OS randomness and construct via
 //! [`NodeKey::from_secret_bytes`].
 
+use alloc::{format};
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 

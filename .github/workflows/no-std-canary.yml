@@ -1,0 +1,76 @@
+# no_std canary for myotis-core (its Cargo.toml `std` feature, PR #478).
+#
+# `cargo build -p myotis-core --no-default-features` for x86_64-unknown-none, a
+# tier-2 target that ships NO std: a `std::` import, a HashMap, or a dependency
+# whose `std` feature is left on fails here and nowhere else. Every other Rust
+# build in CI turns the default feature on (ci.yml's Gradle `check` runs
+# `cargo test --workspace` on every PR, with std), the wasm32 canary uses default
+# features too (and self-skips in CI, which has no wasm32 target), and the UEFI
+# targets the promise exists for ship a partial std, so a UEFI build alone would
+# let a leak through. A BUILD rather than a check because the sha2 SIMD failure
+# those targets share (the force-soft block in the crate's Cargo.toml) surfaces
+# at codegen. The second step builds the UEFI target itself, the embedding the
+# feature exists for; the third runs the crate's tests on the host with default
+# features off, so the no_std configuration is tested, not only built.
+#
+# The EL conformance corpus those tests replay (rust/testdata/el/) is outside
+# the paths filter on purpose: a corpus change cannot introduce a std leak, and
+# ci.yml's `cargo test --workspace` replays it on every PR. Nothing in the crate
+# depends on the feature except the `no_std` attribute itself, so a vector that
+# passes there passes here.
+#
+# Gradle's `check` runs the same x86_64-unknown-none build (`cargoBuildNoStd`)
+# when the rustup target is installed; this job is where it always runs.
+#
+# Trigger shape as cargo-locks.yml minus the tag runs (a tagged commit is
+# already on main): push scoped to main so a branch push with an open PR runs
+# once (under pull_request); path-filtered to what can change the answer.
+name: no_std canary
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "rust/myotis-core/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/.cargo/**"
+      - "rust/rust-toolchain.toml"
+      - ".github/workflows/no-std-canary.yml"
+  pull_request:
+    paths:
+      - "rust/myotis-core/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+      - "rust/.cargo/**"
+      - "rust/rust-toolchain.toml"
+      - ".github/workflows/no-std-canary.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-std:
+    name: myotis-core builds without std
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: x86_64-unknown-none — no std exists, so any std leak fails here
+        working-directory: rust
+        run: cargo build -p myotis-core --no-default-features --target x86_64-unknown-none
+      - name: x86_64-unknown-uefi — the firmware embedding the feature is for
+        working-directory: rust
+        run: cargo build -p myotis-core --no-default-features --target x86_64-unknown-uefi
+      - name: host, default features off — the crate's tests in the no_std configuration
+        working-directory: rust
+        run: cargo test -p myotis-core --no-default-features

@@ -14,6 +14,8 @@
 //! Interpretation of scalar VALUES (e.g. `as_u64`) is strict about leading
 //! zeros, matching Tuweni's canonical-int readers.
 
+use alloc::{format, vec};
+use alloc::{vec::Vec};
 use crate::{err, CoreError};
 
 /// Decoded RLP item: a byte string or a list. Owned — decode copies out of
