@@ -6,11 +6,13 @@ import org.slf4j.LoggerFactory;
 
 import java.net.InetAddress;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -54,8 +56,9 @@ import java.util.function.LongSupplier;
  * ({@link #touch}) and for {@value #OBSERVATION_TTL_HOURS} h after. A fork this build
  * does know ({@code forkNext} in {@link NetworkConfig}) never raises one, and once it
  * passes the watch measures from its successor ({@link ForkIds#effective}), exactly as
- * our own Status does. Not covered: a peer two or more forks ahead (placement is one step
- * from the current baseline).
+ * our own Status does — while peers still on the pinned hash keep being judged against
+ * the pinned fork id, so a date moved after this build shipped stays news past ours. Not
+ * covered: a peer two or more forks ahead (placement is one step from a baseline).
  *
  * <p>One instance per network stack, shared across pause/resume connector rebuilds
  * (like {@link ServeStats}). Thread-safe: observed from Netty event loops, read by
@@ -112,6 +115,12 @@ public final class ForkWatch {
     /** @param observedAt when the Status was presented; @param seenAt last seen connected */
     private record Observation(int hash, long next, long observedAt, long seenAt) {}
 
+    /** A fork id the watch measures from, and the foreign activations announced on it. */
+    private record Baseline(int hash, long next, Set<Long> announced) {}
+
+    /** An activation {@code t} measured from the baseline hash {@code base}: one fork. */
+    private record Claim(int base, long t) {}
+
     /** Votes for one activation, in distinct sources. */
     private static final class Support {
         int placed;
@@ -120,7 +129,8 @@ public final class ForkWatch {
     }
 
     private final String label;
-    /** Our pinned fork id; the baseline at a given time is {@link ForkIds#effective} of it. */
+    /** Our pinned fork id; the baseline at a given time is {@link ForkIds#effective} of it,
+     *  plus the pin itself once {@code pinnedNext} has passed. */
     private final int pinnedHash;
     private final long pinnedNext;
     private final long genesisTime;
@@ -141,7 +151,8 @@ public final class ForkWatch {
      * @param label         network name, for log lines
      * @param localForkHash our own pinned EIP-2124 fork hash (4 bytes)
      * @param localForkNext our own announced next fork (0 = none known). Once it passes,
-     *                      the watch measures from its successor, as our Status does
+     *                      the watch measures from its successor, as our Status does, and
+     *                      from the pin for peers still on it
      * @param genesisTime   beacon genesis time — anchors the epoch-aligned activation grid
      * @param epochSeconds  seconds per beacon epoch (0 = only announced activations place)
      * @param clock         wall clock, unix SECONDS (fork activations are wall-clock times)
@@ -230,52 +241,72 @@ public final class ForkWatch {
         bySource.values().removeIf(o -> o.seenAt() < now - OBSERVATION_TTL_SECONDS);
 
         // Our baseline follows our own schedule: once the fork we know passes, peers on its
-        // successor are on OUR chain, and a further fork they announce is the news.
+        // successor are on OUR chain, and a further fork they announce is the news. The pin
+        // stays a second baseline for peers still on its hash: their Status doesn't change at
+        // OUR date, so neither does its verdict. A date moved after this build shipped keeps
+        // counting (announced, then placed from the pin once it passes), and peers on our
+        // date, or on none, keep dissenting.
         ForkIds.ForkId local = ForkIds.effective(pinnedHash, pinnedNext, now);
         int localHash = local.hash();
-        long localNext = local.next();
+        List<Baseline> baselines = new ArrayList<>(2);
+        baselines.add(new Baseline(localHash, local.next(), new HashSet<>()));
+        if (localHash != pinnedHash) baselines.add(new Baseline(pinnedHash, pinnedNext, new HashSet<>()));
 
-        Set<Long> announced = new HashSet<>();
         for (Observation o : bySource.values()) {
-            if (o.hash() == localHash && isForeignActivation(o.next(), now, localNext)) announced.add(o.next());
+            for (Baseline b : baselines) {
+                if (o.hash() == b.hash() && isForeignActivation(o.next(), now, b.next())) b.announced().add(o.next());
+            }
         }
-        Map<Long, Support> support = new HashMap<>();
+        Map<Claim, Support> support = new HashMap<>();
         int dissent = 0;
         for (Observation o : bySource.values()) {   // one entry per source ⇒ counts are distinct sources
-            if (o.hash() == localHash) {
+            Baseline on = null;
+            for (Baseline b : baselines) {
+                if (o.hash() == b.hash()) on = b;
+            }
+            if (on != null) {
                 long t = o.next();
-                if (t == 0 || t == localNext) {
-                    dissent++;                          // on our hash, no unknown fork ahead
-                } else if (isForeignActivation(t, now, localNext) && stillCounts(o, t, now)) {
-                    support.computeIfAbsent(t, k -> new Support()).announced++;
+                if (t == 0 || t == on.next()) {
+                    dissent++;                          // on a baseline, no unknown fork ahead
+                } else if (isForeignActivation(t, now, on.next()) && stillCounts(o, t, now)) {
+                    support.computeIfAbsent(new Claim(on.hash(), t), k -> new Support()).announced++;
                 }
-            } else {
-                long t = ForkIds.activationOf(localHash, o.hash());
-                if (localNext != 0 && t == localNext) {
+                continue;
+            }
+            for (Baseline b : baselines) {              // the current baseline first: one vote per source
+                long t = ForkIds.activationOf(b.hash(), o.hash());
+                if (b.next() != 0 && t == b.next()) {
                     dissent++;                          // past a fork we DO know: not news
-                } else if (plausiblePlacement(t, announced, now, localNext)) {
-                    support.computeIfAbsent(t, k -> new Support()).placed++;
+                    break;
+                }
+                if (plausiblePlacement(t, b.announced(), now, b.next())) {
+                    support.computeIfAbsent(new Claim(b.hash(), t), k -> new Support()).placed++;
+                    break;
                 }
             }
         }
 
-        // Most-backed activation; ties → more placed, then earliest. It must clear both the
-        // absolute floor and the dissent: a minority can't outvote the peers it contradicts.
-        long bestT = 0;
+        // Most-backed fork; ties → more placed, then earliest, then the current baseline's.
+        // It must clear both the absolute floor and the dissent: a minority can't outvote the
+        // peers it contradicts. The same date from two baselines is two forks: never pooled.
+        Claim bestClaim = null;
         Support best = null;
-        for (Map.Entry<Long, Support> e : support.entrySet()) {
+        for (Map.Entry<Claim, Support> e : support.entrySet()) {
+            Claim c = e.getKey();
             Support s = e.getValue();
             if (s.total() < MIN_PEERS || s.total() <= dissent) continue;
             if (best == null || s.total() > best.total()
                     || (s.total() == best.total() && (s.placed > best.placed
-                        || (s.placed == best.placed && e.getKey() < bestT)))) {
+                        || (s.placed == best.placed && (c.t() < bestClaim.t()
+                            || (c.t() == bestClaim.t() && c.base() == localHash)))))) {
                 best = s;
-                bestT = e.getKey();
+                bestClaim = c;
             }
         }
         if (best == null) return null;
+        long bestT = bestClaim.t();
         Phase phase = bestT <= now || best.placed >= MIN_PEERS ? Phase.ACTIVE : Phase.SCHEDULED;
-        return new Advisory(phase, bestT, ForkIds.successor(localHash, bestT), best.total());
+        return new Advisory(phase, bestT, ForkIds.successor(bestClaim.base(), bestT), best.total());
     }
 
     /** Apply {@code mutation} at the wall clock, then log if the advisory changed. */
@@ -318,8 +349,9 @@ public final class ForkWatch {
 
     /**
      * Whether {@code t}, where {@link ForkIds#activationOf} put a foreign hash, is a real
-     * activation: announced by a source on our hash, or epoch-aligned within the lookback
-     * (EL fork timestamps track the CL fork epoch; one epoch of slack for a clock behind).
+     * activation: announced by a source on the baseline it was placed from, or
+     * epoch-aligned within the lookback (EL fork timestamps track the CL fork epoch; one
+     * epoch of slack for a clock behind).
      */
     private boolean plausiblePlacement(long t, Set<Long> announced, long now, long localNext) {
         if (t < ForkIds.TIMESTAMP_THRESHOLD || t == localNext) return false;
