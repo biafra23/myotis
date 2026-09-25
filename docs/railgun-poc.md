@@ -244,13 +244,18 @@ app verifies before installing the index.
 
 | build | name |
 |---|---|
-| `main`, dispatch | `Myotis-railgun-poc-arm64.dmg` |
-| `v*` tag | `Myotis-railgun-poc-<version>-arm64.dmg` |
+| `main`, dispatch on a branch | `Myotis-railgun-poc-arm64.dmg` |
+| `v*` tag | `Myotis-v<version>-railgun-poc-arm64.dmg` |
 
 The tag build carries the version so a downloaded file identifies itself; the
 `main` build stays unversioned so "the latest build" is a stable name. On a tag
-the dmg is also attached to the GitHub release, alongside the standard dmgs and
-the Android APK.
+the dmg is also attached to the GitHub release, alongside the standard dmgs, the
+Bee PoC dmg and the Android APK, and named the way they are: the whole tag right
+after `Myotis-` (`Myotis-v<version>-arm64.dmg`,
+`Myotis-v<version>-bee-poc-arm64.dmg`), so a release's macOS assets read as one
+set. v0.1.12, the first release with this flavour, carries it under this name
+too: its tag build failed before #479 fixed the seed check, and the dmg was
+uploaded by hand.
 
 ### What CI asserts about the dmg
 

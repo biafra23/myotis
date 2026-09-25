@@ -337,6 +337,15 @@ jobs:
           days after its fetch (the Index tab shows the block it is usable until). See
           docs/bee-rpc-service.md.
 
+          **RAILGUN PoC (`Myotis-v<version>-railgun-poc-arm64.dmg`, when present)** — a separate
+          app ("Myotis RAILGUN PoC", own data dir) that the RAILGUN Terminal Wallet CLI can use as
+          its mainnet RPC from the first minute: it ships a pre-built log-index seed covering the
+          RailgunSmartWallet contract from its deployment block. It serves on port 8555, not the
+          regular app's 8545: point the wallet at `http://127.0.0.1:8555`. Debug/demo artefact,
+          not a production path — the seed is RPC-sourced and unverified (no receipt-root proof),
+          and it stops catching up about 69 days after its fetch (the Index tab shows the block it
+          is usable until). See docs/railgun-poc.md.
+
           **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
           `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
