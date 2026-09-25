@@ -159,6 +159,8 @@ public class CommandHandler {
                 : jsonError("resume failed (lifecycle: " + handle.lifecycle() + ")");
     }
 
+    // Mirrored field-for-field by JSON-RPC myotis_status (StatusJson.kt) — except the
+    // trailing upgradeAdvisory, which is IPC-only on purpose (see StatusJson's KDoc).
     private String handleStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         StatusSnapshot s = handle.status();
@@ -311,11 +313,12 @@ public class CommandHandler {
     static String buildUpgradeAdvisoryJson(UpgradeAdvisory a) {
         if (a == null) return "null";
         String when = java.time.Instant.ofEpochSecond(a.activationTime()).toString();
+        // Attributed to peers: the advisory is unverified peer data (see ForkWatch).
         String message = switch (a.phase()) {
-            case SCHEDULED -> "network upgrade scheduled at " + when
-                    + " is not supported by this build - update before then";
-            case ACTIVE -> "the network upgraded at " + when
-                    + " - this build can no longer follow it; update required";
+            case SCHEDULED -> "peers announce a network upgrade at " + when
+                    + " that this build does not support - update before then";
+            case ACTIVE -> "peers report the network upgraded at " + when
+                    + " to rules this build does not support - update required";
         };
         return "{\"phase\":\"" + a.phase().name() + "\""
                 + ",\"activationTime\":" + a.activationTime()

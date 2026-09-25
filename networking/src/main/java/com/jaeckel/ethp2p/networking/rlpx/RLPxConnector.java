@@ -28,6 +28,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -86,6 +87,9 @@ public final class RLPxConnector implements AutoCloseable {
     /** Stack-owned fork watch (nullable = not enabled on this network); every handler
      *  reports its peer's Status fork id into it. */
     private final ForkWatch forkWatch;
+    /** Open sessions that reported a Status to {@link #forkWatch}, with their source
+     *  network — what {@link #liveForkWatchSources} hands the watch to keep fresh. */
+    private final Map<EthHandler, String> watchedSources = new ConcurrentHashMap<>();
     /** Last eth/69 range we broadcast, to suppress duplicate BlockRangeUpdate spam.
      *  Guarded by {@link #rangeBroadcastLock} (event-loop threads race to update it). */
     private long lastBroadcastEarliest = -1;
@@ -209,8 +213,12 @@ public final class RLPxConnector implements AutoCloseable {
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
         ForkWatch watch = forkWatch;
         if (watch != null) {
-            // Keyed by node id, so a peer counts once however often we redial it.
-            ethHandler.setForkIdObserver((hash, next) -> watch.observe(pubKeyHex, hash, next));
+            // Keyed by source network, not node id: ids are free, networks are not.
+            String source = ForkWatch.sourceOf(peerAddr.getAddress());
+            ethHandler.setForkIdObserver((hash, next) -> {
+                watchedSources.put(ethHandler, source);   // live until the channel closes
+                watch.observe(source, hash, next);
+            });
         }
 
         Bootstrap bootstrap = new Bootstrap()
@@ -230,6 +238,7 @@ public final class RLPxConnector implements AutoCloseable {
                     ch.pipeline().addLast("eth", ethHandler);
                     ch.closeFuture().addListener(f -> {
                         activeHandlers.remove(ethHandler);
+                        watchedSources.remove(ethHandler);
                         if (closeCallback != null) {
                             closeCallback.onPeerClose(ethHandler.isIncompatibleNetwork(),
                                 ethHandler.isPeerBusy(), pubKeyHex);
@@ -801,6 +810,12 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}
+
+    /** Source networks of open sessions that reported their Status to the fork watch —
+     *  the stack touches these periodically so a stable pool's evidence stays fresh. */
+    public List<String> liveForkWatchSources() {
+        return List.copyOf(watchedSources.values());
+    }
 
     public List<PeerInfo> getActivePeers() {
         List<PeerInfo> result = new ArrayList<>();

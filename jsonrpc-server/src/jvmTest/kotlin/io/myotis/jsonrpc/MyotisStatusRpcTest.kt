@@ -7,6 +7,8 @@ import io.myotis.api.LifecycleState
 import io.myotis.api.NodeStatusReads
 import io.myotis.api.PeerInfo
 import io.myotis.api.StatusSnapshot
+import io.myotis.api.UpgradeAdvisory
+import io.myotis.api.UpgradePhase
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -24,7 +26,9 @@ import org.junit.jupiter.api.Test
  * mirror the daemon's `status` / `beacon-status` IPC commands
  * ([com.jaeckel.ethp2p.app.CommandHandler]) field-for-field, and — being local
  * introspection — they must answer without a verified backend. The exact-string asserts
- * pin the shape so it can't silently drift from the IPC command.
+ * pin the shape so it can't silently drift from the IPC command. The one deliberate
+ * difference: IPC's trailing `upgradeAdvisory` is not mirrored (see [StatusJson]), which
+ * the exact-string asserts below also pin — it must not leak into these results.
  */
 class MyotisStatusRpcTest {
 
@@ -72,7 +76,8 @@ class MyotisStatusRpcTest {
         /* elHunting */ false,
         /* rpcPort */ 8545,
         /* rpcServing */ true,
-        /* upgradeAdvisory */ null,
+        // Non-null on purpose: the exact-string asserts prove it stays off JSON-RPC.
+        /* upgradeAdvisory */ UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3),
     )
 
     private fun beaconStatus(

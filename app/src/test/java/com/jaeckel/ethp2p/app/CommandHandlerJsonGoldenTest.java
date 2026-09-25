@@ -351,8 +351,8 @@ class CommandHandlerJsonGoldenTest {
     void upgradeAdvisoryScheduled() {
         // Sepolia's Glamsterdam activation, as peers announce it before the fork.
         assertEquals("{\"phase\":\"SCHEDULED\",\"activationTime\":1791294816,\"forkId\":\"0x6c1d9423\","
-                        + "\"observedPeers\":4,\"message\":\"network upgrade scheduled at 2026-10-06T13:53:36Z"
-                        + " is not supported by this build - update before then\"}",
+                        + "\"observedPeers\":4,\"message\":\"peers announce a network upgrade at 2026-10-06T13:53:36Z"
+                        + " that this build does not support - update before then\"}",
                 CommandHandler.buildUpgradeAdvisoryJson(
                         new UpgradeAdvisory(UpgradePhase.SCHEDULED, 1_791_294_816L, "0x6c1d9423", 4)));
     }
@@ -360,8 +360,8 @@ class CommandHandlerJsonGoldenTest {
     @Test
     void upgradeAdvisoryActive() {
         assertEquals("{\"phase\":\"ACTIVE\",\"activationTime\":1791294816,\"forkId\":\"0x6c1d9423\","
-                        + "\"observedPeers\":3,\"message\":\"the network upgraded at 2026-10-06T13:53:36Z"
-                        + " - this build can no longer follow it; update required\"}",
+                        + "\"observedPeers\":3,\"message\":\"peers report the network upgraded at 2026-10-06T13:53:36Z"
+                        + " to rules this build does not support - update required\"}",
                 CommandHandler.buildUpgradeAdvisoryJson(
                         new UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3)));
     }

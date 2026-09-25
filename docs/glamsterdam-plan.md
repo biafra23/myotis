@@ -1,7 +1,8 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
-Status: PLANNING — written 2026-08-19; updated 2026-09-24 (Sepolia date and
-parameters now decided; A.2's EL detector implemented, Sepolia-gated). Dates
+Status: PLANNING — written 2026-08-19; updated 2026-09-25 (Sepolia date and
+parameters decided; A.2's EL detector implemented, Sepolia-gated, and
+hardened after review — see A.2). Dates
 without a decision are projections and move whenever testing finds something.
 Sources of truth to re-check while executing: `ethereum/consensus-specs`
 (`specs/gloas/light-client/`), the EF fork announcement blog posts (they carry
@@ -121,27 +122,44 @@ verification), but the liveness failure is mute.
 - *Detector:* `networking/.../eth/ForkWatch` + `ForkIds` (Java) ↔
   `rust/myotis-net/src/el/fork_watch.rs` + `rust/myotis-core/src/forkid.rs`
   (Rust). Same constants, same rules, same Sepolia vectors in both suites.
-- *Signals* — EIP-2124 fork ids from the eth `Status` of peers that already
+- *Evidence* — EIP-2124 fork ids from the eth `Status` of peers that already
   passed the network-id + genesis gate:
-  - SCHEDULED: our hash with an unknown `forkNext = T` (upgraded clients
+  - announced: our hash with an unknown `forkNext = T` (upgraded clients
     announce it from the day their release carries the fork);
-  - ACTIVE: a hash that is provably `successor(ourHash, T)` — CRC32 resumes
-    from its checksum, so the peer's hash pins both the relation to ours and
-    `T`. `T` comes from announcements seen earlier, else from a search over
-    the epoch-aligned activation times of the last 400 days, so a wallet that
-    was offline for the whole announcement window still recognises the fork
-    (upgraded peers send their Status before dropping our stale one).
-  - Threshold ≥3 distinct peers; 24 h observation TTL; 6 h grace after `T`
-    without proof (bridges the rollover, ages out a moved date); a fork the
-    build knows (its own `forkNext`) never raises it. Advisory only —
-    nothing in verification reads it.
+  - placed: a foreign hash that places as `successor(ourHash, T)`. CRC32
+    resumes from its checksum and also runs backwards, so
+    `ForkIds.activationOf` / `forkid::activation_of` recovers the one
+    `T < 2^32` for ANY hash in O(1); a real `T` was announced or sits on the
+    epoch grid within the last 400 days, so a wallet that was offline for the
+    whole announcement window still recognises the fork (upgraded peers send
+    their Status before dropping our stale one). Placing separates a
+    successor from another chain's hash; it is **not proof** — anyone can mint
+    a "successor" for any date (`0x47e12c82` places on Sepolia's grid at
+    2026-09-23T23:55:12Z). The first version called it proof and searched
+    ~9·10⁴ grid points per foreign hash behind a cache that a random-hash
+    flood could thrash on the network thread; review caught both.
+- *Vote* — built to be expensive to fake:
+  - one vote per source network (IPv4 /24, IPv6 /48), not per node id — ids
+    are free, and one host can present hundreds;
+  - an advisory needs ≥3 sources behind one activation AND more of them than
+    sources on our hash announcing no unknown fork: a minority can't outvote
+    the peers it contradicts. Most-backed activation wins; ties → placed,
+    then earliest. ACTIVE = passed on the wall clock, or placed by ≥3.
+- *Freshness* — a source counts while one of its peers stays connected (both
+  engines' peer maintainers touch live sessions every 10 s) and for 24 h
+  after. A passed announcement counts 6 h past `T` (bridges the rollover,
+  ages out a moved date) — unless it was made before `T` by a source still
+  seen connected after it: that peer passed `T` with the fork configured. A
+  fork the build knows (its own `forkNext`) never raises one; peers on it
+  count as dissent. Advisory only — nothing in verification reads it.
 - *Vectors:* the full mainnet chain Frontier → BPO2 reproduces our pinned
   `0x07c9462e`; Sepolia `0x268956b6` → `0x6c1d9423` at 1791294816 (the
-  published Glamsterdam fork id).
+  published Glamsterdam fork id), recovered exactly by `activationOf`.
 - *Ownership:* Java ChainStack-owned (survives pause/resume connector
   rebuilds); Rust handle-owned (`EngineState.fork_watches`, attached to every
   rebuilt pool). Both report the advisory in every lifecycle state, PAUSED
-  included.
+  included — but its evidence ages out a day after its sources were last seen
+  connected, so a long sleep re-derives it from the peers dialed on wake.
 - *Gate:* `ENABLED_NETWORKS = {sepolia}` in both engines (staged rollout).
 - *Surfacing:* `myotis-api` `UpgradeAdvisory`/`UpgradePhase` as nullable
   `StatusSnapshot.upgradeAdvisory`; Rust status-JSON key `upgradeAdvisory`
@@ -149,9 +167,12 @@ verification), but the liveness failure is mute.
   absent/null/unknown-phase as "none" rather than failing the status read);
   daemon `status` + `beacon-status` (with a human-readable `message`) and a
   WARN log on transitions; UI `NodeSnapshot.upgrade` → Status + Query banner
-  and a red readiness strip when ACTIVE (desktop, Android and iOS producers);
-  the Node.js module gets it through the same status JSON (README documents
-  it). No JSON-RPC surface (owner decision).
+  (desktop, Android and iOS producers). An ACTIVE advisory turns the
+  readiness strip red and the banner into an alarm only when the node's OWN
+  verified state agrees (`beaconState` not SYNCED, or a stale verified head):
+  peers alone never make the wallet claim it stopped verifying. The Node.js
+  module gets it through the same status JSON (README documents it). No
+  JSON-RPC surface (owner decision; `StatusJson` records the IPC-only key).
 
 **Still open**
 
@@ -163,8 +184,21 @@ verification), but the liveness failure is mute.
   logged, never compared). The req/resp context bytes are extracted in
   `ReqRespCodec` but dropped at every call site, so they need plumbing first.
 - Schedule-known mode (an explicit `unsupportedFork` once a configured epoch
-  is crossed) — depends on A.1.
-- A peer two or more forks ahead is not proven (single-step search).
+  is crossed) — depends on A.1. **A.1 must also move the watch's baseline**:
+  today it is the static pin, fixed when the watch is built. Once the
+  time-gated pair lands, the watch has to use the currently effective hash
+  and `forkNext` — otherwise, after `T`, it ignores peers on the new hash
+  that announce the next fork. Likewise, a build that carries Gloas but
+  forgets its `forkNext` would tell its own users to update.
+- Two or more forks ahead: placement is one step from our pin, so a stale
+  build loses its placed evidence once a further fork (e.g. a BPO soon after
+  Glamsterdam) moves upgraded peers two steps away; only announced/connected
+  evidence remains. Cheap to chain: take the `forkNext` announced by peers
+  placed on `successor(local, T)` as the next step.
+- Before the mainnet/Gnosis flip: re-validate on Sepolia's real fork (churn,
+  announcement timing — the majority rule holds SCHEDULED back until most
+  observed sources announce), and consider a threshold relative to recent
+  handshakes on top of the absolute three.
 - Dropped: sharpening the verified-read error to `upgradeRequired`. The RPC
   surface is out of scope (owner), and `beaconNotSynced` doesn't fire on an
   already-synced node in either engine, so there was nothing to sharpen — the
@@ -331,4 +365,5 @@ Suggested order: **A.1–A.3 + B.0 now** (A is shippable independently and its
 config schema feeds B); B.1→B.2 against spec vectors while Platåberget is the
 live bench; B.4's Android 26.4 rebase in parallel; Sepolia fork day runs A in
 anger and starts B's real-network soak; mainnet config refresh + B shipped
-before ~Nov 4.
+before mainnet's activation (date TBD — see Schedule; the earlier ~Nov 4
+target predates Sepolia's two-week slip).

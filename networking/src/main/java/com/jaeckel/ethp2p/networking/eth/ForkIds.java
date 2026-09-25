@@ -9,15 +9,18 @@ import java.util.Locale;
  * <em>passed</em> fork's activation point encoded as a big-endian uint64 (block
  * numbers up to the Merge, timestamps since Shanghai). CRC32 resumes from its own
  * checksum, so the hash after a fork follows from the hash before it plus the
- * activation value alone. That is what lets a node which knows nothing but its own
- * pinned hash prove that a peer's unknown hash is the direct successor of ours — and
- * recover the activation point that produced it ({@link ForkWatch}).
+ * activation value alone — and runs backwards too: {@link #activationOf} recovers,
+ * from our pinned hash and a peer's unknown one, the activation that would turn one
+ * into the other ({@link ForkWatch}). That PLACES a hash; it does not authenticate it:
+ * every 32-bit hash has exactly one such activation below 2³², so anyone can compute a
+ * "successor" for any date they like.
  *
  * <p>{@link java.util.zip.CRC32} cannot be resumed from an arbitrary checksum, hence
  * this table-driven implementation (reflected polynomial {@code 0xEDB88320}, with the
  * init/final inversion folded into {@link #update} / {@link #successor}). Verified
  * against the full mainnet chain Frontier → BPO2 ({@code 0x07c9462e}) and Sepolia's
  * Glamsterdam fork id ({@code 0x268956b6} → {@code 0x6c1d9423}) in ForkIdsTest.
+ * Twin: the Rust engine's {@code myotis_core::forkid}.
  */
 public final class ForkIds {
 
@@ -29,12 +32,16 @@ public final class ForkIds {
     public static final long TIMESTAMP_THRESHOLD = 1_438_269_973L;
 
     private static final int[] TABLE = new int[256];
+    /** {@code TABLE[TOP_INDEX[b]] >>> 24 == b}: the top bytes of the 256 entries are all
+     *  distinct, which is what makes a CRC32 step reversible. */
+    private static final int[] TOP_INDEX = new int[256];
 
     static {
         for (int n = 0; n < 256; n++) {
             int c = n;
             for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
             TABLE[n] = c;
+            TOP_INDEX[c >>> 24] = n;
         }
     }
 
@@ -50,7 +57,7 @@ public final class ForkIds {
     /**
      * The fork hash in effect once a fork activating at {@code activation} has passed,
      * given the hash {@code hash} in effect before it — {@code update(hash, be64(activation))}
-     * without the allocation (the successor search calls this ~10⁵ times).
+     * without the allocation.
      */
     public static int successor(int hash, long activation) {
         int c = ~hash;
@@ -58,6 +65,30 @@ public final class ForkIds {
             c = TABLE[(c ^ (int) (activation >>> shift)) & 0xff] ^ (c >>> 8);
         }
         return ~c;
+    }
+
+    /**
+     * The activation {@code T} (0 ≤ T < 2³²) with {@code successor(hash, T) == next} —
+     * there is always exactly one, found in O(1) ("CRC forcing"): with be64(T)'s four high
+     * bytes zero, the four low bytes map bijectively onto the final register. Each step's
+     * table index is fixed by the top byte of the register after it, so walk the target
+     * back four steps to learn the indices, then pick each byte to land on its index.
+     */
+    public static long activationOf(int hash, int next) {
+        int a = ~hash;
+        for (int k = 0; k < 4; k++) a = TABLE[a & 0xff] ^ (a >>> 8);   // be64(T)'s zero high bytes
+        int z = ~next;
+        int[] idx = new int[4];
+        for (int k = 3; k >= 0; k--) {
+            idx[k] = TOP_INDEX[z >>> 24];
+            z = (z ^ TABLE[idx[k]]) << 8;
+        }
+        long t = 0;
+        for (int k = 0; k < 4; k++) {
+            t = t << 8 | ((a ^ idx[k]) & 0xff);
+            a = TABLE[idx[k]] ^ (a >>> 8);
+        }
+        return t;
     }
 
     /** A 4-byte big-endian fork hash as an int. */

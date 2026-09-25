@@ -195,8 +195,9 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
     }
 
     /** The fork watch's current advisory as the API shape; null when there is none or the
-     *  watch isn't enabled on this network. Kept while paused: a scheduled fork stays
-     *  scheduled whether or not we're connected. */
+     *  watch isn't enabled on this network. The watch is stack-owned, so a pause keeps its
+     *  evidence — which still ages out a day after its sources were last seen connected; a
+     *  long sleep re-derives it from the peers dialed on resume. */
     static UpgradeAdvisory upgradeAdvisory(ForkWatch watch) {
         ForkWatch.Advisory a = watch != null ? watch.advisory() : null;
         if (a == null) return null;

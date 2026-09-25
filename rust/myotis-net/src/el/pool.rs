@@ -29,7 +29,7 @@ use myotis_core::nodekey::NodeKey;
 
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
-use crate::el::fork_watch::ForkWatch;
+use crate::el::fork_watch::{self, ForkWatch};
 use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
 use crate::el::peercache::{ElPeerCache, SnapQuality};
@@ -779,8 +779,13 @@ impl PoolInner {
         // handshake gate already confirmed network id + genesis. We judge no fork
         // id ourselves: an upgraded peer sends its Status before dropping our
         // stale one, and that Status is exactly the evidence the watch wants.
+        // Keyed by source network, not node id: ids are free, networks are not.
         if let (Ok(session), Some(watch)) = (&result, self.fork_watch.get()) {
-            watch.observe(&pubkey, session.peer_status.fork_id_hash, session.peer_status.fork_next);
+            watch.observe(
+                &fork_watch::source_of(addr.ip()),
+                session.peer_status.fork_id_hash,
+                session.peer_status.fork_next,
+            );
         }
         match result {
             Ok(session) if session.snap => {
@@ -1601,6 +1606,19 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // Keep the fork watch's evidence from the peers we still hold fresh: a
+        // full pool dials nobody new, and their word is exactly what matters
+        // across a fork (Java twin: ChainStack.touchForkWatch).
+        if let Some(watch) = inner.fork_watch.get() {
+            let sources: Vec<String> = inner
+                .peers
+                .lock()
+                .await
+                .iter()
+                .map(|p| fork_watch::source_of(p.addr.ip()))
+                .collect();
+            watch.touch(&sources);
+        }
         // The HUNT keys on peers that could actually serve reads right now:
         // read-benched peers don't count, and neither (since #465) does a
         // peer whose fresh announcement says it lacks the anchored head —

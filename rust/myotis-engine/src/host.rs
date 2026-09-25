@@ -127,9 +127,11 @@ struct EngineState {
     fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
     /// Per-handle fork watch (EIP-2124 stale-software detection): created on the
     /// handle's first spin_up, handed to every rebuilt EL pool, and read by
-    /// `status_json` in EVERY lifecycle state — a scheduled fork stays scheduled
-    /// while the radio sleeps (the Java twin is ChainStack-owned for the same
-    /// reason). Only for networks the watch is enabled on. Dies with the handle.
+    /// `status_json` in EVERY lifecycle state, so its evidence outlives a
+    /// pause/resume (the Java twin is ChainStack-owned for the same reason).
+    /// Evidence still ages out `OBSERVATION_TTL_SECONDS` after its source was
+    /// last seen connected: a long sleep re-derives it from the peers dialed on
+    /// wake. Only for networks the watch is enabled on. Dies with the handle.
     fork_watches: Mutex<HashMap<i64, Arc<ForkWatch>>>,
     /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
     /// anchor-marker read/write, registration). Every guard in those paths is
@@ -768,7 +770,17 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             true
         }
         _ => {
+            // A concurrent stop() removed the handle while we were starting, so
+            // the watch fork_watch_for() may have just re-inserted for it has no
+            // owner left: drop it (ids are never reused). A racing start/resume
+            // that already published keeps it — its reader holds the same Arc.
+            let gone = map.get(&handle).is_none();
             drop(map);
+            if gone {
+                if let Ok(mut watches) = engine.fork_watches.lock() {
+                    watches.remove(&handle);
+                }
+            }
             shutdown(engine, sync, reader);
             false
         }
@@ -1026,7 +1038,9 @@ fn fork_watch_for(
             fork_hash,
             fork_next,
             config.genesis_time,
-            config.slots_per_epoch.saturating_mul(config.seconds_per_slot),
+            config
+                .slots_per_epoch
+                .saturating_mul(config.seconds_per_slot),
         ))
     });
     Some(Arc::clone(watch))

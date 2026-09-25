@@ -597,16 +597,34 @@ class IosNodeController(
 }
 
 /** The status JSON's nested `upgradeAdvisory` (RustChainHandle.parseAdvisory twin):
- *  absent (older natives), JSON null, a non-object, or a phase this build doesn't
- *  know → null. Display-only, so it must never fail the status mapping. */
+ *  absent (older natives), JSON null, a non-object, a phase this build doesn't know,
+ *  or a member of the wrong type → null; an absent member takes its default. Same
+ *  outcome as the JVM parser for every input, so one status JSON shows the same banner
+ *  on every host. Display-only, so it must never fail the status mapping. */
 private fun upgradeNoticeOf(a: JsonObject?): UpgradeNotice? {
     if (a == null) return null
-    val phase = a.engineString("phase") ?: return null
+    val phase = a.advisoryString("phase", "") ?: return null
     if (phase != "SCHEDULED" && phase != "ACTIVE") return null
+    val peers = a.advisoryLong("observedPeers", 0L) ?: return null
+    if (peers !in Int.MIN_VALUE..Int.MAX_VALUE) return null
     return UpgradeNotice(
         phase = phase,
-        activationEpochSec = a.engineLong("activationTime", 0L),
-        forkId = a.engineString("forkId") ?: "",
-        observedPeers = a.engineInt("observedPeers"),
+        activationEpochSec = a.advisoryLong("activationTime", 0L) ?: return null,
+        forkId = a.advisoryString("forkId", "") ?: return null,
+        observedPeers = peers.toInt(),
     )
+}
+
+/** minimal-json's `getString(key, default)` as parseAdvisory sees it: absent → [default];
+ *  present but not a string (JSON null included) → null, dropping the advisory. */
+private fun JsonObject.advisoryString(key: String, default: String): String? {
+    val v = this[key] ?: return default
+    return (v as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
+}
+
+/** minimal-json's `getLong(key, default)`: absent → [default]; present but not an
+ *  integral JSON number (a numeric STRING included) → null, dropping the advisory. */
+private fun JsonObject.advisoryLong(key: String, default: Long): Long? {
+    val v = this[key] ?: return default
+    return (v as? JsonPrimitive)?.takeIf { it !is JsonNull && !it.isString }?.longOrNull
 }

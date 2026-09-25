@@ -8,11 +8,13 @@
 //! id and disconnect on mismatch, so these must track the live networks.
 //!
 //! The CRC32 chain arithmetic itself lives here too ([`crc32_update`],
-//! [`successor`]) — not to compute our own id, but so the fork watch
-//! (`myotis_net::el::fork_watch`, twin of Java `ForkIds`/`ForkWatch`) can prove
-//! that a peer's unknown hash is the direct successor of our pin, and recover
-//! the activation that produced it. CRC32 resumes from its own checksum, so the
-//! hash after a fork follows from the hash before it plus the activation alone.
+//! [`successor`], [`activation_of`]) — not to compute our own id, but so the
+//! fork watch (`myotis_net::el::fork_watch`, twin of Java `ForkIds`/`ForkWatch`)
+//! can recover, from our pin and a peer's unknown hash, the activation that
+//! would turn one into the other. CRC32 resumes from its own checksum, so the
+//! hash after a fork follows from the hash before it plus the activation alone
+//! — and runs backwards too. That PLACES a hash; it does not authenticate it:
+//! every 32-bit hash has exactly one such activation below 2^32.
 //!
 //! Cross-language pin: the conformance corpus records these bytes and the
 //! Java side asserts them against `NetworkConfig` — if either side drifts,
@@ -83,6 +85,43 @@ pub fn successor(hash: u32, activation: u64) -> u32 {
     crc32_update(hash, &activation.to_be_bytes())
 }
 
+/// `CRC32_TABLE[TOP_INDEX[b]] >> 24 == b`: the top bytes of the 256 entries
+/// are all distinct, which is what makes a CRC32 step reversible.
+const TOP_INDEX: [u8; 256] = {
+    let mut top = [0u8; 256];
+    let mut n = 0;
+    while n < 256 {
+        top[(CRC32_TABLE[n] >> 24) as usize] = n as u8;
+        n += 1;
+    }
+    top
+};
+
+/// The activation `T` (`T < 2^32`) with `successor(hash, T) == next` — there
+/// is always exactly one, found in O(1) ("CRC forcing"): with `be64(T)`'s four
+/// high bytes zero, the four low bytes map bijectively onto the final register.
+/// Each step's table index is fixed by the top byte of the register after it,
+/// so walk the target back four steps to learn the indices, then pick each
+/// byte to land on its index (twin: Java `ForkIds.activationOf`).
+pub fn activation_of(hash: u32, next: u32) -> u64 {
+    let mut a = !hash;
+    for _ in 0..4 {
+        a = CRC32_TABLE[(a & 0xff) as usize] ^ (a >> 8); // be64(T)'s zero high bytes
+    }
+    let mut z = !next;
+    let mut idx = [0u8; 4];
+    for slot in idx.iter_mut().rev() {
+        *slot = TOP_INDEX[(z >> 24) as usize];
+        z = (z ^ CRC32_TABLE[usize::from(*slot)]) << 8;
+    }
+    let mut t = 0u64;
+    for i in idx {
+        t = (t << 8) | u64::from((a ^ u32::from(i)) & 0xff);
+        a = CRC32_TABLE[usize::from(i)] ^ (a >> 8);
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +158,40 @@ mod tests {
             hash = successor(hash, a);
         }
         assert_eq!(hash, u32::from_be_bytes(MAINNET_FORK_ID_HASH));
+    }
+
+    #[test]
+    fn activation_of_inverts_successor_exactly() {
+        let pin = u32::from_be_bytes(SEPOLIA_FORK_ID_HASH);
+        assert_eq!(
+            activation_of(pin, SEPOLIA_GLAMSTERDAM_FORK_ID),
+            SEPOLIA_GLAMSTERDAM
+        );
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15; // xorshift64: deterministic
+        for _ in 0..100_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let (hash, t) = ((s >> 32) as u32, s & 0xffff_ffff);
+            assert_eq!(
+                activation_of(hash, successor(hash, t)),
+                t,
+                "hash {hash:#x} t {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hash_places_somewhere_so_a_placement_is_not_proof() {
+        // A hash nobody announced still inverts to an activation — here even an
+        // epoch-aligned one (2026-09-23T23:55:12Z on Sepolia's grid). Anyone can
+        // mint such a "successor"; the fork watch votes by network and weighs
+        // dissent instead of trusting it.
+        let pin = u32::from_be_bytes(SEPOLIA_FORK_ID_HASH);
+        let t = activation_of(pin, 0x47e1_2c82);
+        assert_eq!(t, 1_790_207_712);
+        assert_eq!((t - 1_655_733_600) % 384, 0);
+        assert_eq!(successor(pin, t), 0x47e1_2c82);
     }
 
     #[test]

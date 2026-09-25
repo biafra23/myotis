@@ -1287,6 +1287,21 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         // organically (a couple of probes + query walks). Top the served window up
         // toward the announced head, bounded per tick.
         peerMaintainer.scheduleWithFixedDelay(this::backfillServedHeaders, 7, 15, TimeUnit.SECONDS);
+        if (forkWatch != null) {
+            peerMaintainer.scheduleWithFixedDelay(this::touchForkWatch, 10, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /** Tell the fork watch which sources are still connected: a stable pool makes no new
+     *  handshakes, and its peers' word must not age out while they stay (twin: the Rust
+     *  pool's maintainer tick). */
+    private void touchForkWatch() {
+        try {
+            RLPxConnector conn = connector;
+            if (conn != null) forkWatch.touch(conn.liveForkWatchSources());
+        } catch (RuntimeException e) {   // a throw would silently cancel the schedule
+            log.warn("[{}][fork-watch] touch failed: {}", network.name(), e.toString());
+        }
     }
 
     /** Keep {@code activeSnapHandlers() >= targetSnapPeers}: re-dial cached snap peers,

@@ -499,7 +499,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             // THEN drops our stale one, and that Status is exactly the evidence we want.
             ObjLongConsumer<byte[]> forkIds = forkIdObserver;
             if (forkIds != null && status.forkIdHash != null && status.forkIdHash.size() == 4) {
-                forkIds.accept(status.forkIdHash.toArray(), status.forkNext);
+                try {
+                    forkIds.accept(status.forkIdHash.toArray(), status.forkNext);
+                } catch (RuntimeException e) {
+                    // Advisory only, by construction: the watch must never cost us the peer.
+                    log.warn("[eth] fork watch failed on {}'s Status: {}", remoteAddress, e.toString());
+                }
             }
             // Update chain head only after confirming the peer is on our network.
             // Peers on foreign networks (e.g. BOB Network networkId=60808 with its

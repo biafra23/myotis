@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.SplittableRandom;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -58,6 +59,30 @@ class ForkIdsTest {
             byte[] be = ByteBuffer.allocate(8).putLong(v).array();
             assertEquals(ForkIds.update(0x268956b6, be), ForkIds.successor(0x268956b6, v), "value " + v);
         }
+    }
+
+    @Test
+    void activationOfInvertsSuccessorExactly() {
+        int pin = ForkIds.toInt(NetworkConfig.SEPOLIA.forkIdHash());
+        assertEquals(SEPOLIA_GLAMSTERDAM, ForkIds.activationOf(pin, SEPOLIA_GLAMSTERDAM_FORK_ID));
+        SplittableRandom rnd = new SplittableRandom(7);
+        for (int i = 0; i < 100_000; i++) {
+            int hash = rnd.nextInt();
+            long t = rnd.nextLong() >>> 32;   // any activation below 2^32
+            assertEquals(t, ForkIds.activationOf(hash, ForkIds.successor(hash, t)), "hash " + hash + " t " + t);
+        }
+    }
+
+    @Test
+    void everyHashPlacesSomewhereSoAPlacementIsNotProof() {
+        // A hash nobody announced still inverts to an activation — here even an epoch-aligned
+        // one (2026-09-23T23:55:12Z on Sepolia's grid). Anyone can mint such a "successor",
+        // which is why ForkWatch votes by network and weighs dissent instead of trusting it.
+        int pin = ForkIds.toInt(NetworkConfig.SEPOLIA.forkIdHash());
+        long t = ForkIds.activationOf(pin, 0x47e12c82);
+        assertEquals(1_790_207_712L, t);
+        assertEquals(0, (t - NetworkConfig.SEPOLIA.clGenesisTime()) % (32 * 12));
+        assertEquals(0x47e12c82, ForkIds.successor(pin, t));
     }
 
     @Test

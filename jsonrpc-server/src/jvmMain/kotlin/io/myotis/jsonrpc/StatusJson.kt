@@ -22,6 +22,12 @@ import kotlinx.serialization.json.put
  * exact parity; on the JSON-RPC side this object is the `result`, and success is already
  * implied by `result` being present.
  *
+ * One deliberate exception: the IPC shapes end with `upgradeAdvisory` (the fork watch's
+ * "update required"), which is NOT mirrored here. It tells the node's operator to update
+ * the node; a wallet talking JSON-RPC can't act on that, and the advisory is unverified
+ * peer data that has no business in a wallet-facing answer. A client reusing one parser
+ * must treat that trailing IPC key as optional.
+ *
  * The two serializers can't share code with CommandHandler (different module, no build
  * edge), so [MyotisStatusRpcTest] pins the shape to catch drift.
  */
