@@ -36,6 +36,20 @@ class BeaconChainSpecPeriodTest {
     }
 
     @Test
+    void wallClockSlotDegradesToZeroInsteadOfGoingNegativeOrThrowing() {
+        long nowSec = System.currentTimeMillis() / 1000;
+        // A clock set before genesis (here: genesis a day in the future) reads slot 0.
+        assertEquals(0L, BeaconChainSpec.wallClockSlot(nowSec + 86_400, 5));
+        assertEquals(0L, BeaconChainSpec.currentPeriod(nowSec + 86_400, 5));
+        // A non-positive slot length counts as 1 s rather than dividing by zero. The clock
+        // is read on both sides of the call, so 1-second slots need no drift tolerance.
+        long before = System.currentTimeMillis() / 1000 - GNOSIS_GENESIS;
+        long slot = BeaconChainSpec.wallClockSlot(GNOSIS_GENESIS, 0);
+        long after = System.currentTimeMillis() / 1000 - GNOSIS_GENESIS;
+        assertTrue(slot >= before && slot <= after, before + " <= " + slot + " <= " + after);
+    }
+
+    @Test
     void singleArgOverloadMatchesMainnetSlotTime() {
         assertEquals(
                 BeaconChainSpec.currentPeriod(GNOSIS_GENESIS, BeaconChainSpec.SECONDS_PER_SLOT),

@@ -137,11 +137,14 @@ rather than leave it implicit:
   one.
 - **Withholding is a liveness attack, and this design concentrates it.** After
   rollout, a wallet's LC data comes from one relay fed by one Nimbus. That
-  failure is *detected*, not silently wrong: `BeaconSyncState` regresses out of
-  SYNCED and queries fail with `beaconNotSynced` (gate 1 in
-  `docs/readiness-and-verified-head-age.md`), so a stalled relay surfaces as "not
-  ready" rather than as a confidently wrong balance, and the wallet falls back to
-  discv5-discovered CL peers.
+  failure is *detected*, not silently wrong: both engines drop out of SYNCED once
+  their last finality is more than 5 epochs old (`SYNCED_SLOT_SLACK_EPOCHS`; gate 1
+  in `docs/readiness-and-verified-head-age.md`), so a stalled relay surfaces as
+  "not ready" in the beacon status, and the wallet falls back to discv5-discovered
+  CL peers (the LC hunt engages at that same staleness). Reads do not fail with
+  `beaconNotSynced`, which only fires before the first finalized root lands; they
+  keep answering against the last anchor, so the signal is the status, not a read
+  error.
 
 The alternative that needs no amendment: have the LC server peer with Nimbus over
 **libp2p** as a `--direct-peer` (outbound from Nimbus, trim-exempt) instead of

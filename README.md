@@ -272,9 +272,11 @@ queries:
 
 Account and storage queries return data with a Merkle proof against
 the peer's `stateRoot` even before the beacon light client reaches
-`SYNCED` — but the response will report `beaconChainVerified=false`
-with `failReason: "beaconNotSynced"`. Wait for `SYNCED` if you need
-the full beacon-anchored trust chain.
+`SYNCED`. Until its first finalized root lands (`SYNCING`) the
+response reports `beaconChainVerified=false` with
+`failReason: "beaconNotSynced"`; after that (`CATCHING_UP`) it can
+verify, but against a finalized root that may not be current. Wait
+for `SYNCED` if you need the full beacon-anchored trust chain.
 
 How long `SYNCED` takes depends on what's cached: a warm restart
 (persisted sync snapshot + state-root window + known light-client

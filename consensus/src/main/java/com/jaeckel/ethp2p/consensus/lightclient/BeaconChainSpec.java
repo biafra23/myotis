@@ -112,8 +112,18 @@ public final class BeaconChainSpec {
      * no per-network variant — only this slot-time conversion does.
      */
     public static long currentPeriod(long genesisTimeSec, int secondsPerSlot) {
+        return computeSyncCommitteePeriod(wallClockSlot(genesisTimeSec, secondsPerSlot));
+    }
+
+    /**
+     * The wall-clock slot of a chain with this genesis time and slot length — the one
+     * clock read behind the period estimate, the SYNCED gate and the LC hunt. Clamped at
+     * 0 for a clock set before genesis, and a non-positive slot length counts as 1 s, so
+     * a bad clock or preset degrades to "slot 0" rather than a negative slot or a throw
+     * (Rust twin: {@code ChainConfig::current_slot_estimate}, saturating).
+     */
+    public static long wallClockSlot(long genesisTimeSec, int secondsPerSlot) {
         long nowSec = System.currentTimeMillis() / 1000;
-        long slot = (nowSec - genesisTimeSec) / secondsPerSlot;
-        return computeSyncCommitteePeriod(slot);
+        return Math.max(0L, nowSec - genesisTimeSec) / Math.max(1, secondsPerSlot);
     }
 }

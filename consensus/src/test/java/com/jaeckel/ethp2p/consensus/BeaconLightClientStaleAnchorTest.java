@@ -20,7 +20,7 @@ class BeaconLightClientStaleAnchorTest {
     private static final long MAINNET_GENESIS = 1_606_824_023L;
 
     private static BeaconSyncState.State stateOf(BeaconSyncState s) {
-        return s.getSyncState(MAINNET_GENESIS, 12);
+        return s.getSyncState(MAINNET_GENESIS, 12, 32);
     }
 
     private static void awaitState(BeaconSyncState s, boolean wantStale) throws InterruptedException {

@@ -811,7 +811,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     public io.myotis.api.SyncState syncState() {
         return io.myotis.api.SyncState.valueOf(beaconSyncState.getSyncState(
                 connector.getNetwork().clGenesisTime(),
-                connector.getNetwork().secondsPerSlot()).name());
+                connector.getNetwork().secondsPerSlot(),
+                connector.getNetwork().slotsPerEpoch()).name());
     }
 
     @Override

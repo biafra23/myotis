@@ -61,8 +61,9 @@ final class GatedVerifiedReads implements VerifiedReads {
         stack.noteActivityAndWake();
         BeaconSyncState bss = stack.beaconSyncState();
         if (bss == null) return SyncState.SYNCING;
+        var net = stack.network();
         return SyncState.valueOf(bss.getSyncState(
-                stack.network().clGenesisTime(), stack.network().secondsPerSlot()).name());
+                net.clGenesisTime(), net.secondsPerSlot(), net.slotsPerEpoch()).name());
     }
 
     @Override
