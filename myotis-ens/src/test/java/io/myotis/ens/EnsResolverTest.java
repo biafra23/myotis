@@ -148,6 +148,77 @@ class EnsResolverTest {
         }
     }
 
+    // ---- Resolver discovery: only a revert means "no resolver here" -------
+
+    /** A refused fork, as the Java EVM reports Sepolia past Amsterdam (Besu 26.4). */
+    private static EvmExecutionException refusedFork() {
+        return new EvmExecutionException(new EvmExecutionError.UnsupportedFork(
+                "Sepolia past Amsterdam: this engine's EVM cannot run it"));
+    }
+
+    private static EvmExecutionException causeOf(java.util.concurrent.Future<?> f) {
+        var e = org.junit.jupiter.api.Assertions.assertThrows(
+                java.util.concurrent.ExecutionException.class, f::get);
+        return org.junit.jupiter.api.Assertions.assertInstanceOf(
+                EvmExecutionException.class, e.getCause());
+    }
+
+    @Test
+    void aRegistryLookupThatCannotRunFailsTheWalkInsteadOfReadingUnregistered() {
+        // Every Sepolia name would otherwise "not resolve" past Amsterdam on the Java
+        // engine: the walk read each refused level as "no resolver here". The parent
+        // ("eth") is left unprogrammed — continuing to it would surface the mock's
+        // AssertionError instead of the refusal.
+        var mock = new MockExecutor();
+        mock.failOn(REGISTRY, callRegistryResolver("vitalik.eth"), refusedFork());
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        EvmExecutionException eee = causeOf(resolver.resolveAddress("vitalik.eth", ctx()));
+        org.junit.jupiter.api.Assertions.assertInstanceOf(
+                EvmExecutionError.UnsupportedFork.class, eee.error());
+        assertEquals(1, mock.callCount(), "the walk stops at the failure");
+        // Every record lookup shares the walk.
+        eee = causeOf(resolver.resolveText("vitalik.eth", "url", ctx()));
+        org.junit.jupiter.api.Assertions.assertInstanceOf(
+                EvmExecutionError.UnsupportedFork.class, eee.error());
+    }
+
+    @Test
+    void aRegistryLevelThatRevertsIsSkipped() throws Exception {
+        // A revert IS the registry's answer for that level: walk on to the parent.
+        var mock = new MockExecutor();
+        Address resolved = Address.fromHex("0x849151d7D0bF1F34b70d5caD5149D28CC2308bf1");
+        mock.revertOn(REGISTRY, callRegistryResolver("jesse.cb.id"), new byte[0]);
+        mock.respond(REGISTRY, callRegistryResolver("cb.id"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.respond(WILDCARD_RESOLVER, resolveCalldata("jesse.cb.id", innerAddr("jesse.cb.id")),
+                encodeBytes(encodeAddress(resolved)));
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        assertEquals(Optional.of(resolved), resolver.resolveAddress("jesse.cb.id", ctx()).get());
+    }
+
+    @Test
+    void theErc165ProbeReadsOnlyARevertAsNotExtended() throws Exception {
+        // A resolver without ERC-165 reverts on supportsInterface: legacy path.
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, callRegistryResolver("vitalik.eth"), encodeAddress(PUBLIC_RESOLVER));
+        mock.revertOn(PUBLIC_RESOLVER, callSupportsExtended(), new byte[0]);
+        mock.respond(PUBLIC_RESOLVER, innerAddr("vitalik.eth"), encodeAddress(VITALIK));
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        assertEquals(Optional.of(VITALIK), resolver.resolveAddress("vitalik.eth", ctx()).get());
+
+        // Any other failure propagates — not a silent (and cached) legacy choice.
+        EnsResolver.clearResolverCache();
+        var failing = new MockExecutor();
+        failing.respond(REGISTRY, callRegistryResolver("vitalik.eth"), encodeAddress(PUBLIC_RESOLVER));
+        failing.failOn(PUBLIC_RESOLVER, callSupportsExtended(), refusedFork());
+        EvmExecutionException eee = causeOf(
+                new EnsResolver(failing, REGISTRY, UR).resolveAddress("vitalik.eth", ctx()));
+        org.junit.jupiter.api.Assertions.assertInstanceOf(
+                EvmExecutionError.UnsupportedFork.class, eee.error());
+    }
+
     // ---- Extended record types (direct legacy path) ----------------------
 
     @Test
@@ -575,6 +646,7 @@ class EnsResolverTest {
     private static final class MockExecutor implements EvmExecutor {
         private final Map<Key, byte[]> responses = new HashMap<>();
         private final Map<Key, byte[]> reverts = new HashMap<>();
+        private final Map<Key, Throwable> failures = new HashMap<>();
         private int callCount = 0;
 
         void respond(Address target, byte[] calldata, byte[] returnBytes) {
@@ -585,12 +657,19 @@ class EnsResolverTest {
             reverts.put(new Key(target, HexFormat.of().formatHex(calldata)), revertData);
         }
 
+        /** Fail a specific call with a NON-revert error (an oracle failure, a refused fork). */
+        void failOn(Address target, byte[] calldata, Throwable error) {
+            failures.put(new Key(target, HexFormat.of().formatHex(calldata)), error);
+        }
+
         int callCount() { return callCount; }
 
         @Override
         public CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext) {
             callCount++;
             Key key = new Key(target, HexFormat.of().formatHex(calldata));
+            Throwable failure = failures.get(key);
+            if (failure != null) return CompletableFuture.failedFuture(failure);
             byte[] revertData = reverts.get(key);
             if (revertData != null) {
                 return CompletableFuture.failedFuture(new EvmExecutionException(
