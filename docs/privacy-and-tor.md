@@ -6,7 +6,9 @@
 > (balance/nonce) reads** — the single routing switch sits in
 > `get_account` (`reader.rs`) — over per-address isolated circuits with
 > ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
-> reads, `eth_call`/gas estimation, tx broadcast, the CL fetch, and discovery
+> reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
+> longer pre-check its recipient through `get_code`, the engine's state oracle
+> reads it), tx broadcast, the CL fetch, and discovery
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch

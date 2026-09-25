@@ -424,11 +424,18 @@ behaviour on mainnet or gnosis today.
   at Amsterdam (EIP-2780 reprices transfers; a value transfer to an empty
   account pays new-account state gas). SLOTNUM (EIP-7843) reads the verified
   header's `slot_number`; an Amsterdam-spec context without one is refused
-  permanently (`EvmError::MissingSlotNumber`, -32602), never run with 0.
-  Engine ABI 33. Open: the JVM and iOS hosts still turn the Rust engine's
-  -32602 into the retryable "unavailable" (`RustVerifiedReads`,
-  `IosRpcBackend`) — mapping it to `REFUSED` would make every Rust-engine
-  refusal permanent at the wallet, not just this one.
+  permanently (`EvmError::MissingSlotNumber`, -32602), never run with 0, and
+  so is a slot number on a block the fork table puts before Amsterdam
+  (`EvmError::UnexpectedSlotNumber`). Engine ABI 33. Decided: the JVM and iOS
+  hosts map the Rust engine's `{"error","code":-32602}` on call and estimate
+  to `REFUSED` (`RustChainHandle` / `IosRpcBackend` `permanentRefusalOrNull`),
+  so EVERY Rust-engine -32602 there is permanent at the wallet — executor
+  refusals, malformed arguments, and a block behind the window
+  (`CallBlockRefusal::Behind`) alike, the last one reaching the engine only
+  when the head moves between the host's window check and the engine's. The
+  hosts no longer shortcut a plain transfer to 21000 either: the engine
+  decides, and its EVM setup reads the verified head's header alone (no
+  body), so the estimate costs what the shortcut's recipient read did.
 - **Besu (Java): refused.** Besu 26.4 ships an early `MainnetEVMs.amsterdam`
   without EIP-2780, so it cannot price Sepolia's schedule. `EvmFactory`
   refuses Sepolia blocks at/after the activation with

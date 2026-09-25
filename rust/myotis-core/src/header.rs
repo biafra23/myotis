@@ -124,10 +124,13 @@ impl BlockHeader {
                 .map_err(|e| CoreError(format!("header: requestsHash: {}", e.0)))?;
         }
         // Amsterdam appends blockAccessListHash (EIP-7928), then slotNumber
-        // (EIP-7843). Recognised only as that pair — a 32-byte hash followed by
-        // a canonical u64 — and never an error: past requestsHash every field
-        // stays tolerated as before (Java never reads this far, and the corpus
-        // pins the tolerance: 006-header-future-extra). A malformed or absent
+        // (EIP-7843) — the order of the reference `Header` (execution-specs,
+        // forks/amsterdam/blocks.py: `requests_hash: Hash32`,
+        // `block_access_list_hash: Hash32`, `slot_number: U64`). Recognised
+        // only as that pair — a 32-byte hash followed by a canonical u64 — and
+        // never an error: past requestsHash every field stays tolerated as
+        // before (Java never reads this far, and the corpus pins the
+        // tolerance: 006-header-future-extra). A malformed or absent
         // pair just leaves `slot_number` None, which the EVM refuses for an
         // Amsterdam block rather than guessing a slot.
         let block_access_list_hash = f.next().and_then(|it| it.as_fixed_bytes(32).ok()).map(|b| {
