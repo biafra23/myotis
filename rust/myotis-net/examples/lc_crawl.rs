@@ -150,7 +150,11 @@ async fn main() {
                 Ok(Err(_)) => Verdict::Io,
                 Ok(Ok(raw)) => match codec::decode_response(&raw, true) {
                     Ok(d) => match LightClientFinalityUpdate::decode_for(
-                        config.lc_fork_of_digest(&d.fork_digest),
+                        config.lc_fork_of_chunk(
+                            &d.fork_digest,
+                            d.ssz_payload.len(),
+                            LightClientFinalityUpdate::GLOAS_SIZE,
+                        ),
                         &d.ssz_payload,
                     ) {
                         Ok(u) => Verdict::ServesFinality(u.finalized_header.beacon.slot),

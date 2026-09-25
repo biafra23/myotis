@@ -467,16 +467,26 @@ impl ChainConfig {
         )
     }
 
-    /// The light-client wire format of a req/resp chunk, from its context bytes
-    /// — the fork digest of the object's own (attested) epoch. Gloas' digest
-    /// means the Gloas format; anything else decodes as before, where the
-    /// pre-Gloas decoders tell their own sub-shapes apart. Either way the
-    /// processor then checks the decoded object against the fork of its
-    /// attested slot (`LightClientProcessor::update_shape_ok`), so a peer lying
-    /// in its context bytes gets a rejection, never a misread.
-    pub fn lc_fork_of_digest(&self, digest: &[u8]) -> LcFork {
+    /// The light-client wire format of a req/resp chunk: Gloas when its context
+    /// bytes are the fork digest of Gloas' first epoch, or when its payload is
+    /// exactly `gloas_size` — the Gloas size of the type being read (e.g.
+    /// `LightClientUpdate::GLOAS_SIZE`); otherwise the pre-Gloas format, whose
+    /// decoders tell their own sub-shapes apart. Never Gloas on a network with
+    /// no Gloas epoch.
+    ///
+    /// The size rule is what survives a later blob-parameter fork: its digest
+    /// is not one this config computes, and without the rule every Gloas
+    /// object after it would fail to decode. It cannot misread a pre-Gloas
+    /// object, which is never that size (pinned at compile time in
+    /// `myotis_consensus::types`). Either way the processor then checks the
+    /// decoded object against the fork of its attested slot
+    /// (`LightClientProcessor::update_shape_ok`), so a peer lying in its
+    /// context bytes gets a rejection, never a misread.
+    pub fn lc_fork_of_chunk(&self, digest: &[u8], payload_len: usize, gloas_size: usize) -> LcFork {
         match self.fork_schedule.gloas_epoch() {
-            Some(epoch) if self.fork_digest_at_epoch(epoch) == digest => LcFork::Gloas,
+            Some(epoch) if payload_len == gloas_size || self.fork_digest_at_epoch(epoch) == digest => {
+                LcFork::Gloas
+            }
             _ => LcFork::PreGloas,
         }
     }
@@ -2196,7 +2206,14 @@ async fn try_bootstrap(
             }
         };
         let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
-            Ok(d) => (config.lc_fork_of_digest(&d.fork_digest), d.ssz_payload),
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientBootstrap::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(e) => {
                 fail(pool, &mut round_failures, peer);
                 tracing::debug!(peer = %peer, error = %e, "bootstrap frame invalid");
@@ -2337,7 +2354,8 @@ impl ResumeGuard {
 /// round's responding peer (chunks linger across rounds and responses).
 struct StagedChunk {
     ssz: Vec<u8>,
-    /// The chunk's wire format, from its context bytes (`lc_fork_of_digest`).
+    /// The chunk's wire format, from its context bytes and size
+    /// (`ChainConfig::lc_fork_of_chunk`).
     fork: LcFork,
     from: String,
     /// Other peers' chunks for the SAME period, kept as fallbacks.
@@ -2356,6 +2374,36 @@ struct StagedChunk {
 /// Cap on alternates per period — enough to route around a few bad or stale
 /// servers without holding a full fan-out's multi-MiB responses in memory.
 const MAX_STAGED_ALTERNATES: usize = 3;
+
+/// Stage `chunk` (wire format `fork`) for `period`, served by `from`. The first
+/// copy of a period takes the slot; another peer's copy becomes a FALLBACK
+/// rather than being dropped, so a verify-reject on the leader can try someone
+/// else's (see [`StagedChunk::alternates`]). Copies identical in bytes AND wire
+/// format are skipped — they would fail verification identically. The same
+/// bytes under another format are not a copy: a peer tagging an honest chunk
+/// with the wrong digest must not shadow the correctly tagged one.
+fn stage_chunk(
+    staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
+    period: u64,
+    chunk: Vec<u8>,
+    fork: LcFork,
+    from: &str,
+) {
+    match staged.entry(period) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(StagedChunk { ssz: chunk, fork, from: from.to_string(), alternates: Vec::new() });
+        }
+        std::collections::btree_map::Entry::Occupied(mut o) => {
+            let slot = o.get_mut();
+            if slot.alternates.len() < MAX_STAGED_ALTERNATES
+                && (slot.ssz != chunk || slot.fork != fork)
+                && !slot.alternates.iter().any(|(ssz, f, _)| *ssz == chunk && *f == fork)
+            {
+                slot.alternates.push((chunk, fork, from.to_string()));
+            }
+        }
+    }
+}
 
 /// Periods requested per catch-up round — the full spec cap, matching the
 /// Java client's `min(periodsToFetch, 128)`. This is THE cold-sync lever:
@@ -2965,31 +3013,8 @@ async fn catch_up(
                 break; // truncated/empty chunk — nothing after it is trustworthy
             }
             served += 1;
-            let fork = config.lc_fork_of_digest(&digest);
-            match staged.entry(sub_from + i as u64) {
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(StagedChunk {
-                        ssz: chunk,
-                        fork,
-                        from: peer_key.clone(),
-                        alternates: Vec::new(),
-                    });
-                }
-                std::collections::btree_map::Entry::Occupied(mut o) => {
-                    // Another peer already staged this period: keep this copy
-                    // as a FALLBACK rather than dropping it, so a verify-reject
-                    // on the leader can try someone else's (see
-                    // StagedChunk::alternates). Skip byte-identical copies —
-                    // they would fail verification identically.
-                    let slot = o.get_mut();
-                    if slot.alternates.len() < MAX_STAGED_ALTERNATES
-                        && slot.ssz != chunk
-                        && !slot.alternates.iter().any(|(ssz, _, _)| *ssz == chunk)
-                    {
-                        slot.alternates.push((chunk, fork, peer_key.clone()));
-                    }
-                }
-            }
+            let fork = config.lc_fork_of_chunk(&digest, chunk.len(), LightClientUpdate::GLOAS_SIZE);
+            stage_chunk(staged, sub_from + i as u64, chunk, fork, &peer_key);
         }
         if served == 0 {
             // Unserving answer — NOW the cooldown applies, so the next top-up
@@ -3379,7 +3404,14 @@ async fn poll_finality(
             }
         };
         let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
-            Ok(d) => (config.lc_fork_of_digest(&d.fork_digest), d.ssz_payload),
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientFinalityUpdate::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(e) => {
                 // Garbage frames are failures too (bootstrap-round parity):
                 // strikable when the whole round fails, spared by a winner.
@@ -3499,7 +3531,14 @@ async fn hunt_round(
             }
         };
         let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
-            Ok(d) => (config.lc_fork_of_digest(&d.fork_digest), d.ssz_payload),
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientFinalityUpdate::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(_) => {
                 pool.note_failure(peer.id);
                 continue;
@@ -4195,17 +4234,32 @@ mod tests {
         assert_eq!(c.fork_digest_at_epoch(353_024), [0x66, 0x9E, 0x6C, 0x11]);
         assert_eq!(c.accepted_fork_digests(), vec![c.current_fork_digest()]);
         // Context bytes pick the wire format: Gloas' digest the Gloas decoders,
-        // everything else the (sniffing) pre-Gloas ones.
+        // everything else the (sniffing) pre-Gloas ones — unless the payload is
+        // exactly the Gloas size, which no pre-Gloas object is.
         assert_eq!(c.fork_schedule.gloas_epoch(), Some(353_024));
-        assert_eq!(c.lc_fork_of_digest(&[0x66, 0x9E, 0x6C, 0x11]), LcFork::Gloas);
-        assert_eq!(c.lc_fork_of_digest(&[0x74, 0xD0, 0x14, 0x59]), LcFork::PreGloas);
-        assert_eq!(c.lc_fork_of_digest(&[]), LcFork::PreGloas);
+        const GLOAS: [u8; 4] = [0x66, 0x9E, 0x6C, 0x11];
+        const FULU: [u8; 4] = [0x74, 0xD0, 0x14, 0x59];
+        let (update, upd_len) = (LightClientUpdate::GLOAS_SIZE, 27_000);
+        assert_eq!(c.lc_fork_of_chunk(&GLOAS, upd_len, update), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&FULU, upd_len, update), LcFork::PreGloas);
+        assert_eq!(c.lc_fork_of_chunk(&[], upd_len, update), LcFork::PreGloas);
+        // A digest this config does not compute — a later blob-parameter fork —
+        // still reads a Gloas-sized object as Gloas, as does a mislabelled one.
+        assert_eq!(c.lc_fork_of_chunk(&[1, 2, 3, 4], update, update), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&FULU, update, update), LcFork::Gloas);
+        let fin = LightClientFinalityUpdate::GLOAS_SIZE;
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], fin, fin), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], fin + 1, fin), LcFork::PreGloas);
+        let boot = LightClientBootstrap::GLOAS_SIZE;
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], boot, boot), LcFork::Gloas);
         assert_eq!(c.fork_schedule.lc_fork_at_slot(11_296_767), LcFork::PreGloas);
         assert_eq!(c.fork_schedule.lc_fork_at_slot(11_296_768), LcFork::Gloas);
-        // No Gloas date on mainnet or gnosis yet: every digest is pre-Gloas there.
+        // No Gloas date on mainnet or gnosis yet: nothing is Gloas there, by
+        // digest or by size.
         for other in [ChainConfig::mainnet(), ChainConfig::gnosis()] {
             assert_eq!(other.fork_schedule.gloas_epoch(), None);
-            assert_eq!(other.lc_fork_of_digest(&[0x66, 0x9E, 0x6C, 0x11]), LcFork::PreGloas);
+            assert_eq!(other.lc_fork_of_chunk(&GLOAS, upd_len, update), LcFork::PreGloas);
+            assert_eq!(other.lc_fork_of_chunk(&GLOAS, update, update), LcFork::PreGloas);
         }
         // The full list, in order, addresses included — NOT a suffix match.
         //
@@ -5098,6 +5152,38 @@ mod tests {
         let mut staged = stage(&p, LcFork::PreGloas);
         let out = apply_staged_step(&mut p, &mut staged, u64::MAX);
         assert_eq!(out.applied, 1);
+
+        // A peer that tags the honest bytes with the wrong digest stages them
+        // FIRST: the honest peer's byte-identical copy under the right format is
+        // not a duplicate — it stays as the alternate, and applies.
+        let mut p = processor();
+        let period = p.store.current_period();
+        let mut staged = std::collections::BTreeMap::new();
+        stage_chunk(&mut staged, period, good_ssz.clone(), LcFork::Gloas, "liar");
+        stage_chunk(&mut staged, period, good_ssz.clone(), LcFork::PreGloas, "honest");
+        let out = apply_staged_step(&mut p, &mut staged, u64::MAX);
+        assert_eq!(out.applied, 1, "the correctly tagged copy must not be deduplicated away");
+        assert_eq!(out.applied_from.as_deref(), Some("honest"));
+    }
+
+    /// Staging keeps one copy per (bytes, wire format): the first takes the
+    /// slot, a byte-and-format-identical copy is dropped, the same bytes under
+    /// another format or other bytes become alternates, up to the cap.
+    #[test]
+    fn stage_chunk_dedups_by_bytes_and_format() {
+        let mut staged = std::collections::BTreeMap::new();
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::Gloas, "a");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::Gloas, "b");
+        assert!(staged[&7].alternates.is_empty(), "an identical copy is not an alternate");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::PreGloas, "c");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::PreGloas, "d");
+        stage_chunk(&mut staged, 7, vec![4, 5, 6], LcFork::Gloas, "e");
+        let from: Vec<&str> = staged[&7].alternates.iter().map(|(_, _, f)| f.as_str()).collect();
+        assert_eq!((staged[&7].from.as_str(), from), ("a", vec!["c", "e"]));
+        for i in 0..MAX_STAGED_ALTERNATES as u8 {
+            stage_chunk(&mut staged, 7, vec![9, i], LcFork::Gloas, "f");
+        }
+        assert_eq!(staged[&7].alternates.len(), MAX_STAGED_ALTERNATES, "capped");
     }
 
     #[test]

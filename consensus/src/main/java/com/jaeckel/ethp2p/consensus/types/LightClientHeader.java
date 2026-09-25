@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.core.consensus.LcFork;
 
 import java.nio.ByteBuffer;
@@ -36,10 +37,9 @@ import java.util.Arrays;
 public final class LightClientHeader {
 
     public static final int FIXED_SIZE = 244; // 112 + 4 + 128
-    /** Gloas execution branch: {@code Vector[Bytes32, floorlog2(EXECUTION_BLOCK_HASH_GINDEX_GLOAS)]}. */
-    static final int GLOAS_EXECUTION_BRANCH_NODES = 11;
-    /** The whole Gloas shape: beacon 112 + block hash 32 + 11 x 32. */
-    public static final int GLOAS_SIZE = 112 + 32 + GLOAS_EXECUTION_BRANCH_NODES * 32; // 496
+    /** The whole Gloas shape: beacon 112 + block hash 32 + the execution branch,
+     *  {@code Vector[Bytes32, floorlog2(EXECUTION_BLOCK_HASH_GINDEX_GLOAS)]} (11 x 32). */
+    public static final int GLOAS_SIZE = 112 + 32 + BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN * 32; // 496
 
     private final BeaconBlockHeader beacon;
     private final ExecutionPayloadHeader execution; // pre-Gloas shape; null in the Gloas shape
@@ -79,8 +79,9 @@ public final class LightClientHeader {
     public static LightClientHeader gloas(BeaconBlockHeader beacon, byte[] executionBlockHash, byte[][] executionBranch) {
         if (executionBlockHash == null || executionBlockHash.length != 32)
             throw new IllegalArgumentException("executionBlockHash must be 32 bytes");
-        if (executionBranch == null || executionBranch.length != GLOAS_EXECUTION_BRANCH_NODES)
-            throw new IllegalArgumentException("Gloas executionBranch must have " + GLOAS_EXECUTION_BRANCH_NODES + " nodes");
+        if (executionBranch == null || executionBranch.length != BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN)
+            throw new IllegalArgumentException("Gloas executionBranch must have "
+                    + BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN + " nodes");
         for (byte[] node : executionBranch) {
             if (node == null || node.length != 32)
                 throw new IllegalArgumentException("each executionBranch node must be 32 bytes");
@@ -145,7 +146,7 @@ public final class LightClientHeader {
         }
         BeaconBlockHeader beacon = BeaconBlockHeader.decode(Arrays.copyOfRange(ssz, 0, 112));
         byte[] executionBlockHash = Arrays.copyOfRange(ssz, 112, 144);
-        return gloas(beacon, executionBlockHash, readNodes(ssz, 144, GLOAS_EXECUTION_BRANCH_NODES));
+        return gloas(beacon, executionBlockHash, readNodes(ssz, 144, BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN));
     }
 
     /**

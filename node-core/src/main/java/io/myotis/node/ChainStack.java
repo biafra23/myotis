@@ -1309,9 +1309,14 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
      * {@link #ANCHOR_RESOLVE_RETRY_MS} — an idle pass is one lock and an empty list — and
      * at once whenever a new hash becomes pending ({@link #wakeAnchorResolver}). Twin of the
      * Rust {@code PeerPool::start_anchor_resolver}.
+     *
+     * <p>Only on a network whose fork schedule has a Gloas epoch: before Gloas a header
+     * carries its execution payload and nothing is ever pending, so elsewhere there is no
+     * thread and no tick. The pending listener stays wired either way — with no resolver
+     * running, {@link #wakeAnchorResolver} is a no-op.
      */
     private void startAnchorResolver() {
-        if (anchorResolver != null) return;
+        if (anchorResolver != null || !network.forkSchedule().gloasEpoch().isPresent()) return;
         ScheduledExecutorService ex = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "anchor-resolver-" + network.name());
             t.setDaemon(true);

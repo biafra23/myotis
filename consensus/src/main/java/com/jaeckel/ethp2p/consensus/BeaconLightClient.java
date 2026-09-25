@@ -1378,7 +1378,7 @@ public class BeaconLightClient implements AutoCloseable {
      * format; anything else decodes as before, where the pre-Gloas decoders tell their own
      * sub-shapes apart. Either way the processor then checks the decoded object against the
      * fork of its attested slot, so a peer lying in its context bytes gets a rejection,
-     * never a misread. Rust twin: {@code ChainConfig::lc_fork_of_digest}.
+     * never a misread. Rust twin: the digest half of {@code ChainConfig::lc_fork_of_chunk}.
      */
     LcFork lcForkOfDigest(byte[] digest) {
         java.util.OptionalLong gloas = forkSchedule.gloasEpoch();
@@ -1387,6 +1387,28 @@ public class BeaconLightClient implements AutoCloseable {
             return LcFork.GLOAS;
         }
         return LcFork.PRE_GLOAS;
+    }
+
+    /**
+     * The light-client wire format of a req/resp chunk: Gloas when its context bytes are the
+     * fork digest of the schedule's Gloas epoch ({@link #lcForkOfDigest}), or when its payload
+     * is exactly {@code gloasSize} — the Gloas size of the type being read (e.g.
+     * {@link LightClientUpdate#GLOAS_SIZE}); otherwise the pre-Gloas format, whose decoders
+     * tell their own sub-shapes apart. Never Gloas on a network with no Gloas epoch.
+     *
+     * <p>The size rule is what survives a later blob-parameter fork: its digest is not one
+     * this client computes (a single configured BPO), and without the rule every Gloas object
+     * after it would fail to decode. It cannot misread a pre-Gloas object, which is never that
+     * size: every Gloas container is fixed-size and smaller than the smallest canonical
+     * pre-Gloas encoding of its type (pinned by {@code BeaconLightClientGloasTest}). Either way
+     * the processor then checks the decoded object against the fork of its attested slot, so
+     * a peer lying in its context bytes gets a rejection, never a misread. Rust twin:
+     * {@code ChainConfig::lc_fork_of_chunk}.
+     */
+    LcFork lcForkOf(byte[] digest, int payloadLength, int gloasSize) {
+        if (!forkSchedule.gloasEpoch().isPresent()) return LcFork.PRE_GLOAS;
+        return payloadLength == gloasSize || lcForkOfDigest(digest) == LcFork.GLOAS
+                ? LcFork.GLOAS : LcFork.PRE_GLOAS;
     }
 
     /**
@@ -1570,10 +1592,10 @@ public class BeaconLightClient implements AutoCloseable {
 
             com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", ssz);
             // No context bytes over HTTP: the Gloas format is fixed-size, so its exact
-            // length selects it — and verifyBootstrap's shape check cross-validates that
-            // against the fork of the header's own slot.
+            // length selects it (lcForkOf's size rule) — and verifyBootstrap's shape check
+            // cross-validates that against the fork of the header's own slot.
             LightClientBootstrap bootstrap = LightClientBootstrap.decodeFor(
-                    ssz.length == LightClientBootstrap.GLOAS_SIZE ? LcFork.GLOAS : LcFork.PRE_GLOAS, ssz);
+                    lcForkOf(null, ssz.length, LightClientBootstrap.GLOAS_SIZE), ssz);
 
             try {
                 verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
@@ -1658,7 +1680,8 @@ public class BeaconLightClient implements AutoCloseable {
                         try {
                             com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", response);
                             LightClientBootstrap bootstrap = LightClientBootstrap.decodeFor(
-                                    lcForkOfDigest(framed.forkDigest()), response);
+                                    lcForkOf(framed.forkDigest(), response.length,
+                                            LightClientBootstrap.GLOAS_SIZE), response);
 
                             try {
                                 verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
@@ -2076,7 +2099,8 @@ public class BeaconLightClient implements AutoCloseable {
                 // Each chunk decodes in the format ITS context bytes name: one response can
                 // span the fork.
                 LightClientUpdate update = LightClientUpdate.decodeFor(
-                        lcForkOfDigest(chunk.forkDigest()), responseSsz);
+                        lcForkOf(chunk.forkDigest(), responseSsz.length, LightClientUpdate.GLOAS_SIZE),
+                        responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
                     if (applied == 1) {
@@ -2146,7 +2170,8 @@ public class BeaconLightClient implements AutoCloseable {
 
                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decodeFor(
-                        lcForkOfDigest(framed.forkDigest()), response);
+                        lcForkOf(framed.forkDigest(), response.length, LightClientFinalityUpdate.GLOAS_SIZE),
+                        response);
                 LightClientHeader finalizedHeader = update.finalizedHeader();
                 long finalizedSlot = finalizedHeader.beacon().slot();
                 // Seeding takes an unverified execution payload's fields; a Gloas header
@@ -2450,7 +2475,8 @@ public class BeaconLightClient implements AutoCloseable {
                                 byte[] response = framed.payload();
                                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decodeFor(
-                                        lcForkOfDigest(framed.forkDigest()), response);
+                                        lcForkOf(framed.forkDigest(), response.length,
+                                                LightClientFinalityUpdate.GLOAS_SIZE), response);
                                 // Decodable update ⇒ the peer serves the LC protocol,
                                 // whether or not it wins the round. Dial-priority signal
                                 // only — trust still requires the verified apply below.

@@ -108,9 +108,11 @@ async fn probe(
         Ok(Err(_)) => Verdict::Io,
         Ok(Ok(raw)) => match codec::decode_multi_chunk_response_with_digests(&raw, 1) {
             Ok(chunks) => match chunks.into_iter().next() {
-                // Decoded by its context bytes, as the wallet does (Gloas).
+                // Decoded by its context bytes and size, as the wallet does (Gloas).
                 Some((digest, c)) if !c.is_empty() => {
-                    match LightClientUpdate::decode_for(config.lc_fork_of_digest(&digest), &c) {
+                    let fork =
+                        config.lc_fork_of_chunk(&digest, c.len(), LightClientUpdate::GLOAS_SIZE);
+                    match LightClientUpdate::decode_for(fork, &c) {
                         Ok(u) => {
                             let bits: u64 = u
                                 .sync_aggregate

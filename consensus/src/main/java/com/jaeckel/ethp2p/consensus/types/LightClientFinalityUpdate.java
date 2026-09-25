@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.core.consensus.LcFork;
 
 import java.nio.ByteBuffer;
@@ -31,11 +32,10 @@ public final class LightClientFinalityUpdate {
 
     /** Minimum fixed size (pre-Electra, 6-node finality branch). */
     public static final int FIXED_SIZE = 4 + 4 + 6 * 32 + 160 + 8; // 368
-    /** Gloas finality branch: {@code Vector[Bytes32, floorlog2(FINALIZED_ROOT_GINDEX_GLOAS)]}. */
-    private static final int GLOAS_FINALITY_BRANCH_NODES = 9;
-    /** Gloas: attested 496 + finalized 496 + 9 x 32 + aggregate 160 + slot 8, fixed. */
+    /** Gloas: attested 496 + finalized 496 + the finality branch, {@code Vector[Bytes32,
+     *  floorlog2(FINALIZED_ROOT_GINDEX_GLOAS)]} (9 x 32) + aggregate 160 + slot 8, fixed. */
     public static final int GLOAS_SIZE =
-            2 * LightClientHeader.GLOAS_SIZE + GLOAS_FINALITY_BRANCH_NODES * 32 + 160 + 8; // 1448
+            2 * LightClientHeader.GLOAS_SIZE + BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN * 32 + 160 + 8; // 1448
 
     private final LightClientHeader attestedHeader;
     private final LightClientHeader finalizedHeader;
@@ -51,8 +51,9 @@ public final class LightClientFinalityUpdate {
             long signatureSlot
     ) {
         int nodes = finalityBranch.length;
-        if ((nodes < 6 || nodes > 7) && nodes != GLOAS_FINALITY_BRANCH_NODES) {
-            throw new IllegalArgumentException("finalityBranch must have 6 or 7 nodes (9 for Gloas), got " + nodes);
+        if ((nodes < 6 || nodes > 7) && nodes != BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN) {
+            throw new IllegalArgumentException("finalityBranch must have 6 or 7 nodes ("
+                    + BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN + " for Gloas), got " + nodes);
         }
         this.attestedHeader = attestedHeader;
         this.finalizedHeader = finalizedHeader;
@@ -150,12 +151,12 @@ public final class LightClientFinalityUpdate {
         }
         int h = LightClientHeader.GLOAS_SIZE;
         int finBranch = 2 * h;
-        int agg = finBranch + GLOAS_FINALITY_BRANCH_NODES * 32;
+        int agg = finBranch + BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN * 32;
         int slot = agg + 160;
         return new LightClientFinalityUpdate(
                 LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, 0, h)),
                 LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, h, finBranch)),
-                LightClientHeader.readNodes(ssz, finBranch, GLOAS_FINALITY_BRANCH_NODES),
+                LightClientHeader.readNodes(ssz, finBranch, BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN),
                 SyncAggregate.decode(Arrays.copyOfRange(ssz, agg, slot)),
                 ByteBuffer.wrap(ssz, slot, 8).order(ByteOrder.LITTLE_ENDIAN).getLong());
     }

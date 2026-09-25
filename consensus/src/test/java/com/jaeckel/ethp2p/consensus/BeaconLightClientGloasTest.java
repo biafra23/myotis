@@ -1,6 +1,10 @@
 package com.jaeckel.ethp2p.consensus;
 
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStore;
+import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
+import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
+import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
+import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
 import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.core.consensus.LcFork;
 import org.junit.jupiter.api.Test;
@@ -47,7 +51,7 @@ class BeaconLightClientGloasTest {
     }
 
     /**
-     * Twin of the Rust {@code lc_fork_of_digest} pins: Sepolia's Gloas digest (its own fork
+     * Twin of the Rust {@code lc_fork_of_chunk} digest pins: Sepolia's Gloas digest (its own fork
      * digest formula over 0x90000076, BPO2 fold included) selects the Gloas decoders; the
      * Fulu digest, anything else, and every digest on a chain with no Gloas date, the
      * pre-Gloas ones.
@@ -69,6 +73,93 @@ class BeaconLightClientGloasTest {
             blc.close();
             noGloas.close();
         }
+    }
+
+    /**
+     * Twin of the Rust {@code lc_fork_of_chunk} pins: a payload of exactly its type's Gloas
+     * size is Gloas under ANY context bytes — the digest of a later blob-parameter fork this
+     * client does not compute, or a mislabelled one — while a pre-Gloas payload under an
+     * unknown digest decodes as before. Real objects both ways: the consensus-specs Gloas
+     * {@code ssz_static} vectors and the recorded mainnet (pre-Gloas) corpus. Nothing is
+     * Gloas on a chain with no Gloas date, by digest or by size.
+     */
+    @Test
+    void aGloasSizedChunkIsGloasUnderAnyDigest() throws Exception {
+        byte[] gvr = hex("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078");
+        BeaconLightClient blc = client(sepolia().withGloasEpoch(353024), gvr, 0L, new BeaconSyncState());
+        BeaconLightClient noGloas = client(sepolia(), gvr, 0L, new BeaconSyncState());
+        byte[] gloasDigest = hex("669e6c11");
+        byte[] fuluDigest = hex("74d01459");
+        byte[] unknown = hex("01020304");
+        int update = LightClientUpdate.GLOAS_SIZE;
+        int fin = LightClientFinalityUpdate.GLOAS_SIZE;
+        int boot = LightClientBootstrap.GLOAS_SIZE;
+        try {
+            blc.setBlobParameters(275712L, 21L);
+            noGloas.setBlobParameters(275712L, 21L);
+            // The digest rule alone, for a payload that is not the Gloas size.
+            assertEquals(LcFork.GLOAS, blc.lcForkOf(gloasDigest, 27_000, update));
+            assertEquals(LcFork.PRE_GLOAS, blc.lcForkOf(fuluDigest, 27_000, update));
+            assertEquals(LcFork.PRE_GLOAS, blc.lcForkOf(new byte[0], 27_000, update));
+            assertEquals(LcFork.PRE_GLOAS, blc.lcForkOf(null, 27_000, update));
+            // The size rule, whatever the context bytes say.
+            assertEquals(LcFork.GLOAS, blc.lcForkOf(unknown, update, update));
+            assertEquals(LcFork.GLOAS, blc.lcForkOf(fuluDigest, update, update));
+            assertEquals(LcFork.GLOAS, blc.lcForkOf(unknown, fin, fin));
+            assertEquals(LcFork.PRE_GLOAS, blc.lcForkOf(unknown, fin + 1, fin));
+            assertEquals(LcFork.GLOAS, blc.lcForkOf(null, boot, boot)); // the HTTP bootstrap
+            // No Gloas date: neither rule fires.
+            assertEquals(LcFork.PRE_GLOAS, noGloas.lcForkOf(gloasDigest, 27_000, update));
+            assertEquals(LcFork.PRE_GLOAS, noGloas.lcForkOf(gloasDigest, update, update));
+
+            // Gloas objects under an unknown digest decode in the Gloas format...
+            Path gloasSpec = Path.of("..", "rust", "testdata", "lc", "gloas-spec", "mainnet", "ssz_static");
+            byte[] gUpdate = Files.readAllBytes(gloasSpec.resolve("LightClientUpdate/case_0.ssz"));
+            assertEquals(LcFork.GLOAS, LightClientUpdate.decodeFor(
+                    blc.lcForkOf(unknown, gUpdate.length, update), gUpdate).attestedHeader().shape());
+            byte[] gFin = Files.readAllBytes(gloasSpec.resolve("LightClientFinalityUpdate/case_0.ssz"));
+            assertEquals(LcFork.GLOAS, LightClientFinalityUpdate.decodeFor(
+                    blc.lcForkOf(unknown, gFin.length, fin), gFin).attestedHeader().shape());
+            byte[] gBoot = Files.readAllBytes(gloasSpec.resolve("LightClientBootstrap/case_0.ssz"));
+            assertEquals(LcFork.GLOAS, LightClientBootstrap.decodeFor(
+                    blc.lcForkOf(unknown, gBoot.length, boot), gBoot).header().shape());
+
+            // ...and pre-Gloas ones exactly as before (the sniffing pre-Gloas decoders).
+            Path corpus = Path.of("..", "rust", "testdata", "lc", "mainnet");
+            byte[] eUpdate = Files.readAllBytes(corpus.resolve("001-update.ssz"));
+            assertEquals(LcFork.PRE_GLOAS, blc.lcForkOf(unknown, eUpdate.length, update));
+            LightClientUpdate u = LightClientUpdate.decodeFor(blc.lcForkOf(unknown, eUpdate.length, update), eUpdate);
+            assertEquals(LcFork.PRE_GLOAS, u.attestedHeader().shape());
+            assertEquals(LightClientUpdate.decode(eUpdate).signatureSlot(), u.signatureSlot());
+            byte[] eFin = Files.readAllBytes(corpus.resolve("001-finality.ssz"));
+            LightClientFinalityUpdate f = LightClientFinalityUpdate.decodeFor(
+                    blc.lcForkOf(unknown, eFin.length, fin), eFin);
+            assertEquals(LcFork.PRE_GLOAS, f.attestedHeader().shape());
+            assertEquals(LightClientFinalityUpdate.decode(eFin).signatureSlot(), f.signatureSlot());
+            byte[] eBoot = Files.readAllBytes(corpus.resolve("bootstrap.ssz"));
+            LightClientBootstrap b = LightClientBootstrap.decodeFor(blc.lcForkOf(unknown, eBoot.length, boot), eBoot);
+            assertEquals(LcFork.PRE_GLOAS, b.header().shape());
+            assertEquals(LightClientBootstrap.decode(eBoot).header().beacon().slot(), b.header().beacon().slot());
+        } finally {
+            blc.close();
+            noGloas.close();
+        }
+    }
+
+    /**
+     * What makes the size rule safe (the Rust twin pins it at compile time in
+     * {@code myotis_consensus::types}): every Gloas container is smaller than the smallest
+     * canonical pre-Gloas encoding of its type, so a Gloas-sized payload is never a pre-Gloas
+     * object. The smallest pre-Gloas header is the fixed part plus a Capella payload header
+     * with empty {@code extra_data} (568 bytes; Deneb's and Electra's are larger).
+     */
+    @Test
+    void aGloasObjectIsNeverTheSizeOfAPreGloasOne() {
+        int minPreGloasHeader = LightClientHeader.FIXED_SIZE + 568;
+        assertTrue(LightClientBootstrap.GLOAS_SIZE < LightClientBootstrap.FIXED_SIZE + minPreGloasHeader);
+        assertTrue(LightClientUpdate.GLOAS_SIZE < LightClientUpdate.FIXED_SIZE + 2 * minPreGloasHeader);
+        assertTrue(LightClientFinalityUpdate.GLOAS_SIZE
+                < LightClientFinalityUpdate.FIXED_SIZE + 2 * minPreGloasHeader);
     }
 
     /**

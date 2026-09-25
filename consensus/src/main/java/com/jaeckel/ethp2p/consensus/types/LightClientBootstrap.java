@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.core.consensus.LcFork;
 
 import java.nio.ByteBuffer;
@@ -31,11 +32,10 @@ public final class LightClientBootstrap {
 
     /** Minimum fixed size (pre-Electra, 5 branch nodes). */
     public static final int FIXED_SIZE = 4 + SyncCommittee.ENCODED_SIZE + 5 * 32; // 24788
-    /** Gloas branch: {@code Vector[Bytes32, floorlog2(CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS)]}. */
-    private static final int GLOAS_BRANCH_NODES = 11;
-    /** Gloas: header 496 + committee 24624 + 11 x 32, fixed. */
-    public static final int GLOAS_SIZE =
-            LightClientHeader.GLOAS_SIZE + SyncCommittee.ENCODED_SIZE + GLOAS_BRANCH_NODES * 32; // 25472
+    /** Gloas: header 496 + committee 24624 + the branch, {@code Vector[Bytes32,
+     *  floorlog2(CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS)]} (11 x 32), fixed. */
+    public static final int GLOAS_SIZE = LightClientHeader.GLOAS_SIZE + SyncCommittee.ENCODED_SIZE
+            + BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32; // 25472
 
     private final LightClientHeader header;
     private final SyncCommittee currentSyncCommittee;
@@ -47,9 +47,9 @@ public final class LightClientBootstrap {
             byte[][] currentSyncCommitteeBranch
     ) {
         int nodes = currentSyncCommitteeBranch.length;
-        if ((nodes < 5 || nodes > 6) && nodes != GLOAS_BRANCH_NODES) {
-            throw new IllegalArgumentException("currentSyncCommitteeBranch must have 5 or 6 nodes (11 for Gloas), got "
-                    + nodes);
+        if ((nodes < 5 || nodes > 6) && nodes != BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN) {
+            throw new IllegalArgumentException("currentSyncCommitteeBranch must have 5 or 6 nodes ("
+                    + BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN + " for Gloas), got " + nodes);
         }
         for (byte[] node : currentSyncCommitteeBranch) {
             if (node.length != 32) throw new IllegalArgumentException("each branch node must be 32 bytes");
@@ -123,7 +123,7 @@ public final class LightClientBootstrap {
         int c = h + SyncCommittee.ENCODED_SIZE;
         LightClientHeader header = LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, 0, h));
         SyncCommittee currentSyncCommittee = SyncCommittee.decode(Arrays.copyOfRange(ssz, h, c));
-        byte[][] branch = LightClientHeader.readNodes(ssz, c, GLOAS_BRANCH_NODES);
+        byte[][] branch = LightClientHeader.readNodes(ssz, c, BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN);
         return new LightClientBootstrap(header, currentSyncCommittee, branch);
     }
 

@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.core.consensus.LcFork;
 
 import java.nio.ByteBuffer;
@@ -43,16 +44,15 @@ public final class LightClientUpdate {
             + 160                       // syncAggregate
             + 8;                        // signatureSlot
 
-    /** Gloas: {@code floorlog2(NEXT_SYNC_COMMITTEE_GINDEX_GLOAS)} and {@code floorlog2(FINALIZED_ROOT_GINDEX_GLOAS)}. */
-    private static final int GLOAS_NEXT_SYNC_COMMITTEE_BRANCH_NODES = 11;
-    private static final int GLOAS_FINALITY_BRANCH_NODES = 9;
-    /** Gloas: attested 496 + committee 24624 + 11 x 32 + finalized 496 + 9 x 32 + aggregate 160 + slot 8, fixed. */
+    /** Gloas: attested 496 + committee 24624 + 11 x 32 + finalized 496 + 9 x 32 + aggregate 160 + slot 8, fixed.
+     *  The branches are {@code floorlog2(NEXT_SYNC_COMMITTEE_GINDEX_GLOAS)} and
+     *  {@code floorlog2(FINALIZED_ROOT_GINDEX_GLOAS)} nodes long. */
     public static final int GLOAS_SIZE =
             LightClientHeader.GLOAS_SIZE
             + SyncCommittee.ENCODED_SIZE
-            + GLOAS_NEXT_SYNC_COMMITTEE_BRANCH_NODES * 32
+            + BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32
             + LightClientHeader.GLOAS_SIZE
-            + GLOAS_FINALITY_BRANCH_NODES * 32
+            + BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN * 32
             + 160
             + 8; // 26424
 
@@ -186,16 +186,16 @@ public final class LightClientUpdate {
         int h = LightClientHeader.GLOAS_SIZE;
         int nsc = h;
         int nscBranch = nsc + SyncCommittee.ENCODED_SIZE;
-        int finalized = nscBranch + GLOAS_NEXT_SYNC_COMMITTEE_BRANCH_NODES * 32;
+        int finalized = nscBranch + BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32;
         int finBranch = finalized + h;
-        int agg = finBranch + GLOAS_FINALITY_BRANCH_NODES * 32;
+        int agg = finBranch + BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN * 32;
         int slot = agg + 160;
         return new LightClientUpdate(
                 LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, 0, h)),
                 SyncCommittee.decode(Arrays.copyOfRange(ssz, nsc, nscBranch)),
-                LightClientHeader.readNodes(ssz, nscBranch, GLOAS_NEXT_SYNC_COMMITTEE_BRANCH_NODES),
+                LightClientHeader.readNodes(ssz, nscBranch, BeaconChainSpec.GLOAS_SYNC_COMMITTEE_BRANCH_LEN),
                 LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, finalized, finBranch)),
-                LightClientHeader.readNodes(ssz, finBranch, GLOAS_FINALITY_BRANCH_NODES),
+                LightClientHeader.readNodes(ssz, finBranch, BeaconChainSpec.GLOAS_FINALITY_BRANCH_LEN),
                 SyncAggregate.decode(Arrays.copyOfRange(ssz, agg, slot)),
                 ByteBuffer.wrap(ssz, slot, 8).order(ByteOrder.LITTLE_ENDIAN).getLong());
     }

@@ -130,8 +130,8 @@ fn served_an_update(config: &ChainConfig, raw: &[u8]) -> bool {
     }
     match codec::decode_multi_chunk_response_with_digests(raw, 1) {
         Ok(chunks) => chunks.first().is_some_and(|(digest, c)| {
-            !c.is_empty()
-                && LightClientUpdate::decode_for(config.lc_fork_of_digest(digest), c).is_ok()
+            let fork = config.lc_fork_of_chunk(digest, c.len(), LightClientUpdate::GLOAS_SIZE);
+            !c.is_empty() && LightClientUpdate::decode_for(fork, c).is_ok()
         }),
         Err(_) => false,
     }
@@ -250,7 +250,11 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                     // bootstrap path does not check it either; the checkpoint
                     // pin and the two branches below are the real proof.
                     let verdict = {
-                        let fork = config.lc_fork_of_digest(&d.fork_digest);
+                        let fork = config.lc_fork_of_chunk(
+                            &d.fork_digest,
+                            d.ssz_payload.len(),
+                            LightClientBootstrap::GLOAS_SIZE,
+                        );
                         match LightClientBootstrap::decode_for(fork, &d.ssz_payload) {
                             Err(e) => Err(format!("bootstrap did not decode: {e}")),
                             Ok(b) if b.header.beacon.hash_tree_root() != config.checkpoint_root => {

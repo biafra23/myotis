@@ -779,6 +779,34 @@ impl LightClientFinalityUpdate {
     }
 }
 
+// -------------------------------------------------------------------------
+// A Gloas object is never the size of a pre-Gloas one
+// -------------------------------------------------------------------------
+
+/// The smallest canonical pre-Gloas header of the forks these decoders serve:
+/// the fixed part plus a Capella payload header with empty `extra_data` (568
+/// bytes; Deneb's and Electra's are larger).
+const MIN_PRE_GLOAS_HEADER_SIZE: usize = LightClientHeader::FIXED_SIZE + 568; // 812
+
+// Every Gloas container is fixed-size and smaller than the smallest canonical
+// pre-Gloas encoding of the same type, so a payload of exactly the Gloas size
+// is a Gloas object whatever its context bytes say. That is what lets the sync
+// loop read a Gloas object under a fork digest it does not compute (a later
+// blob-parameter fork) without ever misreading a pre-Gloas one
+// (`ChainConfig::lc_fork_of_chunk` in myotis-net).
+const _: () = assert!(
+    LightClientBootstrap::GLOAS_SIZE
+        < LightClientBootstrap::MIN_FIXED_SIZE + MIN_PRE_GLOAS_HEADER_SIZE
+);
+const _: () = assert!(
+    LightClientUpdate::GLOAS_SIZE
+        < LightClientUpdate::MIN_FIXED_SIZE + 2 * MIN_PRE_GLOAS_HEADER_SIZE
+);
+const _: () = assert!(
+    LightClientFinalityUpdate::GLOAS_SIZE
+        < LightClientFinalityUpdate::MIN_FIXED_SIZE + 2 * MIN_PRE_GLOAS_HEADER_SIZE
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

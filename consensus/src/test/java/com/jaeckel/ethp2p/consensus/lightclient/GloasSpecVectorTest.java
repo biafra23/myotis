@@ -250,20 +250,40 @@ class GloasSpecVectorTest {
     }
 
     /**
-     * {@code upgrade_lc_header_to_gloas} on a genuine Fulu header (the attested header of
-     * the transition's first update, slot 17): block hash + [proof of the block hash
-     * inside the payload header (5) ++ the payload's own branch (4)], normalized to 11.
-     * It must prove at 812 (the pre-Gloas slot's rule) with the two zero pad nodes, and
-     * nowhere else.
+     * {@code upgrade_lc_header_to_gloas} on two genuine Fulu headers of the transition test:
+     * the first update's attested header (slot 17) and the bootstrap's (slot 16 — the block
+     * the spec's store holds as FINALIZED across the fork, i.e. the header a Gloas update
+     * carries as its finalized header in the first epochs after it). Block hash + [proof of
+     * the block hash inside the payload header (5) ++ the payload's own branch (4)],
+     * normalized to 11. Each must prove at 812 (the pre-Gloas slot's rule) with the two zero
+     * pad nodes, and nowhere else.
+     *
+     * <p>v1.7.0-beta.2 has no Gloas-format update whose finalized header is a non-genesis
+     * pre-Gloas block (its transition carries the empty genesis header, then finalizes a
+     * Gloas slot), so this upgrade — the computation a serving node performs — is the
+     * genuine input for that path; {@code GloasBoundaryTest} walks it through the processor.
+     * Rust twin: {@code a_fulu_header_in_the_gloas_shape_proves_at_812}.
      */
     @Test
     void aFuluHeaderInTheGloasShapeProvesAt812() throws IOException {
         byte[] u = read("minimal/gloas_fork/fulu_update.ssz");
         int attestedAt = SszUtil.readUint32(u, 0);
         int finalizedAt = SszUtil.readUint32(u, 4 + MIN_SYNC_COMMITTEE_SIZE + 6 * 32);
-        LightClientHeader pre = LightClientHeader.decode(Arrays.copyOfRange(u, attestedAt, finalizedAt));
-        assertEquals(17, pre.beacon().slot());
-        assertTrue(LightClientProcessor.verifyExecutionBranchAt(pre, LcFork.PRE_GLOAS), "genuine at gindex 25");
+        LightClientHeader attested = LightClientHeader.decode(Arrays.copyOfRange(u, attestedAt, finalizedAt));
+        byte[] b = read("minimal/gloas_fork/fulu_bootstrap.ssz");
+        LightClientHeader finalized = LightClientHeader.decode(
+                Arrays.copyOfRange(b, SszUtil.readUint32(b, 0), b.length));
+        // The trusted block root of the test, and expected.txt's store finality.
+        assertArrayEquals(hex32("b80f3f35165bdc5afb240b420faed2875d00b593d86ed17d450ac0e09b8f7019"),
+                finalized.beacon().hashTreeRoot());
+        assertProvesAt812OnceUpgraded(attested, 17);
+        assertProvesAt812OnceUpgraded(finalized, 16);
+    }
+
+    private static void assertProvesAt812OnceUpgraded(LightClientHeader pre, long slot) {
+        assertEquals(slot, pre.beacon().slot());
+        assertTrue(LightClientProcessor.verifyExecutionBranchAt(pre, LcFork.PRE_GLOAS),
+                "slot " + slot + ": genuine at gindex 25");
 
         ExecutionPayloadHeader p = pre.execution();
         byte[][] fields = {
@@ -297,8 +317,10 @@ class GloasSpecVectorTest {
         System.arraycopy(proof, 0, branch, 2, 5);
         System.arraycopy(pre.executionBranch(), 0, branch, 7, 4);
         LightClientHeader upgraded = LightClientHeader.gloas(pre.beacon(), p.blockHash(), branch);
-        assertTrue(LightClientProcessor.verifyExecutionBranchAt(upgraded, LcFork.PRE_GLOAS), "812, normalized");
-        assertFalse(LightClientProcessor.verifyExecutionBranchAt(upgraded, LcFork.GLOAS), "not at 2856");
+        assertTrue(LightClientProcessor.verifyExecutionBranchAt(upgraded, LcFork.PRE_GLOAS),
+                "slot " + slot + ": 812, normalized");
+        assertFalse(LightClientProcessor.verifyExecutionBranchAt(upgraded, LcFork.GLOAS),
+                "slot " + slot + ": not at 2856");
         // The schedule-less check takes the payload shape only: it refuses the Gloas
         // shape outright, however genuine, so an unmigrated call site fails loudly.
         assertTrue(LightClientProcessor.verifyExecutionBranch(pre));
@@ -308,7 +330,8 @@ class GloasSpecVectorTest {
         for (int i = 0; i < 11; i++) dirtyBranch[i] = branch[i].clone();
         dirtyBranch[0][0] = 1;
         LightClientHeader dirty = LightClientHeader.gloas(pre.beacon(), p.blockHash(), dirtyBranch);
-        assertFalse(LightClientProcessor.verifyExecutionBranchAt(dirty, LcFork.PRE_GLOAS), "a non-zero pad is not padding");
+        assertFalse(LightClientProcessor.verifyExecutionBranchAt(dirty, LcFork.PRE_GLOAS),
+                "slot " + slot + ": a non-zero pad is not padding");
 
         // The Gloas vector is 11 nodes. One pad node short, the normalized check alone
         // would still accept the proof; the Rust verifier refuses it by length, and the

@@ -52,8 +52,6 @@ public final class LightClientStoreSnapshot {
     private static final byte VERSION_V2 = 2;
     private static final int SHAPE_PAYLOAD = 0;
     private static final int SHAPE_BLOCK_HASH = 1;
-    /** Branch nodes of the Gloas shape ({@code Vector[Bytes32, 11]}). */
-    private static final int GLOAS_BRANCH_NODES = 11;
 
     private LightClientStoreSnapshot() {}
 
@@ -130,7 +128,7 @@ public final class LightClientStoreSnapshot {
             // serialize() picks v2 whenever a header is block-hash-shaped.
             out.writeByte(SHAPE_BLOCK_HASH);
             writeFixed(out, h.executionBlockHash(), 32);
-            writeBranch(out, h.executionBranch(), GLOAS_BRANCH_NODES);
+            writeBranch(out, h.executionBranch(), BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN);
         } else {
             if (version == VERSION_V2) out.writeByte(SHAPE_PAYLOAD);
             writeBranch(out, h.executionBranch(), 4);
@@ -161,8 +159,8 @@ public final class LightClientStoreSnapshot {
         }
         if (shape == SHAPE_BLOCK_HASH) {
             byte[] blockHash = readFixed(in, 32);
-            byte[][] branch = new byte[GLOAS_BRANCH_NODES][];
-            for (int i = 0; i < GLOAS_BRANCH_NODES; i++) branch[i] = readFixed(in, 32);
+            byte[][] branch = new byte[BeaconChainSpec.GLOAS_EXECUTION_BRANCH_LEN][];
+            for (int i = 0; i < branch.length; i++) branch[i] = readFixed(in, 32);
             return LightClientHeader.gloas(beacon, blockHash, branch);
         }
         // Unknown shape: a corrupt or future file, never a guess.
