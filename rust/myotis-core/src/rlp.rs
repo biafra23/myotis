@@ -19,7 +19,10 @@ use alloc::{vec::Vec};
 use crate::{err, CoreError};
 
 /// Decoded RLP item: a byte string or a list. Owned — decode copies out of
-/// the input buffer (EL messages are small; headers ~600 bytes).
+/// the input buffer (EL messages are small; headers ~600 bytes). A peer's
+/// message need not be: a tree costs about 50 heap bytes per input byte, so
+/// cap the size of peer bytes before decoding them, or walk them with
+/// [`validate`] and [`raw_list_prefix`] instead (#454).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Bytes(Vec<u8>),
@@ -113,6 +116,22 @@ pub fn decode_at(data: &[u8], pos: usize) -> Result<(Item, usize), CoreError> {
     decode_item(data, pos, 0)
 }
 
+/// Check that `data` is exactly one well-formed item, accepting and rejecting
+/// exactly what [`decode`] does, without building anything. Use it on peer
+/// bytes whose tree is never read: [`decode`] spends about 50 heap bytes per
+/// input byte on a list of one-byte elements (#454), while this allocates
+/// nothing and runs in linear time.
+pub fn validate(data: &[u8]) -> Result<(), CoreError> {
+    let used = skip_item(data, 0, 0)?;
+    if used != data.len() {
+        return err(format!(
+            "RLP: {} trailing bytes after top-level item",
+            data.len() - used
+        ));
+    }
+    Ok(())
+}
+
 /// Split an RLP list into the RAW byte sub-slices of its elements (header +
 /// payload each), without copying — the Rust twin of the Java
 /// `core.trie.RlpItems.split`. The eth wire layer needs this to hash a header
@@ -121,7 +140,19 @@ pub fn decode_at(data: &[u8], pos: usize) -> Result<(Item, usize), CoreError> {
 /// simply hashes to something that won't match the trusted value (correct
 /// rejection). Structure is validated (each element fully inside the payload);
 /// the list must consume `data` exactly.
+///
+/// This still keeps one 16-byte slice per element. For a peer list whose tail
+/// is never read, use [`raw_list_prefix`].
 pub fn raw_list_items(data: &[u8]) -> Result<Vec<&[u8]>, CoreError> {
+    raw_list_prefix(data, usize::MAX)
+}
+
+/// [`raw_list_items`], keeping only the first `max` elements. The rest are
+/// still validated, so it accepts and rejects exactly what [`raw_list_items`]
+/// does, but they are walked instead of collected. A peer can pack a 10 MiB
+/// frame with millions of one-byte elements, so this is the call for a peer
+/// list whose tail is never read.
+pub fn raw_list_prefix(data: &[u8], max: usize) -> Result<Vec<&[u8]>, CoreError> {
     let first = *data.first().ok_or_else(|| CoreError("RLP: empty".into()))?;
     let (payload_start, payload_len) = match first {
         0xc0..=0xf7 => (1usize, usize::from(first - 0xc0)),
@@ -138,11 +169,13 @@ pub fn raw_list_items(data: &[u8]) -> Result<Vec<&[u8]>, CoreError> {
     let mut items = Vec::new();
     let mut pos = payload_start;
     while pos < end {
-        let (_item, next) = decode_item(data, pos, 0)?;
+        let next = skip_item(data, pos, 0)?;
         if next > end {
             return err("RLP: element overruns list payload");
         }
-        items.push(&data[pos..next]);
+        if items.len() < max {
+            items.push(&data[pos..next]);
+        }
         pos = next;
     }
     Ok(items)
@@ -261,6 +294,61 @@ fn decode_list_payload(
         pos = next;
     }
     Ok((Item::List(items), end))
+}
+
+/// Walk one item exactly as [`decode_item`] does, with the same canonical-form,
+/// bounds and depth checks failing with the same errors, but build nothing and
+/// return only the end offset. `skip_item_agrees_with_decode_item` pins the two
+/// together, so a change to either one's checks must be made to both.
+fn skip_item(data: &[u8], pos: usize, depth: usize) -> Result<usize, CoreError> {
+    if depth > MAX_DEPTH {
+        return err("RLP: nesting too deep");
+    }
+    let first = match data.get(pos) {
+        Some(&b) => b,
+        None => return err("RLP: truncated (empty input)"),
+    };
+    match first {
+        0x00..=0x7f => Ok(pos + 1),
+        0x80..=0xb7 => {
+            let len = (first - 0x80) as usize;
+            let payload = slice(data, pos + 1, len)?;
+            if len == 1 && payload[0] < 0x80 {
+                return err("RLP: non-canonical single byte (should be encoded as itself)");
+            }
+            Ok(pos + 1 + len)
+        }
+        0xb8..=0xbf => {
+            let (len, header) = read_long_length(data, pos, first - 0xb7)?;
+            slice(data, pos + header, len)?;
+            Ok(pos + header + len)
+        }
+        0xc0..=0xf7 => {
+            let len = (first - 0xc0) as usize;
+            skip_list_payload(data, pos + 1, len, depth)
+        }
+        0xf8..=0xff => {
+            let (len, header) = read_long_length(data, pos, first - 0xf7)?;
+            skip_list_payload(data, pos + header, len, depth)
+        }
+    }
+}
+
+/// [`decode_list_payload`]'s walk for [`skip_item`].
+fn skip_list_payload(data: &[u8], start: usize, len: usize, depth: usize) -> Result<usize, CoreError> {
+    let end = match start.checked_add(len) {
+        Some(e) if e <= data.len() => e,
+        _ => return err("RLP: truncated list payload"),
+    };
+    let mut pos = start;
+    while pos < end {
+        let next = skip_item(data, pos, depth + 1)?;
+        if next > end {
+            return err("RLP: list element overruns list payload");
+        }
+        pos = next;
+    }
+    Ok(end)
 }
 
 fn slice(data: &[u8], start: usize, len: usize) -> Result<&[u8], CoreError> {
@@ -395,5 +483,255 @@ mod tests {
         // Leading zero rejected, 9-byte integer rejected.
         assert!(Item::Bytes(vec![0x00, 0x01]).as_u64().is_err());
         assert!(Item::Bytes(vec![1; 9]).as_u64().is_err());
+    }
+
+    // --- The allocation-free walkers (#454) must be exactly as strict as the
+    // decoder: the same end offset, or the same error, on every input.
+
+    #[test]
+    fn skip_item_agrees_with_decode_item() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        each_differential_input(|input| {
+            // Every offset of a short input; the start and a few random
+            // offsets of a long one (all of them would be quadratic).
+            let mut offsets: Vec<usize> = if input.len() <= 64 {
+                (0..=input.len()).collect()
+            } else {
+                (0..8).map(|_| rng.below(input.len())).collect()
+            };
+            offsets.push(0);
+            for pos in offsets {
+                assert_eq!(
+                    skip_item(input, pos, 0),
+                    decode_item(input, pos, 0).map(|(_, end)| end),
+                    "input {input:02x?} at offset {pos}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn validate_agrees_with_decode() {
+        let (mut accepted, mut rejected) = (0, 0);
+        each_differential_input(|input| {
+            let verdict = decode(input).map(|_| ());
+            assert_eq!(validate(input), verdict, "input {input:02x?}");
+            if verdict.is_ok() { accepted += 1 } else { rejected += 1 }
+        });
+        // Not vacuous: both verdicts in bulk (about 10k and 90k today).
+        assert!(accepted > 5_000 && rejected > 5_000, "accepted={accepted} rejected={rejected}");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn corpus_is_found_when_present() {
+        // A moved `testdata` must fail here, not quietly shrink the
+        // differential tests to their generated inputs.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/el");
+        if root.is_dir() {
+            assert!(corpus_files().len() >= 20, "found {}", corpus_files().len());
+        }
+    }
+
+    #[test]
+    fn raw_list_prefix_agrees_with_decoding_every_element() {
+        each_differential_input(|input| {
+            let reference = raw_list_items_by_decoding(input);
+            assert_eq!(raw_list_items(input), reference, "input {input:02x?}");
+            for max in [0, 1, 2, 3, 256] {
+                assert_eq!(
+                    raw_list_prefix(input, max),
+                    reference.clone().map(|items| items.into_iter().take(max).collect()),
+                    "input {input:02x?}, max {max}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn raw_list_prefix_still_rejects_a_bad_element_past_the_prefix() {
+        // [0x01, 0x02, 0x81 0x05] — the third element is a non-canonical
+        // single byte, so keeping just the first must not accept the list.
+        let data = [0xc4, 0x01, 0x02, 0x81, 0x05];
+        assert!(raw_list_items(&data).is_err());
+        assert!(raw_list_prefix(&data, 1).is_err());
+    }
+
+    /// The pre-#454 `raw_list_items`, which decoded every element into an
+    /// owned tree just to learn where it ends: the oracle the walk must match.
+    fn raw_list_items_by_decoding(data: &[u8]) -> Result<Vec<&[u8]>, CoreError> {
+        let first = *data.first().ok_or_else(|| CoreError("RLP: empty".into()))?;
+        let (payload_start, payload_len) = match first {
+            0xc0..=0xf7 => (1usize, usize::from(first - 0xc0)),
+            0xf8..=0xff => {
+                let (len, header) = read_long_length(data, 0, first - 0xf7)?;
+                (header, len)
+            }
+            _ => return err("RLP: not a list"),
+        };
+        let end = payload_start
+            .checked_add(payload_len)
+            .filter(|&e| e == data.len())
+            .ok_or_else(|| CoreError("RLP: list length does not match input".into()))?;
+        let mut items = Vec::new();
+        let mut pos = payload_start;
+        while pos < end {
+            let (_item, next) = decode_item(data, pos, 0)?;
+            if next > end {
+                return err("RLP: element overruns list payload");
+            }
+            items.push(&data[pos..next]);
+            pos = next;
+        }
+        Ok(items)
+    }
+
+    /// Feed `check` the differential tests' inputs, one at a time: every
+    /// string of up to two bytes, nesting and long-form lengths either side
+    /// of their bounds, and the shared EL corpora plus seeded random trees,
+    /// each with truncations and header mutations. A checkout without
+    /// `testdata` still runs the generated part.
+    fn each_differential_input(mut check: impl FnMut(&[u8])) {
+        check(&[]);
+        for a in 0..=255u8 {
+            check(&[a]);
+            for b in 0..=255u8 {
+                check(&[a, b]);
+            }
+        }
+
+        for depth in MAX_DEPTH - 2..=MAX_DEPTH + 3 {
+            let mut short = vec![0xc1; depth];
+            short.push(0xc0);
+            check(&short);
+            // The same chain in long list form, 56 one-byte elements at the
+            // bottom (every payload stays within a one-byte length).
+            let mut long = vec![0x01; 56];
+            for _ in 0..depth {
+                let mut wrapped = vec![0xf8, long.len() as u8];
+                wrapped.extend_from_slice(&long);
+                long = wrapped;
+            }
+            check(&long);
+        }
+        for (prefix, len) in [(0xb8u8, 55usize), (0xb8, 56), (0xf8, 55), (0xf8, 56)] {
+            let mut data = vec![prefix, len as u8];
+            data.resize(2 + len, 0x01);
+            check(&data);
+        }
+        check(&[0xb9, 0x00, 0x38]); // leading-zero length
+        check(&[0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // absurd length
+        check(&[0xff, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut seeds = corpus_files();
+        for _ in 0..400 {
+            seeds.push(encode(&random_item(&mut rng, 0)));
+        }
+        for seed in seeds {
+            check(&seed);
+            for _ in 0..16 {
+                check(&seed[..rng.below(seed.len() + 1)]);
+            }
+            let positions = header_positions(&seed);
+            for _ in 0..positions.len().min(12) {
+                let pos = positions[rng.below(positions.len())];
+                let mut m = seed.clone();
+                for byte in [0x00, 0x7f, 0x80, 0x81, 0xb7, 0xb8, 0xbf, 0xc0, 0xc1, 0xf7, 0xf8, 0xff] {
+                    m[pos] = byte;
+                    check(&m);
+                }
+                m[pos] = seed[pos];
+                if pos + 1 < seed.len() {
+                    for byte in [0x00, 0x01, 0x37, 0x38, 0x7f, 0x80, 0xff] {
+                        m[pos + 1] = byte;
+                        check(&m);
+                    }
+                }
+                let mut dropped = seed.clone();
+                dropped.remove(pos);
+                check(&dropped);
+            }
+        }
+    }
+
+    /// Every `.rlp` and `.bin` file under `rust/testdata/el` (not all of them
+    /// are well-formed RLP, which suits a differential test). Reading them
+    /// takes `std`: the no_std test run (no-std-canary.yml) gets only the
+    /// generated inputs, and the std run replays the corpus as well.
+    #[cfg(not(feature = "std"))]
+    fn corpus_files() -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "std")]
+    fn corpus_files() -> Vec<Vec<u8>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/el");
+        let mut out = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for path in entries.flatten().map(|e| e.path()) {
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if matches!(path.extension().and_then(|e| e.to_str()), Some("rlp" | "bin")) {
+                    out.push(std::fs::read(&path).expect("read corpus file"));
+                }
+            }
+        }
+        out
+    }
+
+    /// Start offsets of every item header in a well-formed prefix of `data`.
+    fn header_positions(data: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut ranges = vec![(0, data.len())];
+        while let Some((mut pos, end)) = ranges.pop() {
+            while pos < end {
+                let Ok(next) = skip_item(data, pos, 0) else { break };
+                out.push(pos);
+                match data[pos] {
+                    0xc0..=0xf7 => ranges.push((pos + 1, next)),
+                    b @ 0xf8..=0xff => ranges.push((pos + 1 + usize::from(b - 0xf7), next)),
+                    _ => {}
+                }
+                pos = next;
+            }
+        }
+        out
+    }
+
+    /// A random tree of at most four levels. Only the top level ever gets a
+    /// long list (long enough to need the long list form); deeper lists stay
+    /// short, so a tree stays around a few KiB.
+    fn random_item(rng: &mut Rng, depth: usize) -> Item {
+        if depth < 4 && rng.below(3) == 0 {
+            let n = if depth == 0 && rng.below(4) == 0 { 20 + rng.below(40) } else { rng.below(5) };
+            return Item::List((0..n).map(|_| random_item(rng, depth + 1)).collect());
+        }
+        let len = match rng.below(6) {
+            0 => 0,
+            1 | 2 => 1,
+            3 => rng.below(56),
+            4 => 56 + rng.below(200),
+            _ => rng.below(9),
+        };
+        Item::Bytes((0..len).map(|_| rng.next() as u8).collect())
+    }
+
+    /// xorshift64* — seeded, so a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
     }
 }

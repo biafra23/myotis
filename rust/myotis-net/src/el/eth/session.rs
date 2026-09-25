@@ -16,6 +16,7 @@ use tokio::net::TcpStream;
 
 use myotis_core::rlp::{self, Item};
 
+use crate::el::rlpx::frame::MAX_CONTROL_MSG_SIZE;
 use crate::el::rlpx::transport::{
     decode_hello, encode_hello, Hello, RlpxConnection, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
 };
@@ -271,7 +272,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                 // Gossip / mempool / other responses — ignore (wallet is passive).
                 continue;
             }
-            if response_request_id(&frame.payload) == Some(want_id) {
+            if messages::leading_request_id(&frame.payload) == Some(want_id) {
                 return Ok(frame.payload);
             }
             // A stale/mismatched id — keep reading.
@@ -479,7 +480,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             if frame.message_code != want_code {
                 continue;
             }
-            if snap::response_request_id(&frame.payload) == Some(want_id) {
+            if messages::leading_request_id(&frame.payload) == Some(want_id) {
                 return Ok(frame.payload);
             }
         }
@@ -516,12 +517,6 @@ async fn recv_answering_ping<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
 }
 
-/// The leading request id of an eth/66-68 response (`[reqId, …]`).
-fn response_request_id(payload: &[u8]) -> Option<u64> {
-    let items = rlp::raw_list_items(payload).ok()?;
-    rlp::decode(items.first()?).ok()?.as_u64().ok()
-}
-
 /// The Status-stage disconnect error. Keeps the "peer disconnected" prefix +
 /// `describe_disconnect`'s "reason=N" suffix — the pool's busy classifier pins
 /// both ends (its test builds a string through THIS producer). `{:?}` on the
@@ -536,13 +531,16 @@ pub(crate) fn status_disconnect_error(client_id: &str, eth_version: u64, payload
     )
 }
 
-/// A p2p Disconnect body is `[reason]`; decode the reason code for logging.
-/// `pub(crate)` so the pool's busy-classification test can pin the classifier
-/// against THIS producer — a format change here must break that test instead
-/// of silently degrading busy classification to transient.
+/// A p2p Disconnect body is `[reason]` (or a bare `reason`); decode the reason
+/// code for logging. `pub(crate)` so the pool's busy-classification test can
+/// pin the classifier against THIS producer — a format change here must break
+/// that test instead of silently degrading busy classification to transient.
+/// The peer read loop reports disconnects through it too. A body over the
+/// control-message cap is not decoded (#454) and reads as an unknown reason.
 pub(crate) fn describe_disconnect(payload: &[u8]) -> String {
-    let reason = rlp::decode(payload)
-        .ok()
+    let reason = Some(payload)
+        .filter(|p| p.len() <= MAX_CONTROL_MSG_SIZE)
+        .and_then(|p| rlp::decode(p).ok())
         .and_then(|it| match it {
             Item::List(items) => items.first().and_then(|r| r.as_u64().ok()),
             Item::Bytes(_) => it.as_u64().ok(),
@@ -593,13 +591,12 @@ mod tests {
     }
 
     #[test]
-    fn response_id_extraction() {
-        let msg = rlp::encode(&Item::List(vec![
-            Item::Bytes(rlp::u64_to_minimal_be(4242)),
-            Item::List(vec![]),
-        ]));
-        assert_eq!(response_request_id(&msg), Some(4242));
-        assert_eq!(response_request_id(&[0x80]), None);
+    fn describe_disconnect_reads_both_shapes_and_not_an_oversized_body() {
+        assert_eq!(describe_disconnect(&[0xc1, 0x04]), "reason=4");
+        assert_eq!(describe_disconnect(&[0x04]), "reason=4");
+        // Too big to be a real Disconnect: not decoded, the reason is unknown.
+        let oversized = rlp::encode_list_payload(&[0x04; MAX_CONTROL_MSG_SIZE]);
+        assert_eq!(describe_disconnect(&oversized), format!("reason={}", u64::MAX));
     }
 
     // --- The Status stage, against a scripted peer over an in-memory stream.
@@ -711,6 +708,29 @@ mod tests {
         let (outcome, _) = handshake_against(vec![(messages::STATUS, foreign)]).await;
         let err = outcome.unwrap_err();
         assert!(err.starts_with("incompatible peer"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_refuses_an_oversized_status_as_undecodable() {
+        // Our Status plus trailing one-byte fields, which the decoder
+        // tolerates at any real size.
+        let padded = |extra: usize| {
+            let status =
+                messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+            let mut fields = rlp::raw_list_items(&status).unwrap().concat();
+            fields.resize(fields.len() + extra, 0x01);
+            rlp::encode_list_payload(&fields)
+        };
+        let (outcome, _) = handshake_against(vec![(messages::STATUS, padded(1_000))]).await;
+        assert_eq!(outcome.expect("a padded Status under the cap is accepted").2.latest_block, Some(100));
+
+        // Over the cap it is refused before its tree is built (#454), with the
+        // prefix the pool blacklists on, like any undecodable Status.
+        let (outcome, _) =
+            handshake_against(vec![(messages::STATUS, padded(MAX_CONTROL_MSG_SIZE))]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("peer Status decode"), "{err}");
+        assert!(err.contains("control-message cap"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
