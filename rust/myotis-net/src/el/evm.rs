@@ -33,8 +33,8 @@ use super::reader::{hedged_race, RaceOutcome, HEDGE_DELAY};
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
-    BlockContext, BytecodeCache, OracleAccount, OracleError, SnapStateOracle, StateProofCache,
-    U256,
+    BlockContext, BytecodeCache, EvmError, OracleAccount, OracleError, SnapStateOracle,
+    StateProofCache, U256,
 };
 
 use crate::el::peer::ManagedPeer;
@@ -55,6 +55,24 @@ pub enum CallOutcome {
     /// The call could not be executed/verified (out of gas, halt, state
     /// unavailable, unsupported fork/chain). The string is diagnostic.
     Unavailable(String),
+    /// The call can NEVER be answered on this build ([`EvmError::is_refusal`] —
+    /// e.g. an Amsterdam block whose header has no slot number): the host
+    /// serves a permanent error (-32602), never the retryable `Unavailable`.
+    Refused(String),
+}
+
+impl CallOutcome {
+    /// The executor's verdict: a revert keeps its payload (a verified answer),
+    /// a refusal stays permanent, and anything else is the retryable
+    /// `Unavailable`. One mapping for every call shape.
+    pub fn from_executor(joined: Result<Vec<u8>, EvmError>) -> CallOutcome {
+        match joined {
+            Ok(bytes) => CallOutcome::Success(bytes),
+            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+            Err(e) if e.is_refusal() => CallOutcome::Refused(e.to_string()),
+            Err(e) => CallOutcome::Unavailable(e.to_string()),
+        }
+    }
 }
 
 /// Which verified block a read is anchored at: the block an `eth_call` runs
@@ -107,6 +125,22 @@ pub enum GasOutcome {
     Revert(Vec<u8>),
     /// No estimate (halt / state unavailable). The string is diagnostic.
     Unavailable(String),
+    /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
+    Refused(String),
+}
+
+impl GasOutcome {
+    /// The executor's verdict, mapped exactly as [`CallOutcome::from_executor`].
+    pub fn from_executor(joined: Result<u64, EvmError>) -> GasOutcome {
+        match joined {
+            Ok(gas) => GasOutcome::Estimate(gas),
+            // The typed error survives to here — don't stringify the revert
+            // payload away: it is the verified answer the host must serve.
+            Err(EvmError::Reverted { data }) => GasOutcome::Revert(data),
+            Err(e) if e.is_refusal() => GasOutcome::Refused(e.to_string()),
+            Err(e) => GasOutcome::Unavailable(e.to_string()),
+        }
+    }
 }
 
 /// The outcome of an ENS forward resolution. `block_number` is the verified head
@@ -205,7 +239,8 @@ pub enum EnsQueryOutcome {
 }
 
 /// Build a [`BlockContext`] from a verified head header. `chain_id` comes from the
-/// chain config (the header carries no chain id).
+/// chain config (the header carries no chain id). The EIP-7843 slot number is
+/// carried as decoded; the executor refuses an Amsterdam block without one.
 pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext, String> {
     let coinbase: [u8; 20] = header
         .beneficiary
@@ -225,6 +260,7 @@ pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext
         prev_randao: header.mix_hash_or_prev_randao,
         chain_id,
         gas_limit: header.gas_limit,
+        slot_number: header.slot_number,
     })
 }
 
@@ -915,6 +951,157 @@ mod tests {
         let mut h = BlockHeader::default();
         h.beneficiary = vec![0x11; 19]; // not 20 bytes
         assert!(block_context(&h, 1).is_err());
+    }
+
+    #[test]
+    fn block_context_carries_the_slot_number() {
+        let pre = BlockHeader {
+            beneficiary: vec![0x11; 20],
+            ..BlockHeader::default()
+        };
+        assert_eq!(block_context(&pre, 11_155_111).unwrap().slot_number, None);
+        let amsterdam = BlockHeader {
+            slot_number: Some(11_296_768),
+            ..pre
+        };
+        assert_eq!(
+            block_context(&amsterdam, 11_155_111).unwrap().slot_number,
+            Some(11_296_768)
+        );
+    }
+
+    #[test]
+    fn a_refusal_stays_permanent_and_everything_else_keeps_its_mapping() {
+        fn missing<T>() -> Result<T, EvmError> {
+            Err(EvmError::MissingSlotNumber { block_number: 7 })
+        }
+        assert!(matches!(
+            CallOutcome::from_executor(missing()),
+            CallOutcome::Refused(_)
+        ));
+        assert!(matches!(
+            GasOutcome::from_executor(missing()),
+            GasOutcome::Refused(_)
+        ));
+        // Unchanged for everything that isn't a refusal.
+        assert!(
+            matches!(CallOutcome::from_executor(Ok(vec![1])), CallOutcome::Success(d) if d == [1])
+        );
+        assert!(matches!(
+            CallOutcome::from_executor(Err(EvmError::Reverted { data: vec![2] })),
+            CallOutcome::Revert(d) if d == [2]
+        ));
+        assert!(matches!(
+            CallOutcome::from_executor(Err(EvmError::OutOfGas)),
+            CallOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            GasOutcome::from_executor(Ok(24_150)),
+            GasOutcome::Estimate(24_150)
+        ));
+        assert!(matches!(
+            GasOutcome::from_executor(Err(EvmError::Reverted { data: vec![3] })),
+            GasOutcome::Revert(d) if d == [3]
+        ));
+        assert!(matches!(
+            GasOutcome::from_executor(Err(EvmError::UnsupportedChain { chain_id: 137 })),
+            GasOutcome::Unavailable(_)
+        ));
+    }
+
+    /// End to end: an Amsterdam header's slot travels from the wire bytes
+    /// through `block_context` to what SLOTNUM returns — and a header without
+    /// it is refused, never answered with slot 0.
+    mod slotnum {
+        use super::*;
+        use myotis_core::rlp::{self, Item};
+        use myotis_evm::{EvmExecutor, NoopBytecodeCache, NoopStateProofCache};
+        use std::sync::Arc;
+
+        const TARGET: [u8; 20] = [0x11; 20];
+        /// SLOTNUM PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN.
+        const CODE: [u8; 9] = [0x4b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+        /// Serves exactly one contract (CODE at TARGET); everything else is absent.
+        struct OneContract;
+        impl SnapStateOracle for OneContract {
+            fn fetch_account(
+                &self,
+                _: &[u8; 32],
+                address: [u8; 20],
+            ) -> Result<Option<OracleAccount>, OracleError> {
+                Ok((address == TARGET).then(|| OracleAccount {
+                    nonce: 1,
+                    balance: U256::ZERO,
+                    code_hash: myotis_core::keccak::keccak256(&CODE),
+                    storage_root: EMPTY_TRIE_ROOT,
+                }))
+            }
+            fn fetch_storage(
+                &self,
+                _: &[u8; 32],
+                _: [u8; 20],
+                _: U256,
+            ) -> Result<U256, OracleError> {
+                Ok(U256::ZERO)
+            }
+            fn fetch_bytecode(&self, _: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+                Ok(CODE.to_vec())
+            }
+        }
+
+        /// A sepolia header at Amsterdam's activation, with `tail` appended
+        /// after requestsHash (the Amsterdam pair, or nothing).
+        fn sepolia_header(tail: Vec<Item>) -> BlockHeader {
+            let base = BlockHeader {
+                beneficiary: vec![0x22; 20],
+                number: 10_000_000,
+                gas_limit: 60_000_000,
+                timestamp: myotis_evm::fork::SEPOLIA_AMSTERDAM_TIME,
+                logs_bloom: vec![0; 256],
+                nonce: vec![0; 8],
+                base_fee_per_gas: Some(vec![0x07]),
+                withdrawals_root: Some([0x08; 32]),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some([0x09; 32]),
+                ..BlockHeader::default()
+            };
+            let mut items = rlp::decode(&base.encode())
+                .unwrap()
+                .as_list()
+                .unwrap()
+                .to_vec();
+            items.push(Item::Bytes(vec![0x0a; 32])); // requestsHash
+            items.extend(tail);
+            BlockHeader::decode(&rlp::encode(&Item::List(items))).unwrap()
+        }
+
+        fn run(header: &BlockHeader) -> Result<Vec<u8>, EvmError> {
+            let exec = EvmExecutor::new(
+                Arc::new(OneContract),
+                Arc::new(NoopStateProofCache),
+                Arc::new(NoopBytecodeCache),
+            );
+            exec.call_view(TARGET, &[], &block_context(header, 11_155_111).unwrap())
+        }
+
+        #[test]
+        fn slotnum_reads_the_slot_from_the_header_bytes() {
+            let slot = 11_296_768u64; // Sepolia's first Amsterdam slot
+            let h = sepolia_header(vec![
+                Item::Bytes(vec![0x0b; 32]),
+                Item::Bytes(rlp::u64_to_minimal_be(slot)),
+            ]);
+            let out = run(&h).expect("an Amsterdam call with a slot runs");
+            assert_eq!(U256::from_be_slice(&out), U256::from(slot));
+        }
+
+        #[test]
+        fn a_header_without_the_slot_is_refused_not_answered_with_zero() {
+            let outcome = CallOutcome::from_executor(run(&sepolia_header(Vec::new())));
+            assert!(matches!(outcome, CallOutcome::Refused(_)), "{outcome:?}");
+        }
     }
 
     /// The oracle's within-call ask order: a dead first peer in the call's

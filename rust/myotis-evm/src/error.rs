@@ -36,6 +36,22 @@ pub enum EvmError {
     /// iteration cap (Java `IterationLimitExceeded` twin) — fail closed rather
     /// than answer from a run that was still discovering state.
     IterationLimitExceeded { cap: usize },
+    /// The fork table puts this block at AMSTERDAM or later, but its header
+    /// carried no EIP-7843 slot number, so SLOTNUM could only read a made-up
+    /// value. Consensus requires the field on every Amsterdam header, so a
+    /// verified header without it means the block isn't what the fork table
+    /// says (e.g. the fork was postponed after this build shipped) — no retry
+    /// can fix that. A refusal ([`EvmError::is_refusal`]).
+    MissingSlotNumber { block_number: u64 },
+}
+
+impl EvmError {
+    /// True when this call can never be answered on this build: hosts must
+    /// serve a PERMANENT error (JSON-RPC -32602), never the retryable
+    /// "unavailable" a client would spin on (CLAUDE.md apply-or-refuse).
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, EvmError::MissingSlotNumber { .. })
+    }
 }
 
 impl From<OracleError> for EvmError {
@@ -64,6 +80,11 @@ impl std::fmt::Display for EvmError {
             EvmError::IterationLimitExceeded { cap } => write!(
                 f,
                 "call did not converge within {cap} prefetch iterations"
+            ),
+            EvmError::MissingSlotNumber { block_number } => write!(
+                f,
+                "block {block_number} is an Amsterdam block but its header has no slot number \
+                 (EIP-7843); refusing to run SLOTNUM against a made-up value"
             ),
         }
     }

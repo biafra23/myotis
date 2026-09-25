@@ -5414,13 +5414,9 @@ impl ElReader {
             executor.estimate_gas(sender, to, &data, value, &ctx)
         })
         .await?;
-        Ok(match joined {
-            Ok(gas) => GasOutcome::Estimate(gas),
-            // The typed error survives to here — don't stringify the revert
-            // payload away: it is the verified answer the host must serve.
-            Err(myotis_evm::EvmError::Reverted { data }) => GasOutcome::Revert(data),
-            Err(e) => GasOutcome::Unavailable(e.to_string()),
-        })
+        // Revert payloads survive as the verified answer; executor refusals
+        // (e.g. an Amsterdam block without its slot number) become permanent.
+        Ok(GasOutcome::from_executor(joined))
     }
 
     /// Verified ENS forward resolution: `name` → its address record, resolved
@@ -5592,11 +5588,7 @@ impl ElReader {
         joined: Result<Vec<u8>, EvmError>,
     ) -> CallAnswer {
         CallAnswer {
-            outcome: match joined {
-                Ok(bytes) => CallOutcome::Success(bytes),
-                Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
-                Err(other) => CallOutcome::Unavailable(other.to_string()),
-            },
+            outcome: CallOutcome::from_executor(joined),
             block_number,
             finalized: anchor == ReadAnchor::Finalized,
         }

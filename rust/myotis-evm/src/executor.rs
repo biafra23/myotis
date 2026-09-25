@@ -224,7 +224,7 @@ impl EvmExecutor {
         // `Context::mainnet()` builder below is chain-neutral standard-Ethereum
         // rules — the chain id itself is set via cfg.chain_id, and every chain
         // spec_for knows (mainnet, sepolia) is rule-identical at a given SpecId.
-        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let spec = spec_for_context(ctx)?;
         let db = self.database_for(ctx);
         self.execute_with_db(&db, spec, caller, target, calldata, value, ctx)
     }
@@ -338,7 +338,7 @@ impl EvmExecutor {
         overrides: StateOverrides,
     ) -> Result<Vec<u8>, EvmError> {
         self.oracle.check_request()?;
-        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let spec = spec_for_context(ctx)?;
         let db = self.database_for_with(ctx, overrides);
 
         // Prime the target's account + code synchronously (sentinel OFF, not
@@ -455,7 +455,7 @@ impl EvmExecutor {
         // to an EMPTY account also pays EIP-8037 account-creation state gas — an
         // order of magnitude more than 21000. From AMSTERDAM the metered run below
         // prices it instead (buffered, like every metered estimate).
-        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let spec = spec_for_context(ctx)?;
         if calldata.is_empty()
             && !in_precompile_range(&target)
             && !spec.is_enabled_in(SpecId::AMSTERDAM)
@@ -490,6 +490,22 @@ impl EvmExecutor {
             ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
         }
     }
+}
+
+/// The spec `ctx` executes under ([`spec_for`]), refusing a context that
+/// cannot serve it: an AMSTERDAM block whose header carried no EIP-7843 slot
+/// number would run SLOTNUM against a made-up 0 — a well-formed wrong answer —
+/// so it fails with the permanent [`EvmError::MissingSlotNumber`] before any
+/// state is fetched. Before Amsterdam the slot is not needed (SLOTNUM is an
+/// invalid opcode there).
+fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
+    let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+    if spec.is_enabled_in(SpecId::AMSTERDAM) && ctx.slot_number.is_none() {
+        return Err(EvmError::MissingSlotNumber {
+            block_number: ctx.block_number,
+        });
+    }
+    Ok(spec)
 }
 
 /// The [`CfgEnv`] a view call runs under at `spec`: revm's per-spec defaults
@@ -620,6 +636,7 @@ mod tests {
             prev_randao: [0x33; 32],
             chain_id: 1,
             gas_limit: 30_000_000,
+            slot_number: None, // mainnet has no Amsterdam date: no slot in the header
         }
     }
 
@@ -1308,11 +1325,120 @@ mod tests {
         assert_eq!(U256::from_be_slice(&out), U256::from(11_155_111u64));
     }
 
-    /// A sepolia context at `ts` (the one chain with an Amsterdam date).
+    /// Sepolia's first Amsterdam slot (ethereum/pm#2205).
+    const SEPOLIA_AMSTERDAM_SLOT: u64 = 11_296_768;
+
+    /// A sepolia context at `ts` (the one chain with an Amsterdam date). Like a
+    /// real header, it carries a slot number only from Amsterdam on.
     fn sepolia_ctx(ts: u64) -> BlockContext {
         let mut c = ctx(10_000_000, ts);
         c.chain_id = 11_155_111;
+        c.slot_number =
+            (ts >= crate::fork::SEPOLIA_AMSTERDAM_TIME).then_some(SEPOLIA_AMSTERDAM_SLOT);
         c
+    }
+
+    /// Every fetch panics: proves a refusal happens before any state is read.
+    struct NoFetchOracle;
+    impl SnapStateOracle for NoFetchOracle {
+        fn fetch_account(
+            &self,
+            _: &[u8; 32],
+            _: [u8; 20],
+        ) -> Result<Option<OracleAccount>, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+        fn fetch_storage(&self, _: &[u8; 32], _: [u8; 20], _: U256) -> Result<U256, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+        fn fetch_bytecode(&self, _: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+    }
+
+    /// SLOTNUM PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN — returns the slot.
+    const SLOTNUM_CODE: [u8; 9] = [0x4b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+    #[test]
+    fn slotnum_returns_the_headers_slot_on_amsterdam() {
+        let exec = executor_with(SLOTNUM_CODE.to_vec(), None);
+        let mut c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME);
+        let out = exec
+            .call_view(TARGET, &[], &c)
+            .expect("SLOTNUM runs on Amsterdam");
+        assert_eq!(
+            U256::from_be_slice(&out),
+            U256::from(SEPOLIA_AMSTERDAM_SLOT)
+        );
+        // It is the context's slot, not a constant: a later block reads its own.
+        c.slot_number = Some(SEPOLIA_AMSTERDAM_SLOT + 5);
+        let out = exec.call_view(TARGET, &[], &c).unwrap();
+        assert_eq!(
+            U256::from_be_slice(&out),
+            U256::from(SEPOLIA_AMSTERDAM_SLOT + 5)
+        );
+    }
+
+    #[test]
+    fn amsterdam_context_without_a_slot_is_refused_before_any_fetch() {
+        // Never SLOTNUM against a made-up 0: a verified Amsterdam header always
+        // carries the slot, so its absence means the block isn't what the fork
+        // table says — refused for good, and before the peers are asked anything.
+        let exec = EvmExecutor::new(
+            Arc::new(NoFetchOracle),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let mut c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME);
+        c.slot_number = None;
+        let refused = |r: Result<(), EvmError>| {
+            let e = r.unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    EvmError::MissingSlotNumber {
+                        block_number: 10_000_000
+                    }
+                ),
+                "{e:?}"
+            );
+            assert!(e.is_refusal(), "a missing slot is permanent: {e:?}");
+        };
+        refused(exec.call_view(TARGET, &[], &c).map(drop));
+        refused(
+            exec.create_view(
+                [0u8; 20],
+                &SLOTNUM_CODE,
+                U256::ZERO,
+                &c,
+                StateOverrides::new(),
+            )
+            .map(drop),
+        );
+        refused(
+            exec.estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &c)
+                .map(drop),
+        );
+    }
+
+    #[test]
+    fn slotnum_is_invalid_before_amsterdam_and_needs_no_slot() {
+        // One second before activation there is no slot in the header and
+        // nothing to refuse — the context runs, and SLOTNUM itself is simply an
+        // invalid opcode there (revm gates it on AMSTERDAM).
+        let c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME - 1);
+        assert_eq!(c.slot_number, None);
+        let chain_id = executor_with(
+            vec![0x46u8, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+            None,
+        )
+        .call_view(TARGET, &[], &c)
+        .expect("a pre-Amsterdam context needs no slot");
+        assert_eq!(U256::from_be_slice(&chain_id), U256::from(11_155_111u64));
+        let err = executor_with(SLOTNUM_CODE.to_vec(), None)
+            .call_view(TARGET, &[], &c)
+            .unwrap_err();
+        assert!(matches!(err, EvmError::Halted { .. }), "got {err:?}");
     }
 
     #[test]
