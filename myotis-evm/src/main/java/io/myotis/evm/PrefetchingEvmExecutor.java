@@ -114,6 +114,10 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
 
     private byte[] runConvergent(Address sender, Address target, byte[] calldata,
                                  java.math.BigInteger value, BlockContext blockContext) {
+        // Fork validation FIRST (the Rust call path's spec_for-before-prime twin):
+        // a block every iteration would refuse (Sepolia past Amsterdam) must not
+        // spend snap round-trips on the prime below before failing.
+        io.myotis.evm.besu.EvmFactory.requireSupported(blockContext);
         SnapStateOracle oracle = delegate.oracle();
         BytecodeCache bytecodeCache = delegate.bytecodeCache();
 

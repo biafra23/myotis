@@ -23,19 +23,21 @@ enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
  * detailed `eth_call`. REVERTED is a VERIFIED chain answer (the contract said
  * no) and carries the raw revert payload; the router maps it to the standard
  * `{code: 3, "execution reverted", data}` wallets parse. UNAVAILABLE keeps the
- * retryable -32000 path.
+ * retryable -32000 path. REFUSED is the engine's PERMANENT "not on this build"
+ * (e.g. an EVM fork it cannot price): the router serves -32602 with [detail].
  */
 class RpcCallResult private constructor(
     val kind: Kind,
     val data: ByteArray?,
     val detail: String?,
 ) {
-    enum class Kind { OK, REVERTED, UNAVAILABLE }
+    enum class Kind { OK, REVERTED, UNAVAILABLE, REFUSED }
 
     companion object {
         fun ok(data: ByteArray): RpcCallResult = RpcCallResult(Kind.OK, data, null)
         fun reverted(data: ByteArray): RpcCallResult = RpcCallResult(Kind.REVERTED, data, null)
         fun unavailable(detail: String? = null): RpcCallResult = RpcCallResult(Kind.UNAVAILABLE, null, detail)
+        fun refused(detail: String): RpcCallResult = RpcCallResult(Kind.REFUSED, null, detail)
     }
 }
 
@@ -43,7 +45,8 @@ class RpcCallResult private constructor(
  * `io.myotis.api.EstimateResult`'s pure-Kotlin mirror: the three-way outcome of
  * a detailed `eth_estimateGas`. REVERTED means the ESTIMATED TRANSACTION cannot
  * succeed — a verified answer carrying the raw revert payload, served as the
- * standard code-3 error; UNAVAILABLE keeps the retryable -32000 path.
+ * standard code-3 error; UNAVAILABLE keeps the retryable -32000 path; REFUSED
+ * is permanent (-32602), as for [RpcCallResult].
  */
 class RpcEstimateResult private constructor(
     val kind: RpcCallResult.Kind,
@@ -57,6 +60,8 @@ class RpcEstimateResult private constructor(
             RpcEstimateResult(RpcCallResult.Kind.REVERTED, null, data, null)
         fun unavailable(detail: String? = null): RpcEstimateResult =
             RpcEstimateResult(RpcCallResult.Kind.UNAVAILABLE, null, null, detail)
+        fun refused(detail: String): RpcEstimateResult =
+            RpcEstimateResult(RpcCallResult.Kind.REFUSED, null, null, detail)
     }
 }
 

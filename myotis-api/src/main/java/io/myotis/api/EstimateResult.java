@@ -14,6 +14,9 @@ package io.myotis.api;
  *       retryable -32000 a wallet misreads as a node outage.</li>
  *   <li>{@link Status#UNAVAILABLE} — no verified answer right now (retryable);
  *       {@code detail} may carry a diagnostic reason.</li>
+ *   <li>{@link Status#REFUSED} — permanently unanswerable on this build (e.g.
+ *       an EVM fork this engine cannot price); {@code detail} says why. Hosts
+ *       serve the permanent -32602, as for {@link CallResult.Status#REFUSED}.</li>
  * </ul>
  *
  * <p>Flat record over FFI-portable types per the engine-contract rules;
@@ -26,7 +29,7 @@ public record EstimateResult(Status status, long gas, byte[] revertData, String 
         java.util.Objects.requireNonNull(status, "status");
     }
 
-    public enum Status { OK, REVERTED, UNAVAILABLE }
+    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED }
 
     public static EstimateResult ok(long gas) {
         return new EstimateResult(Status.OK, gas, null, null);
@@ -39,5 +42,9 @@ public record EstimateResult(Status status, long gas, byte[] revertData, String 
 
     public static EstimateResult unavailable(String detail) {
         return new EstimateResult(Status.UNAVAILABLE, 0L, null, detail);
+    }
+
+    public static EstimateResult refused(String detail) {
+        return new EstimateResult(Status.REFUSED, 0L, null, detail);
     }
 }

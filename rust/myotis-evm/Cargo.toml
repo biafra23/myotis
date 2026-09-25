@@ -27,7 +27,7 @@ myotis-core = { path = "../myotis-core" }
 # header base fee but zero gas price, an arbitrary/zero sender that may hold code,
 # and 30 M gas regardless of the block limit. Exact-pinned like every workspace
 # dep; a revm bump is a deliberate, reviewed change (its API churns across majors).
-revm = { version = "=41.0.0", default-features = false, features = [
+revm = { version = "=43.0.3", default-features = false, features = [
     "std",
     "optional_balance_check",
     "optional_block_gas_limit",

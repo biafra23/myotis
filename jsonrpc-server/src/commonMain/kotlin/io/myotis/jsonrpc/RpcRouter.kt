@@ -321,6 +321,14 @@ class RpcRouter(
             staleAnchorMessage(method ?: "request")?.let { return errorEnvelope(id, -32000, it) }
             return errorEnvelope(id, -32000,
                 "method '${method ?: "request"}' cannot be served verified right now: ${e.reason}")
+        } catch (e: EngineRefused) {
+            // The engine's PERMANENT refusal (e.g. an EVM fork this build cannot
+            // price): -32602 with its reason, like the router's own override /
+            // contract-creation refusals — no retry changes it, and -32000 is
+            // documented as retryable. No dev-proxy fallback, for the same reason
+            // as above: the engine engaged and decided.
+            logger.record(method ?: "request", idStr, "ERROR", elapsedMs(t0), -32602)
+            return errorEnvelope(id, -32602, "method '${method ?: "request"}' refused: ${e.reason}")
         }
         if (verified != null) {
             // Label the answer for what it IS. A served override ran over
@@ -451,6 +459,13 @@ class RpcRouter(
      *  surfaced as -32000 WITH the engine's reason instead of the generic
      *  no-peer/not-synced text. */
     private class EngineReadUnavailable(val reason: String) : RuntimeException(reason)
+
+    /** Thrown inside [tryVerified] when the engine REFUSED an eth_call /
+     *  eth_estimateGas for good ([RpcCallResult.Kind.REFUSED] — e.g. the Java
+     *  engine past an EVM fork its Besu cannot price); caught at the dispatch
+     *  site in [handleOne] and surfaced as the PERMANENT -32602 with the
+     *  engine's reason, never the retryable -32000 a client would spin on. */
+    private class EngineRefused(val reason: String) : RuntimeException(reason)
 
     /** Unwrap an engine error envelope from a JSON-string read result: a
      *  single-key `{"error": ...}` object throws [EngineReadUnavailable] (so
@@ -599,6 +614,8 @@ class RpcRouter(
                     // No verified answer right now — fall through to the strict
                     // retryable -32000 (or the dev proxy), exactly as before.
                     RpcCallResult.Kind.UNAVAILABLE -> return null
+                    // Never answerable on this build: permanent -32602 (handleOne).
+                    RpcCallResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                 }
             }
             "eth_getBalance" -> {
@@ -876,6 +893,7 @@ class RpcRouter(
                     RpcCallResult.Kind.REVERTED ->
                         revertEnvelope(id, outcome.data ?: ByteArray(0))
                     RpcCallResult.Kind.UNAVAILABLE -> return null
+                    RpcCallResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                 }
             }
             else -> null

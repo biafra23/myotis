@@ -2005,7 +2005,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /** eth_call over the shared anchored head, three-way: OK bytes, REVERTED with the
      *  revert payload (a verified answer — the EVM ran and the contract said no), or
-     *  UNAVAILABLE (no verified head / no peer / timeout — the retryable case). */
+     *  UNAVAILABLE (no verified head / no peer / timeout — the retryable case). Plus
+     *  REFUSED for a head whose fork this engine cannot price (permanent). */
     private io.myotis.api.CallResult rpcCallDetailed(byte[] from, byte[] to, byte[] data,
                                                      java.math.BigInteger value, String block) {
         // Keep the early-rejection logs correlatable with the wallet call that triggered
@@ -2175,6 +2176,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         + (leader ? "" : " (deduped)"));
                 return io.myotis.api.CallResult.reverted(revert);
             }
+            // A fork this engine cannot price (Sepolia past Amsterdam on Besu 26.4)
+            // is not "no verified answer right now": no retry can change it, so it
+            // is REFUSED — served as the permanent -32602, not the -32000 a wallet
+            // would spin on.
+            String refusal = unsupportedForkOf(e);
+            if (refusal != null) {
+                log.info("[rpc] eth_call " + desc + " -> refused: " + refusal);
+                return io.myotis.api.CallResult.refused(refusal);
+            }
             log.info("[rpc] eth_call " + desc + " -> error after "
                     + (clock.elapsedMillis() - t0) + "ms"
                     + (leader ? "" : " (deduped)") + ": " + describeEvmError(e));
@@ -2194,6 +2204,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             if (c instanceof io.myotis.evm.EvmExecutionException ee
                     && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted r) {
                 return r.data();
+            }
+        }
+        return null;
+    }
+
+    /** The refusal reason when the throwable chain holds an
+     *  {@link io.myotis.evm.EvmExecutionError.UnsupportedFork} (a fork this engine
+     *  cannot price — permanent for this build), else null. Same cause-walk as
+     *  {@link #revertDataOf}; package-private as a test seam. */
+    static String unsupportedForkOf(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.UnsupportedFork u) {
+                return u.detail();
             }
         }
         return null;
@@ -3887,7 +3911,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * payload (a verified answer — the tx cannot succeed as composed; the router
      * serves code 3 and the wallet must not broadcast it); UNAVAILABLE is the
      * retryable case (no anchored head / no peer / timeout; contract creation is
-     * also not served verified yet).
+     * also not served verified yet); REFUSED is a head whose fork this engine
+     * cannot price (permanent — see {@link #rpcCallDetailed}).
      */
     private io.myotis.api.EstimateResult rpcEstimateGasDetailed(byte[] from, byte[] to, byte[] data,
                                                                 java.math.BigInteger value) {
@@ -3908,6 +3933,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         Long cachedGas = estimateCache.get(estKey, clock.elapsedMillis());
         if (cachedGas != null) return io.myotis.api.EstimateResult.ok(cachedGas);
         try {
+            // Fork validation FIRST (the Rust estimate's spec_for twin): the fast path
+            // below never reaches the EVM factory, so without this a head the executor
+            // REFUSES — Sepolia past Amsterdam, which Besu 26.4 cannot price — would
+            // still get 21000, a pre-Amsterdam answer (EIP-2780 reprices transfers).
+            // Cheap: selects the fork, builds nothing.
+            io.myotis.evm.besu.EvmFactory.requireSupported(h.blockCtx());
             // Fast path: a value transfer with no calldata to a plain account costs
             // exactly 21000 — no EVM execution, no 15% headroom (it's exact). This is
             // MetaMask's send-ETH flow. We still fetch the recipient ONCE to confirm
@@ -3957,6 +3988,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // probes re-run the estimate; nothing dedups them beyond the EVM lanes.
                 log.info("[rpc] eth_estimateGas -> reverted (" + revert.length + " bytes)");
                 return io.myotis.api.EstimateResult.reverted(revert);
+            }
+            // Permanent for this build (see rpcCallDetailed): REFUSED, not retryable.
+            String refusal = unsupportedForkOf(e);
+            if (refusal != null) {
+                log.info("[rpc] eth_estimateGas -> refused: " + refusal);
+                return io.myotis.api.EstimateResult.refused(refusal);
             }
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);

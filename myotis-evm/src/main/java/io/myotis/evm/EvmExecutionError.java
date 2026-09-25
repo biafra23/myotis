@@ -68,6 +68,16 @@ public sealed interface EvmExecutionError {
      */
     record Halted(String detail) implements EvmExecutionError {}
 
+    /**
+     * The block's fork is known but this engine cannot price it — the Java engine
+     * past Sepolia's Amsterdam activation, which its Besu (26.4) has no final EVM
+     * for. A PERMANENT refusal for this build, not a transient failure: running
+     * the previous fork's rules instead would be a well-formed answer to a
+     * different question (CLAUDE.md apply-or-refuse), and no retry can help, so
+     * hosts serve it as a permanent JSON-RPC error, never the retryable -32000.
+     */
+    record UnsupportedFork(String detail) implements EvmExecutionError {}
+
     /** Prefetch loop did not converge within the iteration cap. */
     record IterationLimitExceeded(int cap) implements EvmExecutionError {}
 

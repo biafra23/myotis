@@ -27,6 +27,9 @@ class ForkTimePinsTest {
         assertEquals(0x65b9_7d60L, EvmFactory.SEPOLIA_CANCUN_TIME);
         assertEquals(0x67c7_fd60L, EvmFactory.SEPOLIA_PRAGUE_TIME);
         assertEquals(0x68ed_fd60L, EvmFactory.SEPOLIA_OSAKA_TIME);
+        // Refused, not served, by this engine — but the same trust-critical pin as
+        // the Rust amsterdam_time_pins_its_source (ethereum/pm#2205).
+        assertEquals(0x6ac4_fd60L, EvmFactory.SEPOLIA_AMSTERDAM_TIME);
     }
 
     @Test
