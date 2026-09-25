@@ -51,6 +51,23 @@ interface NodeController {
     fun setServedBlockWindow(blocks: Int)
 
     /**
+     * Live-update the weak-subjectivity anchor-age bound override on all running
+     * stacks (0 = each network's built-in default). A stack parked in the
+     * STALE_ANCHOR state re-evaluates against the new bound within a second.
+     * Raising it weakens the long-range-attack guarantee — the Settings row says
+     * so. Default no-op keeps hosts compiling until they wire it.
+     */
+    fun setWsBoundPeriods(periods: Int) {}
+
+    /**
+     * One-shot consent to sync [network] forward from an anchor older than the
+     * weak-subjectivity bound — releases its STALE_ANCHOR park for the rest of
+     * this run. Never persisted: a restart with a still-stale anchor parks (and
+     * asks) again. The stale-anchor dialog's "Sync anyway" action.
+     */
+    fun acceptStaleAnchor(network: String) {}
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
@@ -60,22 +77,34 @@ interface NodeController {
 
     /**
      * Re-apply the engine choice (Java ⇄ Rust) to the process-global selector after
-     * [Settings.setRustEngineEnabled] flips the preference. Unlike the BLS toggle this is
+     * [Settings.setPreferJavaEngine] flips the preference. Unlike the BLS toggle this is
      * NOT live: networks keep the engine that created them — the new choice applies when a
-     * network is (re)started. The Rust engine is experimental (catalog-only today), so the
-     * enabled state maps to the selector's `auto` mode, which falls back to Java per
-     * network until the Rust engine can host it.
+     * network is (re)started. The default maps to the selector's `auto` mode — the Rust
+     * engine where it can serve (it alone serves the log index and Tor routing), Java
+     * fallback otherwise; preferring Java maps to a hard `java`.
      */
     fun applyEngineChoice()
 
     /**
      * Re-apply Tor verified-read routing to the process-global selector after
-     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is a
-     * Rust-engine-only, experimental capability, so hosts that don't support it (Android/iOS
-     * for now) keep the default no-op; the desktop actual pushes the flag to `Tor.select`.
-     * Like the engine toggle it is NOT live: it applies to networks (re)started afterwards.
+     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is an
+     * experimental capability of the Rust engine only, so hosts that don't support it
+     * (Android/iOS for now) keep the default no-op; the desktop actual pushes the flag to
+     * `Tor.select`. Like the engine toggle it is NOT live: it applies to networks
+     * (re)started afterwards.
      */
     fun applyTorMode() {}
+
+    /**
+     * Whether this host can actually route reads over Tor — the Settings row is
+     * shown only when true (the [canImportLogIndex] precedent). Default false:
+     * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
+     * the write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
+     * while reads keep leaving from the real IP would be accepted-and-ignored —
+     * the exact failure mode the trust rules forbid. The desktop actual answers
+     * from the loaded engine build (only a `-PtorEngine` dylib links Arti).
+     */
+    val supportsTor: Boolean get() = false
 
     /** Push the (persisted) log-index preference for [network] down to the
      *  engine — called from the settings toggle and at network (re)start.
@@ -98,6 +127,16 @@ interface NodeController {
     /** Whether [importLogIndexSnapshots] can work on this host (shows the
      *  Index tab's Import button). Default false. */
     val canImportLogIndex: Boolean get() = false
+
+    /**
+     * One-line provenance note for [network]'s log index when THIS HOST seeded
+     * it from a snapshot bundled with the app (the desktop Bee PoC flavour):
+     * what the seed covers, that it is unverified until re-walked, and the block
+     * it is usable until. Null for an index the user built or imported — the
+     * engine's status JSON carries no provenance marker, so only the host that
+     * installed the seed can say so. Rendered in the Index tab.
+     */
+    fun seededIndexNotice(network: String): String? = null
 
     /**
      * Wipe a network's peer caches — clear the live stack's backoff/blacklist and delete the
@@ -188,6 +227,13 @@ interface Settings {
      *  advertises as servable to peers (EIP-7642 Status range). */
     fun servedBlockWindow(): Int
     fun setServedBlockWindow(v: Int)
+    /** Weak-subjectivity anchor-age bound override, in sync-committee periods;
+     *  0 = each network's built-in default (mainnet 13 ≈ two weeks). How old the
+     *  sync anchor may be before the node refuses to sync and asks for consent.
+     *  Larger values weaken the long-range-attack guarantee — an explicit
+     *  operator knob, not a tuning parameter. Defaults keep hosts compiling. */
+    fun wsBoundPeriods(): Int = 0
+    fun setWsBoundPeriods(v: Int) {}
 
     // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
     /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
@@ -206,9 +252,24 @@ interface Settings {
     /** true = use bundled native blst (default on Android); false = pure-Java Milagro. */
     fun nativeBlsEnabled(): Boolean
     fun setNativeBlsEnabled(v: Boolean)
-    /** true = prefer the (experimental) Rust engine for newly started networks; default false. */
-    fun rustEngineEnabled(): Boolean
-    fun setRustEngineEnabled(v: Boolean)
+    /**
+     * true = force the Java engine for newly started networks; default false = the
+     * selector's `auto` mode (Rust engine where it can serve — it alone serves the log
+     * index and Tor routing — Java fallback otherwise). Defaults keep hosts without an
+     * engine choice compiling: iOS has only the Rust engine, so the inert defaults are
+     * exactly its semantics.
+     */
+    fun preferJavaEngine(): Boolean = false
+    fun setPreferJavaEngine(v: Boolean) {}
+
+    /**
+     * Why this host cannot run the Java engine at all, or null when it can (the default,
+     * e.g. desktop). Non-null hides the "Prefer Java engine" toggle and shows this text in
+     * its place, so Settings never offers an engine the host would refuse to start. Android
+     * returns a reason below API 33, where the Java engine's EVM and discv5 fail to link and
+     * every network runs on the Rust engine with no Java fallback.
+     */
+    fun javaEngineUnavailableReason(): String? = null
 
     /**
      * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
@@ -219,12 +280,33 @@ interface Settings {
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
 
-    /** Opt-in eth_getLogs watch-list index (the shipped Kohaku preset), per
-     *  network. Defaults keep hosts without the feature compiling; the
-     *  desktop/iOS actuals persist it and [NodeController.applyLogIndex]
-     *  pushes the preset config down to the Rust engine. */
+    /** Opt-in eth_getLogs watch-list index, per network. Defaults keep hosts
+     *  without the feature compiling; the host actuals persist it and
+     *  [NodeController.applyLogIndex] pushes the config — built from
+     *  [logIndexWatchJson]'s entries — down to the Rust engine. */
     fun logIndexEnabled(network: String): Boolean = false
     fun setLogIndexEnabled(network: String, on: Boolean) {}
+
+    /**
+     * Whether an explicit enabled/disabled flag is PERSISTED for [network] —
+     * i.e. [setLogIndexEnabled] has ever run (import sets it too). Distinct
+     * from [logIndexEnabled]'s value: a disabled-but-configured network still
+     * pushes its (disable) config, because the engine's boot-time
+     * activate-from-disk would otherwise re-enable an imported index the user
+     * turned off. A virgin network (never configured) pushes nothing.
+     */
+    fun logIndexConfigured(network: String): Boolean = false
+
+    /**
+     * The user's watched contracts for [network]'s log index, as the JSON array
+     * [LogIndexWatch] serializes (`[{"address":"0x…","fromBlock":N},…]`). The
+     * Index tab edits this list; [NodeController.applyLogIndex] turns it into
+     * the engine config. Removing an entry only stops FUTURE subscriptions —
+     * the engine's config union never drops a live one (the Index tab says so).
+     * Defaults keep hosts without the feature compiling.
+     */
+    fun logIndexWatchJson(network: String): String = "[]"
+    fun setLogIndexWatchJson(network: String, json: String) {}
 
     /** Backfill pacing for the log index, per network: true = max download
      *  speed (multi-batch ticks), false = nice background pace (one batch
@@ -232,6 +314,16 @@ interface Settings {
      *  accumulated coverage. Defaults keep hosts compiling. */
     fun logIndexMaxSpeed(network: String): Boolean = false
     fun setLogIndexMaxSpeed(network: String, on: Boolean) {}
+
+    /** Backfill OFF switch, per network: true = the downward walk does not run,
+     *  so coverage stays where it is and only head-follow continues. For a node
+     *  serving one consumer that already owns the history below coverage the
+     *  walk is pure contention for the snap pool head-follow needs. Unlike
+     *  raising a watch entry's fromBlock, this keeps queries below the covered
+     *  floor REFUSED rather than answered with an empty list. Fingerprint-neutral
+     *  engine-side: pausing and resuming never discards accumulated coverage. */
+    fun logIndexBackfillPaused(network: String): Boolean = false
+    fun setLogIndexBackfillPaused(network: String, on: Boolean) {}
 
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep
@@ -336,6 +428,15 @@ data class NodeSnapshot(
     // Raw engine status JSON for the Index tab (null when the feature is off
     // or the engine is unavailable); parsed via [LogIndexStatus.parse].
     val logIndexJson: String? = null,
+    // Raw read-fetch shadow-cache JSON (ChainHandle.readStatsJson(), schema 1 —
+    // docs/read-stats.md) for the Status tab's "Reads" rows; null when the host
+    // didn't fetch it. Parsed via [ReadStatsStatus.parse].
+    val readStatsJson: String? = null,
+    // Weak-subjectivity bound (periods) the engine enforces; 0 = host didn't say.
+    // While beaconState == "STALE_ANCHOR", syncCurrentPeriod is the refused
+    // anchor's period and syncTargetPeriod the wall clock, so target - current is
+    // the anchor age the stale-anchor dialog explains.
+    val wsBoundPeriods: Long = 0,
     // Fork watch: peers announce — or have already activated — a network upgrade
     // this build doesn't support (the API's UpgradeAdvisory). null = nothing
     // detected, or not watched on this network (staged rollout: Sepolia first).

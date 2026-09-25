@@ -52,8 +52,11 @@ pub fn canonical_network_name(name_or_alias: String) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Hosting surface. Sentinels unchanged: create returns the handle id (>= 1),
-// -1 for unknown-name/runtime-init failure, -2 for canonical-but-unsupported.
+// Hosting surface. create returns the handle id (>= 1), -1 for
+// unknown-name/runtime-init failure, -2 for canonical-but-unsupported, and (v26)
+// -3 for a dataDir bound to a caller-supplied checkpoint via the plain-C/Node
+// `myotis_create_with_checkpoint` — the JVM has no wrapper for that path and
+// must not resume such a directory from the embedded anchor.
 // ---------------------------------------------------------------------------
 
 /// Allocate a not-yet-started handle for `network` (R1: mainnet only).
@@ -101,6 +104,20 @@ pub fn pause_handle(handle: i64) -> bool {
     crate::host::pause(handle)
 }
 
+/// Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+/// network default. Applied live — a STALE_ANCHOR park re-evaluates.
+#[uniffi::export]
+pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    crate::host::set_ws_bound_periods(handle, periods)
+}
+
+/// One-shot consent to sync forward from a stale anchor (this run only) —
+/// releases a STALE_ANCHOR park.
+#[uniffi::export]
+pub fn accept_stale_anchor(handle: i64) -> bool {
+    crate::host::accept_stale_anchor(handle)
+}
+
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
 /// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
 /// the next spin_up when the handle isn't running. False only for an unknown
@@ -123,10 +140,15 @@ pub fn resume_handle(handle: i64) -> bool {
 // failures the Java side raises as EngineException.
 // ---------------------------------------------------------------------------
 
-/// Verified account query (`AccountProofResult` shape). `address` is 0x-hex.
+/// Verified account query (`AccountProofResult` shape). `address` is 0x-hex;
+/// `block` is the RPC block selector (ABI ≥ 32): empty or a head tag proves at
+/// the verified head, `finalized` at the beacon-finalized block, a number only
+/// inside the window around the head — refused (`{"error","code":-32602}`)
+/// otherwise, never answered from the head. The result names the anchor
+/// (`anchor`).
 #[uniffi::export]
-pub fn request_account_json(handle: i64, address: String) -> String {
-    crate::host::request_account_json(handle, &address)
+pub fn request_account_json(handle: i64, address: String, block: String) -> String {
+    crate::host::request_account_json(handle, &address, &block)
 }
 
 /// Verified storage-slot query (`StorageProofResult` shape). A non-None `holder`
@@ -141,22 +163,33 @@ pub fn get_storage_proof_json(
     crate::host::get_storage_proof_json(handle, &address, slot, holder.as_deref())
 }
 
-/// Verified contract-code query (`eth_getCode`).
+/// Verified contract-code query (`eth_getCode`); `block` as in
+/// [`request_account_json`].
 #[uniffi::export]
-pub fn get_code_json(handle: i64, address: String) -> String {
-    crate::host::get_code_json(handle, &address)
+pub fn get_code_json(handle: i64, address: String, block: String) -> String {
+    crate::host::get_code_json(handle, &address, &block)
 }
 
-/// Verified RAW-32-byte-position storage query (`eth_getStorageAt`).
+/// Verified RAW-32-byte-position storage query (`eth_getStorageAt`); `block`
+/// as in [`request_account_json`].
 #[uniffi::export]
-pub fn get_storage_at_json(handle: i64, address: String, position: String) -> String {
-    crate::host::get_storage_at_json(handle, &address, &position)
+pub fn get_storage_at_json(
+    handle: i64,
+    address: String,
+    position: String,
+    block: String,
+) -> String {
+    crate::host::get_storage_at_json(handle, &address, &position, &block)
 }
 
 /// Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
 /// `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
 /// is the answer); `value` is wei as a decimal string; `block` is the RPC block
-/// tag.
+/// selector: a head tag runs against the verified head, `finalized` (ABI ≥ 30)
+/// against the beacon-finalized block, and a block number outside
+/// [head-64, head+16] is refused (`{"error","code":-32602}` when it can never
+/// be served), never answered from the head. The result names the block it ran
+/// against (`blockNumber`, `verified`).
 #[uniffi::export]
 pub fn eth_call_json(
     handle: i64,
@@ -296,6 +329,14 @@ pub fn set_log_index_config(handle: i64, config_json: String) -> bool {
 #[uniffi::export]
 pub fn log_index_status_json(handle: i64) -> String {
     crate::host::log_index_status_json(handle)
+}
+
+/// Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
+/// / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
+/// docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+#[uniffi::export]
+pub fn read_stats_json(handle: i64) -> String {
+    crate::host::read_stats_json(handle)
 }
 
 /// Import portable log-index snapshots (JSON array of absolute file paths;

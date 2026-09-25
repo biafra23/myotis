@@ -387,9 +387,8 @@ pub struct Discv4Service {
     stop_tx: tokio::sync::watch::Sender<bool>,
     /// Probe requests into the service loop (see [`Discv4Service::probe_sender`]).
     probe_tx: tokio::sync::mpsc::Sender<SocketAddr>,
-    /// `Option` so `stop(self)` can take the handle while `Drop` (the
-    /// forgot-to-stop path) leaves it `None`.
-    task: Option<tokio::task::JoinHandle<()>>,
+    /// Shared-borrow shutdown still owns and joins the service task exactly once.
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Discv4Service {
@@ -428,7 +427,7 @@ impl Discv4Service {
             local_port,
             stop_tx,
             probe_tx,
-            task: Some(task),
+            task: tokio::sync::Mutex::new(Some(task)),
         })
     }
 
@@ -458,9 +457,9 @@ impl Discv4Service {
         self.local_port
     }
 
-    pub async fn stop(mut self) {
+    pub async fn stop(&self) {
         let _ = self.stop_tx.send(true);
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
     }

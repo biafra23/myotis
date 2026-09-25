@@ -62,6 +62,8 @@ impl OracleAccount {
 /// OutOfGas, …) belong to the executor, added in a later Milestone-C slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OracleError {
+    /// The operation was cancelled or its whole-operation deadline expired.
+    Cancelled { reason: String },
     /// State for `address` (and `slot`, if a storage read) could not be fetched
     /// or verified against `state_root` — peers exhausted, transport failure, or
     /// no anchored head. Not necessarily an attack; retryable.
@@ -88,6 +90,7 @@ pub enum OracleError {
 impl std::fmt::Display for OracleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OracleError::Cancelled { reason } => write!(f, "{reason}"),
             OracleError::StateUnavailable { address, slot, .. } => match slot {
                 Some(s) => write!(
                     f,
@@ -131,6 +134,10 @@ fn hex(bytes: &[u8]) -> String {
 /// The verified world-state source the EVM reads through. See the module docs
 /// for the verification and threading contract.
 pub trait SnapStateOracle: Send + Sync {
+    /// Cooperative execution check, including cache-only EVM instruction runs.
+    /// Fixtures and sans-I/O consumers may leave this unlimited.
+    fn check_request(&self) -> Result<(), OracleError> { Ok(()) }
+
     /// The proof-verified account at `address`, or `Ok(None)` when an exclusion
     /// proof shows it absent. `Err` only when it cannot be verified.
     fn fetch_account(

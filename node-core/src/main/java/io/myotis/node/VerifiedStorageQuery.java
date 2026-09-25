@@ -50,7 +50,8 @@ public final class VerifiedStorageQuery {
                                            BeaconSyncState beaconSyncState,
                                            String hexAddress,
                                            long slotNumber,
-                                           String holderHexOrNull) throws Exception {
+                                           String holderHexOrNull,
+                                           io.myotis.evm.world.ReadStats readStats) throws Exception {
         String addr = hexAddress == null ? "" : hexAddress;
         String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
         if (hex.length() != 40) {
@@ -82,9 +83,13 @@ public final class VerifiedStorageQuery {
         Bytes32 storageKeyHash = Hash.keccak256(Bytes.wrap(storageSlotKey));
 
         // Step 1: fetch the account to get the proof-verified storageRoot.
+        // (Each snap round-trip is timed for the read-fetch shadow cache — not
+        // the beacon-anchoring walk in step 4.)
         Bytes32 accountHash = Hash.keccak256(contractAddress);
+        long accountStarted = System.nanoTime();
         AccountRangeMessage.DecodeResult accountResult =
                 connector.requestAccount(contractAddress).get(30, TimeUnit.SECONDS);
+        long accountElapsedNanos = System.nanoTime() - accountStarted;
         AccountRangeMessage.AccountData account = accountResult.accounts().stream()
                 .filter(a -> a.accountHash().equals(accountHash))
                 .findFirst().orElse(null);
@@ -107,9 +112,11 @@ public final class VerifiedStorageQuery {
         Bytes32 storageRoot = Bytes32.wrap(verifiedAccount.storageRoot());
 
         // Step 2: fetch the slot at the SAME peer state root for consistency.
+        long slotStarted = System.nanoTime();
         StorageRangesMessage.DecodeResult storageResult =
                 connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
                         .get(30, TimeUnit.SECONDS);
+        long slotElapsedNanos = System.nanoTime() - slotStarted;
         StorageRangesMessage.StorageData found = storageResult.slots().stream()
                 .filter(s -> s.slotHash().equals(storageKeyHash))
                 .findFirst().orElse(null);
@@ -195,6 +202,28 @@ public final class VerifiedStorageQuery {
         String valueDecimal = null;
         if (found != null && !found.slotValue().isEmpty()) {
             valueDecimal = new java.math.BigInteger(1, found.slotValue().toArrayUnsafe()).toString();
+        }
+
+        // Shadow-cache bookkeeping for the VERIFIED answer only. The account
+        // proof verified above (step 1 throws otherwise); it counts once the
+        // state root is beacon-anchored. The slot additionally needs its own
+        // proof to have held — `verifyMethod` alone is not enough, the
+        // stateRootMatch fast path above does not consult storageProofValid —
+        // because an unproven peer value is not a fact a cache could have served.
+        if (verifyMethod != null && usedStateRoot != null) {
+            readStats.observeAccount(contractAddress.toArrayUnsafe(), usedStateRoot.toArrayUnsafe(),
+                    new io.myotis.evm.world.ReadStats.AccountFact(
+                            account.nonce(), account.balance(), storageRoot,
+                            Bytes32.wrap(verifiedAccount.codeHash())),
+                    accountElapsedNanos);
+            if (storageProofValid) {
+                java.math.BigInteger value = found != null && !found.slotValue().isEmpty()
+                        ? new java.math.BigInteger(1, found.slotValue().toArrayUnsafe())
+                        : java.math.BigInteger.ZERO;
+                readStats.observeStorage(contractAddress.toArrayUnsafe(), storageSlotKey,
+                        usedStateRoot.toArrayUnsafe(), storageRoot.toArrayUnsafe(), value,
+                        slotElapsedNanos);
+            }
         }
 
         return new StorageProofResult(

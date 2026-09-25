@@ -17,7 +17,7 @@ A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API ove
 
 Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, byte utilities; via a Kotlin-rewrite fork), with in-house SSZ and Merkle-Patricia verification, a pure-Java BLS verifier, and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
 
-There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `java`; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
+There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
 
 ## Documentation
 
@@ -25,6 +25,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
+- [Read Statistics](docs/read-stats.md) — The `read-stats` shadow cache: what a state-read cache (per-block, storage-root-keyed, or stale-serve) would have saved on a real session, measured without serving anything from it.
 - [Disk & Network Usage](docs/disk-and-network-usage.md) — Storage footprint of a fully synced client (peer caches, light-client snapshot — there is no on-disk block/header database) and bandwidth: initial sync, the daily cost of staying synced, and what sending a transaction costs.
 - [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.
 
@@ -33,7 +34,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1:8545`** for mainnet; per-network ports beside it) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
-- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, or the head isn't beacon-anchored yet — retryable).
+- `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, the head isn't beacon-anchored yet, or an uncovered log-index range — retryable).
 - `3` — `eth_call` / `eth_estimateGas` executed over verified state and the contract (or the transaction being estimated) REVERTED: the standard `execution reverted` error, with the raw revert payload in `error.data` and the decoded `Error(string)` reason in the message when present. This is a verified chain answer (not retryable) — wallets rely on it, e.g. MetaMask's ERC-165 token-standard probe expects a revert on plain ERC-20s, and a doomed transaction's estimate shows its actual revert reason instead of "node not synced".
 - `-32602` — the request's parameters are structurally valid but unsupported by this node, and no retry will change that. Today this is `eth_call` / `eth_estimateGas` carrying a state override (`params[2]`) or block override (`params[3]`): the node does not apply them, and answering without them would return a well-formed result computed against different state than you asked about. Fall back to a request without overrides, or use an upstream that applies them.
 
@@ -43,18 +44,39 @@ The Android and desktop apps and the desktop daemon run an embedded JSON-RPC ser
 
 ### Implemented (verified) methods
 
+The authoritative list is `VERIFIED_METHODS` in `jsonrpc-server`'s `RpcRouter.kt`; this
+table mirrors it. `myotis_rpcCoverage` on a running node reports what has
+actually been asked and answered.
+
 | Method | How it's verified |
 |---|---|
 | `eth_chainId`, `net_version` | from config |
 | `eth_blockNumber` | beacon optimistic-head execution block number |
+| `eth_syncing` | straight from the beacon light client: `false` once `SYNCED`, otherwise a syncing object with zero bounds (the verified surface has no block-download notion and serves no chain-state reads before `SYNCED`; config and utility methods answer regardless) |
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (absent accounts/slots proven via exclusion proof — a verified zero, not a guess) |
 | `eth_call` | local Besu EVM over proof-served state; multi-hop speculative prefetch batches the SLOAD round-trips |
 | `eth_estimateGas` | local EVM gas metering (intrinsic + EVM + 15% buffer); a plain transfer to an EOA short-circuits to 21000; a reverting tx returns an error, never a number |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; priority-fee tips from block bodies verified against `transactionsRoot` (+ receipts vs `receiptsRoot` for the gas-weighted percentile reward walk) |
-| `eth_getBlockByNumber` | verified header window anchored to the beacon head; tx hashes checked against `transactionsRoot` (no snap peer required) |
-| `eth_getTransactionReceipt` | scans the recent verified block window; receipts verified against `receiptsRoot` (handles eth/69 bloomless receipts by recomputing the bloom) |
+| `eth_getBlockByNumber`, `eth_getBlockByHash` | verified header window anchored to the beacon head; tx hashes checked against `transactionsRoot` (no snap peer required); an unknown or non-canonical hash answers `null` |
+| `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex`, `eth_getUncleCountByBlockNumber`, `eth_getUncleCountByBlockHash`, `eth_getUncleByBlockNumberAndIndex`, `eth_getUncleByBlockHashAndIndex` | derived from the same verified block serve (count or element read out of the verified block); post-Merge blocks have no uncles, so the uncle reads answer `0` / `null` from a verified block, not a stub |
+| `eth_getTransactionReceipt`, `eth_getBlockReceipts` | scans the recent verified block window; receipts verified against `receiptsRoot` (handles eth/69 bloomless receipts by recomputing the bloom) |
 | `eth_getTransactionByHash` | mined txs from the verified block window; locally-broadcast txs served as *pending* from a sent-tx cache; sender recovered from the signature (legacy + EIP-2930/1559/4844/7702) |
+| `eth_getLogs` | served **only from the [log index](#log-index-verified-eth_getlogs)**: an opt-in, per-network index of the contracts you choose, every log verified against `receiptsRoot` over devp2p. A range the index has not covered is refused with `-32000` (the message says how far coverage reaches), never answered with a misleading `[]`. Historical coverage has to be built — a backfill to the contract's deployment block — and can be **bundled**: build once on an always-on daemon, `export-logindex` the portable chain-tagged `.db`, import it in the app. Rust engine only. |
 | `eth_sendRawTransaction` | gossips the user-signed bytes to devp2p peers and returns the hash (Myotis never signs — the wallet does) |
+| `eth_accounts` | the node holds no keys: exactly `[]`, a verified-grade constant |
+| `net_listening`, `net_peerCount` | `true` (the discovery listener is live whenever the node runs); the peer count comes from the node's own status snapshot, never a fabricated zero |
+| `web3_clientVersion`, `web3_sha3` | static identifier `Myotis/verified-light-client`; local keccak-256 — no chain data involved |
+
+Any other method returns `-32601` (not served verified); a method from the table that
+cannot be answered *right now* returns the retryable `-32000` instead — the full
+error-code contract is the list at the top of this section.
+
+**Node introspection (`myotis_*`).** Answered locally, bypassing the verified backend, so a
+myotis-aware client can poll them before the node is synced or has peers:
+`myotis_status` and `myotis_beaconStatus` (the JSON-RPC twins of the daemon's `status` /
+`beacon-status` commands), `myotis_rpcCoverage` (which methods have been requested and how
+they were answered), and `myotis_pause` / `myotis_wakeup` (the host's background/foreground
+hooks).
 
 A number-pinned read (wallets pin every read to the block they just saw) is served from the verified head's state when the pinned block is at/near the head; a genuinely historical pin is rejected rather than answered with newer state.
 
@@ -102,7 +124,7 @@ cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
   -destination 'platform=iOS Simulator,name=<device>' build
 ```
 
-On iOS the app form is a development host more than an integration point: iOS suspends backgrounded apps, so the app's loopback JSON-RPC listener (foreground-only) can't serve a separate wallet app the way the Android and desktop nodes can. The supported iOS integration is **embedding** — a wallet links the `MyotisKit` framework (or the engine's C ABI directly) and runs the node in its own process.
+On iOS the app form is a development host more than an integration point: iOS suspends backgrounded apps, so the app's loopback JSON-RPC listener (foreground-only) can't serve a separate wallet app the way the Android and desktop nodes can. The supported iOS integration is **embedding** — a wallet links the `MyotisKit` framework (or the engine's C ABI directly) and runs the node in its own process. Releases ship a prebuilt **`MyotisKit.xcframework.zip`** (device arm64 + arm64 simulator, `+ .sha256`) so a host can drop it in without a local Kotlin/Native build.
 
 ### Desktop app (GUI)
 
@@ -142,8 +164,12 @@ Myotis also runs **inside other applications** as a Node.js native addon: [`rust
 const myotis = require('./myotis-node.node');   // ESM: createRequire(import.meta.url)
 myotis.init();                                  // ABI handshake
 const h = myotis.create('mainnet', '/path/to/data-dir');
+// or, to recover a STALE_ANCHOR install from a checkpoint the host authenticated itself
+// (ABI >= 26): myotis.createWithCheckpoint('mainnet', freshDir, blockRoot, headerSlot)
 myotis.start(h);
-// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and snapPeers > 0:
+// once statusJson(h) reports beaconState === 'SYNCED', elReaderAvailable, and
+// snapServingPeers > 0 (ABI >= 31: a pooled peer that can answer at the anchored
+// head — a pool of still-syncing peers keeps snapPeers > 0 while every read fails):
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 ```
 
@@ -153,7 +179,7 @@ This is how the [Freedom browser](https://github.com/solardev-xyz/freedom-browse
 
 For Swift hosts that embed the engine **without** the Kotlin/Native `MyotisKit` framework, [`rust/build-xcframework.sh`](rust/build-xcframework.sh) packages the engine's plain C ABI as a static **`MyotisEngine.xcframework`** (device arm64 + fat simulator slice, header + Clang modulemap included — `import MyotisEngine` from Swift). Releases ship the zip + SHA256 alongside the napi addons, and CI builds the iOS targets on every `rust/` change so they stay green.
 
-The host contract is the same as everywhere else: gate on `myotis_init()` returning the header's `MYOTIS_ABI_VERSION`, run the blocking verified reads off the main thread, free every returned string with `myotis_string_free`, and treat `myotis_pause`/`myotis_resume` as the scenePhase background/foreground hooks (warm resume is ~10 s back to `SYNCED`). Wait for `statusJson` to report `beaconState == "SYNCED"` **and** `snapPeers > 0` before attempting reads — right after sync the EL side can still be hunting a snap peer and reads fail with "state unavailable".
+The host contract is the same as everywhere else: gate on `myotis_init()` returning the header's `MYOTIS_ABI_VERSION`, run the blocking verified reads off the main thread, free every returned string with `myotis_string_free`, and treat `myotis_pause`/`myotis_resume` as the scenePhase background/foreground hooks (warm resume is ~10 s back to `SYNCED`). Wait for `statusJson` to report `beaconState == "SYNCED"` **and** `snapServingPeers > 0` before attempting reads — right after sync the pool can hold only peers that are still syncing themselves (`snapPeers > 0`, yet every read fails until one of them covers the anchored head, #465). A host that knows a serving execution node can hand it to the engine with `myotis_set_boot_enodes` (ABI ≥ 31, a JSON array of `enode://` URLs, applied or refused as a whole) to shortcut a cold start; the engine ships no mainnet seed list of its own.
 
 One caveat: an app that already links **another** Rust staticlib (another embedded node) must not add this xcframework next to it — two Rust staticlibs in one binary collide on the runtime/allocator. Build a single aggregator staticlib crate that depends on both engines as rlibs and re-exports their C symbols instead (one std/allocator/tokio/libp2p). That is how the Freedom iOS browser embeds Myotis alongside its Swarm and IPFS nodes: [freedom-mobile-ffi](https://github.com/solardev-xyz/freedom-mobile-ffi).
 
@@ -280,6 +306,7 @@ Returns daemon operational metrics.
 | `connectedPeers` | int | Total active TCP (RLPx) connections |
 | `readyPeers` | long | Peers that completed the eth handshake |
 | `snapPeers` | long | Ready peers that also support snap/1 |
+| `snapServingPeers` | int | Snap peers in the serving pool right now — gate reads on this, not on `snapPeers` (#465). Rust engine: peers whose announced or served head is at or near the anchored head; Java engine: active snap sessions |
 | `backedOffPeers` | long | Peers in temporary exponential backoff |
 | `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 
@@ -301,7 +328,7 @@ Returns beacon chain light client sync state.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `state` | string | `"SYNCING"` (no trust anchor yet), `"CATCHING_UP"` (anchor present, but the state-root window is still sparse or the held sync committee lags wall clock), or `"SYNCED"` (verification-ready; can regress to `CATCHING_UP` if the node falls behind) |
+| `state` | string | `"SYNCING"` (no trust anchor yet), `"CATCHING_UP"` (anchor present, but the state-root window is still sparse or the held sync committee lags wall clock), `"SYNCED"` (verification-ready; can regress to `CATCHING_UP` if the node falls behind), or `"STALE_ANCHOR"` (syncing refused: the best available anchor is older than the weak-subjectivity bound — see §Weak-subjectivity age bound; the response carries `anchorPeriod`, `anchorAgePeriods`, `wsBoundPeriods`, and a `warning`) |
 | `currentPeriod` | long | Sync-committee period the store currently holds (0 before bootstrap) |
 | `targetPeriod` | long | Wall-clock sync-committee period being caught up to |
 | `uptimeSeconds` | long | Daemon uptime |
@@ -328,6 +355,19 @@ Returns beacon chain light client sync state.
 | `clientId` | string | Client identification string (if available) |
 | `lightClient` | boolean | Whether peer supports the light client protocol |
 | `protocols` | int | Number of advertised protocols |
+
+### Accept a stale anchor
+
+```bash
+./gradlew :app:run -Pargs=accept-stale-anchor
+```
+
+One-shot consent to sync forward from a trust anchor older than the weak-subjectivity
+bound (see README §Weak-subjectivity age bound). Applies **only** while `beacon-status`
+reports `"state":"STALE_ANCHOR"` — sent at any other time it answers
+`"applied":false` without arming anything. Consent lasts for the current run only and
+is never persisted; a restart with a still-stale anchor parks again. Prefer refreshing
+the checkpoint (`./gradlew refreshCheckpoint`) over accepting.
 
 ### Get block headers
 
@@ -480,6 +520,23 @@ Returns storage slot data for a contract with Merkle-Patricia proof verification
 | `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (same as `get-account`, only present when `beaconChainVerified=true`) |
 | `matchedBeaconSlot` | long | Beacon slot trust anchor (only present when `beaconChainVerified=true`) |
 | `blsVerified` | boolean | Whether the trust anchor has BLS verification (only present when `beaconChainVerified=true`) |
+
+### Read statistics
+
+```bash
+./gradlew :app:run -Pargs=read-stats
+```
+
+The read-fetch **shadow cache**: counters over every verified account /
+storage / bytecode fetch this daemon made (the wallet's JSON-RPC reads, the
+`eth_call` oracle, and the operator queries above), classifying each repeat by
+which cache keying would have made it unnecessary and how much wall-clock it
+cost — `sameStateRoot` (a per-block cache), `sameStorageRoot` (the sound
+cross-block scheme, keyed by the account's storage root), `sameValue` /
+`unchanged` (the ceiling no proof-based cache reaches), and `byAge` buckets
+(how often a value up to 12 s / 60 s / 5 min old would have been correct).
+Nothing is served from it; it exists to decide the next caching step on
+measured traffic. Field-by-field guide: [docs/read-stats.md](docs/read-stats.md).
 
 ### Resolve ENS name
 
@@ -720,7 +777,7 @@ The only trust anchors are **sync committee BLS signatures** and the embedded hi
 
 The bootstrap trust anchor is a 32-byte mainnet block root hardcoded in `NetworkConfig.MAINNET.checkpointRoot`. Every `LightClientBootstrap` response is rejected unless `hash_tree_root(response.header)` equals this committed value, so the pin is cryptographic: no peer (libp2p or HTTP checkpoint endpoint) can substitute a different anchor, even an internally-consistent one, without finding a SHA-256 preimage.
 
-Ethereum's weak-subjectivity window is only ~28 hours of stake-weighted safety, so the committed root needs to be refreshed periodically or binaries eventually age past the safety envelope. The repo ships with a Gradle task that fetches a current finalized root, cross-validates it against multiple independent providers, and rewrites the `@checkpoint:mainnet` region of `NetworkConfig.java`:
+Ethereum's weak-subjectivity period — how old a trust anchor may be before validators who have since exited could sign a competing "finalized" history (a long-range attack) that a light client cannot distinguish from the real one — is roughly **two weeks** on mainnet at current stake levels (the consensus-spec formula with `SAFETY_DECAY=10` plateaus at 3532 epochs ≈ 15.7 days; Electra's exit-churn cap only lengthens it). It is *not* the ~27-hour sync-committee period, though the two are easy to conflate because `MIN_VALIDATOR_WITHDRAWABILITY_DELAY` happens to be 256 epochs too. What a fresh anchor buys is **attribution, not a slashing penalty**: sync-committee signatures are *not* a slashable offense on any Ethereum chain (bonded or not — the beacon chain slashes only proposer and attester equivocation), so the real protection is that a recent anchor's committee is still held by identifiable, staked validators who would be publicly implicated by a forged signature, and the exit-churn limit caps how fast those keys turn into freely-acquirable, consequence-free ones. So the committed root needs to be refreshed periodically or binaries eventually age past the safety envelope — and refreshing every sync-committee period, as the tasks below encourage, keeps the anchor ~13× fresher than the strict bound requires. The repo ships with a Gradle task that fetches a current finalized root, cross-validates it against multiple independent providers, and rewrites the `@checkpoint:mainnet` region of `NetworkConfig.java`:
 
 ```bash
 # Preview the diff without writing
@@ -737,7 +794,18 @@ The task queries `/eth/v2/beacon/blocks/finalized` on four independent mainnet e
 
 The same task serves every network — `-Pnetwork=sepolia` and `-Pnetwork=gnosis` refresh the `@checkpoint:sepolia` and `@checkpoint:gnosis` regions, and a bare `./gradlew refreshCheckpoint` does all three. It refuses to write a root fewer than two operators agree on; `-PallowSingleSource` is the explicit opt-out, which Gnosis sometimes needs and the other two do not.
 
-Each run rewrites **both engines** from one fetch — `NetworkConfig.java` and the Rust `ChainConfig` in `rust/myotis-net/src/sync.rs` — because a hand-mirrored anchor is a split anchor waiting to happen. The `java_and_rust_checkpoints_agree` test fails if they ever diverge. Use `-Pperiod=<n>` to anchor at a chosen sync-committee period rather than at head (an anchor at head leaves a wallet nothing to walk, and goes stale as soon as the period rolls), or `-Pslot=<n>` to pin an exact slot — needed when the target is a specific retained state on the serving node, such as the oldest bootstrap it can still answer; both require naming the chain with `-Pnetwork` and refuse otherwise. Historical slots may need a full node, named with `-PextraEndpoint=<url>` and checked against the pinned `genesis_validators_root` before it counts.
+Each run rewrites **both engines** from one fetch — `NetworkConfig.java` and the Rust `ChainConfig` in `rust/myotis-net/src/sync.rs` — because a hand-mirrored anchor is a split anchor waiting to happen. The `java_and_rust_checkpoints_agree` test fails if they ever diverge.
+
+### Weak-subjectivity age bound
+
+Both engines enforce the window above at every **sync start** — cold, and on a warm resume from idle-pause (a pause longer than the bound ages the held committee exactly like a cold snapshot) — re-face it at **every bootstrap attempt** (the poll loop's retry and the fallback after a failed snapshot resume judge the embedded checkpoint, which can be older than the anchor the start-time gate approved), and re-check it **continuously while running**: a node that stays awake but peer-starved (or eclipsed) past the bound parks the same way before catching up, so restart-vs-stay-running never decides whether the gate applies. Before resuming or bootstrapping, the client judges the age of the **best anchor it has** — the embedded checkpoint or the persisted sync snapshot, whichever is newer (when the checkpoint is the newer of the two, the snapshot is discarded and the sync restarts from the checkpoint's period, as it always has). If that anchor is older than the network's bound — **mainnet 13 periods (~14.7 days), sepolia 13, gnosis 3** — the client **refuses to sync** and parks in `STALE_ANCHOR`, failing closed: no bootstrap, no verification, verified queries keep erroring. Nothing is deleted; the client is waiting for a decision:
+
+- **Update the binary / refresh the checkpoint** (`./gradlew refreshCheckpoint`) — the recommended fix; the wallet cannot fetch a fresh anchor itself (devp2p/libp2p only, no trusted RPCs).
+- **Raise the bound** — Settings → "Weak-subjectivity bound" in the apps (0 = network default; applied live, a parked chain re-evaluates within a second), or `-Dmyotis.beacon.wsBoundPeriods=N` on the daemon. Raising it weakens the long-range-attack guarantee, knowingly.
+- **Accept the risk for this run** — the apps show a dialog explaining the age and the risk ("Sync anyway"); the daemon takes `./gradlew :app:run -Pargs=accept-stale-anchor` (only applies while actually parked), or `-Dmyotis.beacon.acceptStaleAnchor=true` at start for deliberate pre-consent (e.g. re-syncing an archived data dir). Consent is never persisted — a restart with a still-stale anchor parks, and asks, again.
+- **Supply a fresher checkpoint yourself** (embedding hosts, Node addon / plain C ABI, ABI ≥ 26) — `createWithCheckpoint(network, freshDir, blockRoot, headerSlot)` bootstraps a fresh directory from a beacon block root the **host** obtained and authenticated through its own channels. This does not add a trust anchor to Myotis: the engine treats the root exactly like the embedded checkpoint — bootstrap pinned to it, every update BLS-verified against the committee chain that follows, snapshot probation, and the same weak-subjectivity gate on the supplied slot's age — and it does not vouch for the root's honesty; the host does, and must say so to its users. The directory is bound to that anchor (`sync-anchor[-net].json`) and resumes only with the same root and slot; the Java engine and plain `create()` refuse it rather than silently swapping anchors. See [rust/myotis-node/README.md](rust/myotis-node/README.md).
+
+Why this exists: the forward walk is only as trustworthy as the anchor it starts from. Past the weak-subjectivity period, an attacker who acquired keys of since-exited committee members could serve a validly-signed forged continuation, and BLS verification alone cannot tell it from the honest chain — so an over-age anchor must be an explicit, informed user decision, never a silent default. Per-network derivations are documented at `NetworkConfig.wsBoundPeriods()`; the Rust mirror lives in the `ChainConfig` constructors and is covered by tests on both sides. The default anchor is head, and that is the one to ship: the gate above refuses an anchor older than the bound, so a release anchored further back parks every fresh install on day one (gnosis's 3-period bound means its anchor stays fresh for only ~34 h after the refresh, so tag promptly — and any gnosis install more than ~2 days after the refresh still starts at the `STALE_ANCHOR` consent dialog; that is the expected gnosis first run, not a broken release). Use `-Pperiod=<n>` to anchor at a chosen sync-committee period instead, or `-Pslot=<n>` to pin an exact slot — for testing a specific retained state on the serving node, such as the oldest bootstrap it can still answer; both require naming the chain with `-Pnetwork` and refuse otherwise, and a pin below the serving node's archive floor is unreachable forever (the archive only grows forward). Historical slots may need a full node, named with `-PextraEndpoint=<url>` and checked against the pinned `genesis_validators_root` before it counts. To test from the oldest anchors roost's serving nodes can still bootstrap, without waiting on (or depending on) any endpoint, `-PanchorFile=rust/testdata/anchors/oldest-servable.properties` writes their recorded roots into both engines with no network access; that file carries the provenance and the caveat that every entry opens on the stale-anchor dialog.
 
 ### Verification flow
 
@@ -767,12 +835,12 @@ The light client syncs from the **beacon chain P2P network** (libp2p) -- fully d
 
 ## Engines: Java and Rust
 
-Myotis is mid-migration from a single Java implementation to a **Rust engine** that reimplements the whole verification stack natively. Both engines live behind the same contract and are interchangeable per network at (re)start:
+Myotis ships **two engines** behind one contract: the original **Java engine** and the **Rust engine**, which reimplements the whole verification stack natively and is the primary engine — the default selection, and ahead of the Java engine on features (the eth_getLogs **log index** and Tor verified-read routing run on the Rust engine only). Both are interchangeable per network at (re)start:
 
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
 - **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides. The same engine's plain C ABI also serves the two non-JVM hosts: the iOS app (Kotlin/Native cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — identical JSON shapes, pinned by the same golden tests.
-- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `java` (default), `rust`, or `auto`. On run tasks use `-Pengine=rust`; in the apps it's a Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
+- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `auto` (default: the Rust engine where it can serve, Java fallback otherwise), `java`, or `rust` (hard — error when unavailable). On run tasks use `-Pengine=java` to opt out; in the apps it's the "Prefer Java engine" Settings toggle (applies on network restart). **Android below API 33 (Android 13) is Rust-only**: the Java engine's EVM (Besu's `UInt256`) and its discv5 (Guava futures) use `VarHandle` APIs that Android 10–12 keep hidden, so the app forces `rust` there with no Java fallback, and Settings explains this instead of offering the toggle. The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
 **rustc/cargo are NOT required to build or run the JVM hosts (daemon + desktop).**
@@ -780,14 +848,14 @@ That build is pure Java/Kotlin end to end: the UniFFI-generated Kotlin bindings 
 committed source (no bindgen step for a JVM-host build), JNA comes from Maven Central
 like any other dependency, and every `cargo*` Gradle task self-skips with a single
 note when cargo is missing. On a cargo-less machine the JVM hosts' engine selector
-simply reports the Rust engine as unavailable and everything runs on the Java engine
-(the default, `myotis.engine=java`) — there is nothing to configure or disable. The
+simply reports the Rust engine as unavailable and the default `auto` selection
+falls back to the Java engine — there is nothing to configure or disable. The
 **Android app** is the exception: it builds the Rust engine from source by default
 (cargo + cargo-ndk + NDK + the Android rustup targets; its `preBuild` runs
 `cargoNdkAndroid` and regenerates the bindings). There is no committed `.so`, so
 nothing can drift; a missing toolchain fails the build with a message pointing at
 `-PskipRustEngine`, which builds the app without the Rust engine (Java engine at
-runtime). The packaged **desktop installers** also need cargo
+runtime, so such a build can only start networks on Android 13 / API 33 and newer). The packaged **desktop installers** also need cargo
 (`packageDmg`/`packageDeb`/`runDistributable` fail loudly without it, so an
 installed app can always switch engines).
 Release artifacts don't rely on committed binaries — CI builds the Rust engine
@@ -807,9 +875,57 @@ To actually build the Rust engine and bundle it, per target:
 ./gradlew cargoTest            # cargo test --workspace (part of `check`)
 ./gradlew cargoNdkAndroid      # Android jniLibs (needs cargo-ndk + NDK)
 ./gradlew uniffiGenerateKotlin # regenerate the committed Kotlin bindings after ffi.rs changes
-./gradlew :app:run -Pengine=rust          # daemon on the Rust engine
-./gradlew :app-desktop:run -Pengine=rust  # desktop GUI on the Rust engine
+./gradlew :app:run -Pengine=rust          # daemon on the Rust engine (hard; default auto)
+./gradlew :app-desktop:run -Pengine=java  # desktop GUI forced onto the Java engine
 ```
+
+## Log index: verified eth_getLogs
+
+The **log index** is an opt-in, per-network index of the event logs of contracts *you choose*
+— every log verified against receipt roots on the devp2p network (no RPC provider), backfilled
+to each contract's deployment block, then kept current at the head. Queries outside what the
+index has covered are refused with an error, never answered with a misleading `[]`.
+**Rust engine only** (the default `auto` selection serves it; forcing the Java engine gives it up).
+
+### Create an index in the app
+
+Open the **Index** tab (desktop, Android, iOS), enter each contract's address and the block
+to index back to — its deployment block; when unsure, choose an *earlier* block: later
+silently hides the earlier events, earlier merely walks further — then flip **Collect logs**
+on. The backfill runs in the background ("Max download speed" trades battery/bandwidth for
+speed) and the tab shows per-contract progress. Display names resolve automatically via
+verified reverse-ENS where a name exists.
+
+### Create a portable index with the daemon
+
+For a big backfill (months of history), build the index once on a machine that can run
+around the clock, then hand the file to the apps:
+
+```bash
+# 1. Start the daemon on the target network (the Rust engine serves the index).
+./gradlew :app:run -Pnetwork=gnosis
+
+# 2. Tell it what to index: one or more addresses, and how far back.
+./gradlew :app:run -Pnetwork=gnosis -Pargs="build-logindex 0x45a1502382541cd610cc9068e88727426b696293 --from 31305656"
+
+# 3. Watch the backfill (cursor walks DOWN to the target; maxSpeed is on for build-logindex).
+./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status
+
+# 4. When backfillCursor has reached the target: export a portable snapshot.
+./gradlew :app:run -Pnetwork=gnosis -Pargs="export-logindex /tmp/my-index.db"
+```
+
+The exported `.db` is **self-describing and chain-tagged** (network id + genesis hash), so it
+can only be imported into a node on the same chain. Import it via the Index tab's
+"Import log-index snapshot…" button — the receiving node merges it with whatever it already
+holds and immediately starts catch-up for every imported address, so the file does not need
+to be fresh. One bound: the head-gap bridge spans at most **500,000 blocks** (~29 days on
+Gnosis, ~10 weeks on mainnet), so import a snapshot within that window of its export — or
+re-export a fresh one, which costs seconds on a node whose index is current.
+
+Display names are deliberately NOT part of the file: the importing wallet resolves them
+itself (verified reverse-ENS), so a generated file cannot lie about who a contract is.
+
 
 ## Architecture
 
@@ -821,7 +937,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:
   - `discv4` -- UDP peer discovery (ping/pong/findnode/neighbors)
-  - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`)
+  - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`, consumed as the `com.github.biafra23:discovery` Android fork so it runs at minSdk 29 -- see `gradle/libs.versions.toml`)
   - `rlpx` -- TCP transport with EIP-8 ECIES handshake and AES-256-CTR framed channel
   - `eth` -- eth/66-69 sub-protocol (hello, status, block headers/bodies, receipts, transaction gossip)
   - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)

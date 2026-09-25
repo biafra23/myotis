@@ -1,6 +1,6 @@
 [package]
 name = "myotis-net"
-version = "0.1.7"
+version.workspace = true
 edition = "2021"
 description = "Myotis consensus-layer networking: discv5 discovery + libp2p eth2 req/resp + the light-client sync loop (ALL I/O lives here; myotis-consensus stays sans-I/O)"
 license = "MIT OR Apache-2.0"
@@ -22,7 +22,7 @@ myotis-evm = { path = "../myotis-evm" }
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
-libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "secp256k1", "macros"] }
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
 discv5 = "=0.11.0"
 snap = "=1.1.1"
 tracing = "=0.1.44"
@@ -58,7 +58,13 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 tor = ["dep:arti-client", "dep:tor-rtcompat"]
 
 [dev-dependencies]
+# readstats shape tests parse their own JSON output.
+serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# test-util only: `#[tokio::test(start_paused = true)]` drives the interactive
+# read HEDGING on the paused clock, so the timing invariants are asserted
+# exactly and instantly instead of by sleeping in real time.
+tokio = { version = "=1.52.3", features = ["test-util", "macros", "rt-multi-thread", "time"] }
 
 [[example]]
 name = "live_sync"

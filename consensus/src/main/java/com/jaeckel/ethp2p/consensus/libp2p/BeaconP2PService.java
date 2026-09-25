@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.consensus.libp2p;
 
 import com.jaeckel.ethp2p.consensus.types.MetadataMessage;
 import com.jaeckel.ethp2p.consensus.types.StatusMessage;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import io.libp2p.core.Host;
 import io.libp2p.core.P2PChannel;
 import io.libp2p.core.PeerId;
@@ -30,6 +31,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -180,25 +182,45 @@ public class BeaconP2PService implements AutoCloseable {
     private static final long PING_INTERVAL_SECS = 15;
 
     /**
-     * Gossipsub instance. Observation-only: handler logs incoming messages
-     * and always returns {@code Ignore}. Only created when
-     * {@link #gossipsubEnabled} is true, which defaults to {@code false}
-     * because the primary target (short-lived Android sessions) doesn't
-     * benefit from mesh participation — mesh-join latency is longer than a
-     * whole session, and churning the mesh every 24 h is worse citizenship
-     * than not joining.
+     * Gossipsub instance, always registered so the {@code /meshsub/} protocol
+     * negotiates on every connection. Lighthouse reports a peer whose
+     * negotiation fails as {@code PeerAction::Fatal} ("does_not_support_gossipsub"),
+     * which bans the peer id for 12 h after one connection and bans the IP once
+     * more than five of its peer ids are banned — a req/resp-only client got
+     * exactly one connection per Lighthouse node per start. Registering the
+     * protocol is all that check needs. Joining the light-client topics is a
+     * separate, off-by-default switch
+     * ({@link #setGossipTopicSubscriptionEnabled(boolean)}): a short-lived
+     * wallet that joins a mesh and vanishes churns it for everyone else, the
+     * jvm-libp2p default message id (from+seqno) collapses eth2's unsigned
+     * messages, and the subscription is pinned to the fork digest at start.
      */
     private io.libp2p.pubsub.gossip.Gossip gossip;
 
-    /** Off by default; call {@link #setGossipsubEnabled(boolean)} before {@link #start()}. */
-    private boolean gossipsubEnabled = false;
+    /**
+     * The gossip router's event/heartbeat executor. Owned here because
+     * jvm-libp2p's default {@code GossipRouterBuilder} creates one per router
+     * and exposes no shutdown, and this service is restarted in place on every
+     * pause/resume — an unowned executor would strand one thread per cycle.
+     */
+    private java.util.concurrent.ScheduledExecutorService gossipExecutor;
 
-    /** Toggle gossipsub subscription. Must be called before {@link #start()}. */
-    public void setGossipsubEnabled(boolean enabled) {
+    /**
+     * Whether to also SUBSCRIBE to the light-client gossip topics. Off by
+     * default — see the {@link #gossip} field doc. No host enables it yet; it
+     * stays as the hook for the live-finality plan (plan-gossipsub-subscription.md).
+     */
+    private boolean gossipTopicSubscriptionEnabled = false;
+
+    /** Topics {@link #subscribeLightClientGossipTopics()} joined; empty unless the topic switch is on. */
+    private final Set<String> subscribedGossipTopics = ConcurrentHashMap.newKeySet();
+
+    /** Toggle topic subscription. Must be called before {@link #start()}. */
+    public void setGossipTopicSubscriptionEnabled(boolean enabled) {
         if (host != null) {
-            throw new IllegalStateException("gossipsub flag cannot change after start()");
+            throw new IllegalStateException("gossip topic flag cannot change after start()");
         }
-        this.gossipsubEnabled = enabled;
+        this.gossipTopicSubscriptionEnabled = enabled;
     }
 
     public BeaconP2PService() {
@@ -249,13 +271,10 @@ public class BeaconP2PService implements AutoCloseable {
      * Start the underlying libp2p host and register light client protocol handlers.
      */
     public void start() {
-        // Observation-only gossipsub: installed so we appear as a mesh-
-        // capable peer in Identify, subscribe to light-client topics and
-        // log messages without propagating them. PR 1 of the gossipsub
-        // rollout plan (see plan-gossipsub-subscription.md).
-        //
-        // Gated off by default — mesh participation is net-negative for
-        // short-session clients (see commit message / gossipsub plan).
+        // Gossipsub is registered so the /meshsub/ protocol negotiates (see the
+        // `gossip` field doc: Lighthouse fatally bans peers that lack it). Topic
+        // subscription is a separate switch, off by default — PR 1 of the
+        // gossipsub rollout plan (plan-gossipsub-subscription.md) is on hold.
         HostBuilder hostBuilder = new HostBuilder()
                 .transport(TcpTransport::new)
                 .secureChannel((key, muxers) -> new NoiseXXSecureChannel(key, muxers))
@@ -264,10 +283,16 @@ public class BeaconP2PService implements AutoCloseable {
                 .listen("/ip4/0.0.0.0/tcp/0") // ephemeral port; some peers reject dial-only hosts
                 // Ethereum CL spec requires secp256k1 identity keys
                 .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1));
-        if (gossipsubEnabled) {
-            gossip = new io.libp2p.pubsub.gossip.Gossip();
-            hostBuilder.protocol(gossip);
-        }
+        gossipExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "beacon-gossip-router");
+            t.setDaemon(true);
+            return t;
+        });
+        io.libp2p.pubsub.gossip.builders.GossipRouterBuilder routerBuilder =
+                new io.libp2p.pubsub.gossip.builders.GossipRouterBuilder();
+        routerBuilder.setScheduledAsyncExecutor(gossipExecutor);
+        gossip = new io.libp2p.pubsub.gossip.Gossip(routerBuilder.build());
+        hostBuilder.protocol(gossip);
         host = hostBuilder.build();
 
         // Log connection events and auto-query Identify for protocol support
@@ -360,7 +385,7 @@ public class BeaconP2PService implements AutoCloseable {
         keepaliveExecutor.scheduleAtFixedRate(this::pingAllConnections,
                 PING_INTERVAL_SECS, PING_INTERVAL_SECS, java.util.concurrent.TimeUnit.SECONDS);
 
-        if (gossipsubEnabled) {
+        if (gossipTopicSubscriptionEnabled) {
             subscribeLightClientGossipTopics();
         }
     }
@@ -402,6 +427,8 @@ public class BeaconP2PService implements AutoCloseable {
                     msg -> handleGossipMessage(optimisticTopic, msg);
             gossip.subscribe(finalityFn, new io.libp2p.core.pubsub.Topic(finalityTopic));
             gossip.subscribe(optimisticFn, new io.libp2p.core.pubsub.Topic(optimisticTopic));
+            subscribedGossipTopics.add(finalityTopic);
+            subscribedGossipTopics.add(optimisticTopic);
             log.info("[beacon-p2p] gossipsub subscribed (observation-only) to: {} and {}",
                     finalityTopic, optimisticTopic);
         } catch (Exception e) {
@@ -436,6 +463,12 @@ public class BeaconP2PService implements AutoCloseable {
             keepaliveExecutor.shutdownNow();
             keepaliveExecutor = null;
         }
+        if (gossipExecutor != null) {
+            gossipExecutor.shutdownNow();
+            gossipExecutor = null;
+        }
+        gossip = null;
+        subscribedGossipTopics.clear();
         Host h = host;
         // Null the reference so a close→start cycle (BeaconLightClient pause/resume)
         // gets a fresh host, double-close is a no-op, and doReqResp/getConnectedPeers
@@ -520,8 +553,8 @@ public class BeaconP2PService implements AutoCloseable {
      * (Lighthouse-style application codes &ge; 128, plus spec's FaultError
      * (3) and ClientShutdown (1) where reconnecting doesn't help). For the
      * spec's IrrelevantNetwork (2) we do <em>not</em> cooldown: that's a
-     * static-capability mismatch (we don't advertise gossipsub, so we stay
-     * "irrelevant" until we subscribe), and cooldowning locks us out of
+     * static-capability mismatch (a fork-digest or network disagreement in
+     * Status that re-dialing cannot change), and cooldowning locks us out of
      * every peer at once without reducing abuse — the peer already decided
      * based on Identify, they won't be angrier if we re-dial.
      */
@@ -693,7 +726,7 @@ public class BeaconP2PService implements AutoCloseable {
         String protoId = v2 ? STATUS : STATUS_V1;
         QueuedReqRespBinding binding = bindings.get(protoId);
         if (binding == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("no binding for " + protoId));
         }
         byte[] requestPayload;
@@ -701,7 +734,7 @@ public class BeaconP2PService implements AutoCloseable {
             byte[] ssz = v2 ? local.encode() : local.encodeV1();
             requestPayload = ReqRespCodec.encodeRequest(ssz);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
         binding.enqueue(pid, requestPayload, responseFuture);
@@ -740,6 +773,59 @@ public class BeaconP2PService implements AutoCloseable {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /**
+     * Diagnostic: open one stream to a peer negotiating exactly {@code protocolId}.
+     * Completes with the negotiated id, or fails when the peer does not speak it —
+     * the same multistream-select outcome a remote Lighthouse gets when it opens
+     * its {@code /meshsub/} stream toward us.
+     */
+    public CompletableFuture<String> probeProtocol(String peerMultiaddr, String protocolId) {
+        Host h = host;
+        if (h == null) return Futures.failedFuture(new IllegalStateException("not started"));
+        Multiaddr peerAddr;
+        PeerId peerId;
+        try {
+            peerAddr = new Multiaddr(peerMultiaddr);
+            peerId = peerAddr.getPeerId();
+        } catch (Exception e) {
+            return Futures.failedFuture(e);
+        }
+        if (peerId == null) return Futures.failedFuture(new IllegalArgumentException("no peer id"));
+        ProtocolBinding<String> probe = new ProtocolBinding<>() {
+            @Override
+            public ProtocolDescriptor getProtocolDescriptor() {
+                return new ProtocolDescriptor(protocolId);
+            }
+
+            @Override
+            public CompletableFuture<String> initChannel(P2PChannel channel, String negotiatedProtocol) {
+                channel.close();
+                return CompletableFuture.completedFuture(negotiatedProtocol);
+            }
+        };
+        return findOrConnect(h, peerId, peerAddr)
+                .thenCompose(conn -> conn.muxerSession().createStream(probe).getController());
+    }
+
+    /** Gossip topics this host has joined (empty unless topic subscription is enabled). */
+    public Set<String> subscribedGossipTopics() {
+        return Set.copyOf(subscribedGossipTopics);
+    }
+
+    /**
+     * Our dialable listen multiaddrs, {@code /p2p/<peerId>} included; empty
+     * before {@link #start()}. Loopback tests dial these.
+     */
+    public List<String> listenAddresses() {
+        Host h = host;
+        if (h == null) return List.of();
+        String suffix = "/p2p/" + h.getPeerId();
+        return h.listenAddresses().stream()
+                .map(Object::toString)
+                .map(a -> a.contains("/p2p/") ? a : a + suffix)
+                .toList();
+    }
 
     /** Info about a connected CL peer. */
     public record PeerInfo(String peerId, String remoteAddress, List<String> protocols, String agentVersion) {
@@ -851,12 +937,12 @@ public class BeaconP2PService implements AutoCloseable {
      */
     public CompletableFuture<Void> queryIdentify(String peerMultiaddr) {
         Host h = host;
-        if (h == null) return CompletableFuture.failedFuture(new IllegalStateException("not started"));
+        if (h == null) return Futures.failedFuture(new IllegalStateException("not started"));
 
         try {
             Multiaddr peerAddr = new Multiaddr(peerMultiaddr);
             PeerId peerId = peerAddr.getPeerId();
-            if (peerId == null) return CompletableFuture.failedFuture(new IllegalArgumentException("no peer id"));
+            if (peerId == null) return Futures.failedFuture(new IllegalArgumentException("no peer id"));
 
             // Honor the Goodbye cooldown exactly like doReqResp: re-dialing a peer
             // that just told us to go away is the signal that gets us scored down.
@@ -866,7 +952,7 @@ public class BeaconP2PService implements AutoCloseable {
             if (cooldownUntil != null) {
                 long remaining = cooldownUntil - System.currentTimeMillis();
                 if (remaining > 0) {
-                    return CompletableFuture.failedFuture(
+                    return Futures.failedFuture(
                             new RuntimeException("peer " + peerId + " in Goodbye cooldown for "
                                     + remaining + "ms"));
                 }
@@ -908,7 +994,7 @@ public class BeaconP2PService implements AutoCloseable {
                 return null;
             });
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
     }
 
@@ -932,7 +1018,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(local.encode());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         dumpOutgoingStatus(peerMultiaddr, "v2", local, requestPayload);
         return doReqResp(peerMultiaddr, STATUS, requestPayload)
@@ -947,7 +1033,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(local.encodeV1());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         dumpOutgoingStatus(peerMultiaddr, "v1", local, requestPayload);
         return doReqResp(peerMultiaddr, STATUS_V1, requestPayload)
@@ -1000,14 +1086,14 @@ public class BeaconP2PService implements AutoCloseable {
 
     public CompletableFuture<byte[]> requestBootstrap(String peerMultiaddr, byte[] blockRoot32) {
         if (blockRoot32 == null || blockRoot32.length != 32) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("blockRoot32 must be exactly 32 bytes"));
         }
         byte[] requestPayload;
         try {
             requestPayload = ReqRespCodec.encodeRequest(blockRoot32);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, BOOTSTRAP, requestPayload)
                 .thenApply(BeaconP2PService::decodeSingleResponse);
@@ -1056,7 +1142,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(sszRequest);
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, UPDATES, requestPayload, timeoutMs)
                 .thenApply(raw -> {
@@ -1081,7 +1167,7 @@ public class BeaconP2PService implements AutoCloseable {
         try {
             requestPayload = ReqRespCodec.encodeRequest(buf.array());
         } catch (IOException e) {
-            return CompletableFuture.failedFuture(e);
+            return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, BLOCKS_BY_RANGE, requestPayload)
                 .thenApply(raw -> {
@@ -1152,24 +1238,15 @@ public class BeaconP2PService implements AutoCloseable {
 
         Host h = host;
         if (h == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("BeaconP2PService not started"));
         }
 
         CompletableFuture<byte[]> responseFuture = new CompletableFuture<>();
-        if (timeoutMs > 0L) {
-            // Start the deadline now so it matches the caller's intent (X ms total),
-            // not "X ms from when the muxer happened to open a stream". When the
-            // timer fires it completes responseFuture exceptionally, which triggers
-            // the stream-close whenComplete registered after the stream opens
-            // (see below) — without that, channelRead0 would keep buffering bytes
-            // from a silent peer.
-            responseFuture.orTimeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-        }
 
         QueuedReqRespBinding binding = bindings.get(protocolId);
         if (binding == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("No binding registered for " + protocolId));
         }
 
@@ -1177,7 +1254,7 @@ public class BeaconP2PService implements AutoCloseable {
             Multiaddr peerAddr = new Multiaddr(peerMultiaddr);
             PeerId peerId = peerAddr.getPeerId();
             if (peerId == null) {
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalArgumentException("Cannot extract PeerId from: " + peerMultiaddr));
             }
 
@@ -1189,11 +1266,24 @@ public class BeaconP2PService implements AutoCloseable {
             if (cooldownUntil != null) {
                 long remaining = cooldownUntil - System.currentTimeMillis();
                 if (remaining > 0) {
-                    return CompletableFuture.failedFuture(
+                    return Futures.failedFuture(
                             new RuntimeException("peer " + peerId + " in Goodbye cooldown for "
                                     + remaining + "ms"));
                 }
                 goodbyeUntilMs.remove(peerId.toString());
+            }
+
+            if (timeoutMs > 0L) {
+                // Arm the deadline (in place, on responseFuture) after the cheap
+                // synchronous validation above but before any network step, so it
+                // still spans the caller's full X ms — not "X ms from when the muxer
+                // happened to open a stream" — while the early-return paths above
+                // never park an orphaned timer task for a future nobody completes.
+                // When the timer fires it completes responseFuture exceptionally,
+                // which triggers the stream-close whenComplete registered after the
+                // stream opens (see below) — without that, channelRead0 would keep
+                // buffering bytes from a silent peer.
+                Futures.orTimeout(responseFuture, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
 
             log.debug("[beacon-p2p] Opening stream {} to {}", protocolId, peerMultiaddr);
@@ -1579,7 +1669,7 @@ public class BeaconP2PService implements AutoCloseable {
                 log.debug("[beacon-p2p] Peer-initiated {} stream from {} (agent={}) — no responder, closing",
                         protocolId, pid, agent);
                 try { stream.close(); } catch (Exception ignored) {}
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("Responder role not implemented for " + protocolId));
             }
 
@@ -1590,7 +1680,7 @@ public class BeaconP2PService implements AutoCloseable {
             try {
                 outgoingPeerId = stream.getConnection().secureSession().getRemoteId().toString();
             } catch (Exception e) {
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("Cannot resolve peer ID for outgoing " + protocolId, e));
             }
             ConcurrentLinkedQueue<PendingRequest> queue = pendingByPeer.get(outgoingPeerId);
@@ -1605,7 +1695,7 @@ public class BeaconP2PService implements AutoCloseable {
             if (pending == null) {
                 log.warn("[beacon-p2p] No pending request for outgoing {} to {} — queue was empty!",
                         protocolId, outgoingPeerId);
-                return CompletableFuture.failedFuture(
+                return Futures.failedFuture(
                         new IllegalStateException("No pending request for " + protocolId
                                 + " to " + outgoingPeerId));
             }

@@ -26,11 +26,16 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
- * of {@code latest}/{@code pending}/{@code safe}/{@code finalized}/default, OR a
- * specific number within {@code [head-64, head+16]} (wallets pin reads to the
- * just-fetched latest number), is served from the verified head. A genuinely older
- * block returns {@code null} — the head state does NOT stand in for it. So within
- * the lag window a near-head number resolves to the verified head state (standard
+ * of {@code latest}/{@code pending}/{@code safe}/default, OR a specific number
+ * within {@code [head-64, head+16]} (wallets pin reads to the just-fetched
+ * latest number), is served from the verified head. {@code finalized} is
+ * APPLIED everywhere on this engine: by {@code call}, {@code getBlockByNumber},
+ * {@code getBlockReceipts} and {@code feeHistory} since ABI 30 (#465), and by the
+ * account/code/storage/nonce reads since ABI 32 (#366) — they run against, or
+ * prove at, the beacon-finalized block, and refuse (retryably) while no finalized
+ * block has landed or no peer still serves its state. A genuinely older block returns
+ * {@code null} — the head state does NOT stand in for it. So within the lag
+ * window a near-head number resolves to the verified head state (standard
  * light-client skew); a caller needing exact historical state below the window
  * gets {@code null}, never head data mislabeled as an old block.
  *
@@ -90,6 +95,7 @@ final class RustVerifiedReads implements VerifiedReads {
                 case SYNCED -> SyncState.SYNCED;
                 case CATCHING_UP -> SyncState.CATCHING_UP;
                 case STARTING, SYNCING -> SyncState.SYNCING;
+                case STALE_ANCHOR -> SyncState.STALE_ANCHOR;
             };
         } catch (RuntimeException e) {
             // Never throw from the read surface: an unreadable status reads as
@@ -105,7 +111,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public String getBalance(byte[] address, String block) {
         if (!isServableBlock(block)) return null;
-        AccountProofResult r = queryAccount(address);
+        AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // A verified-absent account has balance 0 (eth semantics), even though the
         // proof-of-exclusion carries a null balanceWei.
@@ -115,7 +121,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public Long getTransactionCount(byte[] address, String block) {
         if (!isServableBlock(block)) return null;
-        AccountProofResult r = queryAccount(address);
+        AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists).
         //
@@ -143,9 +149,9 @@ final class RustVerifiedReads implements VerifiedReads {
         if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         try {
-            return handle.codeVerified(toHex(address));
+            return handle.codeVerified(toHex(address), block);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified code read unavailable: {}", e.getMessage());
+            log.info("[engines] verified code read unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -158,9 +164,9 @@ final class RustVerifiedReads implements VerifiedReads {
         // call; reject anything else defensively.
         if (slot32 == null || slot32.length != 32) return null;
         try {
-            return handle.storageAtVerified(toHex(address), toHex(slot32));
+            return handle.storageAtVerified(toHex(address), toHex(slot32), block);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified storage read unavailable: {}", e.getMessage());
+            log.info("[engines] verified storage read unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -197,7 +203,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     block,
                     stateOverridesJson == null ? "" : stateOverridesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call (overrides) unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call (overrides) unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -218,7 +224,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     valueWei == null ? "" : valueWei,
                     block);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -241,7 +247,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     : handle.ethCallVerifiedDetailedWithOverrides(
                             fromHex, toHex20, dataHex, value, block, stateOverridesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified eth_call (detailed) unavailable: {}", e.getMessage());
+            log.info("[engines] verified eth_call (detailed) unavailable: {}", e.getMessage());
             return io.myotis.api.CallResult.unavailable(e.getMessage());
         }
     }
@@ -269,8 +275,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // polling), or throws when it can't verify (→ null → strict -32000).
             return handle.transactionReceiptJson(toHex(txHash));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified receipt read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified receipt read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -286,9 +292,38 @@ final class RustVerifiedReads implements VerifiedReads {
             // own-sent-tx pending answer yet (needs the sent-tx cache).
             return handle.transactionByHashJson(toHex(txHash));
         } catch (RuntimeException e) {
-            log.debug("[engines] verified tx read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified tx read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
+    }
+
+
+    /**
+     * Engine error envelope for the JSON-string read methods: `{"error": ...}`
+     * instead of a bare null, so the router can answer -32000 WITH the
+     * engine's reason (mirrors the eth_getLogs contract). A bare null told a
+     * wallet only "no peer / not synced" — during the 2026-09-02 stale-pool
+     * incident that text pointed at sync state while the node WAS synced and
+     * the real reason ("8x peer returned 0 headers") was swallowed here.
+     */
+    private static String errJson(RuntimeException e) {
+        String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        StringBuilder b = new StringBuilder(m.length() + 16).append("{\"error\":\"");
+        for (int i = 0; i < m.length(); i++) {
+            char c = m.charAt(i);
+            switch (c) {
+                case '"' -> b.append("\\\"");
+                case '\\' -> b.append("\\\\");
+                case '\n' -> b.append("\\n");
+                case '\r' -> b.append("\\r");
+                case '\t' -> b.append("\\t");
+                default -> {
+                    if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+                    else b.append(c);
+                }
+            }
+        }
+        return b.append("\"}").toString();
     }
 
     @Override
@@ -300,8 +335,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // block), or throws when it can't verify (→ null → -32000).
             return handle.blockByNumberJson(tag, fullTransactions);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified block read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified block read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -314,8 +349,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // verified / reorged away), or throws (→ null → strict -32000).
             return handle.blockByHashJson(toHex(blockHash32), fullTransactions);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified block-by-hash read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -342,8 +377,8 @@ final class RustVerifiedReads implements VerifiedReads {
             // block or never-verified hash), or throws (→ null → strict -32000).
             return handle.blockReceiptsJson(sel);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
-            return null;
+            log.info("[engines] verified blockReceipts read unavailable: {}", e.getMessage());
+            return errJson(e);
         }
     }
 
@@ -383,7 +418,7 @@ final class RustVerifiedReads implements VerifiedReads {
             // (→ null → strict -32000). No "null" literal case for this method.
             return handle.feeHistoryJson(blockCount, tag, percentilesJson);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified feeHistory unavailable: {}", e.getMessage());
+            log.info("[engines] verified feeHistory unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -410,7 +445,7 @@ final class RustVerifiedReads implements VerifiedReads {
                     data == null ? "" : toHex(data),
                     valueWei == null ? "" : valueWei);
         } catch (RuntimeException e) {
-            log.debug("[engines] verified estimateGas (detailed) unavailable: {}", e.getMessage());
+            log.info("[engines] verified estimateGas (detailed) unavailable: {}", e.getMessage());
             return io.myotis.api.EstimateResult.unavailable(e.getMessage());
         }
     }
@@ -425,20 +460,21 @@ final class RustVerifiedReads implements VerifiedReads {
 
     // ---- helpers ----
 
-    /** Run the verified account query, mapping a transport/not-running failure to null. */
-    private AccountProofResult queryAccount(byte[] address) {
+    /** Run the verified account query at {@code block} (the engine applies or refuses
+     *  the selector, ABI >= 32), mapping a transport/not-running failure to null. */
+    private AccountProofResult queryAccount(byte[] address, String block) {
         // An eth address is exactly 20 bytes. Reject any other length (incl. null) up
         // front — "can't answer" (null) rather than round-tripping a bogus key through
         // the native query — so a malformed address never crosses the JNI boundary.
         if (address == null || address.length != 20) return null;
         try {
-            return handle.requestAccount(toHex(address));
+            return handle.accountVerified(toHex(address), block);
         } catch (RuntimeException e) {
             // Contain any unchecked failure (transport/not-running EngineException,
             // or a raw unchecked throwable off the native path) as "can't answer
             // verified right now" — the router's tryVerified dispatch is not
             // exception-guarded, so nothing may escape this adapter.
-            log.debug("[engines] verified account read unavailable: {}", e.getMessage());
+            log.info("[engines] verified account read unavailable: {}", e.getMessage());
             return null;
         }
     }
@@ -471,11 +507,10 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte
-     *  storage position — the forms the natives expect). */
+     *  storage position — the forms the natives expect). core's Hex, not
+     *  {@code java.util.HexFormat} (API 34; see CLAUDE.md's minSdk budget). */
     private static String toHex(byte[] bytes) {
         if (bytes == null) throw new EngineException("byte input is required");
-        // HexFormat is desugared for Android here (desugar_jdk_libs 2.1.x) — the same
-        // API node-core (ChainStack) and myotis-ens already rely on in main code.
-        return "0x" + java.util.HexFormat.of().formatHex(bytes);
+        return com.jaeckel.ethp2p.core.encoding.Hex.formatHexPrefixed(bytes);
     }
 }

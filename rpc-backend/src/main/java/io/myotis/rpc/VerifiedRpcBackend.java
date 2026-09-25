@@ -3,6 +3,7 @@ package io.myotis.rpc;
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
@@ -77,7 +78,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Max blocks below the verified head we'll fetch+verify headers for to answer
     // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
     // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
-    private static final int BLOCK_LOOKBACK_MAX = 256;
+    // 512, not 256: Swarm's bee reads the previous redistribution round's start
+    // header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
+    // whatever skew bee's cached block number has against our anchored head at
+    // serve time. 256 made that call fail for the tail of every round; 512 covers
+    // it with margin and stays one modest header-range fetch (~300 KB).
+    // Mirrored by the Rust engine's BLOCK_LOOKBACK_MAX (el/reader.rs) — keep in sync.
+    private static final int BLOCK_LOOKBACK_MAX = 512;
 
     private static final long ENS_TIMEOUT_SEC = 60;
 
@@ -351,6 +358,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Owned state (created here; stopped in close())
     // ---------------------------------------------------------------------
 
+    /** The read-fetch shadow cache (stack-owned). See the constructor. */
+    private final io.myotis.evm.world.ReadStats readStats;
+
     /** Bytecode is keyed by hash, so this cache is valid forever across roots. */
     private final io.myotis.evm.world.BytecodeCache bytecodeCache =
             io.myotis.evm.world.BytecodeCache.inMemory();
@@ -615,13 +625,19 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  OPTIMISATIONS_AND_LIMITATIONS.md §2.14 for why relaxing the default backfired. */
     private final long stateHeadStaleCapMs;
 
+    /** {@code readStats} — the stack-owned read-fetch shadow cache the snap oracle
+     *  reports every verified fetch to ({@link io.myotis.evm.world.ReadStats}).
+     *  Stack-owned (not backend-owned) so the counters survive the pause/resume
+     *  backend rebuild, like {@code ServeStats}. */
     public VerifiedRpcBackend(RLPxConnector connector,
                               BeaconLightClient beaconLightClient,
                               BeaconSyncState beaconSyncState,
                               io.myotis.evm.ccipread.CcipGateway ccipGateway,
                               RpcLogger log,
                               RpcClock clock,
-                              SnapQualitySink snapQuality) {
+                              SnapQualitySink snapQuality,
+                              io.myotis.evm.world.ReadStats readStats) {
+        this.readStats = java.util.Objects.requireNonNull(readStats, "readStats");
         this.connector = java.util.Objects.requireNonNull(connector, "connector");
         // Heavy-lane snap concurrency cap = half the live snap peers (dynamic). The 30s
         // wait is only a deadlock safety net — permits free as in-flight requests complete.
@@ -1042,8 +1058,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         trimmed, null, call.blockNumber(), verified,
                         "ENS not available on chain id " + connector.getNetwork().networkId()), false));
             }
-            return call.resolver().resolveAddress(trimmed, call.blockCtx())
-                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+            return Futures.orTimeout(call.resolver().resolveAddress(trimmed, call.blockCtx()),
+                            ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                     .handle((opt, ex) -> {
                         final boolean usedOffchain = call.offchainExecutor().usedOffchain();
                         if (ex != null) {
@@ -1220,8 +1236,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         "ENS not available on chain id " + connector.getNetwork().networkId()),
                         false));
             }
-            return call.apply(ctx.resolver(), ctx.blockCtx())
-                    .orTimeout(ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
+            return Futures.orTimeout(call.apply(ctx.resolver(), ctx.blockCtx()),
+                            ENS_TIMEOUT_SEC, TimeUnit.SECONDS)
                     .handle((opt, ex) -> {
                         final boolean usedOffchain = ctx.offchainExecutor().usedOffchain();
                         if (ex != null) {
@@ -1769,7 +1785,30 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // non-empty proof confirms the peer as snap-serving (dialed first on
         // restart); the same root-unavailable event that deprioritizes it for this
         // head also feeds a failure verdict so repeat hangers are deprioritized
-        // across restarts.
+        // across restarts — and, in lockstep, a pool strike (bench, and at
+        // READ_FAILS_EVICT consecutive contexts a disconnect, so the maintainer
+        // replaces a peer that keeps failing instead of re-benching it forever).
+        // Gated on the routing set's add() so one context banks AT MOST ONE strike
+        // and one cache verdict per peer, however many concurrent fetches report
+        // the same deny (the strike ladder counts CONTEXTS, not fetches).
+        final java.util.function.Consumer<EthHandler> onRootDenied = p -> {
+            if (rootDenied.add(p)) {
+                rootServed.remove(p);
+                // Strike first: on the sole-peer SHIELD (no strike banked) the
+                // persisted failure verdict is skipped too, or three shielded
+                // outages would persist DENIED against the one peer that kept
+                // serving — the same guard the Rust record_quality keeps.
+                if (oracleConn.recordReadFailure(p)) {
+                    recordSnapQualityAsync(p, false);
+                }
+            }
+        };
+        final java.util.function.Consumer<EthHandler> onRootServed = p -> {
+            if (rootServed.add(p)) {
+                recordSnapQualityAsync(p, true);
+                oracleConn.recordReadServed(p);
+            }
+        };
         io.myotis.evm.world.SnapBackedStateOracle oracle =
                 new io.myotis.evm.world.SnapBackedStateOracle(
                         () -> {
@@ -1785,10 +1824,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 final EthHandler chosen = served.get(Math.floorMod(n, served.size()));
                                 return new EthHandlerSnapPeer(
                                         chosen,
-                                        () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                                recordSnapQualityAsync(chosen, false); },
-                                        () -> { rootServed.add(chosen);
-                                                recordSnapQualityAsync(chosen, true); },
+                                        () -> onRootDenied.accept(chosen),
+                                        () -> onRootServed.accept(chosen),
                                         snapLaneGate);
                             }
                             // Discovery phase (none proven yet): probed peer first (known to
@@ -1798,10 +1835,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                 final EthHandler pp = probedPeer;
                                 return new EthHandlerSnapPeer(
                                         pp,
-                                        () -> { rootDenied.add(pp); rootServed.remove(pp);
-                                                recordSnapQualityAsync(pp, false); },
-                                        () -> { rootServed.add(pp);
-                                                recordSnapQualityAsync(pp, true); },
+                                        () -> onRootDenied.accept(pp),
+                                        () -> onRootServed.accept(pp),
                                         snapLaneGate);
                             }
                             // activeSnapHandlers() already returns only ready, snap-negotiated,
@@ -1815,14 +1850,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                                     ready.get(Math.floorMod(n, ready.size()));
                             return new EthHandlerSnapPeer(
                                     chosen,
-                                    () -> { rootDenied.add(chosen); rootServed.remove(chosen);
-                                            recordSnapQualityAsync(chosen, false); },
-                                    () -> { rootServed.add(chosen);
-                                            recordSnapQualityAsync(chosen, true); });
+                                    () -> onRootDenied.accept(chosen),
+                                    () -> onRootServed.accept(chosen));
                         },
                         bytecodeCache,
                         SNAP_ORACLE_MAX_ATTEMPTS,
-                        stateProofCache);
+                        stateProofCache,
+                        readStats);
         io.myotis.evm.DefaultEvmExecutor base =
                 new io.myotis.evm.DefaultEvmExecutor(oracle, bytecodeCache, evmPool);
         io.myotis.evm.PrefetchingEvmExecutor prefetching =
@@ -2250,7 +2284,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // The warm has no waiter to give up on it, so bound the BOOKKEEPING
                 // explicitly — otherwise a dropped queue slot would leave the
                 // inflightCalls entry and the per-shape warm flag stuck forever.
-                exec.orTimeout(HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                Futures.orTimeout(exec, HOT_CALL_WARM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         .whenComplete((out, ex) -> {
                             try {
                                 if (ex != null) {
@@ -3398,8 +3432,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         int total = (int) totalLong;
         log.info("[verify] Fetching " + total + " headers from #"
                 + finalizedBlock + " to #" + peerBlock);
-        return conn.requestBlockHeadersBatched(finalizedBlock, total)
-                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+        return Futures.orTimeout(conn.requestBlockHeadersBatched(finalizedBlock, total),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
                     boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
                     log.info("[verify] Full header chain (" + headers.size()
@@ -3529,11 +3563,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (conn == null) return null;
         BlockHeader h = vh.header();
         CompletableFuture<List<BlockBodiesMessage.BlockBody>> bodiesF =
-                conn.requestBlockBodies(vh.hash())
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+                Futures.orTimeout(conn.requestBlockBodies(vh.hash()),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
         CompletableFuture<List<List<Bytes>>> rcptF = needGasWeights
-                ? conn.requestReceipts(vh.hash())
-                        .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                ? Futures.orTimeout(conn.requestReceipts(vh.hash()),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 : CompletableFuture.completedFuture(null);
         return bodiesF.thenCombine(rcptF, (bodies, rcptBlocks) ->
                 decodeBlockTips(h, bodies, rcptBlocks, needGasWeights));
@@ -3945,8 +3979,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  updated before the oracle's fail-fast skim re-consults the supplier), so
      *  the potentially blocking sink call moves off-thread here instead. */
     private void recordSnapQualityAsync(EthHandler peer, boolean served) {
-        java.util.concurrent.CompletableFuture.runAsync(() -> recordSnapQuality(peer, served));
+        // FIFO-chained, not independent runAsync tasks: the cache counts
+        // CONSECUTIVE failures, so a stale serve task overtaking three failure
+        // tasks would re-confirm a peer the pool just evicted and undo the
+        // DENIED verdict the eviction ladder pairs with. Appending under the
+        // lock fixes each event's position at callback time; the chain runs on
+        // the common pool, so callbacks still never block on the sink. Old
+        // stages become unreachable as the chain advances (no growth).
+        synchronized (snapQualityOrder) {
+            snapQualityTail = snapQualityTail.thenRunAsync(() -> recordSnapQuality(peer, served));
+        }
     }
+
+    /** Tail of the FIFO quality-write chain; guarded by {@link #snapQualityOrder}. */
+    private java.util.concurrent.CompletableFuture<Void> snapQualityTail =
+            java.util.concurrent.CompletableFuture.completedFuture(null);
+    private final Object snapQualityOrder = new Object();
 
     private void recordSnapQuality(EthHandler peer, boolean served) {
         if (peer == null) return;

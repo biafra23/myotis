@@ -53,6 +53,22 @@ jobs:
             rust/target/ios-xcframework/MyotisEngine.xcframework.zip
             rust/target/ios-xcframework/MyotisEngine.xcframework.zip.sha256
           if-no-files-found: error
+          # Artifacts are immutable per run; without this, "re-run all jobs" on a
+          # tag 409s in the build leg and the release job never runs. That is the
+          # button people reach for after the version guard fails, so the recovery
+          # path must not wedge the release.
+          overwrite: true
+
+  # Refuse to publish when the pushed tag disagrees with the version in the tree
+  # — the zip lands in the tag's release, while the engine inside advertises
+  # CARGO_PKG_VERSION on the wire (devp2p Hello client id, libp2p agent string),
+  # which verifyCrateVersions pins to project.version. See
+  # release-version-guard.yml. Gated on the REF like the release job below, so it
+  # covers the manual republish path (dispatch against a tag ref) too.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
 
   # Attach to the tag's GitHub Release. The android/desktop/node workflows
   # publish to the SAME release for the same tag; whichever job runs first
@@ -61,7 +77,9 @@ jobs:
   # workflow_dispatch targeting a tag ref is the manual republish path.
   release:
     name: Publish xcframework to release
-    needs: [build]
+    # version-guard carries the same `if` as this job, so it is never merely
+    # skipped underneath it — both run on a tag ref, both skip otherwise.
+    needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

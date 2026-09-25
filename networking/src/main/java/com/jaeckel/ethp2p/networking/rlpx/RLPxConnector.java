@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking.rlpx;
 
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
 import com.jaeckel.ethp2p.networking.ChainHead;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
@@ -31,6 +32,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Manages outbound RLPx TCP connections to Ethereum peers.
@@ -252,7 +256,10 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /** Round-robin cursor for backfill peer selection (fairness + no single peer
-     *  both hammered and trusted with every fill). */
+     *  both hammered and trusted with every fill). Deliberately NOT shared with
+     *  {@link #bodyReceiptRr}: a bodies/receipts burst advancing a shared cursor by
+     *  ~a multiple of the ready-set size would pin every backfill onto the same
+     *  start peer. */
     private final java.util.concurrent.atomic.AtomicInteger backfillRr =
             new java.util.concurrent.atomic.AtomicInteger();
 
@@ -305,7 +312,7 @@ public final class RLPxConnector implements AutoCloseable {
             // channel likely closed between the two checks; remove it.
             it.remove();
         }
-        return CompletableFuture.failedFuture(
+        return Futures.failedFuture(
                 new IllegalStateException("No active peer with completed eth handshake"));
     }
 
@@ -321,7 +328,7 @@ public final class RLPxConnector implements AutoCloseable {
             if (h.isReady()) readyPeers.add(h);
         }
         if (readyPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("No active peer with completed eth handshake"));
         }
         return tryBatchedPeer(readyPeers, 0, startBlock, totalCount);
@@ -330,16 +337,17 @@ public final class RLPxConnector implements AutoCloseable {
     private CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> tryBatchedPeer(
             List<EthHandler> peers, int peerIndex, long startBlock, int totalCount) {
         if (peerIndex >= peers.size()) {
-            return CompletableFuture.failedFuture(new IllegalStateException(
+            return Futures.failedFuture(new IllegalStateException(
                     "All " + peers.size() + " peers failed to serve batched headers"));
         }
         EthHandler handler = peers.get(peerIndex);
         log.info("[rlpx] Batched header request: block={}, count={}, peer={} ({}/{})",
                 startBlock, totalCount, handler.getRemoteAddress(), peerIndex + 1, peers.size());
-        return fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount))
-                .exceptionallyCompose(ex -> {
+        return Futures.exceptionallyCompose(
+                fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount)),
+                ex -> {
                     log.warn("[rlpx] Batched request failed on peer {}: {}, trying next",
-                            handler.getRemoteAddress(), ex.getMessage());
+                            handler.getRemoteAddress(), failureKind(ex));
                     return tryBatchedPeer(peers, peerIndex + 1, startBlock, totalCount);
                 });
     }
@@ -352,12 +360,12 @@ public final class RLPxConnector implements AutoCloseable {
         CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
                 handler.requestBlockHeadersAsync(startBlock, count);
         if (future == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("Peer disconnected during batched header fetch"));
         }
-        return future.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS).thenCompose(batch -> {
+        return Futures.orTimeout(future, 10, java.util.concurrent.TimeUnit.SECONDS).thenCompose(batch -> {
             if (batch.size() != count) {
-                return CompletableFuture.failedFuture(new RuntimeException(
+                return Futures.failedFuture(new RuntimeException(
                         "Expected " + count + " headers, got " + batch.size()));
             }
             accumulated.addAll(batch);
@@ -365,50 +373,157 @@ public final class RLPxConnector implements AutoCloseable {
         });
     }
 
+    /** How many READY peers a bodies/receipts request rotates across before giving
+     *  up. Bounds worst-case latency (x {@link #BODY_RECEIPT_TIMEOUT_MS}) while making
+     *  an all-empty outcome astronomically unlikely: at the ~35% single-peer empty
+     *  rate observed in #359, 8 tries is 0.35^8 ~= 0.02%. Mirrors the snap side's
+     *  {@code SNAP_ORACLE_MAX_ATTEMPTS}. */
+    private static final int BODY_RECEIPT_MAX_PEERS = 8;
+    /** Per-peer deadline for a bodies/receipts fetch — the rotation policy's own
+     *  per-attempt bound (it also covers the unit tests' un-bounded fake suppliers).
+     *  Aliases {@code EthHandler}'s self-cleaning request deadline so the two can't
+     *  drift; the rationale for the 10 s value lives there. Worst case
+     *  (cap x this = 80 s) is longer than any caller's own budget (30-60 s
+     *  {@code .get()}/orTimeout), but reaching it needs every tried peer to HANG —
+     *  clean empties rotate in ~1 RTT; a caller deadline merely truncates what it
+     *  can observe, and the orphaned rotation stays bounded per attempt. */
+    private static final long BODY_RECEIPT_TIMEOUT_MS =
+            EthHandler.BODY_RECEIPT_REQUEST_TIMEOUT_MS;
+
+    /** Round-robin start cursor for bodies/receipts rotation: {@code activeHandlers}
+     *  iterates in a stable order between membership changes, so without it every
+     *  call would start at the same peer — a never-serving first peer would tax each
+     *  request, and wide callers (the 128-deep receipt scan, feeHistory pipelining)
+     *  would herd their whole burst onto one peer at a time. */
+    private final java.util.concurrent.atomic.AtomicInteger bodyReceiptRr =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     /**
-     * Request block bodies from any active READY peer.
+     * Request block bodies, ROTATING across active READY peers (#359). The
+     * bodies path previously took the first ready peer and treated its empty
+     * reply as terminal, so a peer that simply didn't hold the block failed the
+     * whole call (~1-in-3 on mainnet); the header path already rotates, and this
+     * brings bodies in line.
      *
-     * @return a future that completes with the bodies, or a failed future if no peer is available
+     * @return the first peer's COMPLETE reply; an empty list when every tried
+     *     peer replied-but-empty (so the caller's stale/again fallback fires,
+     *     exactly as a single empty reply did before, only now after rotation);
+     *     a failed future when there is no READY peer, or when every attempt
+     *     errored without a clean reply (a transport problem -> the caller's -32000).
      */
     public CompletableFuture<List<BlockBodiesMessage.BlockBody>> requestBlockBodies(
             Bytes32... hashes) {
-        Iterator<EthHandler> it = activeHandlers.iterator();
-        while (it.hasNext()) {
-            EthHandler handler = it.next();
-            if (!handler.isReady()) continue;
-            CompletableFuture<List<BlockBodiesMessage.BlockBody>> future =
-                    handler.requestBlockBodiesAsync(hashes);
-            if (future != null) {
-                log.info("[rlpx] Routed GetBlockBodies({} hashes) to active peer", hashes.length);
-                return future;
-            }
-            it.remove();
-        }
-        return CompletableFuture.failedFuture(
-                new IllegalStateException("No active peer with completed eth handshake"));
+        return rotateRequest("GetBlockBodies(" + hashes.length + ")", hashes.length,
+                h -> h.requestBlockBodiesAsync(hashes));
     }
 
     /**
-     * Request consensus-encoded receipts for the given block hashes from any active READY
-     * peer. The future completes with one receipt list per block (request order). Callers
-     * MUST verify the result against a trusted {@code header.receiptsRoot} before use.
-     *
-     * @return a future, or a failed future if no peer is available
+     * Request consensus-encoded receipts for the given block hashes, ROTATING
+     * across active READY peers (#359) — same shape as {@link #requestBlockBodies},
+     * so {@code eth_getTransactionReceipt} (polled right after a send) no longer
+     * rides on a single peer's reply. Callers MUST verify the result against a
+     * trusted {@code header.receiptsRoot} before use.
      */
     public CompletableFuture<List<List<Bytes>>> requestReceipts(Bytes32... hashes) {
-        Iterator<EthHandler> it = activeHandlers.iterator();
-        while (it.hasNext()) {
-            EthHandler handler = it.next();
-            if (!handler.isReady()) continue;
-            CompletableFuture<List<List<Bytes>>> future = handler.requestReceiptsAsync(hashes);
-            if (future != null) {
-                log.info("[rlpx] Routed GetReceipts({} hashes) to active peer", hashes.length);
-                return future;
-            }
-            it.remove();
+        return rotateRequest("GetReceipts(" + hashes.length + ")", hashes.length,
+                h -> h.requestReceiptsAsync(hashes));
+    }
+
+    /** Log-friendly failure description: a bare {@code TimeoutException} (the
+     *  shape {@code Futures.orTimeout} completes with) has a null message, so
+     *  fall back to the exception itself rather than logging "null". */
+    private static Object failureKind(Throwable ex) {
+        return ex.getMessage() != null ? ex.getMessage() : ex;
+    }
+
+    /** Build a per-peer attempt supplier list from the current READY peers (capped
+     *  at {@link #BODY_RECEIPT_MAX_PEERS}), starting at the {@link #bodyReceiptRr}
+     *  cursor so consecutive calls spread over the whole ready set instead of
+     *  re-taxing the same stable-first peers (and, with more ready peers than the
+     *  cap, every peer gets a turn rather than a fixed first eight), and run them
+     *  through {@link #rotate}. Each supplier calls {@code async} lazily and logs
+     *  when the attempt actually starts; a peer that dropped between snapshot and
+     *  invocation yields a null future, which {@link #rotate} skips without
+     *  counting. */
+    private <T> CompletableFuture<List<T>> rotateRequest(
+            String what, int expected,
+            java.util.function.Function<EthHandler, CompletableFuture<List<T>>> async) {
+        List<EthHandler> ready = new ArrayList<>();
+        for (EthHandler h : activeHandlers) {
+            if (h.isReady()) ready.add(h);
         }
-        return CompletableFuture.failedFuture(
-                new IllegalStateException("No active peer with completed eth handshake"));
+        if (ready.isEmpty()) {
+            return Futures.failedFuture(
+                    new IllegalStateException("No active peer with completed eth handshake"));
+        }
+        int cap = Math.min(ready.size(), BODY_RECEIPT_MAX_PEERS);
+        int start = Math.floorMod(bodyReceiptRr.getAndIncrement(), ready.size());
+        List<Supplier<CompletableFuture<List<T>>>> attempts = new ArrayList<>(cap);
+        for (int i = 0; i < cap; i++) {
+            EthHandler h = ready.get((start + i) % ready.size());
+            int idx = i + 1;
+            attempts.add(() -> {
+                CompletableFuture<List<T>> fut = async.apply(h);
+                if (fut == null) return null;
+                log.info("[rlpx] {} -> {} ({}/{})", what, h.getRemoteAddress(), idx, cap);
+                return fut;
+            });
+        }
+        return rotate(what, expected, attempts, BODY_RECEIPT_TIMEOUT_MS);
+    }
+
+    /**
+     * Pure rotation policy (no EthHandler, unit-testable): try each attempt in
+     * order until one returns a reply of at least {@code expected} size.
+     * <ul>
+     *   <li>A clean but short/empty reply -> rotate, and remember a clean empty was
+     *       seen (the block just isn't being served by that peer).</li>
+     *   <li>An exception (incl. the per-attempt timeout) -> rotate, remember it.</li>
+     *   <li>A null future (peer gone) -> skip, not counted as an attempt.</li>
+     * </ul>
+     * On exhaustion: an empty list if any clean empty was seen (so the caller's
+     * existing empty-reply fallback fires, only now after genuine rotation), else
+     * the last error (a pure-transport failure the caller surfaces as -32000).
+     *
+     * <p>Known limit: the acceptance gate is SIZE-only — root verification stays
+     * with the caller (trust model), so a byzantine peer answering with the right
+     * NUMBER of junk items terminates rotation here and fails only at the caller's
+     * root check, which falls back without retrying the remaining peers. Safety
+     * holds (junk never verifies); availability of the path is what such a peer
+     * controls. Rotating on verification failure would need the trusted roots (or a
+     * verify callback) at this layer — deferred with the peer-quality scoring
+     * follow-up (#400).
+     */
+    static <T> CompletableFuture<List<T>> rotate(
+            String what, int expected,
+            List<Supplier<CompletableFuture<List<T>>>> attempts, long perAttemptTimeoutMs) {
+        return rotateFrom(what, expected, attempts, 0, false, null, perAttemptTimeoutMs);
+    }
+
+    private static <T> CompletableFuture<List<T>> rotateFrom(
+            String what, int expected, List<Supplier<CompletableFuture<List<T>>>> attempts,
+            int i, boolean sawCleanEmpty, Throwable lastEx, long perAttemptTimeoutMs) {
+        if (i >= attempts.size()) {
+            if (sawCleanEmpty) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            return Futures.failedFuture(lastEx != null ? lastEx
+                    : new IllegalStateException("all peer(s) failed to serve " + what));
+        }
+        CompletableFuture<List<T>> f = attempts.get(i).get();
+        if (f == null) {
+            return rotateFrom(what, expected, attempts, i + 1, sawCleanEmpty, lastEx, perAttemptTimeoutMs);
+        }
+        return Futures.orTimeout(f, perAttemptTimeoutMs, TimeUnit.MILLISECONDS)
+                .handle((list, ex) -> {
+                    if (ex == null && list != null && list.size() >= expected) {
+                        return CompletableFuture.completedFuture(list);
+                    }
+                    boolean cleanEmpty = (ex == null);
+                    return rotateFrom(what, expected, attempts, i + 1,
+                            sawCleanEmpty || cleanEmpty, cleanEmpty ? lastEx : ex, perAttemptTimeoutMs);
+                })
+                .thenCompose(x -> x);
     }
 
     /**
@@ -461,7 +576,7 @@ public final class RLPxConnector implements AutoCloseable {
             }
         }
         if (snapPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No active peer with snap/1 support"));
         }
         return trySnapPeer(address, stateRoot, snapPeers, 0);
@@ -470,7 +585,7 @@ public final class RLPxConnector implements AutoCloseable {
     private CompletableFuture<AccountRangeMessage.DecodeResult> trySnapPeer(
             Bytes address, Bytes32 stateRoot, List<EthHandler> peers, int index) {
         if (index >= peers.size()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("All " + peers.size() + " snap peers failed to serve account data"));
         }
         EthHandler handler = peers.get(index);
@@ -483,9 +598,9 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetAccountRange for {} to peer {} ({}/{})",
             address.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return future.exceptionallyCompose(ex -> {
+        return Futures.exceptionallyCompose(future, ex -> {
             log.warn("[rlpx] Snap request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
+                handler.getRemoteAddress(), failureKind(ex));
             // Don't permanently mark as failed — disconnects and timeouts are usually transient
             return trySnapPeer(address, stateRoot, peers, index + 1);
         });
@@ -513,7 +628,7 @@ public final class RLPxConnector implements AutoCloseable {
             }
         }
         if (snapPeers.isEmpty()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("No active peer with snap/1 support"));
         }
         return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, snapPeers, 0);
@@ -523,7 +638,7 @@ public final class RLPxConnector implements AutoCloseable {
             Bytes contractAddress, Bytes32 storageKeyHash, Bytes32 stateRoot,
             List<EthHandler> peers, int index) {
         if (index >= peers.size()) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                 new IllegalStateException("All " + peers.size() + " snap peers failed to serve storage data"));
         }
         EthHandler handler = peers.get(index);
@@ -535,38 +650,154 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetStorageRanges for {} to peer {} ({}/{})",
             storageKeyHash.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return future.thenCompose(result -> {
+        // One decision point on THIS peer's outcome, with the retry recursion outside
+        // it: wrapping the recursion in the failure handler (the previous shape)
+        // replayed the remaining peer list once per level — up to 2^n snap requests
+        // on a fully-failing pool instead of n.
+        return future.handle((result, ex) -> {
+            if (ex != null) {
+                log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
+                    handler.getRemoteAddress(), failureKind(ex));
+                return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
+            }
             if (result.slots().isEmpty() && result.proof().isEmpty()) {
                 log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
                     handler.getRemoteAddress());
-                benchUnlessLastServing(handler);
+                benchReadFailure(handler);
                 return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
             }
+            // No streak clear here: nothing on this path is verified (the proof
+            // check happens in the caller), and the serve credit must not be
+            // spoofable with junk bytes — clears, like strikes, come only from
+            // the oracle path, post-verification (SnapPeer.reportServed).
             return CompletableFuture.completedFuture(result);
-        }).exceptionallyCompose(ex -> {
-            log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
-                handler.getRemoteAddress(), ex.getMessage());
-            return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
-        });
+        }).thenCompose(Function.identity());
     }
 
-    /** Bench a peer that failed to serve — unless it is the last un-benched serving
-     *  snap peer. An empty snap response usually means WE asked for a state root
-     *  outside the peer's ~128-block snapshot window (stale local head), not that
-     *  the peer is broken; benching the sole server empties the serving pool and
-     *  flaps the status (and the EL hunt) between 0 and 1 until the bench expires.
-     *  Synchronized so two concurrent failures on the last two serving peers
-     *  can't each see the other as still serving and both bench — the scan and
-     *  the mark must be atomic against other benchers. */
-    private synchronized void benchUnlessLastServing(EthHandler failed) {
+    /** Consecutive verified-read failures at which a peer is DISCONNECTED instead of
+     *  benched, freeing its slot for a fresh candidate (the snap maintainer refills on
+     *  serving count). Twin of the Rust engine's {@code READ_FAILS_EVICT}
+     *  (rust/myotis-net/src/el/pool.rs), and deliberately equal to the peer caches'
+     *  snap-failure DENIED threshold ({@code PeerCache}/{@code AndroidPeerCache}
+     *  {@code SNAP_FAILURE_THRESHOLD} — they can't import this constant, hosts don't
+     *  see {@code :networking}; {@code PeerCacheTest} pins the equality) so eviction
+     *  and the persisted verdict move in lockstep: the read that evicts is the read
+     *  that denies. */
+    public static final int READ_FAILS_EVICT = 3;
+
+    /** Outcome of one banked verified-read failure. */
+    enum ReadFailureVerdict { SHIELD, BENCH, EVICT }
+
+    /** The pure ladder, extracted for tests: the sole serving peer is shielded (an
+     *  empty response there is likelier OUR stale root than a broken peer, and
+     *  benching it flaps the serving pool between 0 and 1); otherwise the streak
+     *  benches until it reaches {@link #READ_FAILS_EVICT}, then evicts. */
+    static ReadFailureVerdict readFailureVerdict(boolean anotherServing, int failsAfterBank) {
+        if (!anotherServing) {
+            return ReadFailureVerdict.SHIELD;
+        }
+        return failsAfterBank >= READ_FAILS_EVICT ? ReadFailureVerdict.EVICT
+                                                  : ReadFailureVerdict.BENCH;
+    }
+
+    /** True when a serving snap peer other than {@code failed} exists. Caller must hold
+     *  the connector monitor (the scan and the subsequent bench/evict must be atomic
+     *  against other benchers, or the last two serving peers can each see the other as
+     *  still serving and both leave the pool). Counts UN-BENCHED peers — deliberately
+     *  narrower than the Rust twin's shield (any live pool peer, benched included,
+     *  pool.rs): it mirrors the pre-eviction {@code benchUnlessLastServing} predicate,
+     *  and stops striking once the rest of the pool is already benched, which a
+     *  whole-pool outage (our stale root, not the peers') would otherwise turn into a
+     *  pool-wide eviction. */
+    private boolean anotherServing(EthHandler failed) {
         for (EthHandler h : activeHandlers) {
             if (h != failed && h.isReady() && h.isSnapNegotiated() && !h.isSnapServingFailed()) {
-                failed.markSnapServingFailed();
-                return;
+                return true;
             }
         }
-        log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
-            + "a stale-root request)", failed.getRemoteAddress());
+        return false;
+    }
+
+    /** Bench a peer whose response failed a read, without banking an eviction strike —
+     *  for PER-RESPONSE failure paths (one storage request rotating N peers fires this
+     *  N times, and concurrent requests multiply it): banking here would let a couple
+     *  of stale-root queries walk healthy peers to eviction, and this path has no
+     *  cache access, so an eviction from it could not write the DENIED verdict the
+     *  ladder promises ("the read that evicts is the read that denies"). Strikes come
+     *  only from {@link #recordReadFailure}, whose oracle caller dedupes per root
+     *  context and pairs each strike with a cache verdict. */
+    public synchronized void benchReadFailure(EthHandler failed) {
+        if (anotherServing(failed)) {
+            failed.markSnapServingFailed();
+        } else {
+            log.info("[rlpx] Not benching {} — last serving snap peer (empty response likely "
+                + "a stale-root request)", failed.getRemoteAddress());
+        }
+    }
+
+    /** A verified read failed against this peer: bench it for the cooldown, or — on the
+     *  {@link #READ_FAILS_EVICT}th CONSECUTIVE failure — disconnect it so the maintainer
+     *  replaces it (a 30s bench routes around a momentary lag; it cannot rotate out a
+     *  peer that keeps failing, which is how a stale pool held every slot in the Rust
+     *  engine's 2026-09-02 incident). The last un-benched serving snap peer is shielded
+     *  (no strike banked either — matching the Rust pool's sole-peer shield). Callers
+     *  must dedupe to at most one call per peer per failed READ (the oracle gates on
+     *  its per-root-context deny set) — per-response paths use
+     *  {@link #benchReadFailure} instead. Note "consecutive" means no intervening
+     *  serve: routing prefers proven servers, so a struck peer may not be re-tried
+     *  soon, and strikes from unrelated transient lags can accumulate to an eviction —
+     *  acceptable, since eviction only costs a re-dial and the cache verdict needs the
+     *  same three failures it always did.
+     *
+     *  @return true when a strike was banked (BENCH/EVICT); false on the sole-peer
+     *      SHIELD — callers pairing this with a persisted failure verdict must skip
+     *      that write too, or three shielded outages would persist DENIED against
+     *      the one peer that kept serving (the guard Rust's record_quality keeps). */
+    public synchronized boolean recordReadFailure(EthHandler failed) {
+        boolean anotherServing = anotherServing(failed);
+        // Judged on the post-bank streak; the bank itself happens per branch because
+        // the shield must not strike. Bank and clear both happen under the connector
+        // monitor (recordReadServed is synchronized too), so streak+1 IS the
+        // post-bank value.
+        switch (readFailureVerdict(anotherServing, failed.snapReadFailStreak() + 1)) {
+            case SHIELD -> {
+                // Zero the streak, matching the Rust twin: keeping banked
+                // strikes frozen through a shielded phase would evict the peer
+                // on its very next failure the instant the pool regrows,
+                // before it has actually failed as a NON-sole peer.
+                failed.clearSnapReadFailures();
+                log.info(
+                    "[rlpx] Not benching {} — last serving snap peer (empty response likely "
+                        + "a stale-root request)", failed.getRemoteAddress());
+                return false;
+            }
+            case BENCH -> {
+                failed.bankSnapReadFailure();
+                failed.markSnapServingFailed();
+            }
+            case EVICT -> {
+                failed.bankSnapReadFailure();
+                // Bench BEFORE the close: removal from activeHandlers happens
+                // asynchronously in the close-future listener, so without this
+                // a just-evicted peer still satisfies the anotherServing scan
+                // above and two concurrent evictions could drain the pool past
+                // the shield (the Rust twin's prune_closed guards the same
+                // corpse-counting hole, pool.rs).
+                failed.markSnapServingFailed();
+                log.info("[rlpx] Evicting snap peer {} after {} consecutive verified-read "
+                    + "failures — freeing the slot for a fresh candidate",
+                    failed.getRemoteAddress(), READ_FAILS_EVICT);
+                failed.evict();
+            }
+        }
+        return true;
+    }
+
+    /** A verified read served from this peer — reset its consecutive-failure streak.
+     *  Synchronized with {@link #recordReadFailure} so a concurrent serve can't zero a
+     *  streak between that method's read and its bank. */
+    public synchronized void recordReadServed(EthHandler served) {
+        served.clearSnapReadFailures();
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}

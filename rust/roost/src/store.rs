@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use myotis_net::codec::encode_success_response;
+use myotis_net::codec::{decode_multi_chunk_response, encode_success_response};
 
 use crate::rest::MAX_REQUEST_LIGHT_CLIENT_UPDATES;
 
@@ -145,6 +145,18 @@ impl LcStore {
     /// Encode once, at ingest. `fork_digest` is the digest the source framed,
     /// re-emitted verbatim — not derived from a fork name, which since EIP-7892
     /// would not determine it.
+    /// Raw SSZ of the held update for `period` (wire framing stripped), for the
+    /// ingest-refresh decision — see `fill_periods` / the CLI ingest fill loop.
+    /// `None` when the period is not held (or, defensively, when our own wire
+    /// encoding fails to round-trip).
+    pub fn update_ssz(&self, period: u64) -> Option<Vec<u8>> {
+        let wire = self.read().updates.get(&period).cloned()?;
+        decode_multi_chunk_response(&wire, 1)
+            .ok()?
+            .into_iter()
+            .next()
+    }
+
     pub fn insert_update(&self, period: u64, fork_digest: [u8; 4], ssz: &[u8]) {
         let wire: Arc<[u8]> = encode_success_response(ssz, Some(fork_digest)).into();
         let mut inner = self.write();

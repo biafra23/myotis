@@ -45,13 +45,14 @@ class IosRpcBackend(
         return when (statusOrNull(handle)?.engineString("beaconState")) {
             "SYNCED" -> io.myotis.jsonrpc.RpcSyncState.SYNCED
             "CATCHING_UP" -> io.myotis.jsonrpc.RpcSyncState.CATCHING_UP
+            "STALE_ANCHOR" -> io.myotis.jsonrpc.RpcSyncState.STALE_ANCHOR
             else -> io.myotis.jsonrpc.RpcSyncState.SYNCING // STARTING / SYNCING / unreadable
         }
     }
 
     override fun getBalance(address: ByteArray, block: String): String? {
         if (!isServableBlock(block)) return null
-        val r = queryAccount(address) ?: return null
+        val r = queryAccount(address, block) ?: return null
         if (!r.verified) return null
         // Verified-absent account → balance "0": the proof of exclusion IS the
         // verified answer (same convention as RustVerifiedReads).
@@ -60,7 +61,7 @@ class IosRpcBackend(
 
     override fun getTransactionCount(address: ByteArray, block: String): Long? {
         if (!isServableBlock(block)) return null
-        val r = queryAccount(address) ?: return null
+        val r = queryAccount(address, block) ?: return null
         if (!r.verified) return null
         val mined = if (r.exists) r.nonce else 0L
         // ONLY the pending tag consults the sent-tx overlay (RustVerifiedReads
@@ -77,7 +78,7 @@ class IosRpcBackend(
         if (!isServableBlock(block)) return null
         if (address.size != 20) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.getCodeJson(handle, hex(address))) ?: return null
+        val o = resultOrNull(RustEngine.getCodeJson(handle, hex(address), block)) ?: return null
         if (o.engineString("verifyMethod") == null) return null // unverified → can't answer
         return hexToBytes(o.engineString("codeHex")) // 0x / empty → empty bytecode (verified EOA)
     }
@@ -86,7 +87,7 @@ class IosRpcBackend(
         if (!isServableBlock(block)) return null
         if (address.size != 20 || slot32.size != 32) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32))) ?: return null
+        val o = resultOrNull(RustEngine.getStorageAtJson(handle, hex(address), hex(slot32), block)) ?: return null
         if (o.engineString("verifyMethod") == null) return null
         // Left-pad to the full 32-byte word (a zero/unset slot → 32 zero bytes).
         // A value WIDER than a word is engine shape drift — fail closed rather
@@ -306,10 +307,10 @@ class IosRpcBackend(
 
     private class Account(val exists: Boolean, val nonce: Long, val balanceWei: String?, val verified: Boolean)
 
-    private fun queryAccount(address: ByteArray): Account? {
+    private fun queryAccount(address: ByteArray, block: String): Account? {
         if (address.size != 20) return null
         val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.requestAccountJson(handle, hex(address))) ?: return null
+        val o = resultOrNull(RustEngine.requestAccountJson(handle, hex(address), block)) ?: return null
         return Account(
             exists = o.engineBoolean("exists"),
             nonce = o.engineLong("nonce", -1L),
@@ -330,22 +331,38 @@ class IosRpcBackend(
         return o
     }
 
-    /** Tri-state JSON passthrough: object string | literal "null" | null (can't verify). */
+    /** Tri-state JSON passthrough: object string | literal "null" | null (can't
+     *  verify). A single-key `{"error": ...}` envelope PASSES THROUGH — the
+     *  shared router unwraps it into a -32000 carrying the engine's reason
+     *  (api VerifiedReads contract). Flattening it to null here was the iOS
+     *  hole in the "diagnostics must not depend on the host" guarantee: the
+     *  Rust C ABI already emits exactly this shape (eljson::error_json). */
     private fun triStateJson(json: String): String? {
         val t = json.trim()
         if (t.isEmpty()) return null
         if (t == "null") return t
+        if (isEngineErrorEnvelope(t)) return t
         return if (resultOrNull(t) != null) t else null
     }
 
     /** [triStateJson]'s array twin (eth_getBlockReceipts): array string |
-     *  literal "null" | null. An `{"error"}` envelope (an object) → null. */
+     *  literal "null" | the `{"error"}` envelope (passed through for the
+     *  router to unwrap) | null. */
     private fun triStateArrayJson(json: String): String? {
         val t = json.trim()
         if (t.isEmpty()) return null
         if (t == "null") return t
+        if (isEngineErrorEnvelope(t)) return t
         val e = runCatching { engineJson.parseToJsonElement(t) }.getOrNull() ?: return null
         return if (e is kotlinx.serialization.json.JsonArray) t else null
+    }
+
+    /** The api VerifiedReads error envelope: a single-key `{"error": ...}`
+     *  object — same detection the router's orEngineThrow applies. */
+    private fun isEngineErrorEnvelope(t: String): Boolean {
+        if (!t.startsWith("{\"error\"")) return false
+        val o = runCatching { engineJson.parseToJsonElement(t).jsonObject }.getOrNull() ?: return false
+        return o.size == 1 && o.containsKey("error")
     }
 
     private fun statusOrNull(handle: Long): JsonObject? =

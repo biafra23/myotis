@@ -11,8 +11,6 @@ package io.myotis.api;
  * @param rpcPort              verified JSON-RPC HTTP port (loopback); 0 → the network's default
  * @param syncSnapshotPath     file path for the light-client sync snapshot (a private
  *                             cache, not a trust anchor); null → no snapshot persistence
- * @param gossipsubEnabled     subscribe to CL gossipsub (live finality updates) in
- *                             addition to polling
  * @param targetSnapPeers      snap-peer maintainer target; 0 → maintainer disabled
  *                             (bare daemons rely on continuous discv4; NAT'd/mobile
  *                             hosts should enable it)
@@ -30,7 +28,6 @@ public record EngineConfig(
         int discv5Port,
         int rpcPort,
         String syncSnapshotPath,
-        boolean gossipsubEnabled,
         int targetSnapPeers,
         boolean strictStateFreshness,
         String dataDir) {

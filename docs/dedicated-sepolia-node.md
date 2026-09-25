@@ -274,6 +274,12 @@ UPnP/NAT-PMP autodetect) can come up empty on a router with UPnP disabled.
 Verify what it settled on (the enode must carry the PUBLIC IP, and it is the
 line myotis pins in §7):
 
+**Relay exception (2026-09-06).** Behind the netcup relay (§7, "Remaining")
+zbox runs `--nat extip:188.68.32.16`: the address to advertise is the relay's,
+which STUN would never observe (zbox's own uplink is mobile CGNAT), and the
+relay is a static VPS, so the assertion cannot go stale the way a residential
+IP does.
+
 ```bash
 geth-myotis attach --datadir /data/geth --exec admin.nodeInfo.enode
 ```
@@ -339,9 +345,10 @@ Notes:
   and the default retention covers all available periods. This matters
   because a wallet's first request is `light_client_bootstrap` for its
   **pinned checkpoint** (`NetworkConfig.SEPOLIA`, refreshed via
-  `./gradlew refreshCheckpoint -Pnetwork=sepolia`), which is typically days-to-weeks old
-  (a sync-committee period is ~27 h) — with `only-new` the node could not
-  serve bootstraps older than its own start.
+  `./gradlew refreshCheckpoint -Pnetwork=sepolia`), which is typically hours-to-days old
+  and never past the ~2-week weak-subjectivity gate (a sync-committee period is
+  ~27 h; the wallet parks rather than bootstrap from an older pin) — with
+  `only-new` the node could not serve bootstraps older than its own start.
 - Hard limit either way: Nimbus can only produce light-client data for slots
   it processed with state — i.e. from its trustedNodeSync point forward
   (block backfill doesn't help; bootstraps need the sync committee from
@@ -367,6 +374,11 @@ Notes:
   UPnP disabled: Nimbus may initially publish its **LAN** address and only
   correct itself once peers report otherwise. Check the startup line and
   confirm the public IP:
+
+  **Relay exception (2026-09-06):** behind the netcup relay the unit runs
+  `--nat=extip:188.68.32.16` (with `--enr-auto-update=true` kept), for the
+  same reason as Geth's `extip` above — the relay's address is static and is
+  not what any peer-observation of zbox's own uplink would report.
 
   ```bash
   journalctl -u nimbus-sepolia --since '2 min ago' | grep 'Discovery ENR initialized'
@@ -452,39 +464,39 @@ head.
 
 ## 7. Pinned identities (DONE) and remaining follow-ups
 
-The pair is pinned in `NetworkConfig.SEPOLIA` on both layers and in both
-engines: `elBootEnodes()` returns the enode (Java) / `ElConfig::sepolia()`
-seeds `boot_enodes` into the peer cache for the pool's warm-start dial (Rust),
-and the CL multiaddr is `prependLocal`-ed onto `clPeerMultiaddrs` so the light
-client tries it first.
+The EL enode and the roost CL multiaddr are pinned in `NetworkConfig.SEPOLIA`
+on both layers and in both engines: `elBootEnodes()` returns the enode (Java) /
+`ElConfig::sepolia()` seeds `boot_enodes` into the peer cache for the pool's
+warm-start dial (Rust), and the CL multiaddr is `prependLocal`-ed onto
+`clPeerMultiaddrs` so the light client tries it first.
 
 | layer | identity |
 |---|---|
-| EL | `enode://cfd3572b…c37e1b2c@87.154.209.161:30405` |
-| CL (roost, first) | `/ip4/87.154.209.161/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
-| CL (Nimbus, fallback) | `/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6` |
+| EL | `enode://cfd3572b…c37e1b2c@188.68.32.16:30405` |
+| CL (roost, first) | `/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
 
-Both are only stable because of the key-persistence flags above (Geth's
-datadir `nodekey`, Nimbus's `--netkey-file`). The **IP** in both entries is
-literal, so an address rotation makes the pins stale even though the clients
-themselves self-correct (§4, §5) — wallets then fall back to discovery until
-someone refreshes the constants.
+The Nimbus CL fallback (`/tcp/9104` through the relay) was **unpinned on
+2026-09-11**: the port still accepts TCP but the libp2p handshake times out, so
+the tunnel's far end is not answering. Three census-verified public Lighthouse
+servers took its place in `clPeerMultiaddrs` (see the list's comment). Re-pin
+the Nimbus once the far end is fixed and its `--netkey-file` identity is
+confirmed from its startup log.
+
+Both are only stable because their keys persist across restarts (Geth's
+datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is
+the netcup relay (188.68.32.16, a static VPS), not zbox: since 2026-09-06 zbox
+sits behind mobile CGNAT and is reachable only through a WireGuard tunnel to the
+relay, which DNATs the nine serving ports (30405-30407, 9104-9109, tcp+udp) to
+zbox without rewriting peer source addresses. On zbox, uid-based ip rules route
+the geth/nimbus/roost processes through the tunnel and the clients announce the
+relay as their own address (`--nat extip:188.68.32.16`, `--nat=extip:…`, roost
+via the upstream's ENR), so every discovery layer agrees on one public address
+and zbox's own uplink rotating no longer touches the pins.
 
 Remaining:
 
-- **Use a DNS name in the pins** instead of the literal IP, so a rotation
-  stops mattering. Three pieces of work, none blocking: the Java EL path
-  already resolves hostnames (`ChainStack.parseStaticEnodes` builds
-  `InetSocketAddress(host, port)`); the Rust `parse_boot_enodes`
-  (`el/reader.rs`) currently parses `SocketAddr` and would silently SKIP a
-  hostname — it needs `to_socket_addrs()`; and the CL pin would become
-  `/dns4/<host>/tcp/<port>/p2p/<peerId>`, which jvm-libp2p can represent
-  (`Protocol.DNS4`, `MultiaddrDns`) but whose dial path needs verifying —
-  the TCP transport ultimately needs an A record resolved, and the Rust CL
-  (`rust/myotis-net/src/{reqresp,discovery}.rs`) needs the same. Note ENRs
-  cannot carry a hostname at all (they have `ip`/`ip6` fields only), so
-  discovery stays IP-based regardless — which is exactly why §4/§5 make the
-  clients detect their own address.
+- ~~Use a DNS name in the pins~~ — superseded by the relay (above): the VPS
+  address is static, so the pins carry that literal and the DynDNS name is gone.
 - **Drop the `ethp2p` match** from the Geth patch once all deployed wallets
   send the renamed `myotis/…` Hello client id.
 - **No CL equivalent of the EL cap bypass exists.** The Geth patch admits

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 24; // 24: + importLogIndexFiles (portable snapshot import)
+    static final int EXPECTED_ABI_VERSION = 32; // 32: the state reads take a block selector (`finalized` applied)
 
     private static final boolean AVAILABLE = load();
 
@@ -136,6 +136,12 @@ final class RustEngineNative {
      *  doesn't host it yet (must match {@code UNSUPPORTED_NETWORK} in
      *  rust/myotis-engine/src/host.rs). */
     static final long UNSUPPORTED_NETWORK = -2;
+    /** The dataDir is bound to a checkpoint the host supplied through the plain-C /
+     *  Node {@code myotis_create_with_checkpoint} (ABI 26, {@code sync-anchor[-net].json}
+     *  next to the snapshot). The JVM has no wrapper for that path and must never resume
+     *  such a directory from the embedded anchor — see {@link RustMyotisEngine}. Must
+     *  match {@code ANCHOR_MISMATCH} in rust/myotis-engine/src/host.rs. */
+    static final long ANCHOR_MISMATCH = -3;
 
     /** The embedded network catalog as a JSON array of NetworkInfo objects. */
     static String nativeAvailableNetworksJson() {
@@ -211,6 +217,24 @@ final class RustEngineNative {
         return Myotis_engineKt.setServedBlockWindow(handle, blocks);
     }
 
+    /**
+     * Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+     * network default. Applied live — a handle parked in STALE_ANCHOR
+     * re-evaluates within a second. False only for an unknown handle.
+     */
+    static boolean nativeSetWsBoundPeriods(long handle, long periods) {
+        return Myotis_engineKt.setWsBoundPeriods(handle, periods);
+    }
+
+    /**
+     * One-shot consent to sync forward from a stale anchor — releases a
+     * STALE_ANCHOR park for the rest of this run; never persisted. False only
+     * for an unknown handle.
+     */
+    static boolean nativeAcceptStaleAnchor(long handle) {
+        return Myotis_engineKt.acceptStaleAnchor(handle);
+    }
+
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */
     static String nativeDrainLogs(int max) {
         return Myotis_engineKt.drainLogs(max);
@@ -218,9 +242,11 @@ final class RustEngineNative {
 
     // ---- EL verified-read surface. See RustChainHandle for the JSON contracts. ----
 
-    /** Verified account query as JSON (AccountProofResult shape / {@code error} object). */
-    static String nativeRequestAccountJson(long handle, String address) {
-        return Myotis_engineKt.requestAccountJson(handle, nz(address));
+    /** Verified account query as JSON (AccountProofResult shape / {@code error} object);
+     *  {@code block} is the RPC block selector the engine applies or refuses (ABI >= 32:
+     *  the contract is {@code myotis_engine.h}'s). */
+    static String nativeRequestAccountJson(long handle, String address, String block) {
+        return Myotis_engineKt.requestAccountJson(handle, nz(address), nz(block));
     }
 
     /** Verified storage-slot query as JSON; non-null {@code holderOrNull} selects the
@@ -233,13 +259,13 @@ final class RustEngineNative {
     }
 
     /** Verified contract-code query (`eth_getCode`) as JSON. */
-    static String nativeGetCodeJson(long handle, String address) {
-        return Myotis_engineKt.getCodeJson(handle, nz(address));
+    static String nativeGetCodeJson(long handle, String address, String block) {
+        return Myotis_engineKt.getCodeJson(handle, nz(address), nz(block));
     }
 
     /** Verified RAW-32-byte-position storage query (`eth_getStorageAt`) as JSON. */
-    static String nativeGetStorageAtJson(long handle, String address, String position) {
-        return Myotis_engineKt.getStorageAtJson(handle, nz(address), nz(position));
+    static String nativeGetStorageAtJson(long handle, String address, String position, String block) {
+        return Myotis_engineKt.getStorageAtJson(handle, nz(address), nz(position), nz(block));
     }
 
     /** Verified {@code eth_call} over the revm executor, as JSON. */
@@ -337,6 +363,11 @@ final class RustEngineNative {
     /** Log-index status JSON (enabled, counts, coverage per entry). */
     static String nativeLogIndexStatusJson(long handle) {
         return Myotis_engineKt.logIndexStatusJson(handle);
+    }
+
+    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    static String nativeReadStatsJson(long handle) {
+        return Myotis_engineKt.readStatsJson(handle);
     }
 
     /** Import portable log-index snapshots ({"ok":true,...} / {"error":...}). */

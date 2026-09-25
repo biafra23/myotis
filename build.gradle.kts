@@ -13,6 +13,32 @@ import java.util.Properties
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
+// R8/D8 override: AGP 8.7.3 bundles R8 8.7.18, which predates Kotlin 2.2 and
+// cannot parse this build's Kotlin 2.2.21 metadata — every Android dex step
+// then warns "An error occurred when parsing kotlin metadata" per Kotlin
+// class, and an R8-minified build ships stale/dropped @Metadata (visible to
+// kotlin-reflect). The remedy while AGP is older than the Kotlin toolchain is
+// pinning a newer R8 on the root buildscript classpath (the R8 project's
+// documented override; the compatible versions come from
+// developer.android.com/studio/build/kotlin-d8-r8-versions): 8.13.19 is that
+// table's Kotlin 2.3 row (AGP 8.2.2-8.13, which includes 8.7.3) — a superset
+// of the Kotlin 2.2 row's 8.10.21 (AGP 7.3.1-8.10), so it reads this build's
+// 2.2 metadata and already covers a Kotlin 2.3 bump. Drop this whole block
+// when AGP moves past 8.10 while Kotlin is 2.2 (the bundled R8 then reads 2.2
+// natively); if Kotlin bumps to 2.3 first, the pin is still needed up to AGP 8.13.
+buildscript {
+    repositories {
+        google {
+            // Filtered per the convention for special-purpose repos in
+            // settings.gradle.kts: this entry exists only to serve the R8 pin.
+            content { includeGroup("com.android.tools") }
+        }
+    }
+    dependencies {
+        classpath("com.android.tools:r8:8.13.19")
+    }
+}
+
 plugins {
     java
     // Load the Android/Kotlin/Compose plugins once on the root classpath (apply false) so
@@ -30,8 +56,34 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.7-SNAPSHOT"
+    version = "0.1.12-SNAPSHOT"
 }
+
+// The release version — project.version minus the -SNAPSHOT suffix — and the
+// BUILD NUMBER the installable apps derive from it, defined ONCE here and read
+// by :android-app (versionCode) and verifyIosVersion (CFBundleVersion) via
+// rootProject.extra, so the two platforms cannot drift apart.
+//
+// MAJOR*1_000_000 + MINOR*1_000 + PATCH is order-preserving for every semver
+// bump (0.1.8 -> 1008, 0.2.0 -> 2000, 1.0.0 -> 1_000_000), so it is strictly
+// increasing forever, above every literal ever shipped (v0.1.7's versionCode
+// was 8, its CFBundleVersion 1), and — unlike a dotted "0.1.8" — a valid
+// CFBundleVersion, whose first integer Apple requires to be greater than zero.
+// It deliberately does NOT encode a -SNAPSHOT/-rc suffix: a re-cut of the same
+// version gets the same number, so a re-cut bumps PATCH. MINOR/PATCH < 1000
+// keeps it under Android's 2_100_000_000 versionCode ceiling until MAJOR 2100.
+val releaseVersion: String = project.version.toString().substringBefore('-')
+val releaseBuildNumber: Int = releaseVersion.split('.').let { parts ->
+    require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
+        "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
+    }
+    require(parts[1].toInt() < 1000 && parts[2].toInt() < 1000) {
+        "MINOR/PATCH must stay below 1000 for the build-number mapping: ${project.version}"
+    }
+    parts[0].toInt() * 1_000_000 + parts[1].toInt() * 1_000 + parts[2].toInt()
+}
+extra["releaseVersion"] = releaseVersion
+extra["releaseBuildNumber"] = releaseBuildNumber
 
 // The release version — project.version minus the -SNAPSHOT suffix — exactly as
 // :app-desktop and :android-app derive their installer / app versions from it.
@@ -50,32 +102,35 @@ allprojects {
 tasks.register("printReleaseVersion") {
     group = "help"
     description = "Print the release version (project.version without -SNAPSHOT) as releaseVersion=<x.y.z>"
-    // Read at configuration time: the task action captures a plain String, so it
-    // stays configuration-cache compatible.
-    val releaseVersion = project.version.toString().substringBefore('-')
+    // The task action captures a plain String, so it stays configuration-cache
+    // compatible.
     doLast { println("releaseVersion=$releaseVersion") }
 }
 
-// The release sweep sets ONE version for the Gradle build (above) and repeats it
-// in each myotis-* crate's Cargo.toml. That was convention only, and since the
-// Rust engine derives its wire-visible client ids from CARGO_PKG_VERSION
+// The release sweep sets ONE version for the Gradle build (above) and ONE for the
+// Rust workspace (`[workspace.package] version` in rust/Cargo.toml, inherited by
+// every myotis-* crate through `version.workspace = true`). Since the Rust engine
+// derives its wire-visible client ids from CARGO_PKG_VERSION
 // (rust/myotis-net/src/{el/rlpx/transport,reqresp}.rs) a sweep that bumped Gradle
-// but missed the crates would ship an engine advertising the PREVIOUS release's
-// id — the release guard would not notice, because it only compares the tag to
-// project.version.
+// but missed the workspace would ship an engine advertising the PREVIOUS
+// release's id — the release guard would not notice, because it only compares
+// the tag to project.version.
 //
 // So the invariant is checked here, on the PR that breaks it, rather than at tag
 // time when the tag already exists and must be moved. Deliberately a plain file
 // parse: no cargo needed, so it runs on cargo-less machines and under
 // -PskipRustEngine, which is how CI's `./gradlew build` invokes `check`.
 //
-// Scope is rust/myotis-*/ — exactly the crates the sweep bumps. roost and tor-poc
-// are standalone and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool;
-// none of them are release artifacts, and none are matched by the glob.
+// Two checks: the workspace version equals the release version, and every
+// rust/myotis-*/Cargo.toml actually inherits it (a member that re-grows its own
+// `version = "…"` literal silently leaves the sweep's coverage — the failure
+// this task exists to catch, one level down). roost and tor-poc are standalone
+// and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool; none of them
+// are release artifacts, and none are matched by the glob.
 val verifyCrateVersions = tasks.register("verifyCrateVersions") {
     group = "verification"
-    description = "Fail when a myotis-* crate version disagrees with the Gradle release version"
-    val releaseVersion = project.version.toString().substringBefore('-')
+    description = "Fail when the Rust workspace version or a myotis-* crate disagrees with the Gradle release version"
+    val workspaceManifest = file("rust/Cargo.toml")
     val manifests = fileTree("rust") {
         include("myotis-*/Cargo.toml")
     }.files.sortedBy { it.path }
@@ -88,33 +143,89 @@ val verifyCrateVersions = tasks.register("verifyCrateVersions") {
                 "verifyCrateVersions found no rust/myotis-*/Cargo.toml — the glob is stale, fix it rather than deleting this check"
             )
         }
-        // Only the [package] section's version counts: a dependency's
-        // `version = "…"` line elsewhere in the file must never be mistaken for
-        // the crate's own.
-        val mismatches = manifests.mapNotNull { manifest ->
+        val versionLine = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
+        // Only the [workspace.package] table's version counts: a dependency's
+        // `version = "…"` line elsewhere in the file must never be mistaken for it.
+        val workspaceVersion = workspaceManifest.readText()
+            .substringAfter("[workspace.package]", "")
+            .substringBefore("\n[")
+            .let { versionLine.find(it)?.groupValues?.get(1) }
+        val mismatches = mutableListOf<String>()
+        val notInheriting = mutableListOf<String>()
+        when (workspaceVersion) {
+            releaseVersion -> Unit
+            null -> mismatches += "rust/Cargo.toml: no [workspace.package] version found"
+            else -> mismatches += "rust/Cargo.toml: [workspace.package] version = $workspaceVersion"
+        }
+        manifests.forEach { manifest ->
             val packageSection = manifest.readText()
                 .substringAfter("[package]", "")
                 .substringBefore("\n[")
-            val found = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
-                .find(packageSection)?.groupValues?.get(1)
-            when (found) {
-                releaseVersion -> null
-                null -> "${manifest.relativeTo(rootDir)}: no [package] version found"
-                else -> "${manifest.relativeTo(rootDir)}: $found"
+            // Both TOML spellings of inheritance are legal to cargo:
+            // `version.workspace = true` and `version = { workspace = true }`.
+            val inherits = Regex(
+                """^version(\.workspace\s*=\s*true|\s*=\s*\{\s*workspace\s*=\s*true\s*\})""",
+                RegexOption.MULTILINE,
+            ).containsMatchIn(packageSection)
+            val literal = versionLine.find(packageSection)?.groupValues?.get(1)
+            when {
+                inherits -> Unit
+                literal == null -> notInheriting += "${manifest.relativeTo(rootDir)}: no [package] version"
+                else -> notInheriting += "${manifest.relativeTo(rootDir)}: own version literal $literal"
             }
         }
+        val problems = mutableListOf<String>()
+        if (mismatches.isNotEmpty()) {
+            problems += "The Rust workspace version disagrees with the Gradle release version ($releaseVersion):\n" +
+                mismatches.joinToString("\n") { "  $it" } +
+                "\nThe release sweep bumps rust/Cargo.toml with build.gradle.kts — the Rust engine's devp2p" +
+                "\nHello and libp2p agent ids come from the crate version, so a stale workspace ships a" +
+                "\nstale client id. Fix rust/Cargo.toml and regenerate the Cargo.lock files."
+        }
+        if (notInheriting.isNotEmpty()) {
+            problems += "These crates do not inherit the workspace version, so the release sweep does not cover them:\n" +
+                notInheriting.joinToString("\n") { "  $it" } +
+                "\nSet `version.workspace = true` in each crate's [package] table."
+        }
+        if (problems.isNotEmpty()) throw GradleException(problems.joinToString("\n\n"))
+    }
+}
+tasks.named("check") { dependsOn(verifyCrateVersions) }
+
+// The iOS app's bundle version is the other pin outside Gradle's reach. Xcode
+// reads build settings before any script phase runs, so ios-app/Myotis/Version.xcconfig
+// (MARKETING_VERSION -> CFBundleShortVersionString, CURRENT_PROJECT_VERSION ->
+// CFBundleVersion) has to be a committed file rather than something the Gradle
+// pre-build phase derives — which makes it a sweep pin, checked here the same
+// way the Rust workspace version is. CURRENT_PROJECT_VERSION must equal
+// releaseBuildNumber above: the same number :android-app ships as versionCode,
+// and a valid CFBundleVersion (Apple requires its first integer > 0, so the 0.x
+// marketing version cannot be reused verbatim).
+val verifyIosVersion = tasks.register("verifyIosVersion") {
+    group = "verification"
+    description = "Fail when ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version"
+    val xcconfig = file("ios-app/Myotis/Version.xcconfig")
+    val expectedBuild = releaseBuildNumber.toString()
+    doLast {
+        // Only assignment lines count: the file's comment block mentions both
+        // names, so anchor on a line that STARTS with the setting.
+        val settings = xcconfig.readLines()
+            .mapNotNull { line -> Regex("""^\s*([A-Z_]+)\s*=\s*(\S+)\s*$""").find(line)?.destructured }
+            .associate { (k, v) -> k to v }
+        val mismatches = listOfNotNull(
+            settings["MARKETING_VERSION"].let { if (it == releaseVersion) null else "MARKETING_VERSION = ${it ?: "<missing>"} (expected $releaseVersion)" },
+            settings["CURRENT_PROJECT_VERSION"].let { if (it == expectedBuild) null else "CURRENT_PROJECT_VERSION = ${it ?: "<missing>"} (expected $expectedBuild, the root build's releaseBuildNumber)" },
+        )
         if (mismatches.isNotEmpty()) {
             throw GradleException(
-                "crate versions disagree with the Gradle release version ($releaseVersion):\n" +
+                "ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version ($releaseVersion):\n" +
                     mismatches.joinToString("\n") { "  $it" } +
-                    "\nThe release sweep must bump these together — the Rust engine's devp2p Hello" +
-                    "\nand libp2p agent ids come from the crate version, so a stale crate ships a" +
-                    "\nstale client id. Fix the Cargo.toml(s) and regenerate the Cargo.lock files."
+                    "\nThe release sweep must bump it with build.gradle.kts, or the iOS app reports the previous release."
             )
         }
     }
 }
-tasks.named("check") { dependsOn(verifyCrateVersions) }
+tasks.named("check") { dependsOn(verifyIosVersion) }
 
 subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
@@ -202,6 +313,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
     interface Params : ValueSourceParameters {
         val command: ListProperty<String>
         val workingDir: Property<File>
+        val path: Property<String> // optional PATH override (see rustToolchainPath)
     }
 
     @get:Inject abstract val execOperations: ExecOperations
@@ -211,6 +323,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
         val result = execOperations.exec {
             commandLine(parameters.command.get())
             workingDir = parameters.workingDir.get()
+            parameters.path.orNull?.let { environment("PATH", it) }
             standardOutput = out
             errorOutput = ByteArrayOutputStream()
             isIgnoreExitValue = true
@@ -221,14 +334,71 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
     }
 }
 
+// GUI-launched IDEs inherit launchd's minimal PATH on macOS (no ~/.cargo/bin),
+// so a Rust toolchain that works from a terminal "vanishes" when the same build
+// runs inside Android Studio — requireAndroidRustEngine then fails claiming
+// cargo is missing. rustToolBinDir is the directory holding cargo: from the
+// daemon's PATH when present, else the standard rustup install dir
+// ($CARGO_HOME/bin, default ~/.cargo/bin); null only when cargo is in neither
+// (the toolchain is really missing). It feeds two mechanisms, both needed:
+//   • rustTool resolves direct cargo/rustup invocations to absolute paths —
+//     exec resolves a bare command name against the PATH the JVM captured at
+//     its FIRST process spawn, not the current System.getenv, so even a
+//     PATH-listed cargo is resolved absolutely (a Studio-spawned daemon reused
+//     by a terminal build syncs the env but keeps the frozen exec search path);
+//   • rustToolchainPath prepends the dir to each probe's/task's child PATH,
+//     reaching what those processes spawn: cargo's rustc/rustup shims,
+//     `cargo ndk` subcommand lookup, the bare `cargo` inside build-android.sh.
+// (On Windows a second `PATH` key can duplicate the inherited `Path` with
+// unspecified precedence — acceptable: the launchd problem is macOS-specific,
+// and rustTool fixes the direct invocations regardless.)
+val isWindowsHost = System.getProperty("os.name").lowercase().contains("win")
+val rustToolBinDir: File? = run {
+    val exe = if (isWindowsHost) "cargo.exe" else "cargo"
+    fun executableIn(dir: File) = dir.resolve(exe).let { it.isFile && it.canExecute() }
+    val envPath = System.getenv("PATH") ?: ""
+    envPath.split(File.pathSeparator)
+        .firstOrNull { it.isNotEmpty() && executableIn(File(it)) }
+        ?.let { return@run File(it) }
+    listOfNotNull(
+        // Set-but-empty must mean unset, same as rustTargetTriple below.
+        System.getenv("CARGO_HOME")?.takeIf { it.isNotBlank() }?.let { File(it) },
+        File(System.getProperty("user.home"), ".cargo"),
+    )
+        .map { it.resolve("bin") }
+        .firstOrNull { executableIn(it) }
+        ?.also {
+            // Self-announcing, but only at --info: an engaged fallback means the
+            // cargo this build runs is not the one `which cargo` shows in a shell.
+            logger.info("[rust] cargo is not on the daemon's PATH; using $it")
+        }
+}
+val rustToolchainPath: String? = rustToolBinDir?.let { bin ->
+    // No trailing separator when PATH is unset: an empty PATH element means cwd.
+    val envPath = System.getenv("PATH")
+    if (envPath.isNullOrEmpty()) bin.absolutePath
+    else "${bin.absolutePath}${File.pathSeparator}$envPath"
+}
+
+// Every direct cargo/rustup invocation goes through this resolver (see the
+// rustToolBinDir rationale above); a tool not present in that dir (clang) falls
+// through to the bare name and resolves as before.
+fun rustTool(name: String): String {
+    val exe = if (isWindowsHost) "$name.exe" else name
+    return rustToolBinDir?.resolve(exe)?.takeIf { it.isFile && it.canExecute() }?.absolutePath ?: name
+}
+
 // Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
 // reports — probing the repo root would measure the rustup DEFAULT toolchain,
 // not the one the builds actually run. (If rustup has no stable installed,
 // the probe exits non-zero → "" → Rust is skipped, not downloaded.)
 fun probeTool(vararg cmd: String): String =
     providers.of(ToolProbe::class) {
-        parameters.command.set(cmd.toList())
+        // rustTool resolves the executable itself; the PATH override covers
+        // what it spawns (the cargo shim re-execs via rustup, for one).
+        parameters.command.set(listOf(rustTool(cmd.first())) + cmd.drop(1))
         parameters.workingDir.set(file("rust"))
+        rustToolchainPath?.let { parameters.path.set(it) }
     }.get()
 
 val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
@@ -327,9 +497,10 @@ tasks.register<Exec>("cargoBuildHost") {
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
     onlyIf { rustAvailable }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         buildList {
-            addAll(listOf("cargo", "build", "--release", "--workspace"))
+            addAll(listOf(rustTool("cargo"), "build", "--release", "--workspace"))
             // Enable Tor only on the engine crate (package/feature form — a bare
             // `--features tor` with `--workspace` would try every member).
             if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
@@ -358,8 +529,9 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     onlyIf { rustAvailable }
     dependsOn(tasks.named("cargoBuildHost"))
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        "cargo", "run", "--release", "-p", "uniffi-bindgen", "--",
+        rustTool("cargo"), "run", "--release", "-p", "uniffi-bindgen", "--",
         "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
         "--language", "kotlin", "--no-format",
         "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
@@ -377,7 +549,8 @@ val cargoTest = tasks.register<Exec>("cargoTest") {
     description = "cargo test --workspace (self-skips when cargo is missing)"
     onlyIf { rustAvailable }
     workingDir = file("rust")
-    commandLine("cargo", "test", "--workspace")
+    rustToolchainPath?.let { environment("PATH", it) }
+    commandLine(rustTool("cargo"), "test", "--workspace")
     // No declared outputs: cargo's own incrementalism makes a no-change rerun
     // cheap, and test verdicts aren't files Gradle could fingerprint.
 }
@@ -403,8 +576,9 @@ val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     description = "cargo check -p myotis-consensus -p myotis-core for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
     onlyIf { rustAvailable && wasmTargetInstalled && clangAvailable }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        "cargo", "check", "--target", "wasm32-unknown-unknown",
+        rustTool("cargo"), "check", "--target", "wasm32-unknown-unknown",
         "-p", "myotis-consensus", "-p", "myotis-core",
     )
     // No declared outputs, same rationale as cargoTest: cargo's own
@@ -442,10 +616,11 @@ tasks.register<Exec>("cargoNdkAndroid") {
     description = "Cross-compile the Android jniLibs (the Rust engine + native BLS) from source via rust/build-android.sh; skipped by -PskipRustEngine"
     onlyIf { androidRustToolchainReady && !skipRustEngine }
     workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
     // through bash there (Git for Windows ships one alongside git itself).
-    if (System.getProperty("os.name").lowercase().contains("win")) {
+    if (isWindowsHost) {
         commandLine("bash", "./build-android.sh")
     } else {
         commandLine("./build-android.sh")
@@ -476,7 +651,8 @@ tasks.register("requireAndroidRustEngine") {
     doLast {
         if (skipRustEngine) {
             logger.lifecycle("[rust] -PskipRustEngine set — building :android-app WITHOUT the " +
-                "Rust engine; it will use the Java engine (and JVM BLS) at runtime.")
+                "Rust engine; it will use the Java engine (and JVM BLS) at runtime, which boots only " +
+                "on Android 13 (API 33) and newer — below that the app is Rust-engine-only.")
             return@doLast
         }
         if (!androidRustToolchainReady) {
@@ -493,7 +669,7 @@ tasks.register("requireAndroidRustEngine") {
                     "incomplete — missing: ${missing.joinToString("; ")}.\n" +
                     "  • Install it (one-time setup is documented in rust/build-android.sh), OR\n" +
                     "  • Build WITHOUT the Rust engine: add -PskipRustEngine (the app will use the " +
-                    "Java engine at runtime).",
+                    "Java engine at runtime, which boots only on Android 13 / API 33 and newer).",
             )
         }
     }
@@ -593,13 +769,14 @@ fun registerCargoBuildIos(taskName: String, triple: String) =
         description = "cargo build --release -p myotis-engine for $triple (self-skips without cargo + the rustup target on macOS)"
         onlyIf { rustAvailable && isMacHost && triple in installedRustupTargets }
         workingDir = file("rust")
+        rustToolchainPath?.let { environment("PATH", it) }
         // `cargo rustc --crate-type staticlib` (not `cargo build`): only the .a is
         // consumed on iOS, and building the crate's cdylib type too would fail the
         // device link — rustc doesn't link compiler-rt builtins for iOS dylibs, so
         // blst's ___chkstk_darwin stays undefined there. In the staticlib the symbol
         // simply stays unresolved until the app link, where Xcode's clang provides it.
         commandLine(
-            "cargo", "rustc", "--release", "--target", triple, "-p", "myotis-engine",
+            rustTool("cargo"), "rustc", "--release", "--target", triple, "-p", "myotis-engine",
             "--crate-type", "staticlib",
         )
         inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
@@ -642,7 +819,7 @@ gradle.taskGraph.whenReady {
     } else if (allTasks.any { it.name == "cargoNdkAndroid" } && skipRustEngine) {
         // Missing-toolchain (without the flag) is handled loudly at execution by
         // requireAndroidRustEngine; here we only note the deliberate opt-out.
-        logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime)")
+        logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime; boots on API 33+ only)")
     } else if (allTasks.any { it.name == "cargoCheckWasm" } &&
         (!wasmTargetInstalled || !clangAvailable)
     ) {
@@ -694,9 +871,7 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val extra = (project.findProperty("extraEndpoint") as String?)?.split(",")?.map { it.trim() }
         ?.filter { it.isNotEmpty() } ?: emptyList()
     val endpoints = checkpointEndpoints.getValue(net) + extra
-    val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
     val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
-    val slotsPerEpoch = checkpointSlotsPerEpoch.getValue(net)
 
     val javaFile = project(":networking").projectDir
         .resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
@@ -728,14 +903,10 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
                 "this build script's copy has drifted (or been swapped across networks); fix it before refreshing an anchor")
         }
     }
-    // Guarded, as the helper this replaces was: a missing or malformed property
-    // would otherwise surface as a ClassCastException or NumberFormatException
-    // deep in the task rather than as the configuration error it is.
-    val genesis = (project.findProperty("ethp2p.$net.genesisTime") as? String)
-        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
-        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
+    // Called for effect: fail fast on a missing or malformed genesis time before
+    // any network work. writeCheckpointRegions re-reads the value it needs.
+    checkpointGenesisTime(project, net)
 
-    val dryRun = project.hasProperty("dry")
     val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
 
     fun fetch(url: String): String? = try {
@@ -786,10 +957,19 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
 
     // An explicit target period anchors at that period's FIRST slot instead of at
-    // head. Anchoring at head is wrong for this deployment: roost's archive only
-    // grows FORWARD, so an anchor at the newest period leaves a wallet nothing to
-    // walk and goes stale the moment the period rolls. The useful anchor is
-    // roost's FLOOR — the oldest period it can still serve.
+    // head. Head (the default) is the RELEASE anchor: both engines refuse an anchor
+    // older than the network's weak-subjectivity bound (ws_bound_periods — 13
+    // periods on mainnet/sepolia, 3 on gnosis; see NetworkConfig.wsBoundPeriods and
+    // the README's "Weak-subjectivity age bound"), so anything pinned further back
+    // than that parks every fresh install in STALE_ANCHOR on day one. roost serves
+    // a head-period bootstrap root on demand (fill_bootstrap_misses fetches an
+    // unseen root from its upstream), so head needs no pre-population either.
+    // -Pperiod exists for TESTING a specific retained state — the oldest bootstrap
+    // a serving node can still answer, a period at roost's archive floor — and any
+    // pin it writes must still sit within the bound of the current period to be
+    // shippable. The durable constraint is "not BELOW roost's floor" (an archive
+    // only grows forward, so a below-floor anchor is unreachable forever), never
+    // "at the floor".
     //
     // A period's first slot may be SKIPPED (no block proposed), which the beacon
     // API answers with 404, so walk forward until a block exists. Bounded at 32
@@ -918,15 +1098,48 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
         }
     }
 
-    val period = minSlot / slotsPerPeriod
-    val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
-
-    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
-
     // An anchor pinned to a chosen old slot is NOT "recent finalized" — wrong
     // provenance wording beside a trust root invites the next reader to trust
     // the wrong story, same argument as keeping provenance inside the markers.
     val provenance = if (pinnedSlot != null) "pinned" else "recent finalized"
+    writeCheckpointRegions(project, logger, net, minSlot, finalRoot, provenance)
+}
+
+/** `ethp2p.<net>.genesisTime`, guarded: a missing or malformed property would
+ *  otherwise surface as a ClassCastException or NumberFormatException deep in
+ *  the task rather than as the configuration error it is. */
+fun checkpointGenesisTime(project: Project, net: String): Long =
+    (project.findProperty("ethp2p.$net.genesisTime") as? String)
+        ?.takeIf { it.isNotBlank() }?.toLongOrNull()
+        ?: throw GradleException("missing or malformed property ethp2p.$net.genesisTime")
+
+/**
+ * The half of a refresh that needs no network: render one resolved anchor into
+ * every engine's marked regions and write them (or preview, under -Pdry).
+ * [refreshOneCheckpoint] reaches it after fetching and cross-validating; a
+ * `-PanchorFile` run reaches it straight from a committed file of recorded
+ * anchors ([readRecordedCheckpoint]).
+ */
+fun writeCheckpointRegions(
+    project: Project,
+    logger: org.gradle.api.logging.Logger,
+    net: String,
+    minSlot: Long,
+    finalRoot: String,
+    provenance: String,
+) {
+    val secondsPerSlot = checkpointSecondsPerSlot.getValue(net)
+    val slotsPerPeriod = checkpointSlotsPerPeriod.getValue(net)
+    val slotsPerEpoch = checkpointSlotsPerEpoch.getValue(net)
+    val genesis = checkpointGenesisTime(project, net)
+    val dryRun = project.hasProperty("dry")
+    val javaFile = project.project(":networking").projectDir
+        .resolve("src/main/java/com/jaeckel/ethp2p/networking/NetworkConfig.java")
+
+    val period = minSlot / slotsPerPeriod
+    val ts = Instant.ofEpochSecond(genesis + minSlot * secondsPerSlot)
+
+    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).format(ts)
 
     /** 14560000 -> 14_560_000, the form every other numeric literal in sync.rs uses. */
     fun rustLiteral(n: Long): String = n.toString().reversed().chunked(3).joinToString("_").reversed()
@@ -1047,6 +1260,24 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     }
 }
 
+/**
+ * The anchor recorded for [net] in [file], a properties file with `<net>.slot`
+ * and `<net>.root` (see rust/testdata/anchors/oldest-servable.properties). Not
+ * fetched, not cross-validated: for tests that must not wait on public
+ * endpoints, which also stop serving historical slots over time. A missing or
+ * malformed entry fails the task instead of leaving that network on whatever
+ * anchor the tree already had.
+ */
+fun readRecordedCheckpoint(file: File, net: String): Pair<Long, String> {
+    val props = Properties().apply { file.inputStream().use { load(it) } }
+    val slot = props.getProperty("$net.slot")?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
+        ?: throw GradleException("[refresh:$net] ${file.name} has no valid $net.slot")
+    val root = props.getProperty("$net.root")?.trim()?.lowercase()?.removePrefix("0x")
+        ?.takeIf { Regex("[0-9a-f]{64}").matches(it) }
+        ?: throw GradleException("[refresh:$net] ${file.name} has no valid $net.root (64 hex digits)")
+    return slot to root
+}
+
 /** Per-network checkpoint sources — independent, public, and PLURAL by design.
  *
  *  These serve a narrow slice of the Beacon API (`/eth/v2/beacon/blocks/{id}`
@@ -1118,11 +1349,16 @@ val checkpointGenesisValidatorsRoot = mapOf(
  *   ./gradlew refreshCheckpoint                      # all three networks
  *   ./gradlew refreshCheckpoint -Pnetwork=mainnet    # one
  *   ./gradlew refreshCheckpoint -Pdry                # preview, no write
+ *   ./gradlew refreshCheckpoint -PanchorFile=rust/testdata/anchors/oldest-servable.properties
+ *                                                    # recorded TEST anchors, no network
  *
  * Generalised from the gnosis-only task after the same gap appeared twice: an
  * anchor that drifts below roost's archive floor can never be reached, because
  * the archive only grows FORWARD. mainnet sat at period 1777 against a roost
- * floor of 1825 and simply could not sync.
+ * floor of 1825 and simply could not sync. The default (head) is the release
+ * anchor — since the weak-subjectivity gate, an anchor older than the network's
+ * bound parks fresh installs, so the floor is a testing target (-Pperiod /
+ * -Pslot), not a release one.
  *
  * It writes the Rust `ChainConfig` as well as `NetworkConfig.java`. The Rust
  * copy used to carry a "mirror this by hand" note, and hand-mirroring is
@@ -1131,7 +1367,7 @@ val checkpointGenesisValidatorsRoot = mapOf(
  */
 tasks.register("refreshCheckpoint") {
     group = "trust"
-    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview, -Pperiod=<n>/-Pslot=<n> to pin instead of head."
+    description = "Refresh trusted checkpoints in NetworkConfig.java AND the Rust ChainConfig. -Pnetwork=<name> for one, -Pdry to preview, -Pperiod=<n>/-Pslot=<n> to pin instead of head, -PanchorFile=<file> to write recorded test anchors without fetching."
 
     doLast {
         val only = project.findProperty("network") as String?
@@ -1149,7 +1385,34 @@ tasks.register("refreshCheckpoint") {
                 throw GradleException("unknown network '$n' (mainnet|sepolia|gnosis)")
             }
         }
-        nets.forEach { net -> refreshOneCheckpoint(project, logger, net) }
+        // -PanchorFile writes recorded anchors instead of fetching. It fixes the
+        // slot AND the root, so every option that shapes a fetch would be
+        // silently ignored beside it: refuse the combination instead.
+        val anchorFile = (project.findProperty("anchorFile") as String?)?.let { project.rootDir.resolve(it) }
+        if (anchorFile == null) {
+            nets.forEach { net -> refreshOneCheckpoint(project, logger, net) }
+            return@doLast
+        }
+        val conflicting = listOf("slot", "period", "extraEndpoint", "allowSingleSource")
+            .filter { project.hasProperty(it) }
+        if (conflicting.isNotEmpty()) {
+            throw GradleException("-PanchorFile writes recorded anchors; it cannot be combined with " +
+                conflicting.joinToString { "-P$it" })
+        }
+        if (!anchorFile.isFile) throw GradleException("-PanchorFile: no such file: $anchorFile")
+        // Read and validate every network's entry and genesis time before writing
+        // any, so a bad one cannot leave the tree half on recorded anchors. One
+        // mode this does not cover: a missing or drifted @checkpoint marker still
+        // throws inside the writer, after the networks before it were written.
+        // The undo is the two-file `git checkout` in the anchor file's header.
+        val recorded = nets.associateWith { readRecordedCheckpoint(anchorFile, it) }
+        nets.forEach { checkpointGenesisTime(project, it) }
+        recorded.forEach { (net, anchor) ->
+            val (slot, root) = anchor
+            logger.warn("[refresh:$net] writing the RECORDED anchor from ${anchorFile.name} " +
+                "(slot $slot, root 0x$root): not fetched or cross-validated, for testing only")
+            writeCheckpointRegions(project, logger, net, slot, root, "recorded test")
+        }
     }
 }
 

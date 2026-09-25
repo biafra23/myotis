@@ -59,8 +59,7 @@ AndroidCLPeerCache cl = new AndroidCLPeerCache(netCacheFor(n, "cl-peers", ".cach
 ChainStack stack = new ChainStack(net, ports, key,
         new AndroidPeerCacheAdapter(pc), new AndroidClPeerCacheAdapter(cl),
         new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(ccipPool),
-        netCacheFor(n, "sync-state", ".snapshot").toPath(),
-        /*gossipsub*/ false);
+        netCacheFor(n, "sync-state", ".snapshot").toPath());
 stack.configureSnapMaintainer(snapTarget(this), this::activeNetworkDnsServers); // DnsServerProvider
 stacks.put(n, stack);
 new Thread(() -> { if (!stack.start()) stacks.remove(n); }, "ethp2p-boot-" + n).start();

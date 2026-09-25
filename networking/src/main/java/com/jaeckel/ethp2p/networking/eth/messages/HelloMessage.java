@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking.eth.messages;
 
+import com.jaeckel.ethp2p.networking.BuildInfo;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.rlp.RLP;
 
@@ -36,12 +37,12 @@ public final class HelloMessage {
     public static byte[] encode(Bytes nodePublicKey, int tcpPort) {
         return RLP.encodeList(writer -> {
             writer.writeInt(PROTOCOL_VERSION);
-            // Keep the version in sync with the myotis-net crate version
-            // (rust/myotis-net/Cargo.toml): the Rust engine derives its Hello
-            // client id from CARGO_PKG_VERSION, so this literal is the release
-            // sweep's one remaining hand-edited client id. Dedicated
-            // myotis-serving nodes admit peers by matching "myotis" here.
-            writer.writeString("myotis/0.1.7");
+            // Generated from the Gradle release version (:networking's
+            // generateNetworkingBuildInfo), the way the Rust engine derives its
+            // Hello client id from CARGO_PKG_VERSION — the two agree by
+            // construction, and the release sweep has no literal to forget here.
+            // Dedicated myotis-serving nodes admit peers by matching "myotis".
+            writer.writeString(BuildInfo.CLIENT_ID);
             writer.writeList(capWriter -> {
                 // Capabilities must be ascending (name, then version). eth/66 is the
                 // floor: it has request-IDs (which our GetBlockHeaders/snap requests

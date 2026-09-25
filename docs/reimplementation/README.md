@@ -314,7 +314,7 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
   throw; programmer/state errors (malformed address, network not running) DO throw the
   API's single `EngineException`.
 - **`EngineConfig`** — `(networkName, elPort, discv5Port, rpcPort [0 = per-network
-  default], syncSnapshotPath, gossipsubEnabled, targetSnapPeers [0 = maintainer off],
+  default], syncSnapshotPath, targetSnapPeers [0 = maintainer off],
   strictStateFreshness)`.
 - **Status**: `status() -> StatusSnapshot` (EL + beacon counts, per-peer rows),
   `discoveredPeers()`, `connectedPeers()`, `beaconStatus() -> BeaconStatus` (deep CL
@@ -390,9 +390,13 @@ fields a re-implementation needs:
 (ip:port), elEnrTreeUrls (EIP-1459 trees), elBootEnodes (full enode:// for direct dial — used
 by chains with no DNS tree, e.g. Gnosis)`.
 
-**CL:** `genesisValidatorsRoot (32B), checkpointRoot (32B), checkpointSlot, currentForkVersion
-(4B), priorForkVersion (4B, nullable), activeBlobParamsEpoch/MaxBlobs (EIP-7892 BPO),
+**CL:** `genesisValidatorsRoot (32B), checkpointRoot (32B), checkpointSlot, forkSchedule
+(ascending (activation epoch, 4B version) list, genesis first, with the chain's slotsPerEpoch),
+acceptPriorForkDigest (bool), activeBlobParamsEpoch/MaxBlobs (EIP-7892 BPO),
 clPeerMultiaddrs, clGenesisTime, clEnrTreeUrls, clDiscv5Bootnodes (ENR strings)`.
+`currentForkVersion` / `priorForkVersion` are derived from the schedule at the WALL-CLOCK epoch
+(the active entry; the one before it when `acceptPriorForkDigest`), so the next fork can be
+pinned ahead of its activation without flipping the digest early.
 
 | | Mainnet | Gnosis | Sepolia |
 |---|---|---|---|
@@ -400,9 +404,10 @@ clPeerMultiaddrs, clGenesisTime, clEnrTreeUrls, clDiscv5Bootnodes (ENR strings)`
 | genesis hash | `d4e56740…cb8fa3` | `4f1dd231…da79756` | `25a5cc10…93e6dd9` |
 | EL forkIdHash | `07c9462e` | `cfca387c` | `268956b6` |
 | genesisValidatorsRoot | `4b363db9…fe95` | `f5dcb556…9d47` | `d8ea171f…8078` |
-| currentForkVersion | `06000000` (Fulu) | `06000064` (Fulu) | `90000073` (Electra) |
-| priorForkVersion | — | `05000064` | — |
-| BPO (epoch, maxBlobs) | (419072, 21) | (1337856, 2) | (0, 0) |
+| forkSchedule (epoch:version) | 0:`00000000`, 74240:`01000000`, 144896:`02000000`, 194048:`03000000`, 269568:`04000000`, 364032:`05000000`, 411392:`06000000` | 0:`00000064`, 512:`01000064`, 385536:`02000064`, 648704:`03000064`, 889856:`04000064`, 1337856:`05000064`, 1714688:`06000064` | 0:`90000069`, 50:`90000070`, 100:`90000071`, 56832:`90000072`, 132608:`90000073`, 222464:`90000074`, 272640:`90000075` |
+| currentForkVersion (derived) | `06000000` (Fulu) | `06000064` (Fulu) | `90000075` (Fulu) |
+| acceptPriorForkDigest → priorForkVersion | no → — | yes → `05000064` | no → — |
+| BPO (epoch, maxBlobs) | (419072, 21) | (1337856, 2) | (275712, 21) |
 | clGenesisTime | 1606824023 | 1638993340 | 1655733600 |
 | secondsPerSlot / slotsPerEpoch | 12 / 32 | **5 / 16** | 12 / 32 |
 | EL/discv5/RPC ports | 30303/9000/8545 | 30304/9001/8546 | 30305/9002/8547 |

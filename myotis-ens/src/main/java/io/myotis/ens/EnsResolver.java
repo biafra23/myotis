@@ -1,5 +1,6 @@
 package io.myotis.ens;
 
+import com.jaeckel.ethp2p.core.math.BigIntegers;
 import io.myotis.evm.Address;
 import io.myotis.evm.BlockContext;
 import io.myotis.evm.EvmExecutionError;
@@ -539,7 +540,7 @@ public final class EnsResolver {
         byte[] data = AbiDecoder.dynamicBytes(inner, 32);
         if (data.length == 0) return Optional.empty();
         // contentType is a small bitmask in practice (1, 2, 4, 8) — long is plenty.
-        return Optional.of(new AbiRecord(contentType.longValueExact(), data));
+        return Optional.of(new AbiRecord(BigIntegers.longValueExact(contentType), data));
     }
 
     /** Decode a single 32-byte address with empty/short fallback. */

@@ -92,7 +92,7 @@ async fn main() {
     let (disc_task, table_size) = discovery::spawn(
         DiscoveryConfig {
             bootstrap_enrs: config.bootstrap_enrs.clone(),
-            accepted_fork_digests: config.accepted_fork_digests(),
+            accepted_fork_digests: config.accepted_fork_digests().into(),
             listen_port: 0,
             // The census is a hunt by definition: crawl at the boosted cadence.
             hunt_boost: Arc::new(std::sync::atomic::AtomicBool::new(true)),

@@ -1,0 +1,129 @@
+# The two cold-start regressions issue #422 asked us to keep.
+#
+# MANUAL ONLY (workflow_dispatch), deliberately: both tests dial live
+# third-party light-client servers, and both are peer-quota-bound — a serving
+# peer answers roughly one update per 10 s — so they take minutes and can fail
+# for reasons that are not our bug (every server busy, a network blip). Gating
+# merges on that would train everyone to ignore a red check. Run it before a
+# release, or when changing discovery, the peer pool, or the catch-up loop.
+#
+# What each proves, and why a green pipeline elsewhere does not:
+#   * pins-alive: do the shipped pins and bootnodes actually answer? Seconds,
+#                 and the one that would have caught #422 before it shipped.
+#                 A CI runner is a clean host, which matters: a Lighthouse node
+#                 that banned a dev box's IP looks dead from there and is fine
+#                 from here. Clean is not neutral, though: mainnet pin
+#                 57.129.130.18 closed the connection on runner IPs on
+#                 2026-09-12 and 2026-09-13 while serving a residential address
+#                 in full, so confirm a pin only a runner calls dead from a
+#                 second address before pruning it.
+#   * dead-pins:  every pinned server still CONFIGURED but unreachable — the
+#                 #422 shape. Pinned peers are exempt from eviction, so they
+#                 hold their pool slots and keep steering targeted lookups;
+#                 discovery has to find a real server anyway. The dispatched
+#                 smoke job dials a warm peer cache, which hides this.
+#   * old-anchor: the trust anchor is several periods behind, so bootstrap is
+#                 not enough and catch-up must actually walk periods. A
+#                 release-fresh anchor walks 0-2 periods and proves little, so
+#                 the test never uses the embedded one. By default it takes
+#                 this network's entry in
+#                 rust/testdata/anchors/oldest-servable.properties: the oldest
+#                 checkpoint roost's serving nodes still bootstrap, far past
+#                 every weak-subjectivity bound (gnosis 3 periods,
+#                 mainnet/sepolia 13), which the test asserts. anchor_root and
+#                 anchor_slot override it, together. If this step fails before
+#                 bootstrapping, first suspect that the file's entry has aged
+#                 out of what roost still serves: re-probe on zbox and update
+#                 the file before hunting for a regression.
+name: cold-start regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Network to cold-start (gnosis is where #422 bit hardest)"
+        type: choice
+        options: [gnosis, mainnet, sepolia]
+        default: gnosis
+      scope:
+        description: "full = all three checks (release). pins-only = skip the deep walk."
+        type: choice
+        options: [full, pins-only]
+        default: full
+      anchor_root:
+        description: "Optional override: old anchor block root (64 hex). Default: this network's entry in rust/testdata/anchors/oldest-servable.properties."
+        type: string
+        default: ""
+      anchor_slot:
+        description: "Optional override: old anchor slot (set together with anchor_root)"
+        type: string
+        default: ""
+
+# Keyed by network as well as ref: these are dispatched by hand, and running
+# gnosis then mainnet must not silently kill the first run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.network }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cold-start:
+    name: cold start (${{ inputs.network }}, ${{ inputs.scope }})
+    runs-on: ubuntu-latest
+    # Both budgets plus the build, with headroom: the old-anchor test alone
+    # allows 30 minutes of walking.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build the tests
+        working-directory: rust
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start --no-run
+          cargo test --release -p myotis-net --test live_pins_alive --no-run
+
+      # Cheap and first: if the shipped pins are dead, say so before spending
+      # 15 minutes proving the wallet copes without them.
+      - name: Are the shipped pins and bootnodes alive?
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          RUST_LOG: warn,myotis_net=info
+        run: |
+          cargo test --release -p myotis-net --test live_pins_alive -- \
+            --ignored --nocapture --test-threads=1
+
+      # Discovery-only: no pinned peers at all.
+      - name: Cold start with every pinned peer unreachable
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          RUST_LOG: info,myotis_net=debug
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start -- \
+            --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
+
+      # Runs for every scope except an explicit pins-only. With no override the
+      # test reads the committed test-anchor file; a half-supplied override
+      # reaches the test's own loud guard rather than skipping green.
+      - name: Cold start from an old anchor
+        if: inputs.scope != 'pins-only'
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          MYOTIS_TEST_ANCHOR_ROOT: ${{ inputs.anchor_root }}
+          MYOTIS_TEST_ANCHOR_SLOT: ${{ inputs.anchor_slot }}
+          RUST_LOG: info,myotis_net=debug
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start -- \
+            --ignored --nocapture cold_start_from_an_old_anchor

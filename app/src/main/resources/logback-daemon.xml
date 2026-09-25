@@ -20,6 +20,9 @@
          com.jaeckel.ethp2p=DEBUG wire flood with `grep 'jsonrpc.access' devp2p.log`.
          Bump to DEBUG to also log the full request+response bodies. -->
     <logger name="io.myotis.jsonrpc.access" level="INFO"/>
+    <!-- Slow-call watchdog (#312): a JSON-RPC call still unanswered after ~1 s is logged at
+         WARN while it is stuck (method/id/phase) and again when it finishes. -->
+    <logger name="io.myotis.jsonrpc.slow" level="WARN"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>
     <logger name="io.libp2p" level="WARN"/>

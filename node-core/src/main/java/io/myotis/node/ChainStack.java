@@ -2,7 +2,9 @@ package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconLightClient;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.crypto.NodeKey;
+import com.jaeckel.ethp2p.core.encoding.Hex;
 import com.jaeckel.ethp2p.core.enr.Enr;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
 import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
@@ -57,7 +59,7 @@ import static io.myotis.api.LifecycleState.STOPPED;
  * <p>{@link #start()} is fault-isolated: any failure closes only this stack's resources
  * and returns {@code false}; it never affects sibling stacks or the host process.
  */
-public final class ChainStack {
+public final class ChainStack implements io.myotis.api.NodeLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(ChainStack.class);
 
@@ -103,7 +105,9 @@ public final class ChainStack {
      *  Undercounting while online merely slows demotion, which is fine. */
     private static final long ONLINE_SIGNAL_MAX_AGE_MS = 2 * 60 * 1000L;
 
-    /** Max time a verified read arriving on a paused stack is held while the wake completes. */
+    /** Max time a verified read arriving on a paused stack is held while the wake completes —
+     *  and the warm-up window every (re)start opens (WakeGate#beginWarmup), the only other
+     *  time a read is held. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval. */
     private static final long WAKE_POLL_MS = 250L;
@@ -116,7 +120,6 @@ public final class ChainStack {
     private final ClPeerCachePort clPeerCache;
     private final io.myotis.evm.ccipread.CcipGateway ccipGateway;
     private final Path syncSnapshotFile;
-    private final boolean gossipsubEnabled;
 
     // -- per-stack mutable state (formerly Main/NodeService singletons) ---------
     private final Set<String> attempted = ConcurrentHashMap.newKeySet();
@@ -162,6 +165,11 @@ public final class ChainStack {
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
      *  numbers survive pause/resume connector rebuilds; see ServeStats. */
     private final ServeStats serveStats = new ServeStats();
+    /** The read-fetch shadow cache (docs/read-stats.md): every verified snap
+     *  fetch — the RPC backend's oracle and the operator queries — reports here.
+     *  Stack-owned for the same reason as ServeStats: the backend is rebuilt on
+     *  every pause/resume and the counters must not reset with it. */
+    private final io.myotis.evm.world.ReadStats readStats = new io.myotis.evm.world.ReadStats();
     /** EIP-2124 stale-software detector over peers' Status fork ids; stack-owned for the
      *  same reason as serveStats. Null where not enabled (staged rollout: Sepolia). */
     private final ForkWatch forkWatch;
@@ -192,8 +200,7 @@ public final class ChainStack {
                       PeerCachePort peerCache,
                       ClPeerCachePort clPeerCache,
                       io.myotis.evm.ccipread.CcipGateway ccipGateway,
-                      Path syncSnapshotFile,
-                      boolean gossipsubEnabled) {
+                      Path syncSnapshotFile) {
         this.network = network;
         this.ports = ports;
         this.nodeKey = nodeKey;
@@ -201,11 +208,10 @@ public final class ChainStack {
         this.clPeerCache = clPeerCache;
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
-        this.gossipsubEnabled = gossipsubEnabled;
         this.forkWatch = ForkWatch.enabledFor(network) ? ForkWatch.forNetwork(network) : null;
-        this.wakeGate = new WakeGate(phase::get, this::readyForReads,
+        this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::notReadyDetail,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
-                System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
+                System::currentTimeMillis, WAKE_POLL_MS, network.name());
         this.gatedReads = new GatedVerifiedReads(this);
     }
 
@@ -246,6 +252,32 @@ public final class ChainStack {
         this.servedBlockWindow = clamped;
         RLPxConnector conn = connector;
         if (conn != null) conn.servedWindow().setMaxWindow(clamped);
+    }
+
+    /** Host override for the weak-subjectivity anchor-age bound (periods); 0 = the
+     *  network default. Stashed for the next beacon (re)build and applied live —
+     *  a stack parked in STALE_ANCHOR re-evaluates against the new bound. */
+    private volatile long wsBoundOverridePeriods = 0L;
+
+    /** Live-update the weak-subjectivity bound override (0 restores the default). */
+    public void setWsBoundPeriods(long periods) {
+        long sane = Math.max(0L, periods);
+        this.wsBoundOverridePeriods = sane;
+        BeaconLightClient blc = beaconLightClient;
+        if (blc != null) blc.setWsBoundPeriods(sane);
+    }
+
+    /** One-shot consent to sync from a stale anchor, run-sticky for this stack's
+     *  lifetime. Stashed when the beacon client isn't built yet (the daemon's
+     *  -Dmyotis.beacon.acceptStaleAnchor pre-consent arrives before start()) and
+     *  armed at every beacon (re)build; applied live when it is up — a parameter
+     *  accepted pre-start must be APPLIED, never silently dropped. */
+    private volatile boolean staleAnchorAccepted = false;
+
+    public void acceptStaleAnchor() {
+        staleAnchorAccepted = true;
+        BeaconLightClient blc = beaconLightClient;
+        if (blc != null) blc.acceptStaleAnchor();
     }
 
     // -------------------------------------------------------------------------
@@ -307,6 +339,9 @@ public final class ChainStack {
             buildAndStartBeacon(dnsClEnrs);
 
             // 5. Verified JSON-RPC (best-effort; a bind failure here does not fail the stack).
+            //    Warm-up window first (WakeGate#beginWarmup): reads that arrive while the
+            //    fresh stack climbs to SYNCED + a warm head are held (bounded), as after a wake.
+            wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
             startRpc();
 
             // 6. Snap-peer maintainer (optional): keep snap peers topped up from cache +
@@ -322,7 +357,10 @@ public final class ChainStack {
             if (!started) { startedAtNs = startRequestNs; started = true; serveStats.reset(); }
             return true;
         } catch (Throwable t) {
-            log.error("[{}] stack failed to start: {}", network.name(), t.toString());
+            // Pass the throwable itself so the full stack + cause chain reach the log
+            // (Android's boot smoke test prints the log tail on failure — a bare
+            // toString() left a linkage Error undiagnosable from CI).
+            log.error("[{}] stack failed to start", network.name(), t);
             shutdown();
             return false;
         }
@@ -399,6 +437,10 @@ public final class ChainStack {
                 startRpc();
             }
             if (maintainerEnabled) startPeerMaintainer();
+            // Open the warm-up window BEFORE publishing RUNNING (WakeGate#beginWarmup): the
+            // reads held through the pause keep holding while the light client re-anchors and
+            // the pool re-dials, instead of being released into a cold backend at the flip.
+            wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
             phase.set(RUNNING);
             // Foreground (observation) wakes count toward the total but must not overwrite
             // the last-wake reason — see WakeReason / SleepMetrics.
@@ -489,14 +531,16 @@ public final class ChainStack {
     /**
      * The wake-on-request choke point every verified read goes through: notes
      * host-visible activity, triggers a single-flight async {@link #resume()}
-     * when paused, and blocks until reads are answerable or {@code capMs}
-     * elapses.
+     * when paused, and — only while the stack is waking (paused, or inside the
+     * warm-up window a start/resume opens) — blocks until reads are answerable or
+     * {@code capMs} elapses. A RUNNING stack outside a warm-up returns at once,
+     * ready or not (#312).
      *
      * @return the live backend to query, or {@code null} when no verified answer
      *         is possible (stack stopped, RPC never started / failed to bind, or
-     *         still paused at the deadline). A stack that is RUNNING but still cold
-     *         at the deadline returns the backend anyway — it produces its own
-     *         precise bounded errors.
+     *         still paused at the deadline). A RUNNING stack that isn't ready —
+     *         outside a warm-up, or still warming at the deadline — returns the
+     *         backend anyway: it produces its own precise bounded errors.
      */
     public io.myotis.rpc.VerifiedRpcBackend awaitReadyForReads(long capMs) {
         // RUNNING with no backend means the JSON-RPC bind failed at start (the failure
@@ -549,15 +593,30 @@ public final class ChainStack {
     public long lastResumeEpochMs() { return sleepMetrics.lastResumeEpochMs(); }
     public String lastWakeReason() { return sleepMetrics.lastWakeReason(); }
 
-    /** Readiness for verified reads: beacon SYNCED and the head warmer has an anchored head. */
+    /** Readiness for verified reads — what the wake gate holds a warming stack for: beacon
+     *  SYNCED and the head warmer has an anchored head. Also true ("attempt the read now")
+     *  for a STALE_ANCHOR park, which only a human moves (raise the bound or accept the
+     *  risk): holding could never help, and the backend's refusal comes back at once as
+     *  the router's curated STALE_ANCHOR message — the Rust handle's rule too. */
     private boolean readyForReads() {
         if (phase.get() != RUNNING) return false;
         BeaconSyncState bss = beaconSyncState;
         io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
-        return bss != null && b != null
-                && bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot())
-                        == BeaconSyncState.State.SYNCED
-                && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
+        if (bss == null || b == null) return false;
+        BeaconSyncState.State s = bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+        if (s == BeaconSyncState.State.STALE_ANCHOR) return true;
+        return s == BeaconSyncState.State.SYNCED && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
+    }
+
+    /** Why reads aren't answerable yet, for the wake gate's slow-hold WARN. */
+    private String notReadyDetail() {
+        BeaconSyncState bss = beaconSyncState;
+        io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
+        String beacon = bss == null ? "no beacon client"
+                : "beacon " + bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+        String head = b == null ? "no RPC backend"
+                : b.verifiedHeadAgeMs() == Long.MAX_VALUE ? "no verified head yet" : "verified head warm";
+        return beacon + ", " + head;
     }
 
     // -------------------------------------------------------------------------
@@ -600,10 +659,18 @@ public final class ChainStack {
         return servingPeers == 0 && zeroActive && nowMs - zeroSinceMs >= EL_HUNT_STALL_MS;
     }
     public LifecycleState lifecycle() { return phase.get(); }
+
+    // ---- io.myotis.api.NodeLifecycle (the myotis_pause / myotis_wakeup RPC seam) ----
+    // pause() above already satisfies NodeLifecycle.pause(). wakeUp() is the RPC/IPC
+    // wake — resume tagged WakeReason.IPC, exactly like the daemon's `resume` command.
+    @Override public boolean wakeUp() { return resume(io.myotis.api.WakeReason.IPC); }
+    @Override public String lifecycleName() { return lifecycle().name(); }
+
     public RLPxConnector connector() { return connector; }
 
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
+    public io.myotis.evm.world.ReadStats readStats() { return readStats; }
     /** The fork watch, or null where it is not enabled for this network. */
     public ForkWatch forkWatch() { return forkWatch; }
     public DiscV4Service discV4() { return discV4; }
@@ -874,7 +941,10 @@ public final class ChainStack {
      *  during the first start's brief pre-BLC window (peers land in the cache and
      *  are picked up moments later), already-set on resume. */
     private void startDiscV5() {
-        List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+        // The accepted digests are re-read per candidate ENR (two SHA-256s), not
+        // captured here: NetworkConfig.acceptedForkDigests() follows the fork
+        // schedule at the wall clock, so a fork pinned ahead of its activation
+        // rotates the filter at its epoch without a restart (#295 review).
         AtomicInteger mismatchesLogged = new AtomicInteger();
 
         // Targeted lookups (#347): derive the discv5 node ids of the pinned CL
@@ -904,6 +974,7 @@ public final class ChainStack {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
             byte[] peerDigest = eth2.get().forkDigest();
+            List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
             int matchIdx = -1;
             for (int i = 0; i < acceptedForkDigests.size(); i++) {
                 if (java.util.Arrays.equals(peerDigest, acceptedForkDigests.get(i))) { matchIdx = i; break; }
@@ -912,7 +983,7 @@ public final class ChainStack {
                 int n = mismatchesLogged.incrementAndGet();
                 if (n <= 5) {
                     log.info("[{}][discv5] eth2 fork_digest=0x{} not accepted — rejected{}",
-                            network.name(), java.util.HexFormat.of().formatHex(peerDigest),
+                            network.name(), Hex.formatHex(peerDigest),
                             n == 5 ? " [further mismatch logs suppressed]" : "");
                 }
                 return;
@@ -947,7 +1018,7 @@ public final class ChainStack {
         }
         BeaconLightClient blc = new BeaconLightClient(
                 clPeers, network.checkpointRoot(), network.checkpointSlot(),
-                network.currentForkVersion(), network.genesisValidatorsRoot(),
+                network.forkSchedule(), network.genesisValidatorsRoot(),
                 beaconSyncState, network.beaconApiUrl(),
                 clPeerCache::add, clPeerCache::markFailure, network.clGenesisTime());
         blc.setBlobParameters(network.activeBlobParamsEpoch(), network.activeBlobParamsMaxBlobs());
@@ -960,7 +1031,12 @@ public final class ChainStack {
         blc.setProvenNonLightClient(clPeerCache.lightClientDenied());
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
-        blc.setGossipsubEnabled(gossipsubEnabled);
+        // Weak-subjectivity anchor-age bound: network default + any host override,
+        // plus a pre-start stale-anchor consent — all must land before start() so
+        // the cold-start gate judges with them.
+        blc.setWsBoundDefaultPeriods(network.wsBoundPeriods());
+        if (wsBoundOverridePeriods > 0) blc.setWsBoundPeriods(wsBoundOverridePeriods);
+        if (staleAnchorAccepted) blc.acceptStaleAnchor();
         // LC hunt: when the light client is starved of servers it flips this
         // and the CL discv5 service runs extra lookup rounds per tick. Read
         // the field at call time — discv5 (re)starts independently of the
@@ -988,7 +1064,7 @@ public final class ChainStack {
         };
         io.myotis.rpc.VerifiedRpcBackend backend = new io.myotis.rpc.VerifiedRpcBackend(
                 connector, beaconLightClient, beaconSyncState, ccipGateway,
-                rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink);
+                rpcLogger, io.myotis.rpc.RpcClock.monotonic(), snapQualitySink, readStats);
         backend.start();
         return backend;
     }
@@ -1008,7 +1084,7 @@ public final class ChainStack {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads);
+                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads, this);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;
@@ -1121,7 +1197,7 @@ public final class ChainStack {
             if (plan == null) return;
             var future = conn.backfillHeaders(plan.from(), plan.count());
             if (future == null) return; // no ready peer this tick
-            future.orTimeout(10, TimeUnit.SECONDS).whenComplete((headers, ex) -> {
+            Futures.orTimeout(future, 10, TimeUnit.SECONDS).whenComplete((headers, ex) -> {
                 if (ex != null || headers == null) {
                     log.debug("[{}] header backfill fetch failed: {}", network.name(),
                             ex != null ? ex.toString() : "null");

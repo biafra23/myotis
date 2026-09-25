@@ -11,9 +11,12 @@ import kotlinx.serialization.json.JsonObject
  * string, the literal `"null"` (verified not-found, a valid result), or `null`.
  * Wei values cross as decimal strings (the FFI-neutral form).
  */
-/** `io.myotis.api.SyncState`'s pure-Kotlin mirror (same three values, same
- *  meaning); the jvmMain adapter maps 1:1. */
-enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED }
+/** `io.myotis.api.SyncState`'s pure-Kotlin mirror; the jvmMain adapter maps 1:1.
+ *  `STALE_ANCHOR`: syncing is refused because the trust anchor is past the
+ *  weak-subjectivity bound and the user hasn't consented — like SYNCING it gates
+ *  every verified read closed, but unlike SYNCING it will not progress on its
+ *  own. */
+enum class RpcSyncState { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
 
 /**
  * `io.myotis.api.CallResult`'s pure-Kotlin mirror: the three-way outcome of a
@@ -180,3 +183,25 @@ interface RpcStatusSource {
     fun statusJson(uptimeSeconds: Long): JsonObject
     fun beaconStatusJson(uptimeSeconds: Long): JsonObject
 }
+
+/**
+ * The lifecycle-control seam behind `myotis_pause` / `myotis_wakeup` — the
+ * JSON-RPC counterpart of the daemon's `pause` / `resume` IPC commands. Hosts
+ * wire the same node object they wire for [RpcStatusSource]; on the JVM the
+ * adapter delegates to [io.myotis.api.NodeLifecycle], on iOS to the engine's
+ * pause/resume FFI. Both verbs BLOCK (they tear down / rebuild networking) and
+ * may cross an FFI, so the router runs them off its event loop.
+ */
+interface RpcLifecycle {
+    /** Idle-pause: quiesce P2P (sockets + periodic timers) while the RPC listener
+     *  keeps listening. Returns the resulting transition. Blocking. */
+    fun pause(): RpcLifecycleResult
+    /** Wake a paused stack, recorded as the IPC/RPC wake reason. Returns the
+     *  resulting transition. Blocking (seconds). */
+    fun wakeUp(): RpcLifecycleResult
+}
+
+/** The outcome of an [RpcLifecycle] verb: [ok] is whether the target state was
+ *  reached, [lifecycle] the coarse state now in effect ("RUNNING" | "PAUSED" |
+ *  "STOPPED"). Mirrors the IPC command's `{"ok":…, "lifecycle":…}` shape. */
+class RpcLifecycleResult(val ok: Boolean, val lifecycle: String)

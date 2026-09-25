@@ -1,0 +1,61 @@
+# Cargo.lock freshness for every lock in the tree.
+#
+# Three locks exist because tor-poc and roost are deliberately NOT workspace
+# members (rust/Cargo.toml `exclude`), so each resolves its own graph:
+#   rust/Cargo.lock          the engine workspace
+#   rust/roost/Cargo.lock    the light-client server
+#   rust/tor-poc/Cargo.lock  the Tor proof-of-concept
+# Only roost.yml builds with --locked; every other cargo invocation in CI and
+# Gradle runs unlocked, so a lock that stops matching its manifests fails
+# nothing until someone's local cargo run silently repairs it and the fix lands
+# in whatever commit happens to be open (tor-poc's lock drifted that way for
+# nine days after 4a72430a). This job is the one place a stale lock fails.
+#
+# `cargo update --workspace --locked` resolves against the registry INDEX only:
+# no crate is downloaded, nothing is compiled, and it exits non-zero with
+# "the lock file … needs to be updated but --locked was passed" for a missing
+# edge, a missing package or a wrong version. (`cargo metadata --locked` would
+# do the same check but has to read every dependency's manifest, i.e. download
+# and unpack the whole graph — ~1 GB across the three, mostly tor-poc's Arti
+# tree, which rust/Cargo.toml says must never burden CI.)
+#
+# Trigger shape as the other workflows: push scoped to main + release tags so a
+# branch push with an open PR runs once (under pull_request), and tags because
+# the tag builds themselves run unlocked.
+name: cargo locks
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths:
+      - "rust/**/Cargo.toml"
+      - "rust/**/Cargo.lock"
+      - ".github/workflows/cargo-locks.yml"
+  pull_request:
+    paths:
+      - "rust/**/Cargo.toml"
+      - "rust/**/Cargo.lock"
+      - ".github/workflows/cargo-locks.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  locked:
+    name: Cargo.lock files resolve under --locked
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve every lock without changing it
+        run: |
+          set -eu
+          for manifest in rust/Cargo.toml rust/roost/Cargo.toml rust/tor-poc/Cargo.toml; do
+            echo "== $manifest"
+            cargo update --workspace --locked --manifest-path "$manifest"
+          done

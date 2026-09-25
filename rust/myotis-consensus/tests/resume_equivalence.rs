@@ -16,6 +16,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use myotis_consensus::snapshot;
+use myotis_consensus::fork::ForkSchedule;
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate};
 
@@ -125,7 +126,7 @@ fn replay_from(
 fn organic_processor(c: &Corpus) -> LightClientProcessor {
     let mut store = LightClientStore::new_mainnet_preset();
     store.initialize(c.bootstrap.header.clone(), c.bootstrap.current_sync_committee.clone());
-    LightClientProcessor::new(store, c.fork_version, c.gvr)
+    LightClientProcessor::new(store, ForkSchedule::single(c.fork_version), c.gvr)
 }
 
 #[test]
@@ -169,7 +170,7 @@ fn resume_at_every_split_point_matches_uninterrupted_replay() {
             .unwrap_or_else(|| panic!("split {k}: snapshot must deserialize"));
         let mut resumed_store = LightClientStore::new_mainnet_preset();
         resumed_store.restore(restored);
-        let mut resumed = LightClientProcessor::new(resumed_store, c.fork_version, c.gvr);
+        let mut resumed = LightClientProcessor::new(resumed_store, ForkSchedule::single(c.fork_version), c.gvr);
 
         // Continue from the split; verdicts and final state must match the
         // uninterrupted replay exactly.

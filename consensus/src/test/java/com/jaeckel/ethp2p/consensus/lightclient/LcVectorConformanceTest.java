@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
@@ -88,7 +89,8 @@ class LcVectorConformanceTest {
 
         LightClientStore store = new LightClientStore();
         store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
-        LightClientProcessor processor = new LightClientProcessor(store, FORK_VERSION, GVR);
+        // The corpus was recorded under one version — a schedule with no boundary.
+        LightClientProcessor processor = new LightClientProcessor(store, ForkSchedule.single(FORK_VERSION), GVR);
 
         // The recorded wall-clock input (see class javadoc). Generation mode computes it
         // once from the clock; assert mode replays the committed value.

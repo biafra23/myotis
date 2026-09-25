@@ -524,6 +524,72 @@ class SnapBackedStateOracleTest {
     }
 
     @Test
+    void chunkFullyCacheFilledMidFlightGrantsNoServeCredit() throws Exception {
+        // The serve credit (SnapPeer.reportServed — it resets the pool's eviction
+        // streak and re-confirms the peer cache) must fire only when something of
+        // THIS peer's bytes verified. The hole this pins shut: a batch chunk built
+        // while the cache was cold can find every item cache-filled by a CONCURRENT
+        // batch by the time its response arrives — verifyAndCacheChunk then checks
+        // nothing, and a slow peer answering garbage would have been credited for a
+        // "serve" nobody verified, farming streak resets off the race.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        Bytes valueRlp = RLP.encode(w -> w.writeBigInteger(new BigInteger("42")));
+        var storageTrie = TrieFixture.singleLeaf(slotHash, valueRlp);
+        Bytes accountValue = encodeAccount(1L, BigInteger.TEN, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+        List<Bytes> combined = new ArrayList<>();
+        combined.addAll(accountTrie.proof);
+        combined.addAll(storageTrie.proof);
+        byte[] root = accountTrie.root.toArrayUnsafe();
+        var shared = StateProofCache.inMemory(1024);
+        Map<Address, Set<BigInteger>> req = new HashMap<>();
+        req.put(addr, Set.of(slot));
+
+        // The junk peer's batch is BUILT against the cold cache (items included),
+        // but its response hangs in flight...
+        AtomicInteger junkCredits = new AtomicInteger();
+        CompletableFuture<List<Bytes>> junkResponse = new CompletableFuture<>();
+        SnapPeer junk = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return junkResponse;
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportServed() { junkCredits.incrementAndGet(); }
+        };
+        CompletableFuture<Void> inFlight = new SnapBackedStateOracle(
+                () -> junk, BytecodeCache.inMemory(), 2, shared).fetchBatch(root, req);
+
+        // ...while a concurrent honest batch verifies and fills the SHARED cache
+        // (and earns the credit — the positive half of the pin)...
+        AtomicInteger honestCredits = new AtomicInteger();
+        SnapPeer honest = new SnapPeer() {
+            @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 sr, List<PathSet> p) {
+                return CompletableFuture.completedFuture(combined);
+            }
+            @Override public CompletableFuture<List<Bytes>> getByteCodes(List<Bytes32> h) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            @Override public void reportServed() { honestCredits.incrementAndGet(); }
+        };
+        new SnapBackedStateOracle(() -> honest, BytecodeCache.inMemory(), 2, shared)
+                .fetchBatch(root, req).get();
+        assertEquals(1, honestCredits.get(), "a verified batch chunk must credit its peer");
+
+        // ...and only then does the junk peer answer, with garbage. Every item is
+        // now a cache hit, so the chunk completes without touching those bytes —
+        // and must therefore credit nothing.
+        junkResponse.complete(List.of(Bytes.fromHexString("0xdeadbeef")));
+        inFlight.get();
+        assertEquals(0, junkCredits.get(),
+                "a chunk that verified nothing of this peer's bytes must not credit it");
+    }
+
+    @Test
     void fetchBatchRetryServesAlreadyVerifiedItemsFromCache() throws Exception {
         // Retry robustness across peer rotation. Attempt 1 proves the account but NOT
         // the slot, so the slot verify fails and the whole chunk retries on the next

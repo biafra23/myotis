@@ -1,6 +1,8 @@
 package io.myotis.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -20,6 +22,24 @@ class LogIndexStatusTest {
         // not the widest edge across entries at different depths.
         "{\"address\":\"0x34a2068192b1297f2a7f85d7d8cde66f8f0921cb\"," +
         "\"fromBlock\":8461453,\"coveredLow\":8461453,\"coveredHigh\":9000000}]}"
+
+    @Test
+    fun pausedBackfillReportsAStandingDistanceNotProgress() {
+        // With the walk off, "remaining" is a distance that will not shrink and no
+        // ETA can be honest about it. The line must say so, and must say what it
+        // means for queries down there: refused, never an empty list.
+        val json = "{\"enabled\":true,\"logCount\":39213,\"backfillCursor\":6100000," +
+            "\"maxSpeed\":false,\"backfillPaused\":true,\"targetLow\":5594611," +
+            "\"blocksRemaining\":505389,\"headGap\":0," +
+            "\"entries\":[{\"address\":\"0xabc\",\"fromBlock\":5594611," +
+            "\"coveredLow\":6100000,\"coveredHigh\":6200000}]}"
+        val p = LogIndexStatus.parse(json)
+        assertTrue("backfillPaused must parse", p.backfillPaused)
+        val line = LogIndexStatus.progressLine(p)!!
+        assertTrue(line, line.contains("paused"))
+        assertTrue(line, line.contains("refused"))
+        assertFalse("no ETA while paused: $line", line.contains("remaining ("))
+    }
 
     @Test
     fun parses_entries_with_and_without_coverage() {

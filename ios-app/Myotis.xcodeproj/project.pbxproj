@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		658F994631B07FB18FD2EFB0 /* QueryFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCFB86E84C2A33906C0374F6 /* QueryFlowTests.swift */; };
+		C2E6C8EA2B42436E4B3E4DA0 /* LogsFilterShot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7516261FC28F11CDCEFB3D06 /* LogsFilterShot.swift */; };
+		E4035298087F99B9D80517E0 /* ScreenshotTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EC3B7053FE648BDB8CED8CF /* ScreenshotTest.swift */; };
 		FD31D0A030FDDACAE0EF9E9B /* MyotisApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 334FE1A4584215DC91D3354C /* MyotisApp.swift */; };
 /* End PBXBuildFile section */
 
@@ -22,7 +24,10 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0EC3B7053FE648BDB8CED8CF /* ScreenshotTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotTest.swift; sourceTree = "<group>"; };
 		334FE1A4584215DC91D3354C /* MyotisApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MyotisApp.swift; sourceTree = "<group>"; };
+		437DEE1C3FCA9E92F6EC5818 /* Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Version.xcconfig; sourceTree = "<group>"; };
+		7516261FC28F11CDCEFB3D06 /* LogsFilterShot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsFilterShot.swift; sourceTree = "<group>"; };
 		79D3F686DBE004036C2471DB /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		976B4B0F799D395EC9DECD3D /* MyotisUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MyotisUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CCFB86E84C2A33906C0374F6 /* QueryFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueryFlowTests.swift; sourceTree = "<group>"; };
@@ -33,7 +38,9 @@
 		246DBF81ECA04D0B1E4D8DF5 /* MyotisUITests */ = {
 			isa = PBXGroup;
 			children = (
+				7516261FC28F11CDCEFB3D06 /* LogsFilterShot.swift */,
 				CCFB86E84C2A33906C0374F6 /* QueryFlowTests.swift */,
+				0EC3B7053FE648BDB8CED8CF /* ScreenshotTest.swift */,
 			);
 			path = MyotisUITests;
 			sourceTree = "<group>";
@@ -61,6 +68,7 @@
 			children = (
 				79D3F686DBE004036C2471DB /* Info.plist */,
 				334FE1A4584215DC91D3354C /* MyotisApp.swift */,
+				437DEE1C3FCA9E92F6EC5818 /* Version.xcconfig */,
 			);
 			path = Myotis;
 			sourceTree = "<group>";
@@ -167,7 +175,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C2E6C8EA2B42436E4B3E4DA0 /* LogsFilterShot.swift in Sources */,
 				658F994631B07FB18FD2EFB0 /* QueryFlowTests.swift in Sources */,
+				E4035298087F99B9D80517E0 /* ScreenshotTest.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -258,6 +268,7 @@
 		};
 		36214D93E966A69ECDC141DC /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 437DEE1C3FCA9E92F6EC5818 /* Version.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
@@ -359,6 +370,7 @@
 		};
 		F14A89A7FAAFE088F6DD8C67 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 437DEE1C3FCA9E92F6EC5818 /* Version.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";

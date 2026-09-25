@@ -57,6 +57,25 @@ pub struct LogIndexConfig {
     /// background). Deliberately NOT part of the fingerprint — flipping it
     /// must never invalidate accumulated coverage.
     pub max_speed: bool,
+    /// Backfill OFF switch: `true` = the downward walk does not run at all;
+    /// head-follow and queries are untouched. For a node that serves ONE
+    /// consumer which already owns the history below the index's coverage
+    /// (the Bee PoC: Bee embeds postage events to block 47,061,407 and never
+    /// asks below it), the walk only competes for the snap pool that
+    /// head-follow needs — measured on gnosis: the walk ran at ~1000 blocks/min
+    /// while head-follow managed 3-4.5 against a chain doing 12, so coverage
+    /// fell behind until the consumer's stall timer fired.
+    ///
+    /// Crucially this is NOT the same as raising a watch entry's `from_block`
+    /// to the coverage floor. `from_block` is the config's assertion that the
+    /// contract has no logs below it, so raising it makes a query below the
+    /// floor answer an empty list — a silent lie. Pausing leaves `from_block`
+    /// at the deployment block, so such a query still gets `OutOfCoverage`:
+    /// an honest refusal the caller can act on.
+    ///
+    /// Like [`Self::max_speed`], deliberately NOT part of the fingerprint —
+    /// flipping it must never invalidate accumulated coverage.
+    pub backfill_paused: bool,
     pub watch: Vec<WatchEntry>,
 }
 
@@ -104,7 +123,30 @@ impl LogIndexConfig {
                 None => watch.push(s.clone()),
             }
         }
-        Some(LogIndexConfig { enabled: self.enabled, max_speed: self.max_speed, watch })
+        Some(LogIndexConfig {
+            enabled: self.enabled,
+            max_speed: self.max_speed,
+            backfill_paused: self.backfill_paused,
+            watch,
+        })
+    }
+
+    /// The duplicate watch address this config carries, if any — the ONE
+    /// reason [`LogIndex::new`] refuses a config.
+    ///
+    /// Exposed separately so a caller can refuse a bad config at the door,
+    /// before the push has cost anything — before any lock is taken and
+    /// before the live index is touched. `LogIndex::new` sits downstream of
+    /// steps that cannot be undone (`merge` consumes the outgoing index
+    /// outright), so a caller that must leave the installed index intact on a
+    /// refusal asks HERE first (see `ElReader::set_log_index_config`). The
+    /// deserializers ask too: they build `Self` directly, bypassing `new`.
+    pub fn duplicate_address(&self) -> Option<DuplicateWatchAddress> {
+        self.watch
+            .iter()
+            .enumerate()
+            .find(|(i, w)| self.watch.iter().skip(i + 1).any(|o| o.address == w.address))
+            .map(|(_, w)| DuplicateWatchAddress(w.address))
     }
 
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
@@ -287,10 +329,8 @@ impl LogIndex {
     /// query resolution is per-address, and two entries for one address can
     /// desynchronize storage from coverage (a coverage-honesty hole).
     pub fn new(config: LogIndexConfig) -> Result<Self, DuplicateWatchAddress> {
-        for (i, w) in config.watch.iter().enumerate() {
-            if config.watch.iter().skip(i + 1).any(|o| o.address == w.address) {
-                return Err(DuplicateWatchAddress(w.address));
-            }
+        if let Some(dup) = config.duplicate_address() {
+            return Err(dup);
         }
         let n = config.watch.len();
         Ok(Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None })
@@ -344,6 +384,13 @@ impl LogIndex {
     /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
     pub fn set_max_speed(&mut self, max_speed: bool) {
         self.config.max_speed = max_speed;
+    }
+
+    /// Stop or resume the downward walk. Fingerprint-neutral like
+    /// [`Self::set_max_speed`]: coverage already accumulated survives the flip,
+    /// and resuming continues from the same cursor.
+    pub fn set_backfill_paused(&mut self, paused: bool) {
+        self.config.backfill_paused = paused;
     }
 
     pub fn config(&self) -> &LogIndexConfig {
@@ -573,6 +620,63 @@ impl LogIndex {
 // yields None and the caller re-indexes. Never correctness-critical.
 // ---------------------------------------------------------------------------
 
+/// The scratch path one [`write_atomic`] call writes through before renaming
+/// it into place. Distinct for every CALL, not merely every process: two
+/// writers in one process aiming at the same `path` would otherwise share a
+/// temp file, and the loser's `File::create` truncates the winner's mid-write —
+/// or worse, the winner renames the shared temp out from under the loser, whose
+/// still-open fd then keeps writing into the LIVE `.db` that readers are
+/// reading. That was invisible while every caller happened to hold the index
+/// mutex across the whole write; it stops being invisible the moment one of
+/// them doesn't. Separate from `write_atomic` so the distinctness can be
+/// asserted directly instead of only being raced for.
+fn next_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
+
+/// Write `bytes` to `path` atomically: private temp file, fsync, rename, then
+/// fsync the parent directory so the rename itself survives a power loss.
+/// The one place the log-index snapshot pattern lives, so every writer of an
+/// index `.db` gets the same durability, and so a caller can serialize under
+/// whatever lock owns the index and then do the slow part — the fsync —
+/// without holding it. (Other snapshot writers in the tree — `sync.rs`, roost
+/// — keep their own; this is not a repo-wide primitive.)
+///
+/// The temp name comes from [`next_tmp_path`] — see there for why a per-call
+/// counter, and not just the pid, is what makes two concurrent writers safe.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = next_tmp_path(path);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        // A partial temp is dead weight at full snapshot size, and the likely
+        // trigger is ENOSPC — leaving it behind is what keeps the disk full.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Same reasoning, and here the temp is FULL size: a failed rename
+        // (EACCES, EROFS, a dataDir symlinked across filesystems) would
+        // otherwise leave a whole snapshot behind on every attempt.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Best-effort: a rename is not durable until the directory entry is. If
+    // this fails the old checkpoint is still what a crash would find, which is
+    // the same safe degradation as no checkpoint at all.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 const MAGIC: &[u8; 4] = b"MLIX";
 /// v1: config-keyed blob (fingerprint only — unreadable without the exact
 ///     watch-list that produced it; still LOADED for upgrade, never written).
@@ -657,13 +761,7 @@ impl LogIndex {
 
     /// [`Self::persist`] with the same clamp as [`Self::serialize_clamped`].
     pub fn persist_clamped(&self, tag: &ChainTag, path: &Path, max_block: u64) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize_clamped(tag, max_block))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize_clamped(tag, max_block))
     }
 
     pub fn serialize(&self, tag: &ChainTag) -> Vec<u8> {
@@ -684,13 +782,7 @@ impl LogIndex {
         path: &Path,
         clamp: Option<u64>,
     ) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize_impl(tag, clamp, true))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize_impl(tag, clamp, true))
     }
 
     fn serialize_with_clamp(&self, tag: &ChainTag, clamp: Option<u64>) -> Vec<u8> {
@@ -819,7 +911,16 @@ impl LogIndex {
                     let j = parsed.watch.iter().position(|f| f.address == w.address)?;
                     coverage.push(parsed.coverage[j]);
                 }
-                Some(Self { config: config.clone(), coverage, logs: parsed.logs, cursor: parsed.cursor })
+                // Same bar as `new`: a duplicate address desynchronizes
+                // storage from coverage, and this path builds `Self` directly.
+                // Reachable with a hand-written config, since the fingerprint
+                // the file is keyed by is computed from that same config.
+                config.duplicate_address().is_none().then(|| Self {
+                    config: config.clone(),
+                    coverage,
+                    logs: parsed.logs,
+                    cursor: parsed.cursor,
+                })
             }
             _ => None,
         }
@@ -843,7 +944,11 @@ impl LogIndex {
         if c.pos != data.len() {
             return None; // trailing garbage → treat as corrupt
         }
-        Some(Self { config: config.clone(), coverage, logs, cursor })
+        // Same bar as `new` (see `deserialize`).
+        config
+            .duplicate_address()
+            .is_none()
+            .then(|| Self { config: config.clone(), coverage, logs, cursor })
     }
 
     /// Self-describing read (v2 only): reconstruct the subscription set from
@@ -853,29 +958,40 @@ impl LogIndex {
     /// watch entries (names included) with `enabled`/`max_speed` false: those
     /// are runtime bits the receiving host decides, never file content.
     pub fn deserialize_portable(data: &[u8]) -> Option<(ChainTag, Self)> {
+        Self::deserialize_portable_with_id(data).map(|(ix, id)| (id.tag, ix))
+    }
+
+    /// [`Self::deserialize_portable`], plus the [`SnapshotId`] of the bytes it
+    /// read — so a caller can match a finality claim against the very file it
+    /// loaded. Reading the header a second time could see a different file.
+    pub fn deserialize_portable_with_id(data: &[u8]) -> Option<(Self, SnapshotId)> {
         let mut c = Cursor { d: data, pos: 0 };
         if c.take(4)? != MAGIC || c.u32()? != VERSION {
             return None; // v1 files are not self-describing — not importable
         }
         let parsed = parse_v2(data, c)?;
         let config =
-            LogIndexConfig { enabled: false, max_speed: false, watch: parsed.watch };
+            LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: parsed.watch };
         // The stored fingerprint must actually match the stored watch-table —
         // a mismatch means the frame is inconsistent with itself.
         if parsed.fingerprint != config.fingerprint() {
             return None;
         }
+        let id = SnapshotId { tag: parsed.tag, fingerprint: parsed.fingerprint, checksum: parsed.checksum };
         let ix = Self::new(config).ok()?;
-        Some((
-            parsed.tag,
-            Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix },
-        ))
+        Some((Self { coverage: parsed.coverage, logs: parsed.logs, cursor: parsed.cursor, ..ix }, id))
     }
 
     /// [`Self::deserialize_portable`] from a file.
     pub fn load_portable(path: &Path) -> Option<(ChainTag, Self)> {
         let data = std::fs::read(path).ok()?;
         Self::deserialize_portable(&data)
+    }
+
+    /// [`Self::deserialize_portable_with_id`] from a file.
+    pub fn load_portable_with_id(path: &Path) -> Option<(Self, SnapshotId)> {
+        let data = std::fs::read(path).ok()?;
+        Self::deserialize_portable_with_id(&data)
     }
 
     /// Does `path` hold a LEGACY (v1) snapshot? Distinguishes "not portable
@@ -895,23 +1011,145 @@ impl LogIndex {
         header[..4] == *MAGIC && u32::from_le_bytes([header[4], header[5], header[6], header[7]]) == VERSION_LEGACY
     }
 
-    /// Atomic best-effort persist: temp file (pid-suffixed) + rename, the
-    /// `persist_snapshot` pattern. A failed write costs a re-index on the
-    /// affected range, never correctness.
+    /// Atomic best-effort persist: temp file (named per CALL — see
+    /// `next_tmp_path`) + rename, the `persist_snapshot` pattern. A failed
+    /// write costs a re-index on the affected range, never correctness.
     pub fn persist(&self, tag: &ChainTag, path: &Path) -> std::io::Result<()> {
-        let tmp: PathBuf = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&self.serialize(tag))?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &self.serialize(tag))
     }
 
     /// Load a persisted index for `config`; None on absence or any mismatch.
     pub fn load(config: &LogIndexConfig, tag: &ChainTag, path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
         Self::deserialize(config, tag, &data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finality claim: a sidecar beside the index (`<index>.final`) recording, for
+// ONE exact file, the finality its writer clamped it at. The index file alone
+// cannot say whether its top is final: a restart restores the beacon store from
+// a snapshot that is rewritten only once per sync-committee period, so the
+// anchor's first finality can trail the checkpoint by hours, and coverage
+// between the two looks exactly like an optimistic tail nobody can re-check.
+//
+// Deliberately NOT part of the portable format. The portable file is what gets
+// exported, imported and dropped into the data dir, and a claim must never
+// travel with it: it says "THIS NODE's light client had verified finality at
+// this height when it wrote these bytes", which no other file can say. So a
+// claim counts only for the exact bytes it was written beside (`SnapshotId`),
+// and only the reader's own checkpoint path writes one.
+// ---------------------------------------------------------------------------
+
+/// The contents of one v2 snapshot file, as far as a finality claim needs to
+/// know: chain tag and config fingerprint from the header, plus the payload
+/// checksum, which covers everything after it. A replaced file — a drop-in, an
+/// import, another build's write — has a different id, so an old claim no
+/// longer applies to it.
+///
+/// The checksum is FNV-1a, an integrity tag rather than a MAC: this guards
+/// against accidents, not adversaries — anyone who can replace the index in
+/// the data dir can replace the sidecar too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotId {
+    pub tag: ChainTag,
+    pub fingerprint: u64,
+    pub checksum: u64,
+}
+
+impl SnapshotId {
+    /// The id of a serialized v2 frame, read off its header — for a writer
+    /// that holds the bytes it is about to put on disk (it produced them, so
+    /// the checksum is not re-verified). `None` for anything but a v2 frame.
+    pub fn of_frame(bytes: &[u8]) -> Option<SnapshotId> {
+        let mut c = Cursor { d: bytes, pos: 0 };
+        if c.take(4)? != MAGIC || c.u32()? != VERSION {
+            return None;
+        }
+        let network_id = c.u64()?;
+        let genesis_hash = c.arr::<32>()?;
+        let fingerprint = c.u64()?;
+        let checksum = c.u64()?;
+        Some(SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum })
+    }
+}
+
+const CLAIM_MAGIC: &[u8; 4] = b"MLXF";
+const CLAIM_VERSION: u32 = 1;
+/// magic(4) + version(4) + network_id(8) + genesis_hash(32) + fingerprint(8)
+/// + checksum(8) + finalized(8) + the sidecar's own checksum(8).
+const CLAIM_LEN: usize = 80;
+
+/// Where the finality claim for the index at `index` lives: the same name plus
+/// `.final`. Appended rather than swapped in as the extension, so it can never
+/// collide with the index's own scratch files (`next_tmp_path` replaces the
+/// extension).
+pub fn finality_claim_path(index: &Path) -> PathBuf {
+    let mut name = index.as_os_str().to_owned();
+    name.push(".final");
+    PathBuf::from(name)
+}
+
+/// Record that the index file at `index`, whose contents are `id`, holds no
+/// coverage above `finalized` and was written while this node's light client
+/// had verified finality at least that far. Atomic, like the index itself.
+/// Write it AFTER the index: a crash in between leaves the previous claim
+/// beside a file it does not describe, which [`read_finality_claim`] rejects.
+/// A zero `finalized` claims nothing and is refused (`InvalidInput`); remove
+/// the claim instead.
+pub fn write_finality_claim(index: &Path, id: &SnapshotId, finalized: u64) -> std::io::Result<()> {
+    if finalized == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a finality claim at block 0 claims nothing",
+        ));
+    }
+    let mut out = Vec::with_capacity(CLAIM_LEN);
+    out.extend_from_slice(CLAIM_MAGIC);
+    put_u32(&mut out, CLAIM_VERSION);
+    put_u64(&mut out, id.tag.network_id);
+    out.extend_from_slice(&id.tag.genesis_hash);
+    put_u64(&mut out, id.fingerprint);
+    put_u64(&mut out, id.checksum);
+    put_u64(&mut out, finalized);
+    let sum = fnv64(&out);
+    put_u64(&mut out, sum);
+    write_atomic(&finality_claim_path(index), &out)
+}
+
+/// The finality claimed for the index file whose contents are `id`, or `None`
+/// when there is no claim, it is damaged, or it describes a different file.
+/// Only an exact match means "this node wrote these bytes".
+pub fn read_finality_claim(index: &Path, id: &SnapshotId) -> Option<u64> {
+    let data = std::fs::read(finality_claim_path(index)).ok()?;
+    if data.len() != CLAIM_LEN {
+        return None;
+    }
+    let (body, stored_sum) = data.split_at(CLAIM_LEN - 8);
+    if stored_sum != fnv64(body).to_le_bytes() {
+        return None;
+    }
+    let mut c = Cursor { d: body, pos: 0 };
+    if c.take(4)? != CLAIM_MAGIC || c.u32()? != CLAIM_VERSION {
+        return None;
+    }
+    let network_id = c.u64()?;
+    let genesis_hash = c.arr::<32>()?;
+    let fingerprint = c.u64()?;
+    let checksum = c.u64()?;
+    let finalized = c.u64()?;
+    let claimed = SnapshotId { tag: ChainTag { network_id, genesis_hash }, fingerprint, checksum };
+    // Zero is never written (`write_finality_claim` refuses it), so reading
+    // one back means the file is not what this code wrote.
+    (claimed == *id && finalized > 0).then_some(finalized)
+}
+
+/// Remove the finality claim beside `index`, for a write that cannot vouch for
+/// what it puts on disk. Absent already is success.
+pub fn remove_finality_claim(index: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(finality_claim_path(index)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1130,7 +1368,7 @@ impl LogIndex {
                 }
             }
         }
-        let config = LogIndexConfig { enabled: false, max_speed: false, watch };
+        let config = LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch };
         // Duplicates are impossible post-union; new() also re-validates.
         let ix = Self::new(config).expect("union has unique addresses");
         Ok((expected, Self { coverage, logs, cursor, ..ix }))
@@ -1180,6 +1418,8 @@ fn walk_resumable(
 struct ParsedV2 {
     tag: ChainTag,
     fingerprint: u64,
+    /// The payload checksum, already verified against the payload.
+    checksum: u64,
     watch: Vec<WatchEntry>,
     coverage: Vec<Coverage>,
     cursor: Option<(u64, [u8; 32])>,
@@ -1220,7 +1460,15 @@ fn parse_v2(data: &[u8], mut c: Cursor) -> Option<ParsedV2> {
     if c.pos != data.len() {
         return None; // trailing garbage → treat as corrupt
     }
-    Some(ParsedV2 { tag: ChainTag { network_id, genesis_hash }, fingerprint, watch, coverage, cursor, logs })
+    Some(ParsedV2 {
+        tag: ChainTag { network_id, genesis_hash },
+        fingerprint,
+        checksum: stored_sum,
+        watch,
+        coverage,
+        cursor,
+        logs,
+    })
 }
 
 /// Parse the coverage + cursor + log body shared by v1 and v2 frames.
@@ -1270,12 +1518,158 @@ fn parse_body(
 
 #[cfg(test)]
 mod tests {
+    /// `scripts/synth_logindex.py` re-implements `serialize_impl` byte for
+    /// byte so a full node's `eth_getLogs` output can seed the index without
+    /// a devp2p walk (an UNVERIFIED, debug-only seed — the script says so).
+    /// Pin that the frame it writes is accepted by the portable loader and
+    /// queryable with the honest refusal below the fetched span, so a layout
+    /// change on either side fails here rather than at import. Skips (loudly)
+    /// where `python3` is not runnable — the pin holds on the Linux CI lanes,
+    /// which always have it; the Windows smoke lane runs `cargo test
+    /// --workspace` too and must not go red for a missing interpreter.
+    #[test]
+    fn synth_logindex_script_frame_is_importable() {
+        let python_runs = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !python_runs {
+            eprintln!("skipping synth_logindex_script_frame_is_importable: python3 is not runnable here");
+            return;
+        }
+        // Removed on every exit path, including a failing assert.
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!("logindex-synth-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/synth_logindex.py");
+
+        // A synthetic contract at [0x45; 20], deployed at 31_305_656, fetched
+        // over 47_000_000..=47_000_010: two kept logs (blocks 47_000_005 and
+        // 47_000_009) and one `removed` entry the script must drop.
+        let address = [0x45u8; 20];
+        let line = |topics: &[u8], data: &str, block: &str, tx_index: &str, log_index: &str, removed: bool| {
+            let topics: Vec<String> = topics.iter().map(|b| format!("\"0x{}\"", format!("{b:02x}").repeat(32))).collect();
+            format!(
+                r#"{{"address":"0x{}","topics":[{}],"data":"{data}","blockNumber":"{block}","blockHash":"0x{}","transactionHash":"0x{}","transactionIndex":"{tx_index}","logIndex":"{log_index}","removed":{removed}}}"#,
+                "45".repeat(20),
+                topics.join(","),
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        };
+        let good = [
+            line(&[0x11, 0x22], "0xdeadbeef", "0x2cd29c5", "0x3", "0x7", false),
+            line(&[0x22], "0x", "0x2cd29c9", "0x0", "0x0", false),
+            line(&[0x11], "0x01", "0x2cd29c9", "0x0", "0x1", true),
+        ]
+        .join("\n");
+        let run = |name: &str, jsonl: &str| -> (bool, std::path::PathBuf) {
+            let input = dir.0.join(format!("{name}.jsonl"));
+            std::fs::write(&input, jsonl).unwrap();
+            let out = dir.0.join(format!("{name}.db"));
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .args(["--network-id", "100"])
+                .args(["--watch", &format!("0x{}:31305656", "45".repeat(20))])
+                .args(["--from-block", "47000000", "--to-block", "47000010", "--finality-margin", "0"])
+                .arg("--logs")
+                .arg(&input)
+                .arg("--out")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("python3 was runnable a moment ago");
+            (status.success(), out)
+        };
+
+        let (ok, out) = run("good", &good);
+        assert!(ok, "synth_logindex.py rejected a well-formed input");
+        let (tag, ix) = LogIndex::load_portable(&out).expect("the synthesized frame must load");
+        let gnosis = crate::el::reader::ElConfig::gnosis();
+        assert_eq!(tag.network_id, gnosis.network_id);
+        assert_eq!(tag.genesis_hash, gnosis.genesis_hash);
+        assert_eq!(ix.config.watch.len(), 1);
+        assert_eq!(ix.config.watch[0].address, address);
+        assert_eq!(ix.config.watch[0].from_block, 31_305_656, "the deployment block, not the fetch's low edge");
+        assert!(ix.config.watch[0].topic0s.is_empty());
+        assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)), "coverage is the fetched range");
+        assert_eq!(ix.cursor, None);
+        assert_eq!(ix.log_count(), 2);
+
+        // Runtime bits are the host's: enable to query, then filter by topic0
+        // the way Bee does (an OR-list at position 0).
+        let mut ix = ix;
+        ix.config.enabled = true;
+        let all = ix
+            .query(&LogFilter { from_block: 47_000_000, to_block: 47_000_010, addresses: vec![address], topics: vec![] })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].block_number, 47_000_005);
+        assert_eq!(all[0].tx_index, 3);
+        assert_eq!(all[0].log_index, 7);
+        assert_eq!(all[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(all[0].topics.len(), 2);
+        let only_t1 = ix
+            .query(&LogFilter {
+                from_block: 47_000_000,
+                to_block: 47_000_010,
+                addresses: vec![address],
+                topics: vec![vec![[0x11; 32]]],
+            })
+            .unwrap();
+        assert_eq!(only_t1.len(), 1);
+        assert_eq!(only_t1[0].block_number, 47_000_005);
+        // Between the deployment block and the fetched span, and above the
+        // span's high: out of coverage — the honest refusal, never `[]`.
+        for (from, to) in [(31_305_656, 46_999_999), (46_999_990, 47_000_010), (47_000_000, 47_000_011)] {
+            assert!(
+                matches!(
+                    ix.query(&LogFilter { from_block: from, to_block: to, addresses: vec![address], topics: vec![] }),
+                    Err(QueryError::OutOfCoverage { .. })
+                ),
+                "{from}..{to} must be refused, not answered"
+            );
+        }
+
+        // A log outside the declared fetch range contradicts the coverage the
+        // frame would assert: the script must refuse, not drop it.
+        let outside = [good.as_str(), &line(&[0x11], "0x", "0x2cd29cb", "0x0", "0x0", false)].join("\n");
+        let (ok, _) = run("outside", &outside);
+        assert!(!ok, "a log above --to-block must be a hard error");
+    }
+
+    #[test]
+    fn pausing_the_backfill_is_fingerprint_neutral_and_flippable() {
+        // The pause is a runtime bit like max_speed: coverage already walked
+        // must survive the flip, and resuming continues from the same cursor.
+        let w = WatchEntry { address: [9u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
+        let running = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()],
+        };
+        let paused = LogIndexConfig {
+            enabled: true, max_speed: false, backfill_paused: true, watch: vec![w],
+        };
+        assert_eq!(running.fingerprint(), paused.fingerprint());
+        let mut ix = LogIndex::new(running).unwrap();
+        assert!(!ix.config().backfill_paused);
+        ix.set_backfill_paused(true);
+        assert!(ix.config().backfill_paused);
+        ix.set_backfill_paused(false);
+        assert!(!ix.config().backfill_paused);
+    }
 
     #[test]
     fn max_speed_is_fingerprint_neutral_and_flippable() {
         let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
-        let a = LogIndexConfig { enabled: true, max_speed: false, watch: vec![w.clone()] };
-        let b = LogIndexConfig { enabled: true, max_speed: true, watch: vec![w] };
+        let a = LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()] };
+        let b = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![w] };
         // Flipping pacing must never invalidate accumulated coverage.
         assert_eq!(a.fingerprint(), b.fingerprint());
         let mut ix = LogIndex::new(a).unwrap();
@@ -1317,7 +1711,7 @@ mod tests {
     }
 
     fn config(entries: Vec<WatchEntry>) -> LogIndexConfig {
-        LogIndexConfig { enabled: true, max_speed: false, watch: entries }
+        LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: entries }
     }
 
     /// `LogIndex::new(config(...)).unwrap()` shorthand for valid configs.
@@ -1362,7 +1756,7 @@ mod tests {
         let mut ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
         ix.append_block(10, [0xbb; 32], vec![]).unwrap();
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
-        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
+        let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
         assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::Unanswerable));
     }
@@ -1430,6 +1824,103 @@ mod tests {
         // Nothing above the clamp → byte-identical to a plain serialize.
         assert_eq!(ix.serialize_clamped(&tag(), 14), ix.serialize(&tag()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_writes_to_one_path_never_share_a_scratch_file() {
+        // THE invariant that keeps two concurrent checkpoints apart, asserted
+        // directly rather than raced for: `concurrent_writers_never_leave_a_
+        // spliced_file` below exercises the same property, but only detects a
+        // violation when the threads happen to interleave inside the write
+        // window, so it cannot be the only guard. Here a regression to a
+        // per-process name fails every run, on any scheduler.
+        let path = std::path::Path::new("/tmp/whatever/index.db");
+        let names: std::collections::HashSet<_> = (0..64).map(|_| next_tmp_path(path)).collect();
+        assert_eq!(names.len(), 64, "two calls chose the same temp path");
+        // Still per-process, still beside the target, still not the target.
+        for n in &names {
+            assert_eq!(
+                n.parent(),
+                path.parent(),
+                "temp must be renameable onto path"
+            );
+            assert_ne!(n, path, "temp must not BE the target");
+            assert!(
+                n.to_string_lossy()
+                    .contains(&format!(".tmp.{}.", std::process::id())),
+                "temp must stay identifiable as this process's: {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_never_leave_a_spliced_file() {
+        // The checkpoint write no longer happens under the index lock, so the
+        // temp path is what keeps two writers apart. With a per-PROCESS temp
+        // name they share one file: the second `File::create` truncates the
+        // first mid-write and the reader gets a splice of both — which, on a
+        // real index, means a checksum failure and a full re-walk of months of
+        // backfill. Distinct payload bytes make a splice detectable.
+        let dir = std::env::temp_dir().join(format!("logindex-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("racing.db");
+        const LEN: usize = 1 << 20; // big enough that the writes genuinely overlap
+        const WRITERS: u8 = 8;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A reader running throughout: `path` must NEVER be observable in a
+        // partial state. That is what the rename buys, and it is the property
+        // a caller relies on when it reloads a checkpoint after a crash.
+        let watcher = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut torn = None;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(got) = std::fs::read(&path) {
+                        if got.len() != LEN || got.iter().any(|b| *b != got[0]) {
+                            torn = Some(got.len());
+                            break;
+                        }
+                    }
+                }
+                torn
+            })
+        };
+        let writers: Vec<std::thread::JoinHandle<()>> = (1..=WRITERS)
+            .map(|k| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        write_atomic(&path, &vec![k; LEN]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            watcher.join().unwrap(),
+            None,
+            "a reader saw a partial file: the swap is not atomic"
+        );
+        // Whatever landed must be exactly ONE writer's payload, whole.
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), LEN, "file is not one writer's payload");
+        let first = got[0];
+        assert!(
+            (1..=WRITERS).contains(&first),
+            "byte from no writer: {first}"
+        );
+        assert!(got.iter().all(|b| *b == first), "spliced payloads");
+        // And no temp files are left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1570,7 +2061,92 @@ mod tests {
     #[test]
     fn duplicate_watch_addresses_are_rejected() {
         let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![], name: String::new() }]);
+        // Askable ahead of construction, so a caller holding an index it must
+        // not lose can refuse the config before spending anything on it.
+        assert!(matches!(dup.duplicate_address(), Some(DuplicateWatchAddress(a)) if a == addr(1)));
         assert!(matches!(LogIndex::new(dup), Err(DuplicateWatchAddress(a)) if a == addr(1)));
+        // …and it answers None for the configs `new` accepts, including empty.
+        assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).duplicate_address().is_none());
+        assert!(config(vec![]).duplicate_address().is_none());
+    }
+
+    /// Re-key serialized bytes to `fp` so a hand-written config the real
+    /// serializer could never have produced still gets past the fingerprint
+    /// gate. Sound without re-checksumming: the checksum covers only what
+    /// follows it, and the fingerprint sits directly ahead of it in both
+    /// layouts.
+    fn repoint_fingerprint(bytes: &mut [u8], checksum_at: usize, fp: u64) {
+        bytes[checksum_at - 8..checksum_at].copy_from_slice(&fp.to_le_bytes());
+    }
+
+    #[test]
+    fn deserializing_a_v2_file_under_a_duplicate_address_config_is_refused() {
+        // `deserialize` builds `Self` directly, bypassing `new`, so it has to
+        // re-apply the bar itself. Reachable in the field because a file is
+        // keyed by the fingerprint of the config it is read WITH: a
+        // hand-written duplicate config carries its own key, not the writer's.
+        let mut ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        ix.append_block(10, [0xbb; 32], vec![log(10, 0, addr(1), vec![topic(7)])]).unwrap();
+        let good = ix.serialize(&tag());
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        // Control: the same re-keying with a DISTINCT but duplicate-free
+        // config over the same addresses loads — so the refusal above is the
+        // duplicate check, not the fingerprint gate or the coverage re-pair.
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V2_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
+    }
+
+    #[test]
+    fn deserializing_a_legacy_v1_file_under_a_duplicate_address_config_is_refused() {
+        // Same invariant on the upgrade path, which builds `Self` directly too.
+        let ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)])).unwrap();
+        let good = serialize_v1(&ix);
+
+        let dup = config(vec![watch_all(addr(1), 0), watch_all(addr(1), 0)]);
+        let mut keyed = good.clone();
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, dup.fingerprint());
+        assert!(LogIndex::deserialize(&dup, &tag(), &keyed).is_none());
+
+        let clean = config(vec![watch_all(addr(2), 5), watch_all(addr(1), 7)]);
+        let mut keyed = good;
+        repoint_fingerprint(&mut keyed, V1_CHECKSUM_AT, clean.fingerprint());
+        assert!(LogIndex::deserialize(&clean, &tag(), &keyed).is_some());
+    }
+
+    /// `ElReader::set_log_index_config` screens the PUSHED config for
+    /// duplicates and then builds an index from `union_with`'s output, on a
+    /// path where a failure would have to discard an index it has already
+    /// consumed. That is only sound while the union cannot manufacture a
+    /// duplicate the screen never saw — pinned here, including for a `stored`
+    /// list that is itself duplicated (the union folds the second copy into
+    /// the entry the first one appended, rather than appending it again).
+    #[test]
+    fn a_union_never_manufactures_a_duplicate_the_pushed_config_lacked() {
+        let pushed = config(vec![watch_all(addr(1), 10), watch_all(addr(2), 10)]);
+        assert!(pushed.duplicate_address().is_none());
+        for stored in [
+            vec![watch_all(addr(2), 5), watch_all(addr(3), 5)], // overlap + new
+            vec![watch_all(addr(3), 5), watch_all(addr(3), 7)], // duplicated stored
+            vec![watch_all(addr(1), 5), watch_all(addr(1), 7)], // duplicated overlap
+            vec![],
+        ] {
+            let union = pushed.union_with(&stored).expect("no topic conflict");
+            assert!(
+                union.duplicate_address().is_none(),
+                "union_with produced a duplicate the guard could not have caught: {:?}",
+                union.watch.iter().map(|w| w.address[0]).collect::<Vec<_>>()
+            );
+            assert!(LogIndex::new(union).is_ok(), "the union config is unbuildable");
+        }
     }
 
     #[test]
@@ -1828,6 +2404,7 @@ mod tests {
         let pushed = LogIndexConfig {
             enabled: true,
             max_speed: true,
+            backfill_paused: false,
             watch: vec![{
                 let mut w = watch_all(addr(1), 100); // lower from_block
                 w.name = "preset name".to_string();
@@ -1853,7 +2430,7 @@ mod tests {
         // and coverage re-pairs by address.
         let mut renamed = watch_all(addr(2), 150);
         renamed.name = "renamed.eth".to_string();
-        let eff = LogIndexConfig { enabled: true, max_speed: true, watch: vec![renamed, watch_all(addr(1), 200)] };
+        let eff = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![renamed, watch_all(addr(1), 200)] };
         assert!(ix.adopt_config(eff));
         assert!(ix.config().enabled && ix.config().max_speed);
         assert_eq!(ix.config().watch[0].from_block, 150);
@@ -2162,7 +2739,7 @@ mod bloom_match_tests {
             [b; 20]
         }
         let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
-        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, watch: vec![watch] }).unwrap();
+        let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![watch] }).unwrap();
         let mut hit = EMPTY_BLOOM;
         accrue(&mut hit, &addr(1));
         accrue(&mut hit, &[7u8; 32]);
@@ -2172,5 +2749,144 @@ mod bloom_match_tests {
         accrue(&mut addr_only, &addr(1));
         assert!(!ix.bloom_may_match(100, &addr_only)); // topic0-restricted entry needs a topic hit
         assert!(!ix.bloom_may_match(100, &EMPTY_BLOOM));
+    }
+}
+
+#[cfg(test)]
+mod finality_claim_tests {
+    use super::*;
+
+    /// A per-test scratch dir, removed on every exit path.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("logindex-claim-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tag() -> ChainTag {
+        ChainTag { network_id: 100, genesis_hash: [0x4f; 32] }
+    }
+
+    fn index(high: u64) -> LogIndex {
+        let watch = WatchEntry { address: [1; 20], from_block: 0, topic0s: vec![], name: String::new() };
+        let mut ix = LogIndex::new(LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![watch],
+        })
+        .unwrap();
+        for b in 10..=high {
+            ix.append_block(b, [b as u8; 32], vec![]).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn a_claim_counts_only_beside_the_exact_file_it_was_written_for() {
+        let dir = TempDir::new("exact");
+        let path = dir.0.join("logindex-gnosis.db");
+        let bytes = index(20).serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let (_, id) = LogIndex::load_portable_with_id(&path).unwrap();
+        // The writer's view of the id (off the bytes it holds) and the loader's
+        // (off the bytes it parsed) must agree, or no claim ever matches.
+        assert_eq!(SnapshotId::of_frame(&bytes), Some(id));
+        assert_eq!(read_finality_claim(&path, &id), None, "no sidecar yet");
+        write_finality_claim(&path, &id, 20).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), Some(20));
+
+        // The index is replaced — a drop-in, an import, an older build's write.
+        // The sidecar left behind describes the old bytes and says nothing
+        // about the new ones.
+        write_atomic(&path, &index(25).serialize(&tag())).unwrap();
+        let (_, replaced) = LogIndex::load_portable_with_id(&path).unwrap();
+        assert_ne!(replaced, id);
+        assert_eq!(read_finality_claim(&path, &replaced), None);
+
+        // Same payload under another chain's tag is another file too.
+        let other_chain = SnapshotId { tag: ChainTag { network_id: 1, ..tag() }, ..id };
+        assert_eq!(read_finality_claim(&path, &other_chain), None);
+    }
+
+    #[test]
+    fn a_damaged_claim_is_no_claim() {
+        let dir = TempDir::new("damaged");
+        let path = dir.0.join("logindex-gnosis.db");
+        let id = SnapshotId::of_frame(&index(20).serialize(&tag())).unwrap();
+        let claim = finality_claim_path(&path);
+
+        write_finality_claim(&path, &id, 20).unwrap();
+        let good = std::fs::read(&claim).unwrap();
+        assert_eq!(good.len(), CLAIM_LEN);
+        // A flipped bit anywhere — including in the claimed height itself.
+        for at in [0, 8, 56, 64, CLAIM_LEN - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x01;
+            std::fs::write(&claim, &bad).unwrap();
+            assert_eq!(read_finality_claim(&path, &id), None, "bit flip at {at} accepted");
+        }
+        // Truncated, or with trailing bytes.
+        std::fs::write(&claim, &good[..CLAIM_LEN - 1]).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        let mut long = good.clone();
+        long.push(0);
+        std::fs::write(&claim, &long).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // A consistent frame with one field changed, checksum redone.
+        let reframed = |at: usize, bytes: &[u8]| {
+            let mut body = good[..CLAIM_LEN - 8].to_vec();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+            let sum = fnv64(&body);
+            body.extend_from_slice(&sum.to_le_bytes());
+            body
+        };
+        // An unknown version.
+        std::fs::write(&claim, reframed(4, &2u32.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Zero is never written...
+        let refused = write_finality_claim(&path, &id, 0).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        // ...so a well-formed zero on disk is not believed either.
+        std::fs::write(&claim, reframed(64, &0u64.to_le_bytes())).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+    }
+
+    #[test]
+    fn the_claim_is_a_sidecar_the_portable_file_never_carries() {
+        let dir = TempDir::new("sidecar");
+        let path = dir.0.join("logindex-gnosis.db");
+        assert_eq!(finality_claim_path(&path), dir.0.join("logindex-gnosis.db.final"));
+        // Never one of the index's own scratch names (which REPLACE the
+        // extension), so a checkpoint's temp file cannot land on it.
+        for _ in 0..4 {
+            assert_ne!(next_tmp_path(&path), finality_claim_path(&path));
+        }
+        let ix = index(20);
+        let bytes = ix.serialize(&tag());
+        write_atomic(&path, &bytes).unwrap();
+        let id = SnapshotId::of_frame(&bytes).unwrap();
+        write_finality_claim(&path, &id, 20).unwrap();
+        // The index bytes do not change with a claim beside them, so a copy of
+        // the file — an export, a file handed to another node — carries no
+        // claim to wherever it lands.
+        assert_eq!(std::fs::read(&path).unwrap(), ix.serialize(&tag()));
+        let elsewhere = dir.0.join("copied.db");
+        std::fs::copy(&path, &elsewhere).unwrap();
+        assert_eq!(read_finality_claim(&elsewhere, &id), None);
+
+        remove_finality_claim(&path).unwrap();
+        assert_eq!(read_finality_claim(&path, &id), None);
+        // Removing what is already gone is not an error.
+        remove_finality_claim(&path).unwrap();
     }
 }

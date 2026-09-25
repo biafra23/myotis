@@ -9,15 +9,17 @@ import java.util.Locale;
 
 /**
  * Process-wide engine selection, cloning the {@code BlsBackends} pattern. The choice
- * (system property {@code myotis.engine}, default {@code java}) decides which engine a
+ * (system property {@code myotis.engine}, default {@code auto}) decides which engine a
  * NEW {@code create()} goes to; networks already hosted keep the engine that created
  * them — a runtime switch means "flip the choice, then (re)start the network".
  *
  * <ul>
- *   <li>{@code java} — the JVM engine (node-core). The default.</li>
- *   <li>{@code rust} — the Rust engine, hard: unavailable → {@link EngineException}.</li>
  *   <li>{@code auto} — the Rust engine when it's available AND can serve the call,
- *       else the Java engine (logged fallback).</li>
+ *       else the Java engine (logged fallback). The default: the Rust engine is the
+ *       primary engine (it alone serves the log index and Tor routing), and the
+ *       availability probe keeps hosts without the native library on Java.</li>
+ *   <li>{@code java} — the JVM engine (node-core), unconditionally.</li>
+ *   <li>{@code rust} — the Rust engine, hard: unavailable → {@link EngineException}.</li>
  * </ul>
  */
 public final class Engines {
@@ -26,7 +28,7 @@ public final class Engines {
     public static final String PROP = "myotis.engine";
 
     private static final SelectorEngine ENGINE = new SelectorEngine();
-    private static volatile String choice = normalize(System.getProperty(PROP, "java"));
+    private static volatile String choice = normalize(System.getProperty(PROP, "auto"));
 
     private Engines() {}
 
@@ -97,13 +99,13 @@ public final class Engines {
     }
 
     private static String normalize(String c) {
-        String v = c == null ? "java" : c.trim().toLowerCase(Locale.ROOT);
+        String v = c == null ? "auto" : c.trim().toLowerCase(Locale.ROOT);
         return switch (v) {
             case "java", "rust", "auto" -> v;
             default -> {
                 LoggerFactory.getLogger(Engines.class)
-                        .warn("[engines] unknown myotis.engine choice '{}'; using java", c);
-                yield "java";
+                        .warn("[engines] unknown myotis.engine choice '{}'; using auto", c);
+                yield "auto";
             }
         };
     }

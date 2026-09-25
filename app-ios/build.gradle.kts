@@ -7,6 +7,7 @@
 // standard embedAndSignAppleFrameworkForXcode build phase.
 
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
+import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -24,6 +25,13 @@ kotlin {
         "ios_simulator_arm64" to ("aarch64-apple-ios-sim" to "cargoBuildIosSim"),
     )
 
+    // Bundles the per-target frameworks into MyotisKit.xcframework (device +
+    // arm64 simulator) — the single distributable a consumer drops in. The
+    // Xcode app doesn't use it (it links a per-target framework via
+    // embedAndSignAppleFrameworkForXcode); this exists for the CI release
+    // artifact. `assembleMyotisKitReleaseXCFramework` is the produced task.
+    val xcf = XCFramework("MyotisKit")
+
     listOf(iosArm64(), iosSimulatorArm64()).forEach { target: KotlinNativeTarget ->
         val (triple, cargoTask) = rustTargets.getValue(target.konanTarget.name)
         target.compilations.getByName("main").cinterops.create("myotisEngine") {
@@ -38,6 +46,7 @@ kotlin {
             // Static framework: the Rust .a and the Kotlin objects end up in one
             // archive the app links directly — no embed step, no dyld at launch.
             isStatic = true
+            xcf.add(this)
         }
     }
 

@@ -3,11 +3,13 @@
 //! [`myotis_evm`] is sans-I/O and its [`SnapStateOracle`] is synchronous. This
 //! module is the I/O half: [`PoolOracle`] implements that trait over the snap
 //! peer pool, bridging each verified fetch to the async network via
-//! [`Handle::block_on`], and [`ElReader::eth_call`](crate::el::reader::ElReader)
-//! drives the `revm` executor on a blocking thread so that bridge never nests a
+//! [`Handle::block_on`], and
+//! [`ElReader::eth_call_overridden`](crate::el::reader::ElReader) drives the
+//! `revm` executor on a blocking thread so that bridge never nests a
 //! `block_on` inside a runtime worker.
 //!
-//! Every fetch pins to the executor-supplied `state_root` (the verified head's),
+//! Every fetch pins to the executor-supplied `state_root` (the call's anchor:
+//! the verified head's, or the beacon-finalized block's for [`ReadAnchor::Finalized`]),
 //! so all reads in one call see a single consistent block. Verification is
 //! verify-on-fetch: `snap_get_account`/`snap_get_storage` MPT-verify against that
 //! root and `snap_get_bytecode` checks `keccak(code) == code_hash`, so a peer can
@@ -26,6 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
+use super::reader::{hedged_race, RaceOutcome, HEDGE_DELAY};
+
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
@@ -34,6 +38,7 @@ use myotis_evm::{
 };
 
 use crate::el::peer::ManagedPeer;
+use crate::el::readstats::{AccountFact, ReadStats};
 use crate::el::snap::fetch::AccountOutcome;
 
 /// The outcome of an `eth_call`. Mirrors the Java engine's contract, which
@@ -50,6 +55,43 @@ pub enum CallOutcome {
     /// The call could not be executed/verified (out of gas, halt, state
     /// unavailable, unsupported fork/chain). The string is diagnostic.
     Unavailable(String),
+}
+
+/// Which verified block a read is anchored at: the block an `eth_call` runs
+/// against, or the state root an account / storage / code proof is verified
+/// against (ABI ≥ 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnchor {
+    /// The beacon OPTIMISTIC head — the `latest` (and `pending`/`safe`) tag.
+    Head,
+    /// The beacon FINALIZED execution block — the `finalized` tag: older and
+    /// never reorged, but a state peers may already have pruned, so it can be
+    /// unservable while the head serves. Never downgraded to the head: the
+    /// caller asked for finality (CLAUDE.md §Trust — applied or refused).
+    Finalized,
+}
+
+impl ReadAnchor {
+    /// The anchor for a `finalized: bool` selector (the ENS entry points').
+    pub fn for_finalized(finalized: bool) -> ReadAnchor {
+        if finalized {
+            ReadAnchor::Finalized
+        } else {
+            ReadAnchor::Head
+        }
+    }
+}
+
+/// A call's outcome plus the block it actually ran against (#382, #465): a
+/// host that asked for `finalized` can see which block answered, and one that
+/// asked for `latest` learns the head it got.
+#[derive(Debug, Clone)]
+pub struct CallAnswer {
+    pub outcome: CallOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block (the `verified` of
+    /// `ens_record_json`).
+    pub finalized: bool,
 }
 
 /// The outcome of an `estimateGas`. A REVERT is a verified chain answer (the
@@ -213,7 +255,7 @@ fn be_to_u64(bytes: &[u8]) -> u64 {
 /// A minimal big-endian scalar → `U256`. `None` if longer than 32 bytes (a
 /// proof-verified account/storage scalar never is — this only guards against a
 /// panic on adversarial input).
-fn u256_be(bytes: &[u8]) -> Option<U256> {
+pub(crate) fn u256_be(bytes: &[u8]) -> Option<U256> {
     if bytes.len() > 32 {
         None
     } else {
@@ -224,6 +266,7 @@ fn u256_be(bytes: &[u8]) -> Option<U256> {
 /// A [`SnapStateOracle`] over a fixed snapshot of snap peers, bridging the sync
 /// trait to the async snap fetch path. Created per `eth_call`.
 pub struct PoolOracle {
+    operation: Option<Arc<super::request::Operation>>,
     peers: Vec<Arc<ManagedPeer>>,
     handle: Handle,
     /// Snap-quality reputation sink (None in tests): serves confirm a peer,
@@ -235,6 +278,45 @@ pub struct PoolOracle {
     /// and every `fetch_storage` on the same contract need. `Some(None)` caches a
     /// proven absence.
     leaf_memo: Mutex<HashMap<[u8; 20], Option<AccountLeaf>>>,
+    /// The reader's read-fetch shadow cache: every verified fetch this oracle
+    /// makes — including the prefetch wave's — is reported with its wall-clock
+    /// cost so `read_stats_json` covers the EVM path too.
+    stats: Arc<ReadStats>,
+    /// The order this call's hedged reads ask `peers` in, as indices into
+    /// `peers`. It starts as the pool's ladder and adapts WITHIN the call (see
+    /// [`next_order`]), so a dead first peer costs one hedge delay per call
+    /// instead of one per state read. The pool's bench, fed by the same races,
+    /// only reorders the NEXT call's snapshot, and even an eviction does not
+    /// take the peer out of this one.
+    order: Mutex<Vec<usize>>,
+    /// The call runs against the beacon-FINALIZED state root (the `finalized`
+    /// tag; #465, #366). Two things follow, both as for the reader's own
+    /// finalized state reads: a peer answering a fetch with an empty proof
+    /// does not hold a root it is not obliged to hold — no strike, no
+    /// witnessed failure (`record_race`, the prefetch wave) — and the shadow
+    /// cache, which measures head traffic, is not fed.
+    finalized: bool,
+}
+
+/// This call's ask order after one hedged race over `asked` (the order that
+/// race used): the winner first, then every peer the race did not judge in its
+/// current order, then the peers that lost it (missed or outpaced), also in
+/// their current order. Pure, and keyed by peer id rather than by position, so
+/// a race that ran on an older order still applies cleanly.
+fn next_order<T>(order: &[usize], asked: &[usize], out: &RaceOutcome<T>) -> Vec<usize> {
+    let winner = out.accepted.as_ref().and_then(|(pos, _)| asked.get(*pos).copied());
+    let losers: Vec<usize> = out
+        .missed
+        .iter()
+        .chain(&out.outpaced)
+        .filter_map(|pos| asked.get(*pos).copied())
+        .collect();
+    let winner = winner.filter(|w| order.contains(w));
+    let mut next = Vec::with_capacity(order.len());
+    next.extend(winner);
+    next.extend(order.iter().copied().filter(|i| Some(*i) != winner && !losers.contains(i)));
+    next.extend(order.iter().copied().filter(|i| Some(*i) != winner && losers.contains(i)));
+    next
 }
 
 impl PoolOracle {
@@ -242,24 +324,125 @@ impl PoolOracle {
         peers: Vec<Arc<ManagedPeer>>,
         handle: Handle,
         quality: Option<crate::el::pool::SnapQualitySink>,
+        stats: Arc<ReadStats>,
+        finalized: bool,
     ) -> PoolOracle {
+        let order = Mutex::new((0..peers.len()).collect());
         PoolOracle {
+            operation: super::request::Operation::current(),
             peers,
             handle,
             quality,
             leaf_memo: Mutex::new(HashMap::new()),
+            stats,
+            order,
+            finalized,
         }
     }
 
-    /// Record one per-peer fetch outcome (no-op without a sink).
-    async fn record(quality: &Option<crate::el::pool::SnapQualitySink>, peer: &ManagedPeer, served: bool) {
-        if let Some(q) = quality {
-            if served {
-                q.served(peer.addr()).await;
-            } else {
-                q.failed(peer.addr()).await;
-            }
+    /// Shadow-cache bookkeeping for one verified account fetch (`None` = a
+    /// verified absence) that started at `started`.
+    fn note_account(
+        &self,
+        address: [u8; 20],
+        state_root: &[u8; 32],
+        leaf: Option<&AccountLeaf>,
+        started: std::time::Instant,
+    ) {
+        if self.finalized {
+            return; // the shadow cache measures head traffic (see `finalized`)
         }
+        self.stats.observe_account(
+            address,
+            *state_root,
+            AccountFact::from_leaf(leaf),
+            started.elapsed(),
+        );
+    }
+
+    /// Shadow-cache bookkeeping for one verified slot fetch.
+    fn note_storage(
+        &self,
+        address: [u8; 20],
+        position: [u8; 32],
+        state_root: &[u8; 32],
+        storage_root: [u8; 32],
+        value: U256,
+        started: std::time::Instant,
+    ) {
+        if self.finalized {
+            return;
+        }
+        self.stats.observe_storage(
+            address,
+            position,
+            *state_root,
+            storage_root,
+            value.to_be_bytes::<32>(),
+            started.elapsed(),
+        );
+    }
+
+    fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T, OracleError> {
+        self.handle.block_on(async {
+            match &self.operation {
+                Some(op) => op.wait(future).await.map_err(|reason| OracleError::Cancelled { reason }),
+                None => Ok(future.await),
+            }
+        })
+    }
+
+    /// Feed one hedged race into the reputation sink: the winner served, every
+    /// miss failed, and every attempt the winner outpaced reported as outpaced
+    /// (benched; a repeat before the peer serves again is a failure). The same
+    /// rules as `ElReader::hedged_read`, including its excuse: on a
+    /// `finalized` call a miss answered with an empty proof is the peer not
+    /// holding a root it is not obliged to hold, and is banked nowhere.
+    async fn record_race<T>(
+        quality: &Option<crate::el::pool::SnapQualitySink>,
+        peers: &[Arc<ManagedPeer>],
+        out: &RaceOutcome<T>,
+        finalized: bool,
+    ) {
+        debug_assert!(out.indices().all(|i| i < peers.len()), "race indices must index its own peer slice");
+        let Some(q) = quality else { return };
+        // A miss is WITNESSED only when another peer served the same read; a
+        // whole-pool failure is banked live but persisted nowhere (#465 — the
+        // same cold-pool storm that struck the block read hits these).
+        let witnessed = out.accepted.is_some();
+        let excused = |idx: usize| {
+            finalized
+                && out.errors.iter().any(|(i, e)| {
+                    *i == idx && crate::el::snap::fetch::is_unknown_root_error(e)
+                })
+        };
+        for idx in &out.missed {
+            if excused(*idx) {
+                continue;
+            }
+            q.failed(peers[*idx].addr(), witnessed).await;
+        }
+        for idx in &out.outpaced {
+            q.outpaced(peers[*idx].addr()).await;
+        }
+        if let Some((idx, _)) = &out.accepted {
+            q.served(peers[*idx].addr()).await;
+        }
+    }
+
+    /// The peers in this call's current ask order, with the ids that order
+    /// uses (see `order`).
+    fn ladder(&self) -> (Vec<usize>, Vec<Arc<ManagedPeer>>) {
+        let asked = self.order.lock().unwrap().clone();
+        let peers = asked.iter().map(|&i| Arc::clone(&self.peers[i])).collect();
+        (asked, peers)
+    }
+
+    /// Adapt this call's ask order to one race that asked in order `asked`.
+    fn learn_order<T>(&self, asked: &[usize], out: &RaceOutcome<T>) {
+        let mut order = self.order.lock().unwrap();
+        let next = next_order(&order, asked, out);
+        *order = next;
     }
 
     /// The proof-verified account leaf at `address`, or `None` when proven absent.
@@ -269,30 +452,41 @@ impl PoolOracle {
         state_root: &[u8; 32],
         address: [u8; 20],
     ) -> Result<Option<AccountLeaf>, OracleError> {
+        self.check_request()?;
         if let Some(cached) = self.leaf_memo.lock().unwrap().get(&address) {
             return Ok(cached.clone());
         }
         // No lock held across the network fetch.
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
-            for peer in &self.peers {
-                match peer.snap_get_account(state_root, &address).await {
-                    Ok(AccountOutcome::Present(leaf)) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(Some(leaf));
-                    }
-                    Ok(AccountOutcome::Absent) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(None);
-                    }
-                    // Bad proof / transport for this peer — try the next.
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
-        });
+        let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
+        let fetched = self.wait(async {
+            // Hedged across the call's peers (reader::hedged_race). An eth_call
+            // makes several state reads, and a silent first peer used to hold
+            // EACH of them for a full request timeout — the main source of
+            // multi-second eth_call latency on a flaky pool. Any proof-verified
+            // answer ends the race; a bad proof or transport error is a miss.
+            // The call's ask order learns from each race (see `order`).
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_account(state_root, &address).await
+                },
+                |_: &AccountOutcome| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, outcome)| match outcome {
+                AccountOutcome::Present(leaf) => Some(leaf),
+                AccountOutcome::Absent => None,
+            })
+        })?;
         match fetched {
             Some(leaf) => {
+                self.note_account(address, state_root, leaf.as_ref(), started);
                 self.leaf_memo.lock().unwrap().insert(address, leaf.clone());
                 Ok(leaf)
             }
@@ -306,6 +500,13 @@ impl PoolOracle {
 }
 
 impl SnapStateOracle for PoolOracle {
+    fn check_request(&self) -> Result<(), OracleError> {
+        match &self.operation {
+            Some(op) => op.check().map_err(|reason| OracleError::Cancelled { reason }),
+            None => Ok(()),
+        }
+    }
+
     fn fetch_account(
         &self,
         state_root: &[u8; 32],
@@ -403,7 +604,16 @@ impl SnapStateOracle for PoolOracle {
                         let Ok(_permit) = sem.acquire().await else {
                             return ItemOutcome::Failed;
                         };
-                        match peer.snap_get_account(state_root, &addr).await {
+                        let started = std::time::Instant::now();
+                        let outcome = peer.snap_get_account(state_root, &addr).await;
+                        if let Ok(o) = &outcome {
+                            let leaf = match o {
+                                AccountOutcome::Present(l) => Some(l),
+                                AccountOutcome::Absent => None,
+                            };
+                            self.note_account(addr, state_root, leaf, started);
+                        }
+                        match outcome {
                             Ok(AccountOutcome::Present(leaf)) => leaf,
                             Ok(AccountOutcome::Absent) => {
                                 proof_sink.put_account(state_root, &addr, None);
@@ -437,10 +647,16 @@ impl SnapStateOracle for PoolOracle {
                         let Ok(_permit) = sem.acquire().await else {
                             return None; // closed semaphore = local failure
                         };
-                        peer.snap_get_storage(state_root, &addr, &leaf, &position)
+                        let started = std::time::Instant::now();
+                        let value = peer
+                            .snap_get_storage(state_root, &addr, &leaf, &position)
                             .await
                             .ok()
-                            .and_then(|bytes| u256_be(&bytes))
+                            .and_then(|bytes| u256_be(&bytes));
+                        if let Some(v) = value {
+                            self.note_storage(addr, position, state_root, leaf.storage_root, v, started);
+                        }
+                        value
                     }
                 }))
                 .await;
@@ -473,6 +689,11 @@ impl SnapStateOracle for PoolOracle {
                         // next peer (Java tryWithRetries chunk rotation).
                         let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
                         let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
+                        // Peers that failed every item they were asked, held
+                        // until a later peer serves what they could not (then
+                        // witnessed) or the rotation runs out (then not — a
+                        // root every peer pruned is about our ask; #465).
+                        let mut unwitnessed: Vec<std::net::SocketAddr> = Vec::new();
                         for attempt in 0..attempts {
                             if pending.is_empty() {
                                 break;
@@ -502,12 +723,32 @@ impl SnapStateOracle for PoolOracle {
                             }
                             if let Some(q) = &quality {
                                 if served_any {
+                                    // This peer served items the held peers
+                                    // could not: their failures are witnessed
+                                    // — unless the call runs at the finalized
+                                    // root, where an item failure is almost
+                                    // always "does not hold that root" and
+                                    // the wave keeps no reason to tell it
+                                    // from transport (the serial reads that
+                                    // follow still strike a silent peer).
+                                    for addr in unwitnessed.drain(..) {
+                                        if !self.finalized {
+                                            q.failed(addr, true).await;
+                                        }
+                                    }
                                     q.served(peer.addr()).await;
                                 } else if asked_any {
-                                    q.failed(peer.addr()).await;
+                                    unwitnessed.push(peer.addr());
                                 }
                             }
                             pending = still_failed;
+                        }
+                        if let Some(q) = &quality {
+                            for addr in unwitnessed {
+                                if !self.finalized {
+                                    q.failed(addr, false).await;
+                                }
+                            }
                         }
                     }
                 },
@@ -525,7 +766,9 @@ impl SnapStateOracle for PoolOracle {
                     let Ok(_permit) = sem.acquire().await else {
                         return; // closed semaphore — never bypass the bound
                     };
+                    let started = std::time::Instant::now();
                     if let Ok(code) = peer.snap_get_bytecode(hash).await {
+                        self.stats.observe_code(*hash, started.elapsed());
                         code_sink.put(hash, code.into());
                     }
                 }
@@ -538,7 +781,7 @@ impl SnapStateOracle for PoolOracle {
         // The whole wave is bounded (Java PREFETCH_WAVE_TIMEOUT_SEC): on timeout
         // whatever landed is kept and the loop's next iteration proceeds — an
         // eth_call must never hang on a slow warm-up.
-        self.handle.block_on(async {
+        let _ = self.wait(async {
             let _ = tokio::time::timeout(WAVE_TIMEOUT, wave).await;
         });
     }
@@ -559,28 +802,36 @@ impl SnapStateOracle for PoolOracle {
         }
         let position = slot.to_be_bytes::<32>();
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
-            for peer in &self.peers {
-                match peer
-                    .snap_get_storage(state_root, &address, &leaf, &position)
-                    .await
-                {
-                    Ok(value) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(value);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
-        });
+        let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
+        let leaf = &leaf;
+        let fetched = self.wait(async {
+            // Hedged like the account leaf above.
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move {
+                    peer.snap_get_storage(state_root, &address, leaf, &position).await
+                },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, value)| value)
+        })?;
         match fetched {
             // Empty bytes = a proven-zero / absent slot.
-            Some(value) => u256_be(&value).ok_or_else(|| OracleError::InvalidProof {
-                state_root: *state_root,
-                address,
-                detail: format!("storage value scalar too long ({} bytes)", value.len()),
-            }),
+            Some(value) => {
+                let v = u256_be(&value).ok_or_else(|| OracleError::InvalidProof {
+                    state_root: *state_root,
+                    address,
+                    detail: format!("storage value scalar too long ({} bytes)", value.len()),
+                })?;
+                self.note_storage(address, position, state_root, leaf.storage_root, v, started);
+                Ok(v)
+            }
             None => Err(OracleError::StateUnavailable {
                 state_root: *state_root,
                 address,
@@ -593,21 +844,28 @@ impl SnapStateOracle for PoolOracle {
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
-            for peer in &self.peers {
-                match peer.snap_get_bytecode(code_hash).await {
-                    Ok(code) => {
-                        Self::record(&quality, peer, true).await;
-                        return Some(code);
-                    }
-                    Err(_) => Self::record(&quality, peer, false).await,
-                }
-            }
-            None
-        });
-        fetched.ok_or(OracleError::BytecodeUnavailable {
+        let started = std::time::Instant::now();
+        let (asked, peers) = self.ladder();
+        let peers = &peers;
+        let fetched = self.wait(async {
+            // Hedged like the account leaf above. Code is content-addressed and
+            // keyed by hash, so racing discloses nothing new about the caller.
+            let out = hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move { peer.snap_get_bytecode(code_hash).await },
+                |_: &Vec<u8>| true,
+            )
+            .await;
+            Self::record_race(&quality, peers, &out, self.finalized).await;
+            self.learn_order(&asked, &out);
+            out.accepted.map(|(_, code)| code)
+        })?;
+        let code = fetched.ok_or(OracleError::BytecodeUnavailable {
             code_hash: *code_hash,
-        })
+        })?;
+        self.stats.observe_code(*code_hash, started.elapsed());
+        Ok(code)
     }
 }
 
@@ -657,5 +915,80 @@ mod tests {
         let mut h = BlockHeader::default();
         h.beneficiary = vec![0x11; 19]; // not 20 bytes
         assert!(block_context(&h, 1).is_err());
+    }
+
+    /// The oracle's within-call ask order: a dead first peer in the call's
+    /// snapshot must cost one hedge delay per CALL, not one per state read.
+    mod ask_order {
+        use super::*;
+        use std::time::Duration;
+
+        fn outcome(accepted: Option<usize>, missed: Vec<usize>, outpaced: Vec<usize>) -> RaceOutcome<()> {
+            RaceOutcome {
+                accepted: accepted.map(|pos| (pos, ())),
+                fallback: None,
+                missed,
+                outpaced,
+                errors: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn the_winner_leads_and_the_losers_trail() {
+            let order = [0, 1, 2, 3];
+            // Peer 0 was outpaced by peer 1.
+            assert_eq!(next_order(&order, &order, &outcome(Some(1), vec![], vec![0])), vec![1, 2, 3, 0]);
+            // Peer 0 missed and peer 1 was outpaced; peer 2 won and peer 3 was never asked.
+            assert_eq!(next_order(&order, &order, &outcome(Some(2), vec![0], vec![1])), vec![2, 3, 0, 1]);
+            // The first peer answered at once: nothing moves.
+            assert_eq!(next_order(&order, &order, &outcome(Some(0), vec![], vec![])), vec![0, 1, 2, 3]);
+            // Nobody won and everybody missed: the order stands.
+            assert_eq!(next_order(&order, &order, &outcome(None, vec![0, 1, 2, 3], vec![])), vec![0, 1, 2, 3]);
+        }
+
+        #[test]
+        fn race_positions_map_through_the_order_the_race_used() {
+            // The race asked in order [2, 0, 1], so its position 0 is peer 2.
+            let order = [2, 0, 1];
+            assert_eq!(next_order(&order, &order, &outcome(Some(1), vec![], vec![0])), vec![0, 1, 2]);
+            // A race that ran on an older order still applies by peer id, and a
+            // position outside that order is ignored rather than trusted.
+            let asked = [0, 1, 2];
+            assert_eq!(next_order(&[1, 2, 0], &asked, &outcome(Some(2), vec![7], vec![0])), vec![2, 1, 0]);
+        }
+
+        #[test]
+        fn the_order_stays_a_permutation() {
+            let order = [3, 1, 4, 0, 2];
+            for winner in [None, Some(0), Some(4)] {
+                let next = next_order(&order, &order, &outcome(winner, vec![1, 2], vec![3]));
+                let mut sorted = next.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, vec![0, 1, 2, 3, 4], "{next:?}");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_first_peer_costs_one_hedge_delay_per_call() {
+            // Peer 0 never answers and peer 1 answers in 50 ms. Three state
+            // reads in one call, each asking in the order the previous one left.
+            let ask = |id: usize| async move {
+                crate::el::peer::mark_request_sent();
+                let wait = if id == 0 { Duration::from_secs(600) } else { Duration::from_millis(50) };
+                tokio::time::sleep(wait).await;
+                Ok::<usize, String>(id)
+            };
+            let mut order = vec![0usize, 1];
+            let mut costs = Vec::new();
+            for _ in 0..3 {
+                let started = tokio::time::Instant::now();
+                let out = hedged_race(&order, HEDGE_DELAY, ask, |_: &usize| true).await;
+                costs.push(started.elapsed());
+                assert_eq!(out.accepted.as_ref().map(|(_, id)| *id), Some(1));
+                order = next_order(&order, &order, &out);
+            }
+            let fast = Duration::from_millis(50);
+            assert_eq!(costs, vec![HEDGE_DELAY + fast, fast, fast]);
+        }
     }
 }

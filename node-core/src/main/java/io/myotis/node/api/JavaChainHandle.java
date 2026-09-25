@@ -84,10 +84,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     /**
      * Wake-and-wait shared by the verified operator queries: a query on a paused
-     * stack triggers resume and waits up to the cap for readiness. A RUNNING-but-cold
-     * stack does NOT block to full readiness — it proceeds and the query/backend emits
-     * its own bounded errors. Only a PAUSED-at-deadline (resume kept failing) throws;
-     * a STOPPED stack falls through to each query's existing "Node is not running" guard.
+     * stack triggers resume and waits up to the cap for readiness, as does one
+     * arriving during a start/resume warm-up. Otherwise a RUNNING stack that isn't
+     * ready does NOT block — it proceeds and the query/backend emits its own bounded
+     * errors (#312). Only a PAUSED-at-deadline (resume kept failing) throws; a
+     * STOPPED stack falls through to each query's existing "Node is not running" guard.
      */
     private void awaitWake() {
         stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
@@ -100,6 +101,10 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
     @Override public void setTargetSnapPeers(int target) { stack.setTargetSnapPeers(target); }
 
     @Override public void setServedBlockWindow(int blocks) { stack.setServedBlockWindow(blocks); }
+
+    @Override public void setWsBoundPeriods(long periods) { stack.setWsBoundPeriods(periods); }
+
+    @Override public void acceptStaleAnchor() { stack.acceptStaleAnchor(); }
 
     @Override
     public void clearPeerState() {
@@ -161,11 +166,17 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 bss != null ? bss.getFinalizedSlot() : 0L,
                 bss != null ? bss.getFinalizedExecution().blockNumber() : 0L,
                 bss != null ? bss.getCatchUpStartPeriod() : -1L,
-                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                // While parked in STALE_ANCHOR the store holds no committee yet, so
+                // "current" is the refused anchor's period — target minus current is
+                // the anchor age the bound was compared against.
+                beaconState == BeaconState.STALE_ANCHOR
+                        ? bss.getStaleAnchorPeriod()
+                        : bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
                 wallClockPeriod,
                 bss != null ? bss.getFinalizedPeriod() : 0L,
                 wallClockPeriod,
                 backend != null ? backend.verifiedHeadAgeMs() : Long.MAX_VALUE,
+                bss != null ? bss.getWsBoundPeriods() : 0L,
                 readyRows,
                 stack.pauseCount(),
                 stack.totalPausedMs(),
@@ -250,7 +261,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         return new io.myotis.api.BeaconStatus(
                 state,
                 blc != null && blc.isBootstrapped(),
-                bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
+                // Parked in STALE_ANCHOR: report the refused anchor's period (see
+                // BeaconStatus.wsBoundPeriods javadoc).
+                state == io.myotis.api.BeaconState.STALE_ANCHOR
+                        ? bss.getStaleAnchorPeriod()
+                        : bss != null ? bss.getCurrentSyncCommitteePeriod() : 0L,
                 BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot()),
                 stack.discV5() != null ? stack.discV5().liveNodeCount() : 0,
                 peers.size(),
@@ -264,6 +279,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 bss != null ? bss.getExecutionBlockNumber() : 0L,
                 bss != null ? bss.getKnownStateRootCount() : 0,
                 BeaconSyncState.FILL_THRESHOLD,
+                bss != null ? bss.getWsBoundPeriods() : 0L,
                 peers);
     }
 
@@ -309,7 +325,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         stack.beginRequest();
         try {
             return io.myotis.node.VerifiedStorageQuery.query(
-                    conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull);
+                    conn, stack.beaconSyncState(), hexAddress, slot, holderHexOrNull, stack.readStats());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new EngineException("interrupted while querying storage", e);
@@ -320,6 +336,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         } finally {
             stack.endRequest();
         }
+    }
+
+    @Override
+    public String readStatsJson() {
+        return stack.readStats().toJson();
     }
 
     @Override

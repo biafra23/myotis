@@ -17,23 +17,46 @@ fun main() {
     // lib BEFORE anything touches Engines. Dev runs pass an explicit
     // -Dmyotis.engine.lib (absolute path) and win; a missing lib leaves the
     // property unset, and the selector's Java fallback still works.
-    if (System.getProperty("myotis.engine.lib") == null) {
-        System.getProperty("compose.application.resources.dir")
-            ?.takeIf { it.isNotBlank() } // blank would resolve against the CWD
-            ?.let { dir ->
-            val os = System.getProperty("os.name").lowercase()
-            val lib = when {
-                os.contains("mac") -> "libmyotis_engine.dylib"
-                os.contains("win") -> "myotis_engine.dll"
-                else -> "libmyotis_engine.so"
-            }
-            val f = Path.of(dir, lib).toFile()
-            if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
+    val resourcesDir: Path? = System.getProperty("compose.application.resources.dir")
+        ?.takeIf { it.isNotBlank() } // blank would resolve against the CWD
+        ?.let(Path::of)
+    if (System.getProperty("myotis.engine.lib") == null && resourcesDir != null) {
+        val os = System.getProperty("os.name").lowercase()
+        val lib = when {
+            os.contains("mac") -> "libmyotis_engine.dylib"
+            os.contains("win") -> "myotis_engine.dll"
+            else -> "libmyotis_engine.so"
         }
+        val f = resourcesDir.resolve(lib).toFile()
+        if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
     }
-    val dataDir = Path.of(System.getProperty("user.home"), ".myotis")
+    // A PoC flavour (-PbeePoc / -PrailgunPoc → -Dmyotis.<flavour>=true) lives in its own
+    // data dir and seeds that network's log index from the bundle before anything reads
+    // that dir. Null for a regular build, which is every build that sets neither property.
+    val poc = Poc.active()
+    val dataDir = poc?.dataDir() ?: Path.of(System.getProperty("user.home"), ".myotis")
+    // Keep the PoC's logs in its own data dir too. logback-desktop.xml reads
+    // myotis.logdir when the first logger is created, so this must precede
+    // every log call (PocFlavour's logger is lazy for exactly this reason).
+    if (poc != null && System.getProperty("myotis.logdir") == null) {
+        System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
+    }
+    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
+    // processes, so hold a user-initiated activity for the process lifetime (AppNap.kt).
+    // After the logdir property: the outcome is the first line of a start's log.
+    if (AppNap.isMac) {
+        val held = AppNap.disable("Myotis serves JSON-RPC on localhost")
+        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
+            if (held) "App Nap disabled for this process (NSProcessInfo activity held)"
+            else "App Nap NOT disabled — RPC may stall while the window is hidden",
+        )
+    }
+    val settingsFile = dataDir.resolve("settings.properties")
+    val firstStart = !java.nio.file.Files.exists(settingsFile)
+    poc?.installSeedIfAbsent(resourcesDir, dataDir)
     // settings first: the controller reads it at boot (configured RPC port + snap target).
-    val settings = DesktopSettings(file = dataDir.resolve("settings.properties"))
+    val settings = DesktopSettings(file = settingsFile)
+    poc?.applyFirstStartSettings(settings, firstStart)
     val controller = DesktopNodeController(dataDir, settings)
     // Apply the persisted engine choice BEFORE the first network start, so a saved
     // Rust-engine preference survives a restart (Android parity: NodeService applies
@@ -58,7 +81,9 @@ fun main() {
             // Tear down the in-process node stack (Netty event loops, libp2p, sync threads)
             // before exiting so closing the window doesn't leak resources or hang shutdown.
             onCloseRequest = { controller.shutdown(); exitApplication() },
-            title = "Myotis",
+            // The window title names the flavour, so two PoC builds running side by side
+            // are distinguishable at a glance (they already own separate data dirs).
+            title = poc?.let { "Myotis ${it.label}" } ?: "Myotis",
         ) {
             NodeScreen(controller, settings, DesktopLogSource, history = history)
         }

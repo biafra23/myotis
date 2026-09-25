@@ -11,6 +11,10 @@ internal actual fun rpcLogInfo(logger: String, message: String) {
     LoggerFactory.getLogger(logger).info(message)
 }
 
+internal actual fun rpcLogWarn(logger: String, message: String) {
+    LoggerFactory.getLogger(logger).warn(message)
+}
+
 internal actual fun rpcLogDebugEnabled(logger: String): Boolean =
     LoggerFactory.getLogger(logger).isDebugEnabled
 

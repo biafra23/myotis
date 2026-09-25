@@ -12,11 +12,13 @@ on:
   # Manual publish path: attach debs built from the CURRENT ref to an existing
   # release (added so Linux builds could join v0.1.0, which was tagged before
   # this workflow existed, without moving the tag). Note the assets then come
-  # from the dispatched branch tip, not the tag commit.
+  # from the dispatched branch tip, not the tag commit — which is why such a
+  # backfill names them after the version they were built as, not after the
+  # tag (see the publish job).
   workflow_dispatch:
     inputs:
       release-tag:
-        description: "Existing release tag to upload the debs to (e.g. v0.1.0)"
+        description: "Existing release tag to upload the debs to (e.g. v0.1.0). Dispatched on that same tag, the debs are named Myotis-<tag>-<arch>.deb; dispatched from any other ref (a backfill), they are built from that ref and named after the version they report, Myotis-v<version>-<arch>.deb. --clobber replaces only an identical name, so differently named debs already on the release stay."
         required: true
         type: string
 
@@ -90,7 +92,8 @@ jobs:
       # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
       # NON-minified (main, not main-release): the Java backend (Netty / Besu /
       # BouncyCastle / libp2p) is reflection-heavy and proguard would break it.
-      # Unsigned — installed via `sudo apt install ./Myotis-<arch>.deb` or dpkg -i.
+      # Unsigned — released as Myotis-v<version>-<arch>.deb and installed via
+      # `sudo apt install ./Myotis-v<version>-<arch>.deb` or dpkg -i.
       # Retry to ride out transient repo-resolution blips.
       - name: Build Linux .deb (${{ matrix.arch }})
         run: |
@@ -102,8 +105,9 @@ jobs:
           echo "::error::DEB build failed after 3 attempts"
           exit 1
 
-      # jpackage names the output myotis_<version>_<debarch>.deb; rename to match the
-      # release naming convention (Myotis-<arch> like the dmgs). Assert exactly one deb
+      # jpackage names the output myotis_<version>_<debarch>.deb; rename it to the
+      # arch-only artifact name Myotis-<arch>.deb (like the dmgs; the publish job adds
+      # the tag for the release asset). Assert exactly one deb
       # — zero or multiple should fail here, not silently ship an arbitrary pick.
       - name: Tag .deb with architecture
         run: |
@@ -147,6 +151,15 @@ jobs:
           # assertion keeps that assumption honest).
           rustlib=$(find "$ex" -type f -name 'libmyotis_engine.so' | head -n1 || true)
           [ -n "$rustlib" ] || { echo "::error::libmyotis_engine.so missing from the deb"; exit 1; }
+          # JNA's native stub is staged next to it on every platform (prepareJnaBootLib
+          # in app-desktop/build.gradle.kts, -Djna.boot.library.path); parity with the
+          # dmg workflow's check.
+          jna=$(find "$ex" -type f -name 'libjnidispatch.so' | head -n1 || true)
+          [ -n "$jna" ] || { echo "::error::libjnidispatch.so missing from the deb"; exit 1; }
+          jnainfo=$(file -b "$jna")
+          echo "bundled JNA stub: $jnainfo"
+          echo "$jnainfo" | grep -q "$want_elf" \
+            || { echo "::error::JNA stub ELF arch mismatch: expected $want_elf in: $jnainfo"; exit 1; }
           rustinfo=$(file -b "$rustlib")
           echo "bundled rust engine: $rustinfo"
           echo "$rustinfo" | grep -q "$want_elf" \
@@ -211,9 +224,9 @@ jobs:
     # failed/cancelled build still blocks it as the implicit success() used to.
     #
     # 'skipped' is accepted ONLY on workflow_dispatch. On a tag push the guard is
-    # required to have actually SUCCEEDED: this is the one workflow of the five
-    # whose release job doesn't share its `if` with the guard, so it is the only
-    # one where a future mis-gate could silently degrade to an unguarded publish.
+    # required to have actually SUCCEEDED: this is the one guard caller whose
+    # release job doesn't share its `if` with the guard, so it is the only one
+    # where a future mis-gate could silently degrade to an unguarded publish.
     # Narrowing 'skipped' to the event that legitimately skips makes that fail
     # closed instead.
     if: >-
@@ -276,6 +289,33 @@ jobs:
             test -f "deb/Myotis-${arch}.deb" \
               || { echo "::error::missing deb/Myotis-${arch}.deb"; exit 1; }
           done
+          # Release assets carry the version, like the APK
+          # (Myotis-<tag>-android-debug.apk) — but a name may only claim the
+          # version the deb really is. When the version guard ran (a tag push, or
+          # a republish dispatched on that same tag), it proved the tree these
+          # debs were built from is $tag's version: Myotis-<tag>-<arch>.deb. A
+          # BACKFILL (dispatched from another ref; guard skipped) builds that ref,
+          # not the tag, and a tag-named deb would then report a different
+          # version — the mismatch release-version-guard.yml exists to stop. So
+          # a backfilled deb is named after the Version its own control file
+          # declares — jpackage writes the release version there (project.version
+          # minus -SNAPSHOT, the value the version guard checks; e.g. 0.1.11):
+          # Myotis-v<Version>-<arch>.deb. Renamed before the release is created,
+          # so a rename can never fail after the release exists.
+          debs=()
+          for arch in x64 arm64; do
+            if [ "${GUARD_RESULT}" = "success" ]; then
+              namever="$tag"
+            else
+              built=$(dpkg-deb --field "deb/Myotis-${arch}.deb" Version)
+              printf '%s' "$built" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                || { echo "::error::deb/Myotis-${arch}.deb declares Version '$built', not MAJOR.MINOR.PATCH; refusing to guess its name"; exit 1; }
+              namever="v$built"
+              echo "::notice::backfill onto $tag: the $arch deb is named after the version it was built as ($namever), not after the tag"
+            fi
+            mv "deb/Myotis-${arch}.deb" "deb/Myotis-${namever}-${arch}.deb"
+            debs+=("deb/Myotis-${namever}-${arch}.deb")
+          done
           # Notes via a quoted heredoc + --notes-file: markdown stays literal
           # (no shell escaping of backticks/quotes) and renders as intended.
           notes=$(mktemp)
@@ -285,12 +325,20 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
-          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
-          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          unverified until the walker re-fetches it, and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
           NOTES
           # Create the release if it doesn't exist yet. The dmg/apk workflows may
@@ -307,4 +355,4 @@ jobs:
               --target "${GITHUB_SHA}" \
             || gh release view "$tag" >/dev/null 2>&1
           fi
-          gh release upload "$tag" deb/Myotis-x64.deb deb/Myotis-arm64.deb --clobber
+          gh release upload "$tag" "${debs[@]}" --clobber

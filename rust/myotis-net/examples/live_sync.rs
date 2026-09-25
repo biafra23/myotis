@@ -17,6 +17,10 @@ use std::time::Duration;
 
 use myotis_net::{ChainConfig, SyncHandle, SyncState};
 
+/// How long `--once` waits for SYNCED before failing. Named so the value and
+/// the message it is reported in cannot drift apart again.
+const ONCE_BUDGET: Duration = Duration::from_secs(1500);
+
 #[tokio::main]
 async fn main() {
     // The binary installs a subscriber; the library itself only emits tracing.
@@ -51,7 +55,7 @@ async fn main() {
         }
     };
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1500);
+    let deadline = tokio::time::Instant::now() + ONCE_BUDGET;
     let mut last_status = None;
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -68,7 +72,7 @@ async fn main() {
             std::process::exit(0);
         }
         if once && tokio::time::Instant::now() > deadline {
-            tracing::error!("not SYNCED within 15 minutes");
+            tracing::error!(budget_s = ONCE_BUDGET.as_secs(), "not SYNCED within the budget");
             handle.stop().await;
             std::process::exit(1);
         }

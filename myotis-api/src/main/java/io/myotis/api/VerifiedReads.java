@@ -11,6 +11,15 @@ package io.myotis.api;
  * literal {@code "null"} (a <em>verified</em> "not found" — e.g. an unknown tx on
  * a synced chain), or {@code null} (no verified answer).
  *
+ * <p>JSON-string read methods may additionally return a single-key
+ * {@code {"error": "..."}} envelope in place of a bare {@code null} when the
+ * failure carries a reason worth surfacing to the caller (the RPC router turns
+ * it into a -32000 with that reason; {@code getLogs} pioneered the shape for
+ * index-coverage errors — that method keeps its own, looser envelope contract).
+ * A bare {@code null} stays valid and maps to the generic retryable error.
+ * Both engines — and every host backend, iOS included — implement the same
+ * convention: diagnostics must not depend on the engine toggle or the host.
+ *
  * <p>All methods are blocking; call from a worker thread. Block selectors are
  * strings: {@code "latest"}, {@code "pending"}, or a 0x-hex block number.
  */

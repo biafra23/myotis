@@ -1,6 +1,5 @@
 package com.jaeckel.ethp2p.android;
 
-import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -87,11 +86,6 @@ public final class NodeService extends Service {
     // that discovery signal without serving unverified data. Flip to false only for
     // local debugging against an injected upstream.
     private static final boolean STRICT_NO_PROXY = true;
-    // Max blocks below the verified head we'll fetch+verify headers for to answer
-    // eth_getBlockByNumber by number. "latest" is 1 header; older numbers cost a header
-    // range, so bound it (MetaMask asks for "latest" for the fee market anyway).
-    private static final int BLOCK_LOOKBACK_MAX = 256;
-
     // Static so MainActivity can reflect the correct button state after a
     // configuration change — the activity instance is recreated, but the
     // service process (and this flag) outlive it.
@@ -101,16 +95,41 @@ public final class NodeService extends Service {
         return RUNNING.get();
     }
 
+    /** {@link #bootOutcome} value for a fully successful boot. */
+    public static final String BOOT_STARTED = "started";
+    /** Terminal verdict of each network's most recent boot attempt:
+     *  {@link #BOOT_STARTED} once {@code buildAndStart} ran the engine's whole start
+     *  sequence to completion, a failure description on a failed attempt, absent while
+     *  the current attempt hasn't recorded one (a deliberately bailed attempt — a
+     *  stop/disable raced the boot — leaves it absent). ChainStack.start() catches
+     *  {@code Throwable} internally (a linkage Error there returns {@code false}
+     *  instead of crashing the process), so without this record a boot failure is
+     *  observable only as "the handle never appears". Verdict lifecycle rides
+     *  {@link #bootLock}: cleared at the top of each attempt's locked boot region and
+     *  written terminally under the same hold, so attempts serialized by the lock
+     *  can't interleave their verdicts (a brief pre-lock window still shows the
+     *  previous attempt's verdict). STATIC like {@link #RUNNING}/{@link #ENGINE}:
+     *  per-network-stack state that outlives service instances. Consumed by the
+     *  API-29 boot smoke test (androidTest); available to the UI as well. */
+    private static final Map<String, String> BOOT_OUTCOMES = new ConcurrentHashMap<>();
+
+    /** The most recent boot attempt's terminal verdict for {@code network} — null
+     *  while no attempt has finished, {@link #BOOT_STARTED}, or a failure summary. */
+    public static String bootOutcome(String network) {
+        return BOOT_OUTCOMES.get(canonicalNetwork(network));
+    }
+
     // ----- Settings (SharedPreferences "ethp2p"), shared by the service + Compose UI -----
     private static final String PREFS_NAME = "ethp2p";
     private static final String K_NETWORK = "network";
     private static final String K_RPC_PORT = "rpcPort";
     private static final String K_SNAP_TARGET = "snapTarget";
     private static final String K_SERVED_WINDOW = "servedBlockWindow";
+    private static final String K_WS_BOUND = "wsBoundPeriods";
     private static final String K_DEEP_POOL = "deepPoolThreshold";
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
-    private static final String K_RUST_ENGINE = "rustEngine";
+    private static final String K_PREFER_JAVA = "engine.preferJava";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
@@ -242,9 +261,44 @@ public final class NodeService extends Service {
         return rpcPortFor(c, primaryNetwork(c));
     }
     /** Persist the JSON-RPC port for a specific network (ports are per-network — see {@link #rpcPortKey}). */
-    /** Opt-in eth_getLogs Kohaku-preset index for one network (Rust engine only). */
+    /** Opt-in eth_getLogs watch-list index for one network (Rust engine only). */
     public static boolean logIndexEnabled(android.content.Context c, String network) {
         return prefs(c).getBoolean("logIndex." + canonicalNetwork(network), false);
+    }
+
+    /** Whether an explicit log-index enabled/disabled flag is persisted for one network
+     *  (see {@code Settings.logIndexConfigured}): a configured network always pushes its
+     *  config — a disable must reach the engine or its boot-time activate-from-disk
+     *  re-enables an imported index. */
+    public static boolean logIndexConfigured(android.content.Context c, String network) {
+        return prefs(c).contains("logIndex." + canonicalNetwork(network));
+    }
+
+    /** The user's watched contracts for one network's log index, as
+     *  {@code io.myotis.ui.LogIndexWatch}'s JSON array (same key scheme as the desktop).
+     *  MIGRATION on first read: a user who had the retired built-in Kohaku preset toggle
+     *  on has the enabled flag persisted but NO watch entries (the preset lived in code) —
+     *  seed from the legacy preset so the next config push does not silently drop their
+     *  subscriptions. */
+    public static String logIndexWatchJson(android.content.Context c, String network) {
+        String net = canonicalNetwork(network);
+        String key = "logIndex.watch." + net;
+        String v = prefs(c).getString(key, null);
+        if (v != null) {
+            return v;
+        }
+        if (logIndexEnabled(c, net)) {
+            String legacy = io.myotis.ui.LogIndexWatch.legacyKohakuWatchJson(net);
+            if (legacy != null) {
+                prefs(c).edit().putString(key, legacy).apply();
+                return legacy;
+            }
+        }
+        return "[]";
+    }
+
+    public static void setLogIndexWatchJson(android.content.Context c, String network, String json) {
+        prefs(c).edit().putString("logIndex.watch." + canonicalNetwork(network), json).apply();
     }
 
     /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
@@ -254,6 +308,15 @@ public final class NodeService extends Service {
 
     public static void setLogIndexMaxSpeed(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean("logIndex.maxSpeed." + canonicalNetwork(network), on).apply();
+    }
+
+    /** Backfill OFF switch (true = the downward walk does not run); same key scheme. */
+    public static boolean logIndexBackfillPaused(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex.backfillPaused." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexBackfillPaused(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex.backfillPaused." + canonicalNetwork(network), on).apply();
     }
 
     public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
@@ -276,6 +339,25 @@ public final class NodeService extends Service {
         }
         try {
             return handle.logIndexStatusJson();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The read-fetch shadow-cache counters JSON for the Status tab's Reads
+     *  rows (docs/read-stats.md), or null when the network isn't hosted. A
+     *  status probe like the log-index one: not gated on readiness. */
+    public String readStatsJsonOrNull(String network) {
+        String net = canonicalNetwork(network);
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(net);
+        }
+        if (handle == null) {
+            return null;
+        }
+        try {
+            return handle.readStatsJson();
         } catch (RuntimeException e) {
             return null;
         }
@@ -331,9 +413,11 @@ public final class NodeService extends Service {
 
     private void pushLogIndexConfig(String net, ChainHandle handle) {
         boolean enabled = logIndexEnabled(this, net);
-        String json = io.myotis.ui.KohakuPreset.INSTANCE.configJson(net, enabled, logIndexMaxSpeed(this, net));
+        String json = io.myotis.ui.LogIndexWatch.configJson(
+                logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
+                logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
         if (json == null) {
-            return; // no preset for this network — engine stays honestly unconfigured
+            return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
         }
         boolean ok = handle.setLogIndexConfig(json);
         if (enabled && !ok) {
@@ -365,6 +449,15 @@ public final class NodeService extends Service {
     }
     public static void setServedBlockWindowPref(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_SERVED_WINDOW, clampInt(v, 1, 4096, 32)).apply();
+    }
+    /** Weak-subjectivity anchor-age bound override in sync-committee periods
+     *  (0 = each network's built-in default; capped so a typo can't store an
+     *  absurd bound). Raising it weakens the long-range-attack guarantee. */
+    public static int wsBoundPeriods(android.content.Context c) {
+        return clampInt(prefs(c).getInt(K_WS_BOUND, 0), 0, 9999, 0);
+    }
+    public static void setWsBoundPeriodsPref(android.content.Context c, int v) {
+        prefs(c).edit().putInt(K_WS_BOUND, clampInt(v, 0, 9999, 0)).apply();
     }
     /** UI readiness "deep pool" threshold (1–128, default 16). */
     public static int deepPoolThreshold(android.content.Context c) {
@@ -440,24 +533,48 @@ public final class NodeService extends Service {
     public static String blsBackendChoice(android.content.Context c) {
         return nativeBlsEnabled(c) ? "auto" : "milagro";
     }
-    /** Settings toggle: prefer the (experimental) Rust engine for newly started networks.
-     *  Default off — the Java engine is the proven path. */
-    public static boolean rustEngineEnabled(android.content.Context c) {
-        return prefs(c).getBoolean(K_RUST_ENGINE, false);
+    /** Settings toggle: force the Java engine for newly started networks. Default off —
+     *  the selector's {@code auto} mode (Rust engine where it can serve — it alone serves
+     *  the log index and Tor routing — Java fallback otherwise) is the default. Replaces
+     *  the pre-auto-default "rustEngine" preference. MIGRATION: rustEngine=true meant
+     *  "auto", which is the new default — nothing to carry. But a PRESENT rustEngine=false
+     *  is a user who touched the toggle and deliberately ended on the Java engine — an
+     *  expressed opt-out this seeds into the new key rather than silently discarding. */
+    public static boolean preferJavaEngine(android.content.Context c) {
+        // Never honoured below the Java-engine gate (EngineGate): the engine cannot link on
+        // that ART. The stored value is kept, so an OS upgrade past the gate restores it.
+        if (!javaEngineSupported()) return false;
+        android.content.SharedPreferences p = prefs(c);
+        if (!p.contains(K_PREFER_JAVA) && p.contains("rustEngine") && !p.getBoolean("rustEngine", true)) {
+            p.edit().putBoolean(K_PREFER_JAVA, true).apply();
+            return true;
+        }
+        return p.getBoolean(K_PREFER_JAVA, false);
     }
-    public static void setRustEngineEnabled(android.content.Context c, boolean v) {
-        prefs(c).edit().putBoolean(K_RUST_ENGINE, v).apply();
+    public static void setPreferJavaEngine(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_PREFER_JAVA, v).apply();
     }
-    /** Apply the Rust-engine setting to the process-wide {@code Engines} selector. Maps
-     *  enabled → {@code auto} (prefer Rust where it can serve, fall back to Java with a
-     *  log — the Rust engine is catalog-only today), disabled → {@code java}. Unlike the
-     *  BLS toggle this is NOT live: networks keep the engine that created them; the new
-     *  choice applies on the next network (re)start. Returns the applied choice. */
+    /** Apply the engine setting to the process-wide {@code Engines} selector. Maps the
+     *  default → {@code auto} (prefer Rust where it can serve, fall back to Java with a
+     *  log), prefer-Java → {@code java}. Below {@link EngineGate#JAVA_ENGINE_MIN_SDK} it is
+     *  always a hard {@code rust}: no fallback to a Java engine that cannot link on that
+     *  ART, so a Rust create() failure fails the boot visibly. Unlike the BLS toggle this
+     *  is NOT live: networks keep the engine that created them; the new choice applies on
+     *  the next network (re)start. Returns the applied choice. */
     public static String applyEngineChoice(android.content.Context c) {
-        String choice = rustEngineEnabled(c) ? "auto" : "java";
+        String choice = EngineGate.engineChoice(android.os.Build.VERSION.SDK_INT, preferJavaEngine(c));
         System.setProperty(io.myotis.engines.Engines.PROP, choice);
         io.myotis.engines.Engines.select(choice);
         return choice;
+    }
+    /** Whether this device's ART can run the Java engine at all (see {@link EngineGate}). */
+    public static boolean javaEngineSupported() {
+        return EngineGate.javaEngineSupported(android.os.Build.VERSION.SDK_INT);
+    }
+    /** Settings text explaining why the Java engine is unavailable on this device, or
+     *  null when it is available. */
+    public static String javaEngineUnavailableReason() {
+        return EngineGate.javaEngineUnavailableReason(android.os.Build.VERSION.SDK_INT);
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -474,6 +591,28 @@ public final class NodeService extends Service {
         // Same monitor as buildAndStart's read-apply-publish: see the comment there.
         synchronized (handles) {
             for (ChainHandle h : handles.values()) h.setServedBlockWindow(c);
+        }
+    }
+
+    /** Live-update the weak-subjectivity bound override (0 = network default) on every
+     *  live stack and persist it. A stack parked in STALE_ANCHOR re-evaluates within
+     *  a second, so raising the bound from Settings releases it without a restart. */
+    public void setWsBoundPeriods(int v) {
+        int c = clampInt(v, 0, 9999, 0);
+        setWsBoundPeriodsPref(this, c);
+        // Same monitor as buildAndStart's read-apply-publish: see the comment there.
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) h.setWsBoundPeriods(c);
+        }
+    }
+
+    /** One-shot consent to sync {@code network} forward from a stale anchor — releases
+     *  its STALE_ANCHOR park for the rest of this run; never persisted (a restart with
+     *  a still-stale anchor parks, and asks, again). */
+    public void acceptStaleAnchor(String network) {
+        synchronized (handles) {
+            ChainHandle h = handles.get(network);
+            if (h != null) h.acceptStaleAnchor();
         }
     }
 
@@ -847,10 +986,22 @@ public final class NodeService extends Service {
                 io.myotis.api.LifecycleState ls;
                 try { ls = h.lifecycle(); } catch (Throwable t) { continue; }
                 if (ls != io.myotis.api.LifecycleState.RUNNING) continue;
+                // The engine's own timestamp of the most recent DEMAND wake (ipc / request /
+                // catch-up — SleepMetrics.onResume). An out-of-process myotis_wakeup resumes
+                // through the engine and bumps NONE of the host stamps below, so without this
+                // the ticker would re-pause a node a client just woke, mid-rebuild, before its
+                // first verified read. Reading the engine's exact resume instant closes that
+                // window race-free — unlike sampling lifecycle() at 30 s ticks, which misses a
+                // wake landing between two RUNNING samples. FOREGROUND wakes don't stamp it, but
+                // those are host-initiated and already covered by lastResumeMs.
+                long engineResumeMs;
+                try { engineResumeMs = h.status().lastResumeEpochMs(); }
+                catch (Throwable t) { engineResumeMs = 0L; }
                 long lastActivity = Math.max(
                         Math.max(h.lastActivityEpochMillis(), uiActivityMs),
-                        Math.max(lastResumeMs.getOrDefault(n, 0L),
-                                 stackStartMs.getOrDefault(n, 0L)));
+                        Math.max(Math.max(lastResumeMs.getOrDefault(n, 0L),
+                                          stackStartMs.getOrDefault(n, 0L)),
+                                 engineResumeMs));
                 if (now - lastActivity <= idleMs) continue;
                 if (skipWhileCharging) continue; // plugged in: keep awake and synced
                 // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
@@ -1246,6 +1397,9 @@ public final class NodeService extends Service {
             boolean elHunting,            // EL hunt engaged (snap serving pool empty past stall)
             int rpcPort,                  // configured JSON-RPC port (0 = none)
             boolean rpcServing,           // listener bound and live on 127.0.0.1:rpcPort
+            long wsBoundPeriods,          // weak-subjectivity bound (periods) the engine enforces;
+                                          // with beaconState STALE_ANCHOR, syncTargetPeriod -
+                                          // syncCurrentPeriod is the refused anchor's age
             // Fork watch: peers announce (or already activated) a network upgrade this
             // build doesn't support; null = none / not watched here. Kept while paused.
             io.myotis.api.UpgradeAdvisory upgradeAdvisory) {}
@@ -1298,24 +1452,22 @@ public final class NodeService extends Service {
      * The shortcut is checked first so that when it does fire we save a
      * round-trip; otherwise we fall through to the headerChain path.
      */
-    // CompletableFuture.failedFuture (Java 9, hidden behind Android API 31)
-    // and orTimeout (also gated to API 31) are backported to minSdk 29 via
-    // desugar_jdk_libs 2.1.3 — see android-app/build.gradle.kts. Lint flags
-    // them anyway because its API database doesn't track desugar coverage
-    // for every CF method. Suppress at the method level rather than file —
-    // a future use of a *genuinely* unbackported API should still trip.
+    // CompletableFuture.failedFuture is Android API 31 (see CLAUDE.md's minSdk
+    // budget). Engine modules use core's Futures helper; this host inlines the
+    // two lines instead (hosts talk only to :myotis-api), the same way the
+    // key-store below hand-rolls its hex.
     /** Back-compat: query against the primary enabled network. */
     public CompletableFuture<AccountQueryResult> requestAccount(String hexAddress) {
         return requestAccount(primaryNetwork(this), hexAddress);
     }
 
-    @SuppressLint("NewApi") // CompletableFuture.failedFuture (API 31) is backported to
-                            // minSdk 29 via desugar_jdk_libs — see the comment block above.
     public CompletableFuture<AccountQueryResult> requestAccount(String network, String hexAddress) {
         noteUiActivity();
         ChainHandle handle = handles.get(canonicalNetwork(network));
         if (handle == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            CompletableFuture<AccountQueryResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("Node is not running"));
+            return failed;
         }
         // The engine call is blocking (snap fetch + verification ladder, internally
         // timeout-bounded) — run it on the query pool and expose the future the UI expects.
@@ -1472,7 +1624,6 @@ public final class NodeService extends Service {
         return resolveEns(primaryNetwork(this), name);
     }
 
-    @SuppressLint("NewApi") // CompletableFuture.failedFuture — see requestAccount
     public CompletableFuture<EnsResolution> resolveEns(String network, String name) {
         noteUiActivity();
         final String trimmed = name == null ? "" : name.trim();
@@ -1603,7 +1754,10 @@ public final class NodeService extends Service {
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice
-                    + ", engine " + engineChoice + ")");
+                    + ", engine " + engineChoice
+                    + (javaEngineSupported() ? "" : " (Java engine needs API "
+                            + EngineGate.JAVA_ENGINE_MIN_SDK + "+, no fallback)")
+                    + ")");
 
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to
@@ -1614,6 +1768,11 @@ public final class NodeService extends Service {
             // start() too, since start() blocks and the race window spans it. spawnBoot's worker fires
             // the service-stop check after every bail/return path.
             synchronized (bootLock(n)) {
+                // A new attempt voids the previous verdict — INSIDE the lock, so
+                // verdict transitions serialize with the attempts they describe
+                // (see the BOOT_OUTCOMES javadoc). The bail paths below record
+                // nothing: absent means "no verdict".
+                BOOT_OUTCOMES.remove(n);
                 if (!RUNNING.get() || !isNetworkEnabled(this, n) || stopGen(n) != gen) {
                     LogBuffer.i(TAG, "[" + n + "] stop/disable raced boot; skipping");
                     forgetStack(n);
@@ -1628,6 +1787,7 @@ public final class NodeService extends Service {
                     LogBuffer.i(TAG, "[" + n + "] boot skipped: already hosted by the engine");
                     ChainHandle existing = ENGINE.get(n);
                     if (existing != null) handles.putIfAbsent(n, existing);
+                    BOOT_OUTCOMES.put(n, BOOT_STARTED); // a live stack is a started stack
                     return;
                 }
 
@@ -1652,7 +1812,6 @@ public final class NodeService extends Service {
                 EngineConfig config = new EngineConfig(
                         n, 0, 0, rpcPort,
                         netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
-                        /*gossipsub*/ false,
                         snapTarget(this),
                         strictStateFreshness(this),
                         // Reconstructible engine-owned state belongs with the other network
@@ -1695,11 +1854,18 @@ public final class NodeService extends Service {
                 // would leave the live window one Save behind the pref.
                 synchronized (handles) {
                     handle.setServedBlockWindow(servedBlockWindow(this));
+                    // Weak-subjectivity bound override rides the same pre-start apply
+                    // + monitor: the cold-start gate must judge with it.
+                    handle.setWsBoundPeriods(wsBoundPeriods(this));
                     handles.put(n, handle);
                 }
 
                 if (!handle.start()) {
                     LogBuffer.e(TAG, "[" + n + "] node stack failed to start");
+                    // ChainStack.start() caught the real cause (Throwable, stack
+                    // trace in its log line) and returned false; record the verdict.
+                    BOOT_OUTCOMES.put(n, "engine start() returned false — see the "
+                            + "\"stack failed to start\" log line for the cause");
                     forgetStack(n);
                     try { ENGINE.stop(n); } catch (Throwable ignored) {}
                     return;
@@ -1715,6 +1881,7 @@ public final class NodeService extends Service {
                 // the raced-stop guard, so a condemned stack never pays for
                 // the index install / appender spin-up.
                 pushLogIndexConfig(n, handle);
+                BOOT_OUTCOMES.put(n, BOOT_STARTED);
             }
             updateNotification();
             LogBuffer.i(TAG, "[" + n + "] node stack started (RPC " + rpcPort + ")");
@@ -1729,6 +1896,17 @@ public final class NodeService extends Service {
             // bookkeeping from this attempt can remain).
             synchronized (bootLock(n)) {
                 ChainHandle current = handles.get(n);
+                // Failure verdict under the lock, and only while this attempt is
+                // still the one the network's state reflects: a racing NEWER attempt
+                // that already registered its own healthy handle owns the verdict —
+                // an unconditional put here would stamp a failure over a live stack.
+                // (current == created also covers the adopted-broken-handle edge:
+                // an "already hosted" adopter that raced this thrower stamped
+                // BOOT_STARTED on the handle we're about to tear down; this write,
+                // ordered after it by the lock, corrects the record.)
+                if (current == created || current == null) {
+                    BOOT_OUTCOMES.put(n, unwrap(e));
+                }
                 if (created != null ? current == created : current == null) {
                     forgetStack(n);
                     if (created != null && ENGINE.get(n) == created) {
@@ -1985,7 +2163,7 @@ public final class NodeService extends Service {
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(),
+                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
                     s.upgradeAdvisory());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
@@ -2002,7 +2180,7 @@ public final class NodeService extends Service {
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(),
+                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
                 s.upgradeAdvisory());
     }
 

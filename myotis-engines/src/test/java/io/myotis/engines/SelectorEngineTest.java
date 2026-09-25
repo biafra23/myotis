@@ -39,7 +39,7 @@ class SelectorEngineTest {
 
     @AfterEach
     void resetChoice() {
-        Engines.select("java");
+        Engines.select("auto");
         // The engine is a process-global singleton: if an assertion fired between a
         // test's create() and its stop(), the network would stay hosted and poison
         // later tests. shutdownAll() clears every hosted network on both engines.
@@ -80,21 +80,21 @@ class SelectorEngineTest {
 
     private static EngineConfig config(String network) {
         // Non-default ports so a create-only test can't collide with a live daemon.
-        return new EngineConfig(network, 42303, 42900, 42545, null, false, 0, true, null);
+        return new EngineConfig(network, 42303, 42900, 42545, null, 0, true, null);
     }
 
     @Test
-    void defaultChoiceIsJavaAndCatalogAnswers() {
-        assertEquals("java", Engines.choice());
+    void defaultChoiceIsAutoAndCatalogAnswers() {
+        assertEquals("auto", Engines.choice());
         MyotisEngine e = Engines.engine();
         assertEquals(3, e.availableNetworks().size());
         assertEquals("gnosis", e.canonicalNetworkName("xdai"));
     }
 
     @Test
-    void invalidChoiceFallsBackToJava() {
+    void invalidChoiceFallsBackToAuto() {
         Engines.select("cobol");
-        assertEquals("java", Engines.choice());
+        assertEquals("auto", Engines.choice());
     }
 
     @Test
@@ -117,6 +117,7 @@ class SelectorEngineTest {
 
     @Test
     void createRoutesAndOwnershipTracksAcrossStopAndSwitch() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         MyotisEngine e = Engines.engine();
         // java-owned create; get() routes through recorded ownership.
         assertNull(e.get("mainnet"));
@@ -135,6 +136,7 @@ class SelectorEngineTest {
 
     @Test
     void engineKindForReportsOwnerAndNullWhenNotHosted() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         assertNull(Engines.engineKindFor("mainnet"));
         Engines.engine().create(config("mainnet"), ports());
         assertEquals("java", Engines.engineKindFor("mainnet"));
@@ -147,6 +149,7 @@ class SelectorEngineTest {
 
     @Test
     void engineKindForResolvesAliases() {
+        Engines.select("java"); // deterministic java-path ownership (default is auto now)
         Engines.engine().create(config("gnosis"), ports());
         assertEquals("java", Engines.engineKindFor("xdai"));
     }
@@ -161,6 +164,40 @@ class SelectorEngineTest {
         assertNotNull(handle);
         assertNotNull(e.get("gnosis"));
         e.stop("gnosis");
+    }
+
+    @Test
+    void autoDoesNotFallBackToJavaOnACallerSuppliedCheckpointDir() throws Exception {
+        // ABI 26: a dataDir marked by the Rust engine's createWithCheckpoint belongs to
+        // the CALLER's trust anchor. In auto mode the Rust create() answers
+        // ANCHOR_MISMATCH (-3); that must surface as an error, never as the usual
+        // "fall back to the Java engine" — which would resume the snapshot there under
+        // the embedded checkpoint, the silent anchor swap the refusal exists to stop.
+        assumeRustAvailable();
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("myotis-anchor-auto");
+        try {
+            java.nio.file.Files.writeString(dir.resolve("sync-anchor.json"),
+                    "{\"checkpointRoot\":\"0x11\",\"checkpointSlot\":1}");
+            Engines.select("auto");
+            MyotisEngine e = Engines.engine();
+            EngineConfig config = new EngineConfig("mainnet", 42303, 42900, 42545,
+                    dir.resolve("sync-state.snapshot").toString(), 0, true, dir.toString());
+            EngineException ex = assertThrows(EngineException.class, () -> e.create(config, ports()));
+            assertTrue(ex.getMessage().contains("caller-supplied checkpoint"), ex.getMessage());
+            assertNull(e.get("mainnet"), "nothing may be hosted after the refusal");
+            assertNull(Engines.engineKindFor("mainnet"));
+        } finally {
+            try (var walk = java.nio.file.Files.walk(dir)) {
+                walk.sorted(java.util.Comparator.reverseOrder())
+                        .forEach(p -> { try { java.nio.file.Files.delete(p); } catch (Exception ignored) { } });
+            }
+        }
+    }
+
+    private static void assumeRustAvailable() {
+        org.junit.jupiter.api.Assumptions.assumeTrue(RustMyotisEngine.isAvailable(),
+                "libmyotis_engine is NOT available — the with-library selector paths "
+                        + "are covered where cargo built it (cargoBuildHost)");
     }
 
     private static void assumeRustUnavailable() {

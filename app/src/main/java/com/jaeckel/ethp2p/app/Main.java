@@ -155,11 +155,32 @@ public final class Main {
     }
 
 
+    /**
+     * Read {@code -Dmyotis.logindex.backfillPaused} STRICTLY.
+     *
+     * {@code Boolean.getBoolean} maps every value but "true" to false, so a typo
+     * (`-D...=tru`) would boot the daemon with the downward walk running and say
+     * nothing — the silent resume this flag exists to prevent. The Gradle bridge
+     * (`-PbackfillPaused`) already rejects such a value; the raw-java form used by
+     * systemd units must not be more forgiving. Absent means "not paused".
+     *
+     * @throws IllegalArgumentException when the property is present but is neither
+     *         {@code true} nor {@code false}
+     */
+    static boolean backfillPausedProperty() {
+        String raw = System.getProperty("myotis.logindex.backfillPaused");
+        if (raw == null) return false;
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.equals("true")) return true;
+        if (v.equals("false")) return false;
+        throw new IllegalArgumentException(
+                "-Dmyotis.logindex.backfillPaused must be true or false (got '" + raw + "')");
+    }
+
     public static void main(String[] args) throws Exception {
-        // Parse --network (comma-separated list), --port, --gossipsub from anywhere in args.
+        // Parse --network (comma-separated list) and --port from anywhere in args.
         List<String> networkNames = new ArrayList<>();
         int port = DEFAULT_PORT;
-        boolean gossipsubEnabled = false;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
@@ -169,24 +190,27 @@ public final class Main {
                 }
             } else if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
-            } else if ("--gossipsub".equals(args[i])) {
-                gossipsubEnabled = true;
             } else {
                 remaining.add(args[i]);
             }
         }
         if (networkNames.isEmpty()) networkNames.add("mainnet");
-        // System property fallback so Android / other embedders can opt in
-        // without touching CLI args.
-        if (!gossipsubEnabled
-                && Boolean.parseBoolean(System.getProperty("beacon.gossipsub", "false"))) {
-            gossipsubEnabled = true;
-        }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
+        // Validate the boot flag HERE, before any socket, lock or engine exists:
+        // a typo must stop the daemon cleanly rather than throw from the middle
+        // of network setup with resources half-acquired.
+        try {
+            backfillPausedProperty();
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.exit(2);
+            return;
+        }
+
         // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
-        // -Dmyotis.engine=java|rust|auto picks the engine (default java; `./gradlew
-        // :app:run -Pengine=rust` passes it through).
+        // -Dmyotis.engine=java|rust|auto picks the engine (default auto — Rust where it
+        // can serve, Java fallback; `./gradlew :app:run -Pengine=java` passes it through).
         MyotisEngine engine = Engines.engine();
 
         // Client commands / purge target a single network — the first listed. Canonicalize
@@ -247,15 +271,15 @@ public final class Main {
                 System.exit(1);
             }
         }
-        runDaemon(engine, canonical, port, gossipsubEnabled);
+        runDaemon(engine, canonical, port);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride,
-                                  boolean gossipsubEnabled) throws Exception {
+    private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride)
+            throws Exception {
         boolean multi = networks.size() > 1;
         log.info("=== ethp2p Daemon ({}) ===", String.join(", ", networks));
 
@@ -298,7 +322,7 @@ public final class Main {
             String dataDir = Path.of("").toAbsolutePath().toString();
             EngineConfig config = multi
                     ? new EngineConfig(network, 0, 0, 0,
-                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            syncSnapshotFile(network).toString(),
                             SNAP_PEER_TARGET, strict, dataDir)
                     : new EngineConfig(network, portOverride, 9000,
                             // Legacy 8545 stays pinned for mainnet (byte-identical
@@ -306,7 +330,7 @@ public final class Main {
                             // catalog default (0 = engine default; sepolia 8547) so a
                             // sepolia daemon beside a mainnet one doesn't collide.
                             "mainnet".equals(network) ? 8545 : 0,
-                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            syncSnapshotFile(network).toString(),
                             SNAP_PEER_TARGET, strict, dataDir);
             // dnsServers=null → resolver's default DNS (the daemon, unlike Android, has
             // system DNS config). The snap maintainer (SNAP_PEER_TARGET) keeps snap peers
@@ -322,6 +346,25 @@ public final class Main {
                     null);
 
             ChainHandle handle = engine.create(config, ports);
+            // Weak-subjectivity knobs (documented operator properties, mirroring the
+            // strictStateFreshness pattern): a bound override in periods, and a
+            // pre-consent for a knowingly-stale anchor (e.g. re-syncing an archived
+            // data dir on an airgapped box). Both land BEFORE start() so the cold-start
+            // gate judges with them.
+            long wsBound = Long.getLong("myotis.beacon.wsBoundPeriods", 0L);
+            if (wsBound > 0) handle.setWsBoundPeriods(wsBound);
+            if (Boolean.getBoolean("myotis.beacon.acceptStaleAnchor")) {
+                log.warn("[{}] -Dmyotis.beacon.acceptStaleAnchor=true: a stale sync anchor "
+                        + "will be accepted WITHOUT the interactive warning", network);
+                handle.acceptStaleAnchor();
+            }
+            // Log-index backfill OFF switch as a BOOT default. The engine holds the
+            // bit at runtime only (it is not in the portable snapshot), and the
+            // daemon has no settings file, so without this a restart resumes the
+            // downward walk — which on a node serving a single consumer is exactly
+            // what starves head-follow (docs/bee-rpc-service.md). Applied after
+            // start(), because the engine activates a drop-in index during start.
+            boolean pauseBackfill = backfillPausedProperty();
             if (!handle.start()) {
                 System.err.println("Failed to start " + network + " node stack");
                 engine.shutdownAll();
@@ -330,6 +373,70 @@ public final class Main {
                 System.exit(1);
                 return;
             }
+            // Pushed in BOTH directions, because the engine activates a drop-in index
+            // with the walk paused (ElReader::install_log_index_from_disk: a file
+            // speaks for the coverage it holds, not for a backfill nobody asked for).
+            // The daemon is the host that asks: absent property = the historical
+            // default, walking.
+            //
+            // OFF THE STARTUP THREAD, because setLogIndexConfig crosses the Rust
+            // handle's wake gate and holds until the stack is ready for reads (~90 s
+            // cap on a cold start). Inline, that delay would land between start() and
+            // the IPC socket below — a daemon that can't answer `status` or `stop`
+            // for a minute and a half — and, with --network a,b, would hold the
+            // second network's start behind the first one's sync.
+            final ChainHandle indexHandle = handle;
+            final String indexNetwork = network;
+            final boolean pauseBackfillFinal = pauseBackfill;
+            // Set by CommandHandler the moment an operator issues logindex-backfill.
+            final java.util.concurrent.atomic.AtomicBoolean backfillCommanded =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            Thread backfillSwitch = new Thread(() -> {
+                // The IPC socket opens while this thread is still parked on the wake
+                // gate, so an operator can issue logindex-backfill inside the warm-up
+                // window; when the gate releases, both would push in arbitrary order.
+                // A boot DEFAULT must not overwrite an explicit command that was
+                // already answered ok, so stand down as late as possible.
+                if (backfillCommanded.get()) {
+                    log.info("[{}] log-index backfill left to the logindex-backfill command "
+                            + "issued during start-up; the boot default stood down", indexNetwork);
+                    return;
+                }
+                // False = this network has no Rust-engine log index at all. Worth
+                // saying only when the operator asked for the switch: with no index
+                // there is no walk either way.
+                if (CommandHandler.setBackfillPaused(indexHandle, pauseBackfillFinal)) {
+                    if (pauseBackfillFinal) {
+                        log.info("[{}] -Dmyotis.logindex.backfillPaused=true: log-index backfill "
+                                + "is OFF; head-follow continues and queries below the covered "
+                                + "range are refused", indexNetwork);
+                    } else {
+                        log.info("[{}] log-index backfill is ON (the daemon default); pause it with "
+                                + "-Dmyotis.logindex.backfillPaused=true or the logindex-backfill "
+                                + "pause command", indexNetwork);
+                    }
+                } else if (pauseBackfillFinal) {
+                    log.warn("[{}] -Dmyotis.logindex.backfillPaused=true had no effect: this "
+                            + "network has no enabled log index (build or import one first); "
+                            + "the switch is refused rather than installing an empty index",
+                            indexNetwork);
+                } else {
+                    // The refusal shape and a real failure both come back false, and
+                    // in the default direction the difference matters: a network WITH
+                    // an activated index that did not take the push is one whose walk
+                    // never started, silently. Re-probe to tell the two apart — the
+                    // status read is ungated, so it answers even if the push didn't.
+                    String probe = indexHandle.logIndexStatusJson();
+                    if (probe != null && probe.contains("\"enabled\":true")) {
+                        log.warn("[{}] log-index backfill could NOT be turned on at boot "
+                                + "(config push refused): this network has an index, so its "
+                                + "downward walk is not running — resume it with the "
+                                + "logindex-backfill on command", indexNetwork);
+                    }
+                }
+            }, "logindex-backfill-boot-" + network);
+            backfillSwitch.setDaemon(true);
+            backfillSwitch.start();
 
             // get-transactions (TrueBlocks debug stream) is the documented exemption from
             // the API boundary — it takes the raw connector via the CONCRETE Java engine's
@@ -378,7 +485,10 @@ public final class Main {
                             }))
                     : null;
 
-            CommandHandler commandHandler = new CommandHandler(handle, stopLatch, debugCommands);
+            // The AtomicBoolean is how a logindex-backfill command tells the boot
+            // thread above to stand down (both cross the same wake gate).
+            CommandHandler commandHandler =
+                    new CommandHandler(handle, stopLatch, debugCommands, backfillCommanded);
             DaemonServer server = new DaemonServer(socketPath(network), commandHandler);
             try {
                 server.start();

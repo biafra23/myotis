@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use myotis_consensus::spec;
 use myotis_consensus::ssz;
+use myotis_consensus::fork::ForkSchedule;
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
     LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate,
@@ -99,7 +100,9 @@ fn replay_reproduces_recorded_verdicts() {
 
     let mut store = LightClientStore::new_mainnet_preset();
     store.initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
-    let mut processor = LightClientProcessor::new(store, fork_version, gvr);
+    // The corpus was recorded under one version — a schedule with no boundary.
+    let mut processor =
+        LightClientProcessor::new(store, ForkSchedule::single(fork_version), gvr);
 
     // ---- catch-up updates, filename order (3-digit corpus convention) ----
     let mut update_files: Vec<_> = fs::read_dir(&dir)

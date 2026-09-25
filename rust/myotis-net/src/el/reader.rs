@@ -7,9 +7,11 @@
 //! trust bridge). A query:
 //!
 //! 1. picks a live snap peer from the pool,
-//! 2. fetches the peer's FRESH head header → its state root + block number (peers
-//!    prune state beyond ~128 blocks, so a beacon-finalized root is usually too
-//!    stale to serve),
+//! 2. picks the state root: the beacon anchor's optimistic root (a head read),
+//!    or the finalized root (a `finalized` read, ABI ≥ 32 — servable while
+//!    the peer's state window, ~128 blocks on geth, still holds it: finality
+//!    trails the head by two epochs, 64–96 blocks, so a finality delay puts
+//!    it out of reach), with the peer's own head as the head read's fallback,
 //! 3. snap-fetches the account/slot and MPT-verifies it against that state root
 //!    (the proof is the trust anchor, never the peer's slim body),
 //! 4. anchors the state root to the beacon chain via the verified ladder
@@ -18,6 +20,7 @@
 //!    in `fail_reason`, never raised.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -32,15 +35,16 @@ use myotis_evm::{
     InMemoryStateProofCache, U256,
 };
 
-use crate::el::anchor::ExecAnchor;
+use crate::el::anchor::{ExecAnchor, FinalizedExecution};
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
 use crate::el::evm::{
-    block_context, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome, EnsRecordValue,
-    EnsRootMode, GasOutcome, PoolOracle,
+    block_context, ReadAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
+    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
 };
-use crate::el::peer::ManagedPeer;
-use crate::el::pool::{PeerPool, PoolConfig};
+use crate::el::peer::{Coverage, ManagedPeer};
+use crate::el::pool::{Enode, PeerPool, PoolConfig};
+use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
 use crate::el::tx;
@@ -75,44 +79,77 @@ pub struct ElConfig {
     /// (discv4 UDP endpoints, no key) these carry the pubkey the ECIES
     /// handshake needs, so they are dialed over RLPx directly instead of
     /// waiting for discovery to surface them.
-    pub boot_enodes: Vec<(std::net::SocketAddr, [u8; 64])>,
+    pub boot_enodes: Vec<Enode>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
-/// Key stable (persisted nodekey); the IP is residential, so a rotation makes
-/// this entry stale and discovery carries the load until it is refreshed.
+/// Key stable (persisted nodekey); the address is the netcup relay
+/// (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard — zbox
+/// itself is behind mobile CGNAT, so its own uplink rotating no longer matters.
 const SEPOLIA_MYOTIS_ENODE: &str =
-    "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405";
+    "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405";
 
-/// Parse `enode://<128 hex pubkey>@host:port` entries into dialable
-/// `(addr, pubkey)` pairs, skipping anything malformed — a bad pin must not
-/// panic a wallet at startup, it just leaves discovery to do the work. Twin of
-/// the Java `ChainStack.parseBootEnodes`.
-fn parse_boot_enodes(enodes: &[&str]) -> Vec<(std::net::SocketAddr, [u8; 64])> {
-    let mut out = Vec::new();
-    for e in enodes {
-        let Some(body) = e.strip_prefix("enode://") else { continue };
-        let Some((pubkey_hex, host_port)) = body.split_once('@') else { continue };
-        // is_ascii() is load-bearing, not belt-and-braces: len() counts BYTES,
-        // so 64 multi-byte chars (e.g. "é" × 64 = 128 bytes) pass the length
-        // check and then panic in the slicing below at a non-char boundary —
-        // an abort, since the workspace builds panic = "abort". This parser
-        // exists to be lenient with untrusted-ish input, so it must not.
-        if pubkey_hex.len() != 128 || !pubkey_hex.is_ascii() {
-            continue;
-        }
-        let Ok(bytes) = (0..64)
-            .map(|i| u8::from_str_radix(&pubkey_hex[i * 2..i * 2 + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-        else {
-            continue;
-        };
-        let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else { continue };
-        let mut pubkey = [0u8; 64];
-        pubkey.copy_from_slice(&bytes);
-        out.push((addr, pubkey));
+/// Parse ONE `enode://<128 hex pubkey>@ip:port` URL, strictly: the prefix, a
+/// 128-character hex public key (`peercache::parse_pubkey` — hex digits
+/// only, so a `+f` pair `from_str_radix` would take is refused, and a
+/// multi-byte character never reaches a slice: the workspace aborts on
+/// panic), `@`, then a NUMERIC `ip:port` (no DNS name — the pool dials socket
+/// addresses, and a name it cannot dial must be refused, never silently
+/// dropped). `Err` names the first rule the entry breaks, so a host's refused
+/// seed push (`myotis_set_boot_enodes`, #465) says why. The network's own
+/// pins go through it leniently (`parse_boot_enodes`).
+pub fn parse_enode(enode: &str) -> Result<Enode, &'static str> {
+    let Some(body) = enode.strip_prefix("enode://") else {
+        return Err("missing the enode:// prefix");
+    };
+    let Some((pubkey_hex, host_port)) = body.split_once('@') else {
+        return Err("missing the '@' between the public key and the address");
+    };
+    // Exactly 128 characters: `parse_pubkey` would also take a `0x` prefix,
+    // which no enode URL form carries.
+    if pubkey_hex.len() != 128 {
+        return Err("the public key must be 128 hex characters");
     }
-    out
+    let Some(pubkey) = crate::el::peercache::parse_pubkey(pubkey_hex) else {
+        return Err("the public key must be 128 hex characters");
+    };
+    // geth prints `?discport=<udp port>` whenever a node's UDP port differs
+    // from its TCP one, so that is what a host copies from `admin.nodeInfo`
+    // or a static-nodes.json. The pool dials TCP only: accept the query and
+    // ignore it; any other query is refused by name, not as a bad address.
+    let host_port = match host_port.split_once('?') {
+        None => host_port,
+        Some((host_port, query))
+            if query
+                .strip_prefix("discport=")
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            host_port
+        }
+        Some(_) => return Err("only a ?discport=<port> query is accepted after the address"),
+    };
+    let Ok(addr) = host_port.parse::<std::net::SocketAddr>() else {
+        return Err("the address must be a numeric ip:port");
+    };
+    // geth prints its own enode as `@0.0.0.0:30303` until it learns its
+    // external address, so a host copying it from its node's log hits this:
+    // an unspecified IP or port 0 names no dialable remote (on Linux,
+    // connect() to 0.0.0.0 even reaches loopback — possibly a different local
+    // node). Refused by name; loopback stays allowed, fronting a local node
+    // is a legitimate use.
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return Err("the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0");
+    }
+    Ok((addr, pubkey))
+}
+
+/// Parse the network's shipped `enode://` pins into dialable pins, skipping
+/// anything malformed — a bad pin must not panic a wallet at startup, it just
+/// leaves discovery to do the work. Twin of the Java
+/// `ChainStack.parseBootEnodes`. (A HOST's pins are the strict case: see
+/// [`parse_enode`].)
+fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
+    enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
 impl ElConfig {
@@ -120,11 +157,21 @@ impl ElConfig {
     /// pinned hash the Java engine also carries; a hard fork would need a bump
     /// here (tracked as the EL-A7 fork-id item).
     pub fn mainnet() -> ElConfig {
+        // discv4 bootnodes = go-ethereum `params/bootnodes.go` MainnetBootnodes
+        // (labels are geth's), re-synced 2026-09-02. The previous list carried
+        // two addresses that are not in geth's current list (18.188.214.86,
+        // 3.219.208.172); observed from one vantage point that day, none of the
+        // old four answered a ping while both Hetzner entries did. With no
+        // pinned mainnet enodes and no EIP-1459 DNS fallback, an embedder's
+        // fresh profile (no EL peer cache) then never seeds discovery and never
+        // holds a snap peer. Mirror any change into the Java
+        // `NetworkConfig.MAINNET`, the live tests under `tests/` (they pin this
+        // list verbatim) and `rust/tor-poc/src/main.rs` (carries the pubkeys).
         const MAINNET_BOOTNODES: &[&str] = &[
-            "18.138.108.67:30303",
-            "3.209.45.79:30303",
-            "18.188.214.86:30303",
-            "3.219.208.172:30303",
+            "18.138.108.67:30303", // bootnode-aws-ap-southeast-1-001
+            "3.209.45.79:30303",   // bootnode-aws-us-east-1-001
+            "65.108.70.101:30303", // bootnode-hetzner-hel
+            "157.90.35.166:30303", // bootnode-hetzner-fsn
         ];
         ElConfig {
             network_id: 1,
@@ -228,6 +275,32 @@ pub struct VerifiedAccount {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`, the
+    /// `finalized` tag) rather than the optimistic head.
+    pub finalized: bool,
+}
+
+/// The shadow cache's view of a verified account read (`el::readstats`).
+fn account_fact(r: &VerifiedAccount) -> AccountFact {
+    if !r.exists {
+        return AccountFact::absent();
+    }
+    AccountFact {
+        nonce: r.nonce,
+        balance: pad32(&r.balance),
+        storage_root: r.storage_root,
+        code_hash: r.code_hash,
+    }
+}
+
+/// The snap round-trip costs of one direct storage read, for the shadow cache:
+/// the account proof (always fetched — it carries the storage root) and the
+/// slot proof (skipped when the account is absent or has no storage).
+#[derive(Clone, Copy)]
+struct StorageSnapCost {
+    account: AccountFact,
+    account_elapsed: Duration,
+    slot_elapsed: Option<Duration>,
 }
 
 /// A verified storage-slot query result (twin of the Java `StorageProofResult`).
@@ -258,6 +331,8 @@ pub struct VerifiedStorage {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`).
+    pub finalized: bool,
 }
 
 /// A verified contract-code query result (for `eth_getCode`). The bytecode is
@@ -280,6 +355,8 @@ pub struct VerifiedCode {
     pub beacon_synced: bool,
     pub finalized_block_number: u64,
     pub optimistic_block_number: u64,
+    /// Anchored at the beacon-FINALIZED block (`ReadAnchor::Finalized`).
+    pub finalized: bool,
 }
 
 /// A verified block result (`eth_getBlockByNumber`, transactions as hashes). The
@@ -300,10 +377,71 @@ pub struct VerifiedBlock {
     pub full_transactions: Option<Vec<VerifiedTransaction>>,
 }
 
-/// How far below the beacon head a block pin may be and still verify cheaply
-/// (mirrors the Java `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX`): the header window
-/// [target..head] is fetched in one request, so this bounds its size.
-const BLOCK_LOOKBACK_MAX: u64 = 256;
+/// How far below its window's anchor a block pin may be and still verify
+/// cheaply: the header window `[target ..= top]` is fetched in one request, so
+/// this bounds its size. The top is the finalized block for a pin at or below
+/// finality, else the optimistic head (`choose_window_top`, #465) — so a pin
+/// up to this far below FINALITY is served, which is deeper than the Java
+/// `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX` this value mirrors (Java measures
+/// from the head; a pin in `[fin − 511, head − 512)` serves here, not there).
+///
+/// 512, not 256: Swarm's bee reads the previous redistribution round's start
+/// header for its sample cutoff — up to 2×152−1 = 303 blocks behind head, plus
+/// whatever skew bee's cached block number has against our anchored head at
+/// serve time. 256 made that call fail for the tail of every round; 512 covers
+/// it with margin and keeps the window one ~300 KB fetch, still within the eth
+/// response soft limit.
+const BLOCK_LOOKBACK_MAX: u64 = 512;
+
+/// Tip-lag tolerance for a `latest` block/receipt read. The anchored head is
+/// the beacon OPTIMISTIC head, which can momentarily run 1-2 blocks ahead of
+/// what EL peers have imported — they then honestly answer "0 headers" for a
+/// block that, for them, does not exist yet (verified live 2026-09-02: `head`
+/// missed while `head-100` served, gap closing within seconds). The header
+/// window can only be verified up to the anchored head hash, so we cannot
+/// serve an older block instead — but the lag is transient, so a bounded
+/// retry (re-reading the advancing anchor and the current pool each time)
+/// rides it out. Scoped to `latest`: a pinned number returning "0 headers"
+/// is a peer that pruned it, not tip lag. ~3 × 400 ms adds latency ONLY on
+/// the failing path, and only when EVERY peer is merely behind the head (a
+/// mixed/transport failure fails fast — retrying it just burns a second).
+const TIP_LAG_RETRIES: usize = 3;
+const TIP_LAG_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// True when every per-peer failure is a "behind the anchored head" shape
+/// (short/empty header window, or a window head that isn't yet the anchored
+/// head) — the exact signature of the optimistic-head-vs-imported-tip race,
+/// distinct from a transport failure (timeout/disconnect) or a genuine proof
+/// error. Kept as a string match on the phrases `fetch_anchored_window`
+/// produces (there is no typed error across its six callers); the phrases
+/// live here so the coupling is visible. Since #465 this is the BATCH gate
+/// feeding a per-peer split: `pool_race_verdict` then excuses the peers whose
+/// own announced head already predicted the miss.
+fn all_tip_lag(failures: &[(usize, String)]) -> bool {
+    !failures.is_empty()
+        && failures.iter().all(|(_, f)| {
+            f.contains("headers, expected")
+                || f.contains("window head does not match the beacon-anchored head hash")
+        })
+}
+
+/// A whole-pool read failure, split by how the caller must handle strikes.
+enum PoolReadError {
+    /// Not tip-lag (or not a whole-pool batch): any strikes are already
+    /// banked; retrying cannot help.
+    Fatal(String),
+    /// Every peer failed tip-lag-shaped ([`all_tip_lag`]). The batch's
+    /// strikes are DEFERRED to the caller: forgiven only for an attempt the
+    /// caller retries (the anchor advances past a transient lag), banked LIVE
+    /// — bench and eviction, never a persisted verdict, since nobody served —
+    /// via `record_batch_failures` the moment it gives up; `failed` already
+    /// excludes the peers whose own word predicted the miss (#465). So a blip shorter than
+    /// the retry budget strikes nobody, while a persistently lagging pool
+    /// keeps accruing one strike per peer per failed READ — the pre-retry
+    /// rate the 2026-09-02 stale-pool escape (eviction + refill) depends
+    /// on — and a pinned read, which never retries, banks immediately.
+    TipLag { error: String, failed: Vec<std::net::SocketAddr> },
+}
 
 /// First-ever receipt scan for a tx hash looks back this many blocks below the
 /// head (the Java `RECEIPT_INITIAL_LOOKBACK_BLOCKS`); the per-tx cursor then
@@ -389,9 +527,143 @@ const TX_REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 /// How far behind the finalized head the log-index append edge may fall before
 /// the head BRIDGE takes over from the per-block appender. The per-block path
-/// anchors a window from each target block to the optimistic head, so it stays
-/// well inside that lookback cap; anything deeper is a bridge walk.
+/// anchors a window from each target block to the finalized block (or the
+/// optimistic head above it), so it stays well inside that lookback cap;
+/// anything deeper is a bridge walk.
 const APPEND_WINDOW: u64 = 128;
+
+/// Ticks the per-block appender may go WITHOUT advancing the edge — while there
+/// is something to append — before the head BRIDGE takes the gap over early.
+/// The per-block path fetches receipts for every block and abandons its tick on
+/// the first failed read, so on a flaky pool it can trail a 5 s chain by a
+/// handful of blocks indefinitely without ever reaching `APPEND_WINDOW` — and a
+/// consumer that needs `latest` (Bee's postage sync, which shuts the node down
+/// after 10 minutes without a page) starves meanwhile. The bridge bloom-filters
+/// candidates first (a few percent of blocks for a typical watch) and, unlike
+/// the per-block path, anchors its verification at the FINALIZED block every
+/// peer has rather than at our optimistic head — which is why a restart closed
+/// exactly such gaps in seconds on 2026-09-16. Three consecutive ticks is ~18 s
+/// after the edge last moved.
+const APPEND_STALL_TICKS: u32 = 3;
+
+/// Widest head gap one bridge plan will map (`log_index_bridge_step`). Beyond
+/// it the bridge deliberately HOLDS coverage rather than build an unbounded
+/// plan — so in that state nothing is closing the gap and the backfill must
+/// keep working rather than yield to a path that has given up.
+const BRIDGE_MAX_GAP: u64 = 500_000;
+
+/// How far above finality the optimistic tail will chase
+/// (`log_index_tail_tick`). At or beyond it the tail parks at finality, so the
+/// head gap is again nobody's job — same reasoning as `BRIDGE_MAX_GAP`.
+const TAIL_MAX_ABOVE_FINALITY: u64 = 1024;
+
+/// Pending blocks (`edge..=head`, inclusive) the backfill tolerates before
+/// standing down. A block or two IS the steady state of a live chain sampled on
+/// the 6 s tick (gnosis produces a block every 5 s), so the floor sits exactly
+/// there: two pending blocks are normal, three mean the appender is losing
+/// ground and the walk must stand down.
+///
+/// It was eight — a time budget in disguise, justified by Bee's 10-minute
+/// shutdown clock. That framing measured the wrong thing. Bee's clock is not
+/// what a lagging edge costs: a head-reaching `eth_getLogs` is REFUSED for as
+/// long as the top lags at all, so every request in that window fails while the
+/// walk, still inside its tolerance, keeps spending the shared snap pool. A
+/// zbox Bee node died exactly there on 2026-09-17 (39 225 logs served, then 134
+/// consecutive refusals and `postage syncing stalled`). Two keeps the walk off
+/// the head's back from the first block it actually falls behind, and the
+/// fairness floor (`BACKFILL_YIELD_MAX_TICKS`) still guarantees it progress.
+///
+/// In blocks rather than seconds because the reader has no per-network block
+/// time; revisit if one is ever added — on a 12 s chain two blocks is a longer
+/// grace period than here, which is the safe direction.
+const BACKFILL_HEAD_GAP_TOLERANCE: u64 = 2;
+
+/// Consecutive ticks the backfill may be yielded before taking one batch anyway
+/// (~1 min at 6 s). A fairness floor: head-follow states this code does not
+/// enumerate must not silence the downward walk forever.
+///
+/// COUPLED TO [`BACKFILL_HEAD_GAP_TOLERANCE`]: the two together set the walk's
+/// worst-case duty cycle (one batch per floor ticks) in whatever band the
+/// trigger newly covers. When the tolerance was 8, `pending` had to be wildly
+/// out of steady state to yield at all, so a 50-tick floor was cheap. At 2 the
+/// band `3..=8` is reachable by a head-follow that is HEALTHY but perpetually
+/// trailing — `log_index_tail_tick`'s per-tick budget truncates candidate-dense
+/// ranges, so on a 5 s chain the edge can sit a few blocks under the head
+/// indefinitely — and a 50-tick floor would throttle the walk ~50x there for no
+/// gain, since a trailing edge refuses head-reaching queries either way. Ten
+/// keeps head-follow clearly first (90% of ticks) without turning a stable
+/// one-block trail into a stalled backfill. Retune both together, not one.
+const BACKFILL_YIELD_MAX_TICKS: u32 = 10;
+
+/// Whether the downward walk stands down for head-follow this tick.
+///
+/// Pure, because the interesting part is WHEN NOT to yield: yielding is only
+/// right while head-follow can actually close the gap. Beyond the bridge's span
+/// coverage holds by design, and with finality stalled `TAIL_MAX` below the head
+/// the tail parks — yielding in either state would idle the whole index instead
+/// of trading one job for a more urgent one.
+///
+/// `finalized == 0` (an anchor with an optimistic head but no finality yet)
+/// falls out as "keep walking": the head-to-finality distance is then the whole
+/// chain, far past `TAIL_MAX_ABOVE_FINALITY` — and head-follow itself returns
+/// early without a finalized anchor, so there would be nothing to defer to.
+fn backfill_should_yield(edge: u64, head: u64, finalized: u64, yielded_ticks: u32) -> bool {
+    // `edge` is the NEXT block to append, so the pending range INCLUDES it:
+    // edge..=head. (The two guards below deliberately do not add that one —
+    // each mirrors, operand for operand, the check in the path it defers to,
+    // so each has to keep that path's own arithmetic.)
+    let pending = if head >= edge { head - edge + 1 } else { 0 };
+    if pending <= BACKFILL_HEAD_GAP_TOLERANCE {
+        return false;
+    }
+    if yielded_ticks >= BACKFILL_YIELD_MAX_TICKS {
+        return false;
+    }
+    finalized.saturating_sub(edge) <= BRIDGE_MAX_GAP
+        && head.saturating_sub(finalized) < TAIL_MAX_ABOVE_FINALITY
+}
+
+/// The per-block appender's progress across ticks, owned by the appender loop
+/// (an on-demand tick starts from a fresh one). See `APPEND_STALL_TICKS`.
+#[derive(Default)]
+struct AppendStall {
+    last_edge: Option<u64>,
+    ticks: u32,
+}
+
+impl AppendStall {
+    /// Observe the edge this tick starts from; true once it has not moved for
+    /// `APPEND_STALL_TICKS` consecutive observations.
+    ///
+    /// There is deliberately no "nothing to append" exemption: by the time this
+    /// runs the caller has already handed off to the tail if coverage passed
+    /// finality, so a block is always pending. An earlier version exempted
+    /// `finalized - edge == 0` — which is not "caught up" but "exactly ONE
+    /// block pending", the steady state between finality epochs and the
+    /// terminal state of the very stall this detects, so the detector went
+    /// blind precisely where it was needed.
+    fn observe(&mut self, edge: u64) -> bool {
+        if self.last_edge == Some(edge) {
+            self.ticks = self.ticks.saturating_add(1);
+        } else {
+            self.last_edge = Some(edge);
+            self.ticks = 1; // this observation is the first
+        }
+        self.ticks >= APPEND_STALL_TICKS
+    }
+
+    /// True on the tick that crosses the threshold, for a single log line.
+    fn just_stalled(&self) -> bool {
+        self.ticks == APPEND_STALL_TICKS
+    }
+
+    /// Coverage passed finality and the tail took over: drop the charge so a
+    /// later gap counts from scratch instead of resuming a stale count.
+    fn reset(&mut self) {
+        self.last_edge = None;
+        self.ticks = 0;
+    }
+}
 
 /// The sent-tx state behind one lock (see the `sent_txs` field doc). The
 /// WATCH itself lives separately in the shared Arc every peer read loop also
@@ -487,6 +759,333 @@ struct TxScanState {
 /// (mirrors the Java `TIP_SUGGEST_BLOCKS`).
 const TIP_SUGGEST_BLOCKS: u64 = 3;
 
+/// How long an INTERACTIVE verified read waits on the peers already in flight
+/// before it STARTS one more alongside them. It does not abandon the ones
+/// running. The peer request timeout (`peer::REQUEST_TIMEOUT`, 15 s) is sized
+/// for background sync tolerance; a wallet flow is a CHAIN of sequential
+/// reads, so a silent peer costs the user the full 15 s per link (#320:
+/// 15 987 ms `eth_call`, 15 078 ms `eth_getTransactionCount` — each rotated
+/// afterwards and SUCCEEDED, so the wait bought nothing).
+///
+/// HEDGING rather than a per-attempt deadline, deliberately. Cancelling at a
+/// fixed deadline turns "slow but working" into "failed" whenever the peers
+/// after it are broken, and on a uniformly slow link it burns the deadline
+/// once per peer before anyone answers — worse than the stall it fixes.
+/// Racing costs one extra in-flight request and keeps the slow peer's answer
+/// if it still arrives first.
+pub(crate) const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Hedge delay for a block or receipt read whose anchored header window is
+/// DEEP (see [`block_hedge_delay`]). That window grows with the distance to the
+/// head, up to a few hundred KB at the lookback cap (see `get_block_from`), so
+/// on a slow or metered link a peer that is still SENDING it looks exactly like
+/// one that went silent, and hedging at [`HEDGE_DELAY`] would duplicate the
+/// download, and split the bandwidth, far too eagerly. Twice the proof-read
+/// delay still caps a truly silent peer well under the 15 s request timeout. A
+/// tuning choice rather than a derived bound: revisit with measurements from a
+/// metered mobile link.
+pub(crate) const BULK_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Header-window SPAN (headers from the target to the window's anchor top)
+/// from which a block or receipt read hedges on [`BULK_HEDGE_DELAY`]. Below it
+/// the window is a few dozen KB at most, the same order as the body or
+/// receipts that come with it, so the slower delay would buy nothing and cost
+/// two paths that cannot afford it: the latest-block read every `eth_call`
+/// starts with (a window of one), and the on-demand `eth_getLogs` fill, whose
+/// whole deadline ([`LOG_INDEX_FILL_DEADLINE`]) is shorter than the bulk
+/// delay. That fill reads at or just below finality, where the window anchors
+/// at the finalized block itself (`WindowTop::Finalized`), so its span is a
+/// handful of headers however far finality trails the head.
+const BULK_HEDGE_MIN_BACK: u64 = 128;
+const _: () = assert!(BULK_HEDGE_MIN_BACK < BLOCK_LOOKBACK_MAX, "the bulk delay must be reachable");
+
+/// The hedge delay for a block or receipt read whose window spans `span`
+/// headers below its anchor top — pure, so the size rule is pinned by a test.
+pub(crate) fn block_hedge_delay(span: u64) -> std::time::Duration {
+    if span < BULK_HEDGE_MIN_BACK {
+        HEDGE_DELAY
+    } else {
+        BULK_HEDGE_DELAY
+    }
+}
+
+/// Hard deadline of the on-demand log-index fill
+/// (`ElReader::advance_log_index_tail_now`).
+const LOG_INDEX_FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A shallow read's hedge must be able to fire, and its second peer answer,
+/// inside the fill's deadline; otherwise hedging does nothing on that path and
+/// the race is cancelled before it can bench the silent peer.
+///
+/// The fill's reads are shallow by construction: they append blocks at or
+/// below finality, and such a window anchors at the finalized block itself
+/// (`choose_window_top`), so its span never grows with a finality delay. Only
+/// a window of [`BULK_HEDGE_MIN_BACK`] headers or more takes the bulk delay,
+/// and the appender hands any gap deeper than [`APPEND_WINDOW`] (the same
+/// 128) to the bridge — so at most its boundary block can meet it.
+const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_millis());
+
+/// Cap on concurrently hedged attempts for one read. Two reasons to keep it
+/// small, load AND privacy:
+///  - each in-flight attempt holds a snap request on a connection that
+///    background sync shares, so a slow pool must not fan one read out across
+///    every peer at once;
+///  - a snap query for an ADDRESS-carrying read (`get_account`/`get_storage`)
+///    discloses `keccak(address)` to whichever peers it reaches — the §1 "core
+///    leak" in docs/privacy-and-tor.md. Sequential rotation disclosed to a new
+///    peer only on FAILURE; hedging discloses to up to this many peers whenever
+///    the first is slower than `HEDGE_DELAY` (the mobile/congested case #320 is
+///    about), even if that first peer then answers. This cap bounds the widened
+///    disclosure set; the Tor path (which is what actually closes the leak) is
+///    unaffected — `get_account` routes to Tor before hedging.
+///
+/// The eth_call state oracle (`evm::PoolOracle`) hedges its account, storage and
+/// bytecode reads through the same race, so this bound is also what a slow first
+/// peer widens there — eth_call has no Tor path to begin with. Block and receipt
+/// reads are hedged as well, and carry no address at all.
+const MAX_HEDGED_ATTEMPTS: usize = 3;
+
+/// What a hedged race produced: the accepted answer (with the index of the peer
+/// that gave it), the best non-accepted result as a fallback, the indices that
+/// missed (failed, or answered without a verdict), and the ones the winner
+/// outpaced — so the caller can feed peer quality. Any other attempt still in
+/// flight when the winner returned is in no list: its request went out after
+/// the winner's, has not been with its peer for the hedge delay yet, or never
+/// left our side at all, so its slowness proves nothing about the peer.
+///
+/// Every index is a position in the `peers` slice passed to THAT
+/// `hedged_race` call, and means nothing against any other slice. Consumers
+/// index that same slice, and check it with [`RaceOutcome::indices`] in debug
+/// builds (the workspace builds with `panic = "abort"`, so an out-of-bounds
+/// index would abort the app).
+pub(crate) struct RaceOutcome<T> {
+    pub(crate) accepted: Option<(usize, T)>,
+    pub(crate) fallback: Option<T>,
+    pub(crate) missed: Vec<usize>,
+    /// Attempts the winner OUTPACED: the request reached its peer no later than
+    /// the winner's reached the winner, has been with that peer for at least
+    /// the hedge delay, and is still unanswered. Timed from the request's
+    /// actual send (`peer::scope_send_marker`), not from the attempt's start,
+    /// because a request can first wait a long time for the connection's
+    /// shared writer. Not a failure on its own, but a silent peer only ever
+    /// shows up here, so callers report these (`PeerPool::record_snap_outpaced`),
+    /// which benches the peer and counts a repeat as a failure.
+    pub(crate) outpaced: Vec<usize>,
+    /// Every failure reason with the peer position it came from, in arrival
+    /// order. The block and receipt reads summarise the whole pool and
+    /// classify tip-lag across it, so they need all of them, not just the
+    /// last; the state reads excuse a miss by its reason (`hedged_read`).
+    pub(crate) errors: Vec<(usize, String)>,
+}
+
+impl<T> RaceOutcome<T> {
+    /// Every peer position this outcome refers to.
+    pub(crate) fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.missed
+            .iter()
+            .chain(&self.outpaced)
+            .copied()
+            .chain(self.accepted.as_ref().map(|(i, _)| *i))
+    }
+
+    /// The most recent failure reason ("" when nothing failed).
+    pub(crate) fn last_err(&self) -> &str {
+        self.errors.last().map(|(_, e)| e.as_str()).unwrap_or("")
+    }
+}
+
+/// Race `make(peer)` across `peers` with hedging: start the first, and every
+/// `delay` without an answer start one more (up to [`MAX_HEDGED_ATTEMPTS`] in
+/// flight), stopping at the first result `accept` approves. A slow peer keeps
+/// running while its hedge does, so it still wins if it answers first. Proof
+/// reads pass [`HEDGE_DELAY`]; block and receipt reads pass
+/// [`block_hedge_delay`] of their header-window depth.
+///
+/// Pure policy — no pool bookkeeping, no peer types — so the timing invariants
+/// are unit-testable. Callers apply the outcome: [`ElReader::hedged_read`] for
+/// the per-peer-strike reads, `ElReader::settle_pool_race` for the block and
+/// receipt reads, and the eth_call oracle's `record_race`.
+///
+/// NB when a winner returns, the remaining in-flight attempts are dropped
+/// mid-request. That can leave a loser's writer marked torn, which condemns
+/// that connection (`ManagedPeer::fail_all`) — the same trade the backfill
+/// pipeline already makes, and paid only once we HAVE the answer. For the same
+/// reason the losers are not polled again to see whether any of them finished
+/// in the winner's wakeup: a multi-step read (block, receipts) would start its
+/// next request on that poll, and dropping it mid-write is exactly the tear. So
+/// a loser that failed in that same wakeup is judged by its age like the rest,
+/// and at worst is reported as outpaced rather than as a miss. An OUTER
+/// cancellation (the log-index fill deadline, a cancelled request) drops every
+/// attempt still in flight, up to [`MAX_HEDGED_ATTEMPTS`] rather than the one a
+/// sequential read had, so the same risk now reaches up to three connections.
+pub(crate) async fn hedged_race<T, P: Clone, Fut>(
+    peers: &[P],
+    delay: std::time::Duration,
+    mut make: impl FnMut(P) -> Fut,
+    accept: impl Fn(&T) -> bool,
+) -> RaceOutcome<T>
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let total = peers.len();
+    let mut in_flight = FuturesUnordered::new();
+    let mut next = 0usize;
+    // When each attempt started, when its request actually went out, and
+    // whether it has finished — what decides which in-flight losers the winner
+    // OUTPACED.
+    let mut started: Vec<Option<tokio::time::Instant>> = vec![None; total];
+    let mut sent: Vec<Option<std::sync::Arc<std::sync::OnceLock<tokio::time::Instant>>>> = vec![None; total];
+    let mut done = vec![false; total];
+    let mut out = RaceOutcome {
+        accepted: None,
+        fallback: None,
+        missed: Vec::new(),
+        outpaced: Vec::new(),
+        errors: Vec::new(),
+    };
+    // ONE push site: two `async move` blocks are distinct anonymous types and
+    // could not share a FuturesUnordered without boxing every attempt. Pushed
+    // whenever there is capacity: every select arm below that continues the
+    // loop — failed attempt, non-verdict answer, hedge timer — is a
+    // "start another" trigger, so no flag needs to gate this.
+    loop {
+        if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS {
+            let idx = next;
+            let (marker, fut) = crate::el::peer::scope_send_marker(make(peers[idx].clone()));
+            started[idx] = Some(tokio::time::Instant::now());
+            sent[idx] = Some(marker);
+            in_flight.push(async move { (idx, fut.await) });
+            next += 1;
+        }
+        if in_flight.is_empty() {
+            break;
+        }
+        let hedge = tokio::time::sleep(delay);
+        tokio::select! {
+            Some((idx, res)) = in_flight.next() => { done[idx] = true; match res {
+                Ok(value) => {
+                    if accept(&value) {
+                        // OUTPACED = the loser's request went out no later than
+                        // the winner's AND has been with its peer for at least
+                        // the delay. Timed from the actual send: a request still
+                        // queued for its connection's writer never reached the
+                        // peer, so it proves nothing. A request sent after the
+                        // winner's had less time than the winner needed, which
+                        // on a uniformly slow link proves nothing either, and
+                        // one sent just before it has not had the delay yet.
+                        let now = tokio::time::Instant::now();
+                        let sent_at = |i: usize| sent[i].as_ref().and_then(|m| m.get().copied());
+                        // The winner's own send, or its start if it recorded
+                        // none (an answer that needed no request).
+                        let winner_ref = sent_at(idx).or(started[idx]).unwrap_or(now);
+                        out.outpaced = (0..next)
+                            .filter(|&i| i != idx && !done[i])
+                            .filter(|&i| {
+                                sent_at(i).is_some_and(|s| s <= winner_ref && now.duration_since(s) >= delay)
+                            })
+                            .collect();
+                        out.accepted = Some((idx, value));
+                        return out;
+                    }
+                    // Answered, but without a verdict (stale head / bad proof):
+                    // a different peer can still verify.
+                    out.missed.push(idx);
+                    out.fallback.get_or_insert(value);
+                }
+                Err(e) => {
+                    out.missed.push(idx);
+                    out.errors.push((idx, e));
+                }
+            }},
+            // Nobody answered in time and a candidate remains: wake the loop,
+            // which starts it ALONGSIDE the ones running, never instead of them.
+            _ = hedge, if next < total && in_flight.len() < MAX_HEDGED_ATTEMPTS => {}
+            else => break,
+        }
+    }
+    out
+}
+
+/// One peer's result in a hedged block read. Both variants END the race.
+enum BlockAttempt {
+    /// Boxed: a verified block is hundreds of bytes, and every in-flight
+    /// attempt's future is sized for the largest variant.
+    Block(Box<VerifiedBlock>),
+    /// The body root-verified but a transaction in it does not decode: the peer
+    /// served CORRECT data every peer would serve identically, so the read
+    /// fails without striking anyone.
+    Undecodable(String),
+}
+
+/// How a hedged pool read ended, and the peer bookkeeping that implies, for the
+/// reads whose strikes are DEFERRED on tip-lag (block and receipts). Pure, so
+/// the mapping is unit-testable; `ElReader::settle_pool_race` applies it.
+enum PoolRaceVerdict<T> {
+    /// A peer answered. `failed` lost ahead of it (bank them); `outpaced` were
+    /// asked before it and are still silent (report them as outpaced).
+    Won { idx: usize, value: T, failed: Vec<usize>, outpaced: Vec<usize> },
+    /// Every peer failed and every reason was tip-lag shaped: the caller
+    /// retries, and banks `failed` only when it stops (see `PoolReadError`).
+    /// `excused` are the peers whose own FRESH word had already put their
+    /// head below the window top — their "0 headers" was the honest answer
+    /// they predicted, so they are struck for nothing (#465: striking them is
+    /// what flipped 14 of 27 cache entries to `snapbad` on a cold pool).
+    TipLag { summary: String, failed: Vec<usize>, excused: Vec<usize> },
+    /// Every peer failed for some other reason: bank `failed` now.
+    Fatal { summary: String, failed: Vec<usize> },
+}
+
+/// `coverage[i]` is peer `i`'s coverage of the anchored HEAD, sampled BEFORE
+/// the race (an announcement arriving mid-read cannot absolve retroactively).
+/// Only the tip-lag verdict consults it: a won race's misses and a fatal
+/// failure keep their strikes — the reasons in `RaceOutcome::errors` carry
+/// their peer position, so a per-peer excuse there would be cheap now, but a
+/// Behind peer rarely enters a race at all now that the ladder ranks it last
+/// (dropped consciously, docs/TODO.md).
+/// `head_anchored` = the window's top was the optimistic head. Only such a
+/// window can lose the one-slot race with the peers' imports; a window
+/// anchored at the FINALIZED block (`WindowTop::Finalized`) is minutes old, so
+/// a whole-pool miss on it is a pruned or lagging pool — Fatal, nobody
+/// excused (the coverage was judged against the head, not that top).
+fn pool_race_verdict<T>(
+    out: RaceOutcome<T>,
+    coverage: &[Coverage],
+    head_anchored: bool,
+) -> PoolRaceVerdict<T> {
+    match out.accepted {
+        Some((idx, value)) => PoolRaceVerdict::Won {
+            idx,
+            value,
+            failed: out.missed,
+            outpaced: out.outpaced,
+        },
+        None => {
+            let summary = summarize_peer_failures(&out.errors);
+            if head_anchored && all_tip_lag(&out.errors) {
+                let (excused, failed): (Vec<usize>, Vec<usize>) = out
+                    .missed
+                    .into_iter()
+                    .partition(|&i| coverage.get(i) == Some(&Coverage::Behind));
+                PoolRaceVerdict::TipLag { summary, failed, excused }
+            } else {
+                PoolRaceVerdict::Fatal { summary, failed: out.missed }
+            }
+        }
+    }
+}
+
+/// Whether a hedged race's accepted answer was a SERVE: `served` tells a
+/// verified answer from one the caller merely accepts to end the race (a
+/// global failure such as `beaconNotSynced`, identical for every peer). Only
+/// a serve witnesses the race's misses or earns the winner a serve — else a
+/// beacon hiccup would persist `snapbad` against every peer that missed
+/// alongside it, and `Confirmed` for the one that reported the hiccup.
+fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -> bool {
+    out.accepted.as_ref().is_some_and(|(_, v)| served(v))
+}
+
 /// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
@@ -537,6 +1136,39 @@ enum BlockFromError {
     Undecodable(String),
 }
 
+/// Compress a whole pool's per-peer failure strings into one diagnosis-grade
+/// line: identical reasons are counted ("6x request timed out"), distinct ones
+/// listed, the output bounded so it stays fit for an error message and a log
+/// ring. The old behavior kept only the LAST peer's error, which hid exactly
+/// the pattern that matters in a whole-pool failure — "all timeouts" (stale
+/// connections) reads very differently from "all window mismatches" (our head
+/// is ahead of the peers').
+fn summarize_peer_failures(failures: &[(usize, String)]) -> String {
+    const MAX_REASON_CHARS: usize = 120;
+    const MAX_DISTINCT: usize = 4;
+    if failures.is_empty() {
+        return "no failures recorded".to_string();
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (_, f) in failures {
+        let short: String = f.chars().take(MAX_REASON_CHARS).collect();
+        match counts.iter_mut().find(|(s, _)| *s == short) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((short, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let shown = counts.len().min(MAX_DISTINCT);
+    let mut parts: Vec<String> = counts[..shown]
+        .iter()
+        .map(|(s, n)| if *n > 1 { format!("{n}x {s}") } else { s.clone() })
+        .collect();
+    if counts.len() > shown {
+        parts.push(format!("(+{} more distinct reasons)", counts.len() - shown));
+    }
+    parts.join("; ")
+}
+
 /// A verified `eth_feeHistory` result (the Java `rpcFeeHistory` twin). Every
 /// value comes from the beacon-anchored header window; rewards additionally
 /// from bodies verified against `transactionsRoot` and receipts against
@@ -567,6 +1199,8 @@ pub struct FeeEstimate {
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
 pub struct ElReader {
+    request_shutdown: tokio::sync::watch::Sender<bool>,
+    requests: std::sync::Mutex<Vec<std::sync::Weak<super::request::Operation>>>,
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
@@ -588,6 +1222,12 @@ pub struct ElReader {
     /// the cache is a later dispatch-fairness refinement (EL-C-3).
     evm_proof_cache: Arc<InMemoryStateProofCache>,
     evm_bytecode_cache: Arc<InMemoryBytecodeCache>,
+    /// The read-fetch shadow cache (`el::readstats`): every verified account /
+    /// storage / bytecode fetch on this reader — the direct reads below and the
+    /// EVM oracle's — reports here so `read_stats_json` can say how much of
+    /// the traffic a cache (and which keying) would have served. Counts only;
+    /// it never serves a value.
+    read_stats: Arc<ReadStats>,
     /// Per-tx receipt scan cursors (`eth_getTransactionReceipt` /
     /// `locateMinedTx`). Outer std Mutex guards only the map (held briefly);
     /// each entry's tokio Mutex serializes the (network-slow) scan per tx hash,
@@ -613,13 +1253,56 @@ pub struct ElReader {
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
     log_index: std::sync::Mutex<Option<crate::el::logindex::LogIndex>>,
-    /// Last backfill checkpoint write — throttles the full-index persist
-    /// (see the step's PERSIST_MIN_INTERVAL).
-    log_index_last_persist: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Throttles the full-index checkpoint: when the file on disk last became
+    /// current, and what it weighed. See [`PersistClock`].
+    log_index_persist: PersistClock,
+    /// Serializes CHECKPOINT WRITES to `log_index_path` against each other,
+    /// spanning serialize→rename. `log_index` used to do this by accident:
+    /// every writer held it across the whole write. Now that the fsync happens
+    /// outside it, something has to keep two checkpoints from interleaving —
+    /// otherwise the bytes that land last are not necessarily the newest, and
+    /// an older snapshot silently renames over a newer one.
+    ///
+    /// LOCK ORDER: acquired BEFORE `log_index`, never after. Every site that
+    /// writes the canonical `.db` takes it at the top of the function.
+    log_index_write: std::sync::Mutex<()>,
     /// Adaptive chunk-pipeline depth signal: true after an untruncated batch
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
     log_index_pipeline_full: std::sync::atomic::AtomicBool,
+    /// Backfill THROUGHPUT of each peer's most recent batch, in milliblocks per
+    /// second (blocks applied × 1000 / seconds elapsed), keyed by dial address —
+    /// the walk's own record of who actually moves the cursor fastest.
+    ///
+    /// Written on peer-attributable failure too (as 0), never on a failure of
+    /// ours, so "absent" means "not measured": never sampled, pruned because
+    /// the peer left the pool, or dropped because a success could not be
+    /// measured. All are treated the same way — sample it — because all mean
+    /// there is no measurement to rank on.
+    /// See [`Self::log_index_backfill_peer_order`].
+    ///
+    /// A budget-truncated batch is deliberately `Ok` (partial progress beats a
+    /// hard failure), so the batch loop cannot tell a peer that served 62
+    /// blocks from one that served 1023: both "succeed", and the loop takes the
+    /// FIRST success. Without this, whichever peer `snap_peers()` happens to
+    /// list first monopolizes the walk however little it serves — observed on
+    /// gnosis 2026-08-15, where one peer pinned the backfill at ~62 blocks/batch
+    /// (~50 blk/s) for hours while eleven other live peers were never tried.
+    ///
+    /// The metric is a RATE, not a block count: a peer that serves 1023 blocks
+    /// slowly is not better than one that serves 300 quickly, and scoring raw
+    /// blocks would have ranked it so — and would also have demoted a peer that
+    /// fully served an inherently short final batch near the walk's target.
+    log_index_peer_serve:
+        std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, PeerServeScore>>,
+    /// Backfill rounds attempted (every round with a non-empty pool, whether or
+    /// not any peer served). This is the clock [`RESAMPLE_EVERY`] is counted
+    /// against; the success counter cannot be, because it freezes exactly
+    /// during a stall — the condition re-sampling exists to escape.
+    log_index_backfill_rounds: std::sync::atomic::AtomicU64,
+    /// How many candidate blocks to ask for per bodies/receipts request, sized
+    /// to what peers in THIS range actually serve. See [`ChunkSizer`].
+    log_index_chunk_sizer: ChunkSizer,
     /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
     /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
     /// the rate is measured against WALL CLOCK between progress points (idle
@@ -636,6 +1319,14 @@ pub struct ElReader {
     /// so those blocks' hashes are unknown and coverage above finality must
     /// be rewound rather than trusted). See [`Self::log_index_tail_tick`].
     log_index_tail: std::sync::Mutex<Vec<(u64, [u8; 32])>>,
+    /// The restart claim — see [`RestartClaimState`]. Both of its fields sit
+    /// under this one lock, so a claim can never be judged against another
+    /// claim's first finality: the pairing is structural rather than an
+    /// ordering of separate atomic stores, and it holds whatever path installs
+    /// or clears a claim, now or after a refactor. Brief holds only. LOCK
+    /// ORDER: after `log_index` where both are held (every install path),
+    /// never before it; the anchor's lock is never taken under it.
+    log_index_claim: std::sync::Mutex<RestartClaimState>,
     log_index_path: Option<std::path::PathBuf>,
     /// The head-follow appender task (spawned on enable, aborted on stop).
     log_index_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -664,20 +1355,26 @@ struct TxScanMap {
 /// cache at the same count; eviction is LRU.
 const EVM_PROOF_CACHE_ENTRIES: usize = 65_536;
 
-/// Overall deadline for one ENS resolution walk (mirrors the Java
-/// `JavaEnsApi.RESOLVE_TIMEOUT_SEC` order of magnitude — the EnsApi contract
-/// promises a bounded worst case of ~2 min).
-const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Per-ATTEMPT deadline inside the ENS root ladder (the Java
-/// `VerifiedRpcBackend.ENS_TIMEOUT_SEC` twin): AUTO runs up to two attempts
-/// (finalized, then optimistic), each bounded here, with
-/// [`RESOLVE_ENS_DEADLINE`] as the outer cap on the whole query — so a stalled
-/// finalized attempt can't consume the optimistic attempt's budget, and the
-/// JNI caller's total block time stays within the API's ~2 min contract.
+/// ENS whole-query budget is 90 s (REQUEST_BUDGET), including setup and AUTO.
+/// Each root attempt gets at most 60 s and is clamped to the remaining query
+/// budget: a full finalized attempt leaves about 30 s for the optimistic root.
+/// Cancellation drains native work; indivisible segments may overrun.
 const RESOLVE_ENS_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ElReader {
+    /// Budget a host operation, including its network and blocking EVM work.
+    pub async fn request<T>(&self, future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        self.request_with_budget(super::request::REQUEST_BUDGET, future).await
+    }
+
+    async fn request_with_budget<T>(&self, budget: std::time::Duration,
+        future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        super::request::run_registered(&self.requests, self.request_shutdown.subscribe(), budget, future).await
+    }
+
+    /// Signal active readers before waiting for any other shutdown work.
+    pub fn cancel_requests(&self) { self.request_shutdown.send_replace(true); }
+
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
     /// CL side generates its libp2p identity per run too; a persistent EL
     /// identity is an EL-A8 concern). `cache_path` is the EL peer cache for
@@ -686,7 +1383,7 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cache_path: Option<std::path::PathBuf>,
     ) -> Result<ElReader, String> {
-        ElReader::start_for(anchor, cache_path, ElConfig::mainnet()).await
+        ElReader::start_for(anchor, cache_path, ElConfig::mainnet(), Arc::new(ReadStats::new())).await
     }
 
     /// Start a reader for any network's [`ElConfig`] with a freshly-generated
@@ -696,18 +1393,31 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cache_path: Option<std::path::PathBuf>,
         base: ElConfig,
+        read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let key = generate_node_key()?;
         let cfg = ElConfig { cache_path, ..base };
-        ElReader::start(key, anchor, cfg).await
+        ElReader::start_with_stats(key, anchor, cfg, read_stats).await
     }
 
     /// Start discovery + the peer pool for `cfg`, reading verified state against
-    /// `anchor` (the beacon sync loop's execution anchor).
+    /// `anchor` (the beacon sync loop's execution anchor), with a fresh
+    /// read-fetch shadow cache.
     pub async fn start(
         key: Arc<NodeKey>,
         anchor: Arc<ExecAnchor>,
         cfg: ElConfig,
+    ) -> Result<ElReader, String> {
+        ElReader::start_with_stats(key, anchor, cfg, Arc::new(ReadStats::new())).await
+    }
+
+    /// [`start`](Self::start) reporting into an existing shadow cache — how a
+    /// resume keeps the counters the paused reader accumulated.
+    pub async fn start_with_stats(
+        key: Arc<NodeKey>,
+        anchor: Arc<ExecAnchor>,
+        cfg: ElConfig,
+        read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
         let discovery = Discv4Service::start(
@@ -758,13 +1468,15 @@ impl ElReader {
             // number AND hash, because every backfill batch must hash-chain to it.
             Some(Box::new({
                 let anchor = Arc::clone(&anchor);
-                move || {
-                    let n = anchor.optimistic_block_number();
-                    anchor.optimistic_block_hash().filter(|_| n > 0).map(|h| (n, h))
-                }
+                // One lock: a number from one update paired with the hash of
+                // the next would fail a peer's correct header (and the head
+                // probe would count that against the peer).
+                move || anchor.optimistic_head()
             })),
         );
         Ok(ElReader {
+            request_shutdown: tokio::sync::watch::channel(false).0,
+            requests: std::sync::Mutex::new(Vec::new()),
             discovery,
             pool,
             anchor,
@@ -772,6 +1484,7 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
+            read_stats,
             tx_scans: std::sync::Mutex::new(TxScanMap {
                 map: std::collections::HashMap::new(),
                 last_sweep: std::time::Instant::now(),
@@ -787,8 +1500,13 @@ impl ElReader {
             log_index_rate: std::sync::Mutex::new(None),
             log_index_bridge: std::sync::Mutex::new(None),
             log_index_tail: std::sync::Mutex::new(Vec::new()),
-            log_index_last_persist: std::sync::Mutex::new(None),
+            log_index_claim: std::sync::Mutex::new(RestartClaimState::default()),
+            log_index_persist: PersistClock::new(),
+            log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
+            log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
+            log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
+            log_index_chunk_sizer: ChunkSizer::new(),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
@@ -808,9 +1526,41 @@ impl ElReader {
     /// from_block). A genuinely new address or changed topic set still
     /// checkpoints the old index and re-indexes under the union — per-entry
     /// frontiers at different heights would wedge the appender.
-    /// Returns false (and installs nothing) for an invalid config
-    /// (duplicate watch addresses).
+    /// Returns false for an invalid config (duplicate watch addresses) — and
+    /// whenever this returns false, for that reason or because a lock was
+    /// poisoned, the node is EXACTLY as the push found it: same index, same
+    /// coverage, same restart claim, same tail record and bridge plan, and
+    /// nothing written to disk. A refused push is a no-op, not a partial
+    /// apply — the alternative was losing the live index to a config the
+    /// caller cannot even tell was rejected for that reason.
+    ///
+    /// That is why the replace path below builds every replacement candidate
+    /// BEFORE it takes the index out of the slot: from the take onwards it is
+    /// committed, and `LogIndex::merge` consumes the outgoing index outright,
+    /// so there is nothing left to put back.
+    ///
+    /// BLOCKS while another writer holds the checkpoint lock — an import
+    /// merging GBs is the worst case, and it is unbounded from here. That
+    /// covers even the fast path that writes nothing, because the branch
+    /// decision needs the index lock and taking the checkpoint lock after it
+    /// would invert the order. Hosts should not call this on a UI thread.
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
+        // Refuse an unbuildable config HERE — before the locks, before the
+        // outgoing index is checkpointed, and before anything is taken out of
+        // the slot. Duplicate addresses are the only thing `LogIndex::new`
+        // rejects, and every `new` below is downstream of a step that cannot
+        // be undone, so catching it at the door is what makes a refused push
+        // a no-op. (Union output inherits this: `union_with` appends only
+        // addresses the pushed list lacks, and the live config was itself
+        // validated here or by `LogIndex::new`.)
+        if let Some(crate::el::logindex::DuplicateWatchAddress(a)) = config.duplicate_address() {
+            tracing::warn!(
+                address = %a.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "log-index config lists the same watch address twice; refusing it — \
+                 the installed index is unchanged"
+            );
+            return false;
+        }
         let finalized_now = self.finalized_block_number();
         // A SUCCESSFUL config apply invalidates the rate anchor: a pacing
         // flip changes the true rate (stale EMA → bogus ETA for minutes) and
@@ -822,6 +1572,12 @@ impl ElReader {
             }
         };
         let tag = self.chain_tag();
+        // This path checkpoints the outgoing index below; take the checkpoint
+        // lock BEFORE the index lock so it can never race (or invert) with a
+        // periodic checkpoint. See `log_index_write` for the ordering rule.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return false;
+        };
         let Ok(mut slot) = self.log_index.lock() else {
             return false;
         };
@@ -829,7 +1585,8 @@ impl ElReader {
             // Union against the LIVE watch-list. The live set always
             // contains the persisted file's set (it was built from it), so
             // no disk read is needed on a settings poke.
-            if let Some(eff) = config.union_with(&ix.config().watch) {
+            let effective = config.union_with(&ix.config().watch);
+            if let Some(eff) = effective.clone() {
                 if ix.adopt_config(eff) {
                     // Nothing accumulated was invalidated: coverage, the
                     // mapped gap and the tail record still describe this
@@ -839,53 +1596,125 @@ impl ElReader {
                     return true;
                 }
             }
-            // New address or topic conflict: the index below is REPLACED,
-            // which invalidates bridge and tail — neither describes the new
-            // coverage shape.
+            // New address or topic conflict: the index below is REPLACED.
+            //
+            // Build every replacement candidate FIRST, while the live index is
+            // still in the slot and nothing around it has been spent. After
+            // this point the path is committed — it clears the bridge, retires
+            // the tail record (rewinding the coverage that record describes),
+            // checkpoints, and hands the outgoing index to `merge`, which
+            // consumes it. They are EMPTY indexes (a coverage Vec and two
+            // empty maps), so building the ones the branch taken does not use
+            // costs nothing, and paying it here is what lets a failure be a
+            // clean refusal. Unreachable today — the guard at the top of this
+            // function already refused the only config `new` rejects — but
+            // "unreachable" is an argument about a function elsewhere, and the
+            // cost of it going stale was the whole live index.
+            //
+            // The union plan is present exactly when the watch-lists union at
+            // all: the unioned config, the empty index handed to `merge`, and
+            // the one to install if `merge` refuses. Carrying the three
+            // together makes "a union with no index to merge" unrepresentable
+            // rather than merely unreachable, so the match below needs no
+            // catch-all to swallow it. Its fallback is built over the UNION
+            // too: falling back to the push alone would silently stop indexing
+            // an address only the live subscription had, which is the one
+            // thing this function's additive contract exists to prevent.
+            let union_plan = match effective {
+                Some(eff) => match (
+                    crate::el::logindex::LogIndex::new(eff.clone()),
+                    crate::el::logindex::LogIndex::new(eff.clone()),
+                ) {
+                    (Ok(pushed), Ok(fallback)) => Some((eff, pushed, fallback)),
+                    _ => return false,
+                },
+                None => None,
+            };
+            // The topic-conflict replacement: the push ALONE, since a span's
+            // meaning includes its restriction and nothing of the old
+            // subscription can be carried under a different one.
+            let conflict_replacement = match crate::el::logindex::LogIndex::new(config) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            // Committed from here: the replacement is in hand, so every step
+            // below lands or none of them were reached. The bridge and tail
+            // go because neither describes the new coverage shape.
             self.clear_log_index_bridge();
-            if let Ok(mut t) = self.log_index_tail.lock() {
-                t.clear();
+            // The tail record describes blocks this run appended and has not
+            // yet proven canonical, and THE retirement rule says it may only
+            // go together with that coverage (see `retire_tail_record`). So
+            // give the coverage back first, before the checkpoint and the
+            // merge below carry it where no tail could re-check it.
+            let unconfirmed = match self.log_index_tail.lock() {
+                Ok(mut t) => {
+                    let lowest = t.iter().map(|(n, _)| *n).min();
+                    t.clear();
+                    lowest
+                }
+                Err(_) => None,
+            };
+            if let Some(lowest) = unconfirmed {
+                ix.rewind_above(lowest.saturating_sub(1));
             }
-            if let Some(p) = self.log_index_path.as_deref() {
-                // Clamped like every other checkpoint: optimistic coverage is
-                // only verifiable against this run's tail record. A zero
-                // finality means no anchor (so nothing optimistic exists) —
-                // clamping there would erase the file.
-                let _ = if finalized_now == 0 {
-                    ix.persist(&tag, p)
-                } else {
-                    ix.persist_clamped(&tag, p, finalized_now)
-                };
-            }
-            let effective = config.union_with(&ix.config().watch);
+            // Whether the file on disk now holds this checkpoint. Best-effort
+            // like the periodic ones, but NOT silent, and not assumed: the
+            // clock below may only start an interval for a write that landed
+            // — crediting a failed one would leave the incoming index's
+            // progress unprotected for a whole interval while the file on
+            // disk is stale or missing.
+            let checkpointed = match self.log_index_path.as_deref() {
+                // Clamped like every other checkpoint — `checkpoint_clamp`,
+                // with the record already retired above.
+                Some(p) => {
+                    let clamp = checkpoint_clamp(finalized_now, self.vouched_now(), None);
+                    let r = self.write_own_checkpoint(p, &checkpoint_bytes(ix, &tag, clamp), clamp);
+                    if let Err(e) = &r {
+                        tracing::warn!(
+                            error = %e,
+                            path = %p.display(),
+                            "could not checkpoint the outgoing log index before replacing it"
+                        );
+                    }
+                    r.is_ok()
+                }
+                None => false,
+            };
             let old = slot.take().expect("checked Some above");
-            let fresh = match effective {
+            let fresh = match union_plan {
                 // New addresses: MERGE the union config (an empty source)
                 // with the old index, so accumulated coverage — an imported
                 // snapshot's months of backfill included — survives a preset
                 // that merely grew. The merge drops the cursor when the new
                 // entries' holes sit above it; the walker then re-descends
                 // through the kept spans and closes them.
-                Some(eff) => {
-                    let pushed = match crate::el::logindex::LogIndex::new(eff.clone()) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            *slot = Some(old);
-                            return false;
-                        }
-                    };
+                Some((eff, pushed, fallback)) => {
                     match crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, old)]) {
                         Ok((_, mut merged)) => {
                             merged.set_enabled(eff.enabled);
                             merged.set_max_speed(eff.max_speed);
+                            // Every runtime bit must cross the merge: `merge` rebuilds
+                            // the config from the unioned watch set with all of them
+                            // false, so a bit not restored here silently flips — a
+                            // paused walk would restart on the next contract added.
+                            merged.set_backfill_paused(eff.backfill_paused);
                             merged
                         }
-                        // Unreachable in practice (union_with already vetted
-                        // the topic sets); degrade to replace semantics.
-                        Err(_) => match crate::el::logindex::LogIndex::new(config) {
-                            Ok(f) => f,
-                            Err(_) => return false,
-                        },
+                        // Unreachable in practice: `union_with` already vetted
+                        // the topic sets, and both sources carry this chain's
+                        // tag. Degrade to replace semantics — but NOT
+                        // silently. It costs every block of accumulated
+                        // coverage while still reporting success, so the one
+                        // way to tell it happened is this line; without it the
+                        // symptom is an index that is simply empty.
+                        Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                "log-index merge refused a union that union_with accepted; \
+                                 re-indexing from scratch under the unioned watch-list"
+                            );
+                            fallback
+                        }
                     }
                 }
                 // Topic conflict: replace with the push alone — a span's
@@ -895,13 +1724,42 @@ impl ElReader {
                         "log-index config conflicts with the live subscription's topic \
                          restrictions; replacing — accumulated coverage re-indexes"
                     );
-                    match crate::el::logindex::LogIndex::new(config) {
-                        Ok(f) => f,
-                        Err(_) => return false,
-                    }
+                    conflict_replacement
                 }
             };
+            let installed_is_empty = fresh.log_count() == 0;
+            // A restart claim vouches for coverage, so it survives exactly as
+            // far as the coverage did: a merge keeps it, a fresh index has
+            // nothing for it to vouch for.
+            let high = fresh.append_edge().map(|edge| edge.saturating_sub(1));
+            if let Ok(mut claim) = self.log_index_claim.lock() {
+                let kept = high.map_or(0, |h| claim.vouched.min(h));
+                if kept != claim.vouched {
+                    *claim = RestartClaimState { vouched: kept, first_finality: 0 };
+                }
+            }
             *slot = Some(fresh);
+            // The checkpoint above put a full-size file on disk, so it starts
+            // an interval — without one the next appender tick would rewrite
+            // it immediately. Only if it actually landed, though.
+            if checkpointed {
+                if installed_is_empty {
+                    // Size the cadence off the index that is now INSTALLED,
+                    // not off the 238 MB just written. Two branches above
+                    // replace the old index with an EMPTY one (a failed merge,
+                    // a topic conflict), and recording the outgoing size would
+                    // make the first window of a walk that restarted from
+                    // scratch checkpoint every ~238 s — backwards, since a
+                    // small index is exactly when progress is cheapest to
+                    // protect. Zero reads back as the FLOOR, so the interval
+                    // this stamp starts is 10 s; that is the point, not an
+                    // oversight to "fix" into the outgoing file's size.
+                    self.log_index_persist
+                        .wrote(std::time::Instant::now(), Some(0));
+                } else if let Some(p) = self.log_index_path.as_deref() {
+                    self.note_checkpoint_written(p);
+                }
+            }
             reset_rate();
             return true;
         }
@@ -909,17 +1767,20 @@ impl ElReader {
         // its own subscription set — union the push with it and adopt its
         // coverage; imports survive restarts this way. A legacy v1 file
         // (config-keyed, pre-import builds) still loads the old way.
-        let stored = self
-            .log_index_path
-            .as_deref()
-            .and_then(crate::el::logindex::LogIndex::load_portable)
-            .filter(|(t, _)| *t == tag);
+        // The file's restart claim rides along only where its coverage does
+        // (adopted or merged), exactly as in `install_log_index_from_disk`.
+        let stored = self.log_index_path.as_deref().and_then(|p| {
+            let (ix, id) = crate::el::logindex::LogIndex::load_portable_with_id(p)?;
+            (id.tag == tag).then(|| (ix, crate::el::logindex::read_finality_claim(p, &id)))
+        });
+        let mut claim = None;
         let ix = match stored {
-            Some((_, mut stored_ix)) => {
+            Some((mut stored_ix, stored_claim)) => {
                 let adopted = config
                     .union_with(&stored_ix.config().watch)
                     .is_some_and(|eff| stored_ix.adopt_config(eff));
                 if adopted {
+                    claim = stored_claim;
                     stored_ix
                 } else if let Some(eff) = config.union_with(&stored_ix.config().watch) {
                     // Genuinely new addresses (e.g. a host preset pushed on
@@ -927,18 +1788,48 @@ impl ElReader {
                     // of discarding — the snapshot's coverage survives, the
                     // new entries re-index via the walker's re-descent (the
                     // merge drops the cursor for exactly that).
-                    let merged = crate::el::logindex::LogIndex::new(eff.clone())
-                        .ok()
-                        .and_then(|pushed| {
-                            crate::el::logindex::LogIndex::merge(vec![(tag, pushed), (tag, stored_ix)]).ok()
-                        });
+                    // Build the pushed side BEFORE `stored_ix` is handed to
+                    // `merge`, for the same reason the live path does: an
+                    // `.ok()` here would drop the snapshot's index on the
+                    // floor and then install an EMPTY one — reporting success,
+                    // after which the next checkpoint overwrites the file that
+                    // still held the coverage. Refuse instead; the file stays
+                    // intact and the host can push a config that works.
+                    let merged = match crate::el::logindex::LogIndex::new(eff.clone()) {
+                        Ok(pushed) => match crate::el::logindex::LogIndex::merge(vec![
+                            (tag, pushed),
+                            (tag, stored_ix),
+                        ]) {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    "log-index merge refused the stored snapshot against the \
+                                     pushed config; re-indexing from scratch under the \
+                                     unioned watch-list"
+                                );
+                                None
+                            }
+                        },
+                        Err(_) => return false,
+                    };
                     match merged {
                         Some((_, mut m)) => {
                             m.set_enabled(eff.enabled);
                             m.set_max_speed(eff.max_speed);
+                            m.set_backfill_paused(eff.backfill_paused);
+                            claim = stored_claim;
                             m
                         }
-                        None => match crate::el::logindex::LogIndex::new(config) {
+                        // Re-index under the UNION, not the push alone: an
+                        // address only the stored snapshot watched would
+                        // otherwise leave the subscription silently, and
+                        // because the installed index is then empty this path
+                        // skips `note_checkpoint_adopted` — so the next prompt
+                        // checkpoint overwrites the very file that still held
+                        // that address's coverage. Same reasoning as the live
+                        // path's merge-failure arm.
+                        None => match crate::el::logindex::LogIndex::new(eff) {
                             Ok(fresh) => fresh,
                             Err(_) => return false,
                         },
@@ -970,7 +1861,28 @@ impl ElReader {
                 }
             }
         };
+        let installed_is_empty = ix.log_count() == 0;
+        let vouched = vouched_high(ix.append_edge().map(|e| e.saturating_sub(1)), claim);
+        self.set_vouched(vouched);
+        if vouched > 0 {
+            tracing::info!(vouched, "log index: installed this node's own checkpoint, final through the vouched block");
+        }
         *slot = Some(ix);
+        // Boot path: ADOPT the snapshot on disk — it already describes the
+        // index just installed from it, so the first checkpoint of a restarted
+        // daemon is sized, and does not rewrite hundreds of MB byte-identical
+        // but for the header within a tick of launching. See
+        // [`PersistClock::adopted`] for why it still checkpoints at the floor
+        // rather than a full interval later.
+        //
+        // Only when the installed index came off that file: an EMPTY one means
+        // nothing on disk describes it (no snapshot, or one discarded as
+        // foreign/conflicting), so its first coverage must checkpoint promptly.
+        if !installed_is_empty {
+            if let Some(p) = self.log_index_path.as_deref() {
+                self.note_checkpoint_adopted(p);
+            }
+        }
         reset_rate();
         true
     }
@@ -979,46 +1891,90 @@ impl ElReader {
     /// path (the drop-in path, docs/eth-getlogs-design.md): a
     /// self-describing file in the data dir IS an opt-in — someone put it
     /// there deliberately, and the daemon has no settings surface to say so
-    /// otherwise. Enabled on activation; a host's config push right after
-    /// start unions with this and applies the host's own runtime bits (a
-    /// disabled toggle wins). No-op without a path, without a portable file
+    /// otherwise. Enabled for SERVING on activation, with the downward walk
+    /// paused (see `install_log_index_from_disk`: the file speaks for its own
+    /// coverage, not for a backfill nobody asked for); a host's config push
+    /// right after start unions with this and applies the host's own runtime
+    /// bits — a disabled toggle wins, and so does a running backfill.
+    /// No-op without a path, without a portable file
     /// (legacy v1 files activate only through a config push — they name no
     /// subscription set), for a foreign chain's file, or once a config has
     /// already arrived.
     pub fn activate_log_index_from_disk(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        if self.install_log_index_from_disk() {
+            self.ensure_log_index_appender(rt);
+        }
+    }
+
+    /// [`Self::activate_log_index_from_disk`] minus the appender: install the
+    /// file at this reader's own path, with the restart claim that sits beside
+    /// it if the claim describes exactly these bytes (a dropped-in or imported
+    /// file never does). Returns whether an index was installed.
+    fn install_log_index_from_disk(&self) -> bool {
         let Some(path) = self.log_index_path.as_deref() else {
-            return;
+            return false;
         };
-        let Some((t, mut ix)) = crate::el::logindex::LogIndex::load_portable(path) else {
-            return;
+        let Some((mut ix, id)) = crate::el::logindex::LogIndex::load_portable_with_id(path) else {
+            return false;
         };
-        if t != self.chain_tag() {
+        if id.tag != self.chain_tag() {
             tracing::warn!(
                 path = %path.display(),
-                file_network = t.network_id,
+                file_network = id.tag.network_id,
                 own_network = self.eth_cfg.network_id,
                 "log-index snapshot on disk belongs to another chain; ignoring it"
             );
-            return;
+            return false;
         }
+        // Outside the index lock: a file read there would stall every query.
+        let claim = crate::el::logindex::read_finality_claim(path, &id);
+        let vouched = vouched_high(ix.append_edge().map(|e| e.saturating_sub(1)), claim);
         {
             let Ok(mut slot) = self.log_index.lock() else {
-                return;
+                return false;
             };
             if slot.is_some() {
-                return; // a config already arrived — it wins
+                return false; // a config already arrived — it wins
             }
             ix.set_enabled(true);
+            // …but NOT the downward walk. Activation is an opt-in to SERVING what
+            // the file already covers, which is all a drop-in can speak for: the
+            // file carries no runtime bits (`deserialize_portable_with_id`), so a
+            // walk started here is one nobody asked for, spending the snap pool
+            // head-follow needs. It starts on a host's config push and not before
+            // — which matters most where that push is late: hosts send it through
+            // the wake gate, so on a cold start it can trail activation by up to
+            // its ~90 s cap (`RustChainHandle.gated`), and the Bee PoC, whose
+            // bundled index IS its coverage, would walk for that whole window.
+            // A host that wants the walk asks for it (the daemon does at boot,
+            // from `-Dmyotis.logindex.backfillPaused`; apps from Settings).
+            ix.set_backfill_paused(true);
+            self.set_vouched(vouched);
             *slot = Some(ix);
         }
-        tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
-        self.ensure_log_index_appender(rt);
+        // Same reason as the boot path in `set_log_index_config`: this installs
+        // an index straight off disk, so without adopting it the first
+        // checkpoint would rewrite the whole file before the cadence learned
+        // what it weighs.
+        self.note_checkpoint_adopted(path);
+        if vouched > 0 {
+            tracing::info!(
+                path = %path.display(),
+                vouched,
+                "activated log-index snapshot from disk (this node's own checkpoint: final through the vouched block)"
+            );
+        } else {
+            tracing::info!(path = %path.display(), "activated log-index snapshot from disk");
+        }
+        true
     }
 
     /// Export the current index as a portable snapshot at `path` — the
     /// generator's output. Clamped at finality like every checkpoint
     /// (optimistic coverage is only verifiable against this run's tail
-    /// record); the v2 frame carries the watch-table + chain tag, so the file
+    /// record; [`checkpoint_clamp`] has the rule). No finality claim goes
+    /// with it — the claim is this node's, never the file's. The
+    /// v2 frame carries the watch-table + chain tag, so the file
     /// imports anywhere on the same chain. Partial coverage exports honestly
     /// — the importer's catch-up finishes the walk. Display names are
     /// STRIPPED from the export: naming is the importing wallet's job, and
@@ -1026,13 +1982,25 @@ impl ElReader {
     /// generator daemon must not bake its own resolutions into a file whose
     /// importers would then never re-resolve (`set_name` fills only empty
     /// names).
+    ///
+    /// BLOCKS while another writer holds the checkpoint lock (an import
+    /// merging GBs is the worst case) — not a UI-thread call.
     pub fn export_log_index(&self, path: &std::path::Path) -> Result<(), String> {
         let tag = self.chain_tag();
         let finalized = self.finalized_block_number();
+        // Nothing stops a caller aiming an export at our own checkpoint path,
+        // and an export STRIPS display names. While the periodic checkpoint
+        // held the index lock across its whole write these two were mutually
+        // exclusive by accident; now that it doesn't, take the checkpoint lock
+        // explicitly — BEFORE the index lock, per `log_index_write` — so the
+        // two writers stay totally ordered instead of renaming over each other.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return Err("log index unavailable".to_string());
+        };
         match self.log_index.lock() {
             Ok(slot) => match slot.as_ref() {
                 Some(ix) => ix
-                    .export_unnamed(&tag, path, (finalized > 0).then_some(finalized))
+                    .export_unnamed(&tag, path, self.checkpoint_clamp_for(finalized))
                     .map_err(|e| format!("could not write {}: {e}", path.display())),
                 None => Err("no log index is configured".to_string()),
             },
@@ -1056,6 +2024,10 @@ impl ElReader {
     ///
     /// Importing enables the index (it is the opt-in, explicitly) and leaves
     /// the pacing bit as it was.
+    ///
+    /// BLOCKS for the whole checkpoint→merge→write sequence — GBs, on the
+    /// checkpoint lock and then the index lock — so it is not a UI-thread
+    /// call, and neither an export nor a config push can proceed during it.
     pub fn import_log_index(&self, paths: &[std::path::PathBuf]) -> Result<(), String> {
         let Some(own_path) = self.log_index_path.clone() else {
             return Err("this node runs without a log-index path (no data dir)".to_string());
@@ -1078,6 +2050,14 @@ impl ElReader {
         if sources.is_empty() {
             return Err("no files given".to_string());
         }
+        // Held for the whole checkpoint→read→merge→write sequence, BEFORE the
+        // index lock (see `log_index_write`). Without it a periodic checkpoint
+        // can land between the checkpoint below and the merged write, and the
+        // merge would silently drop whatever it recorded — or rename over the
+        // merged result afterwards, discarding the import from disk entirely.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return Err("log index unavailable".to_string());
+        };
         // Checkpoint the live index (finality-clamped, v2) and merge THROUGH
         // THE FILE rather than cloning the live store: the store is fully
         // resident and can be GBs — a clone would double it under the lock.
@@ -1091,17 +2071,20 @@ impl ElReader {
                 return Err("log index unavailable".to_string());
             };
             if let Some(ix) = slot.as_ref() {
-                let r = if finalized == 0 {
-                    ix.persist(&tag, &own_path)
-                } else {
-                    ix.persist_clamped(&tag, &own_path, finalized)
-                };
-                r.map_err(|e| {
+                // An ordinary checkpoint, claim included: if the import fails
+                // below, this is the file the node keeps running on.
+                let clamp = self.checkpoint_clamp_for(finalized);
+                self.write_own_checkpoint(&own_path, &checkpoint_bytes(ix, &tag, clamp), clamp).map_err(|e| {
                     format!("could not checkpoint the current index before merging: {e}")
                 })?;
             }
         }
         let max_speed = self.with_log_index(|ix| ix.config().max_speed).unwrap_or(false);
+        // Carried across the import for the same reason as the pacing bit: no host
+        // re-pushes the config afterwards, so a bit dropped here stays dropped and
+        // the walk would resume behind a UI switch that still reads "paused".
+        let backfill_paused =
+            self.with_log_index(|ix| ix.config().backfill_paused).unwrap_or(false);
         if own_path.exists() {
             match crate::el::logindex::LogIndex::load_portable(&own_path) {
                 Some((t, ix)) if t == tag => sources.push((t, ix)),
@@ -1136,6 +2119,7 @@ impl ElReader {
             crate::el::logindex::LogIndex::merge(sources).map_err(|e| e.to_string())?;
         merged.set_enabled(true);
         merged.set_max_speed(max_speed);
+        merged.set_backfill_paused(backfill_paused);
         // Rewound to LOCAL finality like every other checkpoint: a snapshot
         // from a node further along may carry coverage above it, but the
         // tail's fork scan rewinds above-finality coverage this run did not
@@ -1143,6 +2127,13 @@ impl ElReader {
         // band would only hold data the first tail tick discards — the
         // rewind makes the installed index, the persisted file, and the tail
         // rule tell one story. The appender/tail re-fetch the band promptly.
+        //
+        // That is the ANCHOR's finality, not a restart claim's: the merged
+        // index holds other nodes' logs, and what this node's earlier
+        // checkpoint vouched for does not carry over to them. So the claim
+        // ends here, on disk and in memory, and any band between the anchor's
+        // finality and the claim is re-fetched verified — the same as an
+        // import has always cost.
         let finalized_now = self.finalized_block_number();
         if finalized_now > 0 {
             merged.rewind_above(finalized_now);
@@ -1150,6 +2141,14 @@ impl ElReader {
         merged
             .persist(&tag, &own_path)
             .map_err(|e| format!("could not write {}: {e}", own_path.display()))?;
+        self.note_checkpoint_written(&own_path);
+        // After the write, so a failed import changes nothing. Until then the
+        // claim beside the file describes the checkpoint written above, which
+        // `read_finality_claim` can tell apart from these bytes. Best-effort
+        // for the same reason.
+        if let Err(e) = crate::el::logindex::remove_finality_claim(&own_path) {
+            tracing::warn!(error = %e, path = %own_path.display(), "log index import: could not remove the previous finality claim");
+        }
         match self.log_index.lock() {
             Ok(mut slot) => {
                 // Bridge/tail/rate describe the OLD coverage shape. Cleared
@@ -1157,7 +2156,8 @@ impl ElReader {
                 // set_log_index_config uses): the tail tick appends and
                 // records while holding this lock, so no record seeded
                 // against the old index can slip in between the clear and
-                // the install.
+                // the install. (The records' coverage is not in the merged
+                // index: the checkpoint it was built from stopped below them.)
                 self.clear_log_index_bridge();
                 if let Ok(mut t) = self.log_index_tail.lock() {
                     t.clear();
@@ -1165,6 +2165,7 @@ impl ElReader {
                 if let Ok(mut rate) = self.log_index_rate.lock() {
                     *rate = None;
                 }
+                self.set_vouched(0);
                 *slot = Some(merged);
             }
             Err(_) => return Err("log index unavailable".to_string()),
@@ -1220,8 +2221,10 @@ impl ElReader {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut since_persist = 0u32;
+            let mut append_stall = AppendStall::default();
             let mut ticks = 0u64;
             let mut backfill_ok = 0u64;
+            let mut backfill_yielded = 0u32;
             let mut name_attempts: std::collections::HashMap<[u8; 20], (u8, u64)> =
                 std::collections::HashMap::new();
             loop {
@@ -1238,9 +2241,13 @@ impl ElReader {
                     // on-demand caller (a synchronous FFI thread) wait behind the
                     // backfill budget for nothing.
                     let _drive = reader.log_index_drive.lock().await;
-                    reader.log_index_append_tick(&mut since_persist, ticks).await;
+                    reader
+                        .log_index_append_tick(&mut since_persist, Some(&mut append_stall), ticks)
+                        .await;
                 }
-                reader.log_index_backfill_step(ticks, &mut backfill_ok).await;
+                reader
+                    .log_index_backfill_step(ticks, &mut backfill_ok, &mut backfill_yielded)
+                    .await;
                 reader.log_index_name_tick(&mut name_attempts, ticks).await;
                 ticks = ticks.wrapping_add(1);
             }
@@ -1299,12 +2306,11 @@ impl ElReader {
         let chain_id = self.eth_cfg.network_id;
         // Tightly bounded (see the throttle note above): this shares the
         // appender loop, and a stalled resolution must not starve appends.
-        let out = tokio::time::timeout(
+        let out = self.resolve_ens_query_with_budget(
+            EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto,
             std::time::Duration::from_secs(8),
-            self.resolve_ens_query(EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto),
-        )
-        .await;
-        if let Ok(Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. })) = out {
+        ).await;
+        if let Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. }) = out {
             if let Ok(mut slot) = self.log_index.lock() {
                 if let Some(ix) = slot.as_mut() {
                     if ix.set_name(&address, &name) {
@@ -1322,35 +2328,57 @@ impl ElReader {
 
     /// One appender tick: record finalized blocks from the append edge up to
     /// the finalized head (bounded batch per tick).
-    async fn log_index_append_tick(&self, since_persist: &mut u32, ticks: u64) {
+    async fn log_index_append_tick(
+        &self,
+        since_persist: &mut u32,
+        mut stall: Option<&mut AppendStall>,
+        ticks: u64,
+    ) {
         // Checkpoint due from a PREVIOUS tick first: batches that end early
         // (peer failure mid-catch-up) must not defer persistence forever.
-        if *since_persist >= 64 {
-            self.persist_log_index(self.finalized_block_number());
+        if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
         let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // leaving the per-block path: never carry a count across
+            }
             return;
         }
-        let finalized = self.finalized_block_number();
+        // The finality and its currency as ONE pair: the restart claim is
+        // judged on both, and the rest of this tick must run on the same
+        // finality the claim was judged against.
+        let (finalized, finality_current) = self.finalized_block_number_with_currency();
         if finalized == 0 {
             self.clear_log_index_bridge();
             self.retire_tail_record();
+            if let Some(s) = stall.as_deref_mut() {
+                s.reset(); // ditto: no finality, so the per-block path never ran
+            }
             return;
         }
+        // Before routing: a claim the anchor has caught up with must not keep
+        // the tail on hold, and one it never will reach must not either.
+        self.settle_restart_claim(finalized, finality_current);
         let edge = self.with_log_index(|ix| ix.append_edge()).flatten();
         let start = match edge {
             None => finalized, // fresh index: start at the finalized head
             Some(e) if e <= finalized => e,
             // Caught up to finality — now follow the OPTIMISTIC tail, which is
             // where `toBlock: "latest"` actually points.
-            Some(_) => return self.log_index_tail_tick(finalized, ticks).await,
+            Some(_) => {
+                if let Some(s) = stall.as_deref_mut() {
+                    s.reset(); // the tail owns coverage now; no stale charge
+                }
+                return self.log_index_tail_tick(finalized, ticks).await;
+            }
         };
         // The verified whole-block path anchors a window from the target to
-        // the optimistic head; stay well inside its lookback cap. A deeper lag
+        // the finalized block (or the head above it); stay well inside its
+        // lookback cap. A deeper lag
         // (downtime, a suspended laptop, an imported index whose top predates
         // this run) is the BRIDGE's job — it closes the gap with the same
         // verified machinery the backfill walk uses, after which this per-block
@@ -1358,15 +2386,73 @@ impl ElReader {
         // append needs contiguity, so a single gap wider than the window meant
         // coverage never advanced again and every `toBlock: "latest"` query
         // stayed outside coverage forever.
-        if finalized.saturating_sub(start) > APPEND_WINDOW {
+        // …and so is a gap the per-block path has stopped closing: a pool whose
+        // receipts reads keep failing leaves the edge parked a few blocks under
+        // finality for as long as the pool stays that way (APPEND_STALL_TICKS),
+        // and a plan already in flight is finished rather than thrown away for
+        // the per-block path to redo its last blocks one receipts read at a time.
+        let gap = finalized.saturating_sub(start);
+        // Only the BACKGROUND tick may route to the bridge. The on-demand fill
+        // (a <=4-block shortfall under a 5s timeout) must not: the bridge takes
+        // its plan out of the slot for the duration, so a timeout mid-step would
+        // drop a descent the background tick has been building.
+        let background = stall.is_some();
+        let deep = gap > APPEND_WINDOW;
+        let bridging = background
+            && self
+                .log_index_bridge
+                .lock()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false);
+        // Count only the ticks the per-block path actually DRIVES. It is that
+        // path's failure this detects, and ticks the bridge was already driving
+        // — a deep gap, or a descent spanning several ticks — would otherwise
+        // make the hand-off line below claim a cause that was not the reason.
+        let (stalled, crossed) = match stall.as_deref_mut() {
+            Some(s) if !deep && !bridging => {
+                let st = s.observe(start);
+                (st, st && s.just_stalled())
+            }
+            Some(s) => {
+                s.reset();
+                (false, false)
+            }
+            None => (false, false),
+        };
+        if background && (deep || bridging || stalled) {
+            if crossed {
+                tracing::info!(
+                    edge = start,
+                    finalized,
+                    gap,
+                    "log index appender stalled; handing the gap to the head bridge"
+                );
+            }
             self.log_index_bridge_step(start, finalized, ticks).await;
             return;
         }
-        self.clear_log_index_bridge();
-        // Coverage is at/below finality here, so the tail tick (and its
-        // vouched check) will not run: any entry left in the record describes
-        // a block this run never proved canonical.
-        self.retire_tail_record();
+        if deep {
+            // On-demand only — the background tick returned above. This path
+            // cannot bridge (see the gate), and the per-block loop is not built
+            // for a deep gap: its verify window grows with the distance to
+            // finality, and past BLOCK_LOOKBACK_MAX it cannot succeed at all. Leave
+            // the gap to the background tick instead of burning the caller's
+            // deadline on fetches that get slower the further behind we are.
+            return;
+        }
+        // Only the background tick owns the bridge plan. The on-demand fill is
+        // a guest on this path: clearing the slot would DESTROY a descent the
+        // background tick is building — worse than the mid-step cancellation the
+        // gate above exists to prevent. Leaving the stale tail record costs at
+        // most this fill's own last blocks — the next background tick's retire
+        // can rewind below them — which is bounded, and far cheaper.
+        if stall.is_some() {
+            self.clear_log_index_bridge();
+            // Coverage is at/below finality here, so the tail tick (and its
+            // vouched check) will not run: any entry left in the record
+            // describes a block this run never proved canonical.
+            self.retire_tail_record();
+        }
         let last = finalized.min(start.saturating_add(15));
         for n in start..=last {
             let (block_hash, receipts) = match self.block_receipts_at(Some(n)).await {
@@ -1405,11 +2491,25 @@ impl ElReader {
             if !appended {
                 return;
             }
-            *since_persist += 1;
+            *since_persist = since_persist.saturating_add(1);
         }
-        // Checkpoint roughly every 64 appended blocks (best-effort).
-        if *since_persist >= 64 {
-            self.persist_log_index(self.finalized_block_number());
+        // Checkpoint roughly every 64 appended blocks (best-effort) — but on
+        // the SAME size-aware throttle as the walker and the bridge. The block
+        // count alone is not a bound on the write rate: catching up after a
+        // gap applies 16 blocks per 6 s tick, so 64 blocks arrive every ~24 s
+        // whatever the index weighs — a full rewrite of a 238 MB file at
+        // ~10 MiB/s, which is the exact pathology `persist_interval` exists to
+        // stop. The counter is NOT reset unless a checkpoint actually LANDED:
+        // it is the "there is work to record" flag, and both ways a checkpoint
+        // can be dropped — the throttle deferring it, and `persist_log_index`
+        // skipping on write-lock contention — must delay it, not discard it.
+        // A discarded one waits for the next 64 blocks — ~24 s while catching
+        // up, but as long as ~13 minutes at 12 s blocks once the append edge
+        // is at the head and each tick applies one block. (The tail tick
+        // checkpoints on the same throttle, so a head-following node is
+        // covered in practice; the counter still must not be cleared for a
+        // write that did not happen.)
+        if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
     }
@@ -1430,7 +2530,6 @@ impl ElReader {
     /// minutes-long stall. On timeout the caller just re-queries and serves the
     /// original refusal; the wallet already handles retry.
     pub async fn advance_log_index_tail_now(&self, target: u64) {
-        const FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
         let fill = async {
             let _drive = self.log_index_drive.lock().await;
             // Re-check under the lock: the background tick — or another caller's
@@ -1440,11 +2539,11 @@ impl ElReader {
                 return;
             }
             let mut since_persist = 0u32;
-            self.log_index_append_tick(&mut since_persist, 0).await;
+            self.log_index_append_tick(&mut since_persist, None, 0).await;
         };
         // Cancellation at an await point is safe: coverage and the tail record
         // mutate only synchronously under the index lock (append_block).
-        let _ = tokio::time::timeout(FILL_DEADLINE, fill).await;
+        let _ = tokio::time::timeout(LOG_INDEX_FILL_DEADLINE, fill).await;
     }
 
     /// Follow the OPTIMISTIC tail: keep coverage running from finality up to
@@ -1465,8 +2564,25 @@ impl ElReader {
     /// Coverage above finality that this run did NOT append — a persisted tail
     /// from an older build, or an imported index — has unknown hashes and
     /// cannot be re-checked, so it is rewound to finality rather than trusted.
-    /// (Checkpoints clamp at finality, so a normal restart never inherits
-    /// optimistic coverage in the first place.)
+    ///
+    /// A normal restart never inherits optimistic coverage in the first place
+    /// (checkpoints clamp at finality), but it can inherit coverage above the
+    /// anchor's finality all the same: the beacon store resumes from a snapshot
+    /// written once per sync-committee period, so the first finality this run
+    /// sees can trail the checkpoint by hours. That coverage is final, and the
+    /// checkpoint's own finality claim says so (`log_index_claim`). So the
+    /// finality-based rules below measure against the vouched height where it
+    /// is higher than the anchor's finality — nothing at or below it can
+    /// reorg — and while the anchored head is still below it the tail holds
+    /// there: that head has nothing to add, and a head below FINAL coverage is
+    /// a stale anchor, not the shortened chain the rule for that would take it
+    /// for. The hold covers the vouched region only. What this run appended
+    /// above it is ordinary optimistic coverage, so a head that no longer
+    /// reaches it gives that coverage back before the hold returns — orphaned
+    /// or merely unreachable, nothing above the vouched top may keep serving
+    /// on a chain that does not carry it. Records still retire against the
+    /// anchor's own finality only: the vouched height says what the PREVIOUS
+    /// run proved, nothing about blocks this run appended.
     ///
     /// Serving at the optimistic head matches the rest of the engine, where
     /// every verified read (`eth_call`, `getCode`, `getBalance`) answers under
@@ -1474,7 +2590,7 @@ impl ElReader {
     async fn log_index_tail_tick(&self, finalized: u64, ticks: u64) {
         /// Never chase more than this above finality: a stalled beacon anchor
         /// must not turn into an unbounded walk.
-        const TAIL_MAX: u64 = 1024;
+        const TAIL_MAX: u64 = TAIL_MAX_ABOVE_FINALITY;
         /// Candidate blocks per body/receipts request, as the bridge uses —
         /// an unchunked burst of a full tail would blow every peer's response
         /// budget and make no progress at all.
@@ -1488,6 +2604,54 @@ impl ElReader {
         let Ok((head_n, head_hash)) = self.anchored_head() else {
             return;
         };
+        // The restart claim (see above), ahead of every rule that gives
+        // coverage back, since each would read a stale anchor as evidence
+        // against coverage that is final. The two finality-based ones
+        // (unvouched coverage, finality far below the head) measure against
+        // `final_floor`; the chain-shortened one compares the head with the
+        // covered top, and only this hold keeps a head below the vouched top
+        // from looking like a reorg. `finalized` stays the anchor's own.
+        let vouched = self.vouched_now();
+        if head_n < vouched {
+            // The hold protects the VOUCHED region only. Anything this run
+            // appended above it is ordinary optimistic coverage, and a head
+            // that no longer reaches it is the chain-shortened case the rule
+            // below would have caught before the hold existed — but the hold
+            // returns first, so give that coverage back here.
+            //
+            // Safe in both readings of a head under the vouched top: on a
+            // genuine reorg those blocks are orphaned and MUST go, and on a
+            // merely regressed anchor reading the appender or the bridge
+            // re-adds them verified. Neither reading can justify serving them,
+            // which is the whole point of the records. Nothing at or below
+            // `vouched` is touched: that is what the claim proved final.
+            let above = self
+                .with_log_index(|ix| ix.append_edge())
+                .flatten()
+                .is_some_and(|edge| edge > vouched.saturating_add(1));
+            if above {
+                // Guarded like the TAIL_MAX branch: `rewind_above` scans the
+                // whole log store under the index lock, and a hold repeats
+                // every tick for as long as the light client lags.
+                tracing::info!(
+                    head_n,
+                    vouched,
+                    "log index tail: head below the vouched top; dropping this run's coverage above it"
+                );
+                self.log_index_rewind_to(vouched);
+            }
+            if ticks % 100 == 0 {
+                tracing::info!(
+                    head_n,
+                    finalized,
+                    vouched,
+                    "log index tail: holding for the light client — coverage up to the vouched \
+                     block is final per this node's own checkpoint"
+                );
+            }
+            return;
+        }
+        let final_floor = tail_final_floor(finalized, vouched);
         // Re-read the edge under this tick (the caller's value predates the
         // finalized catch-up that may have just advanced it).
         let Some(mut edge) = self.with_log_index(|ix| ix.append_edge()).flatten() else {
@@ -1503,21 +2667,22 @@ impl ElReader {
             return;
         };
         // Coverage above finality this run cannot vouch for: rewind.
-        if !tail_vouches_for(&recorded, edge, finalized) {
+        if !tail_vouches_for(&recorded, edge, final_floor) {
             tracing::info!(
                 covered_high = edge.saturating_sub(1),
                 finalized,
+                vouched,
                 "log index tail: rewinding unvouched coverage above finality"
             );
-            self.log_index_rewind_to(finalized);
-            edge = finalized.saturating_add(1);
+            self.log_index_rewind_to(final_floor);
+            edge = final_floor.saturating_add(1);
         }
         // The rewind above drops record entries; re-read rather than compare
         // against a stale snapshot (which would fork-rewind coverage that no
         // longer exists and waste a tick on a misleading warning).
         let recorded: Vec<(u64, [u8; 32])> =
             self.log_index_tail.lock().map(|t| t.clone()).unwrap_or_default();
-        if head_n.saturating_sub(finalized) >= TAIL_MAX {
+        if head_n.saturating_sub(final_floor) >= TAIL_MAX {
             // Finality has stalled far below the head. The tail cannot
             // re-check what it appended from here (the window would exceed
             // the 1024-header serve ceiling, so no peer can cover the floor),
@@ -1525,14 +2690,17 @@ impl ElReader {
             // to finality rather than answer explicit-number queries from
             // blocks that can still reorg. `>=` because the window is
             // inclusive at both ends — at exactly TAIL_MAX it needs 1025.
-            if edge > finalized.saturating_add(1) {
+            // (Measured from the vouched floor too: after a restart the
+            // anchor's finality may be hours stale while the head is not, and
+            // nothing at or below the floor needs re-checking.)
+            if edge > final_floor.saturating_add(1) {
                 // Guarded: rewind_above scans the whole log store under the
                 // index lock, and this branch repeats every 6s for as long as
                 // finality stalls.
-                self.log_index_rewind_to(finalized);
+                self.log_index_rewind_to(final_floor);
             }
             if ticks % 100 == 0 {
-                tracing::warn!(finalized, head_n, "log index tail: finality too far below the head; coverage held at finality");
+                tracing::warn!(finalized, vouched, head_n, "log index tail: finality too far below the head; coverage held at finality");
             }
             return;
         }
@@ -1726,9 +2894,7 @@ impl ElReader {
         }
         if appended > 0 {
             tracing::debug!(appended, head_n, "log index tail advanced");
-            if self.log_index_persist_due() {
-                self.persist_log_index(finalized);
-            }
+            self.persist_log_index(finalized, true);
         }
     }
 
@@ -1750,23 +2916,287 @@ impl ElReader {
     /// survive a restart. Persisting it would leave a later run holding
     /// coverage it can never re-check — and once finality moves past those
     /// blocks, nothing would ever rewind them (they would look immutable
-    /// while possibly being orphaned).
-    fn persist_log_index(&self, finalized: u64) {
-        if let (Some(path), Ok(slot)) = (self.log_index_path.as_deref(), self.log_index.lock()) {
-            if let Some(ix) = slot.as_ref() {
-                let tag = self.chain_tag();
-                if finalized == 0 {
-                    // No beacon anchor yet. There is no optimistic coverage to
-                    // clamp either (the tail only runs below a real finality),
-                    // and clamping AT ZERO would rewind the whole index and
-                    // rename an empty file over a good checkpoint — losing, on
-                    // a phone, months of backfill. Write it as it stands.
-                    let _ = ix.persist(&tag, path);
-                } else {
-                    let _ = ix.persist_clamped(&tag, path, finalized);
+    /// while possibly being orphaned). [`checkpoint_clamp`] has the exact
+    /// rule, including the two refinements: a restart claim that still holds
+    /// keeps its vouched coverage in the file, and a tail record finality has
+    /// passed but the tail has not yet re-checked stays out of it. Whatever
+    /// the clamp, the checkpoint records it as the file's finality claim.
+    ///
+    /// Returns whether a checkpoint was actually WRITTEN. Callers use it to
+    /// decide whether their "there is work to record" flag may be cleared —
+    /// clearing it for a checkpoint that never happened drops the work rather
+    /// than deferring it.
+    ///
+    /// OWNS THE THROTTLE, decision and write together: with
+    /// `respect_throttle`, [`PersistClock::is_due`] is consulted HERE, under
+    /// the checkpoint lock, never by the caller. Two writers genuinely race —
+    /// the backfill step runs outside `log_index_drive`, and a host thread can
+    /// drive the tail on the getLogs path — and a caller that asked "is it
+    /// due?" before the other one wrote would get its "yes" honoured after,
+    /// rewriting the whole file back to back. The lock is what makes the
+    /// decision and the write it authorizes inseparable; a pure read outside
+    /// it is not a claim.
+    ///
+    /// Pass `false` for the two once-per-event writes that are exempt by
+    /// design (`stop`, a head bridge's FINAL slice).
+    ///
+    /// The clock advances on the two outcomes that actually cost a write — a
+    /// successful checkpoint and a failed one — and on nothing else, so "a
+    /// full-size write resets the interval" holds whichever path forced it.
+    /// The paths that replace the file wholesale (config push, import merge)
+    /// and the ones that adopt a file already on disk stamp the same clock via
+    /// [`Self::note_checkpoint_written`] / [`Self::note_checkpoint_adopted`].
+    fn persist_log_index(&self, finalized: u64, respect_throttle: bool) -> bool {
+        let Some(path) = self.log_index_path.as_deref() else {
+            return false;
+        };
+        // Held across serialize→rename so checkpoints are totally ordered:
+        // the bytes that land last are the newest. Taken BEFORE the index
+        // lock — see `log_index_write`.
+        //
+        // TRY-lock, because the other holders are slow and this one is
+        // best-effort: an import merges GBs under it, and blocking here would
+        // stall the appender tick and every getLogs that needs a head advance
+        // for the whole merge — the exact stall this change exists to remove,
+        // moved rather than fixed. Skipping instead costs nothing: the writer
+        // holding the lock is writing a NEWER snapshot than this one would.
+        let Ok(_writing) = self.log_index_write.try_lock() else {
+            // Clock deliberately UNTOUCHED: nothing was written, so no interval
+            // started, so the next tick is due again immediately. Writing to it
+            // here — in either direction — is the bug: stamping would charge a
+            // full interval for a checkpoint that never happened, and clearing
+            // would race the holder that is stamping it as we look (it may be
+            // finishing its write right now), discarding a fresh interval and
+            // forcing the duplicate full rewrite this whole change removes.
+            return false;
+        };
+        // The throttle, consulted under the lock — see this function's doc.
+        // Before any serialize: a deferred checkpoint must cost nothing.
+        if respect_throttle && !self.log_index_persist.is_due() {
+            return false;
+        }
+        // Serialize under the index lock — it reads the whole store — but do
+        // the write and the FSYNC outside it. On a multi-hundred-MB index the
+        // fsync dominates the checkpoint by orders of magnitude, and holding
+        // the index mutex across it stalls the appender, the backfill walker
+        // and every getLogs query for the whole duration.
+        let (bytes, clamp) = {
+            let Ok(slot) = self.log_index.lock() else {
+                return false;
+            };
+            let Some(ix) = slot.as_ref() else {
+                return false;
+            };
+            let clamp = self.checkpoint_clamp_for(finalized);
+            (checkpoint_bytes(ix, &self.chain_tag(), clamp), clamp)
+        };
+        // Best-effort, but not SILENT. A checkpoint that fails every time —
+        // ENOSPC is the likely cause, and the one this size-aware cadence
+        // makes rarer but not impossible — now costs up to PERSIST_MAX_INTERVAL
+        // of walk per crash instead of ten seconds, and would otherwise leave
+        // no trace of why. Same reasoning as the tail: a silently broken
+        // checkpoint is the wrong failure shape.
+        if let Err(e) = self.write_own_checkpoint(path, &bytes, clamp) {
+            tracing::warn!(
+                error = %e,
+                bytes = bytes.len(),
+                path = %path.display(),
+                "log index checkpoint failed; a crash now costs the walk since the last good one"
+            );
+            // Both halves of the clock advance on failure too: the serialize
+            // and the write attempt cost the same as a successful one, and
+            // leaving it alone would turn a persistent failure (ENOSPC) into a
+            // retry every tick — 238 MB serialized and pushed at the disk
+            // every 6 s, which is worse than the pathology being fixed. It
+            // retries on the ordinary cadence instead.
+            self.log_index_persist
+                .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
+            return false;
+        }
+        // The bytes are on disk — start the next interval HERE, whatever made
+        // this write happen, and size it by what this one cost. The
+        // unthrottled writers (a completing head bridge, `stop`) go through
+        // this same line, so one of them can no longer be followed immediately
+        // by a throttled checkpoint that is measuring from a stale stamp.
+        self.log_index_persist
+            .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
+        true
+    }
+
+    /// [`checkpoint_clamp`] for the installed index at `finalized`. Call it
+    /// with the index lock held, so the tail record it reads describes the
+    /// coverage being serialized: the tail appends and records under that
+    /// lock, and index → tail is the established order.
+    fn checkpoint_clamp_for(&self, finalized: u64) -> Option<u64> {
+        let lowest = self
+            .log_index_tail
+            .lock()
+            .ok()
+            .and_then(|t| t.iter().map(|(n, _)| *n).min());
+        checkpoint_clamp(finalized, self.vouched_now(), lowest)
+    }
+
+    /// The vouched top of the current restart claim (0: none).
+    fn vouched_now(&self) -> u64 {
+        self.log_index_claim.lock().map(|c| c.vouched).unwrap_or(0)
+    }
+
+    /// Write one checkpoint of this node's OWN index — bytes
+    /// [`checkpoint_bytes`] produced at `clamp` — and record beside it the
+    /// finality it may claim. The index write is the result; the claim is
+    /// best-effort, since without one the next restart merely re-checks the
+    /// checkpoint's top the old way.
+    fn write_own_checkpoint(
+        &self,
+        path: &std::path::Path,
+        bytes: &[u8],
+        clamp: Option<u64>,
+    ) -> std::io::Result<()> {
+        crate::el::logindex::write_atomic(path, bytes)?;
+        self.publish_finality_claim(path, bytes, clamp);
+        Ok(())
+    }
+
+    /// Record (or remove) the finality claim for the checkpoint just written.
+    ///
+    /// RE-CHECKS the clamp before publishing, under the claim lock. A
+    /// checkpoint serializes under the index lock and writes outside it, and
+    /// [`Self::settle_restart_claim`] takes neither that lock nor the
+    /// checkpoint lock — so a claim can be retired while these bytes are in
+    /// flight. Publishing the clamp anyway would put a claim the light client
+    /// has just overruled back on disk, and the next restart would accept it
+    /// again. The clamp still stands if the node's own finality, or a claim
+    /// still held, reaches it; otherwise the file keeps its coverage with no
+    /// claim, which is the old (re-check on restart) behaviour.
+    ///
+    /// The lock also orders this against a contradicted settle's own removal:
+    /// whichever runs second sees the other's decision, and both orders end
+    /// with no claim on disk.
+    fn publish_finality_claim(&self, path: &std::path::Path, bytes: &[u8], clamp: Option<u64>) {
+        use crate::el::logindex::{remove_finality_claim, write_finality_claim, SnapshotId};
+        // Before the claim lock: the anchor's lock is never taken under it.
+        let finalized_now = self.finalized_block_number();
+        let claim = self.log_index_claim.lock();
+        let vouched = claim.as_ref().map(|c| c.vouched).unwrap_or(0);
+        // A clamp at block 0 bounds the file at genesis and vouches for
+        // nothing; `None` means nothing bounds it at all.
+        let backed = clamp.is_some_and(|c| c > 0 && c <= finalized_now.max(vouched));
+        let recorded = match (backed.then_some(clamp).flatten(), SnapshotId::of_frame(bytes)) {
+            (Some(finalized), Some(id)) => write_finality_claim(path, &id, finalized),
+            _ => remove_finality_claim(path),
+        };
+        drop(claim);
+        // Not silent, for the reason the checkpoint itself is not: a claim
+        // that never lands turns every restart back into the re-walk it
+        // exists to save.
+        if let Err(e) = recorded {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "log index: finality claim not recorded; the next restart re-checks the checkpoint's top"
+            );
+        }
+    }
+
+    /// Install a restart claim (0: none) for the index being installed. It
+    /// starts unweighed.
+    fn set_vouched(&self, vouched: u64) {
+        if let Ok(mut claim) = self.log_index_claim.lock() {
+            *claim = RestartClaimState { vouched, first_finality: 0 };
+        }
+    }
+
+    /// [`Self::finalized_block_number`] and whether the light client calls it
+    /// current, as one consistent pair (see
+    /// [`ExecAnchor::finalized_execution_with_currency`]).
+    fn finalized_block_number_with_currency(&self) -> (u64, bool) {
+        let (fin, current) = self.anchor.finalized_execution_with_currency();
+        (fin.map(|f| f.block_number).unwrap_or(0), current)
+    }
+
+    /// Settle a restart's finality claim against the anchor's `finalized`
+    /// (non-zero) and its currency, read as one pair: keep holding, or retire
+    /// the claim for good — once the anchor has caught up with it, or once a
+    /// current finality verified after the claim was first weighed contradicts
+    /// it. See [`RestartClaim`]. One critical section, so the claim judged is
+    /// the claim retired.
+    fn settle_restart_claim(&self, finalized: u64, finality_current: bool) {
+        let (fate, vouched) = {
+            let Ok(mut claim) = self.log_index_claim.lock() else {
+                return;
+            };
+            if claim.vouched == 0 {
+                return;
+            }
+            if claim.first_finality == 0 {
+                claim.first_finality = finalized;
+            }
+            let vouched = claim.vouched;
+            let fate = restart_claim_fate(finalized, vouched, claim.first_finality, finality_current);
+            if fate != RestartClaim::Hold {
+                *claim = RestartClaimState::default();
+            }
+            if fate == RestartClaim::Contradicted {
+                // Off DISK too, and inside this critical section. The claim is
+                // wrong, so leaving it beside the checkpoint would hand the
+                // next restart the coverage this light client just overruled —
+                // and a checkpoint whose bytes were clamped under it may be in
+                // flight right now. That one re-checks the claim under this
+                // same lock before publishing (see `publish_finality_claim`),
+                // so the two cannot cross. A checkpoint that has already
+                // published loses its claim here. Subsumed is left alone: the
+                // anchor reached it, so the claim on disk is simply true.
+                if let Some(path) = self.log_index_path.as_deref() {
+                    if let Err(e) = crate::el::logindex::remove_finality_claim(path) {
+                        tracing::warn!(error = %e, path = %path.display(), "log index: could not remove the contradicted finality claim");
+                    }
                 }
             }
+            (fate, vouched)
+        };
+        if fate == RestartClaim::Contradicted {
+            tracing::warn!(
+                finalized,
+                vouched,
+                "log index: the light client's finality is current yet sits far below what this \
+                 node's checkpoint vouched final; dropping the claim — coverage above finality is \
+                 re-checked as usual"
+            );
+        } else if fate == RestartClaim::Subsumed {
+            tracing::info!(
+                finalized,
+                vouched,
+                "log index: finality reached the coverage this node's checkpoint vouched; the tail resumes"
+            );
         }
+    }
+
+    /// A full-size file was just WRITTEN to `path` by a path that does not go
+    /// through [`Self::persist_log_index`] — the config push and the import
+    /// merge, which write through `LogIndex::persist` (it serializes
+    /// internally, so the size has to be read back off the file).
+    ///
+    /// Both halves matter. Without the size, the first checkpoint after
+    /// importing a multi-GB snapshot would fire at the small index's interval.
+    /// Without the stamp, the write just done would not start an interval, so
+    /// the very next appender tick would rewrite the same multi-GB file — the
+    /// "two full rewrites back to back" this throttle exists to stop, on the
+    /// path where the file is largest.
+    ///
+    /// Only call this for a write that LANDED: crediting a failed one leaves
+    /// the installed index unprotected for a whole interval while the file on
+    /// disk is stale or missing.
+    fn note_checkpoint_written(&self, path: &std::path::Path) {
+        self.log_index_persist
+            .wrote(std::time::Instant::now(), file_len(path));
+    }
+
+    /// An index was installed straight off the file at `path`, which therefore
+    /// already describes it — nothing was written. See
+    /// [`PersistClock::adopted`].
+    fn note_checkpoint_adopted(&self, path: &std::path::Path) {
+        self.log_index_persist
+            .adopted(std::time::Instant::now(), file_len(path));
     }
 
     /// The chain identity stamped into (and demanded of) every log-index
@@ -1787,21 +3217,6 @@ impl ElReader {
         self.with_log_index(|ix| ix.append_edge())
             .flatten()
             .map(|edge| edge.saturating_sub(1))
-    }
-
-    /// True when a full-index checkpoint is due (and claims the slot). The
-    /// persist is a whole-file rewrite under the index lock, so both the
-    /// backfill and the bridge share this throttle.
-    fn log_index_persist_due(&self) -> bool {
-        const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        self.log_index_last_persist.lock().is_ok_and(|mut t| {
-            if t.is_none_or(|prev| prev.elapsed() >= PERSIST_MIN_INTERVAL) {
-                *t = Some(std::time::Instant::now());
-                true
-            } else {
-                false
-            }
-        })
     }
 
     /// Drop any in-progress bridge plan (the gap closed, or the premises it
@@ -1877,7 +3292,7 @@ impl ElReader {
         /// holds: a staged bridge (descend headers-only to an intermediate
         /// anchor, then map MAX_GAP at a time) is the follow-up that would
         /// close arbitrarily deep gaps without an unbounded plan.
-        const MAX_GAP: u64 = 500_000;
+        const MAX_GAP: u64 = BRIDGE_MAX_GAP;
 
         let Some((fin_n, fin_hash)) = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash))
         else {
@@ -2142,9 +3557,19 @@ impl ElReader {
             let done = plan.applied >= total;
             // Checkpoint on the same throttle the backfill uses — the persist
             // is a full-index rewrite, and bridging can apply thousands of
-            // blocks per tick. Always checkpoint the final slice.
-            if applied_this_tick > 0 && (done || self.log_index_persist_due()) {
-                self.persist_log_index(self.finalized_block_number());
+            // blocks per tick. The FINAL slice always writes (`!done` waives
+            // the throttle): head-follow resumes after it, and the plan is
+            // dropped, so nothing else would record it.
+            //
+            // That write is off-budget, but it stamps the clock like every
+            // other, so the next throttled checkpoint measures its interval
+            // from THIS write. It used to measure from the last throttled one,
+            // which let a bridge completing late in an interval be followed
+            // seconds later by a second full rewrite — the write amplification
+            // this change removes, back again on exactly the
+            // phone-waking-from-sleep path.
+            if applied_this_tick > 0 {
+                self.persist_log_index(self.finalized_block_number(), !done);
             }
             if done {
                 tracing::info!(to = anchor_n, "log index head bridge complete; head-follow resumes");
@@ -2253,7 +3678,61 @@ impl ElReader {
     /// (bloom hit) get body+receipts fetched and verified against both roots
     /// before any log is stored. Peer refusal is a stall, never corruption:
     /// coverage simply doesn't extend until some peer serves the range.
-    async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64) {
+    async fn log_index_backfill_step(&self, ticks: u64, backfill_ok: &mut u64, yielded: &mut u32) {
+        // FORWARD FIRST (owner's call, 2026-09-16), with guards. The walk and
+        // the head-follow paths share one snap-peer pool and one 6 s tick, and
+        // the appender abandons its whole tick on a single failed receipts read
+        // — so the walk was buying its progress out of the head's. Nothing waits
+        // on the walk, while a head-reaching `eth_getLogs` is REFUSED for as
+        // long as the top lags AT ALL — which is the cost that matters, not any
+        // consumer's shutdown timer (see `BACKFILL_HEAD_GAP_TOLERANCE`, which
+        // was once sized against Bee's 10-minute clock and is no longer).
+        //
+        // It yields only while head-follow can actually close the gap
+        // (`backfill_should_yield`) and never for longer than the fairness
+        // floor: a walk switched off in a state nobody is fixing would idle the
+        // index completely, which is worse than either job running slowly.
+        // OFF switch, checked before the yield logic: `backfill_paused` stops the
+        // walk outright, where yielding only defers it. A host serving a single
+        // consumer that already owns the history below coverage (the Bee PoC)
+        // gains nothing from the walk and loses the snap-pool capacity
+        // head-follow needs. Unlike raising `from_block` to the coverage floor,
+        // this keeps the coverage description honest: a query below the floor
+        // still gets `OutOfCoverage`, never a silent empty list.
+        if self.with_log_index(|ix| ix.config().backfill_paused) == Some(true) {
+            return;
+        }
+        if let (Some(edge), Some(head)) = (
+            self.with_log_index(|ix| ix.append_edge()).flatten(),
+            self.head_block_number(),
+        ) {
+            // The finality the tail itself measures against (see its restart
+            // claim), so this check keeps mirroring the tail's own.
+            let finalized = tail_final_floor(self.finalized_block_number(), self.vouched_now());
+            if backfill_should_yield(edge, head, finalized, *yielded) {
+                *yielded = yielded.saturating_add(1);
+                // The walker's rate clock is deliberately NOT re-anchored here.
+                // `log_index_rate_bps` withholds the rate — and the ETA with it —
+                // after 60 s without progress, precisely so a stalled walk cannot
+                // keep showing a confident number. A yielded walk is not making
+                // progress either, so "unknown" is the honest reading; holding
+                // the anchor at NOW would instead keep the pre-yield EMA on
+                // screen for as long as the yield lasts, which in the
+                // fairness-floor regime is ~10x optimistic
+                // (`BACKFILL_YIELD_MAX_TICKS`).
+                if ticks % 100 == 0 {
+                    tracing::debug!(
+                        edge,
+                        head,
+                        finalized,
+                        yielded = *yielded,
+                        "log index backfill yielding to head-follow"
+                    );
+                }
+                return;
+            }
+        }
+        *yielded = 0;
         // Pacing: "nice" works ONE batch per 6s tick (background politeness);
         // "max speed" keeps working batches until a per-tick time budget is
         // spent — the difference between ~55 blocks/6s and peer-limited
@@ -2272,11 +3751,12 @@ impl ElReader {
             tokio::task::yield_now().await;
         }
         // Checkpoint at most once per throttle window of progressing steps
-        // (not per batch, not even per step) — see log_index_persist_due; a
-        // crash now costs at most ~10s of batches.
-        let persist_due = any_progress && self.log_index_persist_due();
-        if persist_due {
-            self.persist_log_index(self.finalized_block_number());
+        // (not per batch, not even per step) — `persist_log_index` applies the
+        // throttle itself. The window SCALES WITH THE FILE (10s..600s, see
+        // persist_interval), so a crash costs whatever the walker produced
+        // during one window.
+        if any_progress {
+            self.persist_log_index(self.finalized_block_number(), true);
         }
         // Rolling throughput for the status ETA, measured against WALL CLOCK
         // between progress observations (the anchor persists across idle
@@ -2310,6 +3790,95 @@ impl ElReader {
         }
     }
 
+    /// Order this round's peers so the walk prefers the fastest servers.
+    ///
+    /// Ranking, applied to the pool's list (the read-ladder order, see
+    /// `PeerPool::snap_peers`):
+    ///   1. peers with NO measurement — never sampled, pruned when they left
+    ///      the pool, or dropped because a success could not be measured —
+    ///      first, because the ranking cannot mean anything until they are
+    ///      measured (that is how a better peer is ever discovered);
+    ///   2. then by last-batch throughput, descending.
+    ///
+    /// Every [`RESAMPLE_EVERY`]-th round promotes the peer whose measurement is
+    /// STALEST over its score, so every demoted peer — not just the newest dial
+    /// — is periodically re-measured and can climb back. Only that one peer
+    /// jumps the queue; the rest stays ranked.
+    /// The ranking itself is pure and unit-tested — see [`rank_backfill_peers`].
+    /// Record that `addr` had its turn this round without yielding a usable
+    /// measurement, because the failure was OURS.
+    ///
+    /// The rate must not change — charging our own bookkeeping to a peer is
+    /// exactly what `blames_peer` exists to prevent — but the staleness clock
+    /// must, or the peer is frozen as permanently "stalest" and captures every
+    /// exploration round from then on. That starves every other demoted peer of
+    /// the re-measurement the rotation exists to guarantee, and when the frozen
+    /// peer also holds the best rate it is already at the front, so the
+    /// promotion is a no-op and the exploration round is spent doing nothing.
+    /// Reachable in a self-sustaining loop: a chunk fetch that fails at
+    /// pipeline depth > 1 is classified `ours`, and any other peer's clean
+    /// batch restores the depth for the next round.
+    ///
+    /// Absent entries stay absent: "unmeasured" already sorts first, so such a
+    /// peer is tried every ordinary round anyway, and inventing a rate here
+    /// would be a measurement we never took.
+    fn log_index_note_peer_tried(&self, addr: std::net::SocketAddr, round: u64) {
+        if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+            if let Some(score) = scores.get_mut(&addr) {
+                score.round = round;
+            }
+        }
+    }
+
+    fn log_index_backfill_peer_order(
+        &self,
+        peers: Vec<std::sync::Arc<crate::el::peer::ManagedPeer>>,
+        round: u64,
+    ) -> Vec<std::sync::Arc<crate::el::peer::ManagedPeer>> {
+        let addrs: Vec<std::net::SocketAddr> = peers.iter().map(|p| p.addr()).collect();
+        let order = {
+            let Ok(mut scores) = self.log_index_peer_serve.lock() else {
+                return peers; // poisoned: ordering is an optimization, never a gate
+            };
+            // Bound the map by the LIVE pool, on EVERY round — INCLUDING the
+            // single-peer rounds that skip the ranking below. Peers churn (the
+            // gnosis pool dialed 12 distinct addresses in one session), and a
+            // score for a peer we no longer hold is dead weight that never
+            // expires on its own; pruning only on ranked rounds would let a
+            // long-lived one-peer pool grow an entry per address ever dialed,
+            // which is the exact case the bound exists for.
+            //
+            // Consequence, accepted: a peer absent from one `snap_peers()` call
+            // loses its score and is re-sampled on return. That costs one
+            // round-trip and keeps the map strictly bounded by the pool, which
+            // beats holding a measurement of a connection that may be gone.
+            let live: std::collections::HashSet<std::net::SocketAddr> =
+                addrs.iter().copied().collect();
+            scores.retain(|addr, _| live.contains(addr));
+            if peers.len() < 2 {
+                return peers;
+            }
+            rank_backfill_peers(&addrs, &scores, round)
+        };
+        let n = peers.len();
+        let mut slots: Vec<Option<std::sync::Arc<crate::el::peer::ManagedPeer>>> =
+            peers.into_iter().map(Some).collect();
+        let mut ordered: Vec<std::sync::Arc<crate::el::peer::ManagedPeer>> = order
+            .into_iter()
+            .filter_map(|i| slots.get_mut(i).and_then(|s| s.take()))
+            .collect();
+        // `rank_backfill_peers` returns a permutation, so this drops nothing.
+        // Belt and braces anyway, and NOT only under `debug_assert`: release is
+        // where a silently shrunken pool would actually bite, and it would
+        // starve the walk of peers with no error and no log — the "quietly
+        // wrong rather than loudly refused" shape this codebase refuses
+        // elsewhere. Appending the leftovers keeps every peer reachable
+        // whatever the ranking returns.
+        debug_assert_eq!(ordered.len(), n, "peer ranking must be a permutation");
+        ordered.extend(slots.into_iter().flatten());
+        ordered
+    }
+
     /// One backfill round: try every pooled peer for one batch at the current
     /// cursor. Returns (progressed, max_speed_configured).
     async fn log_index_backfill_round(&self, ticks: u64, backfill_ok: &mut u64) -> (bool, bool) {
@@ -2341,19 +3910,55 @@ impl ElReader {
             }
             return (false, max_speed);
         }
+        // Prefer peers whose last batch was fastest (see the fn's docs): a
+        // truncated batch is `Ok`, so without this the first-listed peer
+        // monopolizes the walk no matter how little it serves. The clock is a
+        // dedicated round counter, NOT `backfill_ok` — a success counter
+        // freezes during a stall, which is exactly when exploration must keep
+        // running.
+        let round = self
+            .log_index_backfill_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let peers = self.log_index_backfill_peer_order(peers, round);
         for peer in &peers {
+            let started = std::time::Instant::now();
             match self
                 .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
                 .await
             {
                 Ok(()) => {
+                    let elapsed = started.elapsed();
+                    let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
+                    // Score this peer by the THROUGHPUT the batch achieved —
+                    // pure and unit-tested, see `backfill_batch_rate`.
+                    match backfill_batch_rate(cur_n, new_cursor.map(|(n, _)| n), count, elapsed) {
+                        Some(rate) => {
+                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                                scores.insert(peer.addr(), PeerServeScore { rate, round });
+                            }
+                        }
+                        // The measurement is void — the cursor moved under the
+                        // batch (a concurrent reorg rewind, config swap or
+                        // snapshot import), so the delta is not this peer's
+                        // throughput. DROP any stale entry rather than keep
+                        // one: the map also holds 0 to mean "failed
+                        // attributably", which sorts dead last, and this peer
+                        // just demonstrated it can serve the range. Keeping
+                        // that 0 would demote a proven server until an
+                        // exploration round rescued it. Absent means "not
+                        // measured", which is exactly the honest state here.
+                        None => {
+                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                                scores.remove(&peer.addr());
+                            }
+                        }
+                    }
                     // Count SUCCESSES, not ticks: with intermittent failures a
                     // ticks-modulo log can systematically miss the successful
                     // ticks and stay silent while progressing. First success
                     // logs immediately, then every 50th (~5 min when healthy).
                     *backfill_ok += 1;
                     if *backfill_ok % 50 == 1 {
-                        let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
                         tracing::info!(
                             cursor = new_cursor.map(|(n, _)| n).unwrap_or(cur_n),
                             target = target_low,
@@ -2366,7 +3971,25 @@ impl ElReader {
                     return (true, max_speed);
                 }
                 Err(e) => {
-                    tracing::debug!(from, count, error = %e, "log index backfill batch failed; trying next peer");
+                    // Score a peer-attributable failure as zero rather than
+                    // leaving it unscored: unscored means "not measured" and
+                    // sorts FIRST, so a peer that always fails (pruned history,
+                    // say) would otherwise cost a full round-trip ahead of every
+                    // good peer, forever. The exploration round is what gives it
+                    // another chance.
+                    //
+                    // A failure of OURS (config swapped mid-batch, gap reset)
+                    // says nothing about the peer, so it must not score at all —
+                    // otherwise our own bookkeeping demotes a good server. Its
+                    // TURN still counts, though: see `log_index_note_peer_tried`.
+                    if e.blames_peer {
+                        if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                            scores.insert(peer.addr(), PeerServeScore { rate: 0, round });
+                        }
+                    } else {
+                        self.log_index_note_peer_tried(peer.addr(), round);
+                    }
+                    tracing::debug!(from, count, blames_peer = e.blames_peer, error = %e, "log index backfill batch failed; trying next peer");
                 }
             }
         }
@@ -2402,16 +4025,47 @@ impl ElReader {
         cur_hash: [u8; 32],
         config: &crate::el::logindex::LogIndexConfig,
         fingerprint: u64,
-    ) -> Result<(), String> {
-        let window = peer.get_block_headers_by_number(cur_n, count + 1, 0, true).await?;
+    ) -> Result<(), BackfillBatchError> {
+        // The `?` blames the peer (see `impl From<String> for
+        // BackfillBatchError`), INCLUDING on a 15s request timeout. That is
+        // deliberate, and unlike the chunk-fetch site below it is not made
+        // conditional on pipeline depth: a timeout here may occasionally be our
+        // own cancelled prefetches from a previous truncated batch still
+        // occupying the peer's serving queue, but withholding blame would leave
+        // a peer that ALWAYS times out permanently unscored — and unscored
+        // sorts FIRST, so it would cost a full 15s round-trip ahead of every
+        // good peer, every round, forever. That is the exact pathology the
+        // zero-on-failure rule exists to prevent, reintroduced through its most
+        // expensive door. A peer wrongly blamed here is not stranded: the
+        // exploration round promotes the STALEST measurement, so it is
+        // re-measured within a bounded number of rounds (see `RESAMPLE_EVERY`).
+        let window = peer
+            .get_block_headers_by_number(cur_n, count + 1, 0, true)
+            .await?;
+        // The PEER does not get to choose the batch size. `max_headers` is a
+        // request field an honest peer honours (geth caps at 1024, which is why
+        // `BATCH` sits at 1023), not something the wire format enforces:
+        // `decode_block_headers` imposes no element cap, so the only bound is
+        // the 10 MiB frame ceiling — ~18k headers. Left unclamped, an
+        // over-serving peer would (a) decide how many candidates this batch
+        // bloom-scans and fetches bodies/receipts for, and (b) push `applied`
+        // past `requested`, which `backfill_batch_rate` reads as a void
+        // measurement — leaving that peer permanently "unmeasured", the rank
+        // that sorts FIRST. It would monopolize the walk exactly as the stingy
+        // peer did. Same clamp the head-window fetch above already applies.
+        let window = &window[..window.len().min(count as usize + 1)];
         let Some((top, rest)) = window.split_first() else {
-            return Err("peer returned no headers".to_string());
+            return Err(BackfillBatchError::peer("peer returned no headers"));
         };
         if top.header.number != cur_n || top.hash != cur_hash {
-            return Err("peer window does not start at the trusted cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer window does not start at the trusted cursor block",
+            ));
         }
         if rest.is_empty() {
-            return Err("peer served only the cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer served only the cursor block",
+            ));
         }
         // Descending parent-hash chain: each header's parent is the next one.
         // Only the verified prefix is used, so a mid-response break just
@@ -2419,7 +4073,9 @@ impl ElReader {
         let mut verified = 0usize;
         for pair in window.windows(2) {
             let [upper, lower] = pair else {
-                return Err("header window pairing failed".to_string());
+                // Unreachable: `windows(2)` always yields pairs. Ours, not the
+                // peer's, so an impossible internal case cannot demote a peer.
+                return Err(BackfillBatchError::ours("header window pairing failed"));
             };
             if upper.header.parent_hash != lower.hash
                 || lower.header.number != upper.header.number.wrapping_sub(1)
@@ -2429,9 +4085,16 @@ impl ElReader {
             verified += 1;
         }
         if verified == 0 {
-            return Err("peer response does not chain to the cursor block".to_string());
+            return Err(BackfillBatchError::peer(
+                "peer response does not chain to the cursor block",
+            ));
         }
-        let new_blocks = rest.get(..verified).ok_or("verified prefix out of range")?;
+        // Ours (and unreachable: `verified` counts pairs of `window`), so the
+        // blanket peer-blaming `From` must not apply — same rule as the
+        // pairing case above.
+        let new_blocks = rest
+            .get(..verified)
+            .ok_or_else(|| BackfillBatchError::ours("verified prefix out of range"))?;
         // Bloom-filter candidates among the NEW blocks. A miss is a
         // definitive skip; a hit needs verified receipts.
         let candidates: Vec<&crate::el::eth::messages::VerifiedHeader> = new_blocks
@@ -2470,7 +4133,12 @@ impl ElReader {
         // the writer's torn marker then fails the peer at its next send
         // rather than let it write MAC-garbage; see peer.rs `GuardedWriter`).
         const CHUNK_PIPELINE: usize = 4;
-        const CHUNK_LEN: usize = 64;
+        // ADAPTIVE width, sized to what peers in this range actually serve —
+        // see [`next_chunk_len`] for why a truncated chunk is so much more
+        // expensive than a small one. Read once so every chunk of this batch is
+        // cut the same way (the consumer re-derives slices by index, which only
+        // matches if the width is stable across the batch).
+        let chunk_len = self.log_index_chunk_sizer.width();
         // ADAPTIVE depth: pipelining only pays where chunks come back FULL
         // (sequential RTTs dominate); in budget-truncated ranges the batch
         // ends at the first chunk and any prefetched chunks are pure wasted
@@ -2491,7 +4159,7 @@ impl ElReader {
         // spawned appender task); the consumer re-derives each chunk slice by
         // index for verification.
         let chunk_hashes: Vec<Vec<[u8; 32]>> = candidates
-            .chunks(CHUNK_LEN)
+            .chunks(chunk_len)
             .map(|c| c.iter().map(|h| h.hash).collect())
             .collect();
         let mut fetches = futures::StreamExt::buffered(
@@ -2510,10 +4178,11 @@ impl ElReader {
         'chunks: while let Some((chunk_idx, bodies, receipt_blocks)) =
             futures::StreamExt::next(&mut fetches).await
         {
+            // Ours (and unreachable: `chunk_idx` came from our own enumerate).
             let chunk = candidates
-                .chunks(CHUNK_LEN)
+                .chunks(chunk_len)
                 .nth(chunk_idx)
-                .ok_or("chunk index out of range")?;
+                .ok_or_else(|| BackfillBatchError::ours("chunk index out of range"))?;
             let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
                 (Ok(b), Ok(r)) => (b, r),
                 (b, r) => {
@@ -2527,7 +4196,21 @@ impl ElReader {
                     // restores full depth.
                     self.log_index_pipeline_full
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    return Err(b.err().or(r.err()).unwrap_or_else(|| "chunk fetch failed".into()));
+                    let cause = b.err().or(r.err());
+                    let cause = cause.unwrap_or_else(|| "chunk fetch failed".into());
+                    // Blame follows the same reasoning as the degrade above: at
+                    // depth > 1 the failure may well be OUR prefetch racing the
+                    // peer's own serving queue, so charging the peer's score for
+                    // it would demote a good server for our choice of depth.
+                    // Once depth is 1 there is no prefetch left to blame and a
+                    // failure is genuinely the peer's. The degrade is what makes
+                    // this converge: the retry happens at depth 1, where a peer
+                    // that really is broken does get scored.
+                    return Err(if depth > 1 {
+                        BackfillBatchError::ours(cause)
+                    } else {
+                        BackfillBatchError::peer(cause)
+                    });
                 }
             };
             // Served items are an in-order prefix of the request (the per-block
@@ -2544,21 +4227,21 @@ impl ElReader {
                 // an empty serve is a data-availability signal, and retrying
                 // the whole batch against a peer that HAS the range beats
                 // committing a shortened batch sourced from one that doesn't.
-                return Err(format!(
+                return Err(BackfillBatchError::peer(format!(
                     "peer served no bodies/receipts for candidate chunk starting at block {}",
                     chunk_numbers.first().copied().unwrap_or_default()
-                ));
+                )));
             };
             for ((vh, body), receipts) in
                 chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {
                 verify_body_transactions(&vh.header, body)?;
                 if receipts.len() != body.transactions.len() {
-                    return Err(format!(
+                    return Err(BackfillBatchError::peer(format!(
                         "block {}: {} receipts for {} transactions",
                         vh.header.number,
                         receipts.len(),
                         body.transactions.len()
-                    ));
+                    )));
                 }
                 verify_block_receipts(&vh.header, receipts)?;
                 let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
@@ -2575,13 +4258,27 @@ impl ElReader {
                 }
             }
             if let Some(stop) = chunk_stop {
-                self.log_index_pipeline_full
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // The peer just told us roughly what its budget fits for THIS
+                // range; narrow toward it so the next batch's chunks come back
+                // full and the batch runs the window instead of ending here.
+                // The sizer also decides whether this truncation is evidence
+                // that the RANGE punishes pipelining, or merely a probe of its
+                // own finding a ceiling — see [`ChunkSizer::note_truncated`].
+                if self.log_index_chunk_sizer.note_truncated(
+                    usable,
+                    chunk.len(),
+                    chunk_len,
+                    candidates.len(),
+                ) {
+                    self.log_index_pipeline_full
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 stop_below = Some(stop);
                 tracing::debug!(
                     served = usable,
                     requested = chunk.len(),
                     resume_at = stop,
+                    next_chunk_len = self.log_index_chunk_sizer.width(),
                     "backfill chunk truncated by peer response budget; applying partial batch"
                 );
                 break 'chunks;
@@ -2593,6 +4290,10 @@ impl ElReader {
             // batch is no evidence either way and leaves the depth alone.)
             self.log_index_pipeline_full
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // For the WIDTH this only counts as evidence if the width was
+            // actually exercised — see [`ChunkSizer::note_clean_batch`].
+            self.log_index_chunk_sizer
+                .note_clean_batch(candidates.len(), chunk_len);
         }
         // Apply top-down (the response is already descending) so every block
         // adjoins the low edge; the trust edge advances with each block. A
@@ -2601,7 +4302,7 @@ impl ElReader {
         match self.log_index.lock() {
             Ok(mut slot) => {
                 let Some(ix) = slot.as_mut() else {
-                    return Err("log index uninstalled mid-batch".to_string());
+                    return Err(BackfillBatchError::ours("log index uninstalled mid-batch"));
                 };
                 // The batch ran across several awaits; a concurrent
                 // set_log_index_config may have replaced the index (fresh
@@ -2612,7 +4313,11 @@ impl ElReader {
                 // unless both the trust edge and the config are the ones this
                 // batch was computed against.
                 if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
-                    return Err("index changed mid-batch; recomputing next tick".to_string());
+                    // OURS: we swapped the config or moved the edge under the
+                    // batch. The peer served fine; do not score it for this.
+                    return Err(BackfillBatchError::ours(
+                        "index changed mid-batch; recomputing next tick",
+                    ));
                 }
                 for vh in new_blocks {
                     let n = vh.header.number;
@@ -2635,15 +4340,15 @@ impl ElReader {
                             "backfill gap; resetting the walk cursor to re-descend"
                         );
                         ix.cursor = None;
-                        return Err(format!(
+                        return Err(BackfillBatchError::ours(format!(
                             "backfill gap at {} (edge {}); walk reset",
                             g.block, g.edge
-                        ));
+                        )));
                     }
                 }
                 Ok(())
             }
-            Err(_) => Err("log index lock poisoned".to_string()),
+            Err(_) => Err(BackfillBatchError::ours("log index lock poisoned")),
         }
     }
 
@@ -2673,9 +4378,48 @@ impl ElReader {
         }
     }
 
+    /// Apply ONLY the runtime bits to a live index — the host's last push,
+    /// re-applied after every activation (`host::spin_up`). A pause drops the
+    /// reader, so the index comes back off disk knowing none of them: it is
+    /// enabled (activation's doing) with the walk paused, whatever the host had
+    /// asked for. All three travel together because all three are lost together.
+    /// The watch table is NOT touched — that part the file does carry. Returns
+    /// whether an index was there to take them.
+    pub fn apply_log_index_runtime_bits(
+        &self,
+        enabled: bool,
+        max_speed: bool,
+        backfill_paused: bool,
+    ) -> bool {
+        match self.log_index.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(ix) => {
+                    ix.set_enabled(enabled);
+                    ix.set_max_speed(max_speed);
+                    ix.set_backfill_paused(backfill_paused);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Count of live snap peers (for host status).
     pub async fn snap_peer_count(&self) -> usize {
         self.pool.snap_peer_count().await
+    }
+
+    /// Count of live snap peers that can answer a read at the anchored head
+    /// right now — their own word or a served proof put them at or near it,
+    /// and they are not read-benched (see `pool::is_serving`). Unlike
+    /// [`snap_peer_count`](Self::snap_peer_count), nonzero only once some
+    /// peer has given evidence it can serve the tip — a fresh word or a
+    /// served proof, not merely a connection (#465). The hosts'
+    /// `snapServingPeers` status key (ABI ≥ 31), which their readiness gates
+    /// use in place of the pooled count.
+    pub async fn snap_serving_count(&self) -> usize {
+        self.pool.snap_serving_count().await
     }
 
     /// EL pool/discovery counts for the host status snapshot.
@@ -2698,6 +4442,15 @@ impl ElReader {
     /// `PeerPool::set_fork_watch`).
     pub fn set_fork_watch(&self, watch: std::sync::Arc<crate::el::fork_watch::ForkWatch>) {
         self.pool.set_fork_watch(watch);
+    }
+
+    /// Replace the HOST-supplied EL seed pins (`myotis_set_boot_enodes`, #465):
+    /// dialed like the network's own pins — a changed list at once, then by
+    /// the maintainer while the pool is below target or nobody serves, and
+    /// once proven above that — never seeded into the peer cache (see
+    /// `PeerPool::set_boot_enodes`).
+    pub async fn set_boot_enodes(&self, pins: Vec<Enode>) {
+        self.pool.set_boot_enodes(pins).await;
     }
 
     /// EL hunt engaged on the pool (serving pool empty past the stall window).
@@ -2732,69 +4485,327 @@ impl ElReader {
 
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     ///
-    /// Tries each live snap peer in turn (newest first) and returns the first
-    /// that serves — twin of the Java `RLPxConnector.trySnapPeer` retry loop, so
-    /// a single hung/dead peer doesn't fail the query. A serving peer is marked
-    /// CONFIRMED in the cache, a failing one records a strike (→ deprioritized).
-    pub async fn get_account(&self, address: [u8; 20]) -> Result<VerifiedAccount, String> {
+    /// HEDGED across live snap peers (see [`ElReader::hedged_read`]): starts the
+    /// first peer, races in another every [`HEDGE_DELAY`], and returns the first
+    /// result that carries a verdict — so a hung/dead peer neither fails the
+    /// query nor holds it for the full request timeout. The winner is marked
+    /// CONFIRMED; peers that fail or answer without a verdict record a strike
+    /// (→ deprioritized); peers the winner outpaced are reported as such
+    /// (benched, a repeat counts as a strike); any other peer still in flight is
+    /// left untouched.
+    ///
+    /// `anchor` selects the state: the optimistic head, or the beacon-FINALIZED
+    /// block for the `finalized` tag (#465, #366) — the snap proof is then
+    /// verified against the anchor's own finalized state root, with no
+    /// fallback to any other root (a peer that pruned it fails this attempt;
+    /// a whole-pool miss is retryable), so the answer is the block asked for
+    /// or nothing (CLAUDE.md §Trust).
+    pub async fn get_account(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
         // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
         // pool's clearnet connections. Fail-closed if no aged peer is available.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
+            if anchor == ReadAnchor::Finalized {
+                return Err("finalized state reads are not routed over Tor (head only)".to_string());
+            }
             return self.get_account_over_tor(address).await;
         }
+        let fin = self.finalized_anchor_for(anchor, "a finalized account read")?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut fallback: Option<VerifiedAccount> = None;
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.get_account_from(peer, address).await {
-                Ok(result) => {
-                    // Verified, or a GLOBAL verdict failure (beacon not ready —
-                    // identical for every peer): this is the answer.
-                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
-                        self.pool.record_snap_served(peer.addr()).await;
-                        return Ok(result);
-                    }
-                    // A PER-PEER verdict failure (a stale/behind head or a bad
-                    // proof — a different peer can still verify): keep it as a
-                    // fallback and try the next peer.
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    fallback.get_or_insert(result);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
+        // Hedged across peers: a silent peer no longer blocks the read for the
+        // full request timeout, and a slow-but-working one still wins if it
+        // answers before its hedge does. Accepted = a verdict, or a GLOBAL
+        // failure (beacon not ready — identical for every peer); a per-peer
+        // verdict failure (stale head / bad proof) becomes the fallback. Only
+        // a verdict is a SERVE — the winner's credit and the misses' witness.
+        let (result, snap_elapsed) = self
+            .hedged_read(
+                &peers,
+                HEDGE_DELAY,
+                |peer| async move { self.get_account_from(&peer, address, fin).await },
+                |(r, _): &(VerifiedAccount, Duration)| {
+                    r.verify_method.is_some() || is_global_fail(r.fail_reason)
+                },
+                |(r, _): &(VerifiedAccount, Duration)| r.verify_method.is_some(),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
+                "a verifiable account",
+            )
+            .await?;
+        // Shadow-cache bookkeeping for the VERIFIED answer only (an unverified
+        // fallback is not a fact a cache could ever have served), costed at the
+        // winning peer's snap round-trip — not the anchoring ladder after it.
+        // Head reads only: the cache measures the head-state traffic, and a
+        // finalized root interleaved with head roots would read as churn.
+        if result.verify_method.is_some() && fin.is_none() {
+            self.read_stats.observe_account(
+                address,
+                result.peer_state_root,
+                account_fact(&result),
+                snap_elapsed,
+            );
         }
-        // No peer verified; return the best per-peer result if we got one.
-        fallback.map(Ok).unwrap_or_else(|| {
-            Err(format!("all {total} snap peer(s) failed to serve a verifiable account: {last_err}"))
+        Ok(result)
+    }
+
+    /// The read-fetch shadow cache's counters as JSON (`el::readstats`).
+    pub fn read_stats_json(&self) -> String {
+        self.read_stats.to_json()
+    }
+
+    /// The shadow cache itself, so a pausing host can carry it into the reader
+    /// that resume builds (the counters are per chain handle, not per reader).
+    pub fn read_stats(&self) -> Arc<ReadStats> {
+        Arc::clone(&self.read_stats)
+    }
+
+    /// [`hedged_race`] plus peer-quality bookkeeping: record the winner as
+    /// served, every miss as a failure, and every peer the winner outpaced as
+    /// outpaced (benched; a repeat before it serves again is a failure). Any
+    /// other peer still in flight is left alone: it had less time than the
+    /// winner, so being slower is no fault. Then return the accepted answer,
+    /// else the fallback, else the last error.
+    ///
+    /// `accept` ends the race; `served` says whether the accepted answer is a
+    /// SERVE. The two differ for the account and storage reads, which accept
+    /// a global failure (`beaconNotSynced`, identical for every peer) so the
+    /// race stops asking — an answer that serves nothing, witnesses no miss,
+    /// and earns its peer no credit (see `race_served_by_winner`). `excused`
+    /// names, by its reason, a miss that is evidence about OUR ask rather
+    /// than the peer — a finalized read answered with an empty proof
+    /// (`is_unknown_root_error`: the peer does not hold a root it is not
+    /// obliged to hold) — and is banked nowhere: neither a strike nor a
+    /// witnessed failure, so polling `finalized` cannot bench, evict or flip
+    /// the cache verdict of a peer that serves the head perfectly. A garbage
+    /// proof at that root stays a strike, as on the head path.
+    #[allow(clippy::too_many_arguments)]
+    async fn hedged_read<T, Fut>(
+        &self,
+        peers: &[std::sync::Arc<ManagedPeer>],
+        delay: std::time::Duration,
+        make: impl FnMut(std::sync::Arc<ManagedPeer>) -> Fut,
+        accept: impl Fn(&T) -> bool,
+        served: impl Fn(&T) -> bool,
+        excused: impl Fn(&str) -> bool,
+        what: &str,
+    ) -> Result<T, String>
+    where
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let total = peers.len();
+        let out = hedged_race(peers, delay, make, accept).await;
+        debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
+        let last_err = out.last_err().to_string();
+        // A miss is WITNESSED only when another peer SERVED the same read — an
+        // accepted global failure ends the race with nobody serving anything
+        // — and a whole-pool failure is banked live but persisted nowhere
+        // (#465).
+        let winner_served = race_served_by_winner(&out, &served);
+        let pardoned: Vec<usize> =
+            out.errors.iter().filter(|(_, e)| excused(e)).map(|(i, _)| *i).collect();
+        if !pardoned.is_empty() {
+            tracing::debug!(
+                excused = pardoned.len(),
+                what,
+                "misses excused: the root was ours to ask, not the peer's to hold"
+            );
+        }
+        let misses: Vec<std::net::SocketAddr> = out
+            .missed
+            .iter()
+            .filter(|i| !pardoned.contains(i))
+            .map(|i| peers[*i].addr())
+            .collect();
+        self.record_batch_failures(&misses, winner_served).await;
+        for idx in &out.outpaced {
+            self.pool.record_snap_outpaced(peers[*idx].addr()).await;
+        }
+        if let Some((idx, value)) = out.accepted {
+            // Only a serve earns the credit: a global failure that won the
+            // race says nothing about this peer.
+            if winner_served {
+                self.pool.record_snap_served(peers[idx].addr()).await;
+            }
+            return Ok(value);
+        }
+        out.fallback.map(Ok).unwrap_or_else(|| {
+            Err(format!("all {total} snap peer(s) failed to serve {what}: {last_err}"))
         })
     }
 
+    /// Apply a hedged pool read's [`PoolRaceVerdict`] to the pool and shape its
+    /// result — shared by the block and receipt reads, whose strikes are
+    /// DEFERRED on tip-lag. On a win: bank the peers that failed ahead of the
+    /// winner (witnessed — the winner served what they could not), report the
+    /// ones it outpaced, credit the winner. On a whole-pool failure: WARN with
+    /// every peer's reason and address — the moment an operator needs them,
+    /// and hosts keep only info+ in their log rings (the Android period-1840 /
+    /// stale-pool incidents of 2026-09-01/02 were undiagnosable on-device with
+    /// debug-only reasons) — then either hand tip-lag back UN-banked for the
+    /// caller's retry loop (banking per attempt would let one retrying read
+    /// push every healthy peer to eviction; never banking would bring back the
+    /// 2026-09-02 wedge), or bank and fail. A whole-pool failure is banked
+    /// LIVE only — nobody witnessed it, so it persists no verdict (#465) — and
+    /// the tip-lag arm hands back only the peers whose own word did not
+    /// predict the miss (`coverage`, sampled before the race). `head_anchored`
+    /// = the window's top was the optimistic head; only such a window can
+    /// lose the tip-lag race, so a finalized-anchored miss is always Fatal.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_pool_race<T>(
+        &self,
+        peers: &[std::sync::Arc<ManagedPeer>],
+        coverage: &[Coverage],
+        out: RaceOutcome<T>,
+        (target_num, span): (u64, u64),
+        head_anchored: bool,
+        what: &str,
+        label: &str,
+    ) -> Result<T, PoolReadError> {
+        let total = peers.len();
+        debug_assert!(out.indices().all(|i| i < total), "race indices must index its own peer slice");
+        debug_assert_eq!(coverage.len(), total, "coverage is sampled over the race's own peer slice");
+        let addrs = |ix: &[usize]| -> Vec<std::net::SocketAddr> {
+            ix.iter().map(|i| peers[*i].addr()).collect()
+        };
+        match pool_race_verdict(out, coverage, head_anchored) {
+            PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
+                self.record_batch_failures(&addrs(&failed), true).await;
+                for i in outpaced {
+                    self.pool.record_snap_outpaced(peers[i].addr()).await;
+                }
+                self.pool.record_snap_served(peers[idx].addr()).await;
+                Ok(value)
+            }
+            PoolRaceVerdict::TipLag { summary, failed, excused } => {
+                let failed = addrs(&failed);
+                tracing::warn!(total, target_num, span, excused = excused.len(), ?failed,
+                    summary = %summary, "{}", label);
+                Err(PoolReadError::TipLag {
+                    error: format!("all {total} snap peer(s) failed to serve {what}: {summary}"),
+                    failed,
+                })
+            }
+            PoolRaceVerdict::Fatal { summary, failed } => {
+                let failed = addrs(&failed);
+                tracing::warn!(total, target_num, span, head_anchored, ?failed, summary = %summary,
+                    "{}", label);
+                self.record_batch_failures(&failed, false).await;
+                Err(PoolReadError::Fatal(format!(
+                    "all {total} snap peer(s) failed to serve {what}: {summary}"
+                )))
+            }
+        }
+    }
+
     /// One account fetch + verdict against a single peer (no retry, no cache
-    /// bookkeeping — the caller loop owns those). Any transport/proof error
-    /// propagates so the loop can move to the next peer.
+    /// bookkeeping — the hedged race owns those). Any transport/proof error
+    /// propagates so the race records the miss and lets another peer answer.
+    /// The second value is the snap round-trip's wall-clock (the shadow cache's
+    /// cost measure), excluding the beacon-anchoring ladder.
     async fn get_account_from(
         &self,
         peer: &ManagedPeer,
         address: [u8; 20],
-    ) -> Result<VerifiedAccount, String> {
-        let (state_root, block_number, outcome) =
-            self.snap_account_at_best_root(peer, address).await?;
+        fin: Option<FinalizedExecution>,
+    ) -> Result<(VerifiedAccount, Duration), String> {
+        let started = Instant::now();
+        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
+        let snap_elapsed = started.elapsed();
         // Anchor the (proof-valid) state root to the beacon chain. The anchor
         // path's root short-circuits via the stateRootMatch fast path; the
-        // fallback path's peer root runs the full ladder.
-        let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-            .await;
-        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+        // fallback path's peer root runs the full ladder; the finalized root
+        // is attested by construction.
+        let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
+        Ok((
+            self.build_verified_account(
+                address,
+                state_root,
+                block_number,
+                outcome,
+                verdict,
+                fin.is_some(),
+            ),
+            snap_elapsed,
+        ))
+    }
+
+    /// The beacon-finalized execution block, or the one refusal every
+    /// finalized read shares while none has landed (not synced: retryable,
+    /// and identical for every peer, so no race is worth running).
+    fn require_finalized_execution(&self, what: &str) -> Result<FinalizedExecution, String> {
+        self.anchor
+            .finalized_execution()
+            .ok_or_else(|| format!("no beacon-finalized execution block for {what}"))
+    }
+
+    /// The finalized anchor a read at `anchor` proves against: `None` at the
+    /// head; at `Finalized`, the beacon-finalized execution block — read ONCE
+    /// here, before any peer is asked, so every attempt, the verdict and the
+    /// reported block number name the same finality.
+    fn finalized_anchor_for(
+        &self,
+        anchor: ReadAnchor,
+        what: &str,
+    ) -> Result<Option<FinalizedExecution>, String> {
+        match anchor {
+            ReadAnchor::Head => Ok(None),
+            ReadAnchor::Finalized => self.require_finalized_execution(what).map(Some),
+        }
+    }
+
+    /// Fetch + MPT-verify one account at the read's anchor: the best available
+    /// root for a head read ([`Self::snap_account_at_best_root`]), or exactly
+    /// the beacon-FINALIZED state root for a finalized read — with NO fallback
+    /// to any other root, since answering from another block would be the
+    /// silent substitution CLAUDE.md §Trust forbids. A peer that cannot prove
+    /// at the finalized root (pruned it, most likely: execution clients keep
+    /// on the order of a hundred recent states, and finality trails the head
+    /// by two epochs or more) fails this attempt with an empty proof;
+    /// `hedged_read` excuses that miss — the root is our ask, not the peer's
+    /// fault — and lets the next peer answer, and a whole-pool miss surfaces
+    /// as a retryable error.
+    async fn snap_account_at(
+        &self,
+        peer: &ManagedPeer,
+        address: [u8; 20],
+        fin: Option<FinalizedExecution>,
+    ) -> Result<([u8; 32], u64, AccountOutcome), String> {
+        let Some(fin) = fin else {
+            return self.snap_account_at_best_root(peer, address).await;
+        };
+        let outcome = peer
+            .snap_get_account(&fin.state_root, &address)
+            .await
+            .map_err(|e| format!("finalized-root query failed ({e})"))?;
+        Ok((fin.state_root, fin.block_number, outcome))
+    }
+
+    /// The beacon verdict for a proof-verified state root: the ladder for a
+    /// head read; for a finalized read the root IS the finality update's own,
+    /// so the verdict is `stateRootMatch` at that update's slot by
+    /// construction (`verify::finalized_root_verdict`) — from the same `fin`
+    /// the proof was verified against, never a second anchor read.
+    async fn anchored_verdict(
+        &self,
+        peer: &ManagedPeer,
+        fin: Option<FinalizedExecution>,
+        state_root: &[u8; 32],
+        block_number: u64,
+    ) -> crate::el::verify::Verdict {
+        match fin {
+            None => {
+                let block = to_ladder_block(block_number);
+                peer.verified_state_root(&self.anchor, state_root, block, true).await
+            }
+            Some(fin) => crate::el::verify::finalized_root_verdict(fin.slot),
+        }
     }
 
     /// Fetch + MPT-verify one account against the best available state root:
@@ -2847,9 +4858,8 @@ impl ElReader {
                 }
                 // Transport-shaped failure (timeout/disconnect): a second
                 // query against the same peer would pay the same timeout
-                // again — propagate so the outer loop moves to the next peer.
-                // (Without this, a dead peer costs up to three timeouts per
-                // read instead of one.)
+                // again — propagate so the hedged race records the miss and
+                // another peer's attempt (already running) can answer.
                 Err(e) => return Err(e),
             }
         }
@@ -2872,6 +4882,7 @@ impl ElReader {
         block_number: u64,
         outcome: AccountOutcome,
         verdict: crate::el::verify::Verdict,
+        finalized: bool,
     ) -> VerifiedAccount {
         let (fin_num, opt_num, synced) = self.anchor_diagnostics();
         let account_hash = keccak256(&address);
@@ -2894,6 +4905,7 @@ impl ElReader {
             beacon_synced: synced,
             finalized_block_number: fin_num,
             optimistic_block_number: opt_num,
+            finalized,
         };
         if let AccountOutcome::Present(leaf) = outcome {
             result.exists = true;
@@ -2962,8 +4974,23 @@ impl ElReader {
             // snap peer — striking it would poison clearnet dialing on the next run.
             // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
             match tokio::time::timeout(remaining, attempt).await {
-                Ok(Ok(result)) => {
+                Ok(Ok((result, snap_elapsed))) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
+                        // The same shadow-cache bookkeeping as the clearnet
+                        // read: the verified answer only, costed at the snap
+                        // round-trip over the circuit (not the circuit build,
+                        // the head fetch or the anchoring ladder). A Tor read
+                        // that a cache would have served is a fetch saved just
+                        // the same — counts only, no address leaves the
+                        // process (`el::readstats`).
+                        if result.verify_method.is_some() {
+                            self.read_stats.observe_account(
+                                address,
+                                result.peer_state_root,
+                                account_fact(&result),
+                                snap_elapsed,
+                            );
+                        }
                         return Ok(result);
                     }
                     fallback.get_or_insert(result);
@@ -2980,17 +5007,24 @@ impl ElReader {
     /// One account fetch + beacon verdict over an already-connected Tor
     /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
     #[cfg(feature = "tor")]
+    /// The second value is the snap round-trip's wall-clock over the circuit
+    /// (the shadow cache's cost measure), like `get_account_from`'s.
     async fn account_from_tor_session(
         &self,
         session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
         address: [u8; 20],
-    ) -> Result<VerifiedAccount, String> {
+    ) -> Result<(VerifiedAccount, Duration), String> {
         let (state_root, block_number) = fresh_head_session(session).await?;
+        let started = Instant::now();
         let outcome = session.snap_get_account(&state_root, &address).await?;
+        let snap_elapsed = started.elapsed();
         let verdict = session
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
-        Ok(self.build_verified_account(address, state_root, block_number, outcome, verdict))
+        Ok((
+            self.build_verified_account(address, state_root, block_number, outcome, verdict, false),
+            snap_elapsed,
+        ))
     }
 
     /// Fetch + verify one storage slot. `holder` switches the key to the
@@ -3002,7 +5036,8 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
     ) -> Result<VerifiedStorage, String> {
-        self.get_storage_keyed(address, slot, holder, storage_key(slot, holder)).await
+        let key = storage_key(slot, holder);
+        self.get_storage_keyed(ReadAnchor::Head, address, slot, holder, key).await
     }
 
     /// Fetch + verify a RAW 32-byte storage position (`eth_getStorageAt`): the
@@ -3011,53 +5046,79 @@ impl ElReader {
     /// meaningful u64 index.
     pub async fn get_storage_at(
         &self,
+        anchor: ReadAnchor,
         address: [u8; 20],
         position: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
-        self.get_storage_keyed(address, 0, None, position).await
+        self.get_storage_keyed(anchor, address, 0, None, position).await
     }
 
-    /// The cross-peer retry loop shared by `get_storage` / `get_storage_at`, keyed
-    /// on the precomputed 32-byte storage key. Verification-aware: returns on the
-    /// first peer that produces a verdict (or a global failure); a per-peer failure
-    /// (stale head / bad proof) moves to the next peer, keeping the best as fallback.
+    /// The hedged cross-peer read shared by `get_storage` / `get_storage_at`,
+    /// keyed on the precomputed 32-byte storage key. Verification-aware: returns
+    /// the first result that carries a verdict (or a global failure); a per-peer
+    /// failure (stale head / bad proof) becomes the fallback. NB with hedging the
+    /// fallback is whichever non-verdict answer COMPLETES first, not a fixed
+    /// peer-rank order — immaterial to correctness (a non-verdict answer is only
+    /// ever returned when NO peer verifies, and each is independently checked).
     async fn get_storage_keyed(
         &self,
+        anchor: ReadAnchor,
         address: [u8; 20],
         slot: u64,
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
+        let fin = self.finalized_anchor_for(anchor, "a finalized storage read")?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut fallback: Option<VerifiedStorage> = None;
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.get_storage_from(peer, address, slot, holder, storage_key).await {
-                Ok(result) => {
-                    if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
-                        self.pool.record_snap_served(peer.addr()).await;
-                        return Ok(result);
-                    }
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    fallback.get_or_insert(result);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
+        let (result, snap) = self
+            .hedged_read(
+                &peers,
+                HEDGE_DELAY,
+                |peer| async move {
+                    self.get_storage_from(&peer, address, slot, holder, storage_key, fin).await
+                },
+                |(r, _): &(VerifiedStorage, StorageSnapCost)| {
+                    r.verify_method.is_some() || is_global_fail(r.fail_reason)
+                },
+                |(r, _): &(VerifiedStorage, StorageSnapCost)| r.verify_method.is_some(),
+                |e: &str| fin.is_some() && crate::el::snap::fetch::is_unknown_root_error(e),
+                "verifiable storage",
+            )
+            .await?;
+        // Shadow-cache bookkeeping for the VERIFIED answer only: the account
+        // proof this path fetches to learn the storage root, then the slot
+        // proof (when the account had storage to prove), each at its own snap
+        // round-trip cost — the same two facts the EVM oracle reports. Head
+        // reads only, as for the account read.
+        if result.verify_method.is_some() && fin.is_none() {
+            self.read_stats.observe_account(
+                address,
+                result.peer_state_root,
+                snap.account,
+                snap.account_elapsed,
+            );
+            if let Some(slot_elapsed) = snap.slot_elapsed {
+                self.read_stats.observe_storage(
+                    address,
+                    storage_key,
+                    result.peer_state_root,
+                    result.storage_root,
+                    pad32(&result.value),
+                    slot_elapsed,
+                );
             }
         }
-        fallback.map(Ok).unwrap_or_else(|| {
-            Err(format!("all {total} snap peer(s) failed to serve verifiable storage: {last_err}"))
-        })
+        Ok(result)
     }
 
     /// One storage-slot fetch + verdict against a single peer (no retry / cache
-    /// bookkeeping — the caller loop owns those). Errors propagate for retry.
+    /// bookkeeping — the hedged race owns those). Errors propagate so the race
+    /// records the miss and another peer can answer. The second value carries
+    /// the shadow cache's cost measure: each snap round-trip's wall-clock,
+    /// excluding the beacon-anchoring ladder.
     async fn get_storage_from(
         &self,
         peer: &ManagedPeer,
@@ -3065,12 +5126,22 @@ impl ElReader {
         slot: u64,
         holder: Option<[u8; 20]>,
         storage_key: [u8; 32],
-    ) -> Result<VerifiedStorage, String> {
+        fin: Option<FinalizedExecution>,
+    ) -> Result<(VerifiedStorage, StorageSnapCost), String> {
         // Step 1: the proof-verified account gives the trusted storage root.
         // Root selection prefers the beacon anchor's current optimistic root
-        // (issue #355 — see snap_account_at_best_root).
-        let (state_root, block_number, outcome) =
-            self.snap_account_at_best_root(peer, address).await?;
+        // (issue #355 — see snap_account_at_best_root), or IS the finalized
+        // root for a finalized read (see snap_account_at).
+        let started = Instant::now();
+        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
+        let mut snap = StorageSnapCost {
+            account: match &outcome {
+                AccountOutcome::Present(leaf) => AccountFact::from_leaf(Some(leaf)),
+                AccountOutcome::Absent => AccountFact::absent(),
+            },
+            account_elapsed: started.elapsed(),
+            slot_elapsed: None,
+        };
 
         let slot_key_hash = keccak256(&storage_key);
 
@@ -3095,6 +5166,7 @@ impl ElReader {
             beacon_synced: synced,
             finalized_block_number: fin_num,
             optimistic_block_number: opt_num,
+            finalized: fin.is_some(),
         };
 
         // An absent account has no storage: every slot is provably zero, and the
@@ -3104,19 +5176,25 @@ impl ElReader {
         // verdict.
         let AccountOutcome::Present(leaf) = outcome else {
             // Still anchor the state root so the verdict reflects the beacon tie.
-            let verdict = peer
-                .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-                .await;
+            let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
             result.storage_proof_valid = true; // exclusion proof held
             apply_verdict(&mut result, &verdict);
-            return Ok(result);
+            return Ok((result, snap));
         };
         result.storage_root = leaf.storage_root;
 
         // Step 2: verify the slot against the proof-verified storage root.
+        let started = Instant::now();
         let value = peer
             .snap_get_storage(&state_root, &address, &leaf, &storage_key)
             .await?;
+        // An empty storage trie is answered locally by the peer layer (every
+        // slot is provably zero) — no round trip, so nothing for the shadow
+        // cache to count; the EVM oracle and the Java paths short-circuit the
+        // same case before observing.
+        if leaf.storage_root != EMPTY_TRIE_ROOT {
+            snap.slot_elapsed = Some(started.elapsed());
+        }
         result.storage_proof_valid = true;
         // `found` means the slot holds a non-zero value (Java's convention): a
         // zero slot is pruned from the trie and indistinguishable from unset,
@@ -3128,11 +5206,9 @@ impl ElReader {
         }
 
         // Step 3: anchor the account's state root to the beacon chain.
-        let verdict = peer
-            .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
-            .await;
+        let verdict = self.anchored_verdict(peer, fin, &state_root, block_number).await;
         apply_verdict(&mut result, &verdict);
-        Ok(result)
+        Ok((result, snap))
     }
 
     /// Fetch + verify a contract's bytecode (`eth_getCode`). The account query is
@@ -3142,8 +5218,12 @@ impl ElReader {
     /// inherited from the account. A verified EOA / empty-code / absent account has
     /// provably empty code (no round trip). An unverified account returns empty code
     /// with `verify_method: None` (the caller surfaces that as "can't answer").
-    pub async fn get_code(&self, address: [u8; 20]) -> Result<VerifiedCode, String> {
-        let account = self.get_account(address).await?;
+    pub async fn get_code(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+    ) -> Result<VerifiedCode, String> {
+        let account = self.get_account(anchor, address).await?;
         let mut result = VerifiedCode {
             address,
             exists: account.exists,
@@ -3158,6 +5238,7 @@ impl ElReader {
             beacon_synced: account.beacon_synced,
             finalized_block_number: account.finalized_block_number,
             optimistic_block_number: account.optimistic_block_number,
+            finalized: account.finalized,
         };
         // No bytecode to fetch when the answer isn't verified, the account is
         // absent, or the code hash is empty (an EOA / empty-code contract): a
@@ -3168,7 +5249,9 @@ impl ElReader {
         {
             return Ok(result);
         }
+        let started = Instant::now();
         result.code = self.fetch_bytecode(&account.code_hash).await?;
+        self.read_stats.observe_code(account.code_hash, started.elapsed());
         Ok(result)
     }
 
@@ -3180,98 +5263,118 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            match peer.snap_get_bytecode(code_hash).await {
-                Ok(code) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(code);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        Err(format!("all {total} snap peer(s) failed to serve verifiable bytecode: {last_err}"))
+        // Bytecode is content-addressed (snap_get_bytecode verifies the hash),
+        // so ANY peer's bytes are the answer — accept the first that returns.
+        self.hedged_read(
+            &peers,
+            HEDGE_DELAY,
+            |peer| {
+                let hash = *code_hash;
+                async move { peer.snap_get_bytecode(&hash).await }
+            },
+            |_: &Vec<u8>| true,
+            |_: &Vec<u8>| true,
+            |_: &str| false,
+            "verifiable bytecode",
+        )
+        .await
     }
 
-    /// Verified `eth_call`: run a read-only call against the verified head's state.
-    ///
-    /// The block is pinned to the current verified head (the host gates the RPC
-    /// block param to the servable window before calling this, as it does for the
-    /// other reads). Builds a [`BlockContext`](myotis_evm::BlockContext) from the
-    /// head header, then runs the `revm` executor on a blocking thread — its
-    /// [`PoolOracle`] bridges each verified snap fetch to the network via
-    /// `block_on`, which is sound there (a blocking thread, not a runtime worker).
-    /// Returns [`CallOutcome`]: success data, revert data, or an unavailable/
-    /// unverifiable reason (the host maps the latter two to a JSON-RPC null).
-    pub async fn eth_call(
-        &self,
-        from: Option<[u8; 20]>,
-        to: [u8; 20],
-        data: Vec<u8>,
-        value: U256,
-        chain_id: u64,
-    ) -> Result<CallOutcome, String> {
-        self.eth_call_overridden(from, to, data, value, chain_id, Default::default()).await
-    }
-
-    /// `eth_call` with NO `to` — contract creation. The init code runs and its
-    /// return data is the answer (the deployless `Deploy` form wallets use).
+    /// Verified `eth_call` with NO `to` — contract creation: the init code runs
+    /// and its return data is the answer (the deployless `Deploy` form wallets
+    /// use). `anchor` selects the block, as for [`Self::eth_call_overridden`].
     pub async fn eth_call_create(
         &self,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         init_code: Vec<u8>,
         value: U256,
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
-    ) -> Result<CallOutcome, String> {
-        let (ctx, executor) = self.evm_setup(chain_id, "eth_call (create)").await?;
-        let joined = tokio::task::spawn_blocking(move || {
+    ) -> Result<CallAnswer, String> {
+        self.request(self.eth_call_create_inner(anchor, from, init_code, value, chain_id, overrides))
+            .await
+    }
+
+    async fn eth_call_create_inner(
+        &self,
+        anchor: ReadAnchor,
+        from: Option<[u8; 20]>,
+        init_code: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call (create)").await?;
+        let block_number = ctx.block_number;
+        let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.create_view(sender, &init_code, value, &ctx, overrides)
         })
-        .await
-        .map_err(|e| format!("eth_call task join error: {e}"))?;
-        Ok(match joined {
-            Ok(bytes) => CallOutcome::Success(bytes),
-            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
-            Err(other) => CallOutcome::Unavailable(other.to_string()),
-        })
+        .await?;
+        Ok(Self::call_answer(anchor, block_number, joined))
     }
 
-    /// [`Self::eth_call`] with caller-supplied state overrides applied for this
-    /// call only (see `myotis_evm::overrides`). The answer is what the call
-    /// WOULD return under the caller's hypothesis — verified state underneath,
-    /// but not itself a chain fact, so hosts label it distinctly.
+    /// Verified `eth_call`: run a read-only call against verified state, with
+    /// caller-supplied state overrides applied for this call only (empty =
+    /// none; see `myotis_evm::overrides` — the answer is then what the call
+    /// WOULD return under the caller's hypothesis, verified state underneath
+    /// but not itself a chain fact, so hosts label it distinctly).
+    ///
+    /// `anchor` is the block: the optimistic head, or the beacon-finalized
+    /// block for the `finalized` tag (#465) — never downgraded to the head; a
+    /// finalized call fails, retryably, when no peer still serves the
+    /// finalized state (CLAUDE.md §Trust — applied or refused). The host
+    /// layer refuses an RPC block number outside the servable window before
+    /// calling this (#452), as the JVM/iOS hosts do for the other reads.
+    /// Builds a [`BlockContext`](myotis_evm::BlockContext) from the anchor's
+    /// header, then runs the `revm` executor on a blocking thread — its
+    /// [`PoolOracle`] bridges each verified snap fetch to the network via
+    /// `block_on`, which is sound there (a blocking thread, not a runtime
+    /// worker). Returns the [`CallOutcome`] — success data, revert data, or
+    /// an unavailable/unverifiable reason (the host maps the latter two to a
+    /// JSON-RPC null) — with the block it ran against (#382).
+    #[allow(clippy::too_many_arguments)]
     pub async fn eth_call_overridden(
         &self,
+        anchor: ReadAnchor,
         from: Option<[u8; 20]>,
         to: [u8; 20],
         data: Vec<u8>,
         value: U256,
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
-    ) -> Result<CallOutcome, String> {
-        let (ctx, executor) = self.evm_setup(chain_id, "eth_call").await?;
+    ) -> Result<CallAnswer, String> {
+        self.request(
+            self.eth_call_overridden_inner(anchor, from, to, data, value, chain_id, overrides),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn eth_call_overridden_inner(
+        &self,
+        anchor: ReadAnchor,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let block_number = ctx.block_number;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = super::request::blocking(move || {
             // A from-less call still honours `value` — the default sender is the zero
             // ADDRESS, not zero value — so always thread `value` through
             // call_view_from (call_view would force value = 0 and drop it).
             let sender = from.unwrap_or([0u8; 20]);
             executor.call_view_overridden(sender, to, &data, value, &ctx, overrides)
         })
-        .await
-        .map_err(|e| format!("eth_call task join error: {e}"))?;
-        Ok(match joined {
-            Ok(bytes) => CallOutcome::Success(bytes),
-            Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
-            Err(other) => CallOutcome::Unavailable(other.to_string()),
-        })
+        .await?;
+        Ok(Self::call_answer(anchor, block_number, joined))
     }
 
     /// Verified `eth_estimateGas` for a call (`to` set): run the call against the
@@ -3279,7 +5382,7 @@ impl ElReader {
     /// transaction yields [`GasOutcome::Revert`] with its payload (a verified
     /// answer the host serves as the standard code-3 error); a halt /
     /// unverifiable run yields [`GasOutcome::Unavailable`] (retryable null).
-    /// Same head-pinning + executor bridge as [`Self::eth_call`].
+    /// Same anchor + executor bridge as [`Self::eth_call_overridden`].
     pub async fn estimate_gas(
         &self,
         from: Option<[u8; 20]>,
@@ -3288,13 +5391,23 @@ impl ElReader {
         value: U256,
         chain_id: u64,
     ) -> Result<GasOutcome, String> {
+        self.request(self.estimate_gas_inner(from, to, data, value, chain_id)).await
+    }
+
+    async fn estimate_gas_inner(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+    ) -> Result<GasOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "estimateGas").await?;
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.estimate_gas(sender, to, &data, value, &ctx)
         })
-        .await
-        .map_err(|e| format!("estimateGas task join error: {e}"))?;
+        .await?;
         Ok(match joined {
             Ok(gas) => GasOutcome::Estimate(gas),
             // The typed error survives to here — don't stringify the revert
@@ -3308,25 +5421,23 @@ impl ElReader {
     /// entirely over verified `eth_call`s against the current head (the registry
     /// resolver-walk + `addr`/ENSIP-10 `resolve` in `myotis_evm::ens`). Runs the
     /// whole walk on one blocking thread (each step's oracle fetch bridges via
-    /// `block_on`, same as [`Self::eth_call`]). An invalid name or a state failure
+    /// `block_on`, same as [`Self::eth_call_overridden`]). An invalid name or a state failure
     /// is `Err`; an offchain (CCIP) name is the distinguishable
     /// [`EnsOutcome::Offchain`].
     pub async fn resolve_ens(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
+        self.request(self.resolve_ens_inner(name, chain_id)).await
+    }
+
+    async fn resolve_ens_inner(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
         let block_number = ctx.block_number;
-        let walk = tokio::task::spawn_blocking(move || {
+        let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             myotis_evm::resolve_address(&caller, &name)
         });
-        // Overall deadline (the EnsApi contract promises a bounded worst case): the
-        // walk is a chain of per-request-bounded peer calls, but a many-label name
-        // against stalling peers could multiply far past that. On timeout the
-        // abandoned closure still runs out its in-flight peer call on the blocking
-        // thread (spawn_blocking can't be cancelled) — only the caller is released.
-        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
-            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        // The enclosing request scope cancels and drains this worker on deadline.
+        // Its oracle waits and interpreter steps observe the same operation.
+        let joined = walk.await?;
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
             Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
@@ -3348,9 +5459,13 @@ impl ElReader {
         chain_id: u64,
         root: EnsRootMode,
     ) -> Result<EnsQueryOutcome, String> {
-        // ONE outer deadline over the whole query — including context setups and
-        // both AUTO attempts — so the (synchronously blocking) JNI caller's worst
-        // case stays within the API's ~2 min contract regardless of root mode.
+        self.resolve_ens_query_with_budget(query, chain_id, root, super::request::REQUEST_BUDGET).await
+    }
+
+    async fn resolve_ens_query_with_budget(&self, query: EnsQuery, chain_id: u64,
+        root: EnsRootMode, budget: std::time::Duration) -> Result<EnsQueryOutcome, String> {
+        // One registered whole-query scope; AUTO's second attempt gets only
+        // the remainder after the finalized attempt has cancelled and drained.
         let ladder = async {
             match root {
                 EnsRootMode::Finalized => self.ens_attempt(query, chain_id, true).await,
@@ -3370,9 +5485,7 @@ impl ElReader {
                 }
             }
         };
-        tokio::time::timeout(RESOLVE_ENS_DEADLINE, ladder)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+        self.request_with_budget(budget, ladder).await
     }
 
     /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
@@ -3395,13 +5508,10 @@ impl ElReader {
         wrapped: bool,
     ) -> Result<EnsQueryOutcome, String> {
         let attempt = async {
-            let (ctx, executor) = if finalized {
-                self.evm_setup_finalized(chain_id, "resolve-ens").await?
-            } else {
-                self.evm_setup(chain_id, "resolve-ens").await?
-            };
+            let anchor = ReadAnchor::for_finalized(finalized);
+            let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
             let block_number = ctx.block_number;
-            let walk = tokio::task::spawn_blocking(move || {
+            let walk = super::request::blocking(move || {
                 let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
                 let raw = myotis_evm::ccip_callback(
                     &caller,
@@ -3414,10 +5524,7 @@ impl ElReader {
                 let Some(raw) = raw else { return Ok(None) };
                 decode_ccip_answer(&caller, &query, &raw)
             });
-            let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
-                .await
-                .map_err(|_| "resolve-ens attempt timed out".to_string())?
-                .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+            let joined = walk.await?;
             match joined {
                 Ok(Some(value)) => {
                     Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized })
@@ -3434,9 +5541,7 @@ impl ElReader {
                 Err(e) => Err(e.to_string()),
             }
         };
-        tokio::time::timeout(RESOLVE_ENS_DEADLINE, attempt)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+        self.request_with_budget(RESOLVE_ENS_ATTEMPT_DEADLINE, attempt).await
     }
 
     /// One resolution attempt against one root (finalized or optimistic).
@@ -3446,24 +5551,20 @@ impl ElReader {
         chain_id: u64,
         finalized: bool,
     ) -> Result<EnsQueryOutcome, String> {
-        let (ctx, executor) = if finalized {
-            self.evm_setup_finalized(chain_id, "resolve-ens").await?
-        } else {
-            self.evm_setup(chain_id, "resolve-ens").await?
-        };
+        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE,
+            self.ens_attempt_inner(query, chain_id, finalized)).await
+    }
+
+    async fn ens_attempt_inner(&self, query: EnsQuery, chain_id: u64, finalized: bool) -> Result<EnsQueryOutcome, String> {
+        let anchor = ReadAnchor::for_finalized(finalized);
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
         let block_number = ctx.block_number;
-        let walk = tokio::task::spawn_blocking(move || {
+        let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             run_ens_query(&caller, &query)
         });
-        // Per-attempt deadline (Java ENS_TIMEOUT_SEC twin): a stalled finalized
-        // walk must leave budget for AUTO's optimistic attempt under the outer
-        // cap. The timed-out spawn_blocking closure still runs out its in-flight
-        // peer call (can't be cancelled) — only the caller is released.
-        let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
-            .await
-            .map_err(|_| "resolve-ens attempt timed out".to_string())?
-            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        // The attempt scope drains this worker before AUTO can start another root.
+        let joined = walk.await?;
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
             Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
@@ -3477,30 +5578,65 @@ impl ElReader {
         }
     }
 
+    /// The executor's verdict as a [`CallAnswer`] for the block it ran against
+    /// — one mapping for both call shapes.
+    fn call_answer(
+        anchor: ReadAnchor,
+        block_number: u64,
+        joined: Result<Vec<u8>, EvmError>,
+    ) -> CallAnswer {
+        CallAnswer {
+            outcome: match joined {
+                Ok(bytes) => CallOutcome::Success(bytes),
+                Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
+                Err(other) => CallOutcome::Unavailable(other.to_string()),
+            },
+            block_number,
+            finalized: anchor == ReadAnchor::Finalized,
+        }
+    }
+
+    /// [`Self::evm_setup`] or [`Self::evm_setup_finalized`], by `anchor`.
+    async fn evm_setup_at(
+        &self,
+        anchor: ReadAnchor,
+        chain_id: u64,
+        what: &str,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        match anchor {
+            ReadAnchor::Head => self.evm_setup(chain_id, what).await,
+            ReadAnchor::Finalized => self.evm_setup_finalized(chain_id, what).await,
+        }
+    }
+
     /// [`Self::evm_setup`], anchored at the beacon-FINALIZED execution block
-    /// instead of the optimistic head. The header is fetched over the verified
-    /// hash-chain window and then CROSS-CHECKED against the finalized anchor's
-    /// own hash + state root, so the context provably IS the finalized state.
-    /// Note the servable-edge caveat: execution peers prune state, so a
-    /// finalized root (~2 epochs back) can be unservable — that fails closed
-    /// here or in the oracle, and AUTO falls back to the optimistic head.
+    /// instead of the optimistic head. The header comes over a verified window
+    /// anchored at the finalized block itself (`choose_window_top`: one header,
+    /// no path to the optimistic head — so this serves while a `latest` read
+    /// still cannot, #465) and is then CROSS-CHECKED against the finalized
+    /// anchor's own hash + state root. That cross-check is the ONLY pin to
+    /// this call's `fin` whenever the window did not anchor there: finality
+    /// sitting at the head (the window then anchors at the head), or finality
+    /// advancing between the two anchor reads (the window then anchors at the
+    /// newer finalized hash). Note the servable-edge caveat: execution peers
+    /// prune state, so a finalized root (~2 epochs back) can be unservable —
+    /// that fails closed here or in the oracle, and ENS's AUTO falls back to
+    /// the optimistic head.
     async fn evm_setup_finalized(
         &self,
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some(fin) = self.anchor.finalized_execution() else {
-            return Err(format!("no beacon-finalized execution block for {what}"));
-        };
+        let fin = self.require_finalized_execution(what)?;
         let Some(block) = self.get_block_by_number(Some(fin.block_number), false).await? else {
             return Err(format!(
                 "finalized block {} not fetchable for {what}",
                 fin.block_number
             ));
         };
-        // The window walk verified hash-linkage to the optimistic head; also pin
-        // the header to the finalized anchor itself (belt and braces — the
-        // finalized payload is the trust anchor this mode advertises).
+        // The window was anchored at the finalized hash itself; pin the header
+        // to the finalized anchor once more (belt and braces — the finalized
+        // payload is the trust anchor this mode advertises).
         if block.hash != fin.block_hash {
             return Err(format!(
                 "finalized-block hash mismatch at {} for {what}",
@@ -3514,7 +5650,7 @@ impl ElReader {
             ));
         }
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, true).await
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
@@ -3529,15 +5665,18 @@ impl ElReader {
             return Err(format!("no verified head to run {what} against"));
         };
         let ctx = block_context(&block.header, chain_id)?;
-        self.evm_executor_for(ctx, what).await
+        self.evm_executor_for(ctx, what, false).await
     }
 
     /// The executor half of the EVM setup: a fresh snap-peer snapshot + the
-    /// reader's cross-call caches bound over the given context.
+    /// reader's cross-call caches bound over the given context. `finalized` =
+    /// the context's state root is the beacon-finalized one, which the oracle
+    /// needs to know for its reputation and shadow-cache bookkeeping.
     async fn evm_executor_for(
         &self,
         ctx: myotis_evm::BlockContext,
         what: &str,
+        finalized: bool,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         // Snapshot the snap peers once: one consistent set for the whole call.
         let peers = self.pool.snap_peers().await;
@@ -3548,6 +5687,8 @@ impl ElReader {
             peers,
             tokio::runtime::Handle::current(),
             Some(self.pool.quality_sink()),
+            Arc::clone(&self.read_stats),
+            finalized,
         ));
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
@@ -3565,7 +5706,10 @@ impl ElReader {
     /// a silent hash fallback.
     ///
     /// Returns `Ok(Some(block))` when a block is fetched and verified; `Ok(None)`
-    /// for a number ABOVE the verified head (a future/unknown block → eth `null`);
+    /// for a number the node does not hold — ABOVE the verified head AND not
+    /// covered by finality (`choose_window_top`: while finality briefly reports
+    /// above a stale head, a number up to the finalized block still serves,
+    /// anchored at the finalized hash) — a future/unknown block → eth `null`;
     /// and `Err` when it can't verify right now (no anchor, too far back, or every
     /// peer failed → the host maps this to an error the router surfaces as -32000).
     pub async fn get_block_by_number(
@@ -3573,17 +5717,66 @@ impl ElReader {
         target: Option<u64>,
         full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
-        let target_num = target.unwrap_or(head_num);
-        // A pin above the verified head is future/unknown, not an error.
-        if target_num > head_num {
-            return Ok(None);
+        // Tip-lag retry for `latest` only — see TIP_LAG_RETRIES. Each attempt
+        // re-reads the anchor (it advances) and the pool ladder (the rotation
+        // may have swapped in fresher peers between attempts).
+        let mut attempt = 0;
+        loop {
+            match self.get_block_by_number_inner(target, full_transactions).await {
+                Err(PoolReadError::TipLag { error, failed }) => {
+                    if target.is_none() && attempt < TIP_LAG_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(attempt, error = %error,
+                            "latest block behind peers' imported tip — retrying");
+                        tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                        continue;
+                    }
+                    // Giving up (or a pinned read, which never retries): bank
+                    // this final attempt's deferred strikes — one per peer per
+                    // failed read, the pre-retry rate (PoolReadError::TipLag).
+                    // Unwitnessed: nobody served, so nothing is persisted.
+                    self.record_batch_failures(&failed, false).await;
+                    return Err(error);
+                }
+                Err(PoolReadError::Fatal(e)) => return Err(e),
+                Ok(v) => {
+                    if attempt > 0 {
+                        // Pair the per-attempt WARNs with their outcome in the
+                        // same info+ ring hosts keep (debug is dropped there).
+                        tracing::info!(attempt,
+                            "latest block read recovered after tip-lag retries");
+                    }
+                    return Ok(v);
+                }
+            }
         }
-        let back = head_num - target_num;
-        if back >= BLOCK_LOOKBACK_MAX {
-            return Err(format!(
-                "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ));
+    }
+
+    async fn get_block_by_number_inner(
+        &self,
+        target: Option<u64>,
+        full_transactions: bool,
+    ) -> Result<Option<VerifiedBlock>, PoolReadError> {
+        let (head_num, head_hash) = self.anchored_head().map_err(PoolReadError::Fatal)?;
+        let target_num = target.unwrap_or(head_num);
+        // The window top: the finalized block when the target is at or below
+        // it — a top every roughly synced peer holds, unlike the optimistic
+        // head a peer one slot behind honestly lacks (#465) — else the head.
+        // A pin above the verified head that finality does not cover either
+        // is future/unknown, not an error.
+        let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
+            return Ok(None);
+        };
+        // The cap bounds the ONE-request window, so it is measured to the
+        // window's own top: a finalized read during a long non-finality
+        // stretch is one header, not "far behind the head".
+        let span = top.number() - target_num;
+        if span >= BLOCK_LOOKBACK_MAX {
+            return Err(PoolReadError::Fatal(format!(
+                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
+                 verify window",
+                top.kind()
+            )));
         }
         // Serve over the snap pool (the peer set the reader maintains); a block
         // serve is eth-only (headers + bodies), so this is a superset of what's
@@ -3591,60 +5784,74 @@ impl ElReader {
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err("no snap peer available".to_string());
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.get_block_from(peer, target_num, back, &head_hash, full_transactions).await
-            {
-                Ok(block) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(Some(block));
+        // Each peer's coverage of the anchored head, sampled before the race
+        // (see pool_race_verdict; consulted only for a head-anchored window).
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
+        // Hedged (hedged_race): a silent first peer no longer costs a whole
+        // request timeout before the next one is asked — on a flaky pool that
+        // stacked up per dead peer, which is where 45-second block reads came
+        // from. The delay follows the window SPAN (block_hedge_delay): a deep
+        // window is a large download that should not be duplicated too
+        // eagerly, while `latest`, which every eth_call starts with, is one
+        // header. Any Ok ends the race: a verified block, or an undecodable
+        // body. Block reads carry no address, so racing widens no disclosure.
+        let out = hedged_race(
+            &peers,
+            block_hedge_delay(span),
+            |peer: std::sync::Arc<ManagedPeer>| async move {
+                match self.get_block_from(&peer, target_num, top, full_transactions).await {
+                    Ok(block) => Ok(BlockAttempt::Block(Box::new(block))),
+                    Err(BlockFromError::Undecodable(e)) => Ok(BlockAttempt::Undecodable(e)),
+                    Err(BlockFromError::Peer(e)) => Err(e),
                 }
-                // The body root-verified but a tx inside it doesn't decode: the
-                // peer served CORRECT data and every peer would serve the same
-                // bytes — rendering it is our failure. Credit the peer and stop
-                // (retrying the pool would just re-download the block N times
-                // and burn the shared snap reputation on verified-good peers).
-                Err(BlockFromError::Undecodable(e)) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Err(e);
-                }
-                Err(BlockFromError::Peer(e)) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
+            },
+            |_: &BlockAttempt| true,
+        )
+        .await;
+        match self
+            .settle_pool_race(
+                &peers,
+                &coverage,
+                out,
+                (target_num, span),
+                top.is_head(),
+                "a verifiable block",
+                "verified block fetch failed against every snap peer",
+            )
+            .await?
+        {
+            BlockAttempt::Block(block) => Ok(Some(*block)),
+            // The peer served CORRECT data every peer would serve identically,
+            // so this is our rendering failure — the settle credited the peer.
+            BlockAttempt::Undecodable(e) => Err(PoolReadError::Fatal(e)),
         }
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable block: {last_err}"))
     }
 
     /// Fetch + verify one block against a single peer. Fetches the header window
-    /// [target..head], checks it hash-links up to the beacon-anchored head hash,
-    /// then fetches the target's body and verifies its transactions against the
-    /// header's `transactions_root`. A [`BlockFromError::Peer`] (mismatch /
-    /// transport) is this peer's failure — the caller loop tries the next one;
-    /// a [`BlockFromError::Undecodable`] is deterministic across peers and must
-    /// short-circuit the loop.
+    /// [target..top] (`top` = the beacon-anchored block the window chains up
+    /// to, see `choose_window_top`), then fetches the target's body and verifies
+    /// its transactions against the header's `transactions_root`. A
+    /// [`BlockFromError::Peer`] (mismatch / transport) is this peer's failure —
+    /// the caller loop tries the next one; a [`BlockFromError::Undecodable`] is
+    /// deterministic across peers and must short-circuit the loop.
     async fn get_block_from(
         &self,
         peer: &ManagedPeer,
         target_num: u64,
-        back: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
         full_transactions: bool,
     ) -> Result<VerifiedBlock, BlockFromError> {
-        // The contiguous forward window [target .. head] (back + 1 headers), in one
-        // request. back < BLOCK_LOOKBACK_MAX (256) bounds this to ~150 KB, within the
-        // eth response soft limit; a peer that caps its response below back+1 fails
-        // the anchored-window length check and is skipped (fails closed — the caller
-        // tries the next peer), so deep pins carry a slightly higher liveness risk
-        // than a batched fetch would. The common case (latest / a few blocks back) is
-        // one small response.
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash)
-            .await
-            .map_err(BlockFromError::Peer)?;
+        // The contiguous forward window [target .. top], in one request. The
+        // caller's BLOCK_LOOKBACK_MAX (512) check bounds this to ~300 KB, within
+        // the eth response soft limit; a peer that caps its response below the
+        // window fails the anchored-window length check and is skipped (fails
+        // closed — the caller tries the next peer), so deep pins carry a slightly
+        // higher liveness risk than a batched fetch would. The common case
+        // (latest / a few blocks back) is one small response.
+        let window =
+            fetch_anchored_window(peer, target_num, top).await.map_err(BlockFromError::Peer)?;
         let vh = &window[0];
         // Body: verify its transactions against the (now trusted) transactions_root.
         let bodies = peer.get_block_bodies(&[vh.hash]).await.map_err(BlockFromError::Peer)?;
@@ -3703,18 +5910,26 @@ impl ElReader {
         }
         let total = peers.len();
         let mut last_err = String::new();
+        // Misses are held until the ladder settles: witnessed by a later rung
+        // that serves, unwitnessed if nobody does (#465 — a wallet polls the
+        // fee as often as the block, and this loop was poisoning the cache
+        // the same way).
+        let mut failed = Vec::new();
         for peer in &peers {
-            match self.fee_estimate_from(peer, start, count, &head_hash).await {
+            let top = WindowTop::Head { number: head_num, hash: head_hash };
+            match self.fee_estimate_from(peer, start, top).await {
                 Ok(est) => {
+                    self.record_batch_failures(&failed, true).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(est);
                 }
                 Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     last_err = e;
                 }
             }
         }
+        self.record_batch_failures(&failed, false).await;
         Err(format!("all {total} snap peer(s) failed to serve a verifiable fee estimate: {last_err}"))
     }
 
@@ -3726,10 +5941,9 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         start: u64,
-        count: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
     ) -> Result<FeeEstimate, String> {
-        let window = fetch_anchored_window(peer, start, count, head_hash).await?;
+        let window = fetch_anchored_window(peer, start, top).await?;
         let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
         let bodies = peer.get_block_bodies(&hashes).await?;
         if bodies.len() != window.len() {
@@ -3773,9 +5987,13 @@ impl ElReader {
     /// the result reflects what was served.
     ///
     /// The error carries the Java tri-state split: a [`FeeHistoryError::Reject`]
-    /// is a bad request AGAINST THE CURRENT HEAD (Java answers these -32000,
-    /// never stale); a [`FeeHistoryError::Build`] is a transport/verify failure
-    /// the host may answer from its last-good same-signature snapshot.
+    /// is a bad request AGAINST THE CURRENT ANCHOR (Java answers these -32000,
+    /// never stale) — a zero count, a `newest_block` the node does not hold
+    /// (above the verified head AND not covered by finality, see
+    /// [`Self::get_block_by_number`]), or an oldest block beyond the verify
+    /// window of the top the window anchors at; a [`FeeHistoryError::Build`]
+    /// is a transport/verify failure the host may answer from its last-good
+    /// same-signature snapshot.
     pub async fn fee_history(
         &self,
         block_count: u64,
@@ -3789,20 +6007,23 @@ impl ElReader {
         // falls to the stale-serve), unlike the request rejects below.
         let (head_num, head_hash) = self.anchored_head().map_err(FeeHistoryError::Build)?;
         let newest = newest_block.unwrap_or(head_num);
-        if newest > head_num {
+        // The window's top, as for the other by-number reads: the finalized
+        // block when `newest` is at or below it (#465) — also while finality
+        // reports above a stale optimistic head — else the head; `None` is a
+        // block the node does not hold yet.
+        let Some(top) = self.window_top(newest, (head_num, head_hash)) else {
             return Err(FeeHistoryError::Reject(
                 "newest block is beyond the verified head".to_string(),
             ));
-        }
+        };
         let count = block_count.min(FEE_HISTORY_MAX_BLOCKS).min(newest + 1);
         let oldest = newest + 1 - count;
-        if head_num - oldest >= BLOCK_LOOKBACK_MAX {
+        if top.number() - oldest >= BLOCK_LOOKBACK_MAX {
             return Err(FeeHistoryError::Reject(format!(
                 "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
             )));
         }
-        self.fee_history_build(oldest, count, head_num, &head_hash, reward_percentiles)
-            .await
+        self.fee_history_build(oldest, count, top, reward_percentiles).await
             .map_err(FeeHistoryError::Build)
     }
 
@@ -3812,8 +6033,7 @@ impl ElReader {
         &self,
         oldest: u64,
         count: u64,
-        head_num: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
         reward_percentiles: Option<&[f64]>,
     ) -> Result<FeeHistory, String> {
         let peers = self.pool.snap_peers().await;
@@ -3822,30 +6042,35 @@ impl ElReader {
         }
         let total = peers.len();
         let mut last_err = String::new();
+        // Misses held until the ladder settles, as in fee_estimate (#465).
+        let mut failed = Vec::new();
         for peer in &peers {
             let attempt = tokio::time::timeout(
                 FEE_HISTORY_DEADLINE,
-                self.fee_history_from(peer, oldest, count, head_num, head_hash, reward_percentiles),
+                self.fee_history_from(peer, oldest, count, top, reward_percentiles),
             )
             .await
             .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
             match attempt {
                 Ok(history) => {
+                    self.record_batch_failures(&failed, true).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(history);
                 }
                 Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
+                    failed.push(peer.addr());
                     last_err = e;
                 }
             }
         }
+        self.record_batch_failures(&failed, false).await;
         Err(format!("all {total} snap peer(s) failed to serve a verifiable feeHistory: {last_err}"))
     }
 
     /// Build the fee history against one peer: one anchored window
-    /// `[oldest..head]` (the span past `newest` is what anchors it — and gives
-    /// the ACTUAL next-block base fee), then, when percentiles were requested,
+    /// `[oldest ..= top]` — the finalized block when `newest` is at or below
+    /// it, else the head (the span past `newest` is what anchors it — and
+    /// gives the ACTUAL next-block base fee), then, when percentiles were requested,
     /// every block's body + receipts fetched CONCURRENTLY (the Java pipelined
     /// `verifiedBlockTipsAsync` — sequential per-block round-trips blew the
     /// wallet's fee-poll timeout) and verified against `transactionsRoot` /
@@ -3855,12 +6080,12 @@ impl ElReader {
         peer: &ManagedPeer,
         oldest: u64,
         count: u64,
-        head_num: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
         reward_percentiles: Option<&[f64]>,
     ) -> Result<FeeHistory, String> {
-        let window_len = head_num - oldest + 1;
-        let window = fetch_anchored_window(peer, oldest, window_len, head_hash).await?;
+        // `[oldest ..= top]`: the span past `newest` is what anchors it — and
+        // gives the ACTUAL next-block base fee when the top is above newest.
+        let window = fetch_anchored_window(peer, oldest, top).await?;
         let count = count as usize;
 
         let mut base_fee_per_gas: Vec<u128> =
@@ -4065,24 +6290,30 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.receipt_from(peer, &loc).await {
-                Ok(vr) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    // A verified receipt IS inclusion — the watch is done
-                    // (the Java rpcGetTransactionReceipt's confirmMined).
-                    self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
-                    return Ok(Some(vr));
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        Err(format!("all {total} snap peer(s) failed to serve verifiable receipts: {last_err}"))
+        // Hedged: this is the wallet's post-send confirm poll, and a silent peer
+        // used to hold every poll for a full request timeout. hedged_read keeps
+        // the old bookkeeping (winner served, every miss struck — now when the
+        // race ends rather than as each happens) and the old "all N snap
+        // peer(s) failed to serve verifiable receipts" error. It fetches one
+        // block's receipts and no header window (locating the tx already
+        // verified the header), so it hedges on HEDGE_DELAY like the other
+        // interactive reads.
+        let loc = &loc;
+        let vr = self
+            .hedged_read(
+                &peers,
+                HEDGE_DELAY,
+                |peer| async move { self.receipt_from(&peer, loc).await },
+                |_: &VerifiedReceipt| true,
+                |_: &VerifiedReceipt| true,
+                |_: &str| false,
+                "verifiable receipts",
+            )
+            .await?;
+        // A verified receipt IS inclusion — the watch is done
+        // (the Java rpcGetTransactionReceipt's confirmMined).
+        self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
+        Ok(Some(vr))
     }
 
     /// Verified `eth_getTransactionByHash` — the same beacon-anchored,
@@ -4167,7 +6398,9 @@ impl ElReader {
     /// Verified `eth_getBlockReceipts` by number/tag (`None` = latest): every
     /// receipt of the block, each carrying the same verified fields as
     /// [`Self::get_transaction_receipt`] (the Java `rpcGetBlockReceipts` twin).
-    /// `Ok(None)` = a verified future/unknown block (eth's null).
+    /// `Ok(None)` = a verified future/unknown block (eth's null): above the
+    /// verified head and not covered by finality, as for
+    /// [`Self::get_block_by_number`].
     pub async fn get_block_receipts(
         &self,
         target: Option<u64>,
@@ -4200,38 +6433,86 @@ impl ElReader {
         &self,
         target: Option<u64>,
     ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
-        let target_num = target.unwrap_or(head_num);
-        if target_num > head_num {
-            return Ok(None); // future/unknown block → eth null
-        }
-        let back = head_num - target_num;
-        if back >= BLOCK_LOOKBACK_MAX {
-            return Err(format!(
-                "block {target_num} is {back} behind the head — beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
-            ));
-        }
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err("no snap peer available".to_string());
-        }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            match self.block_receipts_from(peer, target_num, back, &head_hash).await {
-                Ok(served) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(Some(served));
+        // Tip-lag retry for `latest` only — same shape and rationale as
+        // get_block_by_number (see TIP_LAG_RETRIES / PoolReadError).
+        let mut attempt = 0;
+        loop {
+            match self.block_receipts_at_inner(target).await {
+                Err(PoolReadError::TipLag { error, failed }) => {
+                    if target.is_none() && attempt < TIP_LAG_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(attempt, error = %error,
+                            "latest receipts behind peers' imported tip — retrying");
+                        tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                        continue;
+                    }
+                    self.record_batch_failures(&failed, false).await;
+                    return Err(error);
                 }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
+                Err(PoolReadError::Fatal(e)) => return Err(e),
+                Ok(v) => {
+                    if attempt > 0 {
+                        tracing::info!(attempt,
+                            "latest receipts read recovered after tip-lag retries");
+                    }
+                    return Ok(v);
                 }
             }
         }
-        Err(format!(
-            "all {total} snap peer(s) failed to serve verifiable block receipts: {last_err}"
-        ))
+    }
+
+    /// One full attempt of [`Self::block_receipts_at`]; error semantics are
+    /// [`PoolReadError`]'s (see get_block_by_number_inner).
+    async fn block_receipts_at_inner(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<([u8; 32], Vec<VerifiedReceipt>)>, PoolReadError> {
+        let (head_num, head_hash) = self.anchored_head().map_err(PoolReadError::Fatal)?;
+        let target_num = target.unwrap_or(head_num);
+        // The window top as in get_block_by_number_inner: finalized when the
+        // target is at or below it (#465) — the log-index appender and fill
+        // read at or just below finality, so they now need no path to the head.
+        let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
+            return Ok(None); // above the head, not final: future/unknown → eth null
+        };
+        let span = top.number() - target_num;
+        if span >= BLOCK_LOOKBACK_MAX {
+            return Err(PoolReadError::Fatal(format!(
+                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
+                 verify window",
+                top.kind()
+            )));
+        }
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
+        }
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
+        // Hedged like get_block_by_number_inner, on the same span-scaled delay
+        // and the same deferred-strike settle. It matters at least as much here:
+        // this read also feeds the log-index appender, which abandons its whole
+        // tick on a single failed read, and the on-demand eth_getLogs fill,
+        // which has LOG_INDEX_FILL_DEADLINE in total.
+        let out = hedged_race(
+            &peers,
+            block_hedge_delay(span),
+            |peer: std::sync::Arc<ManagedPeer>| async move {
+                self.block_receipts_from(&peer, target_num, top).await
+            },
+            |_: &([u8; 32], Vec<VerifiedReceipt>)| true,
+        )
+        .await;
+        self.settle_pool_race(
+            &peers,
+            &coverage,
+            out,
+            (target_num, span),
+            top.is_head(),
+            "verifiable block receipts",
+            "verified receipts fetch failed against every snap peer",
+        )
+        .await
+        .map(Some)
     }
 
     /// One peer's block-receipts serve: anchored window, body + receipts in
@@ -4240,10 +6521,9 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         target_num: u64,
-        back: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
     ) -> Result<([u8; 32], Vec<VerifiedReceipt>), String> {
-        let window = fetch_anchored_window(peer, target_num, back + 1, head_hash).await?;
+        let window = fetch_anchored_window(peer, target_num, top).await?;
         let vh = &window[0];
         let (bodies, receipt_blocks) = futures::future::join(
             peer.get_block_bodies(&[vh.hash]),
@@ -4283,17 +6563,40 @@ impl ElReader {
         }
     }
 
+    /// Bank one deferred read-failure strike per peer of a serve batch. The
+    /// block/receipts loops defer recording until the batch's outcome is known
+    /// so a whole-pool TIP-LAG failure (our anchor ahead of the peers' imported
+    /// tip — no peer's fault) strikes nobody; every other outcome banks the
+    /// strikes exactly as immediate recording did.
+    ///
+    /// `witnessed`: another peer served the same read (a won race's misses).
+    /// A whole-pool failure is unwitnessed — banked live, persisted nowhere.
+    async fn record_batch_failures(&self, failed: &[std::net::SocketAddr], witnessed: bool) {
+        for addr in failed {
+            self.pool.record_snap_failure(*addr, witnessed).await;
+        }
+    }
+
+    /// The window top a by-number read at `target_num` anchors at (see
+    /// `choose_window_top`): the finalized block when the target is at or
+    /// below it, else the optimistic head; `None` above the head.
+    fn window_top(&self, target_num: u64, head: (u64, [u8; 32])) -> Option<WindowTop> {
+        let fin = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash));
+        choose_window_top(target_num, head, fin)
+    }
+
     /// The beacon-anchored optimistic head `(number, hash)`, or the standard
     /// not-ready errors every verified read shares.
     fn anchored_head(&self) -> Result<(u64, [u8; 32]), String> {
-        let head_num = self.anchor.optimistic_block_number();
-        let Some(head_hash) = self.anchor.optimistic_block_hash() else {
-            return Err("no beacon-anchored head yet".to_string());
-        };
-        if head_num == 0 {
-            return Err("beacon not synced".to_string());
+        // One lock for the pair: a number from one update with the hash of
+        // the next would fail every peer's correct window, and strike them.
+        if let Some(head) = self.anchor.optimistic_head() {
+            return Ok(head);
         }
-        Ok((head_num, head_hash))
+        if self.anchor.optimistic_block_hash().is_none() {
+            return Err("no beacon-anchored head yet".to_string());
+        }
+        Err("beacon not synced".to_string())
     }
 
     /// The shared locate stage (the Java `locateMinedTx` twin): resolve the tx
@@ -4379,9 +6682,12 @@ impl ElReader {
         Ok(st.found.clone())
     }
 
-    /// Run one `[from..head]` scan across the snap pool: try each peer (each
-    /// attempt bounded by [`RECEIPT_SCAN_DEADLINE`]) until one serves a fully
-    /// verified window, recording served/failure reputation per peer.
+    /// Run one `[from..head]` scan across the snap pool, HEDGED like the other
+    /// interactive reads ([`ElReader::hedged_read`]): each attempt is bounded by
+    /// [`RECEIPT_SCAN_DEADLINE`], the first fully verified window wins (found,
+    /// or verified not seen), and reputation is recorded as hedged_read does.
+    /// This is the wallet's post-send confirm poll until the tx is found, so a
+    /// silent first peer used to cost every such poll a full request timeout.
     async fn scan_window(
         &self,
         from: u64,
@@ -4393,27 +6699,33 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        for peer in &peers {
-            let attempt = tokio::time::timeout(
-                RECEIPT_SCAN_DEADLINE,
-                self.scan_blocks_from(peer, from, head_num, head_hash, tx_hash),
-            )
-            .await
-            .unwrap_or_else(|_| Err("tx scan timed out".to_string()));
-            match attempt {
-                Ok(found) => {
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(found);
-                }
-                Err(e) => {
-                    self.pool.record_snap_failure(peer.addr()).await;
-                    last_err = e;
-                }
-            }
-        }
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable tx scan: {last_err}"))
+        // A steady-state poll scans the few blocks since the previous one. A
+        // catch-up scan can span RECEIPT_MAX_SCAN_BLOCKS_PER_POLL blocks of
+        // bodies, a bulk download that should not be duplicated eagerly.
+        let span = head_num.saturating_sub(from).saturating_add(1);
+        let delay = if span <= RECEIPT_INITIAL_LOOKBACK_BLOCKS { HEDGE_DELAY } else { BULK_HEDGE_DELAY };
+        self.hedged_read(
+            &peers,
+            delay,
+            |peer| async move {
+                tokio::time::timeout(
+                    RECEIPT_SCAN_DEADLINE,
+                    self.scan_blocks_from(
+                        &peer,
+                        from,
+                        WindowTop::Head { number: head_num, hash: *head_hash },
+                        tx_hash,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err("tx scan timed out".to_string()))
+            },
+            |_: &Option<TxLocation>| true,
+            |_: &Option<TxLocation>| true,
+            |_: &str| false,
+            "a verifiable tx scan",
+        )
+        .await
     }
 
     /// Get-or-create the per-tx scan cursor. The idle-TTL sweep is time-gated
@@ -4470,13 +6782,26 @@ impl ElReader {
             return true; // too far to recheck cheaply
         }
         let peers = self.pool.snap_peers().await;
-        for peer in &peers {
-            match self.confirm_canonical_from(peer, loc, count, head_hash).await {
-                Ok(canonical) => return canonical,
-                Err(_) => continue, // transport/anchor failure — can't disprove
-            }
+        // Hedged: this runs on every confirm poll for a found tx that is not
+        // final yet, and a silent first peer used to hold each one for a full
+        // request timeout. Any verified answer ends the race. As before, no
+        // reputation is recorded here: a failure may only mean the peer has not
+        // imported our anchored head, and the receipt fetch that follows in the
+        // same poll records reputation for the same pool anyway.
+        let out = hedged_race(
+            &peers,
+            block_hedge_delay(head_num - loc.header.number),
+            |peer: Arc<ManagedPeer>| async move {
+                let top = WindowTop::Head { number: head_num, hash: *head_hash };
+                self.confirm_canonical_from(&peer, loc, top).await
+            },
+            |_: &bool| true,
+        )
+        .await;
+        match out.accepted {
+            Some((_, canonical)) => canonical,
+            None => true, // nobody could verify either way — can't disprove
         }
-        true
     }
 
     /// One peer's canonicality check: fetch `[loc.block .. head]`, require the
@@ -4486,10 +6811,9 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         loc: &TxLocation,
-        count: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
     ) -> Result<bool, String> {
-        let window = fetch_anchored_window(peer, loc.header.number, count, head_hash).await?;
+        let window = fetch_anchored_window(peer, loc.header.number, top).await?;
         Ok(window[0].hash == loc.block_hash)
     }
 
@@ -4506,12 +6830,10 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         from: u64,
-        head_num: u64,
-        head_hash: &[u8; 32],
+        top: WindowTop,
         want: &[u8; 32],
     ) -> Result<Option<TxLocation>, String> {
-        let count = head_num - from + 1;
-        let window = fetch_anchored_window(peer, from, count, head_hash).await?;
+        let window = fetch_anchored_window(peer, from, top).await?;
         // One single-hash request per block (bounded per-response size), all in
         // flight at once on this peer's multiplexed connection.
         let all_bodies = futures::future::join_all(window.iter().map(|vh| {
@@ -4566,7 +6888,12 @@ impl ElReader {
     }
 
     /// Stop discovery + the pool.
-    pub async fn stop(self) {
+    pub async fn stop(&self) {
+        self.cancel_requests();
+        // Stop producers before collecting/draining registered work.
+        self.stop_log_index_appender().await;
+        let requests: Vec<_> = self.requests.lock().map(|requests| requests.iter().filter_map(std::sync::Weak::upgrade).collect()).unwrap_or_default();
+        for request in requests { request.settled().await; }
         if let Ok(mut t) = self.log_index_task.lock() {
             if let Some(h) = t.take() {
                 h.abort();
@@ -4574,7 +6901,10 @@ impl ElReader {
         }
         // Best-effort index checkpoint before teardown: a failed write only
         // costs a re-index of the uncheckpointed tail, never correctness.
-        self.persist_log_index(self.finalized_block_number());
+        // OFF-BUDGET (`respect_throttle = false`) — it is the last write
+        // before the index goes away, and on Android a graceful teardown is
+        // what banks a session whose interval had not elapsed.
+        self.persist_log_index(self.finalized_block_number(), false);
         self.pool.stop().await;
         self.discovery.stop().await;
     }
@@ -4647,36 +6977,122 @@ fn build_one_receipt(
     }
 }
 
-/// Fetch the contiguous header window `[from ..= from+count-1]` from one peer
-/// and run the trust gate every anchored read shares: exact length, the right
-/// starting number, the window head IS the beacon-anchored head hash, and every
+/// What a verified header window is anchored at — the block its top must BE —
+/// and so what serving it proves about the peer (`peer::KnownHead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowTop {
+    /// The beacon OPTIMISTIC head: serving a window up to it proves the peer
+    /// holds the tip.
+    Head { number: u64, hash: [u8; 32] },
+    /// The beacon FINALIZED execution block: a stronger anchor (finality is
+    /// never reorged) that every roughly synced peer holds — which is why a
+    /// by-number read at or below it anchors here and no longer needs the
+    /// head (#465). Serving it proves nothing about the tip, so the peer's
+    /// head observation is left alone; and a whole-pool miss on it is a
+    /// pruned or lagging pool, never the one-slot race `latest` can lose.
+    Finalized { number: u64, hash: [u8; 32] },
+}
+
+impl WindowTop {
+    fn number(&self) -> u64 {
+        match self {
+            WindowTop::Head { number, .. } | WindowTop::Finalized { number, .. } => *number,
+        }
+    }
+
+    fn hash(&self) -> &[u8; 32] {
+        match self {
+            WindowTop::Head { hash, .. } | WindowTop::Finalized { hash, .. } => hash,
+        }
+    }
+
+    /// Anchored at the optimistic head: serving the window proves the tip,
+    /// and a whole-pool miss can be the tip-lag race.
+    fn is_head(&self) -> bool {
+        matches!(self, WindowTop::Head { .. })
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.is_head() {
+            "the optimistic head"
+        } else {
+            "the finalized block"
+        }
+    }
+}
+
+/// Pure: the top a by-number window anchors at — the finalized block when the
+/// target is at or below it, else the optimistic head — or `None` for a target
+/// above the head (eth's `null`). `latest` has `target == head` and never
+/// takes the finalized anchor, so the tip-lag retry's domain is unchanged.
+/// Judged on the target alone, not on `fin < head`: the CL loop writes
+/// finality and the head in two steps, so a reader can briefly see finality
+/// ABOVE the head, and a finalized read must then still serve rather than
+/// answer `null` for a block the node itself holds as final.
+fn choose_window_top(
+    target: u64,
+    head: (u64, [u8; 32]),
+    fin: Option<(u64, [u8; 32])>,
+) -> Option<WindowTop> {
+    match fin {
+        Some((number, hash)) if target <= number && target != head.0 => {
+            Some(WindowTop::Finalized { number, hash })
+        }
+        _ if target > head.0 => None,
+        _ => Some(WindowTop::Head { number: head.0, hash: head.1 }),
+    }
+}
+
+/// Fetch the contiguous header window `[from ..= top]` from one peer and run
+/// the trust gate every anchored read shares: exact length, the right starting
+/// number, the window top IS the beacon-anchored hash (`top`), and every
 /// header hash-links to the next. This is the sole gate that turns
-/// peer-supplied headers into trusted ones — one implementation, four callers
-/// (block serve, fee estimate, receipt scan, canonicality re-check), so a
-/// hardening never has to be applied in four places.
+/// peer-supplied headers into trusted ones — one implementation, six callers
+/// (block serve, fee estimate, fee history, receipts, receipt scan,
+/// canonicality re-check), so a hardening never has to be applied in six
+/// places.
 async fn fetch_anchored_window(
     peer: &ManagedPeer,
     from: u64,
-    count: u64,
-    head_hash: &[u8; 32],
+    top: WindowTop,
 ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, String> {
+    let Some(count) = top.number().checked_sub(from).map(|span| span + 1) else {
+        return Err(format!("window start {from} is above its anchor {}", top.number()));
+    };
     let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
-    if window.len() as u64 != count {
+    // Distinct messages on purpose: a SHORT window is tip-lag-shaped (the peer
+    // may simply not have imported up to our anchor yet — all_tip_lag matches
+    // "headers, expected"), while returning MORE than asked is a protocol
+    // violation that must never read as retryable.
+    if (window.len() as u64) < count {
         return Err(format!("peer returned {} headers, expected {count}", window.len()));
+    }
+    if window.len() as u64 != count {
+        return Err(format!(
+            "peer over-served the header request: {} returned for {count} asked",
+            window.len()
+        ));
     }
     if window[0].header.number != from {
         return Err("peer returned the wrong starting block number".to_string());
     }
-    // The window's head must BE the beacon-anchored head, and each header must
+    // The window's top must BE the beacon-anchored block, and each header must
     // hash-link to the next — proving every header in it chains to the verified
-    // head (the trust gate: head_hash is the light-client-attested exec hash).
-    if &window[window.len() - 1].hash != head_hash {
+    // anchor (the trust gate: the hash is light-client-attested).
+    if &window[window.len() - 1].hash != top.hash() {
         return Err("window head does not match the beacon-anchored head hash".to_string());
     }
     for i in 0..window.len() - 1 {
         if window[i + 1].header.parent_hash != window[i].hash {
             return Err("header window is not hash-linked".to_string());
         }
+    }
+    // Proof of the peer's head, only when the window reached the tip: it
+    // served a verified window up to our optimistic head (peer::KnownHead),
+    // what the read ladder ranks it by from here on. A finalized-anchored
+    // window proves it holds an older block, which says nothing about the tip.
+    if top.is_head() {
+        peer.note_head_served(top.number());
     }
     Ok(window)
 }
@@ -5083,6 +7499,790 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backfill_yields_only_while_head_follow_can_close_the_gap() {
+        use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};
+        // One block behind is a live chain between tail ticks, not a stall.
+        assert!(!backfill_should_yield(1_000, 1_000, 1_000, 0));
+        // A real gap that head-follow can close: stand down for it.
+        assert!(backfill_should_yield(1_000, 1_200, 1_150, 0));
+        // Wider than the bridge will ever map: coverage holds by design, so the
+        // walk must keep working rather than idle the index entirely.
+        assert!(!backfill_should_yield(1_000, 1_000_000, 900_000, 0));
+        // Finality stalled TAIL_MAX below the head: the tail parks — keep walking.
+        assert!(!backfill_should_yield(1_000, 5_000, 1_000, 0));
+        // Fairness floor, both sides: one tick short of it the walk still stands
+        // down, at it the walk takes a batch regardless. Pinned from below too,
+        // because the floor is the only thing between a permanently trailing
+        // head and a permanently silenced walk.
+        assert!(backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS - 1));
+        assert!(!backfill_should_yield(1_000, 1_200, 1_150, BACKFILL_YIELD_MAX_TICKS));
+        // The boundaries the two bugs lived on. At exactly TAIL_MAX the tail
+        // parks (so keep walking); one block inside it, head-follow still owns
+        // the gap.
+        assert!(!backfill_should_yield(9_000, 11_024, 10_000, 0));
+        assert!(backfill_should_yield(9_000, 11_023, 10_000, 0));
+        // At exactly BRIDGE_MAX_GAP the bridge still maps the gap; one past it
+        // the bridge holds coverage and the walk must not stand down.
+        assert!(backfill_should_yield(1_000, 501_100, 501_000, 0));
+        assert!(!backfill_should_yield(1_000, 501_100, 501_001, 0));
+        // The tolerance itself, counted inclusively over edge..=head: two
+        // pending blocks stay with the walk (the steady state of a 5 s chain on
+        // a 6 s tick), three hand the tick to head-follow.
+        assert!(!backfill_should_yield(1_000, 1_001, 1_000, 0));
+        assert!(backfill_should_yield(1_000, 1_002, 1_000, 0));
+        // Coverage past the head (edge = head + 1) is zero pending, not one.
+        assert!(!backfill_should_yield(1_001, 1_000, 1_000, 0));
+        // No finality yet: keep walking, there is nothing to defer to.
+        assert!(!backfill_should_yield(1_000, 21_000_000, 0, 0));
+    }
+
+    #[test]
+    fn append_stall_fires_on_three_unmoved_observations_and_resets_on_progress() {
+        let mut st = super::AppendStall::default();
+        // Three consecutive observations of the same edge cross the threshold.
+        assert!(!st.observe(100));
+        assert!(!st.just_stalled(), "not before the threshold");
+        assert!(!st.observe(100));
+        assert!(st.observe(100));
+        assert!(st.just_stalled(), "the log line fires on the crossing tick");
+        assert!(st.observe(100));
+        assert!(!st.just_stalled(), "...and only on that one");
+        // Progress restarts the count.
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
+        // A hand-off to the tail drops the charge: the next gap starts fresh.
+        st.reset();
+        assert!(!st.observe(116));
+        assert!(!st.observe(116));
+        assert!(st.observe(116));
+    }
+
+    /// The whole-pool failure summary: what a stuck wallet's one visible error
+    /// line is built from, so its shape is pinned (2026-09-02 stale-pool
+    /// incident — "8x peer returned 0 headers" was the whole diagnosis).
+    mod failure_summaries {
+        use super::*;
+
+        /// Reasons as the race records them: paired with the peer position.
+        fn indexed(reasons: Vec<String>) -> Vec<(usize, String)> {
+            reasons.into_iter().enumerate().collect()
+        }
+
+        #[test]
+        fn identical_reasons_collapse_with_a_count() {
+            let f = vec!["peer returned 0 headers, expected 1".to_string(); 8];
+            assert_eq!(
+                summarize_peer_failures(&indexed(f)),
+                "8x peer returned 0 headers, expected 1"
+            );
+        }
+
+        #[test]
+        fn distinct_reasons_are_listed_most_frequent_first() {
+            let f = vec![
+                "request timed out".to_string(),
+                "peer disconnected".to_string(),
+                "request timed out".to_string(),
+            ];
+            assert_eq!(
+                summarize_peer_failures(&indexed(f)),
+                "2x request timed out; peer disconnected"
+            );
+        }
+
+        #[test]
+        fn overflow_beyond_the_distinct_cap_is_counted_not_dropped_silently() {
+            let f: Vec<String> = (0..6).map(|i| format!("reason {i}")).collect();
+            let s = summarize_peer_failures(&indexed(f));
+            assert!(s.contains("(+2 more distinct reasons)"), "{s}");
+        }
+
+        #[test]
+        fn long_reasons_are_truncated() {
+            let f = vec!["x".repeat(500)];
+            let s = summarize_peer_failures(&indexed(f));
+            assert!(s.len() <= 130, "len {}", s.len());
+        }
+
+        #[test]
+        fn empty_input_yields_the_defensive_placeholder() {
+            assert_eq!(summarize_peer_failures(&[]), "no failures recorded");
+        }
+    }
+
+    /// Where a by-number window anchors (#465): at the finalized block when the
+    /// target is at or below it, so the read needs no path to the optimistic
+    /// head; `latest` never takes it.
+    mod finalized_anchor {
+        use super::super::{choose_window_top, WindowTop};
+
+        const HEAD: (u64, [u8; 32]) = (1_000, [0xaa; 32]);
+        const FIN: Option<(u64, [u8; 32])> = Some((900, [0xff; 32]));
+        const AT_FIN: Option<WindowTop> =
+            Some(WindowTop::Finalized { number: 900, hash: [0xff; 32] });
+        const AT_HEAD: Option<WindowTop> =
+            Some(WindowTop::Head { number: 1_000, hash: [0xaa; 32] });
+
+        #[test]
+        fn a_target_at_or_below_finality_anchors_at_the_finalized_block() {
+            assert_eq!(choose_window_top(900, HEAD, FIN), AT_FIN);
+            assert_eq!(choose_window_top(500, HEAD, FIN), AT_FIN);
+        }
+
+        #[test]
+        fn a_target_above_finality_anchors_at_the_optimistic_head() {
+            assert_eq!(choose_window_top(901, HEAD, FIN), AT_HEAD);
+            assert_eq!(choose_window_top(999, HEAD, FIN), AT_HEAD);
+        }
+
+        #[test]
+        fn a_target_above_the_head_is_unknown() {
+            assert_eq!(choose_window_top(1_001, HEAD, FIN), None);
+            assert_eq!(choose_window_top(1_001, HEAD, None), None);
+        }
+
+        #[test]
+        fn latest_never_takes_the_finalized_anchor() {
+            // target == head: the tip-lag retry loop's domain is unchanged...
+            assert_eq!(choose_window_top(1_000, HEAD, FIN), AT_HEAD);
+            // ...even if finality reports at the head.
+            assert_eq!(choose_window_top(1_000, HEAD, Some((1_000, [0xff; 32]))), AT_HEAD);
+        }
+
+        #[test]
+        fn a_finalized_block_above_a_stale_head_still_serves() {
+            // The CL loop writes finality before the head: a reader between
+            // the two writes must not answer null for a block the node holds
+            // as final — it anchors at the finalized hash instead.
+            let straddle = Some((1_005, [0xff; 32]));
+            assert_eq!(
+                choose_window_top(1_005, HEAD, straddle),
+                Some(WindowTop::Finalized { number: 1_005, hash: [0xff; 32] })
+            );
+            assert_eq!(
+                choose_window_top(998, HEAD, straddle),
+                Some(WindowTop::Finalized { number: 1_005, hash: [0xff; 32] })
+            );
+            // `latest` still reads the head it has.
+            assert_eq!(choose_window_top(1_000, HEAD, straddle), AT_HEAD);
+        }
+
+        #[test]
+        fn no_finalized_anchor_falls_back_to_the_head() {
+            assert_eq!(choose_window_top(500, HEAD, None), AT_HEAD);
+        }
+
+        #[test]
+        fn only_a_head_anchored_top_proves_the_tip() {
+            assert!(AT_HEAD.unwrap().is_head());
+            assert!(!AT_FIN.unwrap().is_head());
+            assert_eq!(AT_FIN.unwrap().number(), 900);
+            assert_eq!(AT_FIN.unwrap().hash(), &[0xff; 32]);
+        }
+    }
+
+    /// The tip-lag classifier gating the bounded `latest` retry: it must fire
+    /// only when EVERY peer failed in a way consistent with "the anchored head
+    /// is ahead of the peers' imported tip" — a short-header window or a head
+    /// hash the window doesn't reach. Anything else (transport errors, bad
+    /// proofs) means retrying won't help and must fail fast.
+    mod tip_lag {
+        use super::*;
+
+        /// Reasons as the race records them: paired with the peer position.
+        fn s(v: &[&str]) -> Vec<(usize, String)> {
+            v.iter().enumerate().map(|(i, x)| (i, x.to_string())).collect()
+        }
+
+        #[test]
+        fn all_zero_header_windows_is_tip_lag() {
+            assert!(all_tip_lag(&s(&[
+                "peer returned 0 headers, expected 1",
+                "peer returned 0 headers, expected 1",
+            ])));
+        }
+
+        #[test]
+        fn head_hash_mismatch_is_tip_lag() {
+            assert!(all_tip_lag(&s(&[
+                "window head does not match the beacon-anchored head hash",
+                "peer returned 2 headers, expected 3",
+            ])));
+        }
+
+        #[test]
+        fn a_single_transport_failure_disqualifies_the_batch() {
+            assert!(!all_tip_lag(&s(&[
+                "peer returned 0 headers, expected 1",
+                "request timed out",
+            ])));
+        }
+
+        #[test]
+        fn empty_failures_are_not_tip_lag() {
+            assert!(!all_tip_lag(&[]));
+        }
+
+        #[test]
+        fn an_over_served_header_window_is_a_protocol_violation_not_tip_lag() {
+            // fetch_anchored_window words the too-many case differently so it
+            // can never match the classifier — pin both halves of that pact.
+            assert!(!all_tip_lag(&s(&[
+                "peer over-served the header request: 5 returned for 3 asked",
+            ])));
+        }
+    }
+
+    /// Hedging invariants (#320): a silent peer must not hold the read for the
+    /// full request timeout, and — the half a naive per-attempt deadline gets
+    /// wrong — a slow-but-working peer must still win when the peers after it
+    /// are broken. Asserted on tokio's paused clock, so the timings are exact.
+    mod hedged_reads {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// What a scripted peer does when asked.
+        #[derive(Clone, Copy)]
+        enum Peer {
+            /// Answers `value` after `delay`.
+            Answers(Duration, u32),
+            /// Fails immediately (a broken peer: stale root, bad proof).
+            FailsNow,
+            /// Answers after `delay`, but without a verdict (accept == false).
+            NoVerdict(Duration),
+            /// Fails after `delay` (a slow failure: a timeout, a late bad proof).
+            FailsAfter(Duration),
+            /// Its request waits `delay` for the connection's writer, then goes
+            /// out and is never answered.
+            QueuedThenSilent(Duration),
+            /// Its request waits the first delay for the writer, then the peer
+            /// answers `value` the second delay after the send.
+            QueuedThenAnswers(Duration, Duration, u32),
+        }
+
+        /// Race the scripted peers, accepting any answer except `NoVerdict`
+        /// (modelled as value 0), and report the accepted value.
+        async fn race(peers: Vec<Peer>) -> Result<u32, String> {
+            race_tracked(peers, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))).await
+        }
+
+        /// As [`race`], tracking concurrent in-flight attempts for the cap test.
+        async fn race_tracked(
+            peers: Vec<Peer>,
+            live: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        ) -> Result<u32, String> {
+            let out = hedged_race(
+                &peers,
+                HEDGE_DELAY,
+                |p: Peer| {
+                    let live = Arc::clone(&live);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let res = attempt(p).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        res
+                    }
+                },
+                |v: &u32| *v != 0,
+            )
+            .await;
+            let total = peers.len();
+            let last_err = out.last_err().to_string();
+            if let Some((_, v)) = out.accepted {
+                return Ok(v);
+            }
+            out.fallback
+                .map(Ok)
+                .unwrap_or_else(|| Err(format!("all {total} snap peer(s) failed: {last_err}")))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_peer_still_wins_when_the_others_are_broken() {
+            // THE regression a fixed per-attempt deadline introduces: peer 0
+            // answers at 4 s (past HEDGE_DELAY) while peers 1-2 fail instantly.
+            // Abandoning peer 0 would turn a working read into "all failed".
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(4), 7),
+                Peer::FailsNow,
+                Peer::FailsNow,
+            ])
+            .await;
+            assert_eq!(out, Ok(7), "a working peer must not be abandoned");
+            assert_eq!(started.elapsed(), Duration::from_secs(4));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_peer_does_not_hold_the_read() {
+            // Peer 0 never answers; peer 1 is hedged in at HEDGE_DELAY and
+            // answers quickly. The read completes then — not at REQUEST_TIMEOUT.
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(600), 1),
+                Peer::Answers(Duration::from_millis(50), 2),
+            ])
+            .await;
+            assert_eq!(out, Ok(2));
+            assert_eq!(started.elapsed(), HEDGE_DELAY + Duration::from_millis(50));
+        }
+
+        /// One scripted attempt. Its request goes out at once, as a real one
+        /// does when the connection's writer is free, unless the script queues
+        /// it first.
+        async fn attempt(p: Peer) -> Result<u32, String> {
+            if let Peer::QueuedThenSilent(q) | Peer::QueuedThenAnswers(q, _, _) = p {
+                tokio::time::sleep(q).await;
+            }
+            crate::el::peer::mark_request_sent();
+            match p {
+                Peer::Answers(d, v) | Peer::QueuedThenAnswers(_, d, v) => {
+                    tokio::time::sleep(d).await;
+                    Ok(v)
+                }
+                Peer::NoVerdict(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(0)
+                }
+                Peer::FailsNow => Err("peer failed".to_string()),
+                Peer::FailsAfter(d) => {
+                    tokio::time::sleep(d).await;
+                    Err("peer failed late".to_string())
+                }
+                Peer::QueuedThenSilent(_) => {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    Ok(0)
+                }
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_failure_reason_is_handed_back() {
+            // The block and receipt reads summarise EVERY peer's reason and
+            // classify tip-lag across all of them, so the race must return each
+            // reason — not only the last, which is all it used to keep.
+            let peers = [Peer::FailsNow, Peer::FailsNow, Peer::Answers(Duration::from_millis(10), 5)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((2, 5)));
+            assert_eq!(out.missed, vec![0, 1]);
+            assert_eq!(out.errors.len(), 2, "one reason per peer that failed ahead of the winner");
+
+            let peers = [Peer::FailsNow; 4];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert!(out.accepted.is_none());
+            assert_eq!(out.errors.len(), 4, "a whole-pool failure reports every peer");
+            assert_eq!(out.last_err(), "peer failed");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_failure_is_still_awaited_and_counted() {
+            // A whole-pool failure must report EVERY peer, including one that
+            // fails late while the others fail at once — classifying the pool
+            // (tip-lag or not) depends on seeing all of them.
+            let started = tokio::time::Instant::now();
+            let peers = [Peer::FailsAfter(Duration::from_secs(5)), Peer::FailsNow, Peer::FailsNow];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert!(out.accepted.is_none());
+            assert_eq!(out.errors.len(), 3);
+            assert_eq!(out.missed, vec![1, 2, 0]);
+            assert_eq!(started.elapsed(), Duration::from_secs(5));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_peer_outpaced_by_a_hedge_is_reported() {
+            // Peer 0 never answers; peer 1 is hedged in and wins. Peer 0 is
+            // neither a miss nor the winner — before this it was simply dropped,
+            // so a dead connection was never struck and stayed first in the
+            // ladder. It was asked before the winner and has been outstanding
+            // past the delay, so it is reported as outpaced.
+            let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert!(out.missed.is_empty());
+            assert_eq!(out.outpaced, vec![0]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_asked_after_the_winner_is_never_outpaced() {
+            // A uniformly slow link: peer 0 answers at 10 s, and the hedges
+            // started at 3 s and 6 s are still running, each for longer than
+            // the delay. They had LESS time than peer 0 needed, so their
+            // slowness proves nothing. Counting them would bench, and on a
+            // repeat strike, healthy peers on exactly the link hedging is for.
+            let peers = [
+                Peer::Answers(Duration::from_secs(10), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_secs(600), 3),
+            ];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 1)));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_asked_just_before_the_winner_is_not_outpaced_yet() {
+            // Peer 1 is hedged in at 3 s. Peer 0 fails at 3.1 s, which starts
+            // peer 2 at once, and peer 2 answers at 3.2 s. Peer 1 was asked
+            // before the winner but has had 0.2 s, not the delay: no evidence.
+            let peers = [
+                Peer::FailsAfter(Duration::from_millis(3100)),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_millis(100), 3),
+            ];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((2, 3)));
+            assert_eq!(out.missed, vec![0]);
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_loser_is_a_miss_not_outpaced() {
+            // Peer 0 fails at 4 s, after peer 1 was hedged in at 3 s; its
+            // failure starts peer 2 at 4 s, and peer 3 is hedged in at 7 s and
+            // wins at 7.05 s. Peers 1 and 2 were asked before the winner and
+            // have had at least the delay: outpaced. Peer 0 had even longer,
+            // but it FINISHED, so it is a miss and must not be listed twice.
+            let peers = [
+                Peer::FailsAfter(Duration::from_secs(4)),
+                Peer::Answers(Duration::from_secs(600), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+                Peer::Answers(Duration::from_millis(50), 3),
+            ];
+            let started = tokio::time::Instant::now();
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(started.elapsed(), Duration::from_millis(7050));
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((3, 3)));
+            assert_eq!(out.missed, vec![0]);
+            assert_eq!(out.outpaced, vec![1, 2]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_still_waiting_for_the_writer_is_not_outpaced() {
+            // Peer 0's request never gets past its connection's writer (we are
+            // busy writing something else to that peer); peer 1 is hedged in
+            // and wins. Peer 0 never saw the request, so nothing is held
+            // against it.
+            let peers = [Peer::QueuedThenSilent(Duration::from_secs(600)), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((1, 2)));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn outpacing_is_timed_from_the_send_not_the_start() {
+            // Peer 1 is hedged in at 3 s and answers at 5 s. Peer 0's request
+            // went out at 1 s: silent for 4 s by then, so outpaced.
+            let peers = [Peer::QueuedThenSilent(Duration::from_secs(1)), Peer::Answers(Duration::from_secs(2), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert_eq!(out.outpaced, vec![0]);
+            // Queued until 2.5 s instead: 2.5 s with the peer is under the
+            // delay, although the attempt itself started 5 s earlier.
+            let peers = [Peer::QueuedThenSilent(Duration::from_millis(2500)), Peer::Answers(Duration::from_secs(2), 2)];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, _)| *i), Some(1));
+            assert!(out.outpaced.is_empty(), "{:?}", out.outpaced);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn send_order_not_ask_order_decides_who_was_outpaced() {
+            // Peer 0 is asked first, but its request waits 7 s for the writer;
+            // peer 1 is hedged in at 3 s and its request goes out at once. Peer
+            // 0 then answers 0.1 s after its send. Peer 1's peer has had the
+            // request for 4.1 s by then, longer than the delay and longer than
+            // the winner needed, so peer 1 was outpaced although it was asked
+            // second.
+            let peers = [
+                Peer::QueuedThenAnswers(Duration::from_secs(7), Duration::from_millis(100), 1),
+                Peer::Answers(Duration::from_secs(600), 2),
+            ];
+            let out = hedged_race(&peers, HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.as_ref().map(|(i, v)| (*i, *v)), Some((0, 1)));
+            assert_eq!(out.outpaced, vec![1]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_hedge_delay_is_the_callers() {
+            // Deep block and receipt reads hedge on BULK_HEDGE_DELAY.
+            let started = tokio::time::Instant::now();
+            let peers = [Peer::Answers(Duration::from_secs(600), 1), Peer::Answers(Duration::from_millis(50), 2)];
+            let out = hedged_race(&peers, BULK_HEDGE_DELAY, attempt, |v: &u32| *v != 0).await;
+            assert_eq!(out.accepted.map(|(i, _)| i), Some(1));
+            assert_eq!(started.elapsed(), BULK_HEDGE_DELAY + Duration::from_millis(50));
+        }
+
+        #[test]
+        fn only_a_deep_block_window_hedges_on_the_bulk_delay() {
+            // `latest` (every eth_call's first read) and the finality-lag
+            // blocks the on-demand getLogs fill appends are shallow, and must
+            // hedge early enough to finish inside the fill's deadline.
+            assert_eq!(block_hedge_delay(0), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(64), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BULK_HEDGE_MIN_BACK - 1), HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BULK_HEDGE_MIN_BACK), BULK_HEDGE_DELAY);
+            assert_eq!(block_hedge_delay(BLOCK_LOOKBACK_MAX - 1), BULK_HEDGE_DELAY);
+            assert!(block_hedge_delay(0) < LOG_INDEX_FILL_DEADLINE);
+        }
+
+        #[test]
+        fn a_won_pool_race_hands_back_its_misses_and_outpaced() {
+            let out = RaceOutcome {
+                accepted: Some((2, 9u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![1],
+                errors: vec![(0, "transport timeout".to_string())],
+            };
+            match pool_race_verdict(out, &[], true) {
+                PoolRaceVerdict::Won { idx, value, failed, outpaced } => {
+                    assert_eq!((idx, value), (2, 9));
+                    assert_eq!(failed, vec![0]);
+                    assert_eq!(outpaced, vec![1]);
+                }
+                _ => panic!("a race with a winner must settle as Won"),
+            }
+        }
+
+        #[test]
+        fn a_whole_pool_failure_defers_strikes_only_when_every_reason_is_tip_lag() {
+            let lag = "got 0 headers, expected 5".to_string();
+            let failed_race = |errors: Vec<String>| RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0, 1],
+                outpaced: vec![],
+                errors: errors.into_iter().enumerate().collect(),
+            };
+            match pool_race_verdict(failed_race(vec![lag.clone(), lag.clone()]), &[], true) {
+                PoolRaceVerdict::TipLag { failed, excused, .. } => {
+                    assert_eq!(failed, vec![0, 1]);
+                    assert!(excused.is_empty(), "no coverage sampled: nobody is excused");
+                }
+                _ => panic!("an all-tip-lag pool must defer its strikes"),
+            }
+            let mixed = failed_race(vec![lag, "connection reset".to_string()]);
+            match pool_race_verdict(mixed, &[], true) {
+                PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0, 1]),
+                _ => panic!("any other reason makes the failure Fatal"),
+            }
+        }
+
+        #[test]
+        fn a_peer_that_announced_it_was_behind_is_excused_from_a_tip_lag_batch() {
+            use crate::el::peer::Coverage;
+            let lag = "peer returned 0 headers, expected 1".to_string();
+            let out = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0, 1, 2],
+                outpaced: vec![],
+                errors: vec![(0, lag.clone()), (1, lag.clone()), (2, lag)],
+            };
+            let coverage = [Coverage::Behind, Coverage::Unknown, Coverage::Covers];
+            match pool_race_verdict(out, &coverage, true) {
+                PoolRaceVerdict::TipLag { failed, excused, .. } => {
+                    assert_eq!(excused, vec![0]);
+                    // The peer nobody can vouch for keeps the deferred strike,
+                    // and so does the one that claimed the head and served nothing.
+                    assert_eq!(failed, vec![1, 2]);
+                }
+                _ => panic!("an all-tip-lag pool must settle as TipLag"),
+            }
+        }
+
+        #[test]
+        fn a_behind_peer_is_not_excused_from_a_fatal_or_won_race() {
+            // Only the tip-lag arm consults coverage (see pool_race_verdict).
+            use crate::el::peer::Coverage;
+            let fatal = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec![(0, "connection reset".to_string())],
+            };
+            match pool_race_verdict(fatal, &[Coverage::Behind], true) {
+                PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0]),
+                _ => panic!("a non-tip-lag reason is Fatal"),
+            }
+            let won = RaceOutcome {
+                accepted: Some((1, 7u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec![(0, "peer returned 0 headers, expected 1".to_string())],
+            };
+            match pool_race_verdict(won, &[Coverage::Behind, Coverage::Covers], true) {
+                PoolRaceVerdict::Won { failed, .. } => assert_eq!(failed, vec![0]),
+                _ => panic!("a race with a winner must settle as Won"),
+            }
+        }
+
+        #[test]
+        fn a_finalized_anchored_miss_is_never_tip_lag() {
+            // A window anchored at the finalized block is minutes old: a
+            // whole-pool miss on it is a pruned or lagging pool, not the
+            // one-slot race, so nobody is excused and the strikes bank now.
+            use crate::el::peer::Coverage;
+            let lag = "peer returned 0 headers, expected 1".to_string();
+            let out = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: None,
+                missed: vec![0, 1],
+                outpaced: vec![],
+                errors: vec![(0, lag.clone()), (1, lag)],
+            };
+            match pool_race_verdict(out, &[Coverage::Behind, Coverage::Covers], false) {
+                PoolRaceVerdict::Fatal { failed, .. } => assert_eq!(failed, vec![0, 1]),
+                _ => panic!("a finalized-anchored miss must settle as Fatal"),
+            }
+        }
+
+        #[test]
+        fn a_global_failure_winner_witnesses_nobody_and_serves_nothing() {
+            // The account and storage reads ACCEPT a global failure (beacon
+            // not ready) to stop the race, but it is not a serve: it neither
+            // witnesses the misses nor earns the winner a serve.
+            let won = RaceOutcome {
+                accepted: Some((1, 7u32)),
+                fallback: None,
+                missed: vec![0],
+                outpaced: vec![],
+                errors: vec![],
+            };
+            assert!(race_served_by_winner(&won, |v| *v == 7));
+            assert!(!race_served_by_winner(&won, |v| *v != 7));
+            let lost = RaceOutcome::<u32> {
+                accepted: None,
+                fallback: Some(3),
+                missed: vec![0, 1],
+                outpaced: vec![],
+                errors: vec![],
+            };
+            assert!(!race_served_by_winner(&lost, |_| true));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_uniformly_slow_pool_answers_at_the_first_completion() {
+            // Every peer slow but working: hedging must not multiply the wait
+            // the way a per-attempt deadline would (3 s burned per peer first).
+            let started = tokio::time::Instant::now();
+            let out = race(vec![
+                Peer::Answers(Duration::from_secs(4), 1),
+                Peer::Answers(Duration::from_secs(4), 2),
+                Peer::Answers(Duration::from_secs(4), 3),
+            ])
+            .await;
+            assert_eq!(out, Ok(1));
+            assert_eq!(started.elapsed(), Duration::from_secs(4));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_sole_slow_peer_is_never_abandoned() {
+            let out = race(vec![Peer::Answers(Duration::from_secs(9), 5)]).await;
+            assert_eq!(out, Ok(5));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_non_verdict_answer_is_kept_only_as_a_fallback() {
+            // Peer 0 answers without a verdict, peer 1 verifies: the verdict wins.
+            assert_eq!(
+                race(vec![Peer::NoVerdict(Duration::ZERO), Peer::Answers(Duration::ZERO, 4)]).await,
+                Ok(4)
+            );
+            // With nobody verifying, the non-verdict answer is still returned.
+            assert_eq!(race(vec![Peer::NoVerdict(Duration::ZERO), Peer::FailsNow]).await, Ok(0));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_peer_failing_reports_the_last_error() {
+            let out = race(vec![Peer::FailsNow, Peer::FailsNow]).await;
+            assert!(out.unwrap_err().contains("all 2 snap peer(s) failed"));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn concurrency_is_capped_including_the_refill_path() {
+            // Every peer answers WITHOUT a verdict after a delay longer than the
+            // hedge, so: the race ramps up by hedging (proving overlap), then
+            // MISSES on each completion — which sends it back to the loop top,
+            // where `in_flight.len() < MAX_HEDGED_ATTEMPTS` is the ONLY thing
+            // holding the cap while it refills. Slow *accepted* answers would
+            // have let peer 0 win and never exercised refill (the old bug).
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let peers = vec![Peer::NoVerdict(Duration::from_secs(30)); 6];
+            // Assert on the result, don't swallow a hang: expect the fallback
+            // (no peer verified → value 0), and a paused-clock deadline that,
+            // if the race ever hung, fails loudly instead of passing.
+            let out = tokio::time::timeout(
+                Duration::from_secs(600),
+                race_tracked(peers, Arc::clone(&live), Arc::clone(&peak)),
+            )
+            .await
+            .expect("hedged race hung")
+            .expect("no-verdict pool returns its fallback, not an error");
+            assert_eq!(out, 0, "no peer produced a verdict, so the fallback wins");
+            // The cap was REACHED (so the refill path really ran at the limit)…
+            assert_eq!(peak.load(Ordering::SeqCst), MAX_HEDGED_ATTEMPTS,
+                "expected the cap to be reached during ramp + refill");
+            // …and never exceeded, and every attempt that started also finished
+            // (all six are misses — nothing is cancelled, so `live` returns to 0).
+            assert_eq!(live.load(Ordering::SeqCst), 0, "an attempt leaked");
+        }
+    }
+
+    /// The Java engine's `VerifiedRpcBackend.BLOCK_LOOKBACK_MAX` and this
+    /// file's [`BLOCK_LOOKBACK_MAX`] are two copies of one serving policy:
+    /// the engines must answer the same pinned block request identically, so
+    /// a lone bump on either side would open a window of pins the two answer
+    /// differently. Same shape as `sync.rs`'s `java_and_rust_checkpoints_agree`:
+    /// parse the Java source and compare, skipping only outside a repo checkout
+    /// (a vendored crate has no Java engine to disagree with).
+    #[test]
+    fn java_and_rust_block_lookback_agree() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let java =
+            repo_root.join("rpc-backend/src/main/java/io/myotis/rpc/VerifiedRpcBackend.java");
+        let src = match std::fs::read_to_string(&java) {
+            Ok(s) => s,
+            Err(e) => {
+                // Inside a checkout an unreadable path means the Java file MOVED —
+                // skipping there would silently disarm this guard forever.
+                if repo_root.join("settings.gradle.kts").exists() {
+                    panic!(
+                        "this is a repo checkout (settings.gradle.kts present) but {} is \
+                         unreadable ({e}) — VerifiedRpcBackend.java moved; update this \
+                         test's path",
+                        java.display()
+                    );
+                }
+                eprintln!("skipping: not a repo checkout ({} unreadable: {e})", java.display());
+                return;
+            }
+        };
+        let needle = "BLOCK_LOOKBACK_MAX = ";
+        let at = src
+            .find(needle)
+            .expect("no `BLOCK_LOOKBACK_MAX = ` assignment in VerifiedRpcBackend.java");
+        let digits: String = src[at + needle.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let java_value: u64 = digits.parse().unwrap_or_else(|_| {
+            panic!("unparseable BLOCK_LOOKBACK_MAX in VerifiedRpcBackend.java: {digits:?}")
+        });
+        assert_eq!(
+            java_value, BLOCK_LOOKBACK_MAX,
+            "Java VerifiedRpcBackend.BLOCK_LOOKBACK_MAX ({java_value}) and Rust \
+             BLOCK_LOOKBACK_MAX ({BLOCK_LOOKBACK_MAX}) have drifted — bump both together"
+        );
+    }
 
     struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);
     impl myotis_evm::EthCaller for ScriptedCaller {
@@ -5220,7 +8420,20 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        assert_eq!(c.bootnodes.len(), 4, "all four mainnet bootnodes must parse");
+        // The four discv4 seeds, pinned as strings: this const is the anchor
+        // the live tests build from and the Java NetworkConfig.MAINNET mirrors,
+        // so a partial re-sync fails here in a fast lib test.
+        let bootnodes: Vec<String> = c.bootnodes.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            bootnodes,
+            [
+                "18.138.108.67:30303",
+                "3.209.45.79:30303",
+                "65.108.70.101:30303",
+                "157.90.35.166:30303",
+            ],
+            "mainnet discv4 bootnodes = go-ethereum MainnetBootnodes (see ElConfig::mainnet)"
+        );
     }
 
     #[test]
@@ -5229,7 +8442,7 @@ mod tests {
         let cfg = ElConfig::sepolia();
         assert_eq!(cfg.boot_enodes.len(), 1, "sepolia pins the dedicated serving node");
         let (addr, pubkey) = cfg.boot_enodes[0];
-        assert_eq!(addr.to_string(), "87.154.209.161:30405");
+        assert_eq!(addr.to_string(), "188.68.32.16:30405");
         assert_eq!(pubkey[0], 0xcf);
         assert_eq!(pubkey[63], 0x2c);
         // The other networks ship none (mainnet/gnosis reach peers via discovery).
@@ -5248,6 +8461,76 @@ mod tests {
         // check and would panic (→ abort) when sliced at a non-char boundary.
         assert!(parse_boot_enodes(&[&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))]).is_empty());
         assert_eq!(parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]).len(), 1);
+    }
+
+    #[test]
+    fn parse_enode_names_each_refusal() {
+        let key = "ab".repeat(64);
+        assert!(parse_enode(SEPOLIA_MYOTIS_ENODE).is_ok());
+        assert_eq!(parse_enode("not-an-enode"), Err("missing the enode:// prefix"));
+        assert_eq!(
+            parse_enode(&format!("enode://{key}")),
+            Err("missing the '@' between the public key and the address")
+        );
+        assert_eq!(
+            parse_enode("enode://short@1.2.3.4:30303"),
+            Err("the public key must be 128 hex characters")
+        );
+        // 64 × "é" is exactly 128 bytes: refused on the hex check, never sliced.
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "\u{00e9}".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "zz".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        // `u8::from_str_radix` alone would read "+a" as 0x0a: 64 such pairs are
+        // 128 ASCII bytes and must still be refused, not applied as a garbage key.
+        assert_eq!(
+            parse_enode(&format!("enode://{}@1.2.3.4:30303", "+a".repeat(64))),
+            Err("the public key must be 128 hex characters")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@nonsense")),
+            Err("the address must be a numeric ip:port")
+        );
+        // A DNS name is refused, not resolved: the pool dials socket addresses,
+        // and a host must learn its pin cannot be dialed rather than lose it.
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@node.example.org:30303")),
+            Err("the address must be a numeric ip:port")
+        );
+        let (addr, pubkey) = parse_enode(&format!("enode://{key}@[2001:db8::1]:30303")).unwrap();
+        assert_eq!(addr.port(), 30303);
+        assert!(addr.is_ipv6());
+        assert_eq!(pubkey, [0xab; 64]);
+        // No enode URL form carries a `0x` prefix: 130 characters are refused
+        // even though the shared decoder would strip it.
+        assert_eq!(
+            parse_enode(&format!("enode://0x{key}@1.2.3.4:30303")),
+            Err("the public key must be 128 hex characters")
+        );
+        // geth prints `@0.0.0.0:<port>` for its own node until it learns its
+        // external address; that and port 0 name no dialable remote. Loopback does.
+        let undialable = "the address must be dialable: an unspecified IP (0.0.0.0, ::) or port 0";
+        assert_eq!(parse_enode(&format!("enode://{key}@0.0.0.0:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@[::]:30303")), Err(undialable));
+        assert_eq!(parse_enode(&format!("enode://{key}@1.2.3.4:0")), Err(undialable));
+        assert!(parse_enode(&format!("enode://{key}@127.0.0.1:30303")).is_ok());
+        // geth's `?discport=` form (UDP port ≠ TCP port) is accepted and ignored;
+        // any other query is refused by name.
+        let with_discport = format!("enode://{key}@1.2.3.4:30303?discport=30301");
+        let (addr, _) = parse_enode(&with_discport).unwrap();
+        assert_eq!(addr.port(), 30303);
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?discport=")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
+        assert_eq!(
+            parse_enode(&format!("enode://{key}@1.2.3.4:30303?foo=bar")),
+            Err("only a ?discport=<port> query is accepted after the address")
+        );
     }
 
 #[test]
@@ -5370,6 +8653,121 @@ fn tail_vouches_for(recorded: &[(u64, [u8; 32])], edge: u64, finalized: u64) -> 
     expect <= finalized
 }
 
+/// How far below a restart's finality claim a CURRENT light client may sit.
+/// The claim is a finality this node verified before the restart, so it is at
+/// or below the network's finality now; a light client that reports SYNCED
+/// holds a finality at most `sync::SYNCED_SLOT_SLACK_EPOCHS` epochs (at most
+/// 160 slots on every supported network) behind the wall clock, and a chain
+/// adds at most one block per slot. 512 leaves 3x headroom, so with a correct
+/// wall clock a genuine claim is never dropped — only one that a finality
+/// verified since the claim was weighed flatly contradicts. With a clock
+/// hours slow AND a light-client server serving a finality hours old, a
+/// genuine claim can still go; that costs the re-walk this claim exists to
+/// save, never trust.
+const RESTART_CLAIM_MAX_LEAD: u64 = 512;
+
+/// A restart's finality claim as the reader holds it (`ElReader::log_index_claim`).
+///
+/// Needed because a restart restores the beacon store from a snapshot written
+/// once per sync-committee period (~11 h on gnosis, ~27 h on mainnet): its
+/// finality can sit hours below the checkpoint, and the tail would otherwise
+/// rewind everything in between as "unvouched" — coverage that was final, can
+/// never reorg, and costs a head bridge to re-walk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RestartClaimState {
+    /// The covered high of the installed index that THIS NODE's own checkpoint
+    /// vouched final (0: nothing vouched) — the one fact about coverage above
+    /// the anchor's finality that survives a restart without a tail record.
+    /// Set only when an index is installed from a file whose finality claim
+    /// matches it (`logindex::read_finality_claim`). Cleared once the anchor's
+    /// finality reaches it, once a current finality verified after the claim
+    /// was first weighed contradicts it ([`RestartClaim`]), or when the index
+    /// is replaced by one that did not come from that file (an import, a fresh
+    /// index). See `ElReader::log_index_tail_tick` for what it changes.
+    vouched: u64,
+    /// The first anchor finality this claim was weighed against (0: not yet).
+    /// Only a finality verified AFTER it may contradict the claim: a restored
+    /// one proves nothing, however current a skewed wall clock makes it look.
+    first_finality: u64,
+}
+
+/// What a restart's finality claim (see [`RestartClaimState`]) means against
+/// the anchor's finality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartClaim {
+    /// The anchor is still below the vouched coverage: the tail holds.
+    Hold,
+    /// The anchor reached it; the claim adds nothing any more.
+    Subsumed,
+    /// A light client whose finality is CURRENT, and was verified after the
+    /// claim was first weighed, sits further below the claim than any restart
+    /// explains: the claim is wrong (a corrupt value), and holding for it
+    /// would stall head-follow for good.
+    Contradicted,
+}
+
+/// `first` is the anchor finality the claim was first weighed against. Only a
+/// finality verified after it counts as evidence against the claim: SYNCED
+/// reads the wall clock, and a clock running hours slow makes a finality
+/// restored from the snapshot look current. Pure — unit-tested.
+fn restart_claim_fate(finalized: u64, vouched: u64, first: u64, finality_current: bool) -> RestartClaim {
+    if finalized >= vouched {
+        RestartClaim::Subsumed
+    } else if finality_current && finalized > first && vouched - finalized > RESTART_CLAIM_MAX_LEAD {
+        RestartClaim::Contradicted
+    } else {
+        RestartClaim::Hold
+    }
+}
+
+/// The finality the tail's finality-based rules measure against: the anchor's,
+/// raised to what a restart claim vouched — but only once the anchor has a
+/// finality at all. Without one nothing follows the head, and a caller that
+/// mirrors the tail has to see exactly that (`backfill_should_yield`: no
+/// finality yet, keep walking). Pure — unit-tested.
+fn tail_final_floor(finalized: u64, vouched: u64) -> u64 {
+    if finalized == 0 {
+        0
+    } else {
+        finalized.max(vouched)
+    }
+}
+
+/// The coverage a restart may keep as final on the strength of this node's
+/// own checkpoint: the installed index's covered high, when the checkpoint's
+/// finality claim reaches it; nothing (0) otherwise. Pure — unit-tested.
+fn vouched_high(covered_high: Option<u64>, claim: Option<u64>) -> u64 {
+    match (covered_high, claim) {
+        (Some(high), Some(finalized)) if finalized >= high => high,
+        _ => 0,
+    }
+}
+
+/// Where a checkpoint of the installed index is clamped — and so the finality
+/// it may claim for the next run. The anchor's finality, or while a restart
+/// claim still holds the coverage that claim vouched; but never at or above a
+/// block the tail appended and has not yet confirmed canonical at or below
+/// finality. Finality moving past such a record proves nothing about the
+/// block we stored ([`record_may_retire`]). Within the run the tail still
+/// re-checks it; a checkpoint carrying it would hand the next run coverage it
+/// can never re-check, vouched final.
+///
+/// `None` means "write the index as it stands and claim nothing": no anchor
+/// and nothing vouched ([`checkpoint_bytes`] explains why that must not clamp
+/// at zero). The tail never runs without finality, so no record can exist
+/// then — and were one to, clamping at zero would erase the file, the worse
+/// failure. Pure — unit-tested.
+fn checkpoint_clamp(finalized: u64, vouched: u64, lowest_unconfirmed: Option<u64>) -> Option<u64> {
+    let floor = finalized.max(vouched);
+    if floor == 0 {
+        return None;
+    }
+    Some(match lowest_unconfirmed {
+        Some(n) => floor.min(n.saturating_sub(1)),
+        None => floor,
+    })
+}
+
 /// The lowest block a tail window must reach. It has to cover every RECORDED
 /// block (so a reorg is detectable — a window starting at the coverage edge
 /// compares against records that all sit BELOW it, i.e. two disjoint ranges,
@@ -5490,6 +8888,196 @@ fn bridge_candidate_chunk(
     out
 }
 
+/// Why a backfill batch failed — and, crucially, whose fault it was.
+///
+/// The peer ranking scores a failure as zero throughput, so a failure WE caused
+/// (a concurrent config swap, our own gap-reset) must not be charged to
+/// whichever peer happened to be in flight: that would demote a good server for
+/// our own bookkeeping, and — since the ranking is sticky between exploration
+/// rounds — keep it demoted.
+#[derive(Debug)]
+struct BackfillBatchError {
+    message: String,
+    /// True when the peer's response (or its absence) is what failed.
+    blames_peer: bool,
+}
+
+impl BackfillBatchError {
+    /// The peer's response was missing, malformed, unverifiable, or too slow.
+    fn peer(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blames_peer: true,
+        }
+    }
+
+    /// Our own state moved under the batch; the peer is not implicated.
+    fn ours(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            blames_peer: false,
+        }
+    }
+}
+
+impl std::fmt::Display for BackfillBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+// Bare `?`/`ok_or` sites in the batch are peer-response failures; the handful
+// that are ours are constructed explicitly with `BackfillBatchError::ours`.
+impl From<String> for BackfillBatchError {
+    fn from(message: String) -> Self {
+        Self::peer(message)
+    }
+}
+
+impl From<&str> for BackfillBatchError {
+    fn from(message: &str) -> Self {
+        Self::peer(message)
+    }
+}
+
+/// Pure scoring arithmetic for one backfill batch: given the cursor before the
+/// batch, the cursor after it, the block count the batch REQUESTED, and how
+/// long it took, return the peer's throughput in milliblocks per second — or
+/// `None` when the measurement is void and must not be scored.
+///
+/// The cursor delta is the only honest numerator: it advances exactly by the
+/// verified, receipt-checked blocks that were committed, which is what a
+/// truncated serve shortens. Dividing by elapsed time is what makes scores
+/// comparable across peers, and what stops a fully-served but inherently SHORT
+/// final batch from reading as a truncation.
+///
+/// A batch runs across awaits, so a concurrent config swap or snapshot import
+/// can move the cursor either way, and neither direction is the peer's
+/// throughput: upward underflows (scoring a good batch as a failure), downward
+/// yields a delta of millions (pinning the rank to that address). A batch can
+/// never apply more than it requested, so `applied > requested` is the tell.
+/// Rejecting it also restores the bound the multiply below relies on.
+fn backfill_batch_rate(
+    cursor_before: u64,
+    cursor_after: Option<u64>,
+    requested: u64,
+    elapsed: std::time::Duration,
+) -> Option<u64> {
+    let applied = cursor_before.checked_sub(cursor_after?)?;
+    if applied > requested {
+        return None;
+    }
+    // Milliblocks per second: integer math with enough resolution to separate
+    // peers (applied ≤ requested ≤ 1023, so ×1e6 cannot overflow), and a floor
+    // of 1ms so a sub-millisecond batch cannot divide by zero.
+    let ms = (elapsed.as_millis() as u64).max(1);
+    Some(applied.saturating_mul(1_000_000) / ms)
+}
+
+/// One peer's last backfill measurement: what it achieved, and when it last
+/// had a turn.
+///
+/// The `round` is not bookkeeping — it is what makes the exploration round's
+/// recovery guarantee per-PEER rather than per-pool-position. See
+/// [`rank_backfill_peers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerServeScore {
+    /// Last batch throughput in milliblocks/sec. A peer-attributable failure
+    /// (see `BackfillBatchError::blames_peer`) records 0; note the converse
+    /// does not hold — an extremely slow success rounds to 0 as well. Both
+    /// rank the same (dead last), which is the honest answer for both.
+    rate: u64,
+    /// The backfill round this peer was last TRIED in — the staleness clock the
+    /// exploration round promotes on. Updated on every attempt that reaches a
+    /// verdict about this peer, INCLUDING one that failed for reasons of ours
+    /// (which leaves `rate` alone — see
+    /// [`ElReader::log_index_note_peer_tried`]); a frozen clock would let one
+    /// peer capture every exploration round.
+    round: u64,
+}
+
+/// How often the backfill promotes the stalest measurement over the scores.
+///
+/// Truncation is a property of the peer AND the range — a peer that truncated
+/// on a candidate-dense stretch may serve the next stretch in full — so a
+/// purely greedy order would strand a peer on one bad batch forever. 16 keeps
+/// the exploration cost at 1 round in 16 (~6%).
+///
+/// Recovery is per-PEER: each exploration round promotes the STALEST
+/// measurement, so a demoted peer's wait is bounded by how many peers carry an
+/// older measurement than it — at worst `RESAMPLE_EVERY × pool_len` rounds. For
+/// the 12-peer gnosis pool that is ~192 rounds — a few minutes in max-speed
+/// mode, ~19 minutes at the nice-mode 6s tick. Lowering the constant buys faster
+/// recovery at a proportional throughput cost; it is deliberately tuned for the
+/// max-speed backfill, which is the mode that does the long walks.
+const RESAMPLE_EVERY: u64 = 16;
+
+/// Pure ranking for [`ElReader::log_index_backfill_peer_order`]: given the
+/// pool's peer addresses (in pool order) and the last-batch score for each,
+/// return the indices to try, best first.
+///
+/// Order: never-sampled peers first (a fresh dial must be tried before the
+/// ranking can mean anything — that is how a better peer is discovered), then
+/// by throughput descending, ties keeping pool order.
+///
+/// Every [`RESAMPLE_EVERY`]-th round is an EXPLORATION round: the peer whose
+/// measurement is STALEST is promoted over its score, so a demoted peer gets a
+/// turn on a range that may suit it. The round loop stops at the first peer
+/// that serves, so an exploration round only ever re-measures whichever peer it
+/// puts in front — leaving the ranking alone would re-measure only the current
+/// best, and a demoted peer could never recover.
+///
+/// Staleness is keyed on the ADDRESS, not on a pool position. Rotating
+/// positions instead is what an earlier revision did, and it cannot deliver the
+/// per-peer guarantee: `snap_peers()` returns the pool in read-ladder order
+/// (reshuffled by every dial, drop, bench or head announcement), so
+/// every change shifts the peers below it by one and `% n` changes
+/// modulus with the pool size — over the ~192 rounds it takes to cycle a
+/// 12-peer pool, the peer at a given position is not the peer that was there
+/// when the cycle started. Keyed on the address, a demoted peer is re-measured
+/// no matter how the pool churns around it. (Ties on the clock still break by
+/// pool index, so co-measured peers — every peer one round touched shares a
+/// clock — are ordered by a position that churn can move. That only reorders
+/// peers that are equally fresh, so it cannot starve one.)
+///
+/// Unmeasured peers are never PROMOTED — there is nothing to refresh — but the
+/// promotion does move one measured peer in front of them for that round.
+fn rank_backfill_peers(
+    addrs: &[std::net::SocketAddr],
+    scores: &std::collections::HashMap<std::net::SocketAddr, PeerServeScore>,
+    round: u64,
+) -> Vec<usize> {
+    let n = addrs.len();
+    if n < 2 {
+        return (0..n).collect();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    // Stable sort: equal keys keep pool order, so this is a refinement of the
+    // existing behavior rather than a reshuffle.
+    order.sort_by_key(|&i| match scores.get(&addrs[i]) {
+        None => (0u8, 0u64, i),
+        Some(s) => (1u8, u64::MAX - s.rate, i),
+    });
+    if round % RESAMPLE_EVERY == 0 {
+        // Only the LEAD ignores the scores — the tail stays ranked, so if the
+        // promoted peer fails, the round falls back to the best remaining peer
+        // instead of walking pool order through known-bad ones.
+        //
+        // Ties on `round` break by pool index, so the choice is deterministic.
+        let stalest = order
+            .iter()
+            .copied()
+            .filter_map(|i| scores.get(&addrs[i]).map(|s| (s.round, i)))
+            .min();
+        if let Some((_, lead)) = stalest {
+            if let Some(at) = order.iter().position(|&i| i == lead) {
+                order[..=at].rotate_right(1);
+            }
+        }
+    }
+    order
+}
+
 /// Pure truncation arithmetic for one backfill candidate chunk: given the
 /// chunk's block numbers (descending) and how many bodies/receipts the peer
 /// actually served, return `(usable, stop_below)` — the verified-prefix
@@ -5514,6 +9102,440 @@ fn truncation_plan(
 /// claim a block whose candidate receipts were not verified.
 fn should_apply(n: u64, stop_below: Option<u64>) -> bool {
     !stop_below.is_some_and(|stop| n <= stop)
+}
+
+/// Largest chunk we will ever request, and the value the sizer converges back
+/// to once a range stops truncating. 64 candidate blocks was the fixed size
+/// before the sizer existed.
+const CHUNK_LEN_MAX: usize = 64;
+/// Smallest chunk. A single block's bodies+receipts always fit a peer's
+/// response budget, so 1 is the floor at which truncation stops being a
+/// request-shaping problem and becomes a data-availability one (which
+/// `truncation_plan` already reports as `None` → rotate peers).
+const CHUNK_LEN_MIN: usize = 1;
+/// The sizer probes a wider request on the Nth consecutive untruncated batch.
+/// See [`next_chunk_len`] — this is what keeps the width off a truncate-every-
+/// other-batch limit cycle. In steady state the cycle is `N + 1` batches with
+/// exactly one truncation in it — the batch AFTER the probe, which is the one
+/// that runs at the guessed width — so a wrong guess costs 1 batch in 9,
+/// against a walk that would otherwise never widen at all.
+const CHUNK_PROBE_AFTER: usize = 8;
+/// A truncation may not cut the width by more than this factor in one step.
+/// See [`next_chunk_len`].
+const CHUNK_SHRINK_LIMIT: usize = 4;
+
+/// Pick the next bodies/receipts chunk size from what the last chunk actually
+/// yielded.
+///
+/// THE POINT, and why this is worth a tuned control loop rather than a
+/// constant: a chunk that comes back TRUNCATED ends the whole batch
+/// (`break 'chunks`), so the batch advances the cursor only as far as the first
+/// truncated chunk — while having already paid for a full ~1023-header window.
+/// On a candidate-dense range where peers cut at ~15 blocks, a 64-block chunk
+/// therefore truncates every single time. Measured on Gnosis: ~0.55 batches/s
+/// at ~1.3 MiB/s total, of which 1023 × ~600 B per batch — roughly a QUARTER of
+/// all bandwidth — was re-downloading the same header window to advance ~15
+/// blocks. Ask for ~15 instead and the chunks come back full, the batch runs
+/// the whole window, and the header cost amortizes over ~1000 blocks instead of
+/// 15. (Full chunks also leave `log_index_pipeline_full` set, so the pipeline
+/// depth stops being pinned at 1 — the two adaptations reinforce each other.)
+///
+/// Shape: decrease toward the OBSERVED serve width, and increase only as an
+/// occasional PROBE — never as a reflex after each clean batch.
+///
+/// The decrease is floored at `current / CHUNK_SHRINK_LIMIT` rather than
+/// dropping straight to `served`, because `served` is a property of the blocks
+/// in THAT chunk, not of the range: a single fat block (full gas, heavy logs)
+/// can cut a response at 1 where the surrounding range comfortably serves 40.
+/// Unfloored, one such observation drops the width straight to 1 and costs ~70
+/// batches of probing to climb back from; floored, converging to a genuinely
+/// small width costs at most a couple of extra truncated batches (each step is
+/// still a strict decrease, so it terminates).
+///
+/// The floor bounds ONE observation, not a persistent adversary: a peer that
+/// truncates every chunk still walks the shared width down a step per batch —
+/// see [`ChunkSizer`] for why the width is shared and why that is a throughput
+/// concern rather than a correctness one.
+///
+/// The probe rule is the part that is easy to get wrong, and it is not
+/// cosmetic. Growth overshoots BY CONSTRUCTION: the width that just worked is
+/// the largest width known to work, so any increase is a guess that the range
+/// got cheaper. When the guess is wrong, the probing batch truncates on its
+/// FIRST chunk and yields one chunk's worth of blocks instead of a full window.
+/// Grown after every clean batch, a steady range therefore settles into a
+/// permanent 12 → 19 → 12 → 19 limit cycle that truncates every OTHER batch —
+/// the very pathology this sizer exists to remove, re-entered through the back
+/// door. Probing once per [`CHUNK_PROBE_AFTER`] clean batches bounds the cost of
+/// a wrong guess to ~1 short batch in that many, while still letting a range
+/// that genuinely got cheaper climb back to [`CHUNK_LEN_MAX`].
+///
+/// `served` is the count the peer actually delivered (`usable` from
+/// [`truncation_plan`]), `requested` what we asked for; `served >= requested`
+/// means untruncated. `clean_streak` counts consecutive untruncated batches
+/// INCLUDING this one.
+fn next_chunk_len(current: usize, served: usize, requested: usize, clean_streak: usize) -> usize {
+    let current = current.clamp(CHUNK_LEN_MIN, CHUNK_LEN_MAX);
+    if served < requested {
+        // Truncated: aim at what fit, but not below `current / SHRINK_LIMIT`.
+        // Capped at `current` because `served > current` means the peer
+        // over-served, which is not evidence about anyone's byte budget.
+        let floor = (current / CHUNK_SHRINK_LIMIT).max(CHUNK_LEN_MIN);
+        return served.clamp(CHUNK_LEN_MIN, current).max(floor);
+    }
+    if clean_streak < CHUNK_PROBE_AFTER {
+        return current;
+    }
+    // Probe. The `+ 1` matters independently of the ratio: without it the floor
+    // is an absorbing state and a range that ever hit 1 could never recover.
+    (current + current / 2 + 1).min(CHUNK_LEN_MAX)
+}
+
+/// The full sizer state machine: fold one observation into `(width, streak)`.
+///
+/// Split out from [`ElReader::log_index_note_chunk_served`] so the streak rules
+/// — in particular the reset that stops a saturated width from probing on every
+/// batch — are pinned by tests directly rather than by a simulator that copies
+/// them. `clean_streak` counts consecutive untruncated observations INCLUDING
+/// this one.
+fn fold_chunk_observation(
+    current: usize,
+    clean_streak: usize,
+    served: usize,
+    requested: usize,
+) -> (usize, usize) {
+    // Truncation breaks the run outright — the next clean batch starts counting
+    // from one, so a range that truncates intermittently never accumulates its
+    // way to a probe.
+    let streak = if served < requested {
+        0
+    } else {
+        // Saturating: the streak is reset every CHUNK_PROBE_AFTER observations
+        // so it cannot climb here, but this is a pure function and a panic in
+        // the sizer would take down a backfill that is otherwise fine.
+        clean_streak.saturating_add(1)
+    };
+    let next = next_chunk_len(current, served, requested, streak);
+    // A fired probe restarts the clock whether it widened or was already at MAX;
+    // otherwise the streak stays past the threshold and every subsequent clean
+    // batch would probe again — the limit cycle back.
+    if next != current || streak >= CHUNK_PROBE_AFTER {
+        (next, 0)
+    } else {
+        (next, streak)
+    }
+}
+
+/// The adaptive bodies/receipts request width and the rules for updating it.
+///
+/// Policy is the pure [`next_chunk_len`] / [`fold_chunk_observation`]; this owns
+/// the state and — importantly — the two rules about WHICH observations count,
+/// which is where the sizer is easiest to get quietly wrong. Kept as one small
+/// struct rather than three loose atomics on `ElReader` so those rules can be
+/// exercised by tests directly instead of only through a live backfill.
+///
+/// Deliberately shared across peers rather than kept per-peer: the byte budget
+/// being probed is a property of the RANGE (how fat the blocks are down here)
+/// at least as much as of the peer, and the walk stays with one serving peer
+/// across many batches rather than cycling, so a per-peer table would re-learn
+/// the same width for every peer it meets. The cost of sharing is real and
+/// bounded: a peer that truncates hard drags the shared width down a step per
+/// batch (three batches to reach the floor from the ceiling), and its successor
+/// inherits that until the probe clock climbs back (~72 batches from the floor).
+/// That is a griefing vector, not a correctness one — the width only shapes
+/// REQUESTS, and every block is verified on arrival regardless of how many were
+/// asked for.
+///
+/// The exposure is LATENCY, not only bandwidth, and it is worth naming
+/// precisely. Chunks per batch is `ceil(candidates / width)`, consumed at
+/// pipeline depth 4 (or 1 while `log_index_pipeline_full` is off) with a 15 s
+/// per-request timeout, so a width driven to the floor turns a full window from
+/// ~4 requests into ~1023 — up to ~256 sequential round trips at depth 4. Two
+/// consequences: `log_index_backfill_step` only checks its tick budget BETWEEN
+/// rounds, so one stretched batch overruns it whole; and the head-follow
+/// appender shares that task, so the stretch delays the optimistic tail appends
+/// that `latest` actually points at. Both are liveness and both self-heal over
+/// the probe ladder. A hard bound on chunks per batch is the natural pairing
+/// for the width floor if this ever shows up in practice; it is deliberately
+/// not in this change, which is about sizing the requests.
+#[derive(Debug)]
+struct ChunkSizer {
+    width: std::sync::atomic::AtomicUsize,
+    /// Consecutive untruncated batches THAT EXERCISED the full width — the
+    /// probe clock. A bloom-sparse batch never asks for a full chunk, so it is
+    /// not evidence and does not tick this.
+    clean_streak: std::sync::atomic::AtomicUsize,
+    /// Set when the last observation GREW the width, i.e. the next batch is a
+    /// speculative probe. Read once, by the next truncation. It means "the
+    /// current width is unvalidated speculation", which is why every batch that
+    /// ends without exercising the width (fetch error, verification failure,
+    /// bloom-sparse window, index changed mid-batch) correctly leaves it set:
+    /// none of those validated anything. The cost is that if the probe batch
+    /// dies for an unrelated reason, one later truncation is misattributed to
+    /// the probe and does not degrade the depth — one batch, self-healing.
+    probing: std::sync::atomic::AtomicBool,
+}
+
+impl ChunkSizer {
+    fn new() -> Self {
+        Self {
+            width: std::sync::atomic::AtomicUsize::new(CHUNK_LEN_MAX),
+            clean_streak: std::sync::atomic::AtomicUsize::new(0),
+            probing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The width to cut this batch's chunks at. Read ONCE per batch by the
+    /// caller: the consumer re-derives each chunk slice by index, which only
+    /// matches the producer if the width is stable across the batch.
+    fn width(&self) -> usize {
+        self.width
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(CHUNK_LEN_MIN, CHUNK_LEN_MAX)
+    }
+
+    /// Fold one observation into the width. Returns whether it GREW (i.e.
+    /// whether the next batch is a probe).
+    fn fold(&self, served: usize, requested: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cur = self.width.load(Relaxed);
+        let (next, streak) =
+            fold_chunk_observation(cur, self.clean_streak.load(Relaxed), served, requested);
+        self.width.store(next, Relaxed);
+        self.clean_streak.store(streak, Relaxed);
+        next > cur
+    }
+
+    /// A chunk came back short. `chunk_len` is the width of THAT chunk, `width`
+    /// the batch's, `candidates` how many blocks the batch had to chunk up.
+    /// Returns whether the pipeline depth should be degraded.
+    ///
+    /// Two rules, both about what this is evidence OF:
+    ///
+    /// - It is evidence about the width only if the chunk was **the widest one
+    ///   the batch could ask for**, i.e. `width.min(candidates)`. Not simply
+    ///   full-width: a bloom-sparse window with 30 candidates at width 64
+    ///   yields ONE 30-block chunk, and if that truncates it is a direct
+    ///   measurement of the budget for this range — the only measurement such a
+    ///   batch can produce. Discarding it left every window with
+    ///   `budget < candidates < width` stuck forever: the width never moved,
+    ///   `stop_below` ended the batch before the clean path could run, and the
+    ///   depth stayed pinned at 1 — the exact pathology this sizer exists to
+    ///   remove. What must NOT count is a batch's short TAIL chunk
+    ///   (`candidates % width`, which exists only when `candidates > width`):
+    ///   there an earlier full-width chunk already succeeded, and letting one
+    ///   fat block in the tail cut the width would discard it.
+    /// - It is evidence that the RANGE punishes pipelining only if the sizer did
+    ///   not provoke it. A probe truncating is the probe finding its ceiling,
+    ///   and the width is about to drop back to one that was already working;
+    ///   degrading the depth on it would make every probe cost a second bad
+    ///   batch — its own short one, then a full window run at depth 1.
+    ///
+    /// The two rules share the gate: an observation that says nothing about the
+    /// width does not TEST a pending probe either, so it must not spend the
+    /// flag — otherwise the probe survives unvalidated and the next truncation,
+    /// quite plausibly that same probe hitting its ceiling, is blamed on the
+    /// range. Mirrors [`Self::note_clean_batch`], which leaves the flag alone
+    /// on the same grounds.
+    fn note_truncated(
+        &self,
+        served: usize,
+        chunk_len: usize,
+        width: usize,
+        candidates: usize,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let provoked = self.probing.load(Relaxed);
+        if chunk_len >= width.min(candidates) {
+            self.probing.store(false, Relaxed);
+            self.fold(served, chunk_len);
+        }
+        !provoked
+    }
+
+    /// A whole batch came back untruncated.
+    ///
+    /// "Untruncated" only counts as evidence if the width was actually
+    /// exercised. The widest chunk a batch requests is
+    /// `candidates.min(width)`, so a bloom-sparse window that asked for 5
+    /// blocks and got 5 says nothing about whether 64 would have fit. Counting
+    /// it would ratchet the width up on fabricated evidence and hand the next
+    /// dense stretch a width it has to re-learn from a truncation.
+    fn note_clean_batch(&self, candidates: usize, width: usize) {
+        if candidates >= width {
+            let grew = self.fold(width, width);
+            self.probing
+                .store(grew, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Sustained bytes/sec the log-index checkpoints are allowed to write.
+const PERSIST_WRITE_BUDGET_BPS: u64 = 1 << 20; // 1 MiB/s
+/// Never checkpoint more often than this, however small the index.
+const PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Never go longer than this between checkpoints, however large. Past this
+/// point the budget is already blown and the only thing left to protect is how
+/// much of the walk a crash would cost.
+const PERSIST_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long to wait between full-index checkpoints, given what the last one
+/// cost to write.
+///
+/// The store is a FULL-REWRITE format: a checkpoint costs its entire size in
+/// bytes written, every time. A FIXED interval therefore makes the write RATE
+/// grow without bound as the index does, which is the wrong quantity to hold
+/// constant. Measured on the Gnosis backfill: a 238 MB index on a flat 10 s
+/// cadence wrote 366 GB across one 6h22m run — a measured 17.8 MiB/s sustained
+/// over the sampled window — for an index that ended at 238 MB. (The flat 10 s
+/// interval is not even the binding constraint at that size: a 238 MB write
+/// takes longer than 10 s, so the next checkpoint was due the moment the
+/// previous one finished and the daemon wrote essentially continuously, at
+/// whatever the disk would take.) On a phone that is not merely I/O, it is
+/// flash wear, and it is why this is worth a policy rather than a constant.
+///
+/// So scale the interval with the size and let the RATE be what stays bounded.
+/// The trade is self-balancing: a longer interval costs a crash more re-walked
+/// blocks, but the amount re-walked is exactly what the walker produced during
+/// one interval — the same work the checkpoint would have been recording.
+///
+/// This bounds the constant. The asymptotics — O(n²) total bytes across a walk
+/// that grows the index linearly — are inherent to full-rewrite checkpoints and
+/// are fixed by the segmented/delta store already recorded as required before
+/// mainnet-scale mobile backfill (docs/eth-getlogs-design.md §Store).
+fn persist_interval(last_bytes: u64) -> std::time::Duration {
+    // div_ceil, not truncating division: rounding the interval DOWN puts the
+    // sustained rate over the budget for every size that isn't a whole
+    // multiple of it (11.5 MiB → 11 s → ~4.5% over). Rounding up is the side
+    // that keeps the invariant the budget names.
+    std::time::Duration::from_secs(last_bytes.div_ceil(PERSIST_WRITE_BUDGET_BPS))
+        .clamp(PERSIST_MIN_INTERVAL, PERSIST_MAX_INTERVAL)
+}
+
+/// A file's size, or None if it cannot be stated. Never a guess: a missing
+/// size must leave the last known one standing, not reset the cadence to the
+/// floor and un-throttle the next write.
+fn file_len(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Whether a checkpoint is due, given when the last one ran and what it cost.
+/// Split out from [`PersistClock`] so the decision — not just the interval it
+/// consults — is testable without a live reader.
+fn persist_due(prev: Option<std::time::Instant>, now: std::time::Instant, last_bytes: u64) -> bool {
+    prev.is_none_or(|p| now.saturating_duration_since(p) >= persist_interval(last_bytes))
+}
+
+/// When the log-index file on disk last became a current checkpoint, and what
+/// it weighed then — the whole state the size-aware throttle runs on.
+///
+/// A checkpoint is a WHOLE-FILE rewrite, so the two live together: the cost of
+/// the next write is what the last one cost, and the interval it earns scales
+/// with it (see [`persist_interval`]).
+///
+/// The one rule: **only a write ends an interval.** [`Self::is_due`] is a pure
+/// read — asking does not consume anything — because the caller may not get to
+/// write (another writer holds the checkpoint lock), and charging a
+/// checkpoint that never happened a full interval throws away up to
+/// [`PERSIST_MAX_INTERVAL`] of walk on a crash. There is no way to un-stamp:
+/// `None` means *nothing has been written or adopted this process*, and once
+/// that stops being true it never becomes true again.
+#[derive(Debug)]
+struct PersistClock {
+    last: std::sync::Mutex<Option<std::time::Instant>>,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl PersistClock {
+    fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// True when a checkpoint is due. PURE — see the type doc. A node with no
+    /// index path never stamps, so this stays permanently true there; the
+    /// writer's own early return, not the clock, is what stops it.
+    fn is_due(&self) -> bool {
+        self.is_due_at(std::time::Instant::now())
+    }
+
+    fn is_due_at(&self, now: std::time::Instant) -> bool {
+        let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        self.last.lock().is_ok_and(|t| persist_due(*t, now, bytes))
+    }
+
+    /// A checkpoint of `bytes` landed at `at` (or cost what one costs —
+    /// a failed write has already paid the serialize and the write attempt,
+    /// so it starts an interval too; otherwise a persistent `ENOSPC` retries
+    /// every tick). `None` bytes means the size could not be read — keep the
+    /// last known one rather than forfeit the interval this write earned.
+    fn wrote(&self, at: std::time::Instant, bytes: Option<u64>) {
+        self.note_bytes(bytes);
+        self.stamp(at);
+    }
+
+    /// A file already on disk describes the index just installed from it — no
+    /// write happened, and none is needed to make the file current.
+    ///
+    /// Credits the interval all but [`PERSIST_MIN_INTERVAL`] of its length:
+    /// the first checkpoint of the session lands at the FLOOR rather than a
+    /// size-derived 238–600 s. Both halves matter on the platform that drove
+    /// this — Android restarts the process routinely. Without the credit a
+    /// session shorter than the interval would bank nothing at all (and a
+    /// device whose sessions are consistently short would never advance the
+    /// file); without the stamp the first tick would rewrite hundreds of MB
+    /// byte-identical but for the header, every launch, which is the flash
+    /// wear this throttle exists to stop.
+    fn adopted(&self, at: std::time::Instant, bytes: Option<u64>) {
+        self.note_bytes(bytes);
+        let credit = persist_interval(self.bytes.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(PERSIST_MIN_INTERVAL);
+        // `checked_sub` returns None below the monotonic epoch — on a host
+        // whose uptime is under one interval. Falling back to `at` merely
+        // grants the full interval, which is the pre-credit behaviour.
+        self.stamp(at.checked_sub(credit).unwrap_or(at));
+    }
+
+    /// Size the NEXT interval without touching the clock: for the index that
+    /// was just installed, not the file that was just written. A push that
+    /// swaps a 238 MB index for a fresh empty one must not leave the new
+    /// walk's first window checkpointing every ~238 s — a small index is
+    /// exactly when progress is cheapest to protect.
+    fn note_bytes(&self, bytes: Option<u64>) {
+        if let Some(b) = bytes {
+            self.bytes.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn stamp(&self, at: std::time::Instant) {
+        if let Ok(mut t) = self.last.lock() {
+            *t = Some(at);
+        }
+    }
+}
+
+/// The bytes one checkpoint of `ix` should contain at `clamp` (see
+/// [`checkpoint_clamp`]).
+///
+/// Split out so BOTH branches are testable: the choice is trust-relevant, and
+/// getting it wrong is invisible from the outside — a checkpoint that skipped
+/// the clamp claims coverage the next run cannot re-verify, and one that
+/// clamped at zero finality would rename an empty file over a good snapshot.
+fn checkpoint_bytes(
+    ix: &crate::el::logindex::LogIndex,
+    tag: &crate::el::logindex::ChainTag,
+    clamp: Option<u64>,
+) -> Vec<u8> {
+    match clamp {
+        // No beacon anchor yet. There is no optimistic coverage to clamp
+        // either (the tail only runs below a real finality), and clamping AT
+        // ZERO would rewind the whole index and rename an empty file over a
+        // good checkpoint — losing, on a phone, months of backfill. Write it
+        // as it stands.
+        None => ix.serialize(tag),
+        Some(max) => ix.serialize_clamped(tag, max),
+    }
 }
 
 #[cfg(test)]
@@ -5577,7 +9599,7 @@ mod tail_reorg_tests {
     #[test]
     fn the_tail_window_floor_must_be_servable() {
         use super::{tail_window_floor, tail_window_is_servable};
-        const TAIL_MAX: u64 = 1_024;
+        const TAIL_MAX: u64 = super::TAIL_MAX_ABOVE_FINALITY;
         let head = 10_000u64;
         // The hard floor the tail uses must be reachable within one window —
         // head - (TAIL_MAX - 1) needs exactly TAIL_MAX headers.
@@ -5710,6 +9732,429 @@ mod bridge_plan_tests {
 }
 
 #[cfg(test)]
+mod backfill_peer_rank_tests {
+    use super::{rank_backfill_peers, PeerServeScore, RESAMPLE_EVERY};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    fn addr(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:30303").parse().unwrap()
+    }
+
+    /// A measurement taken in round 0 — for the tests where only the rate is
+    /// under test, so every peer is equally stale.
+    fn sc(rate: u64) -> PeerServeScore {
+        PeerServeScore { rate, round: 0 }
+    }
+
+    /// A measurement with an explicit staleness clock.
+    fn sc_at(rate: u64, round: u64) -> PeerServeScore {
+        PeerServeScore { rate, round }
+    }
+
+    /// A non-resample round, so the ranking is actually applied.
+    const R: u64 = 1;
+
+    #[test]
+    fn unscored_peers_are_sampled_before_scored_ones() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(1), sc(1023));
+        scores.insert(addr(3), sc(62));
+        // #2 has never been tried: it must be tried first, even though #1 is a
+        // known-generous server. Otherwise a better peer is never discovered.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn faster_peers_outrank_slower_ones() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // The observed gnosis failure: the pool lists the stingy peer FIRST
+        // (newest dial), and it "succeeds" every round with a truncated batch.
+        scores.insert(addr(1), sc(62_000));
+        scores.insert(addr(2), sc(1_023_000));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+    }
+
+    /// The scores are RATES, so a peer that serves fewer blocks per batch but
+    /// serves them faster must win. Scoring raw block counts got this backwards
+    /// — the whole point of the change is throughput, not generosity.
+    #[test]
+    fn a_small_fast_batch_outranks_a_large_slow_one() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // 1023 blocks in 40s = ~25 blk/s.
+        scores.insert(addr(1), sc(1023 * 1_000_000 / 40_000));
+        // 300 blocks in 1s = 300 blk/s.
+        scores.insert(addr(2), sc(300 * 1_000_000 / 1_000));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+    }
+
+    #[test]
+    fn failed_peers_sort_last_but_are_not_dropped() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(1), sc(0)); // failed last round
+        scores.insert(addr(2), sc(500_000));
+        scores.insert(addr(3), sc(900_000));
+        // Sorted worst-last, and the failed peer is still IN the list: ranking
+        // never gates a peer out, because a peer that fails one range may be
+        // the only one holding the next.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![2, 1, 0]);
+    }
+
+    /// Equal scores must not reshuffle the pool: the ranking is a refinement of
+    /// the pool's own order, so an all-equal pool is a no-op. Written against a
+    /// pool whose ranked order would differ from pool order if the sort were
+    /// unstable or the tie-break inverted.
+    #[test]
+    fn ties_keep_pool_order() {
+        let addrs = [addr(7), addr(3), addr(9), addr(1)];
+        let mut scores = HashMap::new();
+        for a in &addrs {
+            scores.insert(*a, sc(1_023_000));
+        }
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn exploration_rounds_ignore_scores_so_a_demoted_peer_can_recover() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        // The demoted peer's measurement is the older one — nobody has
+        // re-tried it since, which is precisely why it is still demoted.
+        scores.insert(addr(1), sc_at(62_000, 3));
+        scores.insert(addr(2), sc_at(1_023_000, 9));
+        // Ranked on ordinary rounds...
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![1, 0]);
+        // ...but every RESAMPLE_EVERY-th round promotes the stalest measurement
+        // over its score, so the demoted peer gets a turn on a range that may
+        // suit it — an order the score-based ranking would never produce.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![0, 1]
+        );
+    }
+
+    /// The round loop stops at the FIRST peer that serves, so an exploration
+    /// round only ever re-measures whichever peer it puts in front. Leaving the
+    /// ranking alone would re-measure only the current best, and a demoted peer
+    /// could never recover. Driving the loop the way the backfill does — the
+    /// promoted peer gets measured, so its clock becomes current — every peer
+    /// must get a turn, and no peer may be starved.
+    #[test]
+    fn every_demoted_peer_is_eventually_re_measured() {
+        let addrs: Vec<SocketAddr> = (1..=5).map(addr).collect();
+        let mut scores = HashMap::new();
+        for (i, a) in addrs.iter().enumerate() {
+            // All demoted, all stale: only exploration can rescue them.
+            scores.insert(*a, sc_at(1, i as u64));
+        }
+        let mut leads = Vec::new();
+        for k in 1..=addrs.len() as u64 {
+            let round = k * RESAMPLE_EVERY;
+            let lead = rank_backfill_peers(&addrs, &scores, round)[0];
+            leads.push(lead);
+            // The backfill measures whoever led, which refreshes its clock —
+            // so the NEXT exploration round must pick somebody else.
+            scores.insert(addrs[lead], sc_at(1, round));
+        }
+        // Every peer led exactly once: nobody is starved, and nobody is
+        // re-measured twice while another peer is still waiting.
+        leads.sort_unstable();
+        assert_eq!(leads, (0..addrs.len()).collect::<Vec<_>>());
+    }
+
+    /// Pins the obligation the ranking places on its CALLER: a promoted peer's
+    /// clock must be refreshed on every attempt that reaches a verdict about
+    /// it, including one that failed for reasons of ours. Left frozen, that
+    /// peer stays `min()` forever and captures every exploration round, so no
+    /// other demoted peer is ever re-measured — the guarantee the rotation
+    /// exists to provide. `log_index_note_peer_tried` is what discharges this;
+    /// this test is what says why it may not be deleted.
+    #[test]
+    fn a_frozen_clock_would_capture_every_exploration_round() {
+        let addrs: Vec<SocketAddr> = (1..=4).map(addr).collect();
+        let mut scores = HashMap::new();
+        for (i, a) in addrs.iter().enumerate() {
+            scores.insert(*a, sc_at(1, 10 + i as u64));
+        }
+        // addr(1) is the stalest and its clock is never refreshed.
+        let frozen = 0;
+        for k in 1..=4u64 {
+            let lead = rank_backfill_peers(&addrs, &scores, k * RESAMPLE_EVERY)[0];
+            assert_eq!(lead, frozen, "round {k}: the frozen peer must keep winning");
+            // Refresh EVERY OTHER peer, as a served or attributably-failed
+            // round would; only the frozen one is skipped.
+            for (i, a) in addrs.iter().enumerate() {
+                if i != frozen {
+                    scores.insert(*a, sc_at(1, k * RESAMPLE_EVERY));
+                }
+            }
+        }
+        // Refreshing it — what the caller must do — hands the turn on.
+        scores.insert(addrs[frozen], sc_at(1, 5 * RESAMPLE_EVERY));
+        let lead = rank_backfill_peers(&addrs, &scores, 6 * RESAMPLE_EVERY)[0];
+        assert_ne!(lead, frozen, "a refreshed clock must release the promotion");
+    }
+
+    /// The staleness clock is keyed on the ADDRESS, so the guarantee above is
+    /// per-PEER and survives pool churn. Rotating pool POSITIONS — what an
+    /// earlier revision did — cannot: `snap_peers()` lists the pool in
+    /// read-ladder order (reshuffled by every dial, drop, bench or head
+    /// announcement), so a single change shifts every peer below it and silently hands
+    /// the promotion to a different peer than the cycle was walking toward.
+    #[test]
+    fn the_promoted_peer_follows_the_address_not_the_pool_position() {
+        let stale = addr(9);
+        let mut scores = HashMap::new();
+        scores.insert(stale, sc_at(1, 0)); // stalest
+        scores.insert(addr(1), sc_at(900_000, 7));
+        scores.insert(addr(2), sc_at(500_000, 8));
+        // Same three peers, three different pool orders (a dial or a drop
+        // reorders them). The promoted peer must be `stale` every time.
+        for pool in [
+            [stale, addr(1), addr(2)],
+            [addr(1), stale, addr(2)],
+            [addr(1), addr(2), stale],
+        ] {
+            let lead = rank_backfill_peers(&pool, &scores, RESAMPLE_EVERY)[0];
+            assert_eq!(pool[lead], stale, "pool {pool:?} promoted the wrong peer");
+        }
+    }
+
+    #[test]
+    fn is_a_permutation_of_the_pool_for_any_score_shape() {
+        let addrs: Vec<SocketAddr> = (1..=8).map(addr).collect();
+        for shape in 0..64u64 {
+            let mut scores = HashMap::new();
+            for (i, a) in addrs.iter().enumerate() {
+                if shape >> (i % 6) & 1 == 1 {
+                    // Vary the staleness clock too, so exploration rounds are
+                    // exercised against every shape of tie and gap.
+                    scores.insert(
+                        *a,
+                        sc_at((shape * 7 + i as u64) % 1024, (shape + i as u64) % 5),
+                    );
+                }
+            }
+            for round in 0..(RESAMPLE_EVERY + 2) {
+                let mut order = rank_backfill_peers(&addrs, &scores, round);
+                order.sort_unstable();
+                // No peer dropped, none duplicated — the round still tries the
+                // whole pool, only the order changes.
+                assert_eq!(order, (0..addrs.len()).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// An exploration round promotes ONE peer; the rest stays ranked, so a
+    /// failing lead falls back to the best remaining peer rather than walking
+    /// pool order through known-bad ones.
+    #[test]
+    fn exploration_keeps_the_tail_ranked_behind_the_promoted_peer() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        // Best, failed-last-round (and stalest), and middling respectively.
+        scores.insert(addr(1), sc_at(900_000, 5));
+        scores.insert(addr(2), sc_at(0, 2));
+        scores.insert(addr(3), sc_at(500_000, 6));
+        // Ordinary round: ranked, best first.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 2, 1]);
+        // Exploration round promotes the failed peer (its measurement is the
+        // stalest): it leads, but the remainder is still ranked — 0 before 2,
+        // NOT pool order.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![1, 0, 2]
+        );
+    }
+
+    /// An exploration round with nothing measured must not misfire — there is
+    /// no measurement to promote. Guards the `.min()` / rotate path against a
+    /// panic or an accidental reshuffle on an all-unmeasured pool.
+    #[test]
+    fn an_exploration_round_with_no_measurements_is_a_no_op() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let scores = HashMap::new();
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![0, 1, 2]
+        );
+    }
+
+    /// The discriminator between "promote the stalest" and "promote the worst".
+    /// Every other exploration test has its stalest peer ALSO holding the worst
+    /// rate, so they all pass under either rule. Here the stalest peer is the
+    /// FASTEST one: promoting by rate would leave it where the ranking already
+    /// put it and re-measure the slowest peer instead, so a stale best-rate
+    /// score could never be refreshed and would pin the ranking indefinitely.
+    #[test]
+    fn exploration_promotes_the_stalest_even_when_it_is_the_fastest() {
+        let addrs = [addr(1), addr(2), addr(3)];
+        let mut scores = HashMap::new();
+        // middling/fresh, worst/freshest, and BEST/stalest respectively.
+        scores.insert(addr(1), sc_at(500_000, 40));
+        scores.insert(addr(2), sc_at(10_000, 41));
+        scores.insert(addr(3), sc_at(900_000, 2));
+        // Ordinary round ranks by rate: best (2), middling (0), worst (1).
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![2, 0, 1]);
+        // The exploration round must promote the stale best (index 2), not the
+        // worst (index 1). Here that coincides with the ranking's own lead, so
+        // assert the whole order is untouched rather than just the head.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![2, 0, 1]
+        );
+        // Make the stale-best peer sort LAST on rate, so promotion is visible:
+        // it must still lead, ahead of two better-rated but fresher peers.
+        scores.insert(addr(3), sc_at(1, 2));
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1, 2]);
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![2, 0, 1]
+        );
+    }
+
+    /// A measured peer's promotion outranks an unmeasured one for that round.
+    /// Documented rather than incidental: an unmeasured peer normally sorts
+    /// first, and exploration is the one round where it does not.
+    #[test]
+    fn exploration_promotes_a_measured_peer_ahead_of_an_unmeasured_one() {
+        let addrs = [addr(1), addr(2)];
+        let mut scores = HashMap::new();
+        scores.insert(addr(2), sc_at(900_000, 0));
+        // Ordinary round: the unmeasured peer leads.
+        assert_eq!(rank_backfill_peers(&addrs, &scores, R), vec![0, 1]);
+        // Exploration round: the stale measurement is refreshed first. The
+        // unmeasured peer is not dropped — it is next, and leads again the very
+        // next round.
+        assert_eq!(
+            rank_backfill_peers(&addrs, &scores, RESAMPLE_EVERY),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn degenerate_pools_are_returned_untouched() {
+        let scores = HashMap::new();
+        assert_eq!(rank_backfill_peers(&[], &scores, R), Vec::<usize>::new());
+        assert_eq!(rank_backfill_peers(&[addr(1)], &scores, R), vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod backfill_batch_rate_tests {
+    use super::backfill_batch_rate;
+    use std::time::Duration;
+
+    /// The walk descends, so the cursor DROPS by the blocks applied.
+    #[test]
+    fn scores_blocks_applied_per_second() {
+        // 1000 blocks in 2s = 500 blk/s = 500_000 milliblocks/s.
+        let r = backfill_batch_rate(1_000_000, Some(999_000), 1023, Duration::from_secs(2));
+        assert_eq!(r, Some(500_000));
+    }
+
+    /// The point of the rate: fewer blocks served faster must win. Scoring raw
+    /// block counts ranked these the wrong way round.
+    #[test]
+    fn a_short_fast_batch_outscores_a_long_slow_one() {
+        let slow = backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(40));
+        let fast = backfill_batch_rate(1_000_000, Some(999_700), 1023, Duration::from_secs(1));
+        assert!(fast > slow, "fast={fast:?} should outscore slow={slow:?}");
+    }
+
+    /// A short FINAL batch, fully served, must not read as a truncation — the
+    /// rate is what makes it comparable to a full-size batch.
+    #[test]
+    fn a_fully_served_short_final_batch_scores_like_a_fast_peer() {
+        // 40 blocks requested, all 40 served, in 100ms = 400 blk/s.
+        let r = backfill_batch_rate(31_305_696, Some(31_305_656), 40, Duration::from_millis(100));
+        assert_eq!(r, Some(400_000));
+        // Comfortably ahead of a full 1023-block batch that took 40s (~25 blk/s).
+        let slow = backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(40));
+        assert!(r > slow);
+    }
+
+    /// A concurrent config swap can install a HIGHER cursor. Saturating that to
+    /// zero would score a peer that just served a full batch as a failure.
+    #[test]
+    fn an_upward_cursor_move_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(1_000_000, Some(1_200_000), 1023, Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// A snapshot import installs its own cursor wholesale, which can be far
+    /// BELOW the walk's. That delta is not throughput — unrejected it would be
+    /// orders of magnitude above any real score and pin the rank to whichever
+    /// peer happened to be in flight.
+    #[test]
+    fn an_implausible_delta_beyond_the_request_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(35_000_000, Some(31_305_656), 1023, Duration::from_secs(1)),
+            None
+        );
+        // The boundary itself is legitimate: a batch may apply exactly what it
+        // requested.
+        assert_eq!(
+            backfill_batch_rate(1_000_000, Some(998_977), 1023, Duration::from_secs(1)),
+            Some(1_023_000)
+        );
+    }
+
+    #[test]
+    fn a_missing_cursor_is_not_scored() {
+        assert_eq!(
+            backfill_batch_rate(1_000_000, None, 1023, Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// Sub-millisecond batches must not divide by zero.
+    #[test]
+    fn a_sub_millisecond_batch_does_not_divide_by_zero() {
+        let r = backfill_batch_rate(1_000_000, Some(999_900), 1023, Duration::from_nanos(1));
+        assert_eq!(r, Some(100 * 1_000_000));
+    }
+}
+
+#[cfg(test)]
+mod backfill_batch_error_tests {
+    use super::BackfillBatchError;
+
+    /// The ranking scores a failure as zero, so misfiling one of OUR failures
+    /// as the peer's demotes a good server for our own bookkeeping.
+    #[test]
+    fn blame_is_explicit_in_both_directions() {
+        assert!(BackfillBatchError::peer("peer returned no headers").blames_peer);
+        assert!(!BackfillBatchError::ours("index changed mid-batch").blames_peer);
+    }
+
+    /// The blanket `From` impls exist so bare `?` sites in the batch stay
+    /// terse. They default to PEER, which is right for peer-response failures
+    /// but is exactly why our own failures must be constructed explicitly.
+    #[test]
+    fn bare_conversions_default_to_blaming_the_peer() {
+        let from_owned: BackfillBatchError = String::from("peer timed out").into();
+        let from_borrowed: BackfillBatchError = "peer timed out".into();
+        assert!(from_owned.blames_peer);
+        assert!(from_borrowed.blames_peer);
+    }
+
+    #[test]
+    fn display_is_the_message() {
+        assert_eq!(
+            BackfillBatchError::ours("walk reset").to_string(),
+            "walk reset"
+        );
+    }
+}
+
+#[cfg(test)]
 mod backfill_truncation_tests {
     use super::{should_apply, truncation_plan};
 
@@ -5750,3 +10195,1362 @@ mod backfill_truncation_tests {
     }
 }
 
+#[cfg(test)]
+mod backfill_chunk_sizing_tests {
+    use super::{
+        fold_chunk_observation, next_chunk_len, truncation_plan, ChunkSizer, CHUNK_LEN_MAX,
+        CHUNK_LEN_MIN, CHUNK_PROBE_AFTER, CHUNK_SHRINK_LIMIT,
+    };
+
+    /// A clean observation that is NOT a probe (the common case).
+    fn clean(current: usize) -> usize {
+        next_chunk_len(current, current, current, 1)
+    }
+    /// A clean observation that IS the probe.
+    fn probe(current: usize) -> usize {
+        next_chunk_len(current, current, current, CHUNK_PROBE_AFTER)
+    }
+
+    #[test]
+    fn a_truncated_chunk_narrows_toward_what_the_peer_served() {
+        // The whole point: peers on a candidate-dense range cut a 64-block
+        // request at ~15, so ask for ~15 next time. Streak is irrelevant here.
+        assert_eq!(next_chunk_len(64, 15, 64, 0), 16); // floored at 64/4
+        assert_eq!(next_chunk_len(16, 15, 16, 0), 15); // floor not binding
+        assert_eq!(next_chunk_len(64, 15, 64, CHUNK_PROBE_AFTER), 16);
+        assert_eq!(next_chunk_len(15, 4, 15, 3), 4);
+    }
+
+    #[test]
+    fn one_outlier_block_cannot_pin_the_width_at_the_floor() {
+        // `served` describes the blocks in ONE chunk. A single fat block (or a
+        // degenerate peer) reporting `served = 1` must not cost the ~70 batches
+        // of probing it would take to climb back from CHUNK_LEN_MIN.
+        assert_eq!(
+            next_chunk_len(64, 1, 64, 0),
+            CHUNK_LEN_MAX / CHUNK_SHRINK_LIMIT
+        );
+        // But a range that really is that expensive still converges there, and
+        // does so quickly — every step is a strict decrease, so it terminates.
+        let mut w = CHUNK_LEN_MAX;
+        let mut steps = 0;
+        while w > CHUNK_LEN_MIN {
+            let next = next_chunk_len(w, 1, w, 0);
+            assert!(next < w, "width {w} did not decrease on truncation");
+            w = next;
+            steps += 1;
+        }
+        assert!(
+            steps <= 4,
+            "took {steps} truncated batches to reach the floor"
+        );
+    }
+
+    #[test]
+    fn a_clean_batch_alone_does_not_widen() {
+        // THE regression this rule exists for. If a clean batch widened, a
+        // steady range would oscillate width -> wider -> truncate -> width and
+        // lose every other batch to a first-chunk truncation.
+        for n in [1, 12, 15, 32, 63] {
+            assert_eq!(clean(n), n, "width {n} widened without a probe");
+        }
+        for s in 0..CHUNK_PROBE_AFTER {
+            assert_eq!(
+                next_chunk_len(12, 12, 12, s),
+                12,
+                "streak {s} widened early"
+            );
+        }
+    }
+
+    #[test]
+    fn the_streak_resets_after_a_probe_even_at_the_ceiling() {
+        // The subtle half of the state machine. At CHUNK_LEN_MAX a probe cannot
+        // widen, so `next == current`; without the explicit reset the streak
+        // would stay above the threshold and EVERY later batch would count as a
+        // probe — which, via the probe-provoked-truncation rule, would suppress
+        // the pipeline-depth signal forever.
+        let (w, s) = fold_chunk_observation(CHUNK_LEN_MAX, CHUNK_PROBE_AFTER - 1, 64, 64);
+        assert_eq!((w, s), (CHUNK_LEN_MAX, 0));
+        // Same for a probe that DID widen.
+        let (w, s) = fold_chunk_observation(12, CHUNK_PROBE_AFTER - 1, 12, 12);
+        assert!(w > 12);
+        assert_eq!(s, 0);
+        // A truncation resets it outright, so intermittent truncation never
+        // accumulates its way to a probe.
+        // Note the input: width 4 truncating at 4-of-8 leaves the width
+        // UNCHANGED (the shrink floor holds it at 4), so the reset can only come
+        // from the truncation arm. An input that also moves the width would pass
+        // whether or not that arm exists.
+        assert_eq!(
+            fold_chunk_observation(4, CHUNK_PROBE_AFTER - 1, 4, 8),
+            (4, 0)
+        );
+        assert_eq!(
+            fold_chunk_observation(12, CHUNK_PROBE_AFTER - 1, 3, 12).1,
+            0
+        );
+        // And an ordinary clean observation just ticks.
+        assert_eq!(fold_chunk_observation(12, 2, 12, 12), (12, 3));
+    }
+
+    #[test]
+    fn a_steady_range_truncates_at_most_once_per_probe_interval() {
+        // The limit-cycle guard, end-to-end: the real state machine driven
+        // against the real truncation arithmetic. A peer serves exactly 12
+        // blocks per response, forever. Converged, the ONLY truncations left
+        // are the periodic probes.
+        const BUDGET: usize = 12;
+        const BATCHES: usize = 200;
+        const WARMUP: usize = 40;
+        let mut width = CHUNK_LEN_MAX;
+        let mut streak = 0usize;
+        let mut converged_truncations = 0;
+        let mut widths_after_warmup = Vec::new();
+        for i in 0..BATCHES {
+            let served = width.min(BUDGET);
+            let numbers: Vec<u64> = (0..width as u64).map(|n| 1000 - n).collect();
+            let (usable, stop) = truncation_plan(&numbers, served, served).expect("nonempty serve");
+            if stop.is_some() && i >= WARMUP {
+                converged_truncations += 1;
+            }
+            (width, streak) = fold_chunk_observation(width, streak, usable, width);
+            if i >= WARMUP {
+                widths_after_warmup.push(width);
+            }
+        }
+        // Converged, the width sits at the budget and steps at most one probe
+        // above it — overshoot is what a probe IS, so asserting `<= BUDGET`
+        // would be asserting against the design (and would depend on which
+        // phase of the cycle BATCHES happens to land in).
+        let ceiling = next_chunk_len(BUDGET, BUDGET, BUDGET, CHUNK_PROBE_AFTER);
+        assert!(
+            widths_after_warmup.iter().all(|&w| w <= ceiling),
+            "width exceeded one probe above the budget: {widths_after_warmup:?}"
+        );
+        assert!(
+            widths_after_warmup.contains(&BUDGET),
+            "width never settled at the budget: {widths_after_warmup:?}"
+        );
+        // Steady-state truncation rate must be ~1 per (PROBE_AFTER + 1) batches,
+        // not the 1-in-2 a reflexive grow produces.
+        let steady = BATCHES - WARMUP;
+        let worst_case = steady / (CHUNK_PROBE_AFTER + 1) + 3;
+        assert!(
+            converged_truncations <= worst_case,
+            "steady-state truncations {converged_truncations} exceed {worst_case} (limit cycle regression)"
+        );
+    }
+
+    #[test]
+    fn a_range_that_got_cheaper_climbs_back_to_the_max_promptly() {
+        // The probe must not be so timid that the width is effectively a
+        // ratchet: a walk that leaves a dense stretch has to recover, and the
+        // recovery cost is what makes the decrease floor worth having, so pin
+        // the step count and not just the endpoint.
+        let mut n = CHUNK_LEN_MIN;
+        let mut probes = 0;
+        while n < CHUNK_LEN_MAX {
+            n = probe(n);
+            probes += 1;
+            assert!(probes < 40, "did not converge");
+        }
+        assert_eq!(n, CHUNK_LEN_MAX);
+        assert!(probes <= 10, "recovery from the floor took {probes} probes");
+    }
+
+    #[test]
+    fn a_probe_is_strictly_monotone_so_the_floor_is_not_absorbing() {
+        // `current + current/2 + 1` — the +1 is what makes 1 -> 2 rather than
+        // 1 -> 1. Without it a range that ever hit 1 could never recover.
+        for n in CHUNK_LEN_MIN..CHUNK_LEN_MAX {
+            assert!(probe(n) > n, "width {n} did not grow on a probe");
+        }
+    }
+
+    #[test]
+    fn the_width_never_leaves_its_bounds() {
+        assert_eq!(probe(CHUNK_LEN_MAX), CHUNK_LEN_MAX);
+        // Defensive, not reachable from the call site: `truncation_plan`
+        // returns None on a 0-length serve, so the caller rotates peers rather
+        // than reporting it here. Pinned because a 0 width would panic
+        // `slice::chunks`, which is a far worse failure than a small request.
+        assert_eq!(
+            next_chunk_len(16, 0, 16, 0),
+            CHUNK_LEN_MIN.max(16 / CHUNK_SHRINK_LIMIT)
+        );
+        assert!(next_chunk_len(CHUNK_LEN_MIN, 0, CHUNK_LEN_MIN, 0) >= CHUNK_LEN_MIN);
+        // Absurd stored values are clamped rather than trusted.
+        assert!(next_chunk_len(usize::MAX, 4, 8, 0) <= CHUNK_LEN_MAX);
+        assert!(next_chunk_len(0, 0, 8, 0) >= CHUNK_LEN_MIN);
+        assert!(next_chunk_len(usize::MAX, 99, 99, CHUNK_PROBE_AFTER) <= CHUNK_LEN_MAX);
+        // Every reachable fold keeps the width in range.
+        for current in [0, 1, 7, 12, 64, usize::MAX] {
+            for served in [0, 1, 11, 64, usize::MAX] {
+                for streak in [0, CHUNK_PROBE_AFTER, usize::MAX] {
+                    let (w, _) = fold_chunk_observation(current, streak, served, 64);
+                    assert!(
+                        (CHUNK_LEN_MIN..=CHUNK_LEN_MAX).contains(&w),
+                        "width {w} out of range"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_full_width_request_is_evidence_about_the_width() {
+        // A bloom-sparse batch asks for `candidates` blocks, not `width`, so a
+        // clean result says nothing about `width`. Counting it would ratchet the
+        // width up on evidence nobody produced.
+        let s = ChunkSizer::new();
+        for _ in 0..(CHUNK_PROBE_AFTER * 4) {
+            s.note_clean_batch(5, 20);
+        }
+        assert_eq!(s.width(), CHUNK_LEN_MAX, "sparse batches moved the width");
+        // Exercising the width really does tick the clock, so the gate is not
+        // just disabling the sizer.
+        let s = ChunkSizer::new();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(64, CHUNK_LEN_MAX);
+        }
+        assert_eq!(s.width(), CHUNK_LEN_MAX); // already at the ceiling
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64, 1000);
+        let narrowed = s.width();
+        assert!(narrowed < CHUNK_LEN_MAX);
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, narrowed);
+        }
+        assert!(s.width() > narrowed, "a full-width clean run never probed");
+    }
+
+    #[test]
+    fn a_short_tail_chunk_cannot_shrink_a_width_the_same_batch_proved() {
+        // 66 candidates at width 64 => chunks [64, 2]. The 64-block chunk came
+        // back full; one fat block in the 2-block tail must not discard that.
+        let s = ChunkSizer::new();
+        s.note_truncated(1, 2, 64, 66);
+        assert_eq!(s.width(), CHUNK_LEN_MAX, "a 2-block sample moved the width");
+        // A full-width chunk truncating IS evidence and does narrow it.
+        s.note_truncated(12, 64, 64, 66);
+        assert!(s.width() < CHUNK_LEN_MAX);
+    }
+
+    #[test]
+    fn a_probe_provoked_truncation_does_not_also_degrade_the_pipeline() {
+        // The sizer asked for more than it knew would fit; the truncation is its
+        // own doing, not a property of the range. Degrading the depth on it
+        // would make every probe cost a second bad batch.
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64, 1000); // converge to a working width
+        let w = s.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, w);
+        }
+        let probed = s.width();
+        assert!(probed > w, "the probe did not widen");
+        assert!(
+            !s.note_truncated(w, probed, probed, 1000),
+            "a probe-provoked truncation degraded the pipeline depth"
+        );
+        // The flag is consumed, so the NEXT truncation — which the range
+        // imposed, not the sizer — does degrade it.
+        assert!(
+            s.note_truncated(4, s.width(), s.width(), 1000),
+            "an unprovoked truncation failed to degrade the pipeline depth"
+        );
+    }
+
+    #[test]
+    fn a_clean_batch_that_is_not_evidence_leaves_the_probe_flag_alone() {
+        // The flag means "the current width is unvalidated speculation". A batch
+        // that never exercised the width neither validates nor invalidates it,
+        // and must not clear a pending probe.
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64, 1000);
+        let w = s.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, w);
+        }
+        assert!(s.width() > w, "the probe did not widen");
+        s.note_clean_batch(2, s.width()); // sparse batch, no evidence
+        assert!(
+            !s.note_truncated(w, s.width(), s.width(), 1000),
+            "a sparse batch cleared a pending probe"
+        );
+    }
+
+    #[test]
+    fn a_sparse_window_that_truncates_is_evidence_and_must_move_the_width() {
+        // The regression this gate was originally too broad to catch. A window
+        // with fewer candidates than the width yields ONE short chunk; if the
+        // peer truncates it, that is a direct measurement of the budget and the
+        // only measurement such a batch can produce. Ignoring it left the width
+        // pinned at the ceiling and the depth pinned at 1 forever, because the
+        // batch also ends before the clean path can run.
+        let s = ChunkSizer::new();
+        assert!(
+            s.width() > 30,
+            "premise: the window is sparser than the width"
+        );
+        s.note_truncated(15, 30, s.width(), 30);
+        let narrowed = s.width();
+        assert!(
+            narrowed <= 30,
+            "a sparse truncation left the width at {narrowed}"
+        );
+        // ...and it converges rather than oscillating: the narrowed width now
+        // fits inside the same budget.
+        assert!(
+            narrowed <= 16,
+            "narrowed only to {narrowed}, still above budget"
+        );
+        // The tail rule still holds — this must not become "any short chunk
+        // counts". 100 candidates at width 64 => [64, 36]; the 36 is a tail.
+        let s = ChunkSizer::new();
+        s.note_truncated(1, 36, 64, 100);
+        assert_eq!(s.width(), CHUNK_LEN_MAX, "a tail chunk moved the width");
+    }
+
+    #[test]
+    fn an_observation_that_is_not_evidence_cannot_spend_a_probe() {
+        // The probe flag means "the width is unvalidated speculation". Only an
+        // observation that actually tested the width may clear it — otherwise
+        // the probe survives untested and the NEXT truncation, quite plausibly
+        // that same probe finding its ceiling, gets blamed on the range.
+        let s = ChunkSizer::new();
+        s.note_truncated(12, 64, 64, 1000);
+        let w = s.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            s.note_clean_batch(1000, w);
+        }
+        let probed = s.width();
+        assert!(probed > w, "the probe did not widen");
+        // A short TAIL chunk truncating: not evidence about `probed`.
+        assert!(!s.note_truncated(1, 2, probed, probed + 2));
+        // The probe is therefore still pending, so its own ceiling-finding
+        // truncation is still attributed to the sizer and not to the range.
+        assert!(
+            !s.note_truncated(w, probed, probed, 1000),
+            "the tail chunk spent the probe flag"
+        );
+    }
+
+    #[test]
+    fn an_over_serving_peer_cannot_widen_the_request() {
+        // `served > requested` is not reachable today — `truncation_plan` caps
+        // the count at the chunk length before the sizer ever sees it — but the
+        // sizer must not become a way to grow the request without a probe if a
+        // future caller reports raw peer counts. Capped at `current` on the
+        // truncated path, gated by the probe clock on the clean one.
+        assert_eq!(next_chunk_len(8, 40, 64, 0), 8);
+        assert_eq!(fold_chunk_observation(8, 0, 40, 8).0, 8);
+    }
+}
+
+#[cfg(test)]
+mod persist_cadence_tests {
+    use super::{
+        checkpoint_bytes, persist_due, persist_interval, PersistClock, PERSIST_MAX_INTERVAL,
+        PERSIST_MIN_INTERVAL, PERSIST_WRITE_BUDGET_BPS,
+    };
+    use std::time::Duration;
+
+    const MIB: u64 = 1 << 20;
+
+    /// Bytes/sec a walk sustains if it checkpoints `bytes` every
+    /// `persist_interval(bytes)`.
+    fn sustained_bps(bytes: u64) -> u64 {
+        bytes / persist_interval(bytes).as_secs()
+    }
+
+    /// The literal schedule, written out rather than expressed in terms of the
+    /// constants under test — otherwise every assertion below would hold for
+    /// any value of them and the numbers would be unpinned.
+    #[test]
+    fn the_schedule_is_exactly_this() {
+        assert_eq!(persist_interval(0), Duration::from_secs(10));
+        assert_eq!(persist_interval(1), Duration::from_secs(10));
+        assert_eq!(persist_interval(10 * MIB), Duration::from_secs(10));
+        // Just past the floor the interval must start tracking the size — and
+        // must round UP, or the sustained rate exceeds the budget for every
+        // size that is not a whole multiple of it.
+        assert_eq!(persist_interval(10 * MIB + 1), Duration::from_secs(11));
+        assert_eq!(persist_interval(11 * MIB), Duration::from_secs(11));
+        assert_eq!(persist_interval(238 * MIB), Duration::from_secs(238));
+        assert_eq!(persist_interval(600 * MIB), Duration::from_secs(600));
+        // ...and stops tracking it at the cap.
+        assert_eq!(persist_interval(600 * MIB + 1), Duration::from_secs(600));
+        assert_eq!(persist_interval(u64::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_write_rate_is_what_stays_bounded_not_the_interval() {
+        // THE regression this exists for: on the measured 238 MB Gnosis index a
+        // flat 10 s cadence meant a full rewrite every 10 s — 366 GB over one
+        // 6h22m backfill. Assert against the OLD policy directly, so this fails
+        // if the old behaviour ever comes back.
+        const MEASURED: u64 = 238 * MIB;
+        let flat_10s = MEASURED / 10;
+        assert!(
+            flat_10s > 20 * MIB,
+            "the pathology being fixed no longer reproduces: {flat_10s} B/s"
+        );
+        // Every size where the budget is achievable at all (i.e. up to the cap)
+        // holds the RATE, not the interval, constant. Deliberately includes
+        // non-multiples of the budget, where truncating division would break it.
+        let cap = PERSIST_WRITE_BUDGET_BPS * PERSIST_MAX_INTERVAL.as_secs();
+        for bytes in [
+            1,
+            MIB,
+            8 * MIB + 3,
+            11 * MIB + 512 * 1024,
+            64 * MIB,
+            MEASURED,
+            cap,
+        ] {
+            assert!(bytes <= cap, "test input above the cap says nothing");
+            assert!(
+                sustained_bps(bytes) <= PERSIST_WRITE_BUDGET_BPS,
+                "{bytes} B index sustains {} B/s, over budget",
+                sustained_bps(bytes)
+            );
+        }
+        // Above the cap the budget is knowingly abandoned — the point of the
+        // cap is that a crash cannot cost the whole walk.
+        assert!(sustained_bps(cap * 4) > PERSIST_WRITE_BUDGET_BPS);
+    }
+
+    #[test]
+    fn a_small_index_still_checkpoints_briskly() {
+        // The budget must not make a fresh or tiny index checkpoint rarely —
+        // early in a walk the file is small and losing progress is the only
+        // cost that matters. 10 s, not "whatever PERSIST_MIN_INTERVAL says".
+        assert_eq!(PERSIST_MIN_INTERVAL, Duration::from_secs(10));
+        for bytes in [0, 1, 4096, 5 * MIB] {
+            assert_eq!(persist_interval(bytes), Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn a_huge_index_is_capped_so_a_crash_cannot_cost_the_whole_walk() {
+        assert_eq!(PERSIST_MAX_INTERVAL, Duration::from_secs(600));
+        // The cap must bite strictly ABOVE the largest size the budget can
+        // still serve, and never below it.
+        assert_eq!(persist_interval(599 * MIB), Duration::from_secs(599));
+        assert_eq!(persist_interval(1024 * MIB), Duration::from_secs(600));
+        assert_eq!(persist_interval(u64::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_interval_is_monotone_in_size() {
+        // A bigger file may never checkpoint MORE often than a smaller one —
+        // otherwise growth could speed the cadence up and the rate would run
+        // away. Walks well past the cap so the plateau is covered too.
+        let mut prev = persist_interval(0);
+        for step in 0..1600u64 {
+            let cur = persist_interval(step * MIB / 2);
+            assert!(cur >= prev, "interval shrank at {step} half-MB");
+            prev = cur;
+        }
+        assert_eq!(prev, PERSIST_MAX_INTERVAL, "never reached the plateau");
+    }
+
+    #[test]
+    fn the_decision_consults_the_size_not_a_fixed_window() {
+        // Pins the WIRING, not just the policy: a checkpoint is due when the
+        // size-aware interval has elapsed. Reverting the consumer to a fixed
+        // 10 s window (the bug) makes the 238 MB case fire at 60 s.
+        //
+        // Moves the OBSERVATION time forward rather than the stamp backward:
+        // `Instant::checked_sub` returns None below the epoch (boot, on
+        // CLOCK_MONOTONIC), and on a host whose uptime is under 238 s — a
+        // freshly started CI container is the realistic case — every `ago(..)`
+        // would collapse to None, which `persist_due` answers `true` to by its
+        // first rule. The negative assertions would then fail and the positive
+        // ones would pass for the wrong reason. `Instant + Duration` has no
+        // such edge.
+        let base = std::time::Instant::now();
+        let after = |s: u64| base + Duration::from_secs(s);
+        assert!(persist_due(None, base, 238 * MIB), "first ever must fire");
+        assert!(
+            !persist_due(Some(base), after(60), 238 * MIB),
+            "fired on a fixed window"
+        );
+        assert!(!persist_due(Some(base), after(237), 238 * MIB));
+        assert!(persist_due(Some(base), after(238), 238 * MIB));
+        // ...and the same clock on a small index still fires briskly, so this
+        // is genuinely reading the size and not just a longer constant.
+        assert!(persist_due(Some(base), after(10), 1024));
+        assert!(!persist_due(Some(base), after(9), 1024));
+    }
+
+    #[test]
+    fn a_checkpoint_clamps_at_finality_but_never_at_a_missing_anchor() {
+        use crate::el::logindex::{ChainTag, LogIndex, LogIndexConfig, StoredLog, WatchEntry};
+        let tag = ChainTag {
+            network_id: 1,
+            genesis_hash: [0xd4; 32],
+        };
+        let cfg = LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![WatchEntry {
+                address: [1u8; 20],
+                from_block: 0,
+                topic0s: vec![],
+                name: String::new(),
+            }],
+        };
+        let mut ix = LogIndex::new(cfg.clone()).unwrap();
+        for b in 10u64..=14 {
+            ix.append_block(
+                b,
+                [b as u8; 32],
+                vec![StoredLog {
+                    block_number: b,
+                    block_hash: [b as u8; 32],
+                    tx_hash: [0xcc; 32],
+                    tx_index: 0,
+                    log_index: 0,
+                    address: [1u8; 20],
+                    topics: vec![],
+                    data: vec![],
+                }],
+            )
+            .unwrap();
+        }
+        // Finality at 12: 13-14 are optimistic. They are verifiable only
+        // against THIS run's in-memory tail record, so a checkpoint carrying
+        // them would leave the next run holding coverage it can never
+        // re-check — and once finality passes them nothing would rewind them.
+        let clamp = std::env::temp_dir().join(format!("ckpt-clamp-{}.db", std::process::id()));
+        crate::el::logindex::write_atomic(&clamp, &checkpoint_bytes(&ix, &tag, Some(12))).unwrap();
+        let clamped = LogIndex::load(&cfg, &tag, &clamp).unwrap();
+        assert_eq!(
+            clamped.coverage_of(&[1u8; 20]).unwrap().span,
+            Some((10, 12))
+        );
+        let _ = std::fs::remove_file(&clamp);
+        // Zero finality means NO anchor, not "finality is at block zero":
+        // clamping there would rewind everything and rename an empty file over
+        // a good checkpoint. Write it as it stands instead — which does record
+        // 13-14 unclamped, so the first half's rule is not universal. What
+        // makes that safe is that finality never REGRESSES to zero:
+        // `AnchorState::execution_state_root` is set once and never cleared,
+        // and the tail tick returns early while it is unset, so the only run
+        // that can write this file is one that has not yet had an anchor at
+        // all — and it appended those blocks under its own tail record.
+        let nofin = std::env::temp_dir().join(format!("ckpt-nofin-{}.db", std::process::id()));
+        crate::el::logindex::write_atomic(&nofin, &checkpoint_bytes(&ix, &tag, None)).unwrap();
+        let unclamped = LogIndex::load(&cfg, &tag, &nofin).unwrap();
+        assert_eq!(
+            unclamped.coverage_of(&[1u8; 20]).unwrap().span,
+            Some((10, 14))
+        );
+        let _ = std::fs::remove_file(&nofin);
+    }
+
+    #[test]
+    fn a_zero_size_gets_the_floor_not_a_zero_interval() {
+        // A lost recorded size reads back as 0. That must degrade to the FLOOR
+        // — the old cadence, which was merely wasteful — and never to a zero
+        // interval, which is an unthrottled write loop. (What it cannot catch
+        // is the loss itself; every writer stores the size at its own write,
+        // `persist_log_index` inline and the config/import/load paths through
+        // `note_checkpoint_on_disk`.)
+        assert_eq!(persist_interval(0), PERSIST_MIN_INTERVAL);
+        assert!(persist_interval(0) > Duration::ZERO);
+        assert_ne!(persist_interval(238 * MIB), persist_interval(0));
+    }
+
+    // Below: the CLOCK, not just the policy. Same forward-time discipline as
+    // `the_decision_consults_the_size_not_a_fixed_window` — never `ago(..)`.
+
+    #[test]
+    fn asking_whether_a_checkpoint_is_due_does_not_consume_the_interval() {
+        // THE regression this guards: while the predicate stamped the clock,
+        // one decider's "yes" made the other's "no" — which reads like mutual
+        // exclusion but is not (the two are not synchronized), and charged a
+        // full interval to a checkpoint that may never be written at all.
+        // Both deciders must see "due"; `persist_log_index` settles which one
+        // writes, under the checkpoint lock.
+        let clock = PersistClock::new();
+        clock.note_bytes(Some(238 * MIB));
+        assert!(clock.is_due(), "a never-written index must checkpoint now");
+        assert!(clock.is_due(), "asking consumed the interval");
+        assert!(clock.is_due());
+    }
+
+    #[test]
+    fn only_a_write_ends_an_interval() {
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        assert!(clock.is_due_at(base));
+        clock.wrote(base, Some(238 * MIB));
+        assert!(!clock.is_due_at(base + Duration::from_secs(237)));
+        assert!(clock.is_due_at(base + Duration::from_secs(238)));
+        // The size travels with the write, so the NEXT interval is sized by
+        // what the last checkpoint actually cost — not by whatever was last
+        // asked about.
+        clock.wrote(base + Duration::from_secs(238), Some(1024));
+        assert!(clock.is_due_at(base + Duration::from_secs(248)));
+    }
+
+    #[test]
+    fn adopting_a_file_still_leaves_one_cheap_checkpoint_in_the_session() {
+        // A load is not a write: the file is already current, so it starts an
+        // interval — but crediting the WHOLE interval means an Android session
+        // shorter than 238 s banks nothing, and a device whose sessions are
+        // consistently short never advances the file at all. Adoption credits
+        // all but the floor, so the first checkpoint lands at 10 s.
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        clock.adopted(base, Some(238 * MIB));
+        assert!(
+            !clock.is_due_at(base + Duration::from_secs(9)),
+            "adoption must still suppress the immediate byte-identical rewrite"
+        );
+        assert!(
+            clock.is_due_at(base + PERSIST_MIN_INTERVAL),
+            "a whole interval was credited; a short session banks nothing"
+        );
+        // ...and the size is adopted too, so the checkpoint that follows is
+        // paced by the real file, not by the floor.
+        clock.wrote(base + PERSIST_MIN_INTERVAL, Some(238 * MIB));
+        assert!(!clock.is_due_at(base + PERSIST_MIN_INTERVAL + Duration::from_secs(237)));
+    }
+
+    #[test]
+    fn a_size_that_cannot_be_read_keeps_the_last_one() {
+        // `file_len` returns None when the file is gone or unstattable. That
+        // must not reset the cadence to the floor — the next write still costs
+        // what the last one cost, and pacing it at 10 s is the unthrottled
+        // rewrite loop this whole change removes.
+        let base = std::time::Instant::now();
+        let clock = PersistClock::new();
+        clock.wrote(base, Some(238 * MIB));
+        clock.wrote(base + Duration::from_secs(238), None);
+        assert!(!clock.is_due_at(base + Duration::from_secs(238 + 237)));
+        assert!(clock.is_due_at(base + Duration::from_secs(238 + 238)));
+    }
+}
+
+#[cfg(test)]
+mod restart_claim_tests {
+    use super::{checkpoint_clamp, restart_claim_fate, vouched_high, RestartClaim, RESTART_CLAIM_MAX_LEAD};
+
+    #[test]
+    fn a_checkpoint_clamps_at_finality_the_claim_and_below_unconfirmed_records() {
+        // No anchor, nothing vouched: write as it stands and claim nothing.
+        assert_eq!(checkpoint_clamp(0, 0, None), None);
+        // A record cannot exist then; were one to, clamping at zero would
+        // erase the file — the worse failure.
+        assert_eq!(checkpoint_clamp(0, 0, Some(5)), None);
+        assert_eq!(checkpoint_clamp(1_000, 0, None), Some(1_000));
+        // Records above finality are already outside the finality clamp.
+        assert_eq!(checkpoint_clamp(1_000, 0, Some(1_001)), Some(1_000));
+        // Finality moved past records the tail has not re-checked yet (the
+        // appender's checkpoint runs BEFORE the tail in the same tick): they
+        // stay out, and so does everything above them.
+        assert_eq!(checkpoint_clamp(1_005, 0, Some(1_001)), Some(1_000));
+        // A restart claim that still holds keeps its coverage in the file,
+        // with the anchor's finality hours behind it or not there at all...
+        assert_eq!(checkpoint_clamp(900, 1_000, None), Some(1_000));
+        assert_eq!(checkpoint_clamp(0, 1_000, None), Some(1_000));
+        // ...but never this run's own unconfirmed appends above it.
+        assert_eq!(checkpoint_clamp(900, 1_000, Some(1_001)), Some(1_000));
+        // Past the claim, the anchor decides again.
+        assert_eq!(checkpoint_clamp(1_200, 1_000, None), Some(1_200));
+    }
+
+    #[test]
+    fn a_restart_claim_holds_until_finality_reaches_it_or_a_current_light_client_refutes_it() {
+        const LEAD: u64 = RESTART_CLAIM_MAX_LEAD;
+        // (finalized, vouched, first weighed at, current)
+        assert_eq!(restart_claim_fate(900, 1_000, 900, false), RestartClaim::Hold);
+        assert_eq!(restart_claim_fate(1_000, 1_000, 900, false), RestartClaim::Subsumed);
+        assert_eq!(restart_claim_fate(1_200, 1_000, 900, true), RestartClaim::Subsumed);
+        // A light client still catching up proves nothing, however far behind.
+        assert_eq!(restart_claim_fate(2, 1_000_000, 1, false), RestartClaim::Hold);
+        // A current one a few epochs behind a genuine claim: wait for it.
+        assert_eq!(restart_claim_fate(1_000 - LEAD, 1_000, 1, true), RestartClaim::Hold);
+        // Further behind than any restart explains: the claim is wrong...
+        assert_eq!(restart_claim_fate(1_000 - LEAD - 1, 1_000, 1, true), RestartClaim::Contradicted);
+        // ...but only on a finality verified since the claim was first
+        // weighed. The restored one "current" by a slow wall clock is not.
+        assert_eq!(restart_claim_fate(1, 1_000, 1, true), RestartClaim::Hold);
+        assert_eq!(restart_claim_fate(2, 1_000, 1, true), RestartClaim::Contradicted);
+    }
+
+    #[test]
+    fn the_tail_finality_floor_needs_a_finality_to_raise() {
+        use super::{backfill_should_yield, tail_final_floor};
+        assert_eq!(tail_final_floor(900, 1_000), 1_000);
+        assert_eq!(tail_final_floor(1_200, 1_000), 1_200);
+        assert_eq!(tail_final_floor(900, 0), 900);
+        // No finality: nothing follows the head, claim or not...
+        assert_eq!(tail_final_floor(0, 1_000), 0);
+        // ...so the backfill must not stand down for it. (Coverage to 1_000,
+        // an optimistic head 100 blocks above: with the claim mistaken for a
+        // finality, this would yield.)
+        assert!(!backfill_should_yield(1_001, 1_100, tail_final_floor(0, 1_000), 0));
+        assert!(backfill_should_yield(1_001, 1_100, tail_final_floor(950, 1_000), 0));
+    }
+
+    #[test]
+    fn the_lead_bound_covers_the_synced_slack_on_every_network() {
+        // A SYNCED light client's finality lags the wall clock by at most this
+        // many slots, hence blocks. The bound must sit well above it, or a
+        // genuine claim would be dropped the moment the light client catches up.
+        use crate::sync::{ChainConfig, SYNCED_SLOT_SLACK_EPOCHS};
+        for cfg in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
+            let slack = SYNCED_SLOT_SLACK_EPOCHS * cfg.slots_per_epoch;
+            assert!(RESTART_CLAIM_MAX_LEAD >= 2 * slack, "{slack} slots of SYNCED slack");
+        }
+    }
+
+    #[test]
+    fn only_a_claim_that_reaches_the_covered_top_vouches_for_it() {
+        assert_eq!(vouched_high(Some(1_000), Some(1_000)), 1_000);
+        // Clamped above its own top (a checkpoint mid-bridge).
+        assert_eq!(vouched_high(Some(990), Some(1_000)), 990);
+        // A claim below the top was not this file's clamp: vouch for nothing.
+        assert_eq!(vouched_high(Some(1_001), Some(1_000)), 0);
+        assert_eq!(vouched_high(Some(1_000), None), 0);
+        assert_eq!(vouched_high(None, Some(1_000)), 0);
+    }
+}
+
+#[cfg(test)]
+mod restart_claim_reader_tests {
+    //! A restart must keep log-index coverage its own checkpoint proved final
+    //! while the beacon anchor — resumed from a snapshot written once per
+    //! sync-committee period — still reports a finality hours older. The
+    //! heights are the 2026-09-16 Bee PoC incident's: coverage checkpointed at
+    //! 48,283,910, relaunched against finality 48,279,644, rewound, and
+    //! re-walked by the head bridge for an hour while Bee's postage sync
+    //! starved.
+    use super::*;
+    use crate::el::logindex::{
+        finality_claim_path, read_finality_claim, ChainTag, LogIndex, LogIndexConfig, StoredLog,
+        WatchEntry,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// Finality when the checkpoint was written.
+    const F1: u64 = 48_283_910;
+    /// Finality the resumed snapshot hands the anchor after the relaunch.
+    const F0: u64 = 48_279_644;
+    /// Where run 1's coverage starts — below F0, so a rewind to F0 leaves
+    /// something to observe.
+    const LOW: u64 = F1 - 5_000;
+    const STAMP: [u8; 20] = [0x45; 20];
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("reader-claim-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn hash(n: u64) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_be_bytes());
+        h
+    }
+
+    fn gnosis_tag() -> ChainTag {
+        ChainTag { network_id: 100, genesis_hash: ElConfig::gnosis().genesis_hash }
+    }
+
+    /// Point `a` where the CL loop would leave it.
+    fn set_anchor(a: &ExecAnchor, finalized: u64, head: u64) {
+        a.update_finalized(finalized, [1; 32], finalized, hash(finalized));
+        a.update_optimistic(head, head, hash(head), [2; 32]);
+    }
+
+    fn anchor_at(finalized: u64, head: u64) -> Arc<ExecAnchor> {
+        let a = Arc::new(ExecAnchor::new());
+        set_anchor(&a, finalized, head);
+        a
+    }
+
+    /// A gnosis reader with no network at all — no bootnodes, no pinned peers,
+    /// no peer cache — so the tail makes every coverage decision and then meets
+    /// an empty pool, which is exactly the part under test.
+    async fn offline_reader(anchor: Arc<ExecAnchor>, index: &Path) -> ElReader {
+        let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"restart-claim-test")).unwrap());
+        let cfg = ElConfig {
+            bootnodes: Vec::new(),
+            boot_enodes: Vec::new(),
+            discv4_port: 0,
+            cache_path: None,
+            log_index_path: Some(index.to_path_buf()),
+            ..ElConfig::gnosis()
+        };
+        ElReader::start(key, anchor, cfg).await.expect("offline reader")
+    }
+
+    fn watch() -> LogIndexConfig {
+        LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![WatchEntry { address: STAMP, from_block: 31_305_656, topic0s: vec![], name: String::new() }],
+        }
+    }
+
+    fn stamp_log(n: u64, data: u8) -> StoredLog {
+        StoredLog {
+            block_number: n,
+            block_hash: hash(n),
+            tx_hash: [0xcc; 32],
+            tx_index: 0,
+            log_index: 0,
+            address: STAMP,
+            topics: vec![[0x77; 32]],
+            data: vec![data],
+        }
+    }
+
+    /// Append `from..=to` to the installed index, a log in every tenth block.
+    /// `record` also enters them in the tail's record, as the tail does for
+    /// what it appends above finality.
+    fn append(reader: &ElReader, from: u64, to: u64, record: bool) {
+        let mut slot = reader.log_index.lock().unwrap();
+        let ix = slot.as_mut().expect("index installed");
+        for n in from..=to {
+            let logs = if n % 10 == 0 { vec![stamp_log(n, 1)] } else { vec![] };
+            ix.append_block(n, hash(n), logs).unwrap();
+            if record {
+                reader.log_index_tail.lock().unwrap().push((n, hash(n)));
+            }
+        }
+    }
+
+    fn vouched(reader: &ElReader) -> u64 {
+        reader.vouched_now()
+    }
+
+    /// One background appender tick, as the appender loop runs it.
+    async fn tick(reader: &ElReader) {
+        let mut since_persist = 0u32;
+        let mut stall = AppendStall::default();
+        reader.log_index_append_tick(&mut since_persist, Some(&mut stall), 0).await;
+    }
+
+    /// The checkpoint on disk: its covered top, and the finality its claim says.
+    fn on_disk(path: &Path) -> (Option<u64>, Option<u64>) {
+        let (ix, id) = LogIndex::load_portable_with_id(path).expect("checkpoint on disk");
+        (ix.append_edge().map(|e| e - 1), read_finality_claim(path, &id))
+    }
+
+    /// Run 1: an index following the head, shut down with the tail above
+    /// finality. Returns the index path.
+    async fn run_to_shutdown(dir: &Path) -> PathBuf {
+        let path = dir.join("logindex-gnosis.db");
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        append(&reader, LOW, F1, false); // final: the appender's and the bridge's
+        append(&reader, F1 + 1, F1 + 30, true); // optimistic: the tail's
+        reader.stop().await; // writes the checkpoint every stop writes
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)), "clamped at finality, and saying so");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_restart_behind_its_own_checkpoint_keeps_the_final_coverage() {
+        let dir = TempDir::new("incident");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // Run 2: the resumed beacon snapshot dates from the period's start —
+        // its finality AND its attested head sit hours below the checkpoint.
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        assert_eq!(vouched(&reader), F1, "this node's own checkpoint vouches for its top");
+
+        // The first tick after launch: where the incident's rewind happened.
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "final coverage rewound to a stale finality");
+
+        // The attested head catches up before finality does — far enough above
+        // the stale finality that "finality too far below the head" fired too.
+        set_anchor(&anchor, F0, F1 + 2_000);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        // Within reach: the tail goes on (to an empty pool, here).
+        set_anchor(&anchor, F0, F1 + 40);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+
+        // Quitting while the anchor is still behind must not cut the file back
+        // to the stale finality: the next launch is in the same position.
+        reader.stop().await;
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+
+        // Run 3 starts behind again, then the light client catches up and the
+        // claim retires. Nothing was lost on the way.
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        set_anchor(&anchor, F1, F1 + 40);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), 0, "a claim the anchor reached adds nothing");
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_drop_in_serves_its_coverage_without_starting_a_walk() {
+        // Activation speaks for the file's coverage only: the index serves, and
+        // the downward walk waits for a host to ask. Hosts push their config
+        // through the wake gate (RustChainHandle.gated, ~90 s cap on a cold
+        // start), so a walk started here runs unasked for that whole window —
+        // and for the Bee PoC, whose bundled index IS its coverage, it is the
+        // walk that starves head-follow of the snap pool.
+        let dir = TempDir::new("drop-in-paused");
+        let path = run_to_shutdown(&dir.0).await;
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(
+            reader.with_log_index(|ix| (ix.config().enabled, ix.config().backfill_paused)),
+            Some((true, true)),
+            "enabled for serving, with the walk paused",
+        );
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "and it serves what the file covered");
+
+        // A host that wants the walk asks for it. This is the DAEMON's shape —
+        // CommandHandler.setBackfillPaused sends an empty watch list, relying on
+        // the push being additive — since Main is what keeps the drop-in walk the
+        // daemon has always done.
+        let daemon_push = LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: Vec::new(),
+        };
+        assert!(reader.set_log_index_config(daemon_push));
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().backfill_paused),
+            Some(false),
+            "a config push still turns the walk on",
+        );
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().watch.len()),
+            Some(1),
+            "and the empty watch list did not drop the file's own subscription",
+        );
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "nor its coverage");
+
+        // The primitive a resume re-applies the host's stashed bits through
+        // (host::spin_up): a pause drops the reader, so the index comes back off
+        // disk at the activation defaults — enabled, walk paused — knowing
+        // nothing of what the host asked for. All three bits travel together
+        // because all three are lost together; a host-disabled index coming back
+        // ENABLED is the one that serves queries the user turned off.
+        assert!(reader.apply_log_index_runtime_bits(false, true, true));
+        assert_eq!(
+            reader.with_log_index(|ix| {
+                let c = ix.config();
+                (c.enabled, c.max_speed, c.backfill_paused)
+            }),
+            Some((false, true, true)),
+        );
+        assert!(reader.apply_log_index_runtime_bits(true, false, false));
+        assert_eq!(
+            reader.with_log_index(|ix| {
+                let c = ix.config();
+                (c.enabled, c.max_speed, c.backfill_paused)
+            }),
+            Some((true, false, false)),
+        );
+        assert_eq!(
+            reader.with_log_index(|ix| ix.config().watch.len()),
+            Some(1),
+            "the runtime bits never touch the watch table",
+        );
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_config_push_at_boot_picks_up_the_claim_too() {
+        // Hosts with a settings surface push their config right after start;
+        // when that push is what loads the file, the claim must come along.
+        let dir = TempDir::new("boot-push");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        assert_eq!(vouched(&reader), F1);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn coverage_no_claim_vouches_for_is_still_rewound_to_finality() {
+        let dir = TempDir::new("unvouched");
+        let path = run_to_shutdown(&dir.0).await;
+        // The same bytes without the claim — a file from a build before claims,
+        // a lost sidecar: nothing says this top is final, so nothing trusts it.
+        std::fs::remove_file(finality_claim_path(&path)).unwrap();
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), 0);
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        reader.stop().await;
+    }
+
+    /// A reorg DURING the hold must still drop what this run appended above the
+    /// vouched top. The hold exists so that a head under that top is not read as
+    /// a reorg of the FINAL region; it must not also shelter the optimistic
+    /// blocks above it, which no longer have a chain reaching them.
+    #[tokio::test]
+    async fn a_reorg_under_the_vouched_top_still_drops_this_runs_optimistic_coverage() {
+        let dir = TempDir::new("hold-reorg");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // Run 2: finality is still stale, but the attested head has caught up
+        // past the vouched top, so the tail follows it as it always does.
+        let anchor = anchor_at(F0, F1 + 5);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        append(&reader, F1 + 1, F1 + 5, true); // what the tail appends this run
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
+
+        // The beacon head reorgs back under the vouched top. `update_optimistic`
+        // is monotonic in SLOT, not in execution block number, so this is what
+        // the anchor reports; F1+1..=F1+5 are orphaned and must stop serving.
+        set_anchor(&anchor, F0, F1 - 3);
+        tick(&reader).await;
+        assert_eq!(
+            reader.log_index_covered_high(),
+            Some(F1),
+            "orphaned optimistic coverage kept serving through the hold"
+        );
+        assert!(
+            reader.log_index_tail.lock().unwrap().iter().all(|(n, _)| *n <= F1),
+            "records above the vouched top outlived the chain that carried them"
+        );
+        // The claim's own region is untouched, and still vouched for: this is
+        // the line between the two, and the reason the hold exists at all.
+        assert_eq!(vouched(&reader), F1);
+        reader.stop().await;
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+    }
+
+    #[tokio::test]
+    async fn a_file_replaced_beside_the_claim_does_not_inherit_it() {
+        let dir = TempDir::new("dropin");
+        let path = run_to_shutdown(&dir.0).await;
+        // Another index dropped in place with our claim left beside it: same
+        // chain, same top, different content (a seed, another node's export).
+        let (mut ix, _) = LogIndex::load_portable_with_id(&path).unwrap();
+        ix.rewind_above(F1 - 2);
+        ix.append_block(F1 - 1, hash(F1 - 1), vec![stamp_log(F1 - 1, 9)]).unwrap();
+        ix.append_block(F1, hash(F1), vec![stamp_log(F1, 1)]).unwrap();
+        ix.persist(&gnosis_tag(), &path).unwrap();
+        assert!(finality_claim_path(&path).exists());
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), 0, "a claim covers the bytes it was written beside, not these");
+        tick(&reader).await;
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_current_light_client_waits_for_a_close_claim_and_overrules_a_far_one() {
+        let dir = TempDir::new("refuted");
+        let path = run_to_shutdown(&dir.0).await;
+
+        // SYNCED, a few epochs short of the claim: that is finality lag, wait.
+        let anchor = anchor_at(F1 - 100, F1 - 60);
+        anchor.set_finality_current(true);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), F1);
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+        reader.stop().await;
+
+        // "Current" at the finality the snapshot restored — what a wall clock
+        // running hours slow makes of it. Nothing has been verified yet, so
+        // that is no evidence: hold.
+        let anchor = anchor_at(F0, F0 + 40);
+        anchor.set_finality_current(true);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), F1, "a restored finality refuted the claim");
+        assert_eq!(reader.log_index_covered_high(), Some(F1));
+
+        // A finality verified since, current and still thousands of blocks
+        // short: F1 cannot have been final. The claim goes and the usual rule
+        // applies.
+        set_anchor(&anchor, F0 + 16, F0 + 56);
+        tick(&reader).await;
+        assert_eq!(vouched(&reader), 0);
+        assert_eq!(reader.log_index_covered_high(), Some(F0 + 16));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_claim_is_weighed_afresh() {
+        // The pairing the claim lock exists for: a claim is judged against the
+        // first finality IT was weighed at, never against a previous claim's.
+        let dir = TempDir::new("afresh");
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &dir.0.join("logindex-gnosis.db")).await;
+        reader.set_vouched(F1);
+        reader.settle_restart_claim(F0, true); // weighed at a restored finality: no evidence
+        assert_eq!(vouched(&reader), F1);
+        // A later install replaces the claim...
+        reader.set_vouched(F1 + 100);
+        // ...so F0 + 16 — newer than the OLD claim's first finality — is this
+        // claim's first, and still proves nothing against it.
+        reader.settle_restart_claim(F0 + 16, true);
+        assert_eq!(vouched(&reader), F1 + 100, "judged against another claim's first finality");
+        // Only a finality verified after that one does.
+        reader.settle_restart_claim(F0 + 32, true);
+        assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_in_flight_cannot_republish_a_contradicted_claim() {
+        // A checkpoint serializes under the index lock and writes outside it,
+        // and the backfill drives one from outside `log_index_drive` — so a
+        // getLogs-driven tick can contradict the claim while those bytes are
+        // in flight. Publishing the old clamp would hand the next restart the
+        // coverage this light client just overruled.
+        let dir = TempDir::new("inflight");
+        let path = run_to_shutdown(&dir.0).await;
+        let anchor = anchor_at(F0, F0 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.install_log_index_from_disk());
+
+        // A checkpoint gets as far as its bytes and clamp...
+        let clamp = reader.checkpoint_clamp_for(F0);
+        assert_eq!(clamp, Some(F1), "clamped at the claim while it still held");
+        let bytes = reader
+            .with_log_index(|ix| checkpoint_bytes(ix, &reader.chain_tag(), clamp))
+            .expect("index installed");
+
+        // ...and before it writes, a current light client overrules the claim.
+        anchor.set_finality_current(true);
+        reader.settle_restart_claim(F0, true); // weighed here
+        reader.settle_restart_claim(F0 + 16, true); // verified since, and far short
+        assert_eq!(vouched(&reader), 0);
+        assert!(!finality_claim_path(&path).exists(), "a contradicted claim stayed on disk");
+
+        // The in-flight checkpoint now lands. Its coverage may go to disk;
+        // its claim may not.
+        set_anchor(&anchor, F0 + 16, F0 + 56);
+        reader.write_own_checkpoint(&path, &bytes, clamp).unwrap();
+        assert_eq!(on_disk(&path), (Some(F1), None), "a rejected claim came back");
+
+        // ...so a start on those bytes re-checks that coverage instead of
+        // serving it. (Before this reader stops — its own checkpoint would
+        // write a fresh, and true, claim at the finality it has by then.)
+        let next = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(next.install_log_index_from_disk());
+        assert_eq!(vouched(&next), 0);
+        tick(&next).await;
+        assert_eq!(next.log_index_covered_high(), Some(F0));
+        next.stop().await;
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_export_carries_the_vouched_coverage_and_no_claim() {
+        let dir = TempDir::new("export");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        // This run's own appends above the vouched top, not yet confirmed.
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let out = dir.0.join("export.db");
+        reader.export_log_index(&out).unwrap();
+        let (exported, _) = LogIndex::load_portable_with_id(&out).unwrap();
+        // All the node holds as final, nothing it has yet to re-check...
+        assert_eq!(exported.append_edge(), Some(F1 + 1));
+        // ...and no claim: that is the node's, never the file's.
+        assert!(!finality_claim_path(&out).exists(), "a claim travelled with an export");
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)), "the export touched the node's own claim");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_import_ends_the_claim_on_disk_and_in_memory() {
+        let dir = TempDir::new("import");
+        let path = run_to_shutdown(&dir.0).await;
+        // Another node's export of the same contract.
+        let other = dir.0.join("other.db");
+        let mut ix = LogIndex::new(watch()).unwrap();
+        for n in (LOW + 1_000)..=(LOW + 2_000) {
+            ix.append_block(n, hash(n), vec![]).unwrap();
+        }
+        ix.persist(&gnosis_tag(), &other).unwrap();
+
+        let reader = offline_reader(anchor_at(F0, F0 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        assert_eq!(vouched(&reader), F1);
+        reader.import_log_index(&[other]).unwrap();
+        assert_eq!(vouched(&reader), 0);
+        assert!(!finality_claim_path(&path).exists(), "a claim beside imported bytes");
+        // Rewound to the ANCHOR's finality, as an import always was.
+        assert_eq!(reader.log_index_covered_high(), Some(F0));
+        assert_eq!(on_disk(&path), (Some(F0), None));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_growing_watch_list_keeps_the_claim_and_drops_unconfirmed_appends_with_their_record() {
+        let dir = TempDir::new("regrow");
+        let path = run_to_shutdown(&dir.0).await;
+        // Finality stale, head above the claim: the tail may append again.
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut grown = watch();
+        grown.watch.push(WatchEntry { address: [0x46; 20], from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(reader.set_log_index_config(grown));
+        assert!(reader.log_index_tail.lock().unwrap().is_empty());
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "unconfirmed appends outlived their record");
+        assert_eq!(vouched(&reader), F1, "the merged index lost the vouched coverage");
+        // The checkpoint the replacement wrote is this node's, and says so.
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+
+        // A replacement that keeps no coverage keeps no claim.
+        let mut conflicting = watch();
+        conflicting.watch[0].topic0s = vec![[0x99; 32]];
+        assert!(reader.set_log_index_config(conflicting));
+        assert_eq!(reader.log_index_covered_high(), None);
+        assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    /// A push the index layer refuses must cost the node NOTHING: same
+    /// coverage, same claim, same tail record. This is the
+    /// variant that used to lose the whole index — a duplicate address makes
+    /// the replacement unbuildable, and the topic change means there is no
+    /// merge to fall back on, so the old index had already left the slot when
+    /// the construction failed.
+    #[tokio::test]
+    async fn a_refused_config_leaves_a_conflicting_index_exactly_as_it_was() {
+        let dir = TempDir::new("refuse-conflict");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut bad = watch();
+        bad.watch[0].topic0s = vec![[0x99; 32]]; // no union, so no merge path
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "the live index vanished");
+        assert_eq!(vouched(&reader), F1, "the restart claim did not survive the refusal");
+        assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "the tail record was retired");
+        reader.stop().await;
+    }
+
+    /// The same rule for the variant that kept the index but had already
+    /// spent what surrounds it: the union succeeds (topics match), so the old
+    /// index went back into the slot — but only after the tail record had
+    /// been retired and its unconfirmed coverage rewound away.
+    #[tokio::test]
+    async fn a_refused_config_keeps_the_unconfirmed_coverage_it_cannot_replace() {
+        let dir = TempDir::new("refuse-union");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append(&reader, F1 + 1, F1 + 5, true);
+
+        let mut bad = watch();
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "unconfirmed coverage was rewound");
+        assert_eq!(vouched(&reader), F1, "the restart claim did not survive the refusal");
+        assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "the tail record was retired");
+        reader.stop().await;
+    }
+
+    /// The two tests above pass with EITHER layer of the fix alone (the guard
+    /// at the top, or the replace path's build-before-take), so neither pins
+    /// the guard. This does: the guard's own reason to exist is that it
+    /// answers without taking the checkpoint lock, which an in-flight import
+    /// can hold for as long as merging GBs takes. A refusal that queues behind
+    /// that is indistinguishable from the outside — except in how long the
+    /// caller waits, which is exactly what a host on a UI thread feels.
+    #[tokio::test]
+    async fn a_duplicate_config_is_refused_without_taking_the_checkpoint_lock() {
+        let dir = TempDir::new("refuse-nolock");
+        let path = run_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+
+        let mut bad = watch();
+        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+
+        // Held as a checkpoint write (or an import) holds it.
+        let held = reader.log_index_write.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = &reader;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _ = tx.send(r.set_log_index_config(bad));
+            });
+            let answered = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Release BEFORE asserting, so a push that did queue can still
+            // finish and be joined instead of hanging the test.
+            drop(held);
+            assert_eq!(answered.ok(), Some(false), "the push queued behind the checkpoint lock");
+        });
+
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "the refusal touched the index");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_stops_below_records_finality_passed_before_the_tail_rechecked_them() {
+        let dir = TempDir::new("race");
+        let path = dir.0.join("logindex-gnosis.db");
+        let anchor = anchor_at(F1, F1 + 40);
+        let reader = offline_reader(Arc::clone(&anchor), &path).await;
+        assert!(reader.set_log_index_config(watch()));
+        append(&reader, F1 - 100, F1, false);
+        append(&reader, F1 + 1, F1 + 30, true);
+        // Finality moves past five records; no tail tick has compared them yet.
+        set_anchor(&anchor, F1 + 5, F1 + 40);
+        assert!(reader.persist_log_index(reader.finalized_block_number(), false));
+        assert_eq!(
+            on_disk(&path),
+            (Some(F1), Some(F1)),
+            "blocks nobody re-checked were checkpointed as final"
+        );
+        reader.stop().await;
+    }
+}

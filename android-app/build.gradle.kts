@@ -86,6 +86,13 @@ val rpcUpstream: String = run {
 // derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
 val releaseVersion = project.version.toString().substringBefore('-')
 
+// versionCode is DERIVED too: the release guard does not check it, so as a
+// hand-bumped literal a forgotten bump shipped an APK that refuses to install
+// over the previous one (INSTALL_FAILED_VERSION_DOWNGRADE) with green CI. The
+// mapping (and why it is monotonic) lives in the root build's
+// releaseBuildNumber, shared with the iOS CFBundleVersion check.
+val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
+
 // Mirror the root build's -PskipRustEngine parse (same truthy rules). When set,
 // the Android build omits the Rust native libs — so packaging must also drop any
 // libmyotis_*.so LEFT OVER in the source tree from an earlier toolchain build,
@@ -104,18 +111,22 @@ android {
         applicationId = "com.jaeckel.ethp2p.android"
         minSdk = 29
         targetSdk = 34
-        // Stays a manual literal: a monotonic install counter with no relation
-        // to semver, so there is nothing to derive it from. Bump it on every
-        // release or the new APK won't install over the previous one.
-        versionCode = 8
+        versionCode = derivedVersionCode // see derivedVersionCode above
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        // Sugar for java.time, java.nio.file etc. missing from Android's stdlib
+        // Core-library desugaring. At minSdk 29 this supplies the Java 9-11 API
+        // backports (List.of, String.strip, Collection.toArray(IntFunction),
+        // Collectors.toUnmodifiable*, …) and — from desugar_jdk_libs 2.1.5 —
+        // Stream.toList(), for our modules AND third-party jars alike. It does
+        // NOT cover CompletableFuture.failedFuture/orTimeout/exceptionallyCompose,
+        // java.util.HexFormat, Path.of, or BigInteger.int/longValueExact — those
+        // are avoided in source instead (core's Futures, evm's Hex, Paths.get).
         isCoreLibraryDesugaringEnabled = true
     }
 
@@ -145,6 +156,45 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+    }
+
+    testOptions {
+        // No UI interactions in the smoke test, but system animations still cost
+        // main-thread time on a software-rendered emulator — keep them off.
+        animationsDisabled = true
+        // Gradle Managed Device pinned to minSdk (API 29) for NodeBootSmokeTest
+        // (androidTest — its KDoc carries the full why: real-ART boot coverage the
+        // static dex scan cannot give). Run it with
+        //   ./gradlew :android-app:api29DebugAndroidTest
+        // (CI adds -Pandroid.testoptions.manageddevices.emulator.gpu=
+        // swiftshader_indirect for its GPU-less runners — see
+        // .github/workflows/android-apk.yml). It needs the Android Rust toolchain:
+        // below API 33 the app is Rust-engine-only (EngineGate), so a
+        // -PskipRustEngine build cannot boot a network on this device.
+        // "aosp", not "aosp-atd": the leaner ATD images only exist for API 30+.
+        // x86_64 hosts only — Google never published an API-29 arm64 emulator
+        // image, so an Apple-Silicon Mac can't run this device locally; the CI
+        // job is the enforcement point.
+        managedDevices {
+            localDevices {
+                create("api29") {
+                    device = "Pixel 2"
+                    apiLevel = 29
+                    systemImageSource = "aosp"
+                    // REQUIRED, not a preference: the APK always carries native
+                    // libs for exactly arm64-v8a + x86_64 (extractJnaAndroidNatives
+                    // packages libjnidispatch.so even under -PskipRustEngine), and
+                    // an APK with native libs installs only on a device offering a
+                    // matching ABI. Left false, AGP resolves this device to the
+                    // 32-BIT image (verified against AGP 8.7.3: aosp images get
+                    // x86_64 only for apiLevel 26 and 30 — a two-element set, not
+                    // a range — and everything else <= 30 falls through to x86),
+                    // and the install dies with INSTALL_FAILED_NO_MATCHING_ABIS
+                    // before any test runs.
+                    require64Bit = true
+                }
+            }
         }
     }
 
@@ -234,8 +284,18 @@ kotlin {
 // Java. That is what shipped in v0.1.3 and v0.1.4.
 
 dependencies {
-    testImplementation("junit:junit:4.13.2")
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
+    testImplementation(libs.junit4)
+    // 2.1.5 is the first release whose config desugars Stream.toList() (via an
+    // emulated Stream interface at minSdk ≤ 33) — earlier 2.1.x left it as a raw
+    // API-34 call that crashes on Android 10-13 devices.
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+
+    // On-device boot smoke test (the api29 managed device above). Test APK only.
+    androidTestImplementation(libs.junit4)
+    androidTestImplementation(libs.androidx.test.core)      // ActivityScenario / ApplicationProvider
+    androidTestImplementation(libs.androidx.test.runner)    // AndroidJUnitRunner (testInstrumentationRunner)
+    androidTestImplementation(libs.androidx.test.rules)     // ServiceTestRule
+    androidTestImplementation(libs.androidx.test.ext.junit) // AndroidJUnit4
 
     implementation(project(":core"))
     implementation(project(":networking"))
@@ -348,7 +408,8 @@ dependencies {
 // the toolchain present, cargoNdkAndroid cross-compiles the jniLibs and
 // uniffiGenerateKotlin refreshes the committed bindings from the same source;
 // without it, the build fails and names `-PskipRustEngine` (which omits the
-// engine and falls back to the Java engine at runtime). verifyAndroidJniLibs is
+// engine; the app then runs the Java engine, on API 33+ only — EngineGate).
+// verifyAndroidJniLibs is
 // the post-build backstop that the produced .so exports every UniFFI symbol the
 // (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
 // PURPOSE — the JVM hosts must stay buildable without cargo (see
@@ -467,8 +528,8 @@ val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") 
         val missing = shippedAbis.filterNot { it in got }
         check(missing.isEmpty()) {
             "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
-                "would ship libmyotis_engine.so with no JNA dispatcher and silently fall " +
-                "back to the Java engine at runtime."
+                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
+                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
         }
     }
 }

@@ -1,0 +1,17 @@
+// The iOS app's bundle version, kept in step with the Gradle release version
+// (root build.gradle.kts `allprojects { version = … }`). Info.plist reads these
+// through $(MARKETING_VERSION) / $(CURRENT_PROJECT_VERSION); project.yml wires
+// this file in as the target's base xcconfig. It has to be a committed file —
+// Xcode reads build settings before any script phase runs, so nothing in the
+// build can derive them from Gradle at build time — which makes both lines
+// release-sweep pins: `./gradlew check` (verifyIosVersion) fails when either
+// disagrees with the project version.
+//   MARKETING_VERSION       = the release version (CFBundleShortVersionString)
+//   CURRENT_PROJECT_VERSION = the root build's releaseBuildNumber
+//                             (MAJOR*1_000_000 + MINOR*1_000 + PATCH), the same
+//                             number android-app ships as versionCode. Apple
+//                             requires CFBundleVersion's first integer to be
+//                             greater than zero, so it cannot simply repeat the
+//                             0.x marketing version.
+MARKETING_VERSION = 0.1.12
+CURRENT_PROJECT_VERSION = 1012

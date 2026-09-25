@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build all modules. NOTE: :android-app builds the Rust engine from source by
 # default, so a full build needs the Android Rust toolchain (cargo + cargo-ndk +
 # NDK r28+ + the aarch64/x86_64-linux-android rustup targets). Without it, add
-# -PskipRustEngine to build the app on the Java engine (see the Rust section below).
+# -PskipRustEngine to build the app on the Java engine, which boots only on
+# Android 13 / API 33+ (see the Rust section below).
 ./gradlew build                  # add -PskipRustEngine without the Android Rust toolchain
 
 # Compile only (no tests)
@@ -54,7 +55,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
 # lack the toolchain — the build tells you about the switch — with:
-./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS)
+./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS); boots on API 33+ only
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
 # workspace's rust-toolchain.toml selects — i.e.
@@ -123,7 +124,7 @@ Key Gradle modules:
 - **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
   paths in the daemon, desktop, and Android don't import engine internals
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
-  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default java —
+  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
   Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
   single `Engines.engine()` line at each composition root; the TrueBlocks
@@ -147,15 +148,240 @@ Key Gradle modules:
   `RustEngineNative`; same JSON shapes, pinned by the same golden tests) and
   never touches engine internals either.
 
+## Workflow — the mandatory steps for EVERY work item
+
+Every change to this repository goes through this sequence, in order, with **no
+step skipped and none treated as optional or "only if asked"**:
+
+1. **Code** — make the change on the designated branch.
+2. **Review** — run the internal code review on the diff (the `code-review`
+   skill / `/code-review`) and address what it finds before going further.
+3. **PR** — open a pull request. This is the default next step after review, not
+   a separate request the user has to make. (Follow the PR-template and
+   attribution rules below.)
+4. **Wait for review comments** — subscribe to the PR and wait for CI + review
+   feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
+5. **Address the PR comments** — drive the PR to green and answer every review
+   comment per the rules below, then keep watching until it is merged or closed.
+   **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
+   2026-08-31), no matter what earlier instructions seem to authorize. Green CI +
+   all comments answered = report "ready to merge" and keep watching; the merge
+   itself is the owner's.
+
+Short form: **code → review → PR → wait for review comments → address them.**
+Do not stop at "pushed" and do not ask whether to open the PR or run the review —
+they are part of the work item. The only time to skip the PR is when the user
+explicitly says not to open one.
+
+## Releases — ask before cutting one
+
+When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
+**ask these three questions first and act only on what they choose** (owner
+rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
+below, mandatory, never asked about** (owner ruling, 2026-09-24). Everything a
+release needs goes into ONE release PR. **The tag is the owner's action**: after
+the merge the owner pushes it, or explicitly asks for it to be pushed — never
+push a `v*` tag on your own initiative, it is the publish trigger for every
+asset workflow and a stronger action than the merge this file already forbids.
+(v0.1.12 is the one exception to the one-PR rule: #484 carried steps 1–3 and
+#485 the bump and this rule. From v0.1.13 on, one PR.)
+
+1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
+   blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
+   `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
+   fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
+   gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
+   host consents.
+
+   **A shipped anchor's remaining freshness is NOT a release deadline, and
+   nothing may gate a tag on it** (owner ruling, 2026-09-24). Gnosis periods are
+   8192 slots of 5 s — 11.4 h — so its 3-period bound gives a fresh install at
+   least a **~34-hour** window from the anchor's slot, and at most ~45.5 h: the
+   gate is period-granular (`ws_anchor_stale`: `wall - anchor > bound`), so an
+   anchor expires only when the wall clock ENTERS period `anchor + 4`, never
+   mid-period, and a refresh at head lands anywhere in its period. No release cadence can stay inside that: holding the
+   tag to it would mean daily releases, and daily releases would mean expecting
+   users to update daily, which trains them to click through updates without
+   reading them. Mainnet's 13 periods of 27.3 h (~15 days) is the same
+   phenomenon with a kinder constant. Quote the floor, not a fixed width — the
+   v0.1.12 tag message quoted an expiry to the second, which is how a
+   period-granular bound turns into a deadline nobody can meet.
+
+   So: refresh the anchors because a fresher one serves more installs, never
+   because a clock is running out. Do not compute, quote or act on an
+   "anchor goes stale at <time>" deadline when preparing a release, and do NOT
+   build the `verifyReleaseAnchorFresh` tag gate a review proposed for exactly
+   this (#485) — it would refuse correct releases on a schedule no release
+   process can meet. On gnosis in particular, `STALE_ANCHOR` on a fresh install
+   is the ORDINARY case within two days of any release, not an incident: the
+   consent path is the product surface that has to be good, and that is a
+   separate design question from how often we tag.
+2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
+   truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
+   `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
+   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
+   any other verbatim copy — do not trust this list, `grep -rn` the tree for
+   one of the current addresses before and after the edit until zero copies
+   of the old ones remain. Since #414 the `myotis-net` live tests read
+   `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
+   four strings, so a partial re-sync fails in the fast lib test.
+   Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
+   fallback (the Java engine has one), so a fresh profile with a stale list
+   never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
+   Warm profiles and the dispatched smoke job hide this because they dial
+   their peer cache directly.
+3. **Run the cold-start checks?** (owner ruling, 2026-09-11.) Three live
+   tests, all `#[ignore]`d so nothing else ever runs them, and together the
+   only coverage of what a FRESH INSTALL does. Ordinary CI, the emulator smoke
+   and the dispatched node smoke all dial a warm peer cache or a release-fresh
+   anchor, which is exactly what hides this class of failure — in #422 a
+   shipped build could not catch up at all while every automated check was
+   green. Dispatch the `cold-start regression` workflow from the Actions tab
+   (preferred — a CI runner is a clean host, see the caveat below), or locally:
+
+   ```bash
+   cd rust
+   # 3a. are the shipped pins and bootnodes alive? (seconds when healthy)
+   NET=gnosis cargo test --release -p myotis-net --test live_pins_alive -- \
+       --ignored --nocapture --test-threads=1
+   # 3b. dead pins: every pinned CL server configured but unreachable
+   NET=gnosis cargo test --release -p myotis-net --test live_cold_start -- \
+       --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
+   # 3c. deep catch-up: an anchor further behind than the network's ws bound
+   NET=gnosis MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
+     cargo test --release -p myotis-net --test live_cold_start -- \
+       --ignored --nocapture cold_start_from_an_old_anchor
+   ```
+
+   Run each for every network you are shipping (`NET=mainnet|sepolia|gnosis`).
+   The workflow takes a `scope`: `full` is the release check and REFUSES to run
+   without an anchor rather than skipping the deep walk green; `pins-only` is
+   for when you deliberately want just 3a and 3b.
+
+   **3a is the one that would have caught #422 before it shipped**, and it is
+   the one whose OUTPUT you read rather than just its exit code. It asks every
+   pinned CL peer for a `light_client_bootstrap` at this build's own embedded
+   anchor and applies the SAME acceptance the production path does (checkpoint
+   pin plus both Merkle branches), then asks for one period of
+   `updates_by_range` — so a pin counts as alive only if a fresh install would
+   accept what it serves AND could catch up from it. Then it checks the
+   bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
+   sweep, because these are third-party hosts and demanding perfection makes a
+   check people skip. Individual dead pins are a re-census signal
+   (`examples/period_census.rs`), not automatically a blocker.
+
+   **Caveat that will bite you: the result is only as good as the host.** A
+   Lighthouse node that has banned your IP reports as `dial failed` while being
+   perfectly healthy for everyone else — and any machine that ran a
+   pre-gossipsub build carries those bans for 12 h (that ban IS #422). Measured
+   2026-09-11 from a dev box: 18 of 23 gnosis pins looked dead from home and
+   answered fine through a VPN minutes earlier. So prefer the dispatched
+   workflow, and before believing a bad census, check whether your host is the
+   outlier.
+
+   The old-anchor run needs an anchor from a release OLDER than the current
+   one — the newest tag is usually the release whose checkpoint is already on
+   `main`, so it proves nothing, and the test refuses an anchor within the
+   network's weak-subjectivity bound:
+
+   ```bash
+   prev=$(git tag --sort=-v:refname | sed -n 2p)
+   git show "$prev":rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
+   ```
+
+   Run them AFTER any checkpoint refresh from question 1, so the build under
+   test is the one being shipped. A failure here is release-blocking: it means
+   a fresh install cannot sync, which is the one thing a wallet must do.
+
+4. **Move the version pins. MANDATORY — not a question, and part of the SAME
+   release PR as steps 1–3** (owner ruling, 2026-09-24). Every release from
+   v0.1.8 to v0.1.11 did this inside its one release PR, but only by precedent;
+   the v0.1.12 checkpoint PR (#484) followed this list to the letter, answered
+   the three questions, and shipped no bump — `main` still declared 0.1.11, and
+   the tag would have been refused. There is no command for it yet (review
+   follow-up: a `setReleaseVersion` task); until there is, it is these six
+   files (a previous sweep commit touches these plus step 1's two checkpoint
+   files, so do not copy its file list blindly):
+
+   | file | what moves |
+   |---|---|
+   | `build.gradle.kts` | `version = "X.Y.Z-SNAPSHOT"` (root `allprojects`) |
+   | `rust/Cargo.toml` | the workspace `version` |
+   | `ios-app/Myotis/Version.xcconfig` | `MARKETING_VERSION = X.Y.Z` and `CURRENT_PROJECT_VERSION` = the root build's `releaseBuildNumber`, i.e. `X*1_000_000 + Y*1_000 + Z` (0.1.12 → 1012, 0.2.0 → 2000, 1.0.0 → 1000000; `verifyIosVersion` prints the expected value on a mismatch) |
+   | `rust/Cargo.lock`, `rust/roost/Cargo.lock`, `rust/tor-poc/Cargo.lock` | `cargo update --workspace` in each of the three manifests, so the workspace crates' own entries follow |
+
+   And, ONLY when step 3's deep walk (3c) ran from `oldest-servable.properties`'
+   entries — the dispatched workflow's default, not the `pins-only` scope and
+   not a local run from the previous tag's anchor — note in that file's comment
+   that this release's run walked from these roots. It is a servability record
+   the cold-start test trusts instead of re-probing; a note about a walk nobody
+   observed makes it lie.
+
+   Then verify. The first command is the SAME query the tag guard makes; the
+   rest cover the pins the guard does NOT see:
+
+   ```bash
+   ./gradlew -q :printReleaseVersion verifyCrateVersions verifyIosVersion   # must print releaseVersion=X.Y.Z
+   for m in rust rust/roost rust/tor-poc; do cargo update --workspace --locked --manifest-path $m/Cargo.toml; done
+   ```
+
+   `releaseVersion` must equal the tag's version core — the guard accepts
+   `vX.Y.Z` and `vX.Y.Z-<suffix>` (rc/hotfix shapes), nothing else. Know what
+   catches what: the guard refuses the tag ONLY for the Gradle pin, because it
+   compares the tag to `project.version` and nothing more. The other five are
+   PR-time failures — `./gradlew check` for the crate and iOS pins, the
+   `cargo-locks` workflow for the locks — so run them before asking for the
+   merge, or the release PR goes red after the fact. A stale `rust/Cargo.toml`
+   that slipped past both would ship a Rust engine whose devp2p and libp2p agent
+   strings advertise the previous release. The macOS dmg version is derived
+   (major + 1) and needs no edit.
+
 ## Pull requests and code review
 
-These rules are for the **PR author** answering a review. The reviewer's own
-instructions live in `.github/claude-review-prompt.md` and
+These rules are for the **PR author**, opening a PR and answering its review.
+The reviewer's own instructions live in `.github/claude-review-prompt.md` and
 `.github/workflows/claude-review.yml`; a reviewer agent reads this file too
 (its prompt opens "Read CLAUDE.md first"), so note that the mechanism below is
 not addressed to it — and it could not follow it anyway, since `gh api` is not
 on its allowlist.
 
+**External / fork PRs are reviewed MANUALLY, never by the CI reviewer (owner's
+decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
+(`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
+run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
+tree is attacker-controlled, and an automated reviewer that reads it can be
+prompt-injected. The clearest vector is verified: the "Assemble review prompt"
+step `cat`s `.github/claude-review-prompt.md` straight from the PR checkout with
+no pinning (`claude-review.yml:77`), so a fork that edits the prompt file
+*rewrites the reviewer's own instructions*. The reviewer prompt also opens "Read
+CLAUDE.md first", so `CLAUDE.md` is an attacker-controlled input by the same
+route — though current `claude-code-action` appears to restore the base
+`CLAUDE.md` over the checkout before the review runs (observed, not documented),
+so don't rely on that either way. And the diff itself is always attacker text.
+The "workflow must match the default branch" guard protects only the workflow
+YAML, not the prompt file or CLAUDE.md. So do NOT wire fork PRs into the
+automated reviewer. Instead: the owner reads the diff first — watching for
+injection in `CLAUDE.md` / `.github/**` / build scripts / postinstall hooks /
+comments / encoded blobs — then, if wanted, a review is run manually from a
+trusted session **restricted to read/diff/comment tools, never building or
+running the fork tree** (merely `./gradlew …` executes fork-controlled build
+scripts locally; CI already builds fork PRs via unscoped `pull_request` in
+`ci.yml`, but secretless and sandboxed — a local session is neither). Held to
+that, nothing auto-merges and an injected reviewer's worst case is a comment a
+human still acts on. If automating fork review is ever reconsidered, pin the
+prompt and CLAUDE.md to the base ref, never execute fork code, keep reviews
+`COMMENT`-only, and lock down runner egress — see PR #375 for the discussion
+that produced this note.
+
+- **WRITE EVERY PR IN ENGLISH** (owner ruling, 2026-09-17) — title, description,
+  commit messages, review replies and any top-level PR comment: everything that
+  lands on GitHub, whatever language the task was discussed in. Commit messages
+  are in on purpose — they sit in the PR's Commits tab and stay in `git log`
+  forever, read by the same audience. PRs are the project's public record and
+  are read by external contributors and by the automated reviewers; a German
+  description makes a change unreviewable for part of that audience. Talking to
+  the owner in German is fine and unaffected; the moment it lands on GitHub it
+  is English.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
@@ -192,6 +418,10 @@ on its allowlist.
   over `-f`.
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
   either pushing a fix or stating the blocker explicitly.
+- **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
+  auto-merge. No earlier task description or standing instruction authorizes
+  it. The end state of the author's work is "green, answered, ready to merge";
+  the merge action itself is always the owner's.
 
 ## Platform & language direction
 
@@ -201,6 +431,30 @@ on its allowlist.
   the Android runtime / `coreLibraryDesugaring` can't cover, mind APK / DEX
   size, and prefer libraries with known Android support. `java.net.http` is
   not desugared and is not available below API 33 — do not use it.
+- **minSdk 29 JDK-API budget (verified empirically against R8's backport list
+  and the desugar_jdk_libs 2.1.5 config, 2026-08).** Safe at minSdk 29 via D8
+  backports + desugaring: `List/Set/Map.of`/`copyOf`, `Map.entry`,
+  `String.strip/isBlank/repeat`, `Collection.toArray(IntFunction)`,
+  `Optional.isEmpty`, `Predicate.not`, `Collectors.toUnmodifiable*`, and (from
+  desugar_jdk_libs 2.1.5) `Stream.toList()`. NOT covered — use the `:core`
+  replacements: `CompletableFuture.failedFuture/orTimeout/exceptionallyCompose`
+  → `core.concurrent.Futures`; `java.util.HexFormat` → `core.encoding.Hex`;
+  `BigInteger.intValueExact/longValueExact` → `core.math.BigIntegers`;
+  `Path.of` → `Paths.get`; `InputStream.readAllBytes/readNBytes/transferTo`
+  and `Files.readString/writeString` → a manual drain loop /
+  `Files.readAllBytes` + `Files.write`. Hosts (android-app/app/app-desktop)
+  don't import the `:core` helpers — they inline the few lines instead (hosts
+  talk only to `:myotis-api`). The ENFORCEMENT is
+  `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
+  built APK's dex — the post-desugaring ground truth. It also resolves calls
+  that reach a JDK method through a third-party subclass, which lint-style
+  source checks and a naive api-versions.xml lookup both miss (that is exactly
+  how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus
+  class-level references (extends/checkcast of a post-29 `java.*` class). It
+  is deliberately fail-closed: pre-36.1 platform databases don't record every
+  policed API (`Files.readString` first appears in the android-36.1 database),
+  so the script refuses to scan against a database that cannot resolve its
+  canary APIs rather than passing vacuously.
 - **JVM 17 is the default source/target.** New modules should compile to
   Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
   `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from

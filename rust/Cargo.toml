@@ -42,6 +42,16 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-evm", "myoti
 # `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
 exclude = ["tor-poc", "roost"]
 
+# ONE version for every myotis-* release crate (`version.workspace = true` in each
+# member). The Gradle build is the source of truth for the release version
+# (root build.gradle.kts `allprojects { version = … }`); `verifyCrateVersions`
+# fails `check` when this line disagrees with it, so the release sweep bumps the
+# two together (with the other pins `check` verifies) and then regenerates the
+# lock files. uniffi-bindgen is a pinned TOOL, not a release artifact, and keeps
+# its own version.
+[workspace.package]
+version = "0.1.12"
+
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
 [profile.release]

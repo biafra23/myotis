@@ -73,6 +73,17 @@ jobs:
       - name: Rename to .node
         shell: bash
         run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"
+      # API tests against the artifact we are about to publish (the f64 slot
+      # boundary and the createWithCheckpoint generation semantics live only in
+      # the addon, so host.rs tests cannot cover them). Native legs only: the
+      # x64 macOS slice is cross-compiled on an arm64 runner and cannot load.
+      - name: Addon API tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        working-directory: rust/myotis-node
+        env:
+          MYOTIS_NODE_ADDON: ${{ github.workspace }}/${{ matrix.artifact }}
+        run: node --test addon-api.test.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -167,12 +178,20 @@ jobs:
           **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
           "Install unknown apps". Not a signed release build.
 
-          **Desktop macOS (`Myotis-<arch>.dmg`)** — unsigned; download the dmg matching
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
           right-click → Open to get past Gatekeeper (not notarized yet).
 
-          **Desktop Linux (`Myotis-<arch>.deb`)** — install with
-          `sudo apt install ./Myotis-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          unverified until the walker re-fetches it, and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
           Raspberry Pi 5 / ARM machines).
           NOTES
           printf '\n' >> "$notes"

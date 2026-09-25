@@ -356,9 +356,25 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 
     // Memory is an accelerator in front of the archive, so the store is rebuilt
     // from it on every start. Re-encoding 1327 periods is milliseconds.
+    // Participation is decoded alongside: the fill loop below uses it to decide
+    // whether a stored update is provisional. Last record per period wins, the
+    // same last-wins rule insert_update applies.
     let store = LcStore::new();
+    let mut participation: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+    let mut held_periods: std::collections::BTreeSet<u64> =
+        std::collections::BTreeSet::new();
     for (period, rec) in &records {
         store.insert_update(*period, rec.fork_digest, &rec.ssz);
+        held_periods.insert(*period);
+        match participation_of(&rec.ssz) {
+            Some(p) => {
+                participation.insert(*period, p);
+            }
+            None => {
+                participation.remove(period);
+            }
+        }
     }
 
     let (head_slot, syncing) = client.syncing().await?;
@@ -379,10 +395,48 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
     println!("  window    periods {floor}..={head_period}");
 
     println!("\n== fill ==");
+    // A stored update is PROVISIONAL — refetched, not frozen — when its
+    // sync-aggregate participation is below the light-client supermajority
+    // (participants*3 < SYNC_COMMITTEE_SIZE*2) or its period is still in
+    // progress. Upstream's by-range answer is its best update SEEN SO FAR, so
+    // an ingest that runs early in a period can capture the period's first
+    // slots' update carrying a fraction of the committee (observed: 113/512 at
+    // mainnet period 1840, attested at the period's slot 0) — and a wallet
+    // REFUSES < 2/3, so a frozen weak update stalls every catch-up through
+    // that period, silently, forever. `has_period` used to be that freezer.
+    // Replacement is strictly-better-only (more participants), so a repeated
+    // ingest never grows the archive with equal copies; the append-only
+    // archive + last-wins insert_update/rebuild make the better record
+    // supersede on this run and on every later start.
     let mut fetched = 0usize;
     let mut newest_digest = None;
+    // Below the upstream window nothing can be refetched from this node — and
+    // below-floor periods are exactly roost's unique serving value — so a weak
+    // or undecodable record there is an UNHEALABLE stall for every wallet that
+    // walks it. Nothing to fix automatically; say it loudly instead of the
+    // silence that hid period 1840 (restore from a back-archive or a node with
+    // deeper light-client retention).
+    for (&period, &p) in participation.range(..floor) {
+        if below_supermajority(p) {
+            println!(
+                "  period {period}: WEAK ({p} participants) and below the \
+                 upstream window — unhealable from this node"
+            );
+        }
+    }
+    for &period in held_periods.range(..floor) {
+        if !participation.contains_key(&period) {
+            println!(
+                "  period {period}: UNDECODABLE and below the upstream window — \
+                 unhealable from this node"
+            );
+        }
+    }
+
     for period in floor..=head_period {
-        if store.has_period(period) {
+        let held = store.has_period(period);
+        let stored = participation.get(&period).copied();
+        if !needs_refetch(held, stored, period == head_period) {
             continue;
         }
         let resp = client.updates(period, 1).await?;
@@ -391,15 +445,52 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
             println!("  period {period}: upstream returned no data, skipping");
             continue;
         }
+        let mut stored_now = 0usize;
         for c in &chunks {
+            if held {
+                let fresh = participation_of(&c.ssz);
+                if !should_replace(stored, fresh) {
+                    match (stored, fresh) {
+                        (Some(old), Some(new)) => println!(
+                            "  period {period}: upstream no better \
+                             ({new} <= {old} participants), keeping"
+                        ),
+                        // stdout is the operator's whole interface — a
+                        // provisional period whose upstream answer doesn't
+                        // decode must say so, not stay silent run after run.
+                        (_, None) => println!(
+                            "  period {period}: upstream answer undecodable by \
+                             this build — keeping the held record"
+                        ),
+                        (None, Some(_)) => unreachable!(
+                            "should_replace is true for decodable-over-undecodable"
+                        ),
+                    }
+                    continue;
+                }
+                match (stored, fresh) {
+                    (Some(old), Some(new)) => println!(
+                        "  period {period}: replacing a provisional update \
+                         ({old} -> {new} participants)"
+                    ),
+                    (None, Some(new)) => println!(
+                        "  period {period}: replacing an undecodable stored \
+                         update ({new} participants)"
+                    ),
+                    (_, None) => unreachable!("should_replace is false for an undecodable fresh chunk"),
+                }
+            }
             archive.append(period, c.fork_digest, &c.ssz)?;
             store.insert_update(period, c.fork_digest, &c.ssz);
             fetched += 1;
+            stored_now += 1;
         }
-        println!("  period {period}: stored {} chunk(s)", chunks.len());
+        if stored_now > 0 && !held {
+            println!("  period {period}: stored {stored_now} chunk(s)");
+        }
     }
     archive.flush()?;
-    println!("  fetched   {fetched} new period(s)");
+    println!("  fetched   {fetched} update(s) (new or replaced)");
 
     // The newest period's digest, used as the interim context bytes for the
     // single-object endpoints below.
@@ -469,6 +560,44 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 
     serving_self_check(&store, &c, bootstrap_root)?;
     Ok(())
+}
+
+/// Sync-aggregate participant count of an SSZ-encoded `LightClientUpdate`, or
+/// `None` when it does not decode with this build's (fork-polymorphic) decoder.
+/// Used by ingest to judge whether a stored update is provisional.
+pub(crate) fn participation_of(ssz: &[u8]) -> Option<usize> {
+    myotis_consensus::types::LightClientUpdate::decode(ssz)
+        .ok()
+        .map(|u| u.sync_aggregate.count_participants())
+}
+
+/// Below the light-client supermajority bar — a wallet REFUSES such an update,
+/// so serving one stalls every catch-up through its period.
+pub(crate) fn below_supermajority(participants: usize) -> bool {
+    participants * 3 < myotis_consensus::spec::SYNC_COMMITTEE_SIZE * 2
+}
+
+/// Whether ingest must refetch a period from upstream instead of freezing what
+/// it holds: not held at all; still in progress (upstream's by-range answer is
+/// its best update SEEN SO FAR, improving as the period ages); stored below
+/// the supermajority; or stored undecodable by this build (`stored == None`
+/// while held — a record nobody with this decoder can use). Pure — every
+/// promised ingest property is pinned by the table tests below.
+pub(crate) fn needs_refetch(held: bool, stored: Option<usize>, in_progress: bool) -> bool {
+    !held || in_progress || stored.is_none_or(below_supermajority)
+}
+
+/// Whether a fresh chunk replaces a held record: strictly more participants;
+/// a decodable update beats an undecodable stored one; an undecodable fresh
+/// chunk never replaces anything (it cannot be judged). Strictly-better-only
+/// is what makes repeated ingests idempotent — equal copies are never
+/// re-appended. Pure — pinned by the table tests below.
+pub(crate) fn should_replace(stored: Option<usize>, fresh: Option<usize>) -> bool {
+    match (stored, fresh) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(old), Some(new)) => new > old,
+    }
 }
 
 /// Serve from the store exactly as the libp2p responder will, and decode the
@@ -693,4 +822,74 @@ async fn find_window_floor(client: &NimbusRest, head_period: u64) -> Result<Opti
         }
     }
     Ok(Some(lo))
+}
+
+#[cfg(test)]
+mod ingest_decision_tests {
+    use super::{below_supermajority, needs_refetch, participation_of, should_replace};
+
+    // 2/3 of 512 = 341.33…, so 342 participants is the lowest acceptable count.
+    #[test]
+    fn supermajority_bar_sits_at_two_thirds_of_512() {
+        assert!(below_supermajority(0));
+        assert!(below_supermajority(113)); // the frozen period-1840 record
+        assert!(below_supermajority(341));
+        assert!(!below_supermajority(342));
+        assert!(!below_supermajority(512));
+    }
+
+    #[test]
+    fn missing_periods_are_always_fetched() {
+        assert!(needs_refetch(false, None, false));
+        assert!(needs_refetch(false, None, true));
+    }
+
+    #[test]
+    fn the_in_progress_period_is_always_provisional() {
+        assert!(needs_refetch(true, Some(512), true));
+    }
+
+    #[test]
+    fn a_weak_stored_update_is_provisional() {
+        assert!(needs_refetch(true, Some(113), false));
+        assert!(needs_refetch(true, Some(341), false));
+    }
+
+    #[test]
+    fn an_undecodable_stored_update_is_provisional() {
+        assert!(needs_refetch(true, None, false));
+    }
+
+    #[test]
+    fn a_strong_complete_period_is_frozen() {
+        assert!(!needs_refetch(true, Some(342), false));
+        assert!(!needs_refetch(true, Some(512), false));
+    }
+
+    #[test]
+    fn replacement_is_strictly_better_only() {
+        assert!(should_replace(Some(113), Some(114)));
+        assert!(should_replace(Some(113), Some(512)));
+        assert!(!should_replace(Some(113), Some(113))); // idempotent re-ingest
+        assert!(!should_replace(Some(512), Some(342)));
+    }
+
+    #[test]
+    fn a_decodable_update_beats_an_undecodable_stored_one() {
+        assert!(should_replace(None, Some(1)));
+        assert!(should_replace(None, Some(512)));
+    }
+
+    #[test]
+    fn an_undecodable_fresh_chunk_never_replaces_anything() {
+        assert!(!should_replace(Some(113), None));
+        assert!(!should_replace(None, None));
+    }
+
+    #[test]
+    fn participation_of_rejects_undecodable_bytes() {
+        assert_eq!(participation_of(&[]), None);
+        assert_eq!(participation_of(&[0u8; 64]), None);
+        assert_eq!(participation_of(b"not an ssz light client update"), None);
+    }
 }

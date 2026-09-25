@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
@@ -22,7 +23,7 @@ class BeaconLightClientPeerPoolTest {
         // Raw valid-length anchors; addPeer touches no network state and the
         // constructor doesn't start libp2p.
         byte[] root32 = new byte[32];
-        byte[] fork4 = {0, 0, 0, 1};
+        ForkSchedule fork4 = ForkSchedule.single(new byte[]{0, 0, 0, 1});
         byte[] gvr32 = new byte[32];
         return new BeaconLightClient(
                 List.of(), root32, 0L, fork4, gvr32,

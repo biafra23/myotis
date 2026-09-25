@@ -1,5 +1,6 @@
 package io.myotis.evm.world;
 
+import com.jaeckel.ethp2p.core.encoding.Hex;
 import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
 import io.myotis.evm.Address;
 import io.myotis.evm.CryptoProviders;
@@ -15,7 +16,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -74,6 +74,11 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  a contract whose storage is unchanged re-proves only its account record per
      *  block, its slots replay from cache. */
     private final StateProofCache stateCache;
+    /** The read-fetch shadow cache ({@link ReadStats}): every verified fetch
+     *  that crossed the network reports here with its wall-clock cost; cache
+     *  hits above never reach it. Never null — a caller that doesn't measure
+     *  gets a private throwaway instance. */
+    private final ReadStats readStats;
 
     /**
      * Per-oracle (i.e. per-resolution) memoization of account-record fetches,
@@ -107,10 +112,30 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             BytecodeCache bytecodeCache,
             int maxAttempts,
             StateProofCache stateCache) {
+        this(peerSupplier, bytecodeCache, maxAttempts, stateCache, new ReadStats());
+    }
+
+    /** {@code readStats}: the (usually stack-owned) shadow cache this oracle
+     *  reports every verified fetch to. */
+    public SnapBackedStateOracle(
+            Supplier<SnapPeer> peerSupplier,
+            BytecodeCache bytecodeCache,
+            int maxAttempts,
+            StateProofCache stateCache,
+            ReadStats readStats) {
         this.peerSupplier = peerSupplier;
         this.bytecodeCache = bytecodeCache;
         this.maxAttempts = maxAttempts;
         this.stateCache = stateCache == null ? StateProofCache.noop() : stateCache;
+        this.readStats = java.util.Objects.requireNonNull(readStats, "readStats");
+    }
+
+    /** The shadow-cache view of a verified account record (an exclusion proof
+     *  decodes as the empty account, see {@link #verifyAndDecodeAccount}). */
+    private static ReadStats.AccountFact factOf(AccountWithStorageRoot awr) {
+        AccountState a = awr.account();
+        return new ReadStats.AccountFact(a.nonce(), a.balance(), awr.storageRoot(),
+                Bytes32.wrap(a.codeHash().clone()));
     }
 
     @Override
@@ -152,11 +177,18 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             byte[] storageRootBytes = storageRoot.toArray();
             Optional<BigInteger> cached = stateCache.getStorage(storageRootBytes, slot);
             if (cached.isPresent()) return CompletableFuture.completedFuture(cached.get());
+            long started = System.nanoTime();
             return tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.storageSlot(accountHash, slotHash)))
-                    .thenApply(nodes -> verifyAndDecodeStorage(storageRoot, slotHash, address, nodes)))
+                    .thenApply(nodes -> {
+                        BigInteger v = verifyAndDecodeStorage(storageRoot, slotHash, address, nodes);
+                        credit(peer);
+                        return v;
+                    }))
                     .thenApply(value -> {
                         stateCache.putStorage(storageRootBytes, slot, value);
+                        readStats.observeStorage(address.toByteArray(), slotKey.toArray(),
+                                stateRoot, storageRootBytes, value, System.nanoTime() - started);
                         return value;
                     });
         });
@@ -236,8 +268,20 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             // verify and the whole chunk retries on the next peer. Best-effort overall —
             // a chunk that can't be verified after retries is left uncached (the caller's
             // per-item path re-fetches it), so the batch never weakens correctness.
+            // Shadow-cache cost of this chunk: end to end across peer attempts,
+            // like the per-item paths (a failed first peer is real cost the
+            // read paid; a cache would have spared all of it).
+            long started = System.nanoTime();
             CompletableFuture<Void> cf = tryWithRetries(peer -> peer.getTrieNodes(root, paths)
-                    .thenApply(nodes -> { verifyAndCacheChunk(stateRoot, root, chunk, nodes); return (Void) null; }))
+                    .thenApply(nodes -> {
+                        // Credit only when the chunk verified something from THIS
+                        // response: a fully cache-filled chunk (concurrent batch)
+                        // checks nothing of this peer's bytes.
+                        if (verifyAndCacheChunk(stateRoot, root, chunk, nodes, started)) {
+                            credit(peer);
+                        }
+                        return (Void) null;
+                    }))
                     .exceptionally(t -> {
                         log.debug("[snap-oracle] batch chunk ({} accounts) failed: {}",
                                 chunk.size(), t.getMessage());
@@ -252,9 +296,32 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  list the peer returned. Each proof is checked with the same verifier the
      *  per-item path uses (the verifier builds a hash→node map, so a combined node set
      *  verifies each key independently); a bad proof throws InvalidProof, failing the
-     *  whole chunk so tryWithRetries rotates to another peer. */
-    private void verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
-                                     List<BatchItem> chunk, List<Bytes> nodes) {
+     *  whole chunk so tryWithRetries rotates to another peer.
+     *
+     *  @return true iff at least one account or slot was verified from THIS
+     *      response (false = everything was already cache-filled, so nothing of
+     *      this peer's bytes was checked and no serve credit is deserved) */
+    private boolean verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
+                                        List<BatchItem> chunk, List<Bytes> nodes,
+                                        long startedNanos) {
+        // Shadow-cache bookkeeping: every fact this response verified, flushed
+        // in `finally` — an item that fails verification mid-chunk fails the
+        // chunk, but the facts verified (and cached) before it were real
+        // fetches and must still count; the retry skips them as cache hits.
+        List<ReadStats.AccountObs> seenAccounts = new ArrayList<>();
+        List<ReadStats.SlotObs> seenSlots = new ArrayList<>();
+        try {
+            return verifyAndCacheChunk(stateRoot, root, chunk, nodes, seenAccounts, seenSlots);
+        } finally {
+            readStats.observeChunk(stateRoot, seenAccounts, seenSlots, System.nanoTime() - startedNanos);
+        }
+    }
+
+    private boolean verifyAndCacheChunk(byte[] stateRoot, Bytes32 root,
+                                        List<BatchItem> chunk, List<Bytes> nodes,
+                                        List<ReadStats.AccountObs> seenAccounts,
+                                        List<ReadStats.SlotObs> seenSlots) {
+        boolean verifiedAny = false;
         for (BatchItem it : chunk) {
             // Query the cache live (not a static per-build snapshot): on a chunk retry
             // against a different peer, items the previous attempt already verified are
@@ -268,8 +335,10 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         Bytes32.wrap(cached.get().storageRoot()));
             } else {
                 awr = verifyAndDecodeAccount(root, it.accountHash(), it.address(), nodes);
+                verifiedAny = true;
                 stateCache.putAccount(stateRoot, it.addr(),
                         new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+                seenAccounts.add(new ReadStats.AccountObs(it.addr(), factOf(awr)));
             }
             Bytes32 storageRoot = awr.storageRoot();
             if (MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot)) {
@@ -281,9 +350,13 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 if (stateCache.getStorage(storageRootBytes, slot).isPresent()) continue;
                 BigInteger value = verifyAndDecodeStorage(
                         storageRoot, it.slotHashes().get(s), it.address(), nodes);
+                verifiedAny = true;
                 stateCache.putStorage(storageRootBytes, slot, value);
+                seenSlots.add(new ReadStats.SlotObs(
+                        it.addr(), paddedSlotKey(slot).toArray(), storageRootBytes, value));
             }
         }
+        return verifiedAny;
     }
 
     @Override
@@ -295,6 +368,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         }
 
         Bytes32 hash = Bytes32.wrap(codeHash.clone());
+        long started = System.nanoTime();
         return tryWithRetries(peer -> peer
                 .getByteCodes(List.of(hash))
                 .thenApply(codes -> {
@@ -309,11 +383,13 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         throw new EvmExecutionException(
                                 new EvmExecutionError.InvalidProof(
                                         new byte[32], Address.ZERO,
-                                        "bytecode hash mismatch: expected 0x"
-                                                + HexFormat.of().formatHex(codeHash)
-                                                + " got 0x" + HexFormat.of().formatHex(actualHash)));
+                                        "bytecode hash mismatch: expected "
+                                                + Hex.formatHexPrefixed(codeHash)
+                                                + " got " + Hex.formatHexPrefixed(actualHash)));
                     }
                     bytecodeCache.put(codeHash, code);
+                    credit(peer);
+                    readStats.observeCode(codeHash, System.nanoTime() - started);
                     return code;
                 }));
     }
@@ -342,9 +418,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
 
         String key = root.toHexString() + ':' + addressBytes.toHexString();
         return accountCache.computeIfAbsent(key, k -> {
+            long started = System.nanoTime();
             CompletableFuture<AccountWithStorageRoot> f = tryWithRetries(peer -> peer
                     .getTrieNodes(root, List.of(SnapPeer.PathSet.account(accountHash)))
-                    .thenApply(nodes -> verifyAndDecodeAccount(root, accountHash, address, nodes)));
+                    .thenApply(nodes -> {
+                        AccountWithStorageRoot awr =
+                                verifyAndDecodeAccount(root, accountHash, address, nodes);
+                        credit(peer);
+                        readStats.observeAccount(addr, stateRoot, factOf(awr), System.nanoTime() - started);
+                        return awr;
+                    }));
             // Evict failed fetches so a later read can retry across peers; on success
             // promote the verified record to the cross-call cache. Use *Async so
             // neither runs synchronously inside computeIfAbsent (a reentrant map
@@ -377,6 +460,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      * the worst case from {@code maxAttempts × request-timeout} (~30s of
      * zombie latency, longer than wallet client timeouts) to a single attempt.
      */
+    /** Credit {@code peer} with a VERIFIED serve ({@link SnapPeer#reportServed}).
+     *  Called only at the concrete verification sites, immediately after a proof
+     *  or hash check on THIS peer's bytes passed — never centrally on op success,
+     *  because an op can succeed without checking anything from this peer (a
+     *  batch chunk whose items a concurrent batch already cache-filled), and a
+     *  slow junk peer must not be able to farm serve credit off that race. */
+    private static void credit(SnapPeer peer) {
+        try { peer.reportServed(); } catch (RuntimeException ignore) {}
+    }
+
     private <T> CompletableFuture<T> tryWithRetries(java.util.function.Function<SnapPeer, CompletableFuture<T>> op) {
         CompletableFuture<T> result = new CompletableFuture<>();
         // Keys are SnapPeer.identity() tokens, compared by reference.

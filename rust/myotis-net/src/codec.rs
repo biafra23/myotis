@@ -138,6 +138,17 @@ pub fn encode_request(ssz_payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `light_client_updates_by_range` request body — `(start_period,
+/// count)` as two little-endian u64s, framed by [`encode_request`]. The one
+/// place the wire shape lives: the sync pipeline, the examples and the tests
+/// all build asks through it.
+pub fn encode_updates_by_range_request(start_period: u64, count: u64) -> Vec<u8> {
+    let mut ssz = Vec::with_capacity(16);
+    ssz.extend_from_slice(&start_period.to_le_bytes());
+    ssz.extend_from_slice(&count.to_le_bytes());
+    encode_request(&ssz)
+}
+
 /// varint(0) = single byte 0x00, no snappy data follows.
 pub fn encode_empty_request() -> Vec<u8> {
     vec![0x00]

@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.core.enr.Enr;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
@@ -28,16 +29,26 @@ public record NetworkConfig(
         long checkpointSlot,            // slot of the trusted checkpoint. Used to populate
                                         // Status.finalized_epoch before bootstrap so Lighthouse
                                         // doesn't goodbye us with IrrelevantNetwork(code=2).
-        byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
+        ForkSchedule forkSchedule,      // the chain's FULL fork schedule (activation epoch -> 4-byte version,
+                                        // ascending, genesis first). Every sync-committee signature is
+                                        // verified under the version active at its signature_slot, so the
+                                        // light client can walk updates across a fork boundary (#295); the
+                                        // entry active at the wall-clock epoch feeds the fork digest, so
+                                        // the NEXT fork may be pinned ahead of activation. Append-only,
+                                        // consensus-critical, same trust standing as genesisValidatorsRoot:
+                                        // pinned from the network's published config
+                                        // (/eth/v1/config/fork_schedule), never fetched. Keep in lockstep
+                                        // with the Rust ChainConfig.fork_schedule (rust/myotis-net/src/sync.rs).
         long activeBlobParamsEpoch,     // EIP-7892: epoch of the currently-active BPO fork, or 0 if none.
                                         // Folded into compute_fork_digest via the XOR formula so our digest
                                         // tracks the network's post-Fulu BPO activations.
         long activeBlobParamsMaxBlobs,  // EIP-7892: MAX_BLOBS_PER_BLOCK for the active BPO entry (paired
                                         // with activeBlobParamsEpoch). Ignored when activeBlobParamsEpoch == 0.
-        byte[] priorForkVersion,        // 4 bytes: immediately preceding fork (nullable). Accepted as
-                                        // a discv5 fork_digest fallback so a configured "current" fork
+        boolean acceptPriorForkDigest,  // accept the PRIOR scheduled fork's digest as a discv5 fork_digest
+                                        // fallback next to the current one, so a configured "current" fork
                                         // that hasn't yet activated on the network doesn't filter every
-                                        // peer out. Null skips the fallback (testnets, genesis fork).
+                                        // peer out. A policy knob — the version itself comes from the
+                                        // schedule. Off for mainnet/sepolia, on for gnosis.
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
         long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
@@ -45,6 +56,19 @@ public record NetworkConfig(
         List<String> clEnrTreeUrls,     // EIP-1459 enrtree:// URLs for consensus-layer libp2p peers
         List<String> clDiscv5Bootnodes  // ENR strings of CL discv5 bootnodes (seed for DHT discovery)
 ) {
+
+    public NetworkConfig {
+        // The schedule maps signature slots to epochs with its own slotsPerEpoch;
+        // it must be THIS chain's geometry or every boundary lands on the wrong
+        // slot. Refused at construction rather than defaulted (CLAUDE.md: a
+        // parameter that can change the answer is applied or refused).
+        java.util.Objects.requireNonNull(forkSchedule, "forkSchedule");
+        if (forkSchedule.slotsPerEpoch() != slotsPerEpochFor(networkId)) {
+            throw new IllegalArgumentException(name + ": forkSchedule.slotsPerEpoch="
+                    + forkSchedule.slotsPerEpoch() + " but the chain's preset has "
+                    + slotsPerEpochFor(networkId));
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Lighthouse mainnet CL bootstrap ENRs
@@ -79,67 +103,84 @@ public record NetworkConfig(
             Bytes32.fromHexString("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"), // genesis (honest)
             new byte[]{(byte) 0x07, (byte) 0xc9, (byte) 0x46, (byte) 0x2e}, // post-BPO2 (Fusaka)
             0L,
+            // discv4 bootnodes = go-ethereum params/bootnodes.go MainnetBootnodes
+            // (labels are geth's), re-synced 2026-09-02: two stale entries replaced
+            // by the Hetzner pair. Keep in lockstep with the Rust twin
+            // (rust/myotis-net/src/el/reader.rs, ElConfig::mainnet), which
+            // documents the incident.
             List.of(
-                    new InetSocketAddress("18.138.108.67", 30303),
-                    new InetSocketAddress("3.209.45.79", 30303),
-                    new InetSocketAddress("18.188.214.86", 30303),
-                    new InetSocketAddress("3.219.208.172", 30303)
+                    new InetSocketAddress("18.138.108.67", 30303), // bootnode-aws-ap-southeast-1-001
+                    new InetSocketAddress("3.209.45.79", 30303),   // bootnode-aws-us-east-1-001
+                    new InetSocketAddress("65.108.70.101", 30303), // bootnode-hetzner-hel
+                    new InetSocketAddress("157.90.35.166", 30303)  // bootnode-hetzner-fsn
             ),
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned mainnet block root (slot 14954528, 2026-08-09, period 1825)
-            Bytes.fromHexString("be4ab798de3dce15ec3602dad3d27bb4af5d3b70524b90dce627ef5e372e9f89").toArrayUnsafe(),
-            14954528L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15285056, 2026-09-24, period 1865)
+            Bytes.fromHexString("4f4b89524600b09292365d29f2e9266e7a004b27bccf7ed31655b88851045028").toArrayUnsafe(),
+            15285056L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
-            // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
-            new byte[]{0x06, 0x00, 0x00, 0x00},
+            // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
+            ForkSchedule.of(32,
+                    ForkSchedule.fork(0, 0x00000000),      // phase0 (genesis)
+                    ForkSchedule.fork(74240, 0x01000000),  // altair
+                    ForkSchedule.fork(144896, 0x02000000), // bellatrix
+                    ForkSchedule.fork(194048, 0x03000000), // capella
+                    ForkSchedule.fork(269568, 0x04000000), // deneb
+                    ForkSchedule.fork(364032, 0x05000000), // electra
+                    ForkSchedule.fork(411392, 0x06000000)  // fulu
+            ),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on mainnet.
             // BPO2 (Fusaka) at epoch 419072, MAX_BLOBS_PER_BLOCK=21, 2026-01-07.
             // Feeds into compute_fork_digest (XOR of base_digest with sha256 of
             // (epoch_le || max_blobs_le)).
             419072L, 21L,
-            // No prior-fork fallback: mainnet is on Fulu; peers still advertising
+            // No prior-fork digest fallback: mainnet is on Fulu; peers still advertising
             // an older digest are either stale ENRs or unupgraded nodes — matching
             // them wouldn't help us sync to the current head anyway.
-            null,
-            // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
-            // discovered via Lighthouse peer API 2026-03-11
-            // NOTE the order: the LITERAL leads and the NAME follows. That looks
-            // backwards and is not — see ROOST_PIN_ORDER in the Rust twin. Java
-            // walks this list in order and falls through, so a stale literal
-            // costs one failed dial before the name resolves; the Rust pool
-            // refreshes a static's address in place and keeps the LAST entry,
-            // which must be the name because a static there can never self-heal.
+            false,
+            // CL peer multiaddrs: known light-client-serving peers. Provenance:
+            // originally discovered via the Lighthouse peer API 2026-03-11,
+            // re-censused via period_census 2026-09-01 (#410), re-verified and
+            // pruned 2026-09-02 (#411), re-censused and pruned 2026-09-13
+            // (per-entry evidence in the Rust twin's list comments).
+            // roost is pinned by the literal address of the netcup relay
+            // (188.68.32.16, a static VPS): zbox itself sits behind mobile CGNAT
+            // and is reachable only through a WireGuard tunnel that DNATs the
+            // serving ports to it, so zbox's own uplink rotating no longer moves
+            // this pin. The earlier DynDNS-name + residential-literal pair is gone.
             // roost mainnet is prepended for the same reason as sepolia's: it is a
             // dedicated LC server, so it neither trims us nor shares its inbound
             // budget with a gossip mesh. 9109/tcp was verified forwarded before
             // pinning. See the Rust twin (MAINNET_STATIC_PEERS) for the full
             // reasoning; keep the two lists and their ORDER in step.
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                    "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
-                    // nimbus peers (4 light_client protocols)
-                    "/ip4/176.229.58.1/tcp/9001/p2p/16Uiu2HAmHu1BxzrSWg7sN9JyJenC5unK5ntdk5QFYqQdQyyD7x3a",
-                    "/ip4/81.172.166.237/tcp/9001/p2p/16Uiu2HAmRogw5aqM4ZuVEmZoQvFp25sUnnQ9wpGuWXRLFMmXc88j",
-                    "/ip4/54.157.213.0/tcp/9000/p2p/16Uiu2HAmQz83bNmMaBFCafuxDasiNdPYZF1B4zhgo3DckByU8bo3",
-                    "/ip4/84.229.246.214/tcp/9001/p2p/16Uiu2HAm1UtRynVpuvWUgn3bfNooSUKYSUrbW8oeuBBcwVxbC1c9",
-                    "/ip4/73.205.184.197/tcp/9000/p2p/16Uiu2HAm9CKG1x5rJk6sgEnCh9TKRagNEVVJfjR1jC3ruzPQfwzb",
-                    "/ip4/172.92.13.157/tcp/9000/p2p/16Uiu2HAm7TEx4DP8iVj1RedeDNK59pw9AskGRwV7x9vgexTQi8CM",
-                    "/ip4/77.12.100.127/tcp/9012/p2p/16Uiu2HAmA5VXnNKGu9jmV5yhL3tGy5seiNMnaBMTaV1vBesz84iJ",
-                    "/ip4/52.200.203.85/tcp/9000/p2p/16Uiu2HAm6JKuoWTSKP7uTbe1PESUcejo4ffcaADoRMuKmMJQKBeP",
-                    "/ip4/82.139.21.242/tcp/9802/p2p/16Uiu2HAm5LSnoe8EdTDhrPEm4M1fnYw34zSo2SYbXLLH4FtfcfnL",
-                    "/ip4/217.67.221.74/tcp/9037/p2p/16Uiu2HAmExQubp4XC5KoQwvYxNWJP2M5rpX3VKdtEYgwPnMb5Kn4",
-                    "/ip4/135.181.210.123/tcp/9000/p2p/16Uiu2HAmBWXZS9H2ncxgEcVi77GvYtmGUEGpHNyJxsF3Ct25Uidc",
-                    "/ip4/195.201.160.183/tcp/9000/p2p/16Uiu2HAm79xzMY5FNnXGo6xcBRxCzYvMNE7CM6NZytrjXoDB5yRQ",
-                    "/ip4/45.10.55.78/tcp/9000/p2p/16Uiu2HAmCpe6iMDvcXFmjLVpJ98u1fqNehpDLS2dmMRgxQ8mgMKu",
-                    "/ip4/185.107.68.131/tcp/9000/p2p/16Uiu2HAm3sGDmyV3m4tju3SzekGt2EBSnALQNdn9QebPSiQP5NA2",
-                    "/ip4/51.161.218.70/tcp/9000/p2p/16Uiu2HAmE6fJp7ZZVMUFxZGgfxAvfVyX3GDU6Wh88GvWv5U6SriT",
-                    // lodestar peers (4 light_client protocols)
-                    "/ip4/216.105.170.30/tcp/9000/p2p/16Uiu2HAm86YwyECbBiHTo2imwQJ4UXGgR1NLY2W6dPUfEFDony6d",
-                    // lighthouse peers (3 light_client protocols)
-                    "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ",
-                    "/ip4/16.63.94.117/tcp/9000/p2p/16Uiu2HAmSd7qzG5joNgvEYYcgVvg1y9MiYjpMHMvzRzaWYqXxkCM"
+                    // Re-censused 2026-09-13 at the period-1854 anchor from two vantage
+                    // points (GitHub-hosted runners, a residential address): each served
+                    // the bootstrap and a 511/512 updates_by_range(1854,1).
+                    // 57.129.130.18 closes on runner IPs but served the residential
+                    // address in full. Seven entries that failed every run pruned.
+                    // Re-verified 2026-09-13 at the then-shipped period-1856 anchor,
+                    // run 34776025758: 4 of 5. 57.129.130.18 served a runner in
+                    // full this time and 91.189.182.90 closed instead, so the closes
+                    // look intermittent rather than tied to runner IPs.
+                    // Re-verified 2026-09-16 at the then-shipped period-1858 anchor,
+                    // run 35065042347: 4 of 5 — 91.189.182.90 closed again and
+                    // 57.129.130.18 served; a third close in a row would be grounds to prune.
+                    // Re-verified 2026-09-21 at the then-shipped period-1863 anchor,
+                    // run 35616056243: 5 of 5 — 91.189.182.90 served in full.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 1865), run 35988133216: 5 of 5 again.
+                    // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
+                    // and their ORDER in step (see the reasoning there).
+                    "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+                    "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+                    "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+                    "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ"
             )),
             "http://localhost:5052",
             1606824023L, // mainnet beacon genesis: 2020-12-01 12:00:23 UTC
@@ -179,11 +220,13 @@ public record NetworkConfig(
                     "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
                     "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA",
                     // roost mainnet (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QCbsE9s7xHdLK_32iZh-P840CxuQ3rbJAtuoFgh3IVLqQP0-Hhkllnv-k9qLfZb47V4sxPw0Ynmj4UaabQ3-RjkChGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QKUnChEU8InNkAxOj6e_KZzebsvUQYJ850DJaEQAygKJb_8Y2Mv5IxDEOacUs0pkVctDN1f8CjrCfG7Vf2leulkIhGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
             )
     );
 
@@ -204,19 +247,28 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned sepolia block root (slot 10838080, 2026-08-03, period 1323)
-            Bytes.fromHexString("a00884e558ff8a4b721ab7ab4b2e3452a1cc45b4212c60de39d033bdcf75c5de").toArrayUnsafe(),
-            10838080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11209280, 2026-09-24, period 1368)
+            Bytes.fromHexString("d9d8f57adb4ad2053a191dd566f5fb75722c09c531fb833a27cee23f077d3b36").toArrayUnsafe(),
+            11209280L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
-            // current fork version: Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14)
-            new byte[]{(byte) 0x90, 0x00, 0x00, 0x75},
+            // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            ForkSchedule.of(32,
+                    ForkSchedule.fork(0, 0x90000069),      // phase0 (genesis)
+                    ForkSchedule.fork(50, 0x90000070),     // altair
+                    ForkSchedule.fork(100, 0x90000071),    // bellatrix
+                    ForkSchedule.fork(56832, 0x90000072),  // capella
+                    ForkSchedule.fork(132608, 0x90000073), // deneb
+                    ForkSchedule.fork(222464, 0x90000074), // electra
+                    ForkSchedule.fork(272640, 0x90000075)  // fulu
+            ),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia:
             // BPO2 at epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28). Folds into
             // the fork digest XOR — see activeBlobParams.
             275712L, 21L,
-            // No prior-fork fallback (same rationale as mainnet: stale digests
+            // No prior-fork digest fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
-            null,
+            false,
             // CL peer multiaddrs for sepolia. First entry is roost, the
             // dedicated light-client server (rust/roost, docs/lc-server-design.md).
             // It is first because it exists precisely for this: a general-purpose
@@ -247,21 +299,37 @@ public record NetworkConfig(
             // silent regression on the DEFAULT engine, and the reason
             // lc-server-design rollout step 3 wants this settled.
             //
-            // The dedicated Nimbus follows it, so a roost OUTAGE degrades to
-            // exactly the previous behaviour rather than to nothing. That entry's
-            // peer-id is stable only because the node pins --netkey-file; Nimbus
-            // otherwise mints a new one per restart, which invalidates it with
-            // InvalidRemotePubKey (see the doc's §5 note). roost has no such
-            // mode — its identity is persisted by construction.
+            // The roost literal is the netcup relay (188.68.32.16, static VPS)
+            // in front of zbox, which lives behind mobile CGNAT — see the
+            // mainnet list above. ENR publication (lc-server-design §7) is what
+            // removes the need to pin at all.
             //
-            // Both literal IPs carry the same exposure: the line is residential
-            // and the address is not guaranteed stable. ENR publication
-            // (lc-server-design §7) is what removes the need to pin at all.
+            // The public servers after it are census-verified 2026-09-11: each
+            // answered light_client_bootstrap for the THEN-pinned root AND
+            // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
+            // v8.2.2. Re-verified 2026-09-12 at period 1357, the anchor then
+            // embedded, by the release's live_pins_alive run: 4 of 4 pins, roost
+            // included, served a bootstrap for that root and a period of
+            // updates. Re-verified 2026-09-13 at the then-shipped period-1358
+            // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the then-shipped
+            // period-1361 anchor, run 35065049320: 4 of 4 again; 2026-09-21 at the
+            // then-shipped period-1365 anchor, run 35616060242: 4 of 4 again;
+            // 2026-09-24 at the anchor this build ships (period 1368), run
+            // 35989152817: 4 of 4 again. Re-run it after every checkpoint refresh,
+            // since a census against a superseded root says nothing about the
+            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
+            // relay (9104: TCP accepts, the libp2p handshake times out) and
+            // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
+            // switched off as well, cost the Rust engine's bootstrap fan-out
+            // 82 rounds on three unreachable pins while a wallet sat in
+            // SYNCING. Keep this list identical to SEPOLIA_STATIC_PEERS in
+            // rust/myotis-net/src/sync.rs (both parity tests pin it).
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                    "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
-                            "/ip4/87.154.209.161/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                            "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
+                            "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+                            "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+                            "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"
                     )),
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
@@ -287,11 +355,13 @@ public record NetworkConfig(
                     "enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
                     "enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
                     // roost sepolia (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QGERMtMCoXY2T1Jwp3zk2fpdn9e-Q8p9IeUCuJ1ZA7JjVLXvrtuxMHqP6iRWbkO3O2eWETkvMBcIRAV3SkBgKAADhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QOZNbpU9w2wGBTa5tMaJKfLFOBvygYCYCtSewcQcXnWnNLbuZFar-gCtb70gJTLrAki7efXD5yBj1tSXOEBgul4HhGV0aDKQdNAUWZAAAHX__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaECOGinXjNuey5xwLNiO0Cd-MB7I3zLqCC5rbLWG6Bo9rqDdGNwgiORg3VkcIIjkQ"
             )
     );
 
@@ -325,52 +395,64 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: pinned gnosis block root (slot 29458656, 2026-08-09, period 3596)
-            Bytes.fromHexString("5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954").toArrayUnsafe(),
-            29458656L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30250464, 2026-09-24, period 3692)
+            Bytes.fromHexString("8cf978da4e896b02351fe9669d0ac82b601174bd6a413c7c975ae1a611bc29f9").toArrayUnsafe(),
+            30250464L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
-            // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
-            new byte[]{0x06, 0x00, 0x00, 0x64},
+            // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
+            // 1714688 (2026-04-14); Electra's epoch is also the blob-params epoch below.
+            ForkSchedule.of(16,
+                    ForkSchedule.fork(0, 0x00000064),       // phase0 (genesis)
+                    ForkSchedule.fork(512, 0x01000064),     // altair
+                    ForkSchedule.fork(385536, 0x02000064),  // bellatrix
+                    ForkSchedule.fork(648704, 0x03000064),  // capella
+                    ForkSchedule.fork(889856, 0x04000064),  // deneb
+                    ForkSchedule.fork(1337856, 0x05000064), // electra
+                    ForkSchedule.fork(1714688, 0x06000064)  // fulu
+            ),
             // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE, so clients fold the
             // Electra-baseline blob params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS_PER_BLOCK_ELECTRA=2)
             // into the Fulu fork digest. Yields the live-verified eth2 digest 0x3237dab6.
             1337856L, 2L,
-            new byte[]{0x05, 0x00, 0x00, 0x64}, // prior fork: Electra — accepted as a discv5 fork-digest fallback
+            true, // Electra's digest (the prior scheduled fork) is accepted as a discv5 fork-digest fallback
             // CL peer multiaddrs for Gnosis: Identify-confirmed LC servers harvested
             // from a long-running desktop profile's cl-peers-gnosis.cache (2026-08-06,
             // issue #291 — a cold Gnosis pool starves catch-up because so few nodes
-            // serve light-client data; these give a fresh install a serving head start).
+            // serve light-client data; these give a fresh install a serving head start),
+            // re-censused 2026-09-13 and cut from 22 to the 7 that still serve catch-up.
+            // Per-entry evidence, and why five bootstrap-only Lighthouse v8.1.3 nodes
+            // were dropped rather than kept, in the Rust twin.
             // Same list and ORDER as the Rust GNOSIS_STATIC_PEERS (sync.rs) — keep in
             // step, one address per peer id: the Rust PeerPool dedupes by peer id, so a
             // second address for a known id would be dropped there while Java (which
             // dedupes by multiaddr string) dialed both.
-            // roost gnosis first, by name then by literal — same shape as the
-            // other two chains. See the Rust GNOSIS_STATIC_PEERS for why the
-            // literal stays behind the name.
+            // roost gnosis first, by the relay literal — same shape as the other
+            // two chains.
             prependLocal(
-                    "/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+                    "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
-                    "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
+                    // Re-censused 2026-09-13 at the period-3666 anchor: all Lighthouse
+                    // v8.2.x advertising light_client_updates_by_range, each serving the
+                    // bootstrap and a 507/512 updates_by_range(3666,1).
+                    // Re-verified 2026-09-13 at the then-shipped period-3670 anchor,
+                    // run 34776024335: 8 of 8.
+                    // Re-verified 2026-09-16 at the then-shipped period-3675 anchor,
+                    // run 35065032444: 8 of 8 again.
+                    // Re-verified 2026-09-21 at the then-shipped period-3686 anchor,
+                    // run 35616052466: 8 of 8 again.
+                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // 3692), run 35988128286: 6 of 8 — both :9500 pins (134.65.194.144,
+                    // 164.152.161.131) failed to dial from the runner. One run from one
+                    // vantage point, and the pair has timed out on a runner before
+                    // (2026-09-13) and served every run since: a re-census signal, not
+                    // grounds to prune. Above the two-pin floor either way.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
-                    "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
-                    "/ip4/135.148.35.18/tcp/9000/p2p/16Uiu2HAm5g8koS1AgicyMZKekLoyh5rK3eBGoZJP5KUsoK5wcehs",
-                    "/ip4/136.243.146.247/tcp/9000/p2p/16Uiu2HAmEFCgE5gLHQRHNMv1P1R673849q7cgH7S3WJBXTkg5698",
-                    "/ip4/138.201.196.44/tcp/4001/p2p/16Uiu2HAmFXPBdWLwQQSLpXhvSAzUfRErcH1whnq3SuPE5dRmojAT",
-                    "/ip4/141.94.46.9/tcp/4001/p2p/16Uiu2HAmBCpdwswdk1wdzZH4gkhPtytx1Jt8GfSjgNsgPdPHUW67",
-                    "/ip4/144.76.106.139/tcp/9200/p2p/16Uiu2HAm4B91Fn21jnSPKw58R46THxhp1ZTHmTWU1TDWvNpJySRB",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
-                    "/ip4/144.76.164.21/tcp/9016/p2p/16Uiu2HAm2UAjrJax6SAtu53VykpbmPrzDDdfB3G79ypQeiXnjj3u",
-                    "/ip4/144.76.196.184/tcp/13000/p2p/16Uiu2HAm6wUQPL4FYKHqmGfZQBPYbDd8GNHxNYeH5DZGLunPAw4J",
-                    "/ip4/146.103.38.79/tcp/4101/p2p/16Uiu2HAmKnRLFoU3QMX3zkTZLRv5mG8FBp4qfZpGJYuT3LAErt11",
-                    "/ip4/146.70.243.142/tcp/9000/p2p/16Uiu2HAm6uE18CuSgCEi5LyjxvbEXdZFQHv1HJCad3WpqerJfDrE",
                     "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
-                    "/ip4/148.251.184.20/tcp/15974/p2p/16Uiu2HAmQYoJ6Gn5caze4BAZXMQ5CJX5qZbdkY3o7S23vvSAPLu9",
                     "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
-                    "/ip4/148.251.237.209/tcp/9000/p2p/16Uiu2HAmSLirTFzTcPE9wsHE6UhbXXmDxFkunHDVhPtrBfuPMq5U",
-                    "/ip4/148.56.243.210/tcp/9000/p2p/16Uiu2HAkyQr5e7gobYTAutAoCDR6ZKEMrgmsChUztDkw2fQTiYL4",
                     "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
-                    "/ip4/159.195.30.80/tcp/9100/p2p/16Uiu2HAmDMWLqML5zdVVVuptjpfKAZi1qEb784HFtrqyJZGPFL3X",
                     "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"
             )),
             null,
@@ -388,11 +470,13 @@ public record NetworkConfig(
                     "enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
                     "enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
                     // roost gnosis (this project's dedicated LC server) — a snapshot of
-                    // its published record (2026-08-10). Seeded so wallets have roost in
-                    // the table from the first second; if its IP rotates this snapshot
-                    // goes stale and discovery's targeted lookup (Rust engine) or the
-                    // random walk recovers the current record from the DHT.
-                    "enr:-KG4QM_0UweYmWFjBAaZ1JnMTeUkeGgHWEVp3N2vewhkzNtlRlnObTaz3ki1RP1lNvOvMBh_iOu0-LnEacfdZN8dx4IChGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIRXmtGhiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA"
+                    // its published record (2026-09-06, from behind the netcup relay).
+                    // Seeded so wallets have roost in the table from the first second.
+                    // The relay address is static, so the only way this snapshot goes
+                    // stale is an operator-driven relay move; then discovery's targeted
+                    // lookup (Rust engine) or the random walk recovers the current
+                    // record from the DHT.
+                    "enr:-KG4QCjwDSRCD6CysnECiWR9i6LBDoETDWI-0zU9bHBbFvgwKHZBGM4LBOBLl15zPJdgPePLlUNJrcbO8l9CGY6aagQHhGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA"
             )
     );
 
@@ -492,10 +576,48 @@ public record NetworkConfig(
     public List<byte[]> acceptedForkDigests() {
         List<byte[]> digests = new ArrayList<>(2);
         digests.add(currentForkDigest());
-        if (priorForkVersion != null) {
-            digests.add(forkDigestFor(priorForkVersion));
+        // KNOWN LIMIT: the prior digest is the plain pre-EIP-7892 form, which is
+        // what Electra-era peers advertise (gnosis today: 0x7D5AAB40). Once the
+        // prior fork is Fulu or later, stale peers advertise the BPO-FOLDED digest
+        // of their era, so this fallback matches nobody (fail-safe, never a wrong
+        // acceptance). Folding it needs the blob-params entry active in the prior
+        // fork's era — the blob-schedule follow-up deferred in PR #430; until then
+        // this knob is a no-op past the next fork. Rust twin: ChainConfig
+        // ::accepted_fork_digests carries the same note.
+        byte[] prior = priorForkVersion();
+        if (prior != null) {
+            digests.add(forkDigestFor(prior));
         }
         return List.copyOf(digests);
+    }
+
+    /**
+     * The fork version active NOW — the fork DIGEST input (discv5 filtering,
+     * Status, gossip topics). Read from the schedule at the wall-clock epoch, so
+     * the next fork can be pinned ahead of its activation without flipping the
+     * digest early (a not-yet-active digest matches no peer). Not a
+     * signing-domain input: the light client reads the schedule per update
+     * ({@link ForkSchedule#versionForSignatureSlot}).
+     */
+    public byte[] currentForkVersion() {
+        return forkSchedule.versionAtEpoch(wallClockEpoch());
+    }
+
+    /**
+     * The version of the fork before the active one when its digest is accepted
+     * ({@link #acceptPriorForkDigest()}), else {@code null}.
+     */
+    public byte[] priorForkVersion() {
+        return acceptPriorForkDigest ? forkSchedule.priorVersionAtEpoch(wallClockEpoch()) : null;
+    }
+
+    /**
+     * Wall-clock beacon epoch of this chain. Clamped at 0 for a clock set before
+     * genesis (Rust twin: {@code ChainConfig::current_slot_estimate}, saturating).
+     */
+    public long wallClockEpoch() {
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000L - clGenesisTime) / secondsPerSlot();
+        return wallSlot / slotsPerEpoch();
     }
 
     /**
@@ -563,11 +685,11 @@ public record NetworkConfig(
      *  this node runs the name-based cap bypass so a myotis wallet is admitted even when
      *  it is full. Direct-dialing it removes the wait for discovery to surface it.
      *
-     *  <p>Operational caveat: the key is stable (persisted nodekey), the IP is a
-     *  residential address — if it rotates this entry goes stale and discovery carries
-     *  the load until it is refreshed. */
+     *  <p>Operational caveat: the key is stable (persisted nodekey); the address is the
+     *  netcup relay (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard —
+     *  zbox itself is behind mobile CGNAT, so its own uplink rotating no longer matters. */
     private static final List<String> SEPOLIA_EL_ENODES = List.of(
-            "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@87.154.209.161:30405"
+            "enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405"
     );
 
     /** Gnosis EL enodes (chainspec {@code nodes}) — Gnosis publishes no EL enrtree, so these
@@ -628,7 +750,50 @@ public record NetworkConfig(
      * period is 8192 on both presets, so that helper is shared.)
      */
     public int slotsPerEpoch() {
+        return slotsPerEpochFor(networkId);
+    }
+
+    private static int slotsPerEpochFor(long networkId) {
         return networkId == 100 ? 16 : 32;
+    }
+
+    /**
+     * Default weak-subjectivity bound, in sync-committee periods: how old the sync
+     * anchor (embedded checkpoint or persisted snapshot, whichever is newer) may be
+     * before the light client refuses to sync forward from it and parks in
+     * {@code STALE_ANCHOR} awaiting explicit user consent. Overridable per host via
+     * {@code ChainHandle.setWsBoundPeriods}; enforced by both engines (the Rust
+     * mirror lives in {@code rust/myotis-net}'s {@code ChainConfig} constructors —
+     * keep them in lockstep).
+     *
+     * <ul>
+     *   <li><b>mainnet: 13</b> (~14.7 days). The consensus-spec formula
+     *       ({@code SAFETY_DECAY=10}) plateaus at 3532 epochs ≈ 15.7 days for any
+     *       validator count ≥ 262 144; Electra's 256-ETH exit-churn cap only
+     *       lengthens it, so 3532/256 = 13.8 → 13 is the conservative floor.</li>
+     *   <li><b>sepolia: 13.</b> The spec formula with Sepolia's tiny validator set
+     *       gives barely over one period, but its validator set is permissioned
+     *       (EF-operated, deposit-gated), so outsiders cannot mount a long-range
+     *       attack at all; the mainnet-preset bound is kept as hygiene.</li>
+     *   <li><b>gnosis: 3</b> (~34 h). Two churn regimes matter here. Pre-Pectra,
+     *       Gnosis's CHURN_LIMIT_QUOTIENT of 4096 (with 80-second epochs)
+     *       collapsed the spec formula to under one 512-epoch period in the worst
+     *       case. The LIVE config (gnosischain/configs mainnet/config.yaml)
+     *       additionally caps Electra-era exit churn at
+     *       MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT = 64e9 Gwei-units = 2
+     *       validators/epoch, which dominates for any active set ≥ ~8k — so the
+     *       REAL window today is ~S/(20·64) + 256 epochs ≈ 2.6 days (~5 periods)
+     *       at 100k validators, ~4.9 days (~10) at 200k, scaling linearly with
+     *       stake. 3 periods therefore sits INSIDE the practical window at
+     *       current set sizes while keeping weekend-off restarts quiet; it would
+     *       only turn permissive again if Gnosis raised the exit cap or the set
+     *       shrank below ~65k. Tightening to 1 period (~11.4 h) remains the
+     *       strict option. Owner's call either way; raise or lower via the
+     *       Settings override knowingly.</li>
+     * </ul>
+     */
+    public long wsBoundPeriods() {
+        return networkId == 100 ? 3L : 13L;
     }
 
     // -------------------------------------------------------------------------

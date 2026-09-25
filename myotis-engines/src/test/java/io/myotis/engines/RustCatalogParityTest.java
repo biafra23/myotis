@@ -63,7 +63,7 @@ class RustCatalogParityTest {
         // raising a named EngineException (auto mode falls back to Java).
         RustMyotisEngine rust = new RustMyotisEngine();
         EngineConfig cfg = new EngineConfig(
-                "not-a-real-network", 0, 0, 0, null, false, 0, true, "/tmp/myotis-test");
+                "not-a-real-network", 0, 0, 0, null, 0, true, "/tmp/myotis-test");
         EngineException e = assertThrows(EngineException.class,
                 () -> rust.create(cfg, null));
         org.junit.jupiter.api.Assertions.assertTrue(

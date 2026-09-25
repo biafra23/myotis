@@ -24,7 +24,7 @@ use myotis_net::el::eth::session::{EthConfig, EthSession};
 use myotis_net::el::peer::ManagedPeer;
 use myotis_net::el::rlpx::transport::RlpxConnection;
 
-const NODE_ADDR: &str = "87.154.209.161:30405";
+const NODE_ADDR: &str = "188.68.32.16:30405";
 const NODE_PUBKEY_HEX: &str =
     "cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd2\
      0adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c";

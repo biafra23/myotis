@@ -51,6 +51,16 @@ impl Verdict {
     }
 }
 
+/// The verdict for a proof verified DIRECTLY against the beacon-finalized
+/// state root (a finalized state read, ABI ≥ 32): `stateRootMatch` at the
+/// finalized slot, BLS-verified — that root arrived in a sync-committee-signed
+/// finality update (`ExecAnchor::update_finalized` records it as such), so no
+/// ladder runs: its header-chain branch would judge the finalized block itself
+/// as "behind finalized".
+pub fn finalized_root_verdict(finalized_slot: u64) -> Verdict {
+    Verdict::verified("stateRootMatch", finalized_slot as i64, true)
+}
+
 /// The next step after the pre-check: either a final verdict, or the
 /// caller must fetch `[finalized_block ..= peer_block]` and call
 /// [`header_chain_verdict`].

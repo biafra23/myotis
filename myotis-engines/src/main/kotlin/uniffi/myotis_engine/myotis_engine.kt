@@ -672,6 +672,8 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_myotis_engine_checksum_func_accept_stale_anchor(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_available_networks_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
@@ -722,6 +724,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_pending_nonce_overlay(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_read_stats_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_request_account_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_resolve_ens_json(
@@ -735,6 +739,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_myotis_engine_checksum_func_set_served_block_window(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_ws_bound_periods(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
     ): Int
@@ -757,6 +763,8 @@ internal object UniffiLib {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "myotis_engine"))
         
     }
+    external fun uniffi_myotis_engine_fn_func_accept_stale_anchor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -787,11 +795,11 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_block_receipts_json(`handle`: Long,`selector`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_myotis_engine_fn_func_get_code_json(`handle`: Long,`address`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_myotis_engine_fn_func_get_code_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_logs_json(`handle`: Long,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_myotis_engine_fn_func_get_storage_at_json(`handle`: Long,`address`: RustBuffer.ByValue,`position`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_myotis_engine_fn_func_get_storage_at_json(`handle`: Long,`address`: RustBuffer.ByValue,`position`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_storage_proof_json(`handle`: Long,`address`: RustBuffer.ByValue,`slot`: Long,`holder`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -807,7 +815,9 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_pending_nonce_overlay(`handle`: Long,`addressHex`: RustBuffer.ByValue,`minedNonce`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_myotis_engine_fn_func_read_stats_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_resolve_ens_json(`handle`: Long,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -820,6 +830,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_ws_bound_periods(`handle`: Long,`periods`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_start_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -948,6 +960,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_myotis_engine_checksum_func_accept_stale_anchor() != 5742) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_myotis_engine_checksum_func_available_networks_json() != 49639) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -969,7 +984,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_estimate_gas_json() != 21056) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 39183) {
+    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 58294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
@@ -993,13 +1008,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_get_block_receipts_json() != 43710) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_code_json() != 40825) {
+    if (lib.uniffi_myotis_engine_checksum_func_get_code_json() != 46545) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_get_logs_json() != 29899) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() != 24299) {
+    if (lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() != 41050) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_get_storage_proof_json() != 41815) {
@@ -1023,7 +1038,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_pending_nonce_overlay() != 21732) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_request_account_json() != 31953) {
+    if (lib.uniffi_myotis_engine_checksum_func_read_stats_json() != 19147) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_request_account_json() != 48343) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_resolve_ens_json() != 48380) {
@@ -1042,6 +1060,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() != 6098) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_start_handle() != 14110) {
@@ -1307,6 +1328,21 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     }
 }
         /**
+         * One-shot consent to sync forward from a stale anchor (this run only) —
+         * releases a STALE_ANCHOR park.
+         */ fun `acceptStaleAnchor`(`handle`: kotlin.Long): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_accept_stale_anchor(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
+}
+    )
+    }
+    
+
+        /**
          * The embedded network catalog as a JSON array of NetworkInfo objects
          * (camelCase keys, display order).
          */ fun `availableNetworksJson`(): kotlin.String {
@@ -1418,7 +1454,11 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
          * Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
          * `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
          * is the answer); `value` is wei as a decimal string; `block` is the RPC block
-         * tag.
+         * selector: a head tag runs against the verified head, `finalized` (ABI ≥ 30)
+         * against the beacon-finalized block, and a block number outside
+         * [head-64, head+16] is refused (`{"error","code":-32602}` when it can never
+         * be served), never answered from the head. The result names the block it ran
+         * against (`blockNumber`, `verified`).
          */ fun `ethCallJson`(`handle`: kotlin.Long, `from`: kotlin.String, `to`: kotlin.String, `data`: kotlin.String, `value`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
@@ -1558,15 +1598,17 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Verified contract-code query (`eth_getCode`).
-         */ fun `getCodeJson`(`handle`: kotlin.Long, `address`: kotlin.String): kotlin.String {
+         * Verified contract-code query (`eth_getCode`); `block` as in
+         * [`request_account_json`].
+         */ fun `getCodeJson`(`handle`: kotlin.Long, `address`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_myotis_engine_fn_func_get_code_json(
     
         
         FfiConverterLong.lower(`handle`),
-        FfiConverterString.lower(`address`),_status)
+        FfiConverterString.lower(`address`),
+        FfiConverterString.lower(`block`),_status)
 }
     )
     }
@@ -1590,8 +1632,9 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Verified RAW-32-byte-position storage query (`eth_getStorageAt`).
-         */ fun `getStorageAtJson`(`handle`: kotlin.Long, `address`: kotlin.String, `position`: kotlin.String): kotlin.String {
+         * Verified RAW-32-byte-position storage query (`eth_getStorageAt`); `block`
+         * as in [`request_account_json`].
+         */ fun `getStorageAtJson`(`handle`: kotlin.Long, `address`: kotlin.String, `position`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_myotis_engine_fn_func_get_storage_at_json(
@@ -1599,7 +1642,8 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`address`),
-        FfiConverterString.lower(`position`),_status)
+        FfiConverterString.lower(`position`),
+        FfiConverterString.lower(`block`),_status)
 }
     )
     }
@@ -1720,15 +1764,37 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Verified account query (`AccountProofResult` shape). `address` is 0x-hex.
-         */ fun `requestAccountJson`(`handle`: kotlin.Long, `address`: kotlin.String): kotlin.String {
+         * Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
+         * / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
+         * docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+         */ fun `readStatsJson`(`handle`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_read_stats_json(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified account query (`AccountProofResult` shape). `address` is 0x-hex;
+         * `block` is the RPC block selector (ABI ≥ 32): empty or a head tag proves at
+         * the verified head, `finalized` at the beacon-finalized block, a number only
+         * inside the window around the head — refused (`{"error","code":-32602}`)
+         * otherwise, never answered from the head. The result names the anchor
+         * (`anchor`).
+         */ fun `requestAccountJson`(`handle`: kotlin.Long, `address`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_myotis_engine_fn_func_request_account_json(
     
         
         FfiConverterLong.lower(`handle`),
-        FfiConverterString.lower(`address`),_status)
+        FfiConverterString.lower(`address`),
+        FfiConverterString.lower(`block`),_status)
 }
     )
     }
@@ -1824,6 +1890,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterBoolean.lower(`on`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Override the weak-subjectivity anchor-age bound (periods); 0 restores the
+         * network default. Applied live — a STALE_ANCHOR park re-evaluates.
+         */ fun `setWsBoundPeriods`(`handle`: kotlin.Long, `periods`: kotlin.Long): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_ws_bound_periods(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterLong.lower(`periods`),_status)
 }
     )
     }

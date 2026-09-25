@@ -24,13 +24,8 @@ use myotis_net::el::discv4::{Discv4Config, Discv4Service, TableEntry};
 use myotis_net::el::eth::session::{EthConfig, EthSession};
 use myotis_net::el::rlpx::transport::RlpxConnection;
 use myotis_net::el::snap::fetch::AccountOutcome;
+use myotis_net::el::reader::ElConfig;
 
-const MAINNET_BOOTNODES: &[&str] = &[
-    "18.138.108.67:30303",
-    "3.209.45.79:30303",
-    "18.188.214.86:30303",
-    "3.219.208.172:30303",
-];
 const MAINNET_GENESIS: &str = "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3";
 const MAINNET_FORK_ID: [u8; 4] = [0x07, 0xc9, 0x46, 0x2e];
 // A well-known mainnet address with state (the "vitalik.eth" address).
@@ -47,7 +42,7 @@ async fn fetches_a_verified_account_on_live_mainnet() {
         .try_init();
 
     let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"myotis-live-snap")).unwrap());
-    let bootnodes: Vec<SocketAddr> = MAINNET_BOOTNODES.iter().map(|s| s.parse().unwrap()).collect();
+    let bootnodes: Vec<SocketAddr> = ElConfig::mainnet().bootnodes; // one source of truth
     let genesis = hex32(MAINNET_GENESIS);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);

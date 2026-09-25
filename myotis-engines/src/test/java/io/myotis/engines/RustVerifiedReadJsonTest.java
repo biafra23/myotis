@@ -209,6 +209,27 @@ class RustVerifiedReadJsonTest {
     // ---- eth_call (callResultFromJson) ----
 
     @Test
+    void abi30CallEnvelopeKeysParseAndAreNotMistakenForData() {
+        // ABI 30 added blockNumber + verified to every call status (#465); the
+        // three-way mapping must read past them, and a finalized-block answer
+        // is still an ordinary ok/revert/unavailable to the API.
+        io.myotis.api.CallResult ok = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x2a\",\"blockNumber\":21000000,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.OK, ok.status());
+        assertArrayEquals(new byte[] {0x2a}, ok.data());
+        io.myotis.api.CallResult fin = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08\",\"blockNumber\":20999936,\"verified\":true}");
+        assertEquals(io.myotis.api.CallResult.Status.REVERTED, fin.status());
+        assertArrayEquals(new byte[] {0x08}, fin.data());
+        io.myotis.api.CallResult un = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"state unavailable\","
+                + "\"blockNumber\":20999936,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, un.status());
+        assertNull(un.data());
+        assertEquals("state unavailable", un.detail());
+    }
+
+    @Test
     void okCallReturnsResultBytes() {
         String json = "{\"status\":\"ok\",\"resultHex\":\"0x00000000000000000000000000000000"
                 + "0000000000000000000000000000002a\"}";
@@ -270,6 +291,17 @@ class RustVerifiedReadJsonTest {
     void callErrorObjectBecomesEngineException() {
         assertThrows(EngineException.class,
                 () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void callInvalidParamsEnvelopeIsStillAnError() {
+        // ABI 27: eth_call's permanent block refusal carries a JSON-RPC code
+        // (eljson::invalid_params_json, pinned there by invalid_params_json_shape).
+        // The second key must not make it read as a result with no status.
+        String json = "{\"error\":\"block \\\"0x1\\\" is too old\",\"code\":-32602}";
+        EngineException e = assertThrows(EngineException.class,
+                () -> RustChainHandle.callDetailedFromJson(json));
+        assertEquals("block \"0x1\" is too old", e.getMessage());
     }
 
     // ---- eth_estimateGas (estimateGasFromJson) ----
@@ -581,7 +613,7 @@ class RustVerifiedReadJsonTest {
     @Test
     void feeHistoryErrorObjectBecomesEngineException() {
         assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(
-                "{\"error\":\"oldest block 20 is beyond the 256-block verify window\"}"));
+                "{\"error\":\"oldest block 20 is beyond the 512-block verify window\"}"));
     }
 
     @Test

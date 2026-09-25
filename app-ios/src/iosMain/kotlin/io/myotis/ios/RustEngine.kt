@@ -20,13 +20,17 @@ import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
 import io.myotis.engine.capi.myotis_import_log_index_files
 import io.myotis.engine.capi.myotis_log_index_status_json
+import io.myotis.engine.capi.myotis_read_stats_json
 import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
+import io.myotis.engine.capi.myotis_set_boot_enodes
 import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
 import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resume
+import io.myotis.engine.capi.myotis_accept_stale_anchor
+import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_start
 import io.myotis.engine.capi.myotis_status_json
 import io.myotis.engine.capi.myotis_stop
@@ -103,7 +107,9 @@ object RustEngine {
         return take(myotis_canonical_network_name(nameOrAlias))
     }
 
-    /** Handle id (>= 1), or a negative sentinel (-1 create failed, -2 unsupported). */
+    /** Handle id (>= 1), or a negative sentinel (-1 create failed, -2 unsupported,
+     *  -3 the dataDir is bound to a caller-supplied checkpoint — ABI 26's
+     *  `myotis_create_with_checkpoint`, which this host does not wrap). */
     fun create(network: String, dataDir: String): Long {
         requireAbi()
         return myotis_create(network, dataDir)
@@ -129,6 +135,27 @@ object RustEngine {
         return myotis_resume(handle)
     }
 
+    /** Override the weak-subjectivity anchor-age bound (periods; 0 = network
+     *  default). Applied live — a STALE_ANCHOR park re-evaluates within a second. */
+    fun setWsBoundPeriods(handle: Long, periods: Long): Boolean {
+        requireAbi()
+        return myotis_set_ws_bound_periods(handle, periods)
+    }
+
+    /** One-shot consent to sync forward from a stale anchor (this run only). */
+    fun acceptStaleAnchor(handle: Long): Boolean {
+        requireAbi()
+        return myotis_accept_stale_anchor(handle)
+    }
+
+    /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a
+     *  JSON array of `enode://` URLs, applied or refused as a whole — the
+     *  contract is `myotis_set_boot_enodes` in `myotis_engine.h`. */
+    fun setBootEnodes(handle: Long, enodesJson: String): Boolean {
+        requireAbi()
+        return myotis_set_boot_enodes(handle, enodesJson)
+    }
+
     /** Status JSON object; `"{}"` for an unknown handle. */
     /** Install the eth_getLogs watch-list config; false = invalid/unavailable. */
     fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
@@ -140,6 +167,12 @@ object RustEngine {
     fun logIndexStatusJson(handle: Long): String {
         requireAbi()
         return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
+    }
+
+    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    fun readStatsJson(handle: Long): String {
+        requireAbi()
+        return take(myotis_read_stats_json(handle)) ?: """{"error":"engine returned no result"}"""
     }
 
     /** Import portable log-index snapshots ({"ok":...} / {"error":...}). */
@@ -154,10 +187,11 @@ object RustEngine {
         return take(myotis_status_json(handle)) ?: "{}"
     }
 
-    /** AccountProofResult JSON, or `{"error": ...}`. */
-    fun requestAccountJson(handle: Long, address: String): String {
+    /** AccountProofResult JSON, or `{"error": ...}`; `block` (ABI >= 32) is the RPC
+     *  selector the engine applies or refuses (the contract is `myotis_engine.h`'s). */
+    fun requestAccountJson(handle: Long, address: String, block: String = ""): String {
         requireAbi()
-        return take(myotis_request_account_json(handle, address))
+        return take(myotis_request_account_json(handle, address, block))
             ?: """{"error":"engine returned no result"}"""
     }
 
@@ -173,11 +207,11 @@ object RustEngine {
     // not-running, status-tagged objects for call/estimate, tri-state block/tx
     // JSON (object | the literal "null" | {"error"}).
 
-    fun getCodeJson(handle: Long, address: String): String =
-        jsonCall { myotis_get_code_json(handle, address) }
+    fun getCodeJson(handle: Long, address: String, block: String = ""): String =
+        jsonCall { myotis_get_code_json(handle, address, block) }
 
-    fun getStorageAtJson(handle: Long, address: String, position32Hex: String): String =
-        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex) }
+    fun getStorageAtJson(handle: Long, address: String, position32Hex: String, block: String = ""): String =
+        jsonCall { myotis_get_storage_at_json(handle, address, position32Hex, block) }
 
     fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
         jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }

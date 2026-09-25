@@ -1,6 +1,7 @@
 package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
+import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -72,17 +73,17 @@ public final class VerifiedAccountQuery {
         RLPxConnector connector = stack != null ? stack.connector() : null;
         BeaconSyncState beaconSyncState = stack != null ? stack.beaconSyncState() : null;
         if (stack == null || !stack.isRunning() || connector == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalStateException("Node is not running"));
         }
         if (hexAddress == null) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address is required"));
         }
         String hex = hexAddress.strip();
         if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
         if (hex.length() != 40) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
         }
         final String hexAddrFinal = hex;
@@ -90,7 +91,7 @@ public final class VerifiedAccountQuery {
         try {
             address = Bytes.fromHexString(hex);
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
         }
         Bytes32 accountHash = Hash.keccak256(address);
@@ -173,49 +174,72 @@ public final class VerifiedAccountQuery {
     public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
             ChainStack stack, String hexAddress) {
         if (stack == null || !stack.isRunning()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         return queryProof(stack.connector(), stack.beaconSyncState(),
-                stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress);
+                stack.network().clGenesisTime(), stack.network().secondsPerSlot(), hexAddress,
+                stack.readStats());
     }
 
     /**
      * {@link #queryProof(ChainStack, String)} for callers holding the parts rather than a
-     * stack (the JVM daemon's CommandHandler until the hosts are rewired onto the API).
+     * stack. {@code readStats} receives the verified account fact (proof-verified AND
+     * beacon-anchored — never the peer's slim body) with the snap round-trip's cost.
      */
     public static CompletableFuture<io.myotis.api.AccountProofResult> queryProof(
             RLPxConnector connector, BeaconSyncState bss,
-            long clGenesisTime, int secondsPerSlot, String hexAddress) {
+            long clGenesisTime, int secondsPerSlot, String hexAddress,
+            io.myotis.evm.world.ReadStats readStats) {
         if (connector == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Node is not running"));
+            return Futures.failedFuture(new IllegalStateException("Node is not running"));
         }
         if (hexAddress == null) {
-            return CompletableFuture.failedFuture(new IllegalArgumentException("Address is required"));
+            return Futures.failedFuture(new IllegalArgumentException("Address is required"));
         }
         String hex = hexAddress.strip();
         if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
         if (hex.length() != 40) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Address must be 20 bytes (40 hex chars)"));
         }
         Bytes address;
         try {
             address = Bytes.fromHexString(hex);
         } catch (Exception e) {
-            return CompletableFuture.failedFuture(
+            return Futures.failedFuture(
                     new IllegalArgumentException("Invalid hex address: " + e.getMessage()));
         }
         final String addr = "0x" + hex;
         final Bytes32 accountHash = Hash.keccak256(address);
         final BeaconSyncState bssFinal = bss;
         final RLPxConnector conn = connector;
+        final long snapStarted = System.nanoTime();
         return connector.requestAccount(address).thenCompose(result -> {
+            // The snap round-trip's cost (the shadow cache's measure); the
+            // verify() below may add a header-chain walk, which is not
+            // something a state cache would have saved.
+            final long snapElapsedNanos = System.nanoTime() - snapStarted;
             AccountRangeMessage.AccountData found = null;
             for (AccountRangeMessage.AccountData a : result.accounts()) {
                 if (a.accountHash().equals(accountHash)) { found = a; break; }
             }
             final AccountRangeMessage.AccountData foundFinal = found;
             return verify(result, address, foundFinal, bssFinal, conn).thenApply(v -> {
+                // Shadow-cache bookkeeping for the VERIFIED answer only: the leaf
+                // proof must have verified (verifyMethod alone is not enough — the
+                // stateRootMatch fast path does not consult peerProofValid, and
+                // the hex fields below then fall back to the peer's slim body).
+                if (readStats != null && v.peerProofValid() && v.verifyMethod() != null
+                        && result.stateRoot() != null) {
+                    var fact = foundFinal == null
+                            ? io.myotis.evm.world.ReadStats.AccountFact.absent()
+                            : new io.myotis.evm.world.ReadStats.AccountFact(
+                                    foundFinal.nonce(), foundFinal.balance(),
+                                    Bytes32.fromHexString(v.verifiedStorageRootHex()),
+                                    Bytes32.fromHexString(v.verifiedCodeHashHex()));
+                    readStats.observeAccount(address.toArrayUnsafe(),
+                            result.stateRoot().toArrayUnsafe(), fact, snapElapsedNanos);
+                }
                 List<String> proofHex = new ArrayList<>(result.proof().size());
                 for (Bytes b : result.proof()) proofHex.add(b.toHexString());
                 String storageRootHex = v.verifiedStorageRootHex() != null
@@ -436,8 +460,8 @@ public final class VerifiedAccountQuery {
         }
         int total = (int) totalLong;
         log.info("[verify] Fetching {} headers from #{} to #{}", total, finalizedBlock, peerBlock);
-        return connector.requestBlockHeadersBatched(finalizedBlock, total)
-                .orTimeout(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+        return Futures.orTimeout(connector.requestBlockHeadersBatched(finalizedBlock, total),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
                     boolean valid = verifyHeaderChain(headers, beaconBlockHash, peerStateRoot);
                     log.info("[verify] Full header chain ({} blocks) valid: {}", headers.size(), valid);

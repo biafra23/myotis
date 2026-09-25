@@ -186,8 +186,11 @@ class IosNodeController(
     }
 
     private fun pushLogIndexConfig(net: String, handle: Long) {
-        val json = io.myotis.ui.KohakuPreset.configJson(
-            net, settings.logIndexEnabled(net), settings.logIndexMaxSpeed(net)) ?: return
+        val json = io.myotis.ui.LogIndexWatch.configJson(
+            settings.logIndexWatchJson(net), settings.logIndexEnabled(net),
+            settings.logIndexMaxSpeed(net),
+            configured = settings.logIndexConfigured(net),
+            backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
         if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
             logs.append("WARN log index config rejected for $net")
         }
@@ -247,6 +250,9 @@ class IosNodeController(
             locked { startMarks.remove(net) }
             return
         }
+        // Weak-subjectivity bound override lands BEFORE start() so the cold-start
+        // gate judges with it (0 = the network default, applied engine-side).
+        RustEngine.setWsBoundPeriods(handle, settings.wsBoundPeriods().toLong())
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
@@ -285,6 +291,9 @@ class IosNodeController(
                 statusReads = IosRpcStatusSource(
                     handleProvider = { locked { handles[net] } },
                     startMarkProvider = { locked { startMarks[net] } },
+                ),
+                lifecycle = IosRpcLifecycle(
+                    handleProvider = { locked { handles[net] } },
                 ),
             )
             // Deterministic up-front bind probe (JVM hosts' ServerSocket probe
@@ -343,6 +352,17 @@ class IosNodeController(
     override fun setTargetSnapPeers(target: Int) {}
     override fun setServedBlockWindow(blocks: Int) {}
 
+    override fun setWsBoundPeriods(periods: Int) {
+        locked { handles.values.toList() }.forEach {
+            RustEngine.setWsBoundPeriods(it, periods.toLong())
+        }
+    }
+
+    override fun acceptStaleAnchor(network: String) {
+        val net = canonical(network)
+        locked { handles[net] }?.let { RustEngine.acceptStaleAnchor(it) }
+    }
+
     // blst is compiled into the engine and the Rust engine is the only engine
     // on iOS — both toggles are inert (see IosSettings).
     override fun applyBlsBackend() {}
@@ -366,8 +386,12 @@ class IosNodeController(
 
     override fun resetSyncState(network: String) {
         val net = canonical(network)
-        // Same lane + lock as clearCaches: the snapshot files are written on
-        // stop/pause, so the delete must not race a concurrent teardown.
+        // Same lane + lock as clearCaches — but NOT because a teardown writes the
+        // snapshot: the sync task ends by abort and persists on neither stop nor
+        // pause (rust/myotis-net/src/sync.rs). The race that matters is the other
+        // direction: a reset immediately followed by a start would otherwise let
+        // these unlinks run against the boot's snapshot read, and a boot that won
+        // would resume from the old snapshot as if the reset had never happened.
         scope.launch(lifecycleLane) {
             bootMutex.withLock {
                 val suffix = if (net == "mainnet") "" else "-$net"
@@ -480,6 +504,12 @@ class IosNodeController(
         val paused = o.engineBoolean("paused")
         val beaconState = o.engineString("beaconState") ?: "STARTING"
         val snapPeers = o.engineInt("snapPeers")
+        // The pooled peers that can answer a read at the anchored head NOW
+        // (ABI >= 31, #465) — what readiness gates on: a pool of peers still
+        // syncing keeps snapPeers positive for hours while every read fails.
+        // Absent → 0, fail closed (the ABI gate is exact, so the linked engine
+        // always emits it) — never the pooled count.
+        val snapServingPeers = o.engineInt("snapServingPeers")
         val currentPeriod = o.engineLong("currentPeriod", 0L)
         // Older-native fallback: a missing targetPeriod parses as 0 — keep the
         // target >= current invariant.
@@ -491,7 +521,7 @@ class IosNodeController(
         // only while a verified read can actually be served; otherwise the
         // Long.MAX_VALUE "no verified head yet" sentinel, with the advance clock
         // pinned to now so the age starts fresh once serveable.
-        val serveable = beaconState == "SYNCED" && optimisticBlock > 0 && snapPeers > 0
+        val serveable = beaconState == "SYNCED" && optimisticBlock > 0 && snapServingPeers > 0
         val verifiedHeadAgeMs = locked {
             val age = headAges.getOrPut(network) {
                 HeadAge(optimisticBlock, TimeSource.Monotonic.markNow())
@@ -522,7 +552,7 @@ class IosNodeController(
             connectedPeers = o.engineInt("peerCount"),        // CL libp2p peers
             readyPeers = snapPeers,                      // EL pool holds only snap-ready
             snapPeers = snapPeers,
-            snapServingPeers = snapPeers,                // approximation, as over JNI
+            snapServingPeers = snapServingPeers,         // ABI >= 31
             clConnectedPeers = o.engineInt("peerCount"),
             clServedPeersLastMin = o.engineInt("servedPeersLastMinute"),
             clCachedPeers = clCache.total,
@@ -558,7 +588,9 @@ class IosNodeController(
             lcHunting = o.engineBoolean("lcHunting"),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            readStatsJson = RustEngine.readStatsJson(handle),
             elHunting = o.engineBoolean("elHunting"),
+            wsBoundPeriods = o.engineLong("wsBoundPeriods", 0L),
             upgrade = upgradeNoticeOf(o["upgradeAdvisory"] as? JsonObject),
         )
     }

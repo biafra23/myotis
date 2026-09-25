@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -110,16 +111,17 @@ fun NodeScreen(
     val snapshots by snapshotsFlow.collectAsState(initial = emptyMap())
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
-    // The Index tab exists while the log index reads as enabled in Settings (the
-    // persisted per-network flags AND the Rust engine — without it the switch shows
-    // off/disabled and no engine serves the index), OR while any live engine reports
-    // an enabled index: an imported/dropped-in snapshot activates engine-side without
-    // any Settings flag ever having been touched, and hiding a running index would
-    // leave its progress unreachable. Settings are plain reads, so the toggles that
-    // change them bump logIndexRev; the engine side re-derives from `snapshots`.
+    // The Index tab is the log-index feature's home — where contracts are added,
+    // snapshots imported, and progress read — so it shows whenever the engine choice
+    // can serve the feature (anything but a forced Java engine; the log index is
+    // Rust-engine-only), OR while any live engine reports an enabled index: an
+    // imported/dropped-in snapshot activates engine-side without any Settings flag
+    // ever having been touched, and hiding a running index would leave its progress
+    // unreachable. Settings are plain reads, so the toggles that change them bump
+    // logIndexRev; the engine side re-derives from `snapshots`.
     var logIndexRev by remember { mutableStateOf(0) }
     val showIndexTab = remember(logIndexRev, snapshots) {
-        (settings.rustEngineEnabled() && KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) }) ||
+        !settings.preferJavaEngine() ||
             snapshots.values.any { it.logIndexJson?.contains("\"enabled\":true") == true }
     }
     val tabs = remember(showIndexTab) {
@@ -194,6 +196,31 @@ fun NodeScreen(
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
                 // selected chain. Uses the configurable deep-pool threshold from Settings.
                 ReadinessStrip(current, settings.deepPoolThreshold())
+
+                // Stale-anchor consent. The engines park fail-closed (beaconState
+                // STALE_ANCHOR) when a network's sync anchor is older than the
+                // weak-subjectivity bound; this dialog is the "ask the user" half of
+                // that contract. Dismissals are remembered only WHILE the network
+                // stays parked, so a later, separate park asks again.
+                var staleDismissed by remember { mutableStateOf(setOf<String>()) }
+                staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
+                    snapshots[it]?.beaconState == "STALE_ANCHOR"
+                }
+                val staleNet = snapshots.entries.firstOrNull {
+                    it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
+                }?.key
+                val staleSnap = staleNet?.let { snapshots[it] }
+                if (staleNet != null && staleSnap != null) {
+                    StaleAnchorDialog(
+                        network = staleNet,
+                        s = staleSnap,
+                        onAccept = {
+                            controller.acceptStaleAnchor(staleNet)
+                            staleDismissed = staleDismissed + staleNet
+                        },
+                        onDismiss = { staleDismissed = staleDismissed + staleNet },
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
 
                 TabRow(selectedTabIndex = tab) {
@@ -259,9 +286,15 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        // An unsupported network upgrade outranks a stale-anchor park: updating the
+        // app fixes both (a new build ships a fresh checkpoint too), while consenting
+        // to the old anchor cannot make this build follow the fork.
         s.upgrade?.active == true ->
             Triple(Color(0xFFD32F2F), 3.dp,
                 "Node readiness: update required — this version can no longer verify the network")
+        s.beaconState == "STALE_ANCHOR" ->
+            Triple(Color(0xFFD32F2F), 3.dp,
+                "Node readiness: sync anchor too old — paused awaiting your consent")
         s.beaconState != "SYNCED" ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
@@ -279,6 +312,48 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             .height(height)
             .background(color)
             .semantics { contentDescription = label },
+    )
+}
+
+/**
+ * The stale-anchor consent dialog — the interactive half of the weak-subjectivity
+ * gate. Shown while a network is parked in STALE_ANCHOR: the engine refuses to
+ * sync from an anchor older than the bound until the user updates the app,
+ * raises the bound (Settings), or accepts the risk here. "Sync anyway" applies
+ * to THIS RUN only; the engine never persists the consent.
+ */
+@Composable
+private fun StaleAnchorDialog(
+    network: String,
+    s: NodeSnapshot,
+    onAccept: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
+    // Rough period length per chain, for a human-scale age (exact math stays in
+    // periods — this is display only): mainnet preset ~27.3 h, Gnosis ~11.4 h.
+    val hoursPerPeriod = if (network == "gnosis") 11.4 else 27.3
+    val ageDays = ((agePeriods * hoursPerPeriod) / 24.0).toInt()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Sync anchor too old — ${network.replaceFirstChar { it.uppercase() }}") },
+        text = {
+            Text(
+                "The newest trust anchor this node has (its built-in checkpoint or last " +
+                    "verified sync state) is $agePeriods sync-committee periods old" +
+                    (if (ageDays > 0) " (~$ageDays days)" else "") +
+                    ", past the weak-subjectivity bound of ${s.wsBoundPeriods} periods.\n\n" +
+                    "Beyond this window, validators who have since exited could sign a fake " +
+                    "chain continuation (a long-range attack), and signature verification " +
+                    "alone cannot tell it from the real chain. Syncing is paused, and " +
+                    "verified reads stay unavailable, until you decide.\n\n" +
+                    "Safest: update the app (a fresh build carries a fresh checkpoint). " +
+                    "Alternatively raise the bound in Settings, or sync anyway if you " +
+                    "trust your network and peers — for this run only.",
+            )
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Sync anyway (accept risk)") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Stay paused") } },
     )
 }
 
@@ -331,12 +406,13 @@ private fun SettingsTab(
     }
     var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
     var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
+    var wsBound by remember { mutableStateOf(settings.wsBoundPeriods().toString()) }
     var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
     var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
     var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
-    var rustEngine by remember { mutableStateOf(settings.rustEngineEnabled()) }
+    var preferJava by remember { mutableStateOf(settings.preferJavaEngine()) }
     var torRouting by remember { mutableStateOf(settings.torEnabled()) }
 
     Column(
@@ -402,6 +478,22 @@ private fun SettingsTab(
             value = deepPool,
             onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
             label = { Text("Readiness \"deep pool\" threshold (default 16)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = wsBound,
+            onValueChange = { wsBound = it.filter(Char::isDigit).take(4) },
+            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
+            supportingText = {
+                Text(
+                    "How old the sync anchor may be before the node refuses to sync and " +
+                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
+                        "it weakens the long-range-attack protection — leave 0 unless you " +
+                        "know why.",
+                )
+            },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
@@ -474,67 +566,71 @@ private fun SettingsTab(
         )
 
         // Engine choice applies per network (re)start — running networks keep their engine.
-        SwitchRow(
-            label = "Rust engine (experimental)",
-            checked = rustEngine,
-            onChange = { on ->
-                rustEngine = on; settings.setRustEngineEnabled(on); controller.applyEngineChoice()
-                onLogIndexChanged()
-            },
-        )
-        Text(
-            "Off (default): the proven Java engine runs every network. On: prefer the " +
-                "experimental Rust engine where it can serve (it hosts all networks today), " +
-                "falling back to the Java engine otherwise. Applies when a network is " +
-                "(re)started, not to already-running networks. Note: Rust-hosted networks " +
-                "do NOT idle-sleep yet — they stay always-on regardless of the idle-sleep " +
-                "setting (the Status screen's Sleep row says so per network).",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        var logIndexKohaku by remember {
-            mutableStateOf(KohakuPreset.byNetwork.keys.any { settings.logIndexEnabled(it) })
+        // A host that cannot run the Java engine at all (Android below API 33) shows why
+        // instead of a toggle it would refuse to honour.
+        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
+        if (javaUnavailable != null) {
+            Text("Engine: Rust only")
+            Text(
+                javaUnavailable,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            SwitchRow(
+                label = "Prefer Java engine",
+                checked = preferJava,
+                onChange = { on ->
+                    preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
+                    onLogIndexChanged()
+                },
+            )
+            Text(
+                "Off (default): the Rust engine runs each network where it can serve, " +
+                    "falling back to the Java engine otherwise. The Rust engine is the " +
+                    "primary engine — the log index (Index tab) and Tor routing run on it " +
+                    "only. On: force the original Java engine everywhere, giving up those " +
+                    "features — currently the only way to use the Query tab's " +
+                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
+                    "network is (re)started, not to already-running networks. Note: " +
+                    "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
+                    "regardless of the idle-sleep setting (the Status screen's Sleep row " +
+                    "says so per network).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
-        SwitchRow(
-            label = "Log index \u2014 Kohaku contracts (experimental)",
-            checked = logIndexKohaku && rustEngine,
-            enabled = rustEngine,
-            onChange = { on ->
-                logIndexKohaku = on
-                KohakuPreset.byNetwork.keys.forEach { net ->
-                    settings.setLogIndexEnabled(net, on)
-                    controller.applyLogIndex(net)
-                }
-                onLogIndexChanged()
-            },
-        )
-        // Tor routing — Rust-engine-only (Arti is embedded there), so the row is disabled
-        // until the Rust engine is enabled above. Applies on the next network (re)start.
-        SwitchRow(
-            label = "Route reads over Tor (experimental)",
-            checked = torRouting && rustEngine,
-            enabled = rustEngine,
-            onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
-        )
-        Text(
-            if (!rustEngine) {
-                "Enable the Rust engine first — Tor routing is built into the Rust engine only."
-            } else {
-                "Off (default): reads use the peer pool directly from your IP. On: route " +
-                    "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
-                    "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
-                    "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
-                    "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
-                    "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
-                    "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
-                    "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                    "fail-closed while this is on. Takes effect immediately — the next read on a " +
-                    "running Rust-engine network routes over Tor (no restart needed)."
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+
+        // Tor routing — shown only on hosts that can actually route over Tor
+        // (controller.supportsTor; a privacy switch that flips ON while reads keep
+        // leaving from the real IP would be accepted-and-ignored). Where shown, the
+        // row is disabled while the Java engine is forced above.
+        if (controller.supportsTor) {
+            SwitchRow(
+                label = "Route reads over Tor (experimental)",
+                checked = torRouting && !preferJava,
+                enabled = !preferJava,
+                onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+            )
+            Text(
+                if (preferJava) {
+                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
+                } else {
+                    "Off (default): reads use the peer pool directly from your IP. On: route " +
+                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
+                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
+                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
+                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
+                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
+                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
+                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
+                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
+                        "running Rust-engine network routes over Tor (no restart needed)."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Text(
             "An RPC-port change reboots that chain; the snap-peer target and served-block " +
                 "window apply live to every running chain, and the readiness threshold persists " +
@@ -547,9 +643,13 @@ private fun SettingsTab(
                 val snap = snapTarget.toIntOrNull() ?: 32
                 val window = servedWindow.toIntOrNull() ?: 32
                 val deep = deepPool.toIntOrNull() ?: 16
+                // Blank/invalid keeps the CURRENT value (0 would silently restore the
+                // default bound — a security knob must not change on a stray edit).
+                val ws = wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
                 settings.setSnapTarget(snap)          // persist
                 settings.setServedBlockWindow(window) // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                settings.setWsBoundPeriods(ws)        // persist
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
                 // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
@@ -558,6 +658,7 @@ private fun SettingsTab(
                 }
                 controller.setTargetSnapPeers(snap)   // live-apply to running stacks
                 controller.setServedBlockWindow(window) // live-apply to running stacks
+                controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,
@@ -652,15 +753,61 @@ private fun StatusTab(
         Spacer(Modifier.height(16.dp))
         // Maintenance actions (mirrors the old Android Status screen): wipe peer caches to give
         // discovery a fresh slate, or drop the persisted sync snapshot to re-bootstrap next start.
+        //
+        // BOTH are offered only while the network is down (owner's call, 2026-09-16): each is one
+        // mis-click away from throwing out hours of learned peers or the sync anchor, and neither
+        // is worth that risk mid-run. The reasons they are unsafe differ, though, and the
+        // difference is worth keeping written down.
+        //
+        // `clearCaches` actually WORKS while running: it goes THROUGH the engine (clearPeerState
+        // plus the live cache instances), so a live stack cannot write the old peers back. Gating
+        // it therefore costs something real — handing discovery a fresh slate without a restart is
+        // a genuine debugging move — and that cost is accepted deliberately to make the accidental
+        // click impossible.
+        //
+        // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
+        // STICKS while the chain runs depends on the engine and on what it is doing — which is
+        // the reason to gate it rather than the reason not to. Rust, synced: persistence is
+        // throttled to a sync-committee PERIOD advance (~11 h gnosis, ~27 h mainnet) and there
+        // is no stop-time persist, so the delete usually holds. Rust, catching up: a persist
+        // lands per applied period, i.e. seconds, and the delete is gone. Java: the `.roots`
+        // sidecar — matched by the same glob — is rewritten unthrottled every ~12 s, and
+        // `close()` persists again at shutdown. So pressed on a running chain the action is
+        // unpredictable rather than merely slow, and it only ever takes effect at the NEXT
+        // start anyway. Stop, reset, start is the sequence to use — on desktop the delete now
+        // takes the same per-network boot lock as the cache clear, so it cannot race the next
+        // boot's snapshot read. Android's reset is still an unlocked detached delete (and drops
+        // only the main file, no sibling glob), so there the sequence stays best-effort.
+        //
+        // One honest limit: `primaryActive` follows the host's 2 s snapshot poll, and the engine
+        // drops a stopping chain from its registry BEFORE the loop finishes tearing down (it
+        // tracks that window itself and refuses a fresh create into the same directory). So the
+        // button can go live a moment before the last writer is gone. A write there needs a
+        // period advance, so the odds are slim — but the gate is a guard rail, not a lock.
+        // Android has a third window that is not poll-related: its bridge emits an EMPTY
+        // snapshot map whenever the Activity is unbound from the foreground service — while the
+        // engine under it keeps running — so just after a rebind these can render enabled
+        // against a live node until the next tick, and a tap then executes for real (the
+        // service handle is resolved at click time, by which point the bind has completed).
         OutlinedButton(
             onClick = { controller.clearCaches(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Clear peer caches") }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = { controller.resetSyncState(primary) },
+            enabled = !primaryActive,
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Reset sync state") }
+        if (primaryActive) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Stop $primary first: these discard learned peers and the sync anchor, and a "
+                    + "reset only applies at the next start anyway.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
 
         // Per-peer detail for the READY peers (address, snap support, client id).
         if (snap != null && snap.readyPeerList.isNotEmpty()) {
@@ -698,6 +845,20 @@ private fun HuntBanner(s: NodeSnapshot) {
 @Composable
 private fun SyncProgressBar(s: NodeSnapshot) {
     if (!s.running || s.beaconState == "SYNCED" || s.beaconState == "STOPPED") return
+    if (s.beaconState == "STALE_ANCHOR") {
+        // Parked, not progressing: a progress bar would promise motion. The strip,
+        // the Beacon status row, and the consent dialog carry this state.
+        Column(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+            Text(
+                "Sync paused — trust anchor older than the weak-subjectivity bound " +
+                    "(${(s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)} periods; " +
+                    "bound ${s.wsBoundPeriods}). Waiting for your decision.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        return
+    }
     val start = s.syncStartPeriod
     val current = s.syncCurrentPeriod
     val target = s.syncTargetPeriod
@@ -869,6 +1030,18 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
         StatusRow("Hdr asks", "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}")
         StatusRow("Blk asks", "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}")
+        // The read-fetch shadow cache (docs/read-stats.md): verified state
+        // fetches this run, the share a sound cache keying would have served
+        // (storage-root keyed slots, per-block accounts, content-addressed
+        // code) with the storage time it would have saved, and how often a
+        // value up to a minute old would still have been right. Rows appear
+        // once the engine has observed a fetch; hidden on hosts that don't
+        // feed the JSON.
+        s.readStatsJson?.let(ReadStatsStatus::parse)?.takeIf(ReadStatsStatus::hasReads)?.let { rs ->
+            StatusRow("Reads", ReadStatsStatus.fetchesLine(rs))
+            StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs))
+            ReadStatsStatus.staleLine(rs)?.let { StatusRow("Stale ≤60s ok", it) }
+        }
         StatusRow("Discovered", s.discoveredPeers.toString())
         StatusRow("Discv5 peers", s.discv5Peers.toString())
         StatusRow("In backoff", s.backedOffPeers.toString())
@@ -1721,9 +1894,10 @@ private fun formatLogTime(ms: Long, tz: TimeZone): String {
 
 
 /**
- * The log-index tab: an explicit per-network trigger for collecting the
- * Kohaku contracts' logs, plus per-contract backfill progress. Data rides the
- * snapshot's raw status JSON (2 s cadence, same as everything else).
+ * The log-index tab: the feature's home. Enter the contracts to watch (address +
+ * the block to index back to), toggle collection per network, import portable
+ * snapshots, and read per-contract backfill progress. Data rides the snapshot's
+ * raw status JSON (2 s cadence, same as everything else).
  */
 @Composable
 private fun IndexTab(
@@ -1731,19 +1905,97 @@ private fun IndexTab(
     settings: Settings,
     snapshot: NodeSnapshot?,
     network: String,
-    // Turning collection off for the last enabled network hides this tab (the screen
-    // falls back to Status), so the screen needs to hear about flag changes.
+    // Turning collection off for the last enabled network can hide this tab (the
+    // screen falls back to Status), so the screen needs to hear about flag changes.
     onLogIndexChanged: () -> Unit = {},
 ) {
-    val preset = KohakuPreset.byNetwork[network]
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
-        if (preset != null) {
+        var watch by remember(network) {
+            mutableStateOf(LogIndexWatch.parse(settings.logIndexWatchJson(network)))
+        }
+        Text(
+            "Index and serve eth_getLogs for contracts you choose — every log verified " +
+                "against receipt roots, backfilled to the block you set. Runs on the Rust " +
+                "engine only.",
+        )
+
+        // ---- The watch list: the user's entries, persisted host-side. ----
+        watch.forEach { entry ->
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(entry.address)
+                    Text(
+                        "from block ${entry.fromBlock}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = {
+                    watch = watch.filterNot { it.address == entry.address }
+                    settings.setLogIndexWatchJson(network, LogIndexWatch.serialize(watch))
+                    // No config push: the engine's config union never drops a live
+                    // subscription — removal only stops FUTURE sessions from
+                    // re-subscribing it (the hint below says so).
+                }) { Text("Remove") }
+            }
+        }
+        var addAddress by remember(network) { mutableStateOf("") }
+        var addFrom by remember(network) { mutableStateOf("") }
+        OutlinedTextField(
+            value = addAddress,
+            onValueChange = { addAddress = it.trim() },
+            label = { Text("Contract address (0x…)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = addFrom,
+            onValueChange = { addFrom = it.filter(Char::isDigit) },
+            label = { Text("Index back to block (the contract's deployment block)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        val addValid = LogIndexWatch.isValidAddress(addAddress) &&
+            addFrom.toLongOrNull() != null &&
+            watch.none { it.address.lowercase() == addAddress.lowercase() }
+        Button(
+            enabled = addValid,
+            onClick = {
+                watch = watch + LogIndexWatch.Entry(addAddress, addFrom.toLong())
+                settings.setLogIndexWatchJson(network, LogIndexWatch.serialize(watch))
+                addAddress = ""
+                addFrom = ""
+                if (collecting) controller.applyLogIndex(network)
+                onLogIndexChanged()
+            },
+        ) { Text("Add contract") }
+        Text(
+            "Earlier is safer for the from-block: the index only answers queries for " +
+                "ranges it has covered, so a from-block AFTER the real deployment silently " +
+                "hides the earlier events, while an earlier one merely walks further. " +
+                "Removing a contract here does NOT unsubscribe an existing index — the " +
+                "engine keeps every subscription its index file names. It only stops the " +
+                "entry from being added where no index exists yet; to truly drop a " +
+                "contract, turn collection off and delete the network's index file.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // `collecting` keeps the row visible even with an empty watch list: an
+        // imported snapshot enables collection without any local entries, and
+        // hiding the switch then would leave the index with no off switch.
+        if (watch.isNotEmpty() || collecting) {
             SwitchRow(
-                label = "Collect Kohaku contract logs on $network",
+                label = "Collect logs on $network",
                 checked = collecting,
                 enabled = true,
                 onChange = { on ->
@@ -1752,10 +2004,6 @@ private fun IndexTab(
                     controller.applyLogIndex(network)
                     onLogIndexChanged()
                 },
-            )
-            Text(
-                "Indexes and serves eth_getLogs for the Kohaku privacy contracts — verified " +
-                    "against receipt roots, backfilling to each contract's deployment block.",
             )
         }
         if (collecting) {
@@ -1776,10 +2024,33 @@ private fun IndexTab(
                 if (maxSpeed) "Backfills as fast as peers serve — heavier on network and battery."
                 else "Nice background pace — one small batch every few seconds.",
             )
+            var backfillPaused by remember(network) {
+                mutableStateOf(settings.logIndexBackfillPaused(network))
+            }
+            SwitchRow(
+                label = "Pause backfill on $network",
+                checked = backfillPaused,
+                enabled = true,
+                onChange = { on ->
+                    backfillPaused = on
+                    settings.setLogIndexBackfillPaused(network, on)
+                    // Fingerprint-neutral like the pacing bit: coverage already
+                    // walked survives, and resuming continues from the same cursor.
+                    controller.applyLogIndex(network)
+                },
+            )
+            Text(
+                if (backfillPaused)
+                    "Walking down to each contract's start is OFF — coverage stays where it is " +
+                        "and only the head is followed. Queries below the covered range are " +
+                        "REFUSED, never answered empty. Use this when the consumer already has " +
+                        "the older history."
+                else "Walks down to each contract's start block in the background.",
+            )
         }
         // Import: merge portable snapshot files (built by the daemon's
         // build-logindex tool, or exported by another node) into this
-        // network's index \u2014 works with or without a preset.
+        // network's index — the alternative to backfilling from peers.
         if (controller.canImportLogIndex) {
             var importResult by remember(network) { mutableStateOf<String?>(null) }
             var importing by remember(network) { mutableStateOf(false) }
@@ -1791,34 +2062,39 @@ private fun IndexTab(
                     val started = controller.importLogIndexSnapshots(network) { line ->
                         importResult = line
                         importing = false
-                        // Importing is the opt-in \u2014 reflect the flag the host persisted.
+                        // Importing is the opt-in — reflect the flag the host persisted.
                         collecting = settings.logIndexEnabled(network)
                         onLogIndexChanged()
                     }
                     if (!started) importing = false
                 },
-            ) { Text(if (importing) "Importing\u2026" else "Import log-index snapshot\u2026") }
+            ) { Text(if (importing) "Importing…" else "Import log-index snapshot…") }
             importResult?.let { Text(it) }
         }
+        // A seed the host installed from its own bundle (Bee PoC flavour) is
+        // served indistinguishably from walked coverage — say so where the
+        // coverage is shown, and only while the engine's index is actually on
+        // (an install that did not reach the engine must not look seeded).
+        val seededNotice = remember(network) { controller.seededIndexNotice(network) }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
             parsed?.enabled == true -> {
+                seededNotice?.let { Text(it) }
                 Text("${parsed.logCount} logs collected")
                 LogIndexStatus.progressLine(parsed)?.let { Text("Backfill: $it") }
-                // The ENGINE's entry list is authoritative \u2014 it includes
-                // imported subscriptions the preset knows nothing about.
-                // Labels prefer the engine name (imports carry baked-in
-                // names), then the preset label, then the raw address.
+                // The ENGINE's entry list is authoritative — it includes imported
+                // subscriptions the watch list here knows nothing about. Labels
+                // prefer the engine name (imports carry baked-in names, and the
+                // engine's naming pass ENS-reverse-resolves unnamed entries),
+                // then the raw address.
                 parsed.entries.forEach { e ->
-                    val label = e.name
-                        ?: preset?.firstOrNull { it.address.lowercase() == e.address }?.label
-                        ?: e.address
+                    val label = e.name ?: e.address
                     val low = e.coveredLow
                     val high = e.coveredHigh
                     Column {
                         Text(label)
                         if (low == null || high == null) {
-                            Text("waiting \u2014 target block ${e.fromBlock}")
+                            Text("waiting — target block ${e.fromBlock}")
                             LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
                         } else {
                             val total = (high - e.fromBlock + 1).coerceAtLeast(1)
@@ -1826,8 +2102,8 @@ private fun IndexTab(
                             val pct = done.toFloat() / total.toFloat()
                             val complete = low <= e.fromBlock
                             Text(
-                                if (complete) "complete \u2014 blocks ${e.fromBlock}\u2013$high"
-                                else "blocks $low\u2013$high \u00b7 target ${e.fromBlock} \u00b7 ${(pct * 100).toInt()}%"
+                                if (complete) "complete — blocks ${e.fromBlock}–$high"
+                                else "blocks $low–$high · target ${e.fromBlock} · ${(pct * 100).toInt()}%"
                             )
                             LinearProgressIndicator(
                                 progress = { if (complete) 1f else pct },
@@ -1836,23 +2112,23 @@ private fun IndexTab(
                         }
                     }
                 }
-                // Preset entries the engine hasn't picked up yet (config not
+                // Watch entries the engine hasn't picked up yet (config not
                 // pushed / engine restarting): keep their waiting rows visible.
-                preset?.filter { p -> parsed.entries.none { it.address == p.address.lowercase() } }
-                    ?.forEach { watch ->
+                watch.filter { w -> parsed.entries.none { it.address == w.address.lowercase() } }
+                    .forEach { w ->
                         Column {
-                            Text(watch.label)
-                            Text("waiting \u2014 target block ${watch.fromBlock}")
+                            Text(w.address)
+                            Text("waiting — target block ${w.fromBlock}")
                             LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
                         }
                     }
             }
             collecting ->
-                Text("Waiting for the engine (start the network with the Rust engine).")
-            preset == null ->
+                Text("Waiting for the engine (the network must be running on the Rust engine).")
+            watch.isEmpty() ->
                 Text(
-                    "No contract preset for $network. Import a log-index snapshot to " +
-                        "collect and serve eth_getLogs for its contracts."
+                    "No contracts watched on $network yet. Add one above, or import a " +
+                        "log-index snapshot built elsewhere."
                 )
             else -> Text("Collection is off.")
         }

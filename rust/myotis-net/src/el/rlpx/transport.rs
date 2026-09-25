@@ -320,9 +320,10 @@ pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     };
     rlp::encode(&Item::List(vec![
         Item::Bytes(rlp::u64_to_minimal_be(5)), // protocol version
-        // The release sweep keeps the myotis-* crate versions equal to the
-        // release version, so the client id follows the Cargo.toml bump instead
-        // of needing its own hand edit. The Java HelloMessage stays hand-maintained.
+        // CARGO_PKG_VERSION is the workspace version (rust/Cargo.toml
+        // [workspace.package]), kept equal to the Gradle release version by
+        // `verifyCrateVersions`; the Java engine generates its Hello id from
+        // that same Gradle version, so the two engines agree by construction.
         Item::Bytes(concat!("myotis/", env!("CARGO_PKG_VERSION")).as_bytes().to_vec()),
         Item::List(vec![
             cap("eth", 66),

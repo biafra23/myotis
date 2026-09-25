@@ -27,6 +27,10 @@ internal actual fun rpcLogInfo(logger: String, message: String) {
     IosRpcLog.sink('I', logger, message)
 }
 
+internal actual fun rpcLogWarn(logger: String, message: String) {
+    IosRpcLog.sink('W', logger, message)
+}
+
 internal actual fun rpcLogDebugEnabled(logger: String): Boolean = false
 
 internal actual fun rpcLogDebug(logger: String, message: String) {

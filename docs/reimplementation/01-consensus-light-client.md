@@ -26,7 +26,7 @@ epochs) and an **optimistic** head.
 | BLS12-381 | **Pluggable `BlsBackend` seam** — `MilagroBlsBackend` (pure-Java AMCL, default/fallback) or `NativeBlsBackend` (Rust **`blst`** via JNI, `rust/myotis-bls`), selected by `BlsBackends.active()` | A port should use **`blst`** (Rust/Go) or `gnark-crypto` (Go) and call their `FastAggregateVerify` + RFC-9380 hash-to-G2 directly. See §8.0 and [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md): native blst is **4–15× faster** than Milagro on real verifies (far more on ART), so a port should make it the primary backend, not the fallback. |
 | hash-to-curve | **hand-rolled RFC 9380** (`bls/HashToCurve.java`) | Not needed if you use `blst`/`gnark` (they implement it) — but you must pass the exact DST. |
 | libp2p | `io.libp2p:jvm-libp2p` (TCP, Noise-XX, yamux/mplex, gossip) | `rust-libp2p` / `go-libp2p`. |
-| discv5 | ConsenSys `io.consensys.protocols:discovery` (in the `networking` module, not here) | `discv5` crate / go-ethereum v5. |
+| discv5 | ConsenSys `io.consensys.protocols:discovery`, via the `com.github.biafra23:discovery` Android fork (in the `networking` module, not here) | `discv5` crate / go-ethereum v5. |
 | Snappy | iq80 snappy (framed) | `snap` / `golang/snappy`. |
 | SHA-256 | JDK `MessageDigest` | All SSZ hashing + fork digest. |
 | keccak + RLP | Tuweni | **Only** for the execution-layer MPT bridge (`proof/`), never for SSZ. |
@@ -148,8 +148,15 @@ signing_root  = hash_tree_root(SigningData{ object_root, domain })
               = sha256(object_root ‖ domain)                                              // 2-leaf container
 ```
 
-`forkVersion` is the network's **current** fork version (not the attested header's epoch — the
-client is forward-only from a recent checkpoint, so the current version always applies).
+`forkVersion` is the fork version **active at the update's `signature_slot`**, per the spec's
+`validate_light_client_update`:
+`compute_fork_version(compute_epoch_at_slot(max(signature_slot, 1) - 1))`. It comes from the
+network's embedded **fork schedule** (`ForkSchedule` — Java `:core`, Rust
+`myotis_consensus::fork`; pinned per network in `NetworkConfig.forkSchedule` /
+`ChainConfig.fork_schedule`), NOT from a single "current" version: a store walking updates across
+a fork boundary needs both versions, and one fixed value stalls sync at every consensus fork
+(#295). Note the `- 1`: the aggregate signs the previous slot's block, so a signature at the first
+slot of a fork's activation epoch still uses the old version.
 
 ---
 
@@ -330,6 +337,26 @@ the app uses to check a peer-claimed EL state root against a beacon-attested one
 
 ```
 Phase 0   discover CL peers (HTTP debug only) — production seeds from discv5 + cache + multiaddrs
+Phase 0b  awaitAnchorFreshness(anchor) — the WEAK-SUBJECTIVITY GATE, on EVERY loop
+          entry: cold starts judge the BEST anchor (embedded checkpoint vs persisted
+          snapshot, whichever period is newer; the snapshot is parsed ONCE and the
+          resume below reuses the parse), warm re-entries via resume() judge the
+          store's held committee period (a pause longer than the bound ages it like
+          a cold snapshot). Bound: lightclient/WeakSubjectivity +
+          NetworkConfig.wsBoundPeriods defaults. Older → park in STALE_ANCHOR, fail
+          closed, re-evaluating 1/s until the bound covers it (raised live via
+          setWsBoundPeriods), acceptStaleAnchor() consents (run-sticky, never
+          persisted), or the client stops. Additionally, bootstrap() itself opens
+          with wsGateAllowsBootstrap(): every attempt — initial, the poll loop's
+          retry, the fallback after a failed resume — re-faces the gate against the
+          EMBEDDED CHECKPOINT, which can be older than the anchor the start-time
+          gate approved (a fresh snapshot masks a stale checkpoint until its resume
+          fails; a peer-starved node crosses the bound while retrying). And the
+          steady-state loop re-checks the HELD committee's age every cycle
+          (wsGateAllowsForwardSync): an awake node ages in memory exactly like a
+          snapshot ages on disk, so staying running while starved past the bound
+          parks the same way instead of silently handing off through past-bound
+          committees when peers return. A port MUST replicate all three layers.
 Phase 1   tryResumeFromSnapshot()  →  preConnectAndIdentify()  →  bootstrap() if not resumed
 Phase 1b  catchUpSyncCommittee()   +  fill the chain-state-root window from any peer
 Phase 2   steady-state: every secondsPerSlot, pollFinalityUpdate()
@@ -403,11 +430,15 @@ Accept the current digest plus the prior-fork digest (eases fork-transition wind
 
 ### 10.6 What is stubbed (flag for any port)
 
-- **Gossipsub is OFF by default and observation-only**: it subscribes to the
-  `light_client_finality_update` / `light_client_optimistic_update` topics, but the handler just
-  logs and returns `Ignore` — **no snappy decode, no SSZ decode, no validation, no message-id, no
-  mesh forwarding**. A real implementation that relied on gossip for liveness would need all of
-  that, plus fork-change resubscribe. The reference relies on req/resp polling instead.
+- **Gossipsub is always negotiated but never used for data.** The `/meshsub/` protocol must be
+  registered on every connection: Lighthouse reports a peer whose gossipsub negotiation fails as
+  `PeerAction::Fatal` ("does_not_support_gossipsub"), bans the peer id for 12 h, and bans the IP
+  once more than five of its peer ids are banned. Registering the protocol is all that check
+  needs. Topic subscription is a separate switch, OFF by default and observation-only: when on it
+  subscribes to the `light_client_finality_update` / `light_client_optimistic_update` topics, but
+  the handler just logs and returns `Ignore` — **no snappy decode, no SSZ decode, no validation,
+  no message-id, no mesh forwarding**. A real implementation that relied on gossip for liveness
+  would need all of that, plus fork-change resubscribe. The reference relies on req/resp polling.
 - `light_client_updates_by_range` / `beacon_blocks_by_range` **responders are absent** (the client
   can initiate, not serve; deliberately not advertised in Identify).
 - Metadata responder is hardcoded (seq 0, all-zero attnets/syncnets); finality/optimistic/bootstrap
@@ -456,5 +487,11 @@ lists. See companion 03 §2 for the algorithm; the security invariant — **`sto
 8. Period rotation: finality across a period boundary rotates current←next; a finality update with
    no held next committee after a boundary fails until a `LightClientUpdate` is fetched.
 9. Snapshot round-trips and is rejected when the gvr doesn't match.
+9b. Weak-subjectivity gate: an anchor `bound+1` periods old parks (STALE_ANCHOR), age ==
+    bound does not, a backwards wall clock reads fresh; the override precedence is
+    host override > network default > fallback; a re-bootstrap after a poisoned
+    resume re-faces the gate with the (older) checkpoint anchor; and an INITIALIZED
+    store whose held committee ages past the bound while the node runs parks at the
+    next poll cycle (the in-run guard) instead of catching up unconsented.
 10. SSZ uses SHA-256/little-endian; the `proof/` MPT uses keccak/big-endian — cross-checked against
     known roots.

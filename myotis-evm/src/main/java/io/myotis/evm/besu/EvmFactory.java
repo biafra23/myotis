@@ -1,5 +1,6 @@
 package io.myotis.evm.besu;
 
+import com.jaeckel.ethp2p.core.math.BigIntegers;
 import io.myotis.evm.BlockContext;
 import org.hyperledger.besu.evm.EVM;
 import org.hyperledger.besu.evm.EvmSpecVersion;
@@ -80,7 +81,7 @@ public final class EvmFactory {
         java.util.Objects.requireNonNull(ctx, "ctx");
         final long chainId;
         try {
-            chainId = ctx.chainId().longValueExact();
+            chainId = BigIntegers.longValueExact(ctx.chainId());
         } catch (ArithmeticException e) {
             // Same friendly type as the unknown-id path — never leak the raw
             // ArithmeticException (module convention, see AbiDecoder).

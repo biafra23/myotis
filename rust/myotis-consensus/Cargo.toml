@@ -1,6 +1,6 @@
 [package]
 name = "myotis-consensus"
-version = "0.1.7"
+version.workspace = true
 edition = "2021"
 description = "Myotis sync-committee light client (pure Rust; grows through the Rust-engine PRs)"
 license = "MIT OR Apache-2.0"
@@ -11,3 +11,11 @@ myotis-bls = { path = "../myotis-bls", default-features = false }
 # SSZ merkleization is SHA-256 only; the containers themselves are hand-decoded
 # (fork-polymorphic layouts — see src/ssz.rs for why not ssz_derive).
 sha2 = "0.10"
+# Diagnostics only (debug-level rejection reasons in store.rs): the tracing
+# facade is I/O-free and wasm-safe, so the sans-I/O canary is unaffected.
+tracing = "=0.1.44"
+
+[dev-dependencies]
+# Signing side of BLS for the synthetic fork-boundary test (tests/fork_boundary.rs).
+# Already in the lock file via myotis-bls, so no new dependency tree.
+blst = "0.3"

@@ -14,6 +14,9 @@ internal expect val rpcIoDispatcher: CoroutineDispatcher
 /** INFO-level line under [logger] (a dotted logger name, e.g. MethodLogger.ACCESS_LOGGER). */
 internal expect fun rpcLogInfo(logger: String, message: String)
 
+/** WARN-level line under [logger] (the slow-call watchdog's, MethodLogger.SLOW_LOGGER). */
+internal expect fun rpcLogWarn(logger: String, message: String)
+
 /** Whether DEBUG is enabled for [logger] — gates building the full-body access line. */
 internal expect fun rpcLogDebugEnabled(logger: String): Boolean
 

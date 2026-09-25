@@ -13,7 +13,7 @@ import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
 import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
-import io.myotis.ui.KohakuPreset
+import io.myotis.ui.LogIndexWatch
 import io.myotis.engines.SelectorEngine
 import io.myotis.engines.Tor
 import io.myotis.txhistory.TxHistoryEvent
@@ -50,8 +50,9 @@ import kotlin.io.path.createDirectories
 /**
  * The Desktop actual of [NodeController]: drives the SAME engine the daemon and Android
  * use — through the engine API ([MyotisEngine]/[ChainHandle]) only. The composition-root
- * default is the [Engines] selector (Java engine unless `myotis.engine`/the Settings
- * toggle says otherwise); everything else this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
+ * default is the [Engines] selector (`auto`: the Rust engine where it can serve, Java
+ * fallback — unless `myotis.engine`/the Settings toggle says otherwise); everything else
+ * this host touches is `io.myotis.api`. Reuses the daemon's file-backed caches + CCIP
  * gateway from `:app` as its port implementations.
  */
 class DesktopNodeController(
@@ -122,7 +123,6 @@ class DesktopNodeController(
                 val config = EngineConfig(
                     canonical, 0, 0, settings.rpcPortFor(canonical),
                     dataDir.resolve("sync-state$suffix.snapshot").toString(),
-                    false,
                     settings.snapTarget(),
                     settings.strictStateFreshness(),
                     dataDir.toString(),
@@ -169,6 +169,9 @@ class DesktopNodeController(
                     // would be overwritten, leaving the live window one Save behind settings.
                     synchronized(servedWindowApplyLock) {
                         handle.setServedBlockWindow(settings.servedBlockWindow())
+                        // Weak-subjectivity bound override rides the same pre-start
+                        // apply + lock: the cold-start gate must judge with it.
+                        handle.setWsBoundPeriods(settings.wsBoundPeriods().toLong())
                     }
                     handle.start()
                 } catch (t: Throwable) {
@@ -238,6 +241,19 @@ class DesktopNodeController(
         }
     }
 
+    override fun setWsBoundPeriods(periods: Int) {
+        // Same lock discipline as the served-window fan-out (the boot path applies
+        // this knob pre-start under the same lock). A STALE_ANCHOR park re-evaluates
+        // against the new bound within a second.
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setWsBoundPeriods(periods.toLong()) }
+        }
+    }
+
+    override fun acceptStaleAnchor(network: String) {
+        engine.get(network)?.acceptStaleAnchor()
+    }
+
     override fun applyBlsBackend() {
         // No-op on desktop: there's no bundled native blst library yet (the macOS dylib is a
         // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend
@@ -245,11 +261,11 @@ class DesktopNodeController(
     }
 
     override fun applyEngineChoice() {
-        // auto (not rust): the Rust engine is catalog-only for now, so a hard `rust` would
-        // refuse to boot networks; auto prefers Rust where it can serve and falls back to
-        // Java with a log. Applies to networks (re)started afterwards — live ones keep
-        // their engine (reboot the network from Settings to switch it).
-        Engines.select(if (settings.rustEngineEnabled()) "auto" else "java")
+        // auto (not rust) as the default: auto prefers Rust where it can serve and falls
+        // back to Java with a log, so a host without the native library still boots.
+        // Applies to networks (re)started afterwards — live ones keep their engine
+        // (reboot the network from Settings to switch it).
+        Engines.select(if (settings.preferJavaEngine()) "java" else "auto")
     }
 
     override fun applyLogIndex(network: String) {
@@ -262,13 +278,22 @@ class DesktopNodeController(
 
     private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
         val enabled = settings.logIndexEnabled(network)
-        val maxSpeed = settings.logIndexMaxSpeed(network)
-        // No preset for this network -> never push; the engine keeps
-        // eth_getLogs in its honest not-configured state.
-        val json = KohakuPreset.configJson(network, enabled, maxSpeed) ?: return
+        val backfillPaused = settings.logIndexBackfillPaused(network)
+        // Nothing to say (no watched contracts, never configured) -> never push;
+        // the engine keeps eth_getLogs in its honest not-configured state. A
+        // CONFIGURED network always pushes — a disable must reach the engine or
+        // its boot-time activate-from-disk re-enables an imported index.
+        val json = logIndexConfigJson(settings, network) ?: return
         val ok = handle.setLogIndexConfig(json)
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
+        } else if (enabled && backfillPaused) {
+            // This push is what the engine's activation defers to: an index found on
+            // disk comes up serving with the walk paused, and stays that way unless a
+            // host asks otherwise. Worth a line, because "no walk" is a state a demo
+            // gets checked for — the Bee PoC runs this way by default
+            // (BeePoc.backfillPausedDefault).
+            log.info("[desktop] {}: log-index backfill paused (no downward walk)", network)
         }
     }
 
@@ -281,6 +306,18 @@ class DesktopNodeController(
         runCatching { engine.get(network)?.logIndexStatusJson() }.getOrNull()
 
     override val canImportLogIndex: Boolean get() = true
+
+    // Only a PoC flavour seeds anything; the notice is fixed for the life of the
+    // process (the manifest is written before any network starts), so compute it once
+    // per network rather than re-reading a file on every recomposition.
+    private val seededNotices = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<String>>()
+
+    override fun seededIndexNotice(network: String): String? {
+        val poc = Poc.active() ?: return null
+        return seededNotices
+            .computeIfAbsent(network) { java.util.Optional.ofNullable(poc.seededIndexNotice(dataDir, it)) }
+            .orElse(null)
+    }
 
     override fun importLogIndexSnapshots(network: String, onResult: (String) -> Unit): Boolean {
         val canonical = engine.canonicalNetworkName(network)
@@ -320,6 +357,12 @@ class DesktopNodeController(
         }
         return true
     }
+
+    // Answered from the loaded engine build: only a -PtorEngine dylib links Arti,
+    // and RustMyotisEngine.isAvailable() is already resolved by the time the UI
+    // renders (Main.kt loads the lib before composition). Cached — the answer
+    // cannot change within a process, and the row reads it on every recomposition.
+    override val supportsTor: Boolean by lazy { runCatching { Tor.supported() }.getOrDefault(false) }
 
     override fun applyTorMode() {
         // Push the persisted Tor preference to the process-global Rust-engine flag
@@ -368,11 +411,18 @@ class DesktopNodeController(
         val canonical = engine.canonicalNetworkName(network)
         // Off the UI thread — directory scan + deletes are blocking IO.
         Thread({
-            val suffix = if (canonical == "mainnet") "" else "-$canonical"
-            // Delete the persisted snapshot and any sibling parts (e.g. the ".roots"
-            // accumulator) so the next start re-bootstraps from the embedded checkpoint.
-            java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
-                s.forEach { java.nio.file.Files.deleteIfExists(it) }
+            // Serialize with enable/disable through the per-network boot lock, exactly as
+            // clearCaches does above. Without it a Reset immediately followed by Start races
+            // the unlinks against the boot's snapshot read: if the boot wins, the node resumes
+            // from the old snapshot and the reset silently did nothing — the same no-op the
+            // Status-tab gate exists to remove, moved inside the recommended sequence.
+            synchronized(bootLock(canonical)) {
+                val suffix = if (canonical == "mainnet") "" else "-$canonical"
+                // Delete the persisted snapshot and any sibling parts (e.g. the ".roots"
+                // accumulator) so the next start re-bootstraps from the embedded checkpoint.
+                java.nio.file.Files.newDirectoryStream(dataDir, "sync-state$suffix.snapshot*").use { s ->
+                    s.forEach { java.nio.file.Files.deleteIfExists(it) }
+                }
             }
         }, "desktop-reset-sync-$canonical").apply { isDaemon = true }.start()
     }
@@ -572,6 +622,8 @@ class DesktopNodeController(
             tor = torModeFor(Engines.engineKindFor(s.network())),
             logIndex = logIndexRaw?.let(io.myotis.ui.LogIndexStatus::format),
             logIndexJson = logIndexRaw,
+            readStatsJson = runCatching { engine.get(network)?.readStatsJson() }.getOrNull(),
+            wsBoundPeriods = s.wsBoundPeriods(),
             upgrade = s.upgradeAdvisory()?.let {
                 UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
             },
@@ -597,6 +649,21 @@ class DesktopNodeController(
 }
 
 /**
+ * The log-index config the desktop host pushes for [network] — the whole Settings →
+ * engine-JSON mapping in one place so a test can assert what the engine is actually
+ * handed (BeePocTest pins the Bee PoC's paused backfill through here). Null when there
+ * is nothing to say; see [LogIndexWatch.configJson].
+ */
+internal fun logIndexConfigJson(settings: Settings, network: String): String? =
+    LogIndexWatch.configJson(
+        settings.logIndexWatchJson(network),
+        settings.logIndexEnabled(network),
+        settings.logIndexMaxSpeed(network),
+        configured = settings.logIndexConfigured(network),
+        backfillPaused = settings.logIndexBackfillPaused(network),
+    )
+
+/**
  * Desktop settings, file-backed so every toggle survives an app restart (Android parity —
  * there SharedPreferences does this for free). [file] is a java.util.Properties file under
  * the app data dir (`~/.myotis/settings.properties`); null keeps the store in-memory
@@ -616,20 +683,28 @@ class DesktopSettings(
     private val ports = HashMap<String, Int>()
     private var snap = 32
     private var servedWindow = 32
+    // Weak-subjectivity bound override (periods); 0 = each network's default.
+    private var wsBound = 0
     private var deep = 16
     private var strict = true
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
     // toggle persists but DesktopNodeController.applyBlsBackend() is a no-op until the dylib ships.
     private var nativeBls = false
-    // The Rust engine is experimental — off by default everywhere.
-    private var rustEngine = false
+    // Default off = the selector's `auto` mode (Rust engine where it can serve, Java
+    // fallback). On = force the Java engine — the opt-out, now that Rust is primary.
+    private var preferJava = false
     // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
-    // Per-network opt-in for the eth_getLogs Kohaku-preset index (Rust engine only).
+    // Per-network opt-in for the eth_getLogs watch-list index (Rust engine only).
     private val logIndexOn = HashMap<String, Boolean>()
     // Per-network backfill pacing (true = max download speed); see Settings.logIndexMaxSpeed.
     private val logIndexMax = HashMap<String, Boolean>()
+    // Per-network backfill OFF switch; see Settings.logIndexBackfillPaused. Absent
+    // means "use the flavour default" — the Bee PoC ships paused (BeePoc.kt).
+    private val logIndexPaused = HashMap<String, Boolean>()
+    // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
+    private val logIndexWatch = HashMap<String, String>()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -665,12 +740,24 @@ class DesktopSettings(
     override fun servedBlockWindow(): Int = synchronized(this) { servedWindow }
     // Clamp like ChainStack.setServedBlockWindow (1..4096) so live and reloaded values agree.
     override fun setServedBlockWindow(v: Int) = mutate { servedWindow = v.coerceIn(1, 4096) }
+    override fun wsBoundPeriods(): Int = synchronized(this) { wsBound }
+    // 0 = per-network default; cap keeps a typo from storing an absurd bound.
+    override fun setWsBoundPeriods(v: Int) = mutate { wsBound = v.coerceIn(0, 9999) }
     override fun logIndexEnabled(network: String): Boolean =
         synchronized(this) { logIndexOn[network] ?: false }
     override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
     override fun logIndexMaxSpeed(network: String): Boolean =
         synchronized(this) { logIndexMax[network] ?: false }
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = mutate { logIndexMax[network] = on }
+    override fun logIndexBackfillPaused(network: String): Boolean =
+        synchronized(this) { logIndexPaused[network] ?: (Poc.active()?.backfillPausedDefault() ?: false) }
+    override fun setLogIndexBackfillPaused(network: String, on: Boolean) = mutate { logIndexPaused[network] = on }
+    override fun logIndexConfigured(network: String): Boolean =
+        synchronized(this) { logIndexOn.containsKey(network) }
+    override fun logIndexWatchJson(network: String): String =
+        synchronized(this) { logIndexWatch[network] ?: "[]" }
+    override fun setLogIndexWatchJson(network: String, json: String) =
+        mutate { logIndexWatch[network] = json }
 
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
@@ -682,8 +769,8 @@ class DesktopSettings(
     override fun setStrictStateFreshness(v: Boolean) = mutate { strict = v }
     override fun nativeBlsEnabled(): Boolean = synchronized(this) { nativeBls }
     override fun setNativeBlsEnabled(v: Boolean) = mutate { nativeBls = v }
-    override fun rustEngineEnabled(): Boolean = synchronized(this) { rustEngine }
-    override fun setRustEngineEnabled(v: Boolean) = mutate { rustEngine = v }
+    override fun preferJavaEngine(): Boolean = synchronized(this) { preferJava }
+    override fun setPreferJavaEngine(v: Boolean) = mutate { preferJava = v }
     override fun torEnabled(): Boolean = synchronized(this) { torRouting }
     override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
 
@@ -707,20 +794,48 @@ class DesktopSettings(
         }
         p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
         p.getProperty(K_SERVED_WINDOW)?.toIntOrNull()?.let { servedWindow = it.coerceIn(1, 4096) }
+        p.getProperty(K_WS_BOUND)?.toIntOrNull()?.let { wsBound = it.coerceIn(0, 9999) }
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
-        p.getProperty(K_RUST_ENGINE)?.toBooleanStrictOrNull()?.let { rustEngine = it }
+        p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexPaused[k.removePrefix(K_LOG_INDEX_PAUSED_PREFIX)] = it }
+        }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexMax[k.removePrefix(K_LOG_INDEX_SPEED_PREFIX)] = it }
         }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_WATCH_PREFIX) }.forEach { k ->
+            // Round-trip through the parser so a hand-edited value degrades to the
+            // entries that do parse rather than reaching the engine raw.
+            p.getProperty(k)?.let {
+                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] =
+                    LogIndexWatch.serialize(LogIndexWatch.parse(it))
+            }
+        }
         p.stringPropertyNames()
-            .filter { it.startsWith(K_LOG_INDEX_PREFIX) && !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }
+            .filter {
+                it.startsWith(K_LOG_INDEX_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_WATCH_PREFIX)
+            }
             .forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexOn[k.removePrefix(K_LOG_INDEX_PREFIX)] = it }
+        }
+        // MIGRATION: a user who had the retired built-in Kohaku preset toggle on
+        // has the enabled flag persisted but NO watch entries — the preset lived
+        // in code. Seed the watch list from the legacy preset so the next config
+        // push does not silently drop their subscriptions (in-memory here; the
+        // next mutate() persists it).
+        logIndexOn.filterValues { it }.keys.forEach { net ->
+            if (net !in logIndexWatch) {
+                LogIndexWatch.legacyKohakuWatchJson(net)?.let { logIndexWatch[net] = it }
+            }
         }
     }
 
@@ -756,13 +871,16 @@ class DesktopSettings(
         ports.forEach { (net, port) -> p.setProperty("$K_RPC_PORT_PREFIX$net", port.toString()) }
         p.setProperty(K_SNAP, snap.toString())
         p.setProperty(K_SERVED_WINDOW, servedWindow.toString())
+        p.setProperty(K_WS_BOUND, wsBound.toString())
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
-        p.setProperty(K_RUST_ENGINE, rustEngine.toString())
+        p.setProperty(K_PREFER_JAVA, preferJava.toString())
         p.setProperty(K_TOR, torRouting.toString())
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
+        logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
+        logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
         return p
     }
 
@@ -794,15 +912,20 @@ class DesktopSettings(
         const val K_RPC_PORT_PREFIX = "rpcPort."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
+        const val K_WS_BOUND = "wsBoundPeriods"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"
-        const val K_RUST_ENGINE = "rustEngine"
+        // Replaces the pre-auto-default "rustEngine" key; that key is simply ignored
+        // now (its true meant "auto", which is the default — nothing to migrate).
+        const val K_PREFER_JAVA = "engine.preferJava"
         const val K_TOR = "torRouting"
         const val K_LOG_INDEX_PREFIX = "logIndex."
-        // Distinct prefix nested under logIndex.* so the enable-loader's
-        // startsWith filter must exclude it (see load()).
+        // Distinct prefixes nested under logIndex.* so the enable-loader's
+        // startsWith filter must exclude them (see load()).
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
+        const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
+        const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
     }
 }
 

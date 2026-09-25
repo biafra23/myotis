@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
 
 /**
@@ -104,9 +105,17 @@ class ManifestCidResolver(
         return if (v in 0..Int.MAX_VALUE) v.toInt() else null
     }
 
+    // Files.readAllBytes + a strict decoder, not readString (API 33; see CLAUDE.md's
+    // minSdk budget). The explicit CharsetDecoder matters: readString REPORTED
+    // malformed UTF-8 (throw -> the catch below -> cache miss -> self-healing
+    // refetch), while the String(bytes) constructor silently substitutes U+FFFD —
+    // which would let a byte-corrupted cache file pass the shape gate as a
+    // mojibake CID and poison lookups for the whole cache TTL.
     private fun readCache(): Pair<Long, String>? = try {
         if (!Files.exists(cacheFile)) null
-        else Files.readString(cacheFile).trim().split('\t').takeIf { it.size == 2 }
+        else StandardCharsets.UTF_8.newDecoder()
+            .decode(java.nio.ByteBuffer.wrap(Files.readAllBytes(cacheFile))).toString()
+            .trim().split('\t').takeIf { it.size == 2 }
             ?.let { (ts, cid) -> ts.toLongOrNull()?.let { it to cid } }
     } catch (e: Exception) {
         null
@@ -115,13 +124,14 @@ class ManifestCidResolver(
     private fun writeCache(now: Long, cid: String) {
         try {
             // Fall back to the working dir when a flat (parent-less) path is supplied.
-            val parent = cacheFile.parent ?: Path.of(".")
+            // Paths.get, not Path.of: the latter needs Android API 34 (minSdk is 29).
+            val parent = cacheFile.parent ?: Paths.get(".")
             Files.createDirectories(parent)
             // Unique temp file (not a fixed "<name>.tmp") so a daemon + desktop sharing the
             // cache dir can't interleave writes to the same tmp before the atomic move.
             val tmp = Files.createTempFile(parent, cacheFile.fileName.toString(), ".tmp")
             try {
-                Files.writeString(tmp, "$now\t$cid")
+                Files.write(tmp, "$now\t$cid".toByteArray(StandardCharsets.UTF_8))
                 Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE)
             } finally {

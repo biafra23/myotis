@@ -59,6 +59,10 @@
          already; pinned here so it's discoverable and can go to DEBUG (full req/resp
          bodies) independently of the app/wire levels. In the Logs tab, filter on "rpc". -->
     <logger name="io.myotis.jsonrpc.access" level="INFO"/>
+    <!-- Slow-call watchdog (#312): a JSON-RPC call still unanswered after ~1 s is logged at
+         WARN while it is stuck (method/id/phase) and again when it finishes. Pinned so it
+         stays visible whatever the app level. In the Logs tab, filter on "slow call". -->
+    <logger name="io.myotis.jsonrpc.slow" level="WARN"/>
 
     <!-- Third-party noise stays pinned regardless of APP_LEVEL. -->
     <logger name="io.netty" level="WARN"/>

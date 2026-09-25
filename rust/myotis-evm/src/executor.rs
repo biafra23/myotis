@@ -27,7 +27,22 @@ use revm::context::result::{ExecutionResult, HaltReason, Output};
 use revm::context::{CfgEnv, TxEnv};
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::primitives::{Address, TxKind, U256};
-use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
+use revm::interpreter::{Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
+use revm::interpreter::interpreter_types::LoopControl;
+
+struct RequestInspector<'a>(&'a dyn SnapStateOracle);
+impl<CTX> Inspector<CTX> for RequestInspector<'_> {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        if self.0.check_request().is_err() {
+            interp.bytecode.set_action(InterpreterAction::Return(InterpreterResult {
+                result: InstructionResult::Stop,
+                output: Default::default(),
+                gas: interp.gas,
+            }));
+        }
+    }
+}
 
 use crate::block::BlockContext;
 use crate::cache::{BytecodeCache, StateProofCache};
@@ -240,6 +255,7 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
+        self.oracle.check_request()?;
         let mut cfg = CfgEnv::new_with_spec(spec);
         cfg.chain_id = ctx.chain_id;
         // Not a real tx: relax the transaction-level checks (see the module docs).
@@ -276,9 +292,13 @@ impl EvmExecutor {
             .with_ref_db(db)
             .with_block(ctx.block_env())
             .with_cfg(cfg)
-            .build_mainnet();
+            .build_mainnet_with_inspector(RequestInspector(self.oracle.as_ref()));
 
-        Ok(evm.transact(tx).map_err(map_evm_error)?.result)
+        let result = evm.inspect_tx(tx);
+        // Cancellation takes precedence over an interpreter stop (including a
+        // cancelled nested call) or a just-finished indivisible precompile.
+        self.oracle.check_request()?;
+        Ok(result.map_err(map_evm_error)?.result)
     }
 
     /// Run a call and return its output bytes (revert/halt → `Err`), via the
@@ -325,6 +345,7 @@ impl EvmExecutor {
         cap: usize,
         overrides: StateOverrides,
     ) -> Result<Vec<u8>, EvmError> {
+        self.oracle.check_request()?;
         let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
         let db = self.database_for_with(ctx, overrides);
 
@@ -342,6 +363,7 @@ impl EvmExecutor {
         let mut seen = AccessSet::default();
         let mut discovering = true;
         for iter in 0..cap {
+            self.oracle.check_request()?;
             // Sentinel while still discovering, but the LAST TWO iterations are
             // always real (one final wave + one warm real run).
             let sentinel = discovering && iter + 2 < cap;
@@ -426,6 +448,7 @@ impl EvmExecutor {
         value: U256,
         ctx: &BlockContext,
     ) -> Result<u64, EvmError> {
+        self.oracle.check_request()?;
         // Java `rpcEstimateGas` parity: a plain transfer (empty calldata) to a
         // CODELESS account costs exactly 21000 — no EVM run and NO 1.15 buffer
         // (it's exact). One verified account fetch through the caching database
@@ -446,6 +469,7 @@ impl EvmExecutor {
                 .basic_ref(Address::from(target))?
                 .is_none_or(|a| a.code_hash.0 == myotis_core::trie::EMPTY_CODE_HASH);
             if no_code {
+                self.oracle.check_request()?;
                 return Ok(PLAIN_TRANSFER_GAS);
             }
         }
@@ -517,6 +541,37 @@ mod tests {
     use crate::fork::{CANCUN_TIME, LONDON_BLOCK};
     use crate::oracle::{FixtureSnapStateOracle, OracleAccount};
     use myotis_core::keccak::keccak256;
+
+    struct CancelledOracle;
+    impl SnapStateOracle for CancelledOracle {
+        fn check_request(&self) -> Result<(), OracleError> {
+            Err(OracleError::Cancelled { reason: "test cancellation".into() })
+        }
+        fn fetch_account(&self, _: &[u8; 32], _: [u8; 20]) -> Result<Option<OracleAccount>, OracleError> {
+            panic!("cancelled executor must not fetch")
+        }
+        fn fetch_storage(&self, _: &[u8; 32], _: [u8; 20], _: U256) -> Result<U256, OracleError> {
+            panic!("cancelled executor must not fetch")
+        }
+        fn fetch_bytecode(&self, _: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+            panic!("cancelled executor must not fetch")
+        }
+    }
+
+    #[test]
+    fn cancelled_call_and_estimate_refuse_before_fetch() {
+        let executor = EvmExecutor::new(Arc::new(CancelledOracle), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        let context = ctx(LONDON_BLOCK, CANCUN_TIME);
+        assert!(matches!(executor.call_view(TARGET, &[], &context), Err(EvmError::Oracle(OracleError::Cancelled { .. }))));
+        assert!(matches!(executor.estimate_gas([0; 20], TARGET, &[], U256::ZERO, &context), Err(EvmError::Oracle(OracleError::Cancelled { .. }))));
+    }
+
+    #[test]
+    fn cancelled_instruction_sets_stop_without_running_bytecode() {
+        let mut interpreter = Interpreter::default_ext();
+        RequestInspector(&CancelledOracle).step(&mut interpreter, &mut ());
+        assert!(interpreter.bytecode.action().is_some());
+    }
 
     const ROOT: [u8; 32] = [0xAA; 32];
     const TARGET: [u8; 20] = [0x11; 20];

@@ -37,10 +37,10 @@ class RustStatusJsonTest {
             "{\"running\":false,\"paused\":false,\"network\":\"mainnet\",\"beaconState\":\"STARTING\","
             + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
             + "\"currentPeriod\":0,\"targetPeriod\":0,\"peerCount\":0,\"servedPeersLastMinute\":0,"
-            + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,\"lcHunting\":false,"
+            + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,\"lcHunting\":false,\"wsBoundPeriods\":0,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
             + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,\"elHunting\":false,"
             + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
@@ -54,7 +54,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,\"elHunting\":true,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":true,"
-            + "\"snapPeers\":6,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
+            + "\"snapPeers\":6,\"snapServingPeers\":4,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
             + "\"executionBlockNumber\":20999000,"
@@ -75,7 +75,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":0,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,"
             + "\"optimisticBlockNumber\":0,\"finalizedBlockNumber\":0,\"executionBlockNumber\":0}";
 
@@ -172,9 +172,11 @@ class RustStatusJsonTest {
         assertTrue(s.lcHunting());
         assertTrue(s.elHunting());
         // EL pool/discovery counts now flow through (not hardcoded 0). The pool
-        // holds only snap-capable READY peers, so readyPeers == snapPeers.
+        // holds only snap-capable READY peers, so readyPeers == snapPeers;
+        // snapServingPeers is the engine's own count (ABI >= 31), not a mirror.
         assertEquals(6, s.snapPeers());
         assertEquals(6, s.readyPeers());
+        assertEquals(4, s.snapServingPeers());
         assertEquals(240, s.discoveredPeers());
         assertEquals(14, s.attemptedDials());
         assertEquals(30, s.backedOffPeers());
@@ -200,10 +202,39 @@ class RustStatusJsonTest {
 
     @Test
     void syncedButNoSnapPeersHasNoVerifiedHead() {
-        // SYNCED but zero snap peers → a verified read can't be served → MAX sentinel.
+        // SYNCED but an empty pool (and so nobody serving — the serving count is
+        // a subset of the pooled one) → a verified read can't be served → MAX
+        // sentinel.
         String noPeers = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
-                .replace("\"snapPeers\":6", "\"snapPeers\":0");
+                .replace("\"snapPeers\":6", "\"snapPeers\":0")
+                .replace("\"snapServingPeers\":4", "\"snapServingPeers\":0");
         StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noPeers);
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void syncedWithPeersButNoneServingHasNoVerifiedHead() {
+        // SYNCED with a full pool of peers that cannot answer at the anchored
+        // head (#465) → a verified read can't be served → MAX sentinel; the
+        // pooled count alone no longer vouches for readiness.
+        String noneServing = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapServingPeers\":4", "\"snapServingPeers\":0");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noneServing);
+        assertEquals(6, s.snapPeers());
+        assertEquals(0, s.snapServingPeers());
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void aShapeWithoutSnapServingKeyReadsAsNobodyServing() {
+        // No snapServingPeers key (a hand-written fixture; a loaded native
+        // always emits it, the ABI gate is exact): 0, fail closed — never the
+        // pooled count, which is the #465 false-ready this key replaces.
+        String noKey = CATCHING_UP_JSON.replace("CATCHING_UP", "SYNCED")
+                .replace("\"snapServingPeers\":4,", "");
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", noKey);
+        assertEquals(6, s.snapPeers());
+        assertEquals(0, s.snapServingPeers());
         assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
     }
 
@@ -243,10 +274,47 @@ class RustStatusJsonTest {
         assertEquals(14560032L, bs.optimisticSlot());
         assertEquals(5, bs.connectedPeers());
         assertEquals(5L, bs.lightClientPeers());
-        // EL fields empty on the CL-only engine.
+        // The finalized payload's block flows from the beacon anchor (same status-JSON
+        // field statusSnapshot() maps); the exec state root / block hash are not in
+        // the status JSON, so they stay null on this surface.
         assertNull(bs.executionStateRootHex());
         assertNull(bs.executionBlockHashHex());
-        assertEquals(0L, bs.executionBlockNumber());
+        assertEquals(20999000L, bs.executionBlockNumber());
+    }
+
+    /** The weak-subjectivity park: STALE_ANCHOR maps through BOTH surfaces with the
+     *  refused anchor as currentPeriod and the enforced bound alongside. */
+    private static final String STALE_ANCHOR_JSON =
+            "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"STALE_ANCHOR\","
+            + "\"bootstrapped\":false,\"finalizedSlot\":0,\"optimisticSlot\":0,"
+            + "\"currentPeriod\":1825,\"targetPeriod\":1845,\"peerCount\":0,"
+            + "\"discv5TableSize\":3,\"syncStartPeriod\":-1,\"wsBoundPeriods\":13}";
+
+    @Test
+    void staleAnchorMapsThroughBothSurfaces() {
+        BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", STALE_ANCHOR_JSON);
+        assertEquals(BeaconState.STALE_ANCHOR, bs.state());
+        assertFalse(bs.bootstrapped());
+        assertEquals(1825L, bs.currentPeriod());
+        assertEquals(1845L, bs.targetPeriod());
+        assertEquals(13L, bs.wsBoundPeriods());
+
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", STALE_ANCHOR_JSON);
+        assertEquals(BeaconState.STALE_ANCHOR, s.beaconState());
+        assertEquals(13L, s.wsBoundPeriods());
+        // Not serveable while parked: no verified head.
+        assertEquals(Long.MAX_VALUE, s.verifiedHeadAgeMs());
+    }
+
+    @Test
+    void unknownBeaconStateFromNewerNativeReadsAsStarting() {
+        // A NEWER .so than this wrapper may emit a state this enum doesn't know:
+        // the whole parse must not throw — it degrades to STARTING (fail closed).
+        StatusSnapshot s = RustChainHandle.statusFromJson("mainnet",
+                "{\"running\":true,\"network\":\"mainnet\",\"beaconState\":\"SOME_FUTURE_STATE\","
+                + "\"currentPeriod\":5,\"targetPeriod\":6}");
+        assertEquals(BeaconState.STARTING, s.beaconState());
+        assertEquals(5L, s.syncCurrentPeriod());
     }
 
     /** The pre-targetPeriod shape an older native library emits (no "targetPeriod"
@@ -268,6 +336,8 @@ class RustStatusJsonTest {
         assertEquals(1777L, s.wallClockPeriod());
         BeaconStatus bs = RustChainHandle.beaconStatusFromJson("mainnet", OLD_SHAPE_CATCHING_UP_JSON);
         assertEquals(1777L, bs.targetPeriod());
+        // No finalizedBlockNumber key in the old shape → 0, never a throw.
+        assertEquals(0L, bs.executionBlockNumber());
     }
 
     /** A running Sepolia status whose peers announce Glamsterdam (ethereum/pm#2205). */
@@ -325,7 +395,7 @@ class RustStatusJsonTest {
                 "libmyotis_engine not on java.library.path — skipping live JNI status test");
         RustMyotisEngine rust = new RustMyotisEngine();
         EngineConfig cfg = new EngineConfig(
-                "mainnet", 0, 0, 0, null, false, 0, true, "/tmp/myotis-r1-test");
+                "mainnet", 0, 0, 0, null, 0, true, "/tmp/myotis-r1-test");
         var handle = rust.create(cfg, null);
         try {
             // A created-but-not-started handle reports not-running / STARTING.

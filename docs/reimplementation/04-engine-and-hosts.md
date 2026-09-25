@@ -48,7 +48,7 @@ Constructed with everything platform-specific **injected**:
 ```
 ChainStack(NetworkConfig network, ChainPorts ports, NodeKey nodeKey,
            PeerCache peerCache, ClPeerCache clPeerCache, CcipGateway ccipGateway,
-           Path syncSnapshotFile, bool gossipsubEnabled)
+           Path syncSnapshotFile)
 ```
 
 Owns, on its own ports & identity: the RLPx connector, discv4, discv5, the beacon light client +
@@ -74,7 +74,7 @@ snap-peer maintainer.
 3. discv4.start(elPort)  — EL is ESSENTIAL: a bind failure throws and fails the stack.
 4. BeaconSyncState; then discv5 (CL discovery — NON-essential: a failure logs and continues)
    + BeaconLightClient (checkpoint root/slot, fork version, gvr, CL-peer-cache wiring via
-   method refs, sync snapshot file, gossipsub flag); blc.start().
+   method refs, sync snapshot file); blc.start().
 5. Verified JSON-RPC (best-effort — a bind failure does NOT fail the stack): up-front loopback
    bind probe, build VerifiedRpcBackend, start MyotisRpcServer on 127.0.0.1:rpcPort.
 6. Snap-peer maintainer (optional; daemon/mobile enable it): a 10s loop keeping
@@ -322,7 +322,7 @@ re-implementation as the reference desktop host (mobile hosts replace this with 
 
 ### 4.1 Daemon vs client mode
 
-- Parse `--network <csv>` (host several networks in one process), `--port`, `--gossipsub`, and a
+- Parse `--network <csv>` (host several networks in one process), `--port`, and a
   remaining command.
 - A command token + a *running* daemon → **client mode**: connect to the network's socket, send one
   JSON line, print responses, exit.

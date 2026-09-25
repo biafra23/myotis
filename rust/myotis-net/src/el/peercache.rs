@@ -36,8 +36,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Consecutive snap-serve failures before a peer is marked DENIED (Java
-/// `PeerCache.SNAP_FAILURE_THRESHOLD`).
-const FAILURE_THRESHOLD: u32 = 3;
+/// `PeerCache.SNAP_FAILURE_THRESHOLD`). `pub(crate)` so the pool's live
+/// eviction threshold can be pinned equal to it by a compile-time assert
+/// (see `el::pool`) — the two must move together or an evicted laggard can be
+/// re-admitted before its cache verdict turns DENIED.
+pub(crate) const FAILURE_THRESHOLD: u32 = 3;
 
 /// Consecutive TCP connect failures before a peer reports DENIED from
 /// [`ElPeerCache::peers`] — a currently-unreachable CONFIRMED peer must not
@@ -245,6 +248,16 @@ impl ElPeerCache {
         // Snap peers first (by quality), then non-snap. Stable within a rank.
         out.sort_by_key(|p| if p.snap { p.quality.dial_rank() } else { 3 });
         out
+    }
+
+    /// The STORED snap verdict on one cached peer, or `None` when the address
+    /// is not cached. Deliberately without the connect-failure demotion
+    /// [`peers`](Self::peers) applies: that demotion orders DIALS by recent
+    /// reachability, whereas the pool reads this at admission — the peer just
+    /// connected — to ask whether it once proved itself, which is what the
+    /// read ladder ranks on.
+    pub fn quality_of(&self, addr: SocketAddr) -> Option<SnapQuality> {
+        self.entries.get(&addr_key(addr)).map(|e| e.quality)
     }
 
     /// Record a peer that reached a READY session with capability `snap`. New
@@ -461,8 +474,10 @@ fn pubkey_hex(pubkey: &[u8; 64]) -> String {
 }
 
 /// Parse a `0x`-prefixed-or-bare 128-hex node id into 64 bytes. Panic-free —
-/// `None` on any malformed input (cache files are semi-trusted on disk).
-fn parse_pubkey(hex: &str) -> Option<[u8; 64]> {
+/// `None` on any malformed input (cache files are semi-trusted on disk), and
+/// strictly hex: `u8::from_str_radix` alone would accept a `+f` pair. Shared
+/// with `reader::parse_enode`, the enode URL parser.
+pub(crate) fn parse_pubkey(hex: &str) -> Option<[u8; 64]> {
     let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
     if hex.len() != 128 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -510,6 +525,34 @@ mod tests {
         assert!(!peers[1].snap);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quality_of_matches_what_peers_reports() {
+        let path = std::env::temp_dir()
+            .join(format!("myotis-peercache-quality-of-{}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cache = ElPeerCache::load(path.clone());
+        let a: std::net::SocketAddr = "192.0.2.10:30303".parse().unwrap();
+        let b: std::net::SocketAddr = "192.0.2.11:30303".parse().unwrap();
+        assert_eq!(cache.quality_of(a), None);
+        cache.add(a, &[1u8; 64], true);
+        cache.add(b, &[2u8; 64], true);
+        cache.record_snap_served(a);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
+        assert_eq!(cache.quality_of(b), Some(SnapQuality::Unknown));
+        for p in cache.peers() {
+            assert_eq!(cache.quality_of(p.addr), Some(p.quality));
+        }
+        // A connect-failure streak demotes the DIAL order (`peers()`), not the
+        // stored verdict: a proven server that was unreachable for a while
+        // and just connected is still a proven server.
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            cache.record_connect_failure(a);
+        }
+        assert_eq!(cache.peers().iter().find(|p| p.addr == a).unwrap().quality, SnapQuality::Denied);
+        assert_eq!(cache.quality_of(a), Some(SnapQuality::Confirmed));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

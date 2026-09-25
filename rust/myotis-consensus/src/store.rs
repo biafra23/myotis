@@ -3,6 +3,7 @@
 //! clock input (the slot estimate behind `force_rotate_if_past_period`) is a
 //! plain parameter, exactly as the conformance corpus records it.
 
+use crate::fork::ForkSchedule;
 use crate::spec;
 use crate::ssz::{self, Root};
 use crate::types::{
@@ -170,17 +171,27 @@ impl LightClientStore {
 }
 
 /// Processes updates against a store — Rust twin of `LightClientProcessor` (minus
-/// the duplicate-signature fast path, which is a perf memo, not a verdict change:
-/// re-verifying a duplicate reaches the same `true`).
+/// the duplicate-signature fast path, which is a perf memo keyed on the applied
+/// signature AND its slot, behind the period gate — not a verdict change:
+/// re-verifying a duplicate reaches the same `true`, and a relabelled slot is
+/// not a duplicate).
 pub struct LightClientProcessor {
     pub store: LightClientStore,
-    fork_version: [u8; 4],
+    /// Per-slot signing-domain selector. Every update is verified under the
+    /// fork active at its `signature_slot` (spec `validate_light_client_update`),
+    /// so a store can walk updates across a fork boundary — a single fixed
+    /// version rejects everything signed on the other side of it (#295).
+    fork_schedule: ForkSchedule,
     genesis_validators_root: Root,
 }
 
 impl LightClientProcessor {
-    pub fn new(store: LightClientStore, fork_version: [u8; 4], genesis_validators_root: Root) -> Self {
-        Self { store, fork_version, genesis_validators_root }
+    pub fn new(
+        store: LightClientStore,
+        fork_schedule: ForkSchedule,
+        genesis_validators_root: Root,
+    ) -> Self {
+        Self { store, fork_schedule, genesis_validators_root }
     }
 
     /// `is_valid_light_client_header` (Capella+): the execution payload header is
@@ -197,31 +208,46 @@ impl LightClientProcessor {
     }
 
     pub fn process_update(&mut self, update: &LightClientUpdate) -> bool {
-        let Some(committee) = self.store.current_sync_committee() else {
+        if self.store.current_sync_committee().is_none() {
+            tracing::debug!("update rejected: store has no current sync committee");
             return false;
-        };
+        }
 
         // Applicability gate BEFORE the expensive BLS verify (per spec
         // validate_light_client_update; mirrors the Java gate exactly).
         let store_period = self.store.current_period();
         let sig_period = self.store.period_of(update.signature_slot);
-        let have_next = self.store.next_sync_committee().is_some();
-        let applicable = if have_next {
-            sig_period == store_period || sig_period == store_period + 1
-        } else {
-            sig_period == store_period
-        };
-        if !applicable {
+        // The aggregate is signed by the committee of signature_slot's PERIOD
+        // (spec validate_light_client_update): our current committee for
+        // store_period, the held next committee for store_period + 1, nothing
+        // for anything else. Selecting the keys IS the gate. Verifying both
+        // admitted periods with the current keys rejected genuine
+        // next-committee updates before rotation and accepted a
+        // current-committee signature whose unsigned signature_slot had been
+        // relabelled into the next period (#423).
+        let Some(committee) = self.committee_for(sig_period) else {
+            tracing::debug!(store_period, sig_period,
+                have_next = self.store.next_sync_committee().is_some(),
+                signature_slot = update.signature_slot,
+                attested_slot = update.attested_header.beacon.slot,
+                "update rejected: not applicable to the store's period");
             return false;
-        }
+        };
 
+        let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
             committee,
             &update.attested_header.beacon,
-            &self.fork_version,
+            &fork_version,
             &self.genesis_validators_root,
         ) {
+            tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
+                signature_slot = update.signature_slot,
+                attested_slot = update.attested_header.beacon.slot,
+                participants = update.sync_aggregate.count_participants(),
+                fork_version = ?fork_version,
+                "update rejected: sync-aggregate BLS verification failed");
             return false;
         }
 
@@ -234,12 +260,20 @@ impl LightClientProcessor {
             spec::finalized_root_gindex(depth),
             &update.attested_header.beacon.state_root,
         ) {
+            tracing::debug!(depth,
+                finalized_slot = update.finalized_header.beacon.slot,
+                attested_slot = update.attested_header.beacon.slot,
+                "update rejected: finality branch does not verify");
             return false;
         }
 
         if !Self::verify_execution_branch(&update.attested_header)
             || !Self::verify_execution_branch(&update.finalized_header)
         {
+            tracing::debug!(
+                attested_slot = update.attested_header.beacon.slot,
+                finalized_slot = update.finalized_header.beacon.slot,
+                "update rejected: execution branch does not verify");
             return false;
         }
 
@@ -253,6 +287,9 @@ impl LightClientProcessor {
                 spec::next_sync_committee_gindex(depth),
                 &update.attested_header.beacon.state_root,
             ) {
+                tracing::debug!(depth,
+                    attested_slot = update.attested_header.beacon.slot,
+                    "update rejected: next-sync-committee branch does not verify");
                 return false;
             }
             self.store
@@ -267,18 +304,52 @@ impl LightClientProcessor {
         true
     }
 
+    /// The committee that signs `sig_period`: the store's current committee
+    /// for its own period, the held next committee for the period after,
+    /// `None` otherwise (spec validate_light_client_update's applicability +
+    /// key selection in one place).
+    fn committee_for(&self, sig_period: u64) -> Option<&SyncCommittee> {
+        let store_period = self.store.current_period();
+        if sig_period == store_period {
+            self.store.current_sync_committee()
+        } else if sig_period == store_period + 1 {
+            self.store.next_sync_committee()
+        } else {
+            None
+        }
+    }
+
     pub fn process_finality_update(&mut self, update: &LightClientFinalityUpdate) -> bool {
-        let Some(committee) = self.store.current_sync_committee() else {
+        if self.store.current_sync_committee().is_none() {
+            return false;
+        }
+        // Same period rule as process_update. This path had no gate at all and
+        // always used the current keys, so with the store at P holding next
+        // and a P+1-signed finality update in hand — the hunt path while
+        // catch-up is starved, or a local clock lagging the chain — the update
+        // was rejected until a catch-up round happened to force-rotate.
+        let store_period = self.store.current_period();
+        let sig_period = self.store.period_of(update.signature_slot);
+        let Some(committee) = self.committee_for(sig_period) else {
+            tracing::debug!(store_period, sig_period,
+                signature_slot = update.signature_slot,
+                "finality update rejected: not applicable to the store's period");
             return false;
         };
 
+        let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
             committee,
             &update.attested_header.beacon,
-            &self.fork_version,
+            &fork_version,
             &self.genesis_validators_root,
         ) {
+            tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
+                signature_slot = update.signature_slot,
+                attested_slot = update.attested_header.beacon.slot,
+                fork_version = ?fork_version,
+                "finality update rejected: sync-aggregate BLS verification failed");
             return false;
         }
 

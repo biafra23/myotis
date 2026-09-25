@@ -98,27 +98,78 @@ impl Write for RingWriter {
 mod tests {
     use super::*;
 
-    /// One sequential test: the ring is a process-global (that's the point —
-    /// one drain surface per engine), so separate #[test] fns would race each
-    /// other under the parallel test runner.
+    /// One test for the ring, written to survive company: the ring is a
+    /// process-global (that's the point — one drain surface per engine), and
+    /// the crate's test binary runs every #[test] in parallel threads, one of
+    /// which (`capi::tests`, `myotis_init()`) installs the global tracing
+    /// subscriber that writes into THIS ring. From that moment every tracing
+    /// event any other test emits lands here too, interleaved with the lines
+    /// below — so the assertions are about our own lines' order and the
+    /// ring's bound, never about the ring holding exactly what we wrote
+    /// (that version failed in CI whenever the scheduler let a foreign line
+    /// in: run 35075614985, where one foreign entry evicted one extra line of
+    /// ours and `drain(1)` returned "line 11"). It does assume no other test
+    /// DRAINS the ring — nothing calls the drain FFI today; a test of that
+    /// would have to serialize with this one.
     #[test]
     fn drains_oldest_first_bounded_and_empties() {
         // Write directly through the writer (installing the global subscriber
         // in tests would race other tests' tracing setup).
-        let _ = drain(usize::MAX); // isolate from any earlier writes
+        let _ = drain(usize::MAX); // start from our own clean slate
         let mut w = RingWriter;
         w.write_all(b"first line\n").unwrap();
         w.write_all(b"second line\n").unwrap();
-        let batch = drain(10);
-        assert!(batch.starts_with("first line"), "{batch}");
-        assert!(batch.ends_with("second line"), "{batch}");
-        assert_eq!(drain(10), "", "drained ring must be empty");
+        let batch = drain(usize::MAX);
+        let first = batch.find("first line").expect("first line drained");
+        let second = batch.find("second line").expect("second line drained");
+        assert!(first < second, "oldest first: {batch}");
+        assert!(
+            !batch.ends_with('\n'),
+            "no trailing newline — the Java side splits on '\\n'"
+        );
+        assert!(
+            !drain(usize::MAX).contains("first line"),
+            "a drained line must not come back"
+        );
 
+        // Overflow the ring by 10 of our own lines: the oldest 10 (at least —
+        // foreign lines can push out more of ours, never fewer) must be gone,
+        // the newest must be there, and the ring must never hold more than
+        // CAPACITY lines in total.
         for i in 0..(CAPACITY + 10) {
             w.write_all(format!("line {i}\n").as_bytes()).unwrap();
         }
-        let first = drain(1);
-        assert_eq!(first, "line 10", "oldest 10 lines must have dropped");
+        // The bound, checked on the ring itself: counting lines of the drained
+        // string would miscount a foreign entry that carried an embedded
+        // newline (the writer stores one entry per event, newlines and all).
+        assert!(
+            ring().lock().unwrap().len() <= CAPACITY,
+            "the ring is bounded at CAPACITY"
+        );
+        let drained = drain(usize::MAX);
+        let ours: Vec<usize> = drained
+            .lines()
+            .filter_map(|l| l.strip_prefix("line ").and_then(|n| n.parse().ok()))
+            .collect();
+        assert!(!ours.is_empty(), "our lines drained: {drained}");
+        assert!(*ours.iter().min().unwrap() >= 10, "oldest 10 lines must have dropped: {ours:?}");
+        assert_eq!(*ours.iter().max().unwrap(), CAPACITY + 9, "newest line kept");
+        assert!(ours.windows(2).all(|p| p[0] < p[1]), "oldest first, in write order");
+
+        // max < len: the clamp (`n = ring.len().min(max)`) is the path every host
+        // actually runs — the daemon drains 1000, desktop and iOS 500, against a
+        // CAPACITY of 4096 — so a burst that outruns the poll always lands here.
+        // Company-safe: `one` may be a foreign line, but it can never be "clamp
+        // newer", whose elder is still queued ahead of it.
+        w.write_all(b"clamp older\n").unwrap();
+        w.write_all(b"clamp newer\n").unwrap();
+        let one = drain(1);
+        assert_eq!(one.lines().count(), 1, "drain(1) pops exactly one entry: {one}");
+        assert!(!one.contains("clamp newer"), "drain(1) pops the OLDEST entry: {one}");
+        assert!(
+            drain(usize::MAX).contains("clamp newer"),
+            "an entry the clamp left behind must still be there"
+        );
         let _ = drain(usize::MAX);
     }
 }

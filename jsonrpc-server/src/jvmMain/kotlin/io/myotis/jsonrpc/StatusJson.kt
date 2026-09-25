@@ -36,6 +36,11 @@ internal object StatusJson {
         put("connectedPeers", s.connectedPeers())
         put("readyPeers", s.readyPeers())
         put("snapPeers", s.snapPeers())
+        // The pooled snap peers that can answer a verified read at the anchored
+        // head NOW (#465): what a wallet should gate its first read on — a pool
+        // of peers still syncing themselves keeps snapPeers positive for hours
+        // while every read fails. Same position as the IPC shape.
+        put("snapServingPeers", s.snapServingPeers())
         put("backedOffPeers", s.backedOffPeers())
         put("blacklistedPeers", s.blacklistedPeers())
         put("pauseCount", s.pauseCount())
@@ -46,21 +51,39 @@ internal object StatusJson {
         if (reason == null) put("lastWakeReason", JsonNull) else put("lastWakeReason", reason)
     }
 
-    /** Mirrors CommandHandler.handleBeaconStatus, incl. its SYNCING-vs-synced branch. */
+    /** Mirrors CommandHandler.handleBeaconStatus, incl. its STALE_ANCHOR and
+     *  SYNCING-vs-synced branches. */
     fun beaconStatus(bs: BeaconStatus, uptimeSeconds: Long): JsonObject = buildJsonObject {
         val syncing = bs.state() == BeaconState.SYNCING || bs.state() == BeaconState.STARTING
+        val staleAnchor = bs.state() == BeaconState.STALE_ANCHOR
         put("ok", true)
         put("state", if (syncing) "SYNCING" else bs.state().name)
         // periodProgress
         put("currentPeriod", bs.currentPeriod())
         put("targetPeriod", bs.targetPeriod())
+        if (staleAnchor) {
+            // Parked pre-bootstrap: currentPeriod IS the refused anchor's period.
+            val age = bs.targetPeriod() - bs.currentPeriod()
+            put("anchorPeriod", bs.currentPeriod())
+            put("anchorAgePeriods", age)
+            put("wsBoundPeriods", bs.wsBoundPeriods())
+            put(
+                "warning",
+                "trust anchor is $age sync-committee periods old, past the weak-subjectivity " +
+                    "bound of ${bs.wsBoundPeriods()}; syncing refused. Refresh the checkpoint / " +
+                    "update the binary, raise the bound (-Dmyotis.beacon.wsBoundPeriods=N), or " +
+                    "send accept-stale-anchor to sync anyway at your own risk",
+            )
+        }
         // peerStats
         put("uptimeSeconds", uptimeSeconds)
         put("discoveredPeers", bs.discv5TableSize())
         put("connectedPeers", bs.connectedPeers())
         put("lightClientPeers", bs.lightClientPeers())
         put("servedPeersLastMinute", bs.servedPeersLastMinute())
-        if (syncing) {
+        if (staleAnchor) {
+            // Nothing verified yet — no finalized/synced fields, matching the IPC shape.
+        } else if (syncing) {
             put("finalizedSlot", 0)
             put("optimisticSlot", 0)
             put("executionStateRoot", JsonNull)
@@ -76,6 +99,7 @@ internal object StatusJson {
             put("executionBlockNumber", bs.executionBlockNumber())
             put("knownStateRoots", bs.knownStateRoots())
             put("fillThreshold", bs.fillThreshold())
+            put("wsBoundPeriods", bs.wsBoundPeriods())
         }
         put("peers", beaconPeers(bs.peers()))
     }

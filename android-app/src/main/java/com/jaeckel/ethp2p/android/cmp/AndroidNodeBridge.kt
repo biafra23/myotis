@@ -63,7 +63,10 @@ class AndroidNodeController(
         while (true) {
             emit(serviceProvider()?.let { svc ->
                 svc.snapshots().mapValues { (net, s) ->
-                    s.toModel().copy(logIndexJson = svc.logIndexStatusJsonOrNull(net))
+                    s.toModel().copy(
+                        logIndexJson = svc.logIndexStatusJsonOrNull(net),
+                        readStatsJson = svc.readStatsJsonOrNull(net),
+                    )
                 }
             } ?: emptyMap())
             delay(2000)
@@ -105,6 +108,8 @@ class AndroidNodeController(
     override fun shutdown() { serviceProvider()?.shutdown() }
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
+    override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
+    override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 
     override val canImportLogIndex: Boolean get() = pickFiles != null
@@ -292,6 +297,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     elHunting = elHunting(),
     rpcPort = rpcPort(),
     rpcServing = rpcServing(),
+    wsBoundPeriods = wsBoundPeriods(),
     upgrade = upgradeAdvisory()?.let {
         UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
     },
@@ -310,10 +316,20 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setLogIndexEnabled(network: String, on: Boolean) = NodeService.setLogIndexEnabled(ctx, network, on)
     override fun logIndexMaxSpeed(network: String): Boolean = NodeService.logIndexMaxSpeed(ctx, network)
     override fun setLogIndexMaxSpeed(network: String, on: Boolean) = NodeService.setLogIndexMaxSpeed(ctx, network, on)
+    override fun logIndexBackfillPaused(network: String): Boolean =
+        NodeService.logIndexBackfillPaused(ctx, network)
+    override fun setLogIndexBackfillPaused(network: String, on: Boolean) =
+        NodeService.setLogIndexBackfillPaused(ctx, network, on)
+    override fun logIndexConfigured(network: String): Boolean = NodeService.logIndexConfigured(ctx, network)
+    override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
+    override fun setLogIndexWatchJson(network: String, json: String) =
+        NodeService.setLogIndexWatchJson(ctx, network, json)
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
     override fun setServedBlockWindow(v: Int) = NodeService.setServedBlockWindowPref(ctx, v)
+    override fun wsBoundPeriods(): Int = NodeService.wsBoundPeriods(ctx)
+    override fun setWsBoundPeriods(v: Int) = NodeService.setWsBoundPeriodsPref(ctx, v)
 
     override fun displayName(network: String): String = NodeService.displayName(network)
     override fun defaultRpcPort(network: String): Int = NodeService.defaultRpcPort(network)
@@ -325,8 +341,9 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setStrictStateFreshness(v: Boolean) = NodeService.setStrictStateFreshness(ctx, v)
     override fun nativeBlsEnabled(): Boolean = NodeService.nativeBlsEnabled(ctx)
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
-    override fun rustEngineEnabled(): Boolean = NodeService.rustEngineEnabled(ctx)
-    override fun setRustEngineEnabled(v: Boolean) = NodeService.setRustEngineEnabled(ctx, v)
+    override fun preferJavaEngine(): Boolean = NodeService.preferJavaEngine(ctx)
+    override fun setPreferJavaEngine(v: Boolean) = NodeService.setPreferJavaEngine(ctx, v)
+    override fun javaEngineUnavailableReason(): String? = NodeService.javaEngineUnavailableReason()
 
     override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
     override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)

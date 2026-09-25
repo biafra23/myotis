@@ -46,6 +46,9 @@ class IosRpcStatusSource(
             if (o.containsKey("peerCount")) put("connectedPeers", o.engineLong("peerCount"))
             put("readyPeers", snapPeers)
             put("snapPeers", snapPeers)
+            // ABI >= 31: the pooled peers that can answer at the anchored head
+            // now — what a wallet gates its first read on (#465).
+            put("snapServingPeers", o.engineLong("snapServingPeers"))
             put("backedOffPeers", o.engineLong("backedOffPeers"))
             put("blacklistedPeers", o.engineLong("blacklistedPeers"))
             // Idle-sleep isn't wired on iOS yet — metrics report the JVM shape's zeros.
@@ -86,11 +89,13 @@ class IosRpcStatusSource(
                 put("finalizedPeriod", o.engineLong("finalizedSlot") / 8192L)
                 put("syncCommitteePeriod", currentPeriod)
                 put("wallClockPeriod", targetPeriod)
-                // The Rust engine doesn't expose the EL anchor / state-root cache
-                // introspection over the FFI (JNI parity: RustChainHandle reports
-                // the same empties).
+                // The finalized payload's block from the beacon anchor — the same
+                // status-JSON field RustChainHandle maps (missing key → 0; never
+                // the optimistic head). The exec state root / state-root cache
+                // introspection stay unexposed over the FFI (JNI parity: the JVM
+                // adapter reports the same empties).
                 put("executionStateRoot", JsonNull)
-                put("executionBlockNumber", 0)
+                put("executionBlockNumber", o.engineLong("finalizedBlockNumber"))
                 put("knownStateRoots", 0)
                 put("fillThreshold", 0)
             }

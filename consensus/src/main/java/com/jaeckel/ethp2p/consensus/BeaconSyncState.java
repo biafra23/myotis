@@ -46,9 +46,15 @@ public class BeaconSyncState {
      *       crossed into a sync-committee period we don't hold.</li>
      *   <li>{@link #SYNCED} — verification-ready: window populated and committee current.
      *       Can regress back to {@link #CATCHING_UP} if we fall behind; not latched.</li>
+     *   <li>{@link #STALE_ANCHOR} — syncing is REFUSED: the best available trust anchor
+     *       (embedded checkpoint or persisted snapshot, whichever is newer) is older than
+     *       the weak-subjectivity bound, so an attacker holding keys of since-exited sync
+     *       committee members could in principle serve a validly signed forged
+     *       continuation. Waits for the user to raise the bound or explicitly accept the
+     *       risk; verified queries fail closed meanwhile.</li>
      * </ul>
      */
-    public enum State { SYNCING, CATCHING_UP, SYNCED }
+    public enum State { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
 
     private record InnerState(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
                           long executionBlockNumber, byte[] executionBlockHash,
@@ -73,6 +79,15 @@ public class BeaconSyncState {
      *  moved, so {@code (current - start) / (target - start)} is a stable progress fraction.
      *  -1 until the first rotation is recorded. */
     private volatile long catchUpStartPeriod = -1L;
+
+    /** Period of the trust anchor a stale-anchor park is refusing to sync from, or -1
+     *  when not parked. Set/cleared by {@code BeaconLightClient.awaitAnchorFreshness}. */
+    private volatile long staleAnchorPeriod = -1L;
+
+    /** The weak-subjectivity bound (periods) currently enforced — host override if set,
+     *  else the network default. Published for status surfaces; 0 until the light
+     *  client records it at sync start. */
+    private volatile long wsBoundPeriods = 0L;
 
     /** Rolling window of recently seen execution state roots from beacon headers. */
     private final ConcurrentLinkedDeque<SlottedStateRoot> knownStateRoots = new ConcurrentLinkedDeque<>();
@@ -260,6 +275,9 @@ public class BeaconSyncState {
      * @param secondsPerSlot network slot time (mainnet 12, Gnosis 5) for wall-clock period estimation
      */
     public State getSyncState(long clGenesisTime, int secondsPerSlot) {
+        if (staleAnchorPeriod >= 0) {
+            return State.STALE_ANCHOR;
+        }
         if (!isSynced()) {
             return State.SYNCING;
         }
@@ -271,6 +289,32 @@ public class BeaconSyncState {
             return State.CATCHING_UP;
         }
         return State.SYNCED;
+    }
+
+    /** Enter the stale-anchor park: report {@link State#STALE_ANCHOR} and remember which
+     *  anchor period was refused (status surfaces show it as the current period). */
+    public void markStaleAnchor(long anchorPeriod) {
+        this.staleAnchorPeriod = Math.max(0L, anchorPeriod);
+    }
+
+    /** Leave the stale-anchor park (bound raised, risk accepted, or anchor fresh). */
+    public void clearStaleAnchor() {
+        this.staleAnchorPeriod = -1L;
+    }
+
+    /** Anchor period a stale-anchor park is refusing, or -1 when not parked. */
+    public long getStaleAnchorPeriod() {
+        return staleAnchorPeriod;
+    }
+
+    /** Record the effective weak-subjectivity bound for status surfaces. */
+    public void setWsBoundPeriods(long periods) {
+        this.wsBoundPeriods = Math.max(0L, periods);
+    }
+
+    /** The weak-subjectivity bound (periods) currently enforced; 0 until recorded. */
+    public long getWsBoundPeriods() {
+        return wsBoundPeriods;
     }
 
     /**

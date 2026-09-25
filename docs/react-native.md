@@ -26,7 +26,8 @@ The integration builds on three assets:
 
    > **Note (updated):** `:android-app` no longer commits the `.so` binaries.
    > It builds the Rust engine **from source** by default (cargo + cargo-ndk +
-   > NDK required; `-PskipRustEngine` opts out to the Java engine). The
+   > NDK required; `-PskipRustEngine` opts out to the Java engine, which boots
+   > only on Android 13 / API 33 and newer — below that the app is Rust-only). The
    > "committed jniLibs as a no-toolchain fallback" model described in this
    > proposal is stale; an RN package can still ship prebuilt binaries **in its
    > published npm tarball** without committing them to git — decide that

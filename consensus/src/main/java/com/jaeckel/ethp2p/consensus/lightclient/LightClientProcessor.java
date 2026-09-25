@@ -1,6 +1,7 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
@@ -19,7 +20,11 @@ public class LightClientProcessor {
     private static final Logger log = LoggerFactory.getLogger(LightClientProcessor.class);
 
     private final LightClientStore store;
-    private final byte[] forkVersion;
+    /** Per-slot signing-domain selector. Every update is verified under the fork
+     *  active at its {@code signatureSlot} (spec {@code validate_light_client_update}),
+     *  so the store can walk updates across a fork boundary — a single fixed version
+     *  rejects everything signed on the other side of it (#295). */
+    private final ForkSchedule forkSchedule;
     private final byte[] genesisValidatorsRoot;
 
     /** Aggregate signature of the last successfully applied finality update. The
@@ -30,13 +35,30 @@ public class LightClientProcessor {
      *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
      *  core re-proving the same update. */
     private volatile byte[] lastAppliedFinalitySig;
+    /** The signature slot that {@link #lastAppliedFinalitySig} was applied under. The slot is not
+     *  covered by the signature, so the memo must key on both: the same aggregate relabelled into
+     *  another period is a different update that has to face the period gate and the next
+     *  committee's keys (#423), not the memo — and a memo hit must never be a verdict that
+     *  re-verification would not reach. */
+    private volatile long lastAppliedFinalitySigSlot = -1;
 
-    public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
+    public LightClientProcessor(LightClientStore store, ForkSchedule forkSchedule, byte[] genesisValidatorsRoot) {
         this.store = store;
-        this.forkVersion = forkVersion.clone();
+        this.forkSchedule = java.util.Objects.requireNonNull(forkSchedule, "forkSchedule");
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
-        log.info("[lc-processor] Initialized with forkVersion={}, fv[0]={}, id={}",
-                bytesToHex(this.forkVersion), this.forkVersion[0], System.identityHashCode(this.forkVersion));
+        log.info("[lc-processor] Initialized with forkSchedule={}", forkSchedule);
+    }
+
+    /**
+     * The committee that signs {@code sigPeriod}: the store's current committee for its own
+     * period, the held next committee for the period after, {@code null} otherwise (spec
+     * validate_light_client_update's applicability + key selection in one place).
+     */
+    private SyncCommittee committeeFor(long sigPeriod) {
+        long storePeriod = store.getCurrentSyncCommitteePeriod();
+        if (sigPeriod == storePeriod) return store.getCurrentSyncCommittee();
+        if (sigPeriod == storePeriod + 1) return store.getNextSyncCommittee();
+        return null;
     }
 
     /**
@@ -63,9 +85,26 @@ public class LightClientProcessor {
         long finalizedSlot = update.finalizedHeader().beacon().slot();
         int participation = update.syncAggregate().countParticipants();
 
+        // Same period rule as processUpdate, and BEFORE the duplicate memo, so a memo hit
+        // can never be a verdict that re-verification would not reach. This path had no
+        // gate at all and always
+        // used the current keys, so with the store at P holding next and a P+1-signed
+        // finality update in hand (a local clock lagging the chain; the Rust engine's
+        // hunt path while catch-up is starved) the update was rejected until a
+        // catch-up round happened to force-rotate.
+        long storePeriod = store.getCurrentSyncCommitteePeriod();
+        long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
+        committee = committeeFor(sigPeriod);
+        if (committee == null) {
+            log.debug("[lc-processor] Finality update rejected: signaturePeriod={} not applicable to "
+                    + "storePeriod={} (attestedSlot={})", sigPeriod, storePeriod, attestedSlot);
+            return false;
+        }
+
         byte[] sig = update.syncAggregate().syncCommitteeSignature();
         byte[] lastSig = lastAppliedFinalitySig;
-        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)) {
+        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)
+                && lastAppliedFinalitySigSlot == update.signatureSlot()) {
             log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
                     + "(attestedSlot={}) — skipping re-verify", attestedSlot);
             return true;
@@ -76,7 +115,9 @@ public class LightClientProcessor {
                 attestedSlot, finalizedSlot, update.signatureSlot(),
                 participation, update.finalityBranch().length);
 
-        // Verify sync aggregate over attested header
+        // Verify sync aggregate over attested header, under the fork active at
+        // the signature slot (spec: compute_fork_version(epoch(max(sig_slot,1)-1))).
+        byte[] forkVersion = forkSchedule.versionForSignatureSlot(update.signatureSlot());
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),
                 committee,
@@ -84,9 +125,9 @@ public class LightClientProcessor {
                 forkVersion,
                 genesisValidatorsRoot)) {
             log.debug("[lc-processor] Finality update rejected: BLS verification failed " +
-                    "(attestedSlot={}, forkVersion={}, fv[0]={}, id={}, participation={})",
-                    attestedSlot, bytesToHex(forkVersion), forkVersion[0],
-                    System.identityHashCode(forkVersion), participation);
+                    "(attestedSlot={}, signatureSlot={}, usedNext={}, forkVersion={}, participation={})",
+                    attestedSlot, update.signatureSlot(), sigPeriod != storePeriod,
+                    bytesToHex(forkVersion), participation);
             return false;
         }
 
@@ -135,6 +176,7 @@ public class LightClientProcessor {
         }
 
         lastAppliedFinalitySig = sig.clone();
+        lastAppliedFinalitySigSlot = update.signatureSlot();
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }
@@ -166,9 +208,9 @@ public class LightClientProcessor {
 
         // Cheap applicability gate BEFORE the expensive BLS verify. An update's
         // sync aggregate is signed by the committee of signature_slot's period,
-        // so it can only verify against our current committee when that period
-        // matches store_period (or store_period+1 once we already hold the next
-        // committee) — per spec validate_light_client_update. This is critical
+        // so it can only verify against the committee of THAT period: ours for
+        // store_period, the held next one for store_period+1 — per spec
+        // validate_light_client_update. This is critical
         // on Android: each BLS sync-aggregate verify costs ~17-30s on ART, and a
         // catch-up updates_by_range response routinely contains far-future
         // periods (e.g. period 1766 while the store is at 1728). Without this
@@ -176,26 +218,31 @@ public class LightClientProcessor {
         // check, so catch-up from an old checkpoint never makes progress.
         long storePeriod = store.getCurrentSyncCommitteePeriod();
         long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
-        boolean haveNext = store.getNextSyncCommittee() != null;
-        boolean applicable = haveNext
-                ? (sigPeriod == storePeriod || sigPeriod == storePeriod + 1)
-                : (sigPeriod == storePeriod);
-        if (!applicable) {
+        // Selecting the keys IS the gate. Verifying both admitted periods with the
+        // current keys rejected genuine next-committee updates before rotation and
+        // accepted a current-committee signature whose unsigned signatureSlot had
+        // been relabelled into the next period (#423).
+        committee = committeeFor(sigPeriod);
+        if (committee == null) {
             log.debug("[lc-processor] Update skipped pre-verify: signaturePeriod={} not applicable to "
                             + "storePeriod={} (haveNext={}, attestedSlot={})",
-                    sigPeriod, storePeriod, haveNext, attestedSlot);
+                    sigPeriod, storePeriod, store.getNextSyncCommittee() != null, attestedSlot);
             return false;
         }
 
-        // Verify sync aggregate over attested header
+        // Verify sync aggregate over attested header, under the fork active at
+        // the signature slot (see processFinalityUpdate).
+        byte[] forkVersion = forkSchedule.versionForSignatureSlot(update.signatureSlot());
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),
                 committee,
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
-            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}): BLS sync-aggregate verify failed",
-                    attestedSlot, finalizedSlot);
+            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}, signatureSlot={}, "
+                            + "usedNext={}, forkVersion={}): BLS sync-aggregate verify failed",
+                    attestedSlot, finalizedSlot, update.signatureSlot(), sigPeriod != storePeriod,
+                    bytesToHex(forkVersion));
             return false;
         }
 

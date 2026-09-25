@@ -57,8 +57,11 @@ class NetworkConfigGnosisTest {
                 Bytes.wrap(G.genesisValidatorsRoot()));
         assertEquals(4, G.currentForkVersion().length, "fork version must be 4 bytes");
         assertArrayEquals(new byte[]{0x06, 0x00, 0x00, 0x64}, G.currentForkVersion(), "Fulu fork version");
+        assertTrue(G.acceptPriorForkDigest());
         assertNotNull(G.priorForkVersion());
         assertArrayEquals(new byte[]{0x05, 0x00, 0x00, 0x64}, G.priorForkVersion(), "Electra prior fork version");
+        // The full schedule is pinned in NetworkConfigForkScheduleTest.
+        assertEquals(16, G.forkSchedule().slotsPerEpoch(), "schedule carries the gnosis geometry");
         assertEquals(32, G.checkpointRoot().length, "checkpoint root must be 32 bytes");
         assertTrue(G.checkpointSlot() > 0, "checkpoint slot must be set");
         // EIP-7892: Gnosis folds the Electra-baseline blob params into the Fulu digest.
@@ -140,21 +143,27 @@ class NetworkConfigGnosisTest {
 
     @Test
     void gnosisPinsHarvestedLcServers() {
-        // 22 Identify-confirmed LC servers from a long-running desktop cache
-        // (issue #291) — same list and ORDER as the Rust GNOSIS_STATIC_PEERS
-        // (sync.rs gnosis_config_matches_networkconfig_java pins the twin side).
+        // LC servers harvested from a long-running desktop cache (issue #291),
+        // pruned 2026-09-13 to the ones a census found serving — the per-entry
+        // evidence is in the Rust GNOSIS_STATIC_PEERS. The FULL list, order and
+        // addresses: the Rust twin (sync.rs gnosis_config_matches_networkconfig_java)
+        // pins the same strings, so a one-sided edit fails on whichever side
+        // diverges; this used to pin only the count and three positions.
+        // roost FIRST, by the netcup relay literal (188.68.32.16, static VPS in
+        // front of zbox).
         List<String> cl = G.clPeerMultiaddrs();
-        assertEquals(23, cl.size(), "22 harvested peers + roost, pinned by NAME only");
-        // roost FIRST, and by NAME — no literal behind it. A dynamic address is
-        // absorbed by DNS instead of by a second entry.
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh", cl.get(0));
-        // The harvested list is unchanged, just shifted by the one roost entry.
-        assertEquals("/ip4/104.37.190.86/tcp/15974/p2p/"
-                + "16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59", cl.get(1));
-        assertEquals("/ip4/164.152.161.131/tcp/9500/p2p/"
-                + "16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw", cl.get(22));
-        assertEquals(23, cl.stream().distinct().count());
-        assertEquals(23, cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
+        assertEquals(List.of(
+                "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+                "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
+                "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
+                "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
+                "/ip4/148.251.181.49/tcp/9000/p2p/16Uiu2HAmAWrwxf2murYQp1tdbwKbFwqUiVofwJ3xgJP5T7BLSpRa",
+                "/ip4/148.251.235.60/tcp/9001/p2p/16Uiu2HAmTeAHEG2tCFgC5RmrjZcw6zGeCgnE5svqM4528R5inSjA",
+                "/ip4/159.195.138.9/tcp/9000/p2p/16Uiu2HAmUimXaHiCvWhx2YuvwTkDLtca6oq1bCH85Eb6JcEYiaGi",
+                "/ip4/164.152.161.131/tcp/9500/p2p/16Uiu2HAmUNdWoUb47hazEeMaZF8nSRac13QxZoE9hE5X6EVN2cnw"),
+                cl,
+                "same list, order AND addresses as the Rust GNOSIS_STATIC_PEERS; roost first");
+        assertEquals(cl.size(), cl.stream().map(a -> a.substring(a.lastIndexOf('/') + 1)).distinct().count(),
                 "one address per peer id");
         for (String addr : cl) {
             assertTrue(addr.matches("/(ip4/\\d+\\.\\d+\\.\\d+\\.\\d+|dns4/[\\w.-]+)/tcp/\\d+/p2p/16Uiu2HA\\S+"), addr);
@@ -167,26 +176,20 @@ class NetworkConfigGnosisTest {
         // waiting on discovery. The CL entry must come FIRST: the light client walks
         // clPeerMultiaddrs in order, and this is the peer we know serves bootstraps.
         String enode = NetworkConfig.SEPOLIA.elBootEnodes().get(0);
-        assertTrue(enode.endsWith("@87.154.209.161:30405"), enode);
+        assertTrue(enode.endsWith("@188.68.32.16:30405"), enode);
 
         // roost, the dedicated light-client server, is tried first — that is the
-        // point of having it. The dedicated Nimbus stays behind it as fallback,
-        // so a roost fault degrades to the previous behaviour.
-        String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
-                "roost must be the first CL peer tried");
-        // POSITION, not presence: the Rust twin asserts index 1, and index is
-        // load-bearing on this side in particular — addPeer inserts every
-        // discovered peer at Math.min(1, size()), i.e. exactly the slot the
-        // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
-        // than anywhere else.
-        assertEquals("/ip4/87.154.209.161/tcp/9104/p2p/"
-                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
-                "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
-                        + "then degrades to exactly the previous behaviour");
-        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
-                "pinning must not drop the existing CL peers");
+        // point of having it. The census-verified public servers follow, so a
+        // roost fault degrades to working peers rather than to dead pins.
+        // The full list, in order — the Rust twin
+        // (sepolia_config_matches_networkconfig_java) pins the same strings.
+        assertEquals(List.of(
+                        "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                        "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+                        "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+                        "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"),
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
+                "roost first, then the census-verified public servers, same list as the Rust twin");
     }
 
     @Test
@@ -201,12 +204,20 @@ class NetworkConfigGnosisTest {
         // It also matters more here than in Rust: addPeer inserts discovered
         // peers at Math.min(1, size()), so presence-anywhere is a weak claim on
         // this side.
+        // The FULL list, order and addresses — the Rust twin
+        // (mainnet_config_matches_networkconfig_java) pins the same strings, so
+        // an address typo or one-sided IP rotation fails a test on WHICHEVER
+        // side diverges; count + element 0 alone let every later element drift
+        // machine-unchecked (PR #411 review).
         List<String> cl = NetworkConfig.MAINNET.clPeerMultiaddrs();
-        assertEquals("/dns4/be833f3590cd0388.dyndns.dappnode.io/tcp/9109/p2p/"
-                        + "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
-                cl.get(0),
-                "roost mainnet must be the first CL peer tried");
-        assertEquals(19, cl.size(),
-                "18 discovered peers + roost; pinning must not drop the fallbacks");
+        assertEquals(List.of(
+                "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+                "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
+                "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
+                "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
+                "/ip4/54.201.148.177/tcp/9000/p2p/16Uiu2HAmNwEsdBC2phX7qU7camNe9Gs21WyrpV5AZDYyjZBMYjWZ"),
+                cl,
+                "same list, order AND addresses as the Rust MAINNET_STATIC_PEERS; "
+                        + "roost mainnet must be the first CL peer tried");
     }
 }

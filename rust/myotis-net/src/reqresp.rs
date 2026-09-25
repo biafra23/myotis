@@ -25,7 +25,7 @@ use libp2p::identify;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
+use libp2p::{gossipsub, Multiaddr, PeerId, StreamProtocol, Swarm};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::codec;
@@ -278,6 +278,16 @@ pub struct Behaviour {
     // established connections so a peer flood can't exhaust fds/memory.
     pub limits: connection_limits::Behaviour,
     pub identify: identify::Behaviour,
+    /// Gossipsub with NO subscriptions. It exists so the `/meshsub/` protocol
+    /// negotiates on every connection: Lighthouse (v8.1.3–v8.2.2 verified in
+    /// `lighthouse_network/src/service/mod.rs`) reports a peer whose gossipsub
+    /// upgrade fails with `PeerAction::Fatal` ("does_not_support_gossipsub"),
+    /// which bans the peer id for 12 h after ONE goodbye (reason 0) and bans
+    /// the whole IP once more than five of its peer ids are banned. A wallet
+    /// therefore got exactly one first-contact connection per Lighthouse
+    /// node per start, and the IP ban after a handful of restarts. Negotiating
+    /// the protocol is all the check needs; the mesh is never joined.
+    pub gossipsub: gossipsub::Behaviour,
     pub status_v2: RR,
     pub status_v1: RR,
     pub ping: RR,
@@ -311,6 +321,17 @@ impl Behaviour {
                 identify::Config::new("eth2/1.0.0".into(), local_public_key)
                     .with_agent_version(concat!("myotis/", env!("CARGO_PKG_VERSION"), "-rs").into()),
             ),
+            // Anonymous on both sides matches the eth2 wire (StrictNoSign:
+            // messages carry no signature, key or seqno); nothing is ever
+            // published or subscribed, so this only shapes the handshake.
+            gossipsub: gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Anonymous,
+                gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .build()
+                    .expect("static gossipsub config"),
+            )
+            .expect("static gossipsub behaviour"),
             status_v2: rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT),
             status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),
             ping: rr(protocols::PING, ProtocolSupport::Full, RESP_TIMEOUT),
@@ -399,11 +420,12 @@ enum Command {
     Observe {
         peers: Vec<(PeerId, Multiaddr)>,
     },
-    /// One snapshot of both catch-up peer-selection inputs — the LC-server set
-    /// and the per-peer `earliest_available_slot` map — so a round fetches them
-    /// in a single swarm round-trip instead of two.
+    /// One snapshot of the catch-up peer-selection inputs — the LC-server set,
+    /// the per-peer `earliest_available_slot` map, and the per-peer Identify
+    /// agent — so a round fetches them in a single swarm round-trip instead of
+    /// three.
     CatchupMeta {
-        reply: oneshot::Sender<(HashSet<PeerId>, HashMap<PeerId, u64>)>,
+        reply: oneshot::Sender<CatchupPeerMeta>,
     },
     Shutdown,
 }
@@ -506,15 +528,16 @@ impl ReqRespClient {
         rx.await.unwrap_or_default()
     }
 
-    /// Both catch-up peer-selection inputs in one round-trip: the set of
-    /// Identify-confirmed LC servers, and `earliest_available_slot` per peer
-    /// (from the auto-Status exchange). Peers absent from the earliest map
-    /// haven't completed Status yet (unknown — never skipped); a v1 peer
-    /// reports 0 (history from genesis).
-    pub async fn catchup_peer_meta(&self) -> (HashSet<PeerId>, HashMap<PeerId, u64>) {
+    /// The catch-up peer-selection inputs in one round-trip: the set of
+    /// Identify-confirmed LC servers, `earliest_available_slot` per peer
+    /// (from the auto-Status exchange), and each peer's Identify agent string.
+    /// Peers absent from the earliest map haven't completed Status yet
+    /// (unknown — never skipped); a v1 peer reports 0 (history from genesis).
+    /// Peers absent from the agent map haven't completed Identify yet.
+    pub async fn catchup_peer_meta(&self) -> CatchupPeerMeta {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::CatchupMeta { reply }).await.is_err() {
-            return (HashSet::new(), HashMap::new());
+            return CatchupPeerMeta::default();
         }
         rx.await.unwrap_or_default()
     }
@@ -522,6 +545,14 @@ impl ReqRespClient {
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown).await;
     }
+}
+
+/// Catch-up peer-selection inputs (see `ReqRespClient::catchup_peer_meta`).
+#[derive(Debug, Default, Clone)]
+pub struct CatchupPeerMeta {
+    pub lc_servers: HashSet<PeerId>,
+    pub earliest_slots: HashMap<PeerId, u64>,
+    pub agents: HashMap<PeerId, String>,
 }
 
 /// Shared local view the responder answers from. The sync loop refreshes it as
@@ -976,7 +1007,17 @@ struct QueuedRequest {
 }
 
 struct SwarmCtx {
-    pending: HashMap<OutboundRequestId, Pending>,
+    /// What each outstanding outbound request's outcome completes.
+    ///
+    /// Keyed by (protocol, id) for the same reason as `in_flight`:
+    /// `OutboundRequestId` is issued PER behaviour, each counting from 1. Keyed
+    /// on the id alone, a new peer's auto-Status and a bootstrap to another peer
+    /// could share an id. The second insert evicted the first entry — a caller
+    /// saw "service shut down", an auto-Status never settled and stranded the
+    /// requests parked behind it — and the first outcome to arrive completed
+    /// the survivor, handing a bootstrap caller Status bytes. Only
+    /// [`send_tracked`] inserts, so a key always names the behaviour that issued it.
+    pending: HashMap<(&'static str, OutboundRequestId), Pending>,
     connected: HashSet<PeerId>,
     /// Peers we dialed BY NAME, and the name used. Logging only — cleared when
     /// the dial resolves one way or the other.
@@ -990,6 +1031,9 @@ struct SwarmCtx {
     lc_servers: HashSet<PeerId>,
     /// `earliest_available_slot` learned from each peer's auto-Status reply.
     peer_earliest: HashMap<PeerId, u64>,
+    /// Identify `agent_version` per peer — the catch-up fan-out sizes its
+    /// request per client family from this (see `sync::agent_serves_one_period`).
+    peer_agents: HashMap<PeerId, String>,
     local_status: Arc<LocalStatus>,
     /// Present only on a serving host; `None` on a wallet, where the
     /// light-client protocols answer `ResourceUnavailable` as before.
@@ -1017,27 +1061,34 @@ struct SwarmCtx {
     peer_source_ips: HashMap<PeerId, (IpAddr, bool)>,
 }
 
+impl SwarmCtx {
+    fn new(local_status: Arc<LocalStatus>, lc: Option<Arc<dyn LcResponder>>) -> Self {
+        Self {
+            pending: HashMap::new(),
+            connected: HashSet::new(),
+            dns_dials: HashMap::new(),
+            status_done: HashSet::new(),
+            queued: HashMap::new(),
+            lc_servers: HashSet::new(),
+            peer_earliest: HashMap::new(),
+            peer_agents: HashMap::new(),
+            local_status,
+            lc,
+            in_flight: HashMap::new(),
+            in_flight_bytes: 0,
+            observed_ips: HashMap::new(),
+            peer_source_ips: HashMap::new(),
+        }
+    }
+}
+
 async fn run_swarm(
     mut swarm: Swarm<Behaviour>,
     mut rx: mpsc::Receiver<Command>,
     local_status: Arc<LocalStatus>,
     lc: Option<Arc<dyn LcResponder>>,
 ) {
-    let mut ctx = SwarmCtx {
-        pending: HashMap::new(),
-        connected: HashSet::new(),
-        dns_dials: HashMap::new(),
-        status_done: HashSet::new(),
-        queued: HashMap::new(),
-        lc_servers: HashSet::new(),
-        peer_earliest: HashMap::new(),
-        local_status,
-        lc,
-        in_flight: HashMap::new(),
-        in_flight_bytes: 0,
-        observed_ips: HashMap::new(),
-        peer_source_ips: HashMap::new(),
-    };
+    let mut ctx = SwarmCtx::new(local_status, lc);
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -1092,7 +1143,11 @@ async fn run_swarm(
                     }
                 }
                 Some(Command::CatchupMeta { reply }) => {
-                    let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
+                    let _ = reply.send(CatchupPeerMeta {
+                        lc_servers: ctx.lc_servers.clone(),
+                        earliest_slots: ctx.peer_earliest.clone(),
+                        agents: ctx.peer_agents.clone(),
+                    });
                 }
             },
             event = swarm.select_next_some() => handle_swarm_event(&mut swarm, &mut ctx, event),
@@ -1116,12 +1171,7 @@ fn submit_request(
     reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
 ) {
     if ctx.status_done.contains(&peer) {
-        let Some(rr) = behaviour_for(swarm, protocol) else {
-            let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
-            return;
-        };
-        let id = rr.send_request_with_addresses(&peer, wire, addrs);
-        ctx.pending.insert(id, Pending::External(reply));
+        send_tracked(swarm, ctx, peer, protocol, wire, addrs, Pending::External(reply));
         return;
     }
 
@@ -1169,6 +1219,32 @@ fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<
     })
 }
 
+/// Send `wire` on `protocol`'s behaviour and record what its outcome completes.
+///
+/// The only place a `pending` entry is created: the protocol that picks the
+/// behaviour is the protocol in the key, so a key can never name a behaviour
+/// other than the one that issued its id (see `SwarmCtx::pending`).
+fn send_tracked(
+    swarm: &mut Swarm<Behaviour>,
+    ctx: &mut SwarmCtx,
+    peer: PeerId,
+    protocol: &'static str,
+    wire: Vec<u8>,
+    addrs: Vec<Multiaddr>,
+    on_outcome: Pending,
+) {
+    let Some(rr) = behaviour_for(swarm, protocol) else {
+        // Only an external caller can name a protocol this host lacks; the
+        // auto-Status ones are this module's own constants.
+        if let Pending::External(reply) = on_outcome {
+            let _ = reply.send(Err(RequestError::Io(format!("unknown protocol {protocol}"))));
+        }
+        return;
+    };
+    let id = rr.send_request_with_addresses(&peer, wire, addrs);
+    ctx.pending.insert((protocol, id), on_outcome);
+}
+
 fn fail_queued(ctx: &mut SwarmCtx, peer: &PeerId, error: RequestError) {
     if let Some(queue) = ctx.queued.remove(peer) {
         for q in queue {
@@ -1182,12 +1258,7 @@ fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: Peer
     ctx.status_done.insert(peer);
     let Some(queue) = ctx.queued.remove(&peer) else { return };
     for q in queue {
-        let Some(rr) = behaviour_for(swarm, q.protocol) else {
-            let _ = q.reply.send(Err(RequestError::Io(format!("unknown protocol {}", q.protocol))));
-            continue;
-        };
-        let id = rr.send_request_with_addresses(&peer, q.wire, q.addrs);
-        ctx.pending.insert(id, Pending::External(q.reply));
+        send_tracked(swarm, ctx, peer, q.protocol, q.wire, q.addrs, Pending::External(q.reply));
     }
 }
 
@@ -1224,8 +1295,8 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // in the Java service). v2 first, v1 fallback on negotiation
                 // failure. Parked requests flush when it settles.
                 let wire = codec::encode_request(&ctx.local_status.get().encode());
-                let id = swarm.behaviour_mut().status_v2.send_request(&peer_id, wire);
-                ctx.pending.insert(id, Pending::AutoStatusV2(peer_id));
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V2, wire, Vec::new(),
+                    Pending::AutoStatusV2(peer_id));
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -1237,6 +1308,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // re-runs Identify + auto-Status and repopulates both).
                 ctx.status_done.remove(&peer_id);
                 ctx.lc_servers.remove(&peer_id);
+                ctx.peer_agents.remove(&peer_id);
                 ctx.peer_earliest.remove(&peer_id);
                 ctx.observed_ips.remove(&peer_id);
                 ctx.peer_source_ips.remove(&peer_id);
@@ -1285,10 +1357,14 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
                 ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
             }
+            ctx.peer_agents.insert(peer_id, info.agent_version.clone());
             tracing::debug!(peer = %peer_id, agent = %info.agent_version,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
         }
         E::Identify(_) => {}
+        // No subscriptions, so the only events are peers' subscription
+        // announcements and unsupported-protocol notices; none needs handling.
+        E::Gossipsub(_) => {}
         E::StatusV2(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V2, ev),
         E::StatusV1(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V1, ev),
         E::Ping(ev) => on_rr_event(swarm, ctx, protocols::PING, ev),
@@ -1307,7 +1383,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
             request_response::Message::Response { request_id, response } => {
-                complete(ctx, swarm, request_id, peer, Ok(response));
+                complete(ctx, swarm, protocol, request_id, peer, Ok(response));
             }
             request_response::Message::Request { request, channel, request_id, .. } => {
                 let mut response = respond_inbound(ctx, protocol, peer, &request);
@@ -1366,7 +1442,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 other => RequestError::Io(other.to_string()),
             };
             tracing::debug!(peer = %peer, protocol, error = %error, "outbound failure");
-            complete(ctx, swarm, request_id, peer, Err(mapped));
+            complete(ctx, swarm, protocol, request_id, peer, Err(mapped));
         }
         // Both terminal outcomes release the budget; missing either would leak it
         // and converge on a responder that refuses everything.
@@ -1383,13 +1459,27 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
 fn complete(
     ctx: &mut SwarmCtx,
     swarm: &mut Swarm<Behaviour>,
+    protocol: &'static str,
     request_id: OutboundRequestId,
-    _peer: PeerId,
+    peer: PeerId,
     result: Result<Vec<u8>, RequestError>,
 ) {
-    match ctx.pending.remove(&request_id) {
+    match ctx.pending.remove(&(protocol, request_id)) {
         Some(Pending::External(reply)) => {
             let _ = reply.send(result);
+        }
+        // Stale: the peer's LAST connection closed before this outcome arrived.
+        // libp2p yields `SwarmEvent::ConnectionClosed` first and the request's
+        // `OutboundFailure` on a later poll, so the close handler has already
+        // reset the peer and failed its parked requests. Settling it now would
+        // mark a disconnected peer Status-done, sending its next requests ahead
+        // of the next connection's own auto-Status. Nothing can reconnect the
+        // peer in between: queued behaviour events drain before the pool is
+        // polled again.
+        Some(Pending::AutoStatusV2(peer_id) | Pending::AutoStatusV1(peer_id))
+            if !ctx.connected.contains(&peer_id) =>
+        {
+            tracing::debug!(peer = %peer_id, protocol, "auto-status outcome after disconnect — ignored");
         }
         Some(Pending::AutoStatusV2(peer_id)) => match result {
             Ok(raw) => {
@@ -1402,8 +1492,8 @@ fn complete(
                 // v1-only peer (Nimbus bucket in the Java notes) — fall back.
                 let local = ctx.local_status.get();
                 let wire = codec::encode_request(&local.encode_v1());
-                let id = swarm.behaviour_mut().status_v1.send_request(&peer_id, wire);
-                ctx.pending.insert(id, Pending::AutoStatusV1(peer_id));
+                send_tracked(swarm, ctx, peer_id, protocols::STATUS_V1, wire, Vec::new(),
+                    Pending::AutoStatusV1(peer_id));
             }
             Err(e) => {
                 tracing::debug!(peer = %peer_id, error = %e, "auto-status v2 failed");
@@ -1423,7 +1513,10 @@ fn complete(
             }
             mark_status_done(swarm, ctx, peer_id);
         }
-        None => {}
+        None => {
+            tracing::debug!(peer = %peer, protocol, %request_id,
+                "outcome for an untracked outbound request — dropped");
+        }
     }
 }
 
@@ -1879,6 +1972,62 @@ mod dial_resolution_tests {
         std::sync::Mutex::new(HashMap::new())
     }
 
+    /// The Lighthouse-ban regression: a peer that has subscriptions to announce
+    /// (Lighthouse always does) opens a `/meshsub/` stream toward us right after
+    /// the connection is established. If our swarm cannot negotiate it, that
+    /// peer's gossipsub emits `GossipsubNotSupported` — which Lighthouse turns
+    /// into `PeerAction::Fatal` and a 12 h ban. Here peer A plays Lighthouse
+    /// (subscribed), peer B is our wallet host (no subscriptions), and the
+    /// negotiation must complete with B recorded as a gossipsub peer.
+    #[tokio::test]
+    async fn meshsub_negotiates_without_any_subscription() {
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm a");
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm b");
+        b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
+                break address;
+            }
+        };
+        a.behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub::IdentTopic::new(
+                "/eth2/00000000/light_client_finality_update/ssz_snappy",
+            ))
+            .unwrap();
+        a.dial(addr).unwrap();
+        let b_id = *b.local_peer_id();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = a.select_next_some() => {
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                        gossipsub::Event::GossipsubNotSupported { peer_id },
+                    )) = &ev
+                    {
+                        panic!("peer {peer_id} failed /meshsub/ negotiation — this is the Lighthouse ban");
+                    }
+                    // `peer_protocol` starts every peer as Floodsub and moves it to a
+                    // Gossipsub* kind once the stream negotiated (or NotSupported).
+                    if let Some((_, kind)) =
+                        a.behaviour().gossipsub.peer_protocol().find(|(p, _)| **p == b_id)
+                    {
+                        let kind = format!("{kind:?}");
+                        assert_ne!(kind, "NotSupported");
+                        if kind.starts_with("Gossipsub") {
+                            return;
+                        }
+                    }
+                }
+                _ = b.select_next_some() => {}
+                _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_plain_ip_address_passes_through_untouched() {
         let a: Multiaddr = "/ip4/87.154.209.161/tcp/9105/p2p/\
@@ -1986,5 +2135,246 @@ mod dns_change_detection_tests {
         a.sort();
         b.sort();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod pending_request_tests {
+    //! `OutboundRequestId` is unique only PER `request_response::Behaviour`, and
+    //! this host runs one behaviour per protocol, each counting from 1. These
+    //! drive the real dispatch (`submit_request`, the auto-Status on
+    //! `ConnectionEstablished`) and the real completion (`on_rr_event`) with
+    //! colliding ids, and check that every outcome reaches whoever asked for it.
+    use super::*;
+    use libp2p::core::transport::PortUse;
+    use libp2p::core::{ConnectedPoint, Endpoint};
+    use libp2p::swarm::ConnectionId;
+    use std::num::NonZeroU32;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    fn host() -> (Swarm<Behaviour>, SwarmCtx) {
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None))
+    }
+
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id()
+    }
+
+    fn addr() -> Multiaddr {
+        "/ip4/127.0.0.1/tcp/9000".parse().unwrap()
+    }
+
+    fn status(earliest_available_slot: u64) -> StatusMessage {
+        StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot,
+        }
+    }
+
+    /// The id every behaviour gives its FIRST request. `OutboundRequestId` has
+    /// no public constructor, so it is minted the way the host's behaviours mint
+    /// theirs — and checked to collide across two protocols, which is the
+    /// premise of every test here.
+    fn first_request_id() -> OutboundRequestId {
+        let p = peer();
+        let a = rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        let b = rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT).send_request(&p, Vec::new());
+        assert_eq!(a, b, "request ids no longer collide across behaviours — revisit these tests");
+        a
+    }
+
+    fn response(peer: PeerId, request_id: OutboundRequestId, bytes: &[u8]) -> RrEvent {
+        request_response::Event::Message {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            message: request_response::Message::Response { request_id, response: bytes.to_vec() },
+        }
+    }
+
+    fn failure(
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        error: request_response::OutboundFailure,
+    ) -> RrEvent {
+        request_response::Event::OutboundFailure {
+            peer,
+            connection_id: ConnectionId::new_unchecked(0),
+            request_id,
+            error,
+        }
+    }
+
+    fn dialer() -> ConnectedPoint {
+        ConnectedPoint::Dialer { address: addr(), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }
+    }
+
+    /// A new connection, which is what starts a peer's auto-Status.
+    fn connect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: dialer(),
+            num_established: NonZeroU32::MIN,
+            concurrent_dial_errors: None,
+            established_in: Duration::ZERO,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// The peer's LAST connection closing.
+    fn disconnect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
+        let event = SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: dialer(),
+            num_established: 0,
+            cause: None,
+        };
+        handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// Two protocols' first requests in flight together carry the same id. Keyed
+    /// on the id alone, the second insert dropped the first caller's reply
+    /// channel — which a caller sees as "service shut down" — and the bootstrap
+    /// response was handed to the finality caller.
+    #[tokio::test]
+    async fn first_requests_on_two_protocols_reach_their_own_callers() {
+        let (mut swarm, mut ctx) = host();
+        let p = peer();
+        let id = first_request_id();
+        ctx.status_done.insert(p); // an established peer: both dispatch at once
+        let (boot_tx, mut boot_rx) = oneshot::channel();
+        let (fin_tx, mut fin_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::BOOTSTRAP, vec![1], boot_tx);
+        submit_request(&mut swarm, &mut ctx, p, None, vec![addr()], protocols::FINALITY_UPDATE, Vec::new(), fin_tx);
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(p, id, b"bootstrap"));
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::FINALITY_UPDATE,
+            failure(p, id, request_response::OutboundFailure::Timeout),
+        );
+
+        assert_eq!(
+            boot_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "the bootstrap caller must get the bootstrap response"
+        );
+        assert_eq!(
+            fin_rx.try_recv(),
+            Ok(Err(RequestError::Timeout)),
+            "the finality caller must get its own outcome"
+        );
+        assert!(ctx.pending.is_empty(), "each outcome consumes its own entry");
+    }
+
+    /// The race the sync loop's fan-out produces: B connects while a bootstrap
+    /// to A is outstanding, so B's auto-Status and A's bootstrap are both id 1.
+    /// Keyed on the id alone, A was handed B's Status bytes as a successful
+    /// bootstrap (undecodable, so A gets struck) and B never settled, stranding
+    /// the request parked behind B's Status.
+    #[tokio::test]
+    async fn auto_status_and_a_request_to_another_peer_settle_independently() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        let (parked_tx, mut parked_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], parked_tx);
+        assert!(ctx.queued.contains_key(&b), "B's request waits for B's Status");
+
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![2], a_tx);
+
+        let b_status = codec::encode_success_response(&status(4242).encode(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V2, response(b, id, &b_status));
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+
+        assert_eq!(
+            a_rx.try_recv(),
+            Ok(Ok(b"bootstrap".to_vec())),
+            "A must get A's bootstrap, not B's Status"
+        );
+        assert!(ctx.status_done.contains(&b), "B's Status reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&4242), "and be read as B's Status");
+        assert!(!ctx.queued.contains_key(&b), "settling B releases its parked request");
+        assert_eq!(parked_rx.try_recv(), Err(TryRecvError::Empty), "released into flight, not dropped");
+        assert_eq!(ctx.pending.len(), 1, "B's released request is the only one outstanding");
+    }
+
+    /// A v1-only peer refusing status/2 while another peer's first bootstrap is
+    /// out: the refusal must start THAT peer's v1 fallback, never reach the
+    /// bootstrap caller as UnsupportedProtocol, and the v1 reply — id 1 on a
+    /// third behaviour — must settle the peer.
+    #[tokio::test]
+    async fn a_status_v2_refusal_falls_back_for_that_peer_only() {
+        let (mut swarm, mut ctx) = host();
+        let (a, b) = (peer(), peer());
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        ctx.status_done.insert(a);
+        let (a_tx, mut a_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, a, None, vec![addr()], protocols::BOOTSTRAP, vec![1], a_tx);
+
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::UnsupportedProtocols),
+        );
+        assert_eq!(a_rx.try_recv(), Err(TryRecvError::Empty), "B's refusal is not A's outcome");
+
+        let b_status = codec::encode_success_response(&status(0).encode_v1(), None);
+        on_rr_event(&mut swarm, &mut ctx, protocols::STATUS_V1, response(b, id, &b_status));
+        assert!(ctx.status_done.contains(&b), "B's v1 reply must settle B");
+        assert_eq!(ctx.peer_earliest.get(&b), Some(&0), "a v1 peer reports history from genesis");
+
+        on_rr_event(&mut swarm, &mut ctx, protocols::BOOTSTRAP, response(a, id, b"bootstrap"));
+        assert_eq!(a_rx.try_recv(), Ok(Ok(b"bootstrap".to_vec())));
+        assert!(ctx.pending.is_empty());
+    }
+
+    /// libp2p yields a peer's last `ConnectionClosed` BEFORE the `OutboundFailure`
+    /// of the auto-Status in flight on it: the behaviour queues the failure while
+    /// handling the close, and it surfaces on a later poll. That late failure must
+    /// not settle the peer. A disconnected peer marked Status-done sends whatever
+    /// was parked since the close, and every request after it, ahead of the next
+    /// connection's own auto-Status — the ordering the parking exists to prevent.
+    #[tokio::test]
+    async fn a_late_auto_status_failure_does_not_settle_a_disconnected_peer() {
+        let (mut swarm, mut ctx) = host();
+        let b = peer();
+        let id = first_request_id();
+
+        connect(&mut swarm, &mut ctx, b);
+        disconnect(&mut swarm, &mut ctx, b);
+        let (early_tx, mut early_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![1], early_tx);
+        on_rr_event(
+            &mut swarm,
+            &mut ctx,
+            protocols::STATUS_V2,
+            failure(b, id, request_response::OutboundFailure::ConnectionClosed),
+        );
+        assert!(!ctx.status_done.contains(&b), "a disconnected peer is never Status-done");
+        assert!(ctx.pending.is_empty(), "the request parked since the close stays parked");
+
+        connect(&mut swarm, &mut ctx, b); // the reconnect sends its own auto-Status
+        let (late_tx, mut late_rx) = oneshot::channel();
+        submit_request(&mut swarm, &mut ctx, b, None, vec![addr()], protocols::BOOTSTRAP, vec![2], late_tx);
+        assert_eq!(ctx.queued.get(&b).map(Vec::len), Some(2), "both wait for the new Status");
+        assert_eq!(ctx.pending.len(), 1, "only the new auto-Status is in flight");
+        assert_eq!(early_rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(late_rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

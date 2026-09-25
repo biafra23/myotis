@@ -15,6 +15,9 @@ java {
 
 dependencies {
     implementation(project(":myotis-evm"))
+    // Android-safe minSdk-29 shims shared across the engine modules
+    // (core.encoding.Hex, core.math.BigIntegers — see CLAUDE.md's API budget).
+    implementation(project(":core"))
 
     // Tuweni Bytes for hex parsing of the canonical mainnet addresses.
     implementation(libs.tuweni.bytes)

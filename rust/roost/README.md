@@ -84,9 +84,10 @@ record without publishing, for inspection.
   updates only from the period its states reach; everything older is
   irreplaceable once collected.
 - **Dropping the wallet-side pins** (#335 step 4): both engines still pin
-  roost's multiaddr by DynDNS name. That stays until discovery is proven on all
-  three networks — a wallet with no pin and discovery enabled finds roost,
-  bootstraps, and stays synced.
+  roost's multiaddr, by the literal address of the netcup relay (188.68.32.16,
+  a static VPS that DNATs the serving ports to zbox over WireGuard). That stays
+  until discovery is proven on all three networks — a wallet with no pin and
+  discovery enabled finds roost, bootstraps, and stays synced.
 
 ## Run locally
 
@@ -223,9 +224,9 @@ serving handlers and the archive together.
 address is confirmed, publishes its ENR — wallets can DISCOVER it (#335).
 Deploy in two steps: start with `--no-publish` and confirm the table populates
 and the node is pingable on UDP from outside; then drop the flag. The pinned
-multiaddrs in both engines stay for now (mainnet, gnosis and sepolia, by
-DynDNS name, resolved at dial time) — removing them is #335 step 4, gated on
-discovery being proven end to end.
+multiaddrs in both engines stay for now (mainnet, gnosis and sepolia, by the
+relay's static literal) — removing them is #335 step 4, gated on discovery
+being proven end to end.
 
 ## Why it is not a workspace member
 

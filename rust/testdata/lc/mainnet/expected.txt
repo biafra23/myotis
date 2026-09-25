@@ -8,8 +8,10 @@
 # 001..018-update.ssz is the accepted catch-up chain (periods 1777→1795);
 # 099-update.ssz is a STALE negative (= 018 replayed after rotation: rejected by
 # the applicability gate, signaturePeriod 1794 vs storePeriod 1795);
-# 001-finality.ssz is a negative (BLS verify fails: captured while the live store
-# was mid-catch-up on a different committee); 002-finality.ssz applies.
+# 001-finality.ssz is a negative (captured while the live store was mid-catch-up
+# on a different committee: its signature period 1794 is neither the replay
+# store's 1795 nor 1796, so the period gate rejects it before BLS — it failed
+# BLS under the pre-#423 processor); 002-finality.ssz applies.
 # input.currentSlotEstimate is the ONE wall-clock input, replayed verbatim
 # (drives forceRotateIfPastPeriod between applied updates).
 bootstrap.headerRoot=58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e

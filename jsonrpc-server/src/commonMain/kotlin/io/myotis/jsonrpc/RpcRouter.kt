@@ -31,6 +31,7 @@ class RpcRouter(
     private val logger: MethodLogger,
     private val backend: RpcBackend? = null,
     private val statusReads: RpcStatusSource? = null,
+    private val lifecycle: RpcLifecycle? = null,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -75,8 +76,8 @@ class RpcRouter(
                     logger.record("<empty-batch>", "null", "ERROR", elapsedMs(t0), -32600)
                     return errorEnvelope(JsonNull, -32600, "Invalid Request")
                 }
-                val responses = root.map { el ->
-                    (el as? JsonObject)?.let { handleOne(it, null) }
+                val responses = root.mapIndexed { i, el ->
+                    (el as? JsonObject)?.let { handleOne(it, null, "${i + 1}/${root.size}") }
                         ?: run {
                             logger.record("<invalid>", "null", "ERROR", 0, -32600)
                             errorEnvelope(JsonNull, -32600, "Invalid Request")
@@ -196,12 +197,29 @@ class RpcRouter(
     /**
      * Handle one request object, returning its complete JSON-RPC response envelope.
      * [wholeBody] is the original request text used for the single-request proxy path;
-     * null for a batch element (re-serialized and proxied individually).
+     * null for a batch element (re-serialized and proxied individually). [batchPos]
+     * ("2/5") places a batch element in the slow-call watchdog's WARN; null for a
+     * single request.
      */
-    private suspend fun handleOne(root: JsonObject, wholeBody: String?): String {
+    private suspend fun handleOne(root: JsonObject, wholeBody: String?, batchPos: String? = null): String {
         val method = root["method"]?.jsonPrimitive?.contentOrNull
         val id = root["id"] ?: JsonNull
         val idStr = idString(id)
+        val phase = CallPhase()
+        return logger.watch(method ?: "request", idStr, batchPos, phase) {
+            dispatchOne(root, wholeBody, method, id, idStr, phase)
+        }
+    }
+
+    /** [handleOne]'s body: route one request, keeping [phase] current for the watchdog. */
+    private suspend fun dispatchOne(
+        root: JsonObject,
+        wholeBody: String?,
+        method: String?,
+        id: JsonElement,
+        idStr: String,
+        phase: CallPhase,
+    ): String {
         if (method == "myotis_rpcCoverage") {
             logger.record(method, idStr, "LOCAL", 0)
             return resultEnvelope(id, logger.coverage())
@@ -216,6 +234,7 @@ class RpcRouter(
                 logger.record(method, idStr, "ERROR", 0, -32601)
                 return errorEnvelope(id, -32601, "method '$method' is not supported by this node")
             }
+            phase.name = "status"
             // Isolate the read like the IPC command does (CommandHandler wraps dispatch in
             // try/catch): a throw becomes a JSON-RPC error envelope, never a raw Ktor 500.
             return try {
@@ -238,8 +257,71 @@ class RpcRouter(
                 errorEnvelope(id, -32603, "status read failed: $detail")
             }
         }
+        // Local lifecycle control — the JSON-RPC counterpart of the daemon's pause /
+        // resume IPC commands. Like the status methods these bypass the verified
+        // backend: a Myotis-aware wallet pauses the node when its UI backgrounds and
+        // wakes it (then polls myotis_status / myotis_beaconStatus until ready) before
+        // its next burst of queries. -32601 when the host didn't wire a control seam.
+        if (method == "myotis_pause" || method == "myotis_wakeup") {
+            val lc = lifecycle
+            if (lc == null) {
+                logger.record(method, idStr, "ERROR", 0, -32601)
+                return errorEnvelope(id, -32601, "method '$method' is not supported by this node")
+            }
+            // Isolate the transition like the status reads / IPC command do: a throw
+            // becomes a JSON-RPC error envelope, never a raw Ktor 500.
+            phase.name = "lifecycle"
+            val tLc = TimeSource.Monotonic.markNow()
+            return try {
+                // pause()/wakeUp() tear down / rebuild networking (seconds) and can
+                // cross a JNI boundary into the native engine — run them on the IO
+                // dispatcher rather than blocking the Ktor CIO event loop, same as
+                // the status handler and the verified handlers below.
+                val r = withContext(rpcIoDispatcher) {
+                    if (method == "myotis_pause") lc.pause() else lc.wakeUp()
+                }
+                // Unlike the status reads (hardcoded 0), record the REAL elapsed time:
+                // a pause/wakeup takes seconds, and the access log is where that shows.
+                logger.record(method, idStr, "LOCAL", elapsedMs(tLc))
+                resultEnvelope(id, buildJsonObject {
+                    put("ok", r.ok)
+                    put("lifecycle", r.lifecycle)
+                })
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
+            } catch (e: Exception) {
+                logger.record(method, idStr, "ERROR", 0, -32603)
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
+                errorEnvelope(id, -32603, "lifecycle op failed: $detail")
+            }
+        }
+        phase.name = "backend"
         val t0 = TimeSource.Monotonic.markNow()
-        val verified = tryVerified(method, id, root)
+        val verified = try {
+            tryVerified(method, id, root)
+        } catch (e: EngineReadUnavailable) {
+            // A backend read that failed WITH a reason: the same -32000 class
+            // as the generic decline below, but carrying the engine's actual
+            // diagnosis — e.g. "all 8 snap peer(s) failed to serve a
+            // verifiable block: 8x peer returned 0 headers" (the 2026-09-02
+            // stale-pool incident, whose generic "no peer / not synced" text
+            // sent everyone chasing sync state while the node WAS synced).
+            //
+            // Deliberately no dev-proxy fallback here (unlike a bare-null
+            // decline): the engine ENGAGED verified serving and produced a
+            // diagnosis; forwarding to a proxy would mask exactly the failure
+            // this path exists to surface.
+            logger.record(method ?: "request", idStr, "ERROR", elapsedMs(t0), -32000)
+            // A STALE_ANCHOR park must keep its curated, actionable message on
+            // this path too: the Rust engine reports the park through shared
+            // read plumbing ("beacon not synced" via anchored_head), which now
+            // arrives as an envelope — without this probe the operator
+            // guidance would fire only for methods whose failures still cross
+            // as bare nulls (PR review finding).
+            staleAnchorMessage(method ?: "request")?.let { return errorEnvelope(id, -32000, it) }
+            return errorEnvelope(id, -32000,
+                "method '${method ?: "request"}' cannot be served verified right now: ${e.reason}")
+        }
         if (verified != null) {
             // Label the answer for what it IS. A served override ran over
             // verified state but under the CALLER'S hypothesis, so it is not a
@@ -325,12 +407,22 @@ class RpcRouter(
             val code = if (m in VERIFIED_METHODS) -32000 else -32601
             logger.record(m, idStr, "ERROR", elapsedMs(t0), code)
             return if (m in VERIFIED_METHODS) {
+                // A STALE_ANCHOR park deserves its own message: unlike ordinary
+                // not-synced it will NOT progress on its own — a human must raise
+                // the weak-subjectivity bound or accept the risk — and the generic
+                // "no peer / not synced" text would send an operator chasing peers.
+                // The code stays -32000 (retryable): the state CAN change without
+                // the caller acting, once the user decides. Same off-event-loop
+                // discipline as eth_syncing for the (non-blocking, but
+                // FFI-crossing) syncState probe.
+                staleAnchorMessage(m)?.let { return errorEnvelope(id, -32000, it) }
                 errorEnvelope(id, -32000, "method '$m' cannot be served verified right now (no peer / not synced)")
             } else {
                 errorEnvelope(id, -32601, "method '$m' is not supported by this permissionless node")
             }
         }
         // Dev-only proxy fallback (never used in production / strict mode).
+        phase.name = "proxy"
         val pt0 = TimeSource.Monotonic.markNow()
         val forwardBody = wholeBody ?: json.encodeToString(JsonObject.serializer(), root)
         return try {
@@ -354,6 +446,50 @@ class RpcRouter(
      * The state-reading handlers (eth_call / eth_getBalance / …) are BLOCKING, so
      * they run on the IO dispatcher to keep the Ktor worker thread free.
      */
+    /** Thrown inside [tryVerified] when a backend JSON read carried an engine
+     *  {"error": ...} envelope; caught at the dispatch site in [handleOne] and
+     *  surfaced as -32000 WITH the engine's reason instead of the generic
+     *  no-peer/not-synced text. */
+    private class EngineReadUnavailable(val reason: String) : RuntimeException(reason)
+
+    /** Unwrap an engine error envelope from a JSON-string read result: a
+     *  single-key `{"error": ...}` object throws [EngineReadUnavailable] (so
+     *  the call sites stay one-liners); every normal result — block object,
+     *  receipt array, the literal "null" — passes through untouched. Engines
+     *  return the envelope instead of a bare null exactly when the failure has
+     *  a reason a wallet/operator needs (mirrors the eth_getLogs contract,
+     *  which pioneered the shape for index-coverage errors). */
+    private fun String.orEngineThrow(): String {
+        // Fast path: both engines emit the envelope verbatim as {"error":...}
+        // and nothing else starts that way (a block object starts with its own
+        // first field), so a multi-MB full-transactions block is never parsed
+        // twice just to prove it isn't an error.
+        if (!startsWith("{\"error\"")) return this
+        val parsed = try { json.parseToJsonElement(this) } catch (_: Exception) { return this }
+        val obj = parsed as? JsonObject ?: return this
+        if (obj.size != 1) return this
+        val err = obj["error"] ?: return this
+        val msg = (err as? JsonPrimitive)?.contentOrNull ?: err.toString()
+        throw EngineReadUnavailable(msg)
+    }
+
+    /** The curated STALE_ANCHOR refusal for [method], or null when the node
+     *  isn't parked. Shared by the bare-null decline path and the
+     *  [EngineReadUnavailable] path — the park must keep its actionable
+     *  message ("raise the bound or accept the risk") no matter which shape
+     *  the failure crossed the backend boundary in: unlike ordinary
+     *  not-synced it will NOT progress without a human deciding. Same
+     *  off-event-loop discipline as eth_syncing for the FFI-crossing probe. */
+    private suspend fun staleAnchorMessage(method: String): String? {
+        val be = backend ?: return null
+        val parked = withContext(rpcIoDispatcher) { be.syncState() == RpcSyncState.STALE_ANCHOR }
+        if (!parked) return null
+        return "method '$method' refused: the node's trust anchor is past the " +
+            "weak-subjectivity bound and syncing is paused awaiting user " +
+            "consent — raise the bound or accept the risk (Settings / " +
+            "accept-stale-anchor; details via myotis_beaconStatus)"
+    }
+
     private suspend fun tryVerified(method: String?, id: JsonElement, root: JsonObject): String? {
         val b = backend ?: return null
         return when (method) {
@@ -391,8 +527,12 @@ class RpcRouter(
                     })
                 }
             }
-            // Verified beacon head; null (not synced) -> proxy.
-            "eth_blockNumber" -> b.headBlockNumber()?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
+            // Verified beacon head; null (not synced) -> proxy. BLOCKING like every read
+            // below (a paused or warming stack holds it in the wake gate), so it runs on
+            // the IO dispatcher too — which also leaves the slow-call watchdog free to
+            // report it while it is held.
+            "eth_blockNumber" -> withContext(rpcIoDispatcher) { b.headBlockNumber() }
+                ?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 
             "eth_call" -> {
                 val p = root.params()
@@ -503,14 +643,14 @@ class RpcRouter(
                 // CAN'T verify (not synced / no peer), which falls through to the strict
                 // error — so we never tell the wallet "pending on a healthy chain" when we
                 // actually couldn't check.
-                val receiptJson = withContext(rpcIoDispatcher) { b.getTransactionReceipt(txHash) } ?: return null
+                val receiptJson = withContext(rpcIoDispatcher) { b.getTransactionReceipt(txHash) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
             }
             "eth_getTransactionByHash" -> {
                 val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
                 // Object string when found (mined or pending-from-our-cache); "null" for a
                 // verified-unknown tx; Kotlin null (can't verify) → strict error.
-                val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) } ?: return null
+                val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(txJson))
             }
             "eth_getBlockByNumber" -> {
@@ -526,7 +666,7 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_getBlockByHash" -> {
@@ -541,7 +681,7 @@ class RpcRouter(
                 }
                 // Object string when found; "null" for an unknown/non-canonical hash; Kotlin
                 // null (can't verify) → strict error.
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             // ---- compat batch: answers derived from reads already served above ----
@@ -580,50 +720,50 @@ class RpcRouter(
             // null) carries through unchanged.
             "eth_getBlockTransactionCountByNumber" -> {
                 val block = root.params().specShapedBlockTag(0) ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getBlockTransactionCountByHash" -> {
                 val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getTransactionByBlockNumberAndIndex" -> {
                 val p = root.params()
                 val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getTransactionByBlockHashAndIndex" -> {
                 val p = root.params()
                 val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleCountByBlockNumber" -> {
                 val block = root.params().specShapedBlockTag(0) ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleCountByBlockHash" -> {
                 val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleByBlockNumberAndIndex" -> {
                 val p = root.params()
                 val block = p.specShapedBlockTag(0) ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleByBlockHashAndIndex" -> {
                 val p = root.params()
                 val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
                 val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) } ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getBlockReceipts" -> {
@@ -648,7 +788,7 @@ class RpcRouter(
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
                 val receiptsJson =
-                    withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) } ?: return null
+                    withContext(rpcIoDispatcher) { b.getBlockReceipts(selector) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(receiptsJson))
             }
             "eth_getLogs" -> {
@@ -709,7 +849,7 @@ class RpcRouter(
                     else -> return null
                 }
                 val historyJson = withContext(rpcIoDispatcher) { b.feeHistory(blockCount, newest, pctArr) }
-                    ?: return null
+                    ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(historyJson))
             }
             "eth_estimateGas" -> {

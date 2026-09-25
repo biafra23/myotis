@@ -29,9 +29,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use myotis_net::el::evm::{EnsQuery, EnsRootMode};
+use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
 use myotis_net::el::fork_watch::{self, ForkWatch};
-use myotis_net::el::reader::ElReader;
+use myotis_net::el::pool::Enode;
+use myotis_net::el::reader::{parse_enode, ElReader};
+use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
 
@@ -45,8 +47,17 @@ const SLOTS_PER_PERIOD: u64 = 8192;
 // but distinguishable for tests / future callers):
 /// Unknown network name, or the tokio runtime never came up.
 const CREATE_FAILED: i64 = -1;
-/// A canonical network that R1 does not host yet (anything but mainnet).
+/// A canonical catalog network this engine has no `ChainConfig` for (none today:
+/// mainnet, gnosis and sepolia are all hosted; kept for the contract).
 const UNSUPPORTED_NETWORK: i64 = -2;
+/// The dataDir already holds sync state from a DIFFERENT trust anchor than the
+/// one this call names: a caller-supplied checkpoint that does not match the
+/// directory's recorded anchor, a caller-supplied checkpoint for a directory
+/// whose snapshot came from the embedded checkpoint, or a plain `create` on a
+/// directory bootstrapped from a caller-supplied checkpoint. Never silently
+/// resolved — the host owns its directories and must pick a fresh one (or the
+/// matching anchor) itself.
+const ANCHOR_MISMATCH: i64 = -3;
 
 /// One hosted chain: created-but-not-started, or running. Running keeps the
 /// config so status reads can derive wall-clock values (targetPeriod) fresh.
@@ -66,8 +77,11 @@ enum ChainEntry {
     /// handle stays valid and `resume` re-runs the start path, which warm-starts
     /// from the persisted snapshot / peer caches under the host's dataDir (no
     /// checkpoint re-bootstrap). Carries the last `SyncStatus` observed at pause
-    /// time so status reads keep reporting the warm beacon fields while asleep.
-    Paused(Arc<ChainConfig>, SyncStatus),
+    /// time so status reads keep reporting the warm beacon fields while asleep,
+    /// and the read-fetch shadow cache so its counters outlive the torn-down
+    /// reader (they are per handle, like the Java stack's — resume hands them
+    /// to the new reader).
+    Paused(Arc<ChainConfig>, SyncStatus, Arc<ReadStats>),
 }
 
 /// The single legitimate engine singleton. Owns the runtime + the handle map;
@@ -81,6 +95,28 @@ struct EngineState {
     /// spin_up (start AND resume) re-applies it after building the EL reader,
     /// mirroring the Java ChainStack's pre-start buffer. Dies with the handle.
     pending_served_window: Mutex<HashMap<i64, u64>>,
+    /// Per-handle LAST-PUSHED host seed pins (`set_boot_enodes_json`, #465):
+    /// stashed for every spin_up (start AND resume — a resume rebuilds the
+    /// pool from scratch) and applied live to a running reader, exactly like
+    /// [`EngineState::pending_served_window`]. Dies with the handle.
+    pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
+    /// Serializes the two paths that hand a stashed seed list to a reader —
+    /// a host's live push and the post-publish replay in `spin_up` — so the
+    /// pool always ends up holding the LATEST list: without it a push could
+    /// stash and apply a newer list between the replay's stash read and its
+    /// apply, and the older list would land last. Held across the pool call
+    /// (host threads only; no runtime task takes it).
+    boot_enodes_apply: Mutex<()>,
+    /// Per-handle LAST-PUSHED log-index runtime bits, as
+    /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
+    /// portable snapshot, and a pause drops the EL reader with the index in it,
+    /// so a resume re-activates from disk at the ACTIVATION defaults — enabled,
+    /// walk paused — no matter what the host last said, and no host re-pushes on
+    /// resume. Without this, one Android idle pause strands a walk a host asked
+    /// for, and re-enables an index a host turned off. Re-applied by every
+    /// spin_up (start AND resume) after activation, exactly like
+    /// [`Engine::pending_served_window`]. Dies with the handle.
+    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool)>>,
     /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
     /// request signature it answered, re-servable within
     /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
@@ -95,6 +131,22 @@ struct EngineState {
     /// while the radio sleeps (the Java twin is ChainStack-owned for the same
     /// reason). Only for networks the watch is enabled on. Dies with the handle.
     fork_watches: Mutex<HashMap<i64, Arc<ForkWatch>>>,
+    /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
+    /// anchor-marker read/write, registration). Every guard in those paths is
+    /// check-then-act against the filesystem and the handle map; without one
+    /// lock across all of it, two racing creates on the same dataDir could both
+    /// pass and persist different generations into one snapshot. Creates are
+    /// cold, so a coarse lock costs nothing (the JVM's `RustMyotisEngine.create`
+    /// is `synchronized` for the same reason). Never held while `handles` is
+    /// taken by anything that could wait on a create.
+    create_lock: Mutex<()>,
+    /// Snapshot paths whose handle has been removed from `handles` but whose
+    /// sync loop is still being awaited by `stop` (teardown runs OUTSIDE the
+    /// map lock). A loop in that window can still persist a snapshot, so the
+    /// directory stays "in use" for the create guards until the await returns
+    /// — otherwise a `createWithCheckpoint` slipping in between would label a
+    /// late embedded-anchor snapshot as the caller's generation.
+    tearing_down: Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 /// How long a last-good `eth_feeHistory` result may be re-served (the Java
@@ -119,8 +171,13 @@ fn engine() -> Option<&'static EngineState> {
                     // Start at 1 so a valid id is never confused with the -1 sentinel.
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
+                    pending_boot_enodes: Mutex::new(HashMap::new()),
+                    boot_enodes_apply: Mutex::new(()),
+                    log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
                     fork_watches: Mutex::new(HashMap::new()),
+            create_lock: Mutex::new(()),
+            tearing_down: Mutex::new(std::collections::HashSet::new()),
                 }),
                 Err(_) => None,
             }
@@ -178,47 +235,358 @@ pub fn tor_status() -> i32 {
     }
 }
 
-/// `nativeCreate`: allocate an id for a not-yet-started hosted chain (mainnet or
+/// `nativeCreate`: allocate a handle for a hosted network (mainnet, gnosis,
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
-/// network this engine doesn't host yet (gnosis), or `CREATE_FAILED` (-1) for an
-/// unknown name, an unavailable runtime, or an uncreatable dataDir.
+/// network this engine doesn't host yet, `CREATE_FAILED` (-1) for an unknown
+/// name, an unavailable runtime, or an uncreatable dataDir, and
+/// `ANCHOR_MISMATCH` (-3) when the dataDir was bootstrapped from a
+/// caller-supplied checkpoint (see [`create_with_checkpoint`]) — resuming such
+/// a directory from the embedded anchor would silently swap trust anchors.
 pub fn create(network_name: &str, data_dir: &str) -> i64 {
     let Some(engine) = engine() else {
         return CREATE_FAILED;
     };
-    // Unknown network → CREATE_FAILED; canonical-but-not-hosted → UNSUPPORTED.
-    let mut config = match crate::catalog::canonical_network_name(network_name) {
-        None => return CREATE_FAILED,
-        Some(_) => match config_for(network_name) {
-            Some(c) => c,
-            None => return UNSUPPORTED_NETWORK,
-        },
+    let mut config = match resolve_config(network_name) {
+        Ok(c) => c,
+        Err(sentinel) => return sentinel,
     };
-    // Persistence lives under the host's dataDir, in the SAME files (names and
-    // formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
-    // `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
-    // state and proven LC servers survive restarts AND engine switches.
+    // Guard + register under one lock (see `EngineState::create_lock`).
+    let Ok(_serial) = engine.create_lock.lock() else {
+        return CREATE_FAILED;
+    };
     if !data_dir.is_empty() {
-        // The dir may not exist yet (fresh host profile) — create it now.
-        // Without this, sync runs fine but every snapshot/cache write fails
-        // with ENOENT ("retrying on the next period advance", forever), so
-        // persistence is silently lost and every restart bootstraps cold.
-        // An uncreatable dataDir is a runtime-init failure the caller must
-        // see (honest error over silent degradation), hence CREATE_FAILED
-        // rather than warn-and-continue.
-        if let Err(e) = std::fs::create_dir_all(data_dir) {
-            tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
-            return CREATE_FAILED;
-        }
-        let suffix = if config.name == "mainnet" {
-            String::new()
-        } else {
-            format!("-{}", config.name)
+        let dir = match bind_persistence(&mut config, data_dir) {
+            Ok(d) => d,
+            Err(sentinel) => return sentinel,
         };
-        let dir = std::path::Path::new(data_dir);
-        config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
-        config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
+        // A directory carrying a caller-supplied anchor belongs to that
+        // generation: the embedded checkpoint is a different trust anchor, and
+        // the snapshot-resume rule would happily continue from the caller's
+        // verified state as if it descended from ours. Fail closed: only a
+        // marker entry that is DEFINITELY absent lets the embedded anchor in —
+        // a file, a dangling symlink, an unreadable entry, or one that cannot
+        // even be stat'ed all refuse (same rule as create_with_checkpoint).
+        if !marker_entry_absent(&anchor_marker_path(&dir, &config)) {
+            tracing::warn!(data_dir, "dataDir was bootstrapped from a caller-supplied \
+                checkpoint — refusing to create it from the embedded anchor");
+            return ANCHOR_MISMATCH;
+        }
     }
+    register(engine, config)
+}
+
+/// Like [`create`], but the light client bootstraps from the CALLER's beacon
+/// block root and slot instead of the embedded checkpoint. Reached through the
+/// plain C ABI (`myotis_create_with_checkpoint`) and the Node addon; the
+/// UniFFI/JVM and iOS hosts have no wrapper for it (they refuse a directory it
+/// has bound — see `ANCHOR_MISMATCH`). This is the recovery path for a host whose install is
+/// past the weak-subjectivity bound (`STALE_ANCHOR`) and that has obtained a
+/// fresher checkpoint through its own means (#441).
+///
+/// **Trust boundary.** The engine does not — cannot — authenticate the root.
+/// It treats it exactly as it treats the embedded checkpoint: the bootstrap is
+/// pinned to it (a peer can only return the committee that Merkle-proves
+/// against it), every later update is BLS-verified against the committee
+/// chain that follows from it, the persisted snapshot stays on probation until
+/// an update verifies against it, and the weak-subjectivity gate judges the
+/// supplied slot's age like any other anchor: a root that is itself past the
+/// bound still parks in `STALE_ANCHOR`. That last guarantee is enforced by the
+/// IN-RUN re-check in the sync loop (the one that re-judges the store's period
+/// right after bootstrap, before catch-up — `run_sync`'s held-gate in
+/// myotis-net's sync.rs), which reads the period the store derived from the
+/// VERIFIED header, not from the slot the caller claimed; the start-time gate
+/// only sees the claim, so an overstated slot buys exactly one bootstrap
+/// (pinned to the caller's own root) and no forward sync. Keep that re-check
+/// when refactoring the loop. Supplying a checkpoint therefore never
+/// marks the client synced or unlocks verified reads early; it only moves the
+/// anchor. Whether the root is the honest chain's is the caller's
+/// responsibility and must be described as such to users.
+///
+/// **Slot.** The slot of the checkpoint BLOCK HEADER (the header whose
+/// hash_tree_root equals `root`), not the epoch boundary it finalizes: with
+/// skipped slots the two differ. Only the sync-committee PERIOD derived from
+/// it is load-bearing (it floors what gets persisted and what a later restart
+/// may resume from); the bootstrap logs a warning when the verified header's
+/// slot disagrees, and a slot in a LATER period than the header degrades
+/// persistence (nothing is written until the store passes the claimed period)
+/// without weakening verification. `>= 1` and not in the future; the Node
+/// binding additionally bounds it to a JS safe integer.
+///
+/// **Generations.** The first successful call on a directory records the
+/// anchor in `sync-anchor[-net].json` next to the snapshot, before any sync
+/// state exists. From then on the directory belongs to that anchor:
+/// - the same root and slot on a later call RESUMES it — the engine's normal
+///   rule applies (a persisted snapshot strictly newer than the checkpoint is
+///   restored and re-verified; otherwise it bootstraps from the checkpoint
+///   again), so a restart never reverts to the embedded anchor;
+/// - a different root or slot, a directory whose snapshot predates the marker
+///   (state from the embedded anchor), an unreadable marker, or a plain
+///   [`create`] on a marked directory returns `ANCHOR_MISMATCH` (-3). Nothing
+///   is deleted or rewritten; the host picks a fresh directory or the matching
+///   anchor. A directory another live handle of this process already uses —
+///   or one whose stopped handle is still tearing down — is refused with
+///   `CREATE_FAILED` before the marker is touched: two writers into one
+///   snapshot would mix generations, and a loop mid-shutdown is still a
+///   writer.
+///
+/// Invalid inputs — unknown/unsupported network, malformed or all-zero root,
+/// slot 0 or ahead of the wall clock, empty dataDir — return
+/// `CREATE_FAILED` (-1) / `UNSUPPORTED_NETWORK` (-2) before the directory is
+/// created or touched. A non-empty dataDir is required: a caller-supplied
+/// anchor without a home for its marker could not be told apart on restart.
+pub fn create_with_checkpoint(
+    network_name: &str,
+    data_dir: &str,
+    checkpoint_root_hex: &str,
+    checkpoint_slot: u64,
+) -> i64 {
+    let Some(engine) = engine() else {
+        return CREATE_FAILED;
+    };
+    let mut config = match resolve_config(network_name) {
+        Ok(c) => c,
+        Err(sentinel) => return sentinel,
+    };
+    if data_dir.is_empty() {
+        tracing::warn!("createWithCheckpoint needs a dataDir to record its anchor in");
+        return CREATE_FAILED;
+    }
+    let Some(root) = parse_hex_fixed::<32>(checkpoint_root_hex) else {
+        tracing::warn!("createWithCheckpoint: checkpoint root is not 32 bytes of hex");
+        return CREATE_FAILED;
+    };
+    if root == [0u8; 32] {
+        tracing::warn!("createWithCheckpoint: checkpoint root is all zeros");
+        return CREATE_FAILED;
+    }
+    let wall_slot = config.wall_clock_slot();
+    if checkpoint_slot == 0 || checkpoint_slot > wall_slot {
+        tracing::warn!(slot = checkpoint_slot, wall_slot,
+            "createWithCheckpoint: checkpoint slot is zero or in the future");
+        return CREATE_FAILED;
+    }
+    // Guard, marker I/O and registration under one lock (see
+    // `EngineState::create_lock`): every check below is check-then-act.
+    let Ok(_serial) = engine.create_lock.lock() else {
+        return CREATE_FAILED;
+    };
+    let dir = match bind_persistence(&mut config, data_dir) {
+        Ok(d) => d,
+        Err(sentinel) => return sentinel,
+    };
+    // A live handle already persisting into this directory (typically a plain
+    // create() that has not written its first snapshot yet) would later drop
+    // embedded-anchor state into the caller's generation. Host error, refused
+    // before any marker is written.
+    if let Some(other) = handle_using(engine, config.snapshot_path.as_deref()) {
+        tracing::warn!(data_dir, other_handle = other,
+            "createWithCheckpoint: dataDir is in use by another handle — refusing");
+        return CREATE_FAILED;
+    }
+    let marker = anchor_marker_path(&dir, &config);
+    match read_anchor_marker(&marker) {
+        Err(()) => {
+            tracing::warn!(data_dir,
+                "createWithCheckpoint: existing anchor marker is unreadable — refusing \
+                 (it never unlocks a resume; restore it or use a fresh directory)");
+            return ANCHOR_MISMATCH;
+        }
+        Ok(Some((recorded_root, recorded_slot))) => {
+            if recorded_root != root || recorded_slot != checkpoint_slot {
+                tracing::warn!(data_dir, recorded_slot, requested_slot = checkpoint_slot,
+                    "createWithCheckpoint: dataDir belongs to a different checkpoint \
+                     generation — refusing");
+                return ANCHOR_MISMATCH;
+            }
+            tracing::info!(data_dir, slot = checkpoint_slot,
+                "createWithCheckpoint: resuming the recorded checkpoint generation");
+        }
+        Ok(None) => {
+            // No marker: either a fresh directory or one that already holds a
+            // snapshot from the EMBEDDED anchor. The latter must not be
+            // silently adopted — its state descends from a different root.
+            let has_foreign_state = config
+                .snapshot_path
+                .as_ref()
+                .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
+            if has_foreign_state {
+                tracing::warn!(data_dir,
+                    "createWithCheckpoint: dataDir holds a snapshot from the embedded \
+                     anchor and no checkpoint marker — refusing (use a fresh directory)");
+                return ANCHOR_MISMATCH;
+            }
+            if let Err(e) = write_anchor_marker(&marker, &root, checkpoint_slot) {
+                tracing::warn!(data_dir, error = %e,
+                    "createWithCheckpoint: could not record the checkpoint anchor");
+                return CREATE_FAILED;
+            }
+            tracing::info!(data_dir, slot = checkpoint_slot,
+                "createWithCheckpoint: fresh directory bound to the caller's checkpoint");
+        }
+    }
+    config.checkpoint_root = root;
+    config.checkpoint_slot = checkpoint_slot;
+    register(engine, config)
+}
+
+/// Unknown network → `CREATE_FAILED`; canonical-but-not-hosted → `UNSUPPORTED`.
+fn resolve_config(network_name: &str) -> Result<ChainConfig, i64> {
+    match crate::catalog::canonical_network_name(network_name) {
+        None => Err(CREATE_FAILED),
+        Some(_) => config_for(network_name).ok_or(UNSUPPORTED_NETWORK),
+    }
+}
+
+/// Point the config's persistence at the host's (non-empty) dataDir, creating
+/// it, and return the directory.
+///
+/// Persistence lives under the host's dataDir, in the SAME files (names and
+/// formats) the Java hosts/engine maintain — `sync-state[-net].snapshot` and
+/// `cl-peers[-net].cache`, mainnet keeping the bare name — so verified sync
+/// state and proven LC servers survive restarts AND engine switches.
+fn bind_persistence(config: &mut ChainConfig, data_dir: &str) -> Result<std::path::PathBuf, i64> {
+    // The dir may not exist yet (fresh host profile) — create it now.
+    // Without this, sync runs fine but every snapshot/cache write fails
+    // with ENOENT ("retrying on the next period advance", forever), so
+    // persistence is silently lost and every restart bootstraps cold.
+    // An uncreatable dataDir is a runtime-init failure the caller must
+    // see (honest error over silent degradation), hence CREATE_FAILED
+    // rather than warn-and-continue.
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        tracing::warn!(data_dir, error = %e, "dataDir cannot be created");
+        return Err(CREATE_FAILED);
+    }
+    // Resolve the directory's IDENTITY, not its spelling: symlinks, `..`, and
+    // relative paths all alias the same inode, and every guard below (the
+    // in-use check, the anchor marker) must see one directory as one
+    // directory — `create('x', real)` then `createWithCheckpoint('x', alias)`
+    // used to slip past the in-use check and drop a marker into the first
+    // handle's directory (reported from freedom-browser#353).
+    let dir = match std::fs::canonicalize(data_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(data_dir, error = %e, "dataDir cannot be resolved");
+            return Err(CREATE_FAILED);
+        }
+    };
+    let suffix = persistence_suffix(config);
+    config.snapshot_path = Some(dir.join(format!("sync-state{suffix}.snapshot")));
+    config.cl_peer_cache_path = Some(dir.join(format!("cl-peers{suffix}.cache")));
+    Ok(dir)
+}
+
+/// The id of a live handle (created, running, or paused) whose persistence is
+/// bound to `snapshot_path`, if any — or `Some(0)` when no handle owns it any
+/// more but a stopped loop is still tearing down there (see `tearing_down`).
+fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -> Option<i64> {
+    let target = snapshot_path?;
+    // Lock order everywhere: handles, then tearing_down (stop() takes them the
+    // same way), so the two views cannot interleave into a gap.
+    let map = engine.handles.lock().ok()?;
+    if engine.tearing_down.lock().ok()?.contains(target) {
+        return Some(0);
+    }
+    map.iter()
+        .find(|(_, entry)| {
+            let cfg = match entry {
+                ChainEntry::Created(c) => c,
+                ChainEntry::Running(c, _, _) => c,
+                ChainEntry::Paused(c, ..) => c,
+            };
+            cfg.snapshot_path.as_deref() == Some(target)
+        })
+        .map(|(id, _)| *id)
+}
+
+/// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
+/// shared with the Java hosts.
+fn persistence_suffix(config: &ChainConfig) -> String {
+    if config.name == "mainnet" {
+        String::new()
+    } else {
+        format!("-{}", config.name)
+    }
+}
+
+/// The caller-supplied-checkpoint marker for this network under `dir`
+/// (`sync-anchor[-net].json`, next to the snapshot it governs).
+fn anchor_marker_path(dir: &std::path::Path, config: &ChainConfig) -> std::path::PathBuf {
+    dir.join(format!("sync-anchor{}.json", persistence_suffix(config)))
+}
+
+/// Whether the marker ENTRY is definitely absent. Judged on the directory entry
+/// itself (`symlink_metadata`, never following links): a dangling symlink at
+/// the marker path is an entry, not absence — following it would read ENOENT
+/// and let a caller rebind the directory and overwrite the link
+/// (freedom-browser#353). Any error other than NotFound also counts as
+/// present (fail closed).
+fn marker_entry_absent(path: &std::path::Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Read a marker written by [`write_anchor_marker`]: `Ok(None)` when the entry
+/// is absent, `Err(())` when an entry exists but cannot be read as a marker
+/// (garbage, wrong shape, dangling symlink, permissions) — which both entry
+/// points treat as a foreign generation (a marker we cannot read never unlocks
+/// a resume).
+fn read_anchor_marker(path: &std::path::Path) -> Result<Option<([u8; 32], u64)>, ()> {
+    if marker_entry_absent(path) {
+        return Ok(None);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Err(());
+    };
+    let parse = || -> Option<([u8; 32], u64)> {
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let root = parse_hex_fixed::<32>(v.get("checkpointRoot")?.as_str()?)?;
+        let slot = v.get("checkpointSlot")?.as_u64()?;
+        Some((root, slot))
+    };
+    parse().map(Some).ok_or(())
+}
+
+/// Record the caller's anchor DURABLY: the tree's atomic writer (unique temp,
+/// fsync, rename) followed by an fsync of the parent directory that is
+/// required to succeed. `write_atomic`'s own directory sync is best-effort —
+/// right for a cache, where a lost rename just means the previous checkpoint —
+/// but wrong here: if the rename were not durable, a power loss after the
+/// engine persisted a caller-anchored snapshot could leave that snapshot
+/// WITHOUT its marker, and a later plain `create()` would classify the
+/// directory as embedded-anchor state and resume it under the wrong anchor.
+/// So a create is registered only once the marker's directory entry is on
+/// disk; any failure here surfaces as `CREATE_FAILED`, never as a handle.
+fn write_anchor_marker(path: &std::path::Path, root: &[u8; 32], slot: u64) -> std::io::Result<()> {
+    let body = serde_json::json!({
+        "checkpointRoot": format!("0x{}", hex32(root)),
+        "checkpointSlot": slot,
+        "note": "trust anchor supplied by the host at createWithCheckpoint; the engine \
+                 verifies forward from it but did not authenticate it",
+    });
+    myotis_net::el::logindex::write_atomic(path, &serde_json::to_vec_pretty(&body)?)?;
+    sync_parent_dir(path)
+}
+
+/// Make a rename in `path`'s directory durable. On Unix that is an fsync of
+/// the directory itself, and it must succeed. Windows has no directory fsync
+/// (opening a directory as a file is refused) and NTFS journals directory
+/// metadata itself, so nothing is required there.
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "marker path has no parent")
+        })?;
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Insert a not-yet-started handle for `config` and hand out its id.
+fn register(engine: &EngineState, config: ChainConfig) -> i64 {
     let id = engine.next_id.fetch_add(1, Ordering::Relaxed);
     match engine.handles.lock() {
         Ok(mut map) => {
@@ -268,14 +636,19 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // Holding the map lock across block_on would serialize every other native
     // (status/stop/create) behind a potentially-slow start and invites deadlock on
     // future changes — even though SyncHandle::start is fast today (spawn + return).
-    let config = {
+    let (config, read_stats) = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return false,
         };
         match (from, map.get(&handle)) {
-            (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => Arc::clone(c),
-            (SpinUpFrom::Paused, Some(ChainEntry::Paused(c, _))) => Arc::clone(c),
+            (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => {
+                (Arc::clone(c), Arc::new(ReadStats::new()))
+            }
+            // Resume keeps the shadow cache the paused reader accumulated.
+            (SpinUpFrom::Paused, Some(ChainEntry::Paused(c, _, stats))) => {
+                (Arc::clone(c), Arc::clone(stats))
+            }
             _ => return false, // unknown id, or not in the expected state
         }
     };
@@ -293,11 +666,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // on mainnet — the same file the Java daemon writes — `peers-sepolia.cache`
     // etc. otherwise), so verified snap peers warm-start across restarts and
     // engine switches without cross-network contamination.
-    let el_suffix = if config.name == "mainnet" {
-        String::new()
-    } else {
-        format!("-{}", config.name)
-    };
+    let el_suffix = persistence_suffix(&config);
     let el_cache_path = config
         .snapshot_path
         .as_deref()
@@ -327,7 +696,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
             let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
-            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg).await
+            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg, read_stats).await
         }) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
@@ -356,12 +725,26 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         // one push their config right after start, which unions with (and
         // can disable) what this activated.
         reader.activate_log_index_from_disk(engine.rt.handle());
+        // Then re-apply the host's last push. Activation sets its own defaults —
+        // enabled, walk paused — which are right on a cold start, where the
+        // host's push decides what happens next. A RESUME has no push behind it:
+        // pause dropped the reader, the index came back off disk, and no host
+        // re-pushes on resume (Android's idle pause is the common case). Without
+        // this, one idle pause strands a walk the host asked for, and re-enables
+        // an index the host turned off — the latter silently, since a disabled
+        // index leaves its file in place for activation to find.
+        if let Ok(bits) = engine.log_index_runtime_bits.lock() {
+            if let Some(&(enabled, max_speed, backfill_paused)) = bits.get(&handle) {
+                reader.apply_log_index_runtime_bits(enabled, max_speed, backfill_paused);
+            }
+        }
     }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
     // start()/resume() may have already published a Running one, while we were
     // starting. Either way, shut the handle we just started down rather than
     // orphan its tokio/libp2p host.
+    let pins_reader = reader.clone();
     let mut map = match engine.handles.lock() {
         Ok(m) => m,
         Err(_) => {
@@ -373,6 +756,15 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         (SpinUpFrom::Created, Some(ChainEntry::Created(_)))
         | (SpinUpFrom::Paused, Some(ChainEntry::Paused(..))) => {
             map.insert(handle, ChainEntry::Running(config, sync, reader));
+            drop(map);
+            // The host's seed pins, applied AFTER the entry is Running (#465):
+            // the pool was rebuilt from scratch, and the pins are the host's
+            // answer to a starving pool. After, not before, the publish: a
+            // push that lands while the reader is being built sees a
+            // Created/Paused entry and only stashes, so reading the stash
+            // here catches it, and a push from now on applies itself live.
+            // Applying twice is idle (set semantics; `try_dial` dedups).
+            apply_pending_boot_enodes(engine, handle, pins_reader.as_ref());
             true
         }
         _ => {
@@ -380,6 +772,25 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             shutdown(engine, sync, reader);
             false
         }
+    }
+}
+
+/// Hand the handle's stashed host seed pins (`set_boot_enodes_json`) to its EL
+/// reader: read under the stash lock, applied outside it (the pool call
+/// takes its own locks). No reader (the CL-only degraded mode) or no pins:
+/// nothing to do — the stash stays for the next spin_up.
+fn apply_pending_boot_enodes(engine: &EngineState, handle: i64, reader: Option<&Arc<ElReader>>) {
+    let Some(reader) = reader else { return };
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
+    let pins = engine
+        .pending_boot_enodes
+        .lock()
+        .ok()
+        .and_then(|pending| pending.get(&handle).cloned())
+        .filter(|pins| !pins.is_empty());
+    if let Some(pins) = pins {
+        let reader = Arc::clone(reader);
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
     }
 }
 
@@ -419,7 +830,14 @@ pub fn pause(handle: i64) -> bool {
                 frozen.peer_count = 0;
                 frozen.served_peers_last_min = 0;
                 frozen.discv5_table_size = 0;
-                map.insert(handle, ChainEntry::Paused(config, frozen));
+                // The shadow cache outlives the reader; a CL-only chain
+                // (no reader) parks an empty one so resume has something to
+                // hand the reader it may then manage to start.
+                let stats = reader
+                    .as_ref()
+                    .map(|r| r.read_stats())
+                    .unwrap_or_else(|| Arc::new(ReadStats::new()));
+                map.insert(handle, ChainEntry::Paused(config, frozen, stats));
                 (sync, reader)
             }
             Some(other) => {
@@ -431,14 +849,10 @@ pub fn pause(handle: i64) -> bool {
     };
     // Await the async teardown outside the map lock, like stop().
     engine.rt.block_on(async move {
+        if let Some(reader) = &reader { reader.cancel_requests(); }
         sync.stop().await;
         if let Some(reader) = reader {
-            reader.stop_log_index_appender().await;
-            if let Ok(reader) = Arc::try_unwrap(reader) {
-                reader.stop().await;
-            }
-            // An in-flight verified read still holds a clone: its Drop aborts
-            // the reader's tasks when the last Arc goes (same as stop()).
+            reader.stop().await;
         }
     });
     tracing::info!(handle, "paused (networking torn down; warm state persisted)");
@@ -449,17 +863,10 @@ pub fn pause(handle: i64) -> bool {
 /// path). Runs the async stops on the engine runtime.
 fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>>) {
     engine.rt.block_on(async move {
+        if let Some(reader) = &reader { reader.cancel_requests(); }
         sync.stop().await;
         if let Some(reader) = reader {
-            // Only our just-started reader holds an Arc here, so unwrapping the
-            // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
-            // reader's Drop still aborts its tasks. The appender is stopped
-            // (abort + await) FIRST so its per-tick strong Arc can't defeat
-            // the unwrap.
-            reader.stop_log_index_appender().await;
-            if let Ok(reader) = Arc::try_unwrap(reader) {
-                reader.stop().await;
-            }
+            reader.stop().await;
         }
     });
 }
@@ -499,7 +906,7 @@ pub fn status_json(handle: i64) -> String {
                 config.wall_clock_period(),
                 reader.clone(),
             ),
-            Some(ChainEntry::Paused(config, frozen)) => {
+            Some(ChainEntry::Paused(config, frozen, _)) => {
                 Snap::Paused(config.name, frozen.clone(), config.wall_clock_period())
             }
             None => Snap::Unknown,
@@ -529,6 +936,7 @@ pub fn status_json(handle: i64) -> String {
                         ElCounts {
                             reader_available: true,
                             snap_peers: r.snap_peer_count().await,
+                            snap_serving: r.snap_serving_count().await,
                             discovered: r.discovered_count(),
                             attempted: r.attempted_count().await,
                             backed_off: r.backoff_count().await,
@@ -571,6 +979,12 @@ struct ElCounts {
     /// fast-fails instead of holding the full wake cap.
     reader_available: bool,
     snap_peers: usize,
+    /// The subset of `snap_peers` that can answer a read at the anchored head
+    /// NOW (`ElReader::snap_serving_count`: their own word or a served proof
+    /// puts them at or near it, and they are not read-benched). What the hosts
+    /// gate readiness on since ABI 31 — a pool of peers still syncing keeps
+    /// `snap_peers` positive for hours while every read fails (#465).
+    snap_serving: usize,
     discovered: usize,
     attempted: usize,
     backed_off: usize,
@@ -627,7 +1041,17 @@ pub fn stop(handle: i64) {
     // and can take a moment; holding the map lock across it would serialize all
     // other natives needlessly).
     let entry = match engine.handles.lock() {
-        Ok(mut m) => m.remove(&handle),
+        Ok(mut m) => {
+            let entry = m.remove(&handle);
+            // Still under the map lock: the directory must never be observable
+            // as free while the loop below may still write to it.
+            if let Some(ChainEntry::Running(cfg, _, _)) = &entry {
+                if let (Some(p), Ok(mut td)) = (cfg.snapshot_path.clone(), engine.tearing_down.lock()) {
+                    td.insert(p);
+                }
+            }
+            entry
+        }
         Err(_) => return,
     };
     // The handle's cached feeHistory dies with it.
@@ -637,19 +1061,27 @@ pub fn stop(handle: i64) {
     if let Ok(mut pending) = engine.pending_served_window.lock() {
         pending.remove(&handle);
     }
+    if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
+        pending.remove(&handle);
+    }
+    if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
+        bits.remove(&handle);
+    }
     if let Ok(mut watches) = engine.fork_watches.lock() {
         watches.remove(&handle);
     }
-    if let Some(ChainEntry::Running(_, sync, reader)) = entry {
+    if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
+            if let Some(reader) = &reader { reader.cancel_requests(); }
             sync.stop().await;
             if let Some(reader) = reader {
-                reader.stop_log_index_appender().await;
-                if let Ok(reader) = Arc::try_unwrap(reader) {
-                    reader.stop().await;
-                }
+                reader.stop().await;
             }
         });
+        // Teardown complete: no writer is left for this directory.
+        if let (Some(p), Ok(mut td)) = (cfg.snapshot_path.as_ref(), engine.tearing_down.lock()) {
+            td.remove(p);
+        }
     }
 }
 
@@ -689,11 +1121,176 @@ pub fn set_served_block_window(handle: i64, blocks: i32) -> bool {
     }
 }
 
+/// Cap on host-supplied seed pins per handle: a seed list is a handful of
+/// servers the host knows to be up, not a peer database (the cache is that).
+const MAX_HOST_ENODES: usize = 64;
+
+/// Pure: a host's seed-pin push (`myotis_set_boot_enodes`) → dialable pins,
+/// APPLIED OR REFUSED AS A WHOLE (CLAUDE.md §Trust — a push the engine
+/// half-applied is one the host cannot reason about): a non-array, any entry
+/// that is not a string or not a strict `enode://<128 hex>@ip:port` URL
+/// (`parse_enode` — a DNS name is refused, not resolved), a duplicate
+/// address, or more than [`MAX_HOST_ENODES`] entries refuses the push with
+/// every reason named. An empty array is a valid "clear".
+fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
+    let entries = match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Array(entries)) => entries,
+        Ok(_) => return Err("not a JSON array of enode:// strings".to_string()),
+        Err(e) => return Err(format!("not valid JSON: {e}")),
+    };
+    if entries.len() > MAX_HOST_ENODES {
+        return Err(format!(
+            "{} entries; at most {MAX_HOST_ENODES} seed pins are accepted",
+            entries.len()
+        ));
+    }
+    let mut pins: Vec<Enode> = Vec::with_capacity(entries.len());
+    let mut reasons = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(url) = entry.as_str() else {
+            reasons.push(format!("entry {i}: not a string"));
+            continue;
+        };
+        match parse_enode(url) {
+            Ok((addr, _)) if pins.iter().any(|(seen, _)| *seen == addr) => {
+                reasons.push(format!("entry {i}: duplicate address {addr}"));
+            }
+            Ok(pin) => pins.push(pin),
+            Err(why) => reasons.push(format!("entry {i}: {why}")),
+        }
+    }
+    if reasons.is_empty() {
+        Ok(pins)
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
+/// `myotis_set_boot_enodes` (ABI ≥ 31, #465): replace the handle's
+/// HOST-SUPPLIED EL seed pins with a JSON array of `enode://` URLs. Strict —
+/// the whole push is applied or refused ([`parse_boot_enodes_json`]; `false`
+/// with one WARN naming every reason, nothing applied). Applied immediately
+/// on a RUNNING handle's EL reader and STASHED for every spin_up (start AND
+/// resume), exactly like [`set_served_block_window`]: hosts push between
+/// create() and start(), and a resume rebuilds the pool. A RUNNING handle
+/// whose EL reader failed to start (`elReaderAvailable` false, the CL-only
+/// degraded mode) stashes only, for the resume that rebuilds it — as the
+/// served window does. Set semantics — a later push replaces an earlier one;
+/// an empty array clears. `false` for an unknown handle (nothing stashed).
+pub fn set_boot_enodes_json(handle: i64, enodes_json: &str) -> bool {
+    let pins = match parse_boot_enodes_json(enodes_json) {
+        Ok(pins) => pins,
+        Err(reason) => {
+            tracing::warn!(handle, %reason, "boot enodes refused; nothing applied");
+            return false;
+        }
+    };
+    let Some(engine) = engine() else { return false };
+    // Serialized with spin_up's replay (see `EngineState::boot_enodes_apply`).
+    let _serial = engine.boot_enodes_apply.lock().unwrap_or_else(|e| e.into_inner());
+    // Stash under the handles lock — stop() removes the entry under this same
+    // lock and clears the stash after, so an entry stashed for a known handle
+    // cannot outlive it (set_served_block_window's discipline) — and apply to
+    // the snapshotted reader OUTSIDE it (the pool call takes its own locks).
+    let reader = {
+        let Ok(map) = engine.handles.lock() else { return false };
+        let reader = match map.get(&handle) {
+            Some(ChainEntry::Running(_, _, Some(reader))) => Some(Arc::clone(reader)),
+            Some(_) => None, // Created / Paused / EL-less: applied at the next spin_up
+            None => return false,
+        };
+        if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
+            pending.insert(handle, pins.clone());
+        }
+        reader
+    };
+    if let Some(reader) = reader {
+        engine.rt.block_on(async move { reader.set_boot_enodes(pins).await });
+    }
+    true
+}
+
+/// `nativeSetWsBoundPeriods`: override the weak-subjectivity anchor-age bound
+/// (periods); 0 restores the network default. No stash map needed: the knob
+/// lives in the config's shared `Arc<WsPolicy>`, which every entry state
+/// (Created/Running/Paused) and the running sync loop's config clone all point
+/// at — a loop parked in STALE_ANCHOR re-reads it within a second. False only
+/// for an unknown handle.
+pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+    let Some(engine) = engine() else { return false };
+    let sane = periods.max(0) as u64;
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
+        | Some(ChainEntry::Paused(c, ..)) => {
+            c.ws_policy
+                .bound_override_periods
+                .store(sane, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `nativeAcceptStaleAnchor`: one-shot consent to sync forward from an anchor
+/// older than the weak-subjectivity bound — releases a STALE_ANCHOR park for
+/// the rest of this run (same shared-`WsPolicy` reach as the bound setter).
+/// Never persisted. False only for an unknown handle.
+pub fn accept_stale_anchor(handle: i64) -> bool {
+    let Some(engine) = engine() else { return false };
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
+        | Some(ChainEntry::Paused(c, ..)) => {
+            c.ws_policy
+                .accept_stale_anchor
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Parse a verified read's RPC block selector — BEFORE the handle lookup: a
+/// selector no retry can serve (`earliest`, a block hash, garbage) is refused
+/// as invalid params, the request's own fault, whatever state the handle is
+/// in. `Err` is the JSON to return. Shared by `eth_call` (#452) and the state
+/// reads (ABI ≥ 32, #465, #366).
+fn parse_read_block(block: &str) -> Result<BlockSelector, String> {
+    parse_call_block(block).map_err(|msg| eljson::invalid_params_json(&msg))
+}
+
+/// The anchor a parsed selector reads at, judged against the head as of
+/// dispatch: a head tag → the verified head; `finalized` → the beacon-finalized
+/// block; a number → the head, but only inside the window around it
+/// ([`check_call_block`] — head state is the near-head trade-off, exact
+/// historical state is not held), else refused as JSON rather than answered
+/// from the head. The reader itself refuses `finalized` while no finalized
+/// block has landed.
+fn read_anchor(selector: BlockSelector, reader: &ElReader) -> Result<ReadAnchor, String> {
+    check_call_block(selector, reader.optimistic_block_number()).map_err(|r| r.to_json())?;
+    Ok(match selector {
+        BlockSelector::Finalized => ReadAnchor::Finalized,
+        BlockSelector::Head | BlockSelector::Number(_) => ReadAnchor::Head,
+    })
+}
+
 /// Verified account query as JSON (`AccountProofResult` shape / an
-/// `{"error": ...}` object) — `nativeRequestAccountJson`.
-pub fn request_account_json(handle: i64, address_hex: &str) -> String {
+/// `{"error": ...}` object) — `nativeRequestAccountJson`. `block` is the RPC
+/// block selector, applied or refused ([`read_anchor`]).
+pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -705,7 +1302,11 @@ pub fn request_account_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_account(address).await }) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_account(anchor, address).await })) {
         Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -740,7 +1341,7 @@ pub fn get_storage_proof_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_storage(address, slot, holder).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
         Ok(storage) => eljson::storage_json(
             address_hex,
             holder_hex,
@@ -754,10 +1355,15 @@ pub fn get_storage_proof_json(
 
 /// `nativeGetCodeJson`: run a verified contract-code query (`eth_getCode`) for a
 /// running handle, returning the code result JSON, or `{"error": "..."}` for a
-/// transport / not-running / bad-input failure.
-pub fn get_code_json(handle: i64, address_hex: &str) -> String {
+/// transport / not-running / bad-input failure. `block` is the RPC block
+/// selector, applied or refused ([`read_anchor`]).
+pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -766,7 +1372,11 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_code(address).await }) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_code(anchor, address).await })) {
         Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -775,13 +1385,23 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
 /// `nativeGetStorageAtJson`: run a verified RAW-32-byte-position storage query
 /// (`eth_getStorageAt`) for a running handle. `position_hex` is the 32-byte
 /// storage position (0x-hex); the trie key is that position itself — no ERC-20
-/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`.
-pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -> String {
+/// mapping, unlike `get_storage_proof_json`'s `(slot, holder)`. `block` is the
+/// RPC block selector, applied or refused ([`read_anchor`]).
+pub fn get_storage_at_json(
+    handle: i64,
+    address_hex: &str,
+    position_hex: &str,
+    block: &str,
+) -> String {
     let Some(address) = parse_address(address_hex) else {
         return eljson::error_json("invalid address (expected 20-byte hex)");
     };
     let Some(position) = parse_word32(position_hex) else {
         return eljson::error_json("invalid storage position (expected 32-byte hex)");
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -790,7 +1410,14 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_storage_at(address, position).await }) {
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine
+        .rt
+        .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
+    {
         Ok(storage) => {
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
@@ -803,9 +1430,16 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
 /// calldata is init code and the constructor's return data is the answer);
 /// `data_hex` is the calldata;
 /// `value_dec` is the wei value as a decimal string (FFI-neutral); `block` is the
-/// RPC block tag (the Java side has already gated it to the servable window, so
-/// the call runs against the verified head). Returns the call JSON
-/// (`ok`/`revert`/`unavailable`, see [`eljson::call_json`]) or `{"error": "..."}`.
+/// RPC block selector, checked HERE, once for every host (#452): a head tag (or
+/// empty) runs against the VERIFIED HEAD's state, `finalized` against the
+/// beacon-finalized block (ABI ≥ 30, #465), a block number runs only inside the
+/// window around the head ([`check_call_block`]) and still against head state,
+/// and anything else is refused rather than answered from the head. Returns
+/// the call JSON (`ok`/`revert`/`unavailable`, each naming the block it ran
+/// against, see
+/// [`eljson::call_json`]), `{"error": "..."}`, or
+/// [`eljson::invalid_params_json`] for a request this node can never serve (a
+/// malformed argument, or a block it will never reach).
 pub fn eth_call_json(
     handle: i64,
     from_hex: &str,
@@ -827,16 +1461,22 @@ pub fn eth_call_overrides_json(
     to_hex: &str,
     data_hex: &str,
     value_dec: &str,
-    _block: &str,
+    block: &str,
     overrides_json: &str,
 ) -> String {
+    // Every refusal of the request's own arguments is permanent (-32602): no
+    // retry changes them. The block first, as the host adapters check it.
+    let call_block = match parse_read_block(block) {
+        Ok(b) => b,
+        Err(json) => return json,
+    };
     let overrides = match parse_state_overrides(overrides_json) {
         Ok(o) => o,
-        Err(msg) => return eljson::error_json(&msg),
+        Err(msg) => return eljson::invalid_params_json(&msg),
     };
     let target = match call_target(to_hex) {
         Ok(t) => t,
-        Err(msg) => return eljson::error_json(msg),
+        Err(msg) => return eljson::invalid_params_json(msg),
     };
     let creation = target.is_none();
     let to = target.unwrap_or([0u8; 20]);
@@ -846,7 +1486,9 @@ pub fn eth_call_overrides_json(
     } else {
         match parse_address(from_hex) {
             Some(a) => Some(a),
-            None => return eljson::error_json("invalid 'from' address (expected 20-byte hex)"),
+            None => {
+                return eljson::invalid_params_json("invalid 'from' address (expected 20-byte hex)")
+            }
         }
     };
     // Calldata may be empty (a bare value transfer / fallback call).
@@ -855,7 +1497,7 @@ pub fn eth_call_overrides_json(
     } else {
         match parse_hex_bytes(data_hex) {
             Some(d) => d,
-            None => return eljson::error_json("invalid call data (expected hex)"),
+            None => return eljson::invalid_params_json("invalid call data (expected hex)"),
         }
     };
     let value = if value_dec.trim().is_empty() {
@@ -863,7 +1505,7 @@ pub fn eth_call_overrides_json(
     } else {
         match U256::from_str_radix(value_dec.trim(), 10) {
             Ok(v) => v,
-            Err(_) => return eljson::error_json("invalid value (expected decimal wei)"),
+            Err(_) => return eljson::invalid_params_json("invalid value (expected decimal wei)"),
         }
     };
     let Some(engine) = engine() else {
@@ -873,17 +1515,24 @@ pub fn eth_call_overrides_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    // Against the head as of dispatch, like the host adapters' own check.
+    let anchor = match read_anchor(call_block, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
     match engine
         .rt
         .block_on(async {
             if creation {
-                reader.eth_call_create(from, data, value, chain_id, overrides).await
+                reader.eth_call_create(anchor, from, data, value, chain_id, overrides).await
             } else {
-                reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
+                reader
+                    .eth_call_overridden(anchor, from, to, data, value, chain_id, overrides)
+                    .await
             }
         })
     {
-        Ok(outcome) => eljson::call_json(&outcome),
+        Ok(answer) => eljson::call_json(&answer),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -905,6 +1554,140 @@ fn call_target(to_hex: &str) -> Result<Option<[u8; 20]>, &'static str> {
         Some(a) => Ok(Some(a)),
         None => Err("invalid 'to' address (expected 20-byte hex)"),
     }
+}
+
+/// How far BELOW the verified head a numbered `eth_call` block still runs
+/// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE`
+/// (jsonrpc-server), the check the JVM and iOS hosts run before calling in;
+/// `RustBlockWindowTest` reads this file and pins the two together.
+const CALL_BLOCK_LAG_TOLERANCE: u64 = 64;
+
+/// How far ABOVE the verified head a numbered `eth_call` block still runs
+/// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_TOLERANCE`.
+const CALL_BLOCK_AHEAD_TOLERANCE: u64 = 16;
+
+/// A parsed eth block selector — for `eth_call` ([`parse_call_block`]) and the
+/// block reads ([`parse_block_target`]), whose accepted syntax differs but
+/// whose meaning is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockSelector {
+    /// A head tag (`latest`/`pending`/`safe`), or empty — the JSON-RPC
+    /// default. `safe` and `pending` still mean the head (#366).
+    Head,
+    /// The `finalized` tag: the beacon-FINALIZED block (ABI ≥ 30, #465) —
+    /// applied, not silently mapped to the head; for a block read resolved
+    /// against the anchor by [`resolve_block_target`].
+    Finalized,
+    /// A block number: for `eth_call` still to be checked against the verified
+    /// head ([`check_call_block`]); for a block read served as is.
+    Number(u64),
+}
+
+/// Parse an `eth_call` block selector with the acceptance of the hosts'
+/// `RpcBlockWindow.blockInWindow`, so the engine does not refuse a pin they
+/// admit: head tags in any case, `0x`/`0X` hex, and bare digits read as
+/// DECIMAL (unlike [`parse_block_target`], which reads them as hex; #366 item
+/// 6). Deliberately stricter in one respect: ASCII digits only and no sign,
+/// where Kotlin's `toLongOrNull` also takes a sign and non-ASCII digits. No
+/// JSON-RPC quantity carries either.
+///
+/// `Err` is a selector no retry can make servable (`earliest`, a block hash,
+/// garbage), so the caller refuses it as invalid params.
+fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
+    let b = block.trim();
+    let is_tag = |t: &str| b.eq_ignore_ascii_case(t);
+    if b.is_empty() || ["latest", "pending", "safe"].into_iter().any(is_tag) {
+        return Ok(BlockSelector::Head);
+    }
+    if is_tag("finalized") {
+        return Ok(BlockSelector::Finalized);
+    }
+    if is_tag("earliest") {
+        return Err("earliest (genesis) is not served: verified reads run against the \
+                    head's state, or the finalized block's"
+            .to_string());
+    }
+    let (digits, radix) = match b.strip_prefix("0x").or_else(|| b.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (b, 10),
+    };
+    let well_formed = !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix));
+    // Digits only, so the parse fails only on overflow: a number past i64::MAX
+    // is malformed, as the hosts' Long parse has it.
+    let number = if well_formed { i64::from_str_radix(digits, radix).ok() } else { None };
+    if let Some(n) = number.and_then(|n| u64::try_from(n).ok()) {
+        return Ok(BlockSelector::Number(n));
+    }
+    if well_formed && radix == 16 && digits.len() == 64 {
+        return Err("a block hash is not supported as the selector: pass a block number or a tag"
+            .to_string());
+    }
+    let shown: String = b.chars().take(66).collect();
+    let more = if shown.len() < b.len() { "…" } else { "" };
+    Err(format!(
+        "invalid block selector {shown:?}{more} (expected latest, pending, safe, finalized or a \
+         block number)"
+    ))
+}
+
+/// Why a numbered `eth_call` block cannot run against the verified head.
+#[derive(Debug, PartialEq, Eq)]
+enum CallBlockRefusal {
+    /// More than [`CALL_BLOCK_LAG_TOLERANCE`] below the head. Head state would
+    /// answer a different question, and the head never moves back that far:
+    /// PERMANENT (-32602).
+    Behind { block: u64, head: u64 },
+    /// More than [`CALL_BLOCK_AHEAD_TOLERANCE`] above the head: a block this
+    /// node has not verified YET. That clears as the head advances, so it is
+    /// retryable, like geth's "header not found" for a future block. Calling
+    /// it permanent would tell a client to stop asking a node that is only
+    /// lagging.
+    Ahead { block: u64, head: u64 },
+    /// No verified head yet to check the number against: not synced, retryable.
+    NoHead { block: u64 },
+}
+
+impl CallBlockRefusal {
+    fn to_json(&self) -> String {
+        match *self {
+            Self::Behind { block, head } => eljson::invalid_params_json(&format!(
+                "block {block:#x} ({block}) is more than {CALL_BLOCK_LAG_TOLERANCE} blocks \
+                 behind the verified head ({head}); verified reads run against head state, so \
+                 this node cannot answer for that block"
+            )),
+            Self::Ahead { block, head } => eljson::error_json(&format!(
+                "block {block:#x} ({block}) is more than {CALL_BLOCK_AHEAD_TOLERANCE} blocks \
+                 ahead of the verified head ({head})"
+            )),
+            Self::NoHead { block } => eljson::error_json(&format!(
+                "beacon not synced: no verified head to check block {block:#x} against"
+            )),
+        }
+    }
+}
+
+/// Whether a call for `block` may run against the verified head `head` (0 =
+/// none yet). A number must lie in `[head - 64, head + 16]`, the hosts'
+/// window: wallets pin reads to the number `eth_blockNumber` just returned,
+/// which is at or near the head. Inside the window the call still runs against
+/// HEAD state, the documented near-head trade-off (exact-block execution is
+/// #382). A tag needs no check here: `Head` runs at the head, `Finalized` at
+/// the beacon-finalized block, whose own not-synced refusal comes from the
+/// reader.
+fn check_call_block(block: BlockSelector, head: u64) -> Result<(), CallBlockRefusal> {
+    let BlockSelector::Number(block) = block else {
+        return Ok(());
+    };
+    if head == 0 {
+        return Err(CallBlockRefusal::NoHead { block });
+    }
+    if block < head.saturating_sub(CALL_BLOCK_LAG_TOLERANCE) {
+        return Err(CallBlockRefusal::Behind { block, head });
+    }
+    if block > head.saturating_add(CALL_BLOCK_AHEAD_TOLERANCE) {
+        return Err(CallBlockRefusal::Ahead { block, head });
+    }
+    Ok(())
 }
 
 /// Parse an `eth_call` state-override object (the JSON-RPC third parameter).
@@ -1199,7 +1982,8 @@ pub fn estimate_gas_json(
 /// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
 /// handle. `full_transactions` selects fully decoded tx objects instead of
 /// hashes. Returns the block JSON when found+verified, the literal `"null"` for
-/// a future/unknown block (eth's null), or `{"error": "..."}` when it can't
+/// a future/unknown block (eth's null — above the verified head and not
+/// covered by finality), or `{"error": "..."}` when it can't
 /// verify right now (which the Java side maps to a null → -32000).
 pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
     let target = match parse_block_target(block_tag) {
@@ -1213,9 +1997,13 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    let target = match resolve_block_target(target, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
+    };
     match engine
         .rt
-        .block_on(async { reader.get_block_by_number(target, full_transactions).await })
+        .block_on(reader.request(async { reader.get_block_by_number(target, full_transactions).await }))
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
@@ -1264,7 +2052,7 @@ pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_transaction_receipt(tx_hash).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_transaction_receipt(tx_hash).await })) {
         Ok(Some(receipt)) => eljson::receipt_json(&receipt),
         Ok(None) => "null".to_string(), // verified "not seen" → eth null
         Err(e) => eljson::error_json(&e),
@@ -1288,7 +2076,7 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_transaction_by_hash(tx_hash).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_transaction_by_hash(tx_hash).await })) {
         Ok(myotis_net::el::reader::TxLookup::Mined(tx)) => eljson::tx_json(&tx),
         Ok(myotis_net::el::reader::TxLookup::Pending { tx_hash, tx }) => {
             eljson::pending_tx_json(&tx_hash, &tx)
@@ -1320,7 +2108,7 @@ pub fn get_block_by_hash_json(
     };
     match engine
         .rt
-        .block_on(async { reader.get_block_by_hash(block_hash, full_transactions).await })
+        .block_on(reader.request(async { reader.get_block_by_hash(block_hash, full_transactions).await }))
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
@@ -1346,7 +2134,7 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.send_raw_transaction(&raw).await }) {
+    match engine.rt.block_on(reader.request(async { reader.send_raw_transaction(&raw).await })) {
         Ok(hash) => eljson::tx_hash_json(&hash),
         Err(e) => eljson::error_json(&e),
     }
@@ -1365,7 +2153,7 @@ pub fn fee_estimate_json(handle: i64) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.fee_estimate().await }) {
+    match engine.rt.block_on(reader.request(async { reader.fee_estimate().await })) {
         Ok(est) => eljson::fee_json(&est),
         Err(e) => eljson::error_json(&e),
     }
@@ -1394,7 +2182,7 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
         let Some(hash) = parse_word32(selector) else {
             return eljson::error_json("invalid block hash (expected 32-byte hex)");
         };
-        engine.rt.block_on(async { reader.get_block_receipts_by_hash(hash).await })
+        engine.rt.block_on(reader.request(async { reader.get_block_receipts_by_hash(hash).await }))
     } else {
         let tag = if selector.is_empty() { "latest" } else { selector };
         let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
@@ -1407,7 +2195,11 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
             Ok(t) => t,
             Err(msg) => return eljson::error_json(msg),
         };
-        engine.rt.block_on(async { reader.get_block_receipts(target).await })
+        let target = match resolve_block_target(target, reader.finalized_block_number()) {
+            Ok(t) => t,
+            Err(msg) => return eljson::error_json(&msg),
+        };
+        engine.rt.block_on(reader.request(async { reader.get_block_receipts(target).await }))
     };
     match outcome {
         Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
@@ -1450,15 +2242,35 @@ pub fn fee_history_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    let newest = match resolve_block_target(newest, reader.finalized_block_number()) {
+        Ok(t) => t,
+        Err(msg) => return eljson::error_json(&msg),
+    };
     // The raw request strings ARE the stale-serve signature (the Java
     // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
     let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
-    match engine.rt.block_on(async {
-        reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
-    }) {
+    let result = engine.rt.block_on(reader.request(async {
+        Ok(reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await)
+    }));
+    fee_history_response(result, &engine.fee_history_cache, handle, key)
+}
+
+// Keep host result/cache policy independent of the live engine for finite tests.
+fn fee_history_response(
+    result: Result<
+        Result<myotis_net::el::reader::FeeHistory, myotis_net::el::reader::FeeHistoryError>,
+        String,
+    >,
+    cache: &Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
+    handle: i64,
+    key: String,
+) -> String {
+    // An outer operation failure is a build/availability failure, just like
+    // an inner peer timeout. Explicit request Rejects retain their meaning.
+    match result.unwrap_or_else(|msg| Err(myotis_net::el::reader::FeeHistoryError::Build(msg))) {
         Ok(history) => {
             let json = eljson::fee_history_json(&history);
-            if let Ok(mut cache) = engine.fee_history_cache.lock() {
+            if let Ok(mut cache) = cache.lock() {
                 cache.insert(handle, (key, json.clone(), std::time::Instant::now()));
             }
             json
@@ -1468,7 +2280,7 @@ pub fn fee_history_json(
         // BUILD failures reach serveStaleFeeHistory).
         Err(myotis_net::el::reader::FeeHistoryError::Reject(msg)) => eljson::error_json(&msg),
         Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
-            if let Ok(cache) = engine.fee_history_cache.lock() {
+            if let Ok(cache) = cache.lock() {
                 if let Some((last_key, json, at)) = cache.get(&handle) {
                     // saturating + read once: explicit panic-free style (the
                     // workspace convention under panic="abort"), and the gate
@@ -1510,13 +2322,15 @@ fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
     Ok(Some(out))
 }
 
-/// Parse an eth block selector to a target number: `None` = latest (the head).
-/// Mirrors the Java backend — latest/pending/safe/finalized all resolve to the
-/// optimistic head; earliest (genesis) and malformed/negative are not served
-/// verified (`Err`, surfaced as an error the router turns into -32000).
-fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
+
+/// Parse an eth block selector. Pure — `finalized` resolves against the anchor
+/// in [`resolve_block_target`]. Earliest (genesis) and malformed/negative are
+/// not served verified (`Err`, surfaced as an error the router turns into
+/// -32000).
+fn parse_block_target(tag: &str) -> Result<BlockSelector, &'static str> {
     match tag {
-        "latest" | "pending" | "safe" | "finalized" => Ok(None),
+        "latest" | "pending" | "safe" => Ok(BlockSelector::Head),
+        "finalized" => Ok(BlockSelector::Finalized),
         "earliest" => Err("earliest (genesis) is not served verified"),
         hex => {
             let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
@@ -1527,10 +2341,31 @@ fn parse_block_target(tag: &str) -> Result<Option<u64>, &'static str> {
                 // Block 0 (any hex form) is genesis — reject it up front, same as the
                 // "earliest" tag, rather than letting it fail deep in the lookback cap.
                 Ok(0) => Err("earliest (genesis) is not served verified"),
-                Ok(n) => Ok(Some(n)),
+                Ok(n) => Ok(BlockSelector::Number(n)),
                 Err(_) => Err("block number out of range"),
             }
         }
+    }
+}
+
+/// Resolve a parsed selector to the reader's target: `None` = the head,
+/// `Some(n)` = a block number. `finalized` takes the anchor's finalized block
+/// (`finalized_block_number`, 0 before one has landed) and is then refused with
+/// a plain, RETRYABLE error — it clears when the beacon syncs, and `-32602`
+/// would tell a client to stop asking a node that is merely unsynced. (The
+/// `eth_call` path lets the reader refuse the same state itself, with the same
+/// words.)
+fn resolve_block_target(
+    target: BlockSelector,
+    finalized_block_number: u64,
+) -> Result<Option<u64>, String> {
+    match target {
+        BlockSelector::Head => Ok(None),
+        BlockSelector::Number(n) => Ok(Some(n)),
+        BlockSelector::Finalized => match finalized_block_number {
+            0 => Err("no beacon-finalized execution block yet".to_string()),
+            n => Ok(Some(n)),
+        },
     }
 }
 
@@ -1748,6 +2583,7 @@ fn beacon_state(state: SyncState) -> &'static str {
         SyncState::Bootstrapping => "SYNCING",
         SyncState::CatchingUp => "CATCHING_UP",
         SyncState::Synced => "SYNCED",
+        SyncState::StaleAnchor => "STALE_ANCHOR",
     }
 }
 
@@ -1817,13 +2653,21 @@ fn status_object(
     // LC hunt engaged (starved of light-client servers) — drives the hosts'
     // hunt banner on the Status screen.
     obj.insert("lcHunting".into(), s.hunting.into());
+    // Weak-subjectivity bound (periods) the engine enforces. While beaconState
+    // is STALE_ANCHOR, currentPeriod is the refused anchor's period, so
+    // targetPeriod - currentPeriod is the anchor age judged against this.
+    obj.insert("wsBoundPeriods".into(), s.ws_bound_periods.into());
     obj.insert("finalizedRootHex".into(), hex32(&s.finalized_root).into());
     // EL pool/discovery counts (the Rust engine's execution-layer side). The
-    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers.
-    // elReaderAvailable distinguishes "EL warming up" from "EL reader failed to
-    // start" (the CL-only degraded mode) — the wake gate fast-fails the latter.
+    // pool keeps only snap-capable READY peers, so readyPeers == snapPeers —
+    // both count POOLED peers. snapServingPeers (ABI >= 31) is the subset that
+    // can answer a read at the anchored head now; it is what the hosts gate
+    // on (#465). elReaderAvailable distinguishes "EL warming up" from "EL
+    // reader failed to start" (the CL-only degraded mode) — the wake gate
+    // fast-fails the latter.
     obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
+    obj.insert("snapServingPeers".into(), el.snap_serving.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
     obj.insert("attemptedDials".into(), el.attempted.into());
@@ -1869,10 +2713,10 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#"{"running":false,"paused":false,"network":"mainnet","beaconState":"STARTING","#,
     r#""bootstrapped":false,"finalizedSlot":0,"optimisticSlot":0,"#,
     r#""currentPeriod":0,"targetPeriod":0,"peerCount":0,"servedPeersLastMinute":0,"#,
-    r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"#,
+    r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
-    r#""snapPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""snapPeers":0,"snapServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
@@ -1882,6 +2726,68 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_history_outer_failure_preserves_stale_cache_policy() {
+        use myotis_net::el::reader::FeeHistoryError;
+        let key = "2|latest|null".to_string();
+        let json = r#"{"oldestBlock":"0x1","baseFeePerGas":["0x1"]}"#.to_string();
+        let cache = Mutex::new(HashMap::from([(
+            7,
+            (key.clone(), json.clone(), std::time::Instant::now()),
+        )]));
+        for message in ["request deadline exceeded", "request cancelled"] {
+            assert_eq!(
+                fee_history_response(Err(message.into()), &cache, 7, key.clone()),
+                json
+            );
+            assert_eq!(
+                fee_history_response(
+                    Ok(Err(FeeHistoryError::Build(message.into()))),
+                    &cache,
+                    7,
+                    key.clone()
+                ),
+                json
+            );
+        }
+        let reject = "newest block is beyond the verified head";
+        assert_eq!(
+            fee_history_response(
+                Ok(Err(FeeHistoryError::Reject(reject.into()))),
+                &cache,
+                7,
+                key.clone()
+            ),
+            eljson::error_json(reject)
+        );
+        assert_eq!(
+            fee_history_response(
+                Err("request cancelled".into()),
+                &cache,
+                7,
+                "different request".into()
+            ),
+            eljson::error_json("request cancelled")
+        );
+        assert_eq!(
+            fee_history_response(Err("request cancelled".into()), &cache, 8, key),
+            eljson::error_json("request cancelled")
+        );
+    }
+
+    #[test]
+    fn fee_history_outer_failure_does_not_serve_expired_cache() {
+        let key = "2|latest|null".to_string();
+        let expired = std::time::Instant::now()
+            .checked_sub(FEE_HISTORY_STALE_MAX)
+            .unwrap();
+        let cache = Mutex::new(HashMap::from([(7, (key.clone(), "stale".into(), expired))]));
+        assert_eq!(
+            fee_history_response(Err("request deadline exceeded".into()), &cache, 7, key),
+            eljson::error_json("request deadline exceeded")
+        );
+    }
 
     #[test]
     fn create_makes_the_data_dir() {
@@ -1897,6 +2803,208 @@ mod tests {
         assert!(dir.is_dir(), "dataDir was not created");
         stop(id);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_with_checkpoint_rejects_bad_input_before_touching_the_disk() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.to_str().unwrap();
+        let root = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let future = ChainConfig::mainnet().wall_clock_slot() + 10_000;
+        for (label, id) in [
+            ("unknown network", create_with_checkpoint("nope", d, root, 100)),
+            ("short root", create_with_checkpoint("mainnet", d, "0x1234", 100)),
+            ("non-hex root", create_with_checkpoint("mainnet", d, &"zz".repeat(32), 100)),
+            ("zero root", create_with_checkpoint("mainnet", d, &"00".repeat(32), 100)),
+            ("slot 0", create_with_checkpoint("mainnet", d, root, 0)),
+            ("future slot", create_with_checkpoint("mainnet", d, root, future)),
+            ("empty data_dir", create_with_checkpoint("mainnet", "", root, 100)),
+        ] {
+            assert_eq!(id, CREATE_FAILED, "{label} must be refused with CREATE_FAILED");
+        }
+        // Refusals happen BEFORE any state mutation: no directory, no marker.
+        assert!(!dir.exists(), "a refused createWithCheckpoint must not create the dataDir");
+    }
+
+    #[test]
+    fn create_with_checkpoint_binds_a_fresh_dir_and_resumes_only_the_same_anchor() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-gen-{}", std::process::id()))
+            .join("fresh");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let d = dir.to_str().unwrap();
+        let root = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let other = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let slot = 8_192 * 3 + 5; // not an epoch boundary on purpose
+
+        // Fresh directory: bound to the caller's anchor, config carries it.
+        let id = create_with_checkpoint("mainnet", d, root, slot);
+        assert!(id >= 1, "fresh createWithCheckpoint failed: {id}");
+        let marker = dir.join("sync-anchor.json");
+        assert!(marker.is_file(), "the anchor marker must be written on first use");
+        assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
+        {
+            let map = engine().unwrap().handles.lock().unwrap();
+            let ChainEntry::Created(cfg) = map.get(&id).expect("handle registered") else {
+                panic!("fresh handle must be Created");
+            };
+            assert_eq!(cfg.checkpoint_root, parse_hex_fixed::<32>(root).unwrap());
+            assert_eq!(cfg.checkpoint_slot, slot);
+            assert_eq!(cfg.snapshot_path.as_deref(), Some(dir.join("sync-state.snapshot").as_path()));
+        }
+        // While that handle is alive the directory is in use: a second binding —
+        // even the same anchor — is refused before any marker work.
+        assert_eq!(create_with_checkpoint("mainnet", d, root, slot), CREATE_FAILED);
+        stop(id);
+
+        // Same anchor again: resume (a second handle, same generation).
+        let again = create_with_checkpoint("mainnet", d, root, slot);
+        assert!(again >= 1, "same-anchor restart must resume: {again}");
+        stop(again);
+
+        // A different root, or the same root at another slot: refused, marker untouched.
+        assert_eq!(create_with_checkpoint("mainnet", d, other, slot), ANCHOR_MISMATCH);
+        assert_eq!(create_with_checkpoint("mainnet", d, root, slot + 1), ANCHOR_MISMATCH);
+        assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
+
+        // The embedded anchor must not be able to adopt this generation either.
+        assert_eq!(create("mainnet", d), ANCHOR_MISMATCH);
+
+        // Another network in the same dir is a separate generation (own suffix).
+        let g = create_with_checkpoint("gnosis", d, other, slot);
+        assert!(g >= 1, "per-network markers are independent: {g}");
+        assert!(dir.join("sync-anchor-gnosis.json").is_file());
+        stop(g);
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_with_checkpoint_refuses_a_dir_holding_embedded_anchor_state() {
+        // A snapshot without a marker is state that descends from the EMBEDDED
+        // checkpoint: adopting it would let the snapshot-resume rule continue
+        // from a different trust anchor than the caller named.
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sync-state.snapshot"), b"whatever").unwrap();
+        let root = "0x4444444444444444444444444444444444444444444444444444444444444444";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), ANCHOR_MISMATCH);
+        assert!(!dir.join("sync-anchor.json").exists(), "no marker may be written on refusal");
+        // The plain path still works on such a directory (no marker → not ours to refuse).
+        let id = create("mainnet", dir.to_str().unwrap());
+        assert!(id >= 1);
+        stop(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_aliases_share_one_identity_for_the_guards() {
+        // freedom-browser#353 repro: create(real) then createWithCheckpoint(alias)
+        // used to yield two live handles and a marker in the first handle's dir.
+        let base = std::env::temp_dir().join(format!("myotis-cwc-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let alias = base.join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = "0x8888888888888888888888888888888888888888888888888888888888888888";
+
+        let id = create("mainnet", real.to_str().unwrap());
+        assert!(id >= 1);
+        // The alias is the same directory: in use, refused, and no marker written.
+        assert_eq!(create_with_checkpoint("mainnet", alias.to_str().unwrap(), root, 100), CREATE_FAILED);
+        assert!(!real.join("sync-anchor.json").exists(), "no marker may land in a live handle's dir");
+        stop(id);
+
+        // Bind through the alias; the real path must then see the marker.
+        let g = create_with_checkpoint("mainnet", alias.to_str().unwrap(), root, 100);
+        assert!(g >= 1, "{g}");
+        assert!(real.join("sync-anchor.json").is_file());
+        // Plain create sees the marker through the real path (its refusal is the
+        // marker, not the in-use guard, which is createWithCheckpoint's).
+        assert_eq!(create("mainnet", real.to_str().unwrap()), ANCHOR_MISMATCH, "bound via alias");
+        stop(g);
+        assert_eq!(create("mainnet", real.to_str().unwrap()), ANCHOR_MISMATCH);
+        // And resuming through either spelling is the same generation.
+        let r = create_with_checkpoint("mainnet", real.to_str().unwrap(), root, 100);
+        assert!(r >= 1, "{r}");
+        stop(r);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_marker_path_is_an_entry_not_absence() {
+        // freedom-browser#353 repro: a dangling `sync-anchor.json` symlink used to read
+        // as "no marker" (ENOENT through the link), so createWithCheckpoint bound the
+        // directory and replaced the link. Both constructors must refuse it.
+        let dir = std::env::temp_dir().join(format!("myotis-cwc-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("sync-anchor.json");
+        std::os::unix::fs::symlink(dir.join("does-not-exist"), &marker).unwrap();
+        assert!(!marker_entry_absent(&marker));
+        assert_eq!(read_anchor_marker(&marker), Err(()));
+        let root = "0x9999999999999999999999999999999999999999999999999999999999999999";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), ANCHOR_MISMATCH);
+        assert_eq!(create("mainnet", dir.to_str().unwrap()), ANCHOR_MISMATCH);
+        assert!(std::fs::symlink_metadata(&marker).unwrap().file_type().is_symlink(),
+            "the dangling link must be left untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_still_tearing_down_counts_as_in_use() {
+        // stop() removes the handle from the map before awaiting its loop, which
+        // may still persist a snapshot; the directory must stay "in use" for the
+        // create guards until teardown returns (Copilot on #442).
+        let dir = std::env::temp_dir().join(format!("myotis-cwc-teardown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let snap = canonical.join("sync-state.snapshot");
+        let engine = engine().unwrap();
+        engine.tearing_down.lock().unwrap().insert(snap.clone());
+        let root = "0xabababababababababababababababababababababababababababababababab";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100), CREATE_FAILED);
+        assert!(!canonical.join("sync-anchor.json").exists(), "no marker while a writer may remain");
+        engine.tearing_down.lock().unwrap().remove(&snap);
+        let id = create_with_checkpoint("mainnet", dir.to_str().unwrap(), root, 100);
+        assert!(id >= 1, "{id}");
+        stop(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_marker_round_trips_and_rejects_garbage() {
+        let dir = std::env::temp_dir()
+            .join(format!("myotis-cwc-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sync-anchor.json");
+        let root = [0xabu8; 32];
+        assert_eq!(read_anchor_marker(&p), Ok(None), "absent marker reads as None");
+        write_anchor_marker(&p, &root, 12_345).unwrap();
+        assert_eq!(read_anchor_marker(&p), Ok(Some((root, 12_345))));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "sync-anchor.json").collect();
+        assert!(leftovers.is_empty(), "temp files must be renamed away: {leftovers:?}");
+        // Garbage is Err, never None: a marker we cannot read must never unlock a
+        // resume (createWithCheckpoint answers ANCHOR_MISMATCH on it).
+        std::fs::write(&p, b"{not json").unwrap();
+        assert_eq!(read_anchor_marker(&p), Err(()));
+        std::fs::write(&p, br#"{"checkpointRoot":"0x12","checkpointSlot":1}"#).unwrap();
+        assert_eq!(read_anchor_marker(&p), Err(()));
+        let other = "0x7777777777777777777777777777777777777777777777777777777777777777";
+        assert_eq!(create_with_checkpoint("mainnet", dir.to_str().unwrap(), other, 100), ANCHOR_MISMATCH);
+        assert_eq!(create("mainnet", dir.to_str().unwrap()), ANCHOR_MISMATCH);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1969,9 +3077,9 @@ mod tests {
         assert_eq!(v["elReaderAvailable"], false);
         assert!(v["upgradeAdvisory"].is_null(), "no advisory before any peer was seen");
         // EL counts are zero for a not-started handle.
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
         }
         // Round-trips through the fallback constant too.
@@ -2054,10 +3162,12 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let el = ElCounts {
             reader_available: true,
             snap_peers: 5,
+            snap_serving: 3,
             discovered: 240,
             attempted: 14,
             backed_off: 30,
@@ -2095,11 +3205,14 @@ mod tests {
         assert_eq!(synced["servedPeersLastMinute"], 3);
         assert_eq!(synced["discv5TableSize"], 12);
         assert_eq!(synced["syncStartPeriod"], 1777);
+        assert_eq!(synced["wsBoundPeriods"], 13);
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
-        // readyPeers, since the pool holds only snap-capable READY peers).
+        // readyPeers, since the pool holds only snap-capable READY peers;
+        // snapServingPeers is its own count — the peers that can answer now).
         assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
+        assert_eq!(synced["snapServingPeers"], 3);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
         assert_eq!(synced["attemptedDials"], 14);
@@ -2143,6 +3256,7 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Paused,
@@ -2160,9 +3274,9 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 14_560_000);
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1795);
-        for k in ["snapPeers", "readyPeers", "discoveredPeers", "attemptedDials",
-                  "backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
-                  "finalizedBlockNumber", "executionBlockNumber"] {
+        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+                  "attemptedDials", "backedOffPeers", "blacklistedPeers",
+                  "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");
         }
     }
@@ -2188,6 +3302,104 @@ mod tests {
         // The stash dies with the handle.
         stop(handle);
         assert!(engine.pending_served_window.lock().unwrap().get(&handle).is_none());
+    }
+
+    #[test]
+    fn state_reads_apply_or_refuse_their_block_selector() {
+        // The three state reads take the RPC block selector since ABI 32 and
+        // judge it BEFORE the handle lookup would fail: a selector no retry can
+        // serve is permanent (-32602), a servable one reaches the engine (and
+        // fails here only on the unknown handle).
+        let addr = format!("0x{}", "ab".repeat(20));
+        let pos = format!("0x{}", "00".repeat(32));
+        let read = |block: &str| -> Vec<serde_json::Value> {
+            [
+                request_account_json(i64::MIN, &addr, block),
+                get_code_json(i64::MIN, &addr, block),
+                get_storage_at_json(i64::MIN, &addr, &pos, block),
+            ]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect()
+        };
+        for servable in ["", "latest", "pending", "safe", "finalized", "0x10"] {
+            for v in read(servable) {
+                assert_eq!(v["error"], "unknown handle", "{servable}: {v}");
+            }
+        }
+        for refused in ["earliest", "0xzz", &format!("0x{}", "ab".repeat(32))] {
+            for v in read(refused) {
+                assert_eq!(v["code"], -32602, "{refused}: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn boot_enodes_json_is_applied_or_refused_as_a_whole() {
+        let key = "ab".repeat(64);
+        let pin = |host: &str| format!("enode://{key}@{host}");
+        // The empty "clear", and a valid list.
+        assert_eq!(parse_boot_enodes_json("[]").unwrap(), vec![]);
+        let two = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("[2001:db8::1]:30303")
+        ))
+        .unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].1, [0xab; 64]);
+        // Refused as a whole, every reason named — a good entry beside a bad
+        // one is not applied.
+        let mixed = parse_boot_enodes_json(&format!(r#"["{}","nope",7]"#, pin("1.2.3.4:30303")))
+            .unwrap_err();
+        assert!(mixed.contains("entry 1: missing the enode:// prefix"), "{mixed}");
+        assert!(mixed.contains("entry 2: not a string"), "{mixed}");
+        let dup = parse_boot_enodes_json(&format!(
+            r#"["{}","{}"]"#,
+            pin("1.2.3.4:30303"),
+            pin("1.2.3.4:30303")
+        ))
+        .unwrap_err();
+        assert!(dup.contains("entry 1: duplicate address 1.2.3.4:30303"), "{dup}");
+        assert!(parse_boot_enodes_json("{}").unwrap_err().contains("not a JSON array"));
+        assert!(parse_boot_enodes_json("[").unwrap_err().contains("not valid JSON"));
+        let dns = parse_boot_enodes_json(&format!(r#"["{}"]"#, pin("node.example.org:30303")))
+            .unwrap_err();
+        assert!(dns.contains("numeric ip:port"), "{dns}");
+        let many = format!(
+            "[{}]",
+            (0..=MAX_HOST_ENODES)
+                .map(|i| format!("\"{}\"", pin(&format!("10.0.0.{i}:1"))))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse_boot_enodes_json(&many).unwrap_err().contains("at most 64"));
+    }
+
+    #[test]
+    fn boot_enodes_stash_pre_start_refuse_malformed_and_clear_on_stop() {
+        let key = "ab".repeat(64);
+        let list = format!(r#"["enode://{key}@1.2.3.4:30303"]"#);
+        // Unknown handle → false, nothing stashed.
+        assert!(!set_boot_enodes_json(999_999, &list));
+        let dir = std::env::temp_dir().join("myotis-host-boot-enodes-test");
+        let handle = create("mainnet", dir.to_str().unwrap());
+        assert!(handle > 0);
+        let engine = engine().unwrap();
+        let stashed = |h: i64| engine.pending_boot_enodes.lock().unwrap().get(&h).map(|p| p.len());
+        assert!(stashed(999_999).is_none());
+        // A Created (not-started) handle stashes the pins for spin_up.
+        assert!(set_boot_enodes_json(handle, &list));
+        assert_eq!(stashed(handle), Some(1));
+        // A malformed push is refused and leaves the earlier one in place.
+        assert!(!set_boot_enodes_json(handle, r#"["nope"]"#));
+        assert_eq!(stashed(handle), Some(1));
+        // An empty array is a valid clear.
+        assert!(set_boot_enodes_json(handle, "[]"));
+        assert_eq!(stashed(handle), Some(0));
+        // The stash dies with the handle.
+        stop(handle);
+        assert!(stashed(handle).is_none());
     }
 
     #[test]
@@ -2222,6 +3434,7 @@ mod tests {
             discv5_table_size: 12,
             sync_start_period: 1777,
             hunting: false,
+            ws_bound_periods: 13,
         };
         let v: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
@@ -2236,6 +3449,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_anchor_state_maps_and_carries_the_bound() {
+        // A parked handle: beaconState STALE_ANCHOR (NOT bootstrapped), period =
+        // the refused anchor's period, wsBoundPeriods = the enforced bound — so a
+        // host can render "anchor is (target - current) periods old, bound N".
+        let s = SyncStatus {
+            state: SyncState::StaleAnchor,
+            finalized_slot: 0,
+            finalized_root: [0u8; 32],
+            optimistic_slot: 0,
+            period: 1825,
+            peer_count: 0,
+            served_peers_last_min: 0,
+            discv5_table_size: 0,
+            sync_start_period: -1,
+            hunting: false,
+            ws_bound_periods: 13,
+        };
+        let v: serde_json::Value = serde_json::from_str(&status_object(
+            Lifecycle::Running,
+            "mainnet",
+            Some(s),
+            1845,
+            ElCounts::default(),
+        ))
+        .unwrap();
+        assert_eq!(v["beaconState"], "STALE_ANCHOR");
+        assert_eq!(v["bootstrapped"], false);
+        assert_eq!(v["currentPeriod"], 1825);
+        assert_eq!(v["targetPeriod"], 1845);
+        assert_eq!(v["wsBoundPeriods"], 13);
+    }
+
+    #[test]
     fn unknown_handle_returns_empty_object() {
         // No engine calls here — just the contract for a missing handle, which
         // status_json returns directly.
@@ -2244,10 +3490,20 @@ mod tests {
 
     #[test]
     fn parse_block_target_cases() {
-        assert_eq!(parse_block_target("latest"), Ok(None));
-        assert_eq!(parse_block_target("pending"), Ok(None));
-        assert_eq!(parse_block_target("finalized"), Ok(None));
-        assert_eq!(parse_block_target("0x1406f40"), Ok(Some(21_000_000)));
+        assert_eq!(parse_block_target("latest"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("pending"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("safe"), Ok(BlockSelector::Head));
+        assert_eq!(parse_block_target("finalized"), Ok(BlockSelector::Finalized));
+        assert_eq!(parse_block_target("0x1406f40"), Ok(BlockSelector::Number(21_000_000)));
+        // `finalized` resolves to the anchor's finalized block — applied — and
+        // is refused, retryably, before one has landed.
+        assert_eq!(resolve_block_target(BlockSelector::Head, 20_999_936), Ok(None));
+        assert_eq!(resolve_block_target(BlockSelector::Number(7), 20_999_936), Ok(Some(7)));
+        assert_eq!(
+            resolve_block_target(BlockSelector::Finalized, 20_999_936),
+            Ok(Some(20_999_936))
+        );
+        assert!(resolve_block_target(BlockSelector::Finalized, 0).is_err());
         assert!(parse_block_target("earliest").is_err());
         // Block 0 (genesis) is rejected up front in any hex form, like "earliest".
         assert!(parse_block_target("0x0").is_err());
@@ -2273,13 +3529,13 @@ mod tests {
     fn account_query_rejects_bad_address_and_unknown_handle() {
         // Bad address → error before any handle lookup.
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(1, "0xnothex")).unwrap();
+            serde_json::from_str(&request_account_json(1, "0xnothex", "")).unwrap();
         assert!(v["error"].as_str().unwrap().contains("invalid address"));
 
         // Valid address, unknown handle → "unknown handle" error.
         let addr = format!("0x{}", "ab".repeat(20));
         let v: serde_json::Value =
-            serde_json::from_str(&request_account_json(i64::MIN, &addr)).unwrap();
+            serde_json::from_str(&request_account_json(i64::MIN, &addr, "")).unwrap();
         assert_eq!(v["error"], "unknown handle");
     }
 
@@ -2301,13 +3557,24 @@ mod tests {
 /// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}]}`. False on malformed
 /// input, duplicate addresses, or an unavailable reader.
 pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
+    // Both refusals below were silent: the caller got a bare `false` with
+    // nothing in the engine log to say why, and since the parser screens
+    // duplicate addresses the reader's own warning never fires for a JSON
+    // caller either. Say it once, here, at the boundary that decides.
     let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        tracing::warn!("log-index config is not valid JSON; ignoring the push");
         return false;
     };
     let Some(config) = parse_log_index_config(&v) else {
+        tracing::warn!(
+            "log-index config refused: a watch entry is missing `address` or `fromBlock`, \
+             a field has the wrong type or is not valid hex, or the watch list names \
+             one address twice; ignoring the push"
+        );
         return false;
     };
     let enabled = config.enabled;
+    let bits = (config.enabled, config.max_speed, config.backfill_paused);
     let Some(engine) = engine() else {
         return false;
     };
@@ -2315,6 +3582,20 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         return false;
     };
     let installed = reader.set_log_index_config(config);
+    if installed {
+        // Remember what the host asked for, so a resume re-applies it instead of
+        // the activation defaults (see `Engine::log_index_runtime_bits`). Written
+        // under the handles lock, and only while the handle is still Running, so a
+        // push racing `stop()` cannot leave a stash entry behind a removed handle
+        // — the same discipline `set_served_block_window` keeps.
+        if let Ok(map) = engine.handles.lock() {
+            if matches!(map.get(&handle), Some(ChainEntry::Running(..))) {
+                if let Ok(mut stash) = engine.log_index_runtime_bits.lock() {
+                    stash.insert(handle, bits);
+                }
+            }
+        }
+    }
     if installed && enabled {
         // Spawn (or keep) the head-follow appender on the engine runtime.
         reader.ensure_log_index_appender(engine.rt.handle());
@@ -2322,16 +3603,40 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     installed
 }
 
+/// A JSON boolean field that must be a boolean if it is there at all.
+///
+/// Absent (or `null`, which every host's "field omitted" encodes as) yields
+/// `default`; a real boolean yields itself; anything else yields `None`, which
+/// makes the caller refuse the config instead of applying a default the caller
+/// never asked for.
+fn strict_bool(v: &serde_json::Value, key: &str, default: bool) -> Option<bool> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Some(default),
+        Some(other) => other.as_bool(),
+    }
+}
+
 /// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
-/// adds engine plumbing). `None` = malformed (wrong types); unknown keys are
-/// ignored for forward compatibility.
+/// adds engine plumbing). `None` = malformed — a watch entry missing the
+/// required `address` or `fromBlock`, a field of the wrong type, an address
+/// or topic that is not valid hex of the right width, or a watch-list that
+/// names one address twice. Unknown keys are ignored for forward
+/// compatibility.
 fn parse_log_index_config(
     v: &serde_json::Value,
 ) -> Option<myotis_net::el::logindex::LogIndexConfig> {
-    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    // Every scalar here decides what the index DOES, so a present-but-malformed
+    // value refuses the whole config rather than falling back to a default: a
+    // caller that wrote `"enabled":"true"` would otherwise get a running index
+    // silently switched off, with no way to tell (CLAUDE.md §Trust — applied or
+    // refused, never silently replaced). Absent stays the documented default.
+    let enabled = strict_bool(v, "enabled", false)?;
     // Backfill pacing (optional; absent = nice/background). Fingerprint-neutral:
     // flipping it re-applies onto the live index without resetting coverage.
-    let max_speed = v.get("maxSpeed").and_then(|e| e.as_bool()).unwrap_or(false);
+    let max_speed = strict_bool(v, "maxSpeed", false)?;
+    // Absent means "not paused": a host that predates this key keeps walking,
+    // which is the behaviour it already had.
+    let backfill_paused = strict_bool(v, "backfillPaused", false)?;
     let mut watch = Vec::new();
     if v.get("watch").is_some_and(|w| !w.is_array() && !w.is_null()) {
         return None;
@@ -2358,7 +3663,17 @@ fn parse_log_index_config(
             watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s, name });
         }
     }
-    Some(myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, watch })
+    let config =
+        myotis_net::el::logindex::LogIndexConfig { enabled, max_speed, backfill_paused, watch };
+    // The one config the index layer refuses outright. The reader refuses it
+    // too (and leaves its installed index alone doing so), but catching it
+    // here keeps a malformed push off the checkpoint lock entirely — that lock
+    // can be held for as long as an import takes to merge GBs, and a caller
+    // that is going to get `false` either way should not wait behind it.
+    if config.duplicate_address().is_some() {
+        return None;
+    }
+    Some(config)
 }
 
 /// Import portable log-index snapshots: `paths_json` is a JSON array of
@@ -2414,8 +3729,13 @@ pub fn log_index_status_json(handle: i64) -> String {
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
-        return eljson::error_json("node is not running");
+    // Propagate snapshot_reader's reason like the verified-read natives do:
+    // with the host-side wake gate gone from this probe, a paused chain's
+    // status is the first thing a caller sees — "handle is paused" points at
+    // `resume`, where a collapsed "node is not running" pointed at start.
+    let (reader, _, _) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
     };
     let rate_bps = reader.log_index_rate_bps();
     // Measured against the ANCHORED HEAD, which is what `latest` resolves to
@@ -2425,6 +3745,31 @@ pub fn log_index_status_json(handle: i64) -> String {
     let head = reader.head_block_number().unwrap_or(0);
     let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// The read-fetch shadow cache's counters (`myotis_net::el::readstats`): how
+/// much of this handle's verified account / storage / bytecode fetch traffic
+/// a cache — and which keying — would have served. A diagnostic, not gated on
+/// readiness: like the log-index status it answers on any running handle.
+pub fn read_stats_json(handle: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    // Not `snapshot_reader`: a PAUSED handle still answers, from the shadow
+    // cache parked in its entry — the counters are per handle, not per reader.
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return eljson::error_json("engine lock poisoned"),
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Running(_, _, Some(reader))) => reader.read_stats_json(),
+        Some(ChainEntry::Running(_, _, None)) => {
+            eljson::error_json("EL reader unavailable on this handle")
+        }
+        Some(ChainEntry::Paused(_, _, stats)) => stats.to_json(),
+        Some(ChainEntry::Created(_)) => eljson::error_json("handle not started"),
+        None => eljson::error_json("unknown handle"),
+    }
 }
 
 /// Pure status serializer (unit-tested): fixed key order, no whitespace —
@@ -2445,6 +3790,8 @@ fn build_log_index_status(
         }
         s.push_str(",\"maxSpeed\":");
         s.push_str(if ix.config().max_speed { "true" } else { "false" });
+        s.push_str(",\"backfillPaused\":");
+        s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
         // All optional-by-context so the shape stays honest: no cursor yet →
@@ -2707,9 +4054,50 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
             })
     );
     if needs_fill {
-        engine.rt.block_on(async { reader.advance_log_index_tail_now(filter.to_block).await });
+        if let Err(error) = engine.rt.block_on(reader.request(async {
+            reader.advance_log_index_tail_now(filter.to_block).await;
+            Ok(())
+        })) {
+            return eljson::error_json(&error);
+        }
         result = reader.with_log_index(|ix| ix.query(&filter));
     }
+    // What the caller should DO about a coverage shortfall depends on which side
+    // fell short, and on whether anything is still working on it.
+    //
+    // A HIGH-side shortfall is head-follow's job — the appender and the bridge
+    // are closing it right now, and the backfill OFF switch touches neither —
+    // so "retry" stays right even on a paused node, and telling that caller to
+    // resume the walk would point at the one action that makes it slower. Only
+    // a LOW-side shortfall is the walk's job, and a paused node never fills it.
+    //
+    // Which side fell short is decided against the EFFECTIVE floor, not the raw
+    // filter: `LogIndex::query` requires coverage only from
+    // `max(filter.from_block, entry.from_block)`, because below a watch entry's
+    // from_block the config asserts the contract has no logs. So a routine
+    // `0..head` sweep of a contract deployed at 31,305,656 whose coverage starts
+    // exactly there has NO low-side gap — only the head side is missing, and
+    // that caller must be told to retry however the walk is set.
+    // Host-neutral wording: this reaches every eth_getLogs consumer, and the
+    // daemon's `logindex-backfill on` does not exist on desktop, Android or iOS,
+    // whose lever is the Index tab's pause switch.
+    let paused = reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true);
+    let effective_from = |address: [u8; 20]| -> u64 {
+        let entry_from = reader
+            .with_log_index(|ix| {
+                ix.config().watch.iter().find(|w| w.address == address).map(|w| w.from_block)
+            })
+            .flatten()
+            .unwrap_or(0);
+        filter.from_block.max(entry_from)
+    };
+    let advice = |address: [u8; 20], low: u64| -> &'static str {
+        if paused && effective_from(address) < low {
+            "the backfill is paused on this node, so this range will not be filled in; resume it (Index tab switch, or logindex-backfill on in the daemon) or query within the covered range"
+        } else {
+            "retry as the index catches up"
+        }
+    };
     match result {
         None => eljson::error_json("log index is not configured on this network"),
         Some(Ok(logs)) => eljson::get_logs_json(&logs),
@@ -2720,10 +4108,20 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         Some(Err(QueryError::UnindexedTopic(_))) => {
             eljson::error_json("topic is outside this node's indexed signatures for that address")
         }
-        Some(Err(QueryError::OutOfCoverage { covered, .. })) => match covered.span {
+        Some(Err(QueryError::OutOfCoverage { address, covered })) => match covered.span {
             Some((low, high)) => eljson::error_json(&format!(
-                "requested range is not indexed yet (covered: {low}-{high}); retry as the index catches up"
+                "requested range is not indexed yet (covered: {low}-{high}); {}",
+                advice(address, low)
             )),
+            // No coverage at all yet, so there is no side to compare against.
+            // Head-follow still starts covering from the head as blocks arrive,
+            // which a retrying caller near the tip will see; anything further
+            // down waits on the walk, and on a paused node waits forever.
+            None if paused => eljson::error_json(
+                "log index has no coverage yet, and the backfill is paused on this node, so only \
+                 blocks indexed from here on become answerable; resume it (Index tab switch, or \
+                 logindex-backfill on in the daemon)",
+            ),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
         Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
@@ -2736,6 +4134,53 @@ mod log_index_json_tests {
 
     fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
         parse_log_index_config(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn a_present_but_non_boolean_scalar_refuses_the_whole_config() {
+        // Applied or refused, never silently replaced: `"enabled":"true"` used to
+        // parse as enabled=false, which would switch a running index off while the
+        // caller believed it had turned one on.
+        assert!(cfg(r#"{"enabled":"true","watch":[]}"#).is_none());
+        assert!(cfg(r#"{"enabled":true,"maxSpeed":1,"watch":[]}"#).is_none());
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":"true","watch":[]}"#).is_none());
+        // Absent and explicit null both keep the documented default.
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).is_some());
+        assert!(!cfg(r#"{"enabled":true,"backfillPaused":null,"watch":[]}"#).unwrap().backfill_paused);
+    }
+
+    #[test]
+    fn a_watch_list_naming_one_address_twice_is_refused_at_the_parser() {
+        // The index layer refuses this config anyway; refusing it here keeps a
+        // push that cannot be applied from queueing behind the checkpoint lock.
+        let a = "0x4e69fD587118dFb64957d18654E3894118E9b1BF";
+        let dup = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"{a}","fromBlock":9}}]}}"#
+        );
+        assert!(cfg(&dup).is_none(), "a duplicate watch address parsed");
+        // Case is not identity here — the parser normalizes, so the same
+        // address in two spellings is still the same address.
+        let mixed = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"{}","fromBlock":9}}]}}"#,
+            a.to_lowercase()
+        );
+        assert!(cfg(&mixed).is_none(), "a duplicate watch address parsed in another case");
+        // Two genuinely different addresses still parse.
+        let two = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}},{{"address":"0x{}","fromBlock":9}}]}}"#,
+            "ab".repeat(20)
+        );
+        assert_eq!(cfg(&two).unwrap().watch.len(), 2);
+    }
+
+    #[test]
+    fn parses_backfill_paused_default_and_explicit() {
+        // Absent means "keep walking": a host that predates the key must not
+        // silently stop its backfill on upgrade.
+        let base = r#"{"enabled":true,"watch":[{"address":"0x4e69fD587118dFb64957d18654E3894118E9b1BF","fromBlock":5}]}"#;
+        assert!(!cfg(base).unwrap().backfill_paused, "absent backfillPaused must keep the walk running");
+        assert!(cfg(r#"{"enabled":true,"backfillPaused":true,"watch":[]}"#).unwrap().backfill_paused);
+        assert!(!cfg(r#"{"enabled":true,"backfillPaused":false,"watch":[]}"#).unwrap().backfill_paused);
     }
 
     #[test]
@@ -2783,12 +4228,16 @@ mod log_index_json_tests {
         let cfg = myotis_net::el::logindex::LogIndexConfig {
             enabled: true,
             max_speed: true,
+            backfill_paused: false,
             watch: vec![w],
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
         let s = build_log_index_status(&ix, Some(9.44), 0);
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
+        // The pause bit rides next to maxSpeed in the fixed key order the
+        // Kotlin parser and its golden test pin.
+        assert!(s.contains("\"backfillPaused\":false"), "{s}");
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":500"), "{s}");
         assert!(s.contains("\"blocksPerSec\":9.4"), "{s}");
@@ -2826,6 +4275,148 @@ mod call_target_tests {
         assert!(call_target("0xZZ").is_err());
         assert!(call_target("0x1234").is_err());          // too short
         assert!(call_target("not-hex-at-all").is_err());
+    }
+}
+
+#[cfg(test)]
+mod call_block_tests {
+    use super::{
+        check_call_block, eth_call_json, eth_call_overrides_json, parse_call_block, BlockSelector,
+        CallBlockRefusal, CALL_BLOCK_AHEAD_TOLERANCE, CALL_BLOCK_LAG_TOLERANCE,
+    };
+
+    /// The JVM twin's head (`RustBlockWindowTest`), so the two tables line up.
+    const HEAD: u64 = 25_000_000;
+
+    /// The hosts' `blockInWindow` verdict, as the engine reaches it.
+    fn servable(block: &str, head: u64) -> bool {
+        parse_call_block(block).is_ok_and(|b| check_call_block(b, head).is_ok())
+    }
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn head_tags_and_default_are_servable() {
+        for tag in ["latest", "pending", "safe", "", "  ", "LATEST", "Pending"] {
+            assert_eq!(parse_call_block(tag), Ok(BlockSelector::Head), "{tag:?}");
+        }
+        // A tag needs no head to be checked against; without one, the executor
+        // fails with its own not-synced error.
+        assert_eq!(check_call_block(BlockSelector::Head, 0), Ok(()));
+    }
+
+    #[test]
+    fn finalized_is_its_own_anchor() {
+        // Applied, not mapped to the head (#465, #366): the call runs against
+        // the beacon-finalized block.
+        for tag in ["finalized", "FINALIZED", " finalized "] {
+            assert_eq!(parse_call_block(tag), Ok(BlockSelector::Finalized), "{tag:?}");
+        }
+        // Like a head tag it needs no window check; the reader refuses it
+        // itself while there is no finalized block.
+        assert_eq!(check_call_block(BlockSelector::Finalized, 0), Ok(()));
+        assert!(servable("finalized", HEAD));
+    }
+
+    #[test]
+    fn a_number_at_or_near_the_head_is_servable() {
+        assert!(servable("0x17d7840", HEAD)); // == HEAD
+        assert!(servable("0X17D7840", HEAD));
+        assert!(servable(&HEAD.to_string(), HEAD)); // bare digits are decimal, as for the hosts
+        assert!(servable(&format!("{:#x}", HEAD - CALL_BLOCK_LAG_TOLERANCE), HEAD));
+        assert!(servable(&format!("{:#x}", HEAD + CALL_BLOCK_AHEAD_TOLERANCE), HEAD));
+        // Zero-padded to hash length, it is still a number.
+        assert!(servable(&format!("0x{HEAD:064x}"), HEAD));
+    }
+
+    #[test]
+    fn an_older_number_is_refused_for_good() {
+        let behind = HEAD - CALL_BLOCK_LAG_TOLERANCE - 1;
+        let refusal = check_call_block(BlockSelector::Number(behind), HEAD).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::Behind { block: behind, head: HEAD });
+        assert_eq!(json(&refusal.to_json())["code"], -32602);
+        assert!(!servable("0x1", HEAD));
+    }
+
+    #[test]
+    fn a_number_past_the_head_is_refused_but_retryable() {
+        let ahead = HEAD + CALL_BLOCK_AHEAD_TOLERANCE + 1;
+        let refusal = check_call_block(BlockSelector::Number(ahead), HEAD).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::Ahead { block: ahead, head: HEAD });
+        let v = json(&refusal.to_json());
+        assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_number_without_a_verified_head_is_refused_but_retryable() {
+        let refusal = check_call_block(BlockSelector::Number(HEAD), 0).unwrap_err();
+        assert_eq!(refusal, CallBlockRefusal::NoHead { block: HEAD });
+        let v = json(&refusal.to_json());
+        assert!(v["error"].is_string() && v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_young_chain_clamps_the_window_at_genesis() {
+        assert!(servable("0x0", 10)); // head - 64 saturates to 0
+        assert!(servable("0x1a", 10)); // 26 == head + 16
+        assert!(!servable("0x1b", 10));
+    }
+
+    #[test]
+    fn unservable_selectors_are_refused_as_malformed() {
+        for bad in [
+            "earliest",
+            "EARLIEST",
+            "0xzz",
+            "garbage",
+            "0x",
+            "0x+5",
+            "+5",
+            "-5",
+            "0x-1",
+            "1.5",
+            "0x8000000000000000", // past i64::MAX
+            r#"{"blockHash":"0x00"}"#,
+        ] {
+            assert!(parse_call_block(bad).is_err(), "{bad:?} should be refused");
+        }
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert!(parse_call_block(&hash).unwrap_err().contains("block hash"));
+        // The echo of the caller's input is bounded.
+        assert!(parse_call_block(&"z".repeat(10_000)).unwrap_err().len() < 200);
+    }
+
+    #[test]
+    fn eth_call_refuses_a_malformed_block_before_anything_else() {
+        // No engine or handle needed: both entry points refuse the selector
+        // first, as invalid params.
+        let to = format!("0x{}", "11".repeat(20));
+        for out in [
+            eth_call_json(i64::MIN, "", &to, "", "", "earliest"),
+            eth_call_overrides_json(i64::MIN, "", &to, "", "", "0xzz", ""),
+        ] {
+            assert_eq!(json(&out)["code"], -32602, "{out}");
+        }
+        // A well-formed number gets past the parse to the handle lookup.
+        let v = json(&eth_call_json(i64::MIN, "", &to, "", "", "0x1"));
+        assert_eq!(v["error"], "unknown handle");
+        assert!(v.get("code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn eth_call_refuses_every_malformed_argument_as_invalid_params() {
+        let to = format!("0x{}", "11".repeat(20));
+        for (what, out) in [
+            ("from", eth_call_json(i64::MIN, "0xnope", &to, "", "", "latest")),
+            ("to", eth_call_json(i64::MIN, "", "0x1234", "", "", "latest")),
+            ("data", eth_call_json(i64::MIN, "", &to, "0xzz", "", "latest")),
+            ("value", eth_call_json(i64::MIN, "", &to, "", "ten", "latest")),
+            ("overrides", eth_call_overrides_json(i64::MIN, "", &to, "", "", "latest", "[]")),
+        ] {
+            assert_eq!(json(&out)["code"], -32602, "{what}: {out}");
+        }
     }
 }
 

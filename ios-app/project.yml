@@ -15,10 +15,17 @@ targets:
     platform: iOS
     sources:
       - Myotis
+    # The bundle version comes from Version.xcconfig (kept in step with the
+    # Gradle release version by `./gradlew check`), not from literals here.
+    configFiles:
+      Debug: Myotis/Version.xcconfig
+      Release: Myotis/Version.xcconfig
     info:
       path: Myotis/Info.plist
       properties:
         CFBundleDisplayName: Myotis
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         # Compose Multiplatform's PlistSanityCheck refuses to start without this
         # (it unlocks ProMotion refresh rates for Compose's own render loop).

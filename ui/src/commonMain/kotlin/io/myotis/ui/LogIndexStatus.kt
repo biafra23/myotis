@@ -34,6 +34,10 @@ object LogIndexStatus {
          *  so this is what explains a refusal on an otherwise complete
          *  index. */
         val headGap: Long? = null,
+        /** True while the downward walk is switched off (`backfillPaused` in the
+         *  engine's status). Coverage then stays where it is: the Index tab must
+         *  not present the remaining-blocks figure as progress. */
+        val backfillPaused: Boolean = false,
     )
 
     /** Structured parse of the engine's status JSON (regex over the fixed
@@ -54,12 +58,13 @@ object LogIndexStatus {
                 name = m.groupValues[3].takeIf { it.isNotEmpty() }?.let(::unescapeJson),
             )
         }.toList()
+        val backfillPaused = json.contains("\"backfillPaused\":true")
         val targetLow = Regex("\"targetLow\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val remaining = Regex("\"blocksRemaining\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val bps = Regex("\"blocksPerSec\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
         val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val headGap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
-        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap)
+        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap, backfillPaused)
     }
 
     /** The head-side line: while coverage trails the head `latest` resolves
@@ -84,6 +89,16 @@ object LogIndexStatus {
     fun progressLine(p: Parsed): String? {
         val remaining = p.blocksRemaining ?: return null
         if (remaining == 0L) return headLine(p) ?: "backfill complete"
+        // Paused: the remaining count is a standing distance, not progress, and
+        // no ETA can be honest about it. Say what the state is and what it means
+        // for queries below the covered floor (they are refused, not answered
+        // empty), and still surface a head-side lag if there is one.
+        if (p.backfillPaused) {
+            val head = headLine(p)
+            val base = "backfill paused — ${grouped(remaining)} blocks below the covered range " +
+                "stay unindexed and queries there are refused"
+            return if (head != null) "$base; $head" else base
+        }
         val eta = p.etaSeconds
         if (eta != null && p.blocksPerSec != null) {
             return "~${formatDuration(eta)} remaining " +
