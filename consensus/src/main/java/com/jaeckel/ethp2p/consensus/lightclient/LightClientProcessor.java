@@ -202,7 +202,9 @@ public class LightClientProcessor {
      * <ol>
      *   <li>Verify sync aggregate over the attested header.</li>
      *   <li>Verify the finality branch.</li>
-     *   <li>If a next sync committee is provided, verify its branch and store it.</li>
+     *   <li>If the store holds no next sync committee, verify the update's branch and store
+     *       it — only from an update attested in the store's period, whose next committee
+     *       is the store's next period's.</li>
      *   <li>Update the store's finalized and optimistic headers.</li>
      *   <li>Rotate the sync committee if a period boundary was crossed.</li>
      * </ol>
@@ -243,6 +245,30 @@ public class LightClientProcessor {
                             + "storePeriod={} (haveNext={}, attestedSlot={})",
                     sigPeriod, storePeriod, store.getNextSyncCommittee() != null, attestedSlot);
             return false;
+        }
+
+        // A store holding no next committee adopts the one this update carries (below):
+        // the next committee of the ATTESTED state, i.e. of period(attested) + 1. So only
+        // an update attested in the store's own period can supply it (spec
+        // validate_light_client_update counts it only when update_attested_period ==
+        // store_period). The last block of P-1 signed at the first slot of P passes the
+        // gate above and verifies, and its genuine next committee is committee(P) — ours:
+        // the rotation would install it for P+1, and every P+1 update would then fail BLS.
+        // Honest servers send that update without a committee (spec
+        // create_light_client_update), which the branch check below would refuse anyway,
+        // so this changes no honest verdict. Not required: the spec's
+        // apply_light_client_update also wants the FINALIZED header in the store period.
+        // This client adopts from the attested state, as the spec's force-update path
+        // does, having no best-valid-update timeout: requiring finality would stall
+        // catch-up at a period that never finalized. Rust twin: store.rs process_update.
+        if (store.getNextSyncCommittee() == null) {
+            long attestedPeriod = BeaconChainSpec.computeSyncCommitteePeriod(attestedSlot);
+            if (attestedPeriod != storePeriod) {
+                log.info("[lc-processor] Update rejected (attestedSlot={}): attested in period {}, not the "
+                                + "store's {}, so its next committee is not the store's next (signaturePeriod={})",
+                        attestedSlot, attestedPeriod, storePeriod, sigPeriod);
+                return false;
+            }
         }
 
         if (!updateShapeOk(update.attestedHeader(), update.finalizedHeader())) {

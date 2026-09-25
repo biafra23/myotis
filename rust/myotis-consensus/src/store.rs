@@ -318,6 +318,37 @@ impl LightClientProcessor {
             return false;
         };
 
+        // A store holding no next committee adopts the one this update carries
+        // (below): the next committee of the ATTESTED state, i.e. of
+        // period(attested) + 1. So only an update attested in the store's own
+        // period can supply it (spec validate_light_client_update counts it
+        // only when update_attested_period == store_period). The last block of
+        // P−1 signed at the first slot of P passes the gate above and verifies,
+        // and its genuine next committee is committee(P) — ours: the rotation
+        // would install it for P+1, and every P+1 update would then fail BLS.
+        // Honest servers send that update without a committee (spec
+        // create_light_client_update), which the branch check below would
+        // refuse anyway, so this changes no honest verdict. Not required: the
+        // spec's apply_light_client_update also wants the FINALIZED header in
+        // the store period. This client adopts from the attested state, as the
+        // spec's force-update path does, having no best-valid-update timeout:
+        // requiring finality would stall catch-up at a period that never
+        // finalized. Java twin: LightClientProcessor.processUpdate.
+        if self.store.next_sync_committee().is_none() {
+            let attested_period = self.store.period_of(update.attested_header.beacon.slot);
+            if attested_period != store_period {
+                tracing::debug!(
+                    store_period,
+                    attested_period,
+                    sig_period,
+                    attested_slot = update.attested_header.beacon.slot,
+                    "update rejected: attested outside the store's period, so its next \
+                     committee is not the store's next"
+                );
+                return false;
+            }
+        }
+
         if !self.update_shape_ok(&update.attested_header, &update.finalized_header) {
             tracing::debug!(attested_slot = update.attested_header.beacon.slot,
                 attested_shape = ?update.attested_header.shape(),
