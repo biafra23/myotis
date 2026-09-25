@@ -69,8 +69,13 @@ checkpointed after each backfill batch and periodically at head. Contents:
 - format: versioned framed blob; unknown version ⇒ discard and re-index
   (an index is derived data, never correctness-critical state).
 
-Size expectation (kohaku set): tens–hundreds of MB on Sepolia; single-digit GB
-on mainnet (railgun ciphertexts dominate) — acceptable for an opt-in feature.
+Size expectation (kohaku set): tens–hundreds of MB on Sepolia — acceptable for
+an opt-in feature. Mainnet was originally expected at single-digit GB (railgun
+ciphertexts dominate); the RAILGUN proxy's full history has since been
+measured at ~426,000 logs framing to a ~243 MB index (docs/railgun-poc.md),
+the same class as the Gnosis Bee index. The kohaku set's other mainnet
+entries (the Tornado registries, the Privacy Pools entrypoint) were not
+measured.
 
 **Recorded constraint (slice-1 memory model):** the initial store is fully
 resident with whole-buffer snapshots — fine for the dormant slice and for
@@ -578,7 +583,9 @@ standing as the node's own snapshot — so import is a deliberate user act on
 the hosts, never something fetched. Two properties to state plainly
 (review, 2026-08-14): served logs do not distinguish locally-verified from
 imported coverage (a provenance marker in the status JSON, or a signed
-snapshot format, is tracked follow-up hardening); and subscriptions are
+snapshot format, is tracked follow-up hardening — and a precondition for
+serving a seeded history as a production path under the 2026-09-25
+carve-out, docs/seeded-log-histories.md); and subscriptions are
 currently ADD-ONLY — config pushes union and imports merge, so an address
 can only leave the index via a topic-conflict replace or a cache wipe. An
 explicit unsubscribe/replace surface is follow-up work; until then, note

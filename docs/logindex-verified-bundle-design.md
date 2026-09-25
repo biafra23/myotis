@@ -91,7 +91,9 @@ trusts. State roots play no part.
   answer; proving keccak over terabytes of receipts is not practical today.
 - **A signed seed** (the tracked "signed snapshot" follow-up). Compact, but
   it is publisher trust, which CLAUDE.md's trust rule excludes for the wallet
-  unless the owner decides otherwise. Not this design; see below.
+  unless the owner decides otherwise — as the owner has, for root-committing
+  protocols (2026-09-25, docs/seeded-log-histories.md). Not this design; see
+  below.
 
 ## Where this pays: Gnosis yes, mainnet no
 
@@ -113,9 +115,12 @@ asset, chunked) and imports at disk speed. For mainnet the verifiable form is
 as large as the chain's receipts and saves nothing but peer round-trips; the
 only compact mainnet options are the trusted ones — a signed seed, or the
 withhold-but-not-forge hybrid (signed coverage plus receipt proofs for every
-served log). That is a trust decision for the owner, deliberately outside
-this document. Note that even a trusted mainnet seed can stand on this
-format's generator and verifier for its presence half.
+served log). That is a trust decision for the owner, deliberately outside this
+document — made on 2026-09-25 for protocols whose client checks its rebuilt
+tree against an on-chain root, which keeps forged leaves out of the client's
+tree but does not prove completeness (docs/seeded-log-histories.md); for
+everything else the walk stands. Note that even a trusted mainnet seed can
+stand on this format's generator and verifier for its presence half.
 
 ## Design
 
@@ -465,7 +470,9 @@ are there so that is visible.
 ### Out of scope
 
 - Mainnet histories (the bloat argument above). A signed seed or the
-  withhold-not-forge hybrid is a separate trust decision.
+  withhold-not-forge hybrid is a separate trust decision — made on
+  2026-09-25 for protocols whose client checks its rebuilt tree against an
+  on-chain root (docs/seeded-log-histories.md).
 - Replacing the MLIX snapshot path. It stays for its documented debug/demo
   use and for operators who trust their own source; the bee docs keep
   pointing at it until a bundle exists.

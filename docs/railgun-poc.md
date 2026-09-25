@@ -18,6 +18,14 @@ walker verified itself. The repo rule stands: a local client over http "may only
 be used for debugging purposes, it is not an option for production" (CLAUDE.md,
 *Data sources*).
 
+The seeded-history carve-out (CLAUDE.md, owner's decision 2026-09-25;
+docs/seeded-log-histories.md) does not cover this build, so the label stands.
+It accepts a seed on its protocol maintainers' word — the RAILGUN engine's
+`rootHistory` check keeps forged commitments out of its tree but does not
+surface a withheld or altered one — and this seed is the repo's own fetch from
+a node over JSON-RPC, served without the provenance marker the carve-out
+makes a precondition.
+
 ## Why a seed at all
 
 The wallet rebuilds its private balances by scanning one contract's entire
