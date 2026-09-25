@@ -370,9 +370,9 @@ Sepolia 30305 for both RLPx-TCP and discv4-UDP).
 9. eth/69 receipts are bloomless — recompute the logs bloom before any `receiptsRoot` check.
 10. discv4 needs a large fixed UDP receive buffer (NEIGHBORS packets are truncated by default
     allocators on some stacks).
-11. Never build an owned RLP tree of a peer's frame just to read part of it. A 10 MiB list of
+11. The whole stack is client/dialer-only; add responder halves only if you intend to serve.
+12. Never build an owned RLP tree of a peer's frame just to read part of it. A 10 MiB list of
     one-byte elements is ~500 KB of snappy and costs ~0.5 GB as a tree (#454). Read the request
     id by walking the list, cap control messages (the Rust engine refuses a Hello, Disconnect,
     Status, BlockRangeUpdate or inbound GetBlockHeaders over 16 KiB before decoding), and keep
     only the prefix of a gossip list you actually read.
-11. The whole stack is client/dialer-only; add responder halves only if you intend to serve.
