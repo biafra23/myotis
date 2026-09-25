@@ -351,17 +351,13 @@ decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
 (`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
 run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
 tree is attacker-controlled, and an automated reviewer that reads it can be
-prompt-injected. The clearest vector was the prompt itself: the "Assemble
-review prompt" step used to `cat` `.github/claude-review-prompt.md` from the PR
-checkout, so a PR that edited that file *rewrote its own reviewer's
-instructions*. The step now reads it from the PR's base commit, and
-`claude-code-action` restores the root `CLAUDE.md`, `CLAUDE.local.md` and
-`.claude/` from the base branch before the review runs (documented in its
-`docs/security.md`; done since v1.0.89). Neither makes a fork tree safe to
-hand the reviewer: "base" is whatever branch the PR targets, which can
-itself be unmerged; a `CLAUDE.md` in a subdirectory is not restored, and
-Claude Code loads it as soon as the reviewer reads a file there;
-and the diff itself is always attacker text. So do NOT wire fork PRs into the
+prompt-injected. A PR can no longer rewrite the reviewer's prompt file (the
+workflow reads it from the PR's base commit) or its root `CLAUDE.md`
+(`claude-code-action` restores that from the base branch, as documented in
+its `docs/security.md`), but that does not make a fork tree safe to hand the
+reviewer: whoever opens a PR picks its base, instruction files below the
+repo root are not restored, and the diff itself is always attacker text (the
+header of `claude-review.yml` has the details). So do NOT wire fork PRs into the
 automated reviewer. Instead: the owner reads the diff first — watching for
 injection in `CLAUDE.md` / `.github/**` / build scripts / postinstall hooks /
 comments / encoded blobs — then, if wanted, a review is run manually from a
