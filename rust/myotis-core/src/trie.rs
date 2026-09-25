@@ -11,7 +11,9 @@
 //! zero-nibble extension nodes must not grow the stack (the workspace builds
 //! with `panic = "abort"`).
 
-use std::collections::HashMap;
+use alloc::format;
+use alloc::{string::String, vec::Vec};
+use alloc::collections::BTreeMap;
 
 use crate::keccak::keccak256;
 use crate::rlp::{self, Item};
@@ -61,7 +63,7 @@ pub fn verify_proof(root: &[u8; 32], key: &[u8], proof_nodes: &[Vec<u8>]) -> Pro
 
     // Index nodes by keccak256 so descent picks the next node by hash match
     // (tolerates out-of-order node lists; lets one node set serve many keys).
-    let mut by_hash: HashMap<[u8; 32], &[u8]> = HashMap::with_capacity(proof_nodes.len());
+    let mut by_hash: BTreeMap<[u8; 32], &[u8]> = BTreeMap::new();
     for node in proof_nodes {
         by_hash.insert(keccak256(node), node.as_slice());
     }
@@ -342,6 +344,7 @@ fn hex32(b: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use crate::rlp::Item;
 
     fn leaf_node(key_nibbles: &[u8], value: &[u8]) -> Vec<u8> {
