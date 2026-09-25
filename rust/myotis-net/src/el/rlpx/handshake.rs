@@ -38,6 +38,41 @@ pub struct SessionSecrets {
     pub ack_wire: Vec<u8>,
 }
 
+#[cfg(test)]
+impl SessionSecrets {
+    /// Both ends of one channel over fixed material, no handshake: `(initiator,
+    /// responder)`, the responder with the nonce and auth/ack-wire roles
+    /// swapped. For tests that need two frame codecs that understand each
+    /// other (the frame tests; the eth handshake's scripted peer).
+    pub(crate) fn test_pair() -> (SessionSecrets, SessionSecrets) {
+        // Fixed channel material; auth/ack "wire" are opaque MAC seeds here.
+        let aes_secret = keccak256(b"frame:aes");
+        let mac_secret = keccak256(b"frame:mac");
+        let a_nonce = keccak256(b"frame:A-nonce");
+        let b_nonce = keccak256(b"frame:B-nonce");
+        let auth_wire = b"AUTH-wire-bytes-opaque".to_vec();
+        let ack_wire = b"ACK-wire-bytes-opaque".to_vec();
+        let initiator = SessionSecrets {
+            aes_secret,
+            mac_secret,
+            egress_nonce: a_nonce,
+            ingress_nonce: b_nonce,
+            auth_wire: auth_wire.clone(),
+            ack_wire: ack_wire.clone(),
+        };
+        // Responder: swap nonce + wire roles.
+        let responder = SessionSecrets {
+            aes_secret,
+            mac_secret,
+            egress_nonce: b_nonce,
+            ingress_nonce: a_nonce,
+            auth_wire: ack_wire,
+            ack_wire: auth_wire,
+        };
+        (initiator, responder)
+    }
+}
+
 /// In-flight initiator handshake. `entropy` (ecies ephemeral secret, ecies IV,
 /// EIP-8 padding) is supplied so the pure path is deterministic; the service
 /// draws it from the OS.

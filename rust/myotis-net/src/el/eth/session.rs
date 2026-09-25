@@ -144,25 +144,25 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             );
             conn.send(messages::STATUS, &status).await?;
 
-            // Read the peer's Status (answering Ping in between).
-            let peer_status = loop {
-                let frame = recv_answering_ping(&mut conn).await?;
-                match frame.message_code {
-                    messages::STATUS => {
-                        break messages::decode_status(&frame.payload, eth_version)
-                            .map_err(|e| format!("peer Status decode: {}", e.0))?
-                    }
-                    P2P_DISCONNECT => {
-                        return Err(status_disconnect_error(
-                            &peer_hello.client_id,
-                            eth_version,
-                            &frame.payload,
-                        ))
-                    }
-                    other => {
-                        return Err(format!("expected Status, got code 0x{other:02x}"));
-                    }
+            // Read the peer's Status. `recv_answering_ping` answers any Ping in
+            // between; the first other frame must be the Status (or a
+            // Disconnect). Anything else fails the handshake instead of being
+            // skipped — like the Hello stage above and, for eth messages,
+            // geth's `readStatusMsg` (geth's p2p layer also drops a stray Pong;
+            // we send no Ping here, so none is due) — and unlike the Java
+            // `EthHandler`, which logs it and keeps waiting.
+            let frame = recv_answering_ping(&mut conn).await?;
+            let peer_status = match frame.message_code {
+                messages::STATUS => messages::decode_status(&frame.payload, eth_version)
+                    .map_err(|e| format!("peer Status decode: {}", e.0))?,
+                P2P_DISCONNECT => {
+                    return Err(status_disconnect_error(
+                        &peer_hello.client_id,
+                        eth_version,
+                        &frame.payload,
+                    ))
                 }
+                other => return Err(format!("expected Status, got code 0x{other:02x}")),
             };
             if !peer_status.is_compatible(cfg.network_id, &cfg.genesis_hash) {
                 return Err(format!(
@@ -562,7 +562,9 @@ fn hex4(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::el::rlpx::handshake::SessionSecrets;
     use crate::el::rlpx::transport::Capability;
+    use tokio::io::DuplexStream;
 
     fn hello_with(caps: Vec<(&str, u64)>) -> Hello {
         Hello {
@@ -598,5 +600,126 @@ mod tests {
         ]));
         assert_eq!(response_request_id(&msg), Some(4242));
         assert_eq!(response_request_id(&[0x80]), None);
+    }
+
+    // --- The Status stage, against a scripted peer over an in-memory stream.
+
+    const NETWORK_ID: u64 = 1;
+    const GENESIS: [u8; 32] = [0x11; 32];
+    const FORK_HASH: [u8; 4] = [0xaa; 4];
+
+    fn test_config() -> EthConfig {
+        EthConfig {
+            network_id: NETWORK_ID,
+            genesis_hash: GENESIS,
+            fork_id_hash: FORK_HASH,
+            fork_next: 0,
+            head_hash: GENESIS,
+            head_number: 0,
+            listen_port: 30303,
+            genesis_header_rlp: None,
+        }
+    }
+
+    /// Our side (the initiator) and the peer's side of one FRAMED connection
+    /// over an in-memory stream — no ECIES handshake.
+    fn framed_pair() -> (RlpxConnection<DuplexStream>, RlpxConnection<DuplexStream>) {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let (initiator, responder) = SessionSecrets::test_pair();
+        (
+            RlpxConnection::from_secrets(ours, &initiator, [2; 64]),
+            RlpxConnection::from_secrets(theirs, &responder, [1; 64]),
+        )
+    }
+
+    /// Run our handshake against a peer that answers our Hello with its own
+    /// (eth/66-69 + snap/1, so eth/69 is negotiated) and sends `script` once our
+    /// Status arrives. Returns our outcome (negotiated version, snap, the peer's
+    /// Status) and the codes of every frame we sent after our Status.
+    async fn handshake_against(
+        script: Vec<(u64, Vec<u8>)>,
+    ) -> (Result<(u64, bool, Status), String>, Vec<u64>) {
+        let (ours, mut peer) = framed_pair();
+        let peer_side = tokio::spawn(async move {
+            assert_eq!(peer.recv().await.unwrap().message_code, P2P_HELLO);
+            peer.send(P2P_HELLO, &encode_hello(&[2; 64], 30303)).await.unwrap();
+            assert_eq!(peer.recv().await.unwrap().message_code, messages::STATUS);
+            for (code, body) in script {
+                peer.send(code, &body).await.unwrap();
+            }
+            // Whatever we answer, until our side hangs up.
+            let mut answered = Vec::new();
+            while let Ok(frame) = peer.recv().await {
+                answered.push(frame.message_code);
+            }
+            answered
+        });
+        let outcome = EthSession::handshake(ours, &[1; 64], &test_config(), None)
+            .await
+            // Dropping the session's connection is what ends the peer's loop.
+            .map(|session| {
+                let (_conn, eth_version, snap, status, _hello) = session.into_parts();
+                (eth_version, snap, status)
+            });
+        (outcome, peer_side.await.unwrap())
+    }
+
+    // start_paused: a handshake left waiting (e.g. one that skipped the frame
+    // under test) hits its 30 s timeout at once instead of stalling the suite.
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_answers_a_ping_then_accepts_the_status() {
+        let status =
+            messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+        let (outcome, answered) =
+            handshake_against(vec![(P2P_PING, vec![0xc0]), (messages::STATUS, status)]).await;
+        let (eth_version, snap, peer_status) = outcome.expect("handshake completes");
+        assert_eq!((eth_version, snap), (69, true));
+        assert_eq!(peer_status.network_id, NETWORK_ID);
+        assert_eq!(peer_status.latest_block, Some(100));
+        assert_eq!(answered, vec![P2P_PONG]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_rejects_any_other_first_frame() {
+        // Gossip, an eth/69 BlockRangeUpdate or a stray Pong where the Status
+        // must be fails the handshake, unanswered; it is not skipped to wait
+        // for a Status that may follow.
+        for code in [
+            messages::TRANSACTIONS,
+            messages::NEW_POOLED_TRANSACTION_HASHES,
+            messages::BLOCK_RANGE_UPDATE,
+            P2P_PONG,
+        ] {
+            let (outcome, answered) = handshake_against(vec![(code, vec![0xc0])]).await;
+            assert_eq!(outcome.unwrap_err(), format!("expected Status, got code 0x{code:02x}"));
+            assert!(answered.is_empty(), "code 0x{code:02x}: answered {answered:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_undecodable_or_foreign_status_is_incompatible() {
+        // The pool's dial arm blacklists on exactly these PREFIXES (the
+        // `incompatible` check in pool.rs) — a rewording here would demote a
+        // foreign-chain peer to a transient redial.
+        let (outcome, _) = handshake_against(vec![(messages::STATUS, vec![0xc0])]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("peer Status decode"), "{err}");
+
+        let foreign =
+            messages::encode_status69(69, 137, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+        let (outcome, _) = handshake_against(vec![(messages::STATUS, foreign)]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("incompatible peer"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_stage_disconnect_classifies_as_busy() {
+        // rlp([4]) = TooManyPeers: the Status-stage error must land in the
+        // pool's busy class (`BACKOFF_BUSY`), not degrade to transient.
+        let (outcome, _) = handshake_against(vec![(P2P_DISCONNECT, vec![0xc1, 0x04])]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("peer disconnected after our Status"), "{err}");
+        assert!(crate::el::pool::is_busy_disconnect(&err), "{err}");
     }
 }

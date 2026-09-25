@@ -194,6 +194,24 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
     }
 }
 
+#[cfg(test)]
+impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
+    /// A FRAMED connection over `stream` keyed with already-derived `secrets`,
+    /// skipping the ECIES handshake — lets unit tests script the peer side of
+    /// the eth handshake over an in-memory stream.
+    pub(crate) fn from_secrets(
+        stream: S,
+        secrets: &super::handshake::SessionSecrets,
+        peer_pubkey: [u8; 64],
+    ) -> RlpxConnection<S> {
+        RlpxConnection {
+            stream,
+            codec: FrameCodec::new(secrets),
+            peer_pubkey,
+        }
+    }
+}
+
 /// The write half of a split [`RlpxConnection`] — owns the egress cipher/MAC.
 /// Serialize all sends through `&mut self`.
 pub struct RlpxWriter {
