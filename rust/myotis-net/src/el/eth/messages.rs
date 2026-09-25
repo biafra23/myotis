@@ -11,6 +11,8 @@ use myotis_core::keccak::keccak256;
 use myotis_core::rlp::{self, Item};
 use myotis_core::CoreError;
 
+use crate::el::rlpx::frame::MAX_CONTROL_MSG_SIZE;
+
 // Absolute eth message codes (p2p base 0x10).
 pub const STATUS: u64 = 0x10;
 pub const NEW_BLOCK_HASHES: u64 = 0x11;
@@ -108,6 +110,7 @@ pub struct BlockRangeUpdate {
 /// engine decodes and logs the update but does not yet route requests by it;
 /// the Rust pool does — see `peer::KnownHead`.)
 pub fn decode_block_range_update(rlp_bytes: &[u8]) -> Result<BlockRangeUpdate, CoreError> {
+    check_control_size("BlockRangeUpdate", rlp_bytes)?;
     let top = rlp::decode(rlp_bytes)?;
     let items = top.as_list()?;
     if items.len() < 3 {
@@ -157,6 +160,7 @@ fn fork_id_item(fork_id_hash: &[u8; 4], fork_next: u64) -> Item {
 
 /// Decode a peer Status. `eth_version >= 69` selects the eth/69 layout.
 pub fn decode_status(rlp_bytes: &[u8], eth_version: u64) -> Result<Status, CoreError> {
+    check_control_size("Status", rlp_bytes)?;
     let top = rlp::decode(rlp_bytes)?;
     let items = top.as_list()?;
     if eth_version >= 69 {
@@ -233,6 +237,7 @@ pub enum HeadersOrigin {
 pub fn decode_get_block_headers(
     payload: &[u8],
 ) -> Result<(u64, HeadersOrigin, u64, u64, bool), CoreError> {
+    check_control_size("GetBlockHeaders", payload)?;
     let top = rlp::decode(payload)?;
     let items = top.as_list()?;
     if items.len() < 2 {
@@ -434,35 +439,37 @@ pub const MAX_GOSSIP_HASHES_PER_MSG: usize = 256;
 /// only the sent-tx watch's "seen in gossip" signal (never a trust surface),
 /// so a malformed or unexpected announcement yields the hashes it can read,
 /// or none.
+///
+/// The frame is validated and walked, never built (#454): the cap limits what
+/// is read, not what a full decode would have allocated.
 pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
-    let Ok(top) = rlp::decode(payload) else {
+    // The verdict a full decode of the frame would reach.
+    if rlp::validate(payload).is_err() {
         return Vec::new();
-    };
-    let Ok(items) = top.as_list() else {
+    }
+    let Ok(items) = rlp::raw_list_prefix(payload, 4) else {
         return Vec::new();
     };
     // eth/68: exactly [types, sizes, hashes] where the LAST item is the hash
     // list. A flat eth/66 list of 3 hashes would ALSO be length 3 — the two
     // are distinguished by the last item's kind (list vs 32-byte string).
-    if items.len() == 3 {
-        if let Ok(hashes) = items[2].as_list() {
-            return collect_hashes(hashes);
-        }
+    if items.len() == 3 && rlp::is_list_prefix(items[2]) {
+        return collect_hashes(items[2]);
     }
-    collect_hashes(items)
+    collect_hashes(payload)
 }
 
 /// Hash the elements of an inbound `Transactions` (0x12) full-body gossip
 /// frame (capped at [`MAX_GOSSIP_HASHES_PER_MSG`]): a tx's hash is keccak of
 /// its raw wire element — the RLP list bytes for a legacy tx, the byte-string
 /// CONTENT for a typed one (the Java `TransactionsMessage.hashes` twin).
-/// Same tolerance rationale as the announcement decoder.
+/// Same tolerance rationale as the announcement decoder. Every element is
+/// validated, but only the ones hashed are kept (#454).
 pub fn transactions_gossip_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
-    let Ok(raws) = rlp::raw_list_items(payload) else {
+    let Ok(raws) = rlp::raw_list_prefix(payload, MAX_GOSSIP_HASHES_PER_MSG) else {
         return Vec::new();
     };
     raws.iter()
-        .take(MAX_GOSSIP_HASHES_PER_MSG)
         .filter_map(|raw| {
             if rlp::is_list_prefix(raw) {
                 Some(keccak256(raw)) // legacy: the list bytes ARE the tx
@@ -474,15 +481,16 @@ pub fn transactions_gossip_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// The 32-byte items of an RLP hash list (capped); anything else is skipped.
-fn collect_hashes(items: &[Item]) -> Vec<[u8; 32]> {
+/// The 32-byte strings among the first [`MAX_GOSSIP_HASHES_PER_MSG`] elements
+/// of an already-validated RLP hash list; anything else is skipped.
+fn collect_hashes(list: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(items) = rlp::raw_list_prefix(list, MAX_GOSSIP_HASHES_PER_MSG) else {
+        return Vec::new();
+    };
     items
-        .iter()
-        .take(MAX_GOSSIP_HASHES_PER_MSG)
-        .filter_map(|item| {
-            let bytes = item.as_bytes().ok()?;
-            <[u8; 32]>::try_from(bytes).ok()
-        })
+        .into_iter()
+        .filter(|item| !rlp::is_list_prefix(item))
+        .filter_map(|item| <[u8; 32]>::try_from(rlp::strip_bytes_header(item).ok()?).ok())
         .collect()
 }
 
@@ -590,6 +598,32 @@ fn encode_hash_request(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
         Item::Bytes(rlp::u64_to_minimal_be(request_id)),
         list,
     ]))
+}
+
+/// The request id heading an eth/66-69 or snap/1 request or response
+/// (`[reqId, …]`), or `None` when the payload is not one. The read loops
+/// call this on every frame a peer sends, so it walks the list instead of
+/// building it (#454). The whole list is still validated, as before.
+pub fn leading_request_id(payload: &[u8]) -> Option<u64> {
+    let head = *rlp::raw_list_prefix(payload, 1).ok()?.first()?;
+    // A canonical u64 encodes in at most 9 bytes. A longer head (a list, or a
+    // longer string) cannot be one, so it is not worth building to find out.
+    if head.len() > 9 {
+        return None;
+    }
+    rlp::decode(head).ok()?.as_u64().ok()
+}
+
+/// Refuse a control message too large to be a real one before building its
+/// tree ([`MAX_CONTROL_MSG_SIZE`], #454).
+fn check_control_size(what: &str, payload: &[u8]) -> Result<(), CoreError> {
+    if payload.len() > MAX_CONTROL_MSG_SIZE {
+        return Err(CoreError(format!(
+            "{what}: {} bytes is over the {MAX_CONTROL_MSG_SIZE}-byte control-message cap",
+            payload.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Strip the `[reqId, payload]` wrapper (present in every eth/66-69 request/
@@ -760,6 +794,85 @@ mod tests {
         assert!(decode_new_pooled_tx_hashes(&[0xff, 0x00]).is_empty());
         let short = rlp::encode(&Item::List(vec![Item::Bytes(vec![1, 2, 3])]));
         assert!(decode_new_pooled_tx_hashes(&short).is_empty());
+    }
+
+    #[test]
+    fn leading_request_id_reads_the_head_and_validates_the_tail() {
+        let msg = |head: Item, tail: Vec<u8>| {
+            let mut payload = rlp::encode(&head);
+            payload.extend_from_slice(&tail);
+            rlp::encode_list_payload(&payload)
+        };
+        let id = |n: u64| Item::Bytes(rlp::u64_to_minimal_be(n));
+        assert_eq!(leading_request_id(&msg(id(4242), vec![0xc0])), Some(4242));
+        assert_eq!(leading_request_id(&msg(id(0), vec![0xc0])), Some(0));
+        assert_eq!(leading_request_id(&msg(id(u64::MAX), vec![])), Some(u64::MAX));
+        // A bare byte string is not a `[reqId, …]` list.
+        assert_eq!(leading_request_id(&[0x80]), None);
+        // A head that cannot be a u64: a list, or a nine-byte string.
+        assert_eq!(leading_request_id(&msg(Item::List(vec![id(1)]), vec![])), None);
+        assert_eq!(leading_request_id(&msg(Item::Bytes(vec![1; 9]), vec![])), None);
+        // A malformed tail still voids the id, as when the whole list was decoded.
+        assert_eq!(leading_request_id(&msg(id(7), vec![0x81, 0x05])), None);
+        // A huge tail is walked, not built, to the same answer (#454).
+        let mut tail = vec![0x01; 1 << 20];
+        tail.splice(0..0, [0xfa, 0x10, 0x00, 0x00]); // list header for 1 MiB
+        assert_eq!(leading_request_id(&msg(id(9), tail)), Some(9));
+    }
+
+    #[test]
+    fn control_decoders_refuse_a_message_over_the_cap() {
+        // Each message plus trailing one-byte fields, which the decoders
+        // tolerate at any real size.
+        let padded = |message: Vec<u8>, extra: usize| {
+            let mut fields = rlp::raw_list_items(&message).unwrap().concat();
+            fields.resize(fields.len() + extra, 0x01);
+            rlp::encode_list_payload(&fields)
+        };
+        let over = MAX_CONTROL_MSG_SIZE;
+        let refused = |r: Result<(), CoreError>| {
+            let e = r.unwrap_err().0;
+            assert!(e.contains("control-message cap"), "{e}");
+        };
+
+        let status = encode_status69(69, 1, &[0x11; 32], &[0x22; 32], &[0xaa; 4], 0, 0, 100);
+        assert!(decode_status(&padded(status.clone(), 1_000), 69).is_ok());
+        refused(decode_status(&padded(status, over), 69).map(drop));
+
+        let range = encode_block_range_update(100, 131, &[0x11; 32]);
+        assert!(decode_block_range_update(&padded(range.clone(), 1_000)).is_ok());
+        refused(decode_block_range_update(&padded(range, over)).map(drop));
+
+        let get = encode_get_block_headers_by_number(42, 21_000_000, 16, 0, false);
+        assert!(decode_get_block_headers(&padded(get.clone(), 1_000)).is_ok());
+        refused(decode_get_block_headers(&padded(get, over)).map(drop));
+    }
+
+    #[test]
+    fn gossip_decoders_read_a_prefix_of_a_huge_frame() {
+        // 300 hashes then a million one-byte elements: capped at the first
+        // MAX_GOSSIP_HASHES_PER_MSG, with the rest walked but not built (#454).
+        let mut elements = Vec::new();
+        for i in 0..300u32 {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_be_bytes());
+            elements.extend_from_slice(&rlp::encode_bytes(&h));
+        }
+        elements.resize(elements.len() + (1 << 20), 0x01);
+        let frame = rlp::encode_list_payload(&elements);
+
+        let hashes = decode_new_pooled_tx_hashes(&frame);
+        assert_eq!(hashes.len(), MAX_GOSSIP_HASHES_PER_MSG);
+        assert_eq!(hashes[255][..4], 255u32.to_be_bytes());
+        assert_eq!(transactions_gossip_hashes(&frame).len(), MAX_GOSSIP_HASHES_PER_MSG);
+
+        // Still all-or-nothing on a malformed element past the prefix.
+        let mut bad = elements.clone();
+        let last = bad.len() - 2;
+        bad[last] = 0x81; // `0x81 0x01`: non-canonical single byte
+        let bad = rlp::encode_list_payload(&bad);
+        assert!(decode_new_pooled_tx_hashes(&bad).is_empty());
+        assert!(transactions_gossip_hashes(&bad).is_empty());
     }
 
     #[test]

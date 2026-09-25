@@ -324,12 +324,6 @@ pub fn encode_empty_codes(request_id: u64) -> Vec<u8> {
     ]))
 }
 
-/// The leading request id of any snap response `[reqId, …]`.
-pub fn response_request_id(payload: &[u8]) -> Option<u64> {
-    let items = rlp::raw_list_items(payload).ok()?;
-    rlp::decode(items.first()?).ok()?.as_u64().ok()
-}
-
 fn decode_proof(item: Option<&Item>) -> Vec<Vec<u8>> {
     match item {
         Some(Item::List(nodes)) => nodes

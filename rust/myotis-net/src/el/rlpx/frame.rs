@@ -35,6 +35,15 @@ type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 /// 10 MiB frame-body cap (Java `MAX_FRAME_BODY_SIZE`).
 pub const MAX_FRAME_BODY_SIZE: usize = 10 * 1024 * 1024;
 
+/// Size cap for the control messages decoded into an owned RLP tree: Hello,
+/// Disconnect, Status, BlockRangeUpdate and inbound GetBlockHeaders. Real ones
+/// stay well under 1 KiB, and geth refuses a Hello or Disconnect over 2 KiB
+/// (`baseProtocolMaxMsgSize`). An owned decode costs about 50 heap bytes per
+/// input byte, so a frame at the full [`MAX_FRAME_BODY_SIZE`] costs about
+/// 0.5 GB (#454); this cap keeps it under 1 MB. Decoders refuse a larger
+/// message instead of building it.
+pub const MAX_CONTROL_MSG_SIZE: usize = 16 * 1024;
+
 /// A decoded frame: the p2p/eth message code and its (decompressed) payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {

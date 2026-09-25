@@ -31,13 +31,12 @@ use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use myotis_core::rlp;
 use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 use crate::el::anchor::ExecAnchor;
 use crate::el::served::ServeContext;
 use crate::el::eth::messages::{self, Status, VerifiedHeader};
-use crate::el::eth::session::EthSession;
+use crate::el::eth::session::{describe_disconnect, EthSession};
 use crate::el::rlpx::transport::{
     Hello, RlpxConnection, RlpxReader, RlpxWriter, P2P_DISCONNECT, P2P_PING, P2P_PONG,
 };
@@ -985,8 +984,12 @@ async fn read_loop(
             }
         }
 
+        // Get* requests and their responses both open with `[reqId, …]`. Read
+        // it once per frame, by walking the list rather than building it (#454).
+        let request_id = messages::leading_request_id(&frame.payload);
+
         // An inbound Get* request we answer with an empty response.
-        if let Some((resp_code, empty)) = empty_answer(code, &snap_codes, &frame.payload) {
+        if let Some((resp_code, empty)) = request_id.and_then(|id| empty_answer(code, &snap_codes, id)) {
             if let Err(e) = send_frame(&writer, resp_code, &empty).await {
                 fail_all(&pending, &closed, format!("peer write failure on empty response: {e}"))
                     .await;
@@ -997,7 +1000,7 @@ async fn read_loop(
 
         // Otherwise try to correlate a response by (reqId, code). Anything that
         // doesn't match a waiting request is gossip/mempool — ignore it.
-        if let Some(id) = leading_request_id(&frame.payload) {
+        if let Some(id) = request_id {
             let mut map = pending.lock().await;
             if let Some(entry) = map.get(&id) {
                 if entry.want_code == code {
@@ -1013,14 +1016,9 @@ async fn read_loop(
 }
 
 /// If `code` is an inbound eth/snap Get\* request, return the `(responseCode,
-/// emptyBody)` to answer it with — echoing the request's id. `None` for any
+/// emptyBody)` to answer it with — echoing the request's `id`. `None` for any
 /// other frame.
-fn empty_answer(
-    code: u64,
-    snap_codes: &Option<snap::SnapCodes>,
-    payload: &[u8],
-) -> Option<(u64, Vec<u8>)> {
-    let id = leading_request_id(payload)?;
+fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Option<(u64, Vec<u8>)> {
     match code {
         messages::GET_BLOCK_HEADERS => {
             Some((messages::BLOCK_HEADERS, messages::encode_empty_response(id)))
@@ -1058,12 +1056,6 @@ async fn fail_all(pending: &PendingMap, closed: &Arc<AtomicBool>, reason: String
     }
 }
 
-/// The leading request id of an eth/snap request or response (`[reqId, …]`).
-fn leading_request_id(payload: &[u8]) -> Option<u64> {
-    let items = rlp::raw_list_items(payload).ok()?;
-    rlp::decode(items.first()?).ok()?.as_u64().ok()
-}
-
 /// Serve an inbound GetBlockHeaders from the shared window, or `None` when the
 /// request is malformed, exotic (skip/reverse), or asks for blocks we don't hold
 /// (the caller then answers empty — never a fabricated response). Serves the two
@@ -1088,21 +1080,10 @@ fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
     Some(messages::encode_block_headers_response(id, &raws))
 }
 
-/// A p2p Disconnect body is `[reason]` (or a bare `reason`); decode it.
-fn describe_disconnect(payload: &[u8]) -> String {
-    let reason = rlp::decode(payload)
-        .ok()
-        .and_then(|it| match it {
-            rlp::Item::List(items) => items.first().and_then(|r| r.as_u64().ok()),
-            rlp::Item::Bytes(_) => it.as_u64().ok(),
-        })
-        .unwrap_or(u64::MAX);
-    format!("reason={reason}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myotis_core::rlp;
 
     /// The pure head classifier behind the read ladder, the admission and
     /// eviction bar, the strike policy and the serving count (#465).
@@ -1256,48 +1237,29 @@ mod tests {
     }
 
     #[test]
-    fn leading_request_id_reads_reqid() {
-        let msg = rlp::encode(&rlp::Item::List(vec![
-            rlp::Item::Bytes(rlp::u64_to_minimal_be(4242)),
-            rlp::Item::List(vec![]),
-        ]));
-        assert_eq!(leading_request_id(&msg), Some(4242));
-        // A bare byte string is not a `[reqId, …]` list.
-        assert_eq!(leading_request_id(&[0x80]), None);
-    }
-
-    #[test]
     fn empty_answer_maps_eth_get_star() {
-        let req = rlp::encode(&rlp::Item::List(vec![
-            rlp::Item::Bytes(rlp::u64_to_minimal_be(7)),
-            rlp::Item::List(vec![]),
-        ]));
-        let (code, body) = empty_answer(messages::GET_BLOCK_HEADERS, &None, &req).unwrap();
+        let (code, body) = empty_answer(messages::GET_BLOCK_HEADERS, &None, 7).unwrap();
         assert_eq!(code, messages::BLOCK_HEADERS);
-        assert_eq!(leading_request_id(&body), Some(7));
+        assert_eq!(messages::leading_request_id(&body), Some(7));
 
-        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, &req).unwrap();
+        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, 7).unwrap();
         assert_eq!(code, messages::RECEIPTS);
 
         // A response code is not an inbound request.
-        assert!(empty_answer(messages::BLOCK_HEADERS, &None, &req).is_none());
+        assert!(empty_answer(messages::BLOCK_HEADERS, &None, 7).is_none());
     }
 
     #[test]
     fn empty_answer_maps_snap_get_star() {
         let codes = snap::SnapCodes::for_eth_version(68);
-        let req = rlp::encode(&rlp::Item::List(vec![
-            rlp::Item::Bytes(rlp::u64_to_minimal_be(9)),
-            rlp::Item::List(vec![]),
-        ]));
-        let (code, body) = empty_answer(codes.get_account_range, &Some(codes), &req).unwrap();
+        let (code, body) = empty_answer(codes.get_account_range, &Some(codes), 9).unwrap();
         assert_eq!(code, codes.account_range);
-        assert_eq!(leading_request_id(&body), Some(9));
+        assert_eq!(messages::leading_request_id(&body), Some(9));
 
-        let (code, _) = empty_answer(codes.get_byte_codes, &Some(codes), &req).unwrap();
+        let (code, _) = empty_answer(codes.get_byte_codes, &Some(codes), 9).unwrap();
         assert_eq!(code, codes.byte_codes);
 
         // Without snap negotiated, snap codes aren't answered.
-        assert!(empty_answer(codes.get_account_range, &None, &req).is_none());
+        assert!(empty_answer(codes.get_account_range, &None, 9).is_none());
     }
 }

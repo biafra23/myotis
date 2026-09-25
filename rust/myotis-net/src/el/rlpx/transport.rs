@@ -373,9 +373,19 @@ pub struct Hello {
     pub node_id: Vec<u8>,
 }
 
-/// Decode a p2p Hello body.
+/// Decode a p2p Hello body. A Hello over [`MAX_CONTROL_MSG_SIZE`] is refused
+/// before its tree is built (#454); real ones are a few hundred bytes.
+///
+/// [`MAX_CONTROL_MSG_SIZE`]: super::frame::MAX_CONTROL_MSG_SIZE
 pub fn decode_hello(body: &[u8]) -> Result<Hello, String> {
+    use super::frame::MAX_CONTROL_MSG_SIZE;
     use myotis_core::rlp;
+    if body.len() > MAX_CONTROL_MSG_SIZE {
+        return Err(format!(
+            "hello: {} bytes is over the {MAX_CONTROL_MSG_SIZE}-byte control-message cap",
+            body.len()
+        ));
+    }
     let top = rlp::decode(body).map_err(|e| format!("hello: {}", e.0))?;
     let items = top.as_list().map_err(|e| format!("hello: {}", e.0))?;
     if items.len() < 5 {
@@ -420,5 +430,24 @@ mod tests {
         assert_eq!(hello.capabilities.len(), 5);
         assert_eq!(hello.capabilities[3], Capability { name: "eth".into(), version: 69 });
         assert_eq!(hello.capabilities[4], Capability { name: "snap".into(), version: 1 });
+    }
+
+    #[test]
+    fn hello_over_the_control_cap_is_refused_unbuilt() {
+        use super::super::frame::MAX_CONTROL_MSG_SIZE;
+        use myotis_core::rlp;
+        // Our own Hello plus trailing one-byte fields, which the decoder
+        // tolerates at any legitimate size.
+        let padded = |extra: usize| {
+            let mut fields = rlp::raw_list_items(&encode_hello(&[0x11; 64], 30303))
+                .unwrap()
+                .concat();
+            fields.resize(fields.len() + extra, 0x01);
+            rlp::encode_list_payload(&fields)
+        };
+        assert!(decode_hello(&padded(1_000)).is_ok());
+        let oversized = padded(MAX_CONTROL_MSG_SIZE);
+        let err = decode_hello(&oversized).unwrap_err();
+        assert!(err.starts_with("hello: ") && err.contains("control-message cap"), "{err}");
     }
 }
