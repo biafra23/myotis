@@ -997,8 +997,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private void sendStatus(ChannelHandlerContext ctx) {
         // Always use chain-head mode with current forkId (post-merge standard)
         ChainHead.Head head = chainHead.get();
-        byte[] forkIdHash = network.forkIdHash();
-        long forkNext = network.forkNext();
+        // The fork id in effect NOW: a known next fork is announced until it passes,
+        // then folded into the hash (EIP-2124), so upgraded peers keep us across it.
+        ForkIds.ForkId forkId = network.currentForkId();
+        byte[] forkIdHash = forkId.hashBytes();
+        long forkNext = forkId.next();
         org.apache.tuweni.bytes.Bytes32 headHash = head.blockNumber() > 0 ? head.blockHash() : network.bestBlockHash();
         long blockNumber = head.blockNumber();
         // eth/69 block range: advertise only what we actually hold, never [0, head] and

@@ -260,7 +260,9 @@ impl ChainConfig {
             name: "sepolia",
             chain_id: 11_155_111,
             // eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH / *_FORK_VERSION.
-            // Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            // Fulu (0x90000075) activated at epoch 272640 (2025-10-14); Gloas
+            // (Glamsterdam's CL half) activates at epoch 353024, 2026-10-06
+            // 13:53:36 UTC (ethereum/pm#2205), pinned ahead of activation.
             fork_schedule: ForkSchedule::new(slots_per_epoch, &[
                 (0, [0x90, 0x00, 0x00, 0x69]),       // phase0 (genesis)
                 (50, [0x90, 0x00, 0x00, 0x70]),      // altair
@@ -269,6 +271,7 @@ impl ChainConfig {
                 (132_608, [0x90, 0x00, 0x00, 0x73]), // deneb
                 (222_464, [0x90, 0x00, 0x00, 0x74]), // electra
                 (272_640, [0x90, 0x00, 0x00, 0x75]), // fulu
+                (353_024, [0x90, 0x00, 0x00, 0x76]), // gloas
             ]),
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
@@ -421,7 +424,12 @@ impl ChainConfig {
     /// verification reads the schedule per update
     /// (`ForkSchedule::version_for_signature_slot`).
     pub fn current_fork_version(&self) -> [u8; 4] {
-        self.fork_schedule.version_at_epoch(self.wall_clock_epoch())
+        self.fork_version_at_epoch(self.wall_clock_epoch())
+    }
+
+    /// The schedule's fork version at `epoch` (the digest input at that epoch).
+    pub fn fork_version_at_epoch(&self, epoch: u64) -> [u8; 4] {
+        self.fork_schedule.version_at_epoch(epoch)
     }
 
     /// The version of the fork before the active one when its digest is
@@ -440,8 +448,16 @@ impl ChainConfig {
     }
 
     pub fn current_fork_digest(&self) -> [u8; 4] {
+        self.fork_digest_at_epoch(self.wall_clock_epoch())
+    }
+
+    /// [`current_fork_digest`](Self::current_fork_digest) as of `epoch`: the
+    /// digest of the fork active then. Pure in the clock, so a digest on either
+    /// side of a pinned fork can be checked (Java twin:
+    /// `NetworkConfig.forkDigestAtEpoch`).
+    pub fn fork_digest_at_epoch(&self, epoch: u64) -> [u8; 4] {
         fork_digest_bpo(
-            self.current_fork_version(),
+            self.fork_version_at_epoch(epoch),
             self.genesis_validators_root,
             self.blob_params_epoch,
             self.blob_params_max_blobs,
@@ -3986,8 +4002,6 @@ mod tests {
     #[test]
     fn a_future_fork_pinned_ahead_does_not_change_todays_digest() {
         for c in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
-            assert_eq!(c.current_fork_version(), c.fork_schedule.newest(),
-                "{}: every pinned fork is active today", c.name);
             let mut forks = c.fork_schedule.forks().to_vec();
             forks.push((u64::MAX / 64, [0x7F, 0, 0, 0])); // never activates in this test's lifetime
             let ahead = ChainConfig {
@@ -4019,7 +4033,9 @@ mod tests {
     fn sepolia_config_matches_networkconfig_java() {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
-        assert_eq!(c.current_fork_version(), [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        // Gloas is pinned ahead of its activation (2026-10-06): keyed by epoch.
+        assert_eq!(c.fork_version_at_epoch(353_023), [0x90, 0x00, 0x00, 0x75]); // Fulu
+        assert_eq!(c.fork_version_at_epoch(353_024), [0x90, 0x00, 0x00, 0x76]); // Gloas
         assert_eq!(c.prior_fork_version(), None); // fallback digest off
         // eth-clients/sepolia metadata/config.yaml — Java twin pins the same.
         assert_eq!(c.fork_schedule.slots_per_epoch(), c.slots_per_epoch);
@@ -4033,8 +4049,13 @@ mod tests {
                 (132_608, [0x90, 0x00, 0x00, 0x73]),
                 (222_464, [0x90, 0x00, 0x00, 0x74]),
                 (272_640, [0x90, 0x00, 0x00, 0x75]),
+                (353_024, [0x90, 0x00, 0x00, 0x76]),
             ]
         );
+        // Gloas's first slot (353024 * 32) still verifies under Fulu.
+        let sig = |slot| c.fork_schedule.version_for_signature_slot(slot);
+        assert_eq!(sig(11_296_768), [0x90, 0x00, 0x00, 0x75]);
+        assert_eq!(sig(11_296_769), [0x90, 0x00, 0x00, 0x76]);
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 11_209_280);
         assert_eq!(
@@ -4055,10 +4076,13 @@ mod tests {
             spec::compute_sync_committee_period(c.checkpoint_slot),
             spec::compute_sync_committee_period_with(c.checkpoint_slot, c.slots_per_period())
         );
-        // The live digest the Java computes (verified by running
-        // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
-        assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
-        assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
+        // The digests the Java computes (NetworkConfig.SEPOLIA.forkDigestAtEpoch, BPO2
+        // folded in), keyed by epoch because Gloas flips it. Fulu's is live-verified;
+        // Gloas's is the same formula over 0x90000076 with the unchanged BPO2 params —
+        // derived, to be confirmed against live peers after the fork.
+        assert_eq!(c.fork_digest_at_epoch(353_023), [0x74, 0xD0, 0x14, 0x59]);
+        assert_eq!(c.fork_digest_at_epoch(353_024), [0x66, 0x9E, 0x6C, 0x11]);
+        assert_eq!(c.accepted_fork_digests(), vec![c.current_fork_digest()]);
         // The full list, in order, addresses included — NOT a suffix match.
         //
         // This does NOT read the Java config: the two are hand-maintained copies

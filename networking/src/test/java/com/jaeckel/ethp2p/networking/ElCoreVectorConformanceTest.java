@@ -24,6 +24,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -190,6 +191,11 @@ class ElCoreVectorConformanceTest {
         actual.put("forkid.forkNext.mainnet", Long.toString(NetworkConfig.MAINNET.forkNext()));
         actual.put("forkid.forkNext.gnosis", Long.toString(NetworkConfig.GNOSIS.forkNext()));
         actual.put("forkid.forkNext.sepolia", Long.toString(NetworkConfig.SEPOLIA.forkNext()));
+        // The fork id once forkNext has passed: both engines' CRC32 must agree on it.
+        for (NetworkConfig net : List.of(NetworkConfig.MAINNET, NetworkConfig.GNOSIS, NetworkConfig.SEPOLIA)) {
+            actual.put("forkid.afterNext." + net.name(), net.forkNext() == 0 ? "none"
+                    : String.format(Locale.ROOT, "%08x", net.forkIdAt(net.forkNext()).hash()));
+        }
 
         if (WRITE) {
             StringBuilder sb = new StringBuilder(

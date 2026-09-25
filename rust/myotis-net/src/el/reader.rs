@@ -204,7 +204,10 @@ impl ElConfig {
             network_id: 11_155_111,
             genesis_hash: hex32("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"),
             fork_id_hash: [0x26, 0x89, 0x56, 0xb6],
-            fork_next: 0,
+            // Amsterdam (Glamsterdam's EL half), 2026-10-06 13:53:36 UTC
+            // (ethereum/pm#2205): announced until then, folded in after
+            // (`EthConfig::fork_id_at`). Java twin: NetworkConfig.SEPOLIA.
+            fork_next: myotis_core::forkid::SEPOLIA_FORK_NEXT,
             bootnodes: SEPOLIA_BOOTNODES.iter().filter_map(|s| s.parse().ok()).collect(),
             discv4_port: 0,
             // Sepolia's conventional EL port (Java `defaultElPort` 30305);
@@ -8542,7 +8545,7 @@ mod tests {
             super::hex32("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9")
         );
         assert_eq!(cfg.fork_id_hash, [0x26, 0x89, 0x56, 0xb6]);
-        assert_eq!(cfg.fork_next, 0);
+        assert_eq!(cfg.fork_next, 1_791_294_816, "Amsterdam, announced ahead");
         assert_eq!(cfg.bootnodes.len(), 5, "all five sepolia bootnodes must parse");
         assert_eq!(cfg.listen_port, 30305);
         assert_eq!(cfg.min_suggested_tip_wei, 100_000_000);

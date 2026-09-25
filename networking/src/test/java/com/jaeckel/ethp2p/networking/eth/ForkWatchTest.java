@@ -268,6 +268,23 @@ class ForkWatchTest {
     }
 
     @Test
+    void theBaselineFollowsOurOwnKnownFork() {
+        // A build that carries Glamsterdam: past it, peers on its successor are on OUR
+        // chain, and a further fork they announce is what the watch reports.
+        long nextFork = SEPOLIA_GLAMSTERDAM + 60 * DAY;
+        clock.set(SEPOLIA_GLAMSTERDAM + DAY);
+        ForkWatch w = watch(SEPOLIA_GLAMSTERDAM);
+        announce(w, "upgraded", 3, SUCCESSOR, 0);
+        assertNull(w.advisory(), "our own fork's successor is not news");
+        announce(w, "upgraded", 3, SUCCESSOR, nextFork);
+        ForkWatch.Advisory a = w.advisory();
+        assertNotNull(a);
+        assertEquals(ForkWatch.Phase.SCHEDULED, a.phase());
+        assertEquals(nextFork, a.activationTime());
+        assertEquals(ForkIds.successor(SEPOLIA_GLAMSTERDAM_FORK_ID, nextFork), a.forkHash());
+    }
+
+    @Test
     void implausibleAnnouncementsAreIgnored() {
         ForkWatch w = watch(0);
         announce(w, "s", 4, LOCAL, 1_150_000);                                       // a block number

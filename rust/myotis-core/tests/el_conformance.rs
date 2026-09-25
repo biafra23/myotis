@@ -179,10 +179,16 @@ fn replay_reproduces_recorded_verdicts() {
     actual.insert("forkid.gnosis".into(), hex(&forkid::GNOSIS_FORK_ID_HASH));
     actual.insert("forkid.sepolia".into(), hex(&forkid::SEPOLIA_FORK_ID_HASH));
     for net in ["mainnet", "gnosis", "sepolia"] {
-        actual.insert(
-            format!("forkid.forkNext.{net}"),
-            forkid::FORK_NEXT.to_string(),
-        );
+        let pin = u32::from_be_bytes(forkid::fork_id_hash(net).expect("known network"));
+        let next = forkid::fork_next(net).expect("known network");
+        actual.insert(format!("forkid.forkNext.{net}"), next.to_string());
+        // The fork id once `next` has passed: both engines' CRC32 must agree on it.
+        let after = if next == 0 {
+            "none".to_string()
+        } else {
+            format!("{:08x}", forkid::fork_id_at(pin, next, next).0)
+        };
+        actual.insert(format!("forkid.afterNext.{net}"), after);
     }
 
     // Per-key diff first for readable failures, then full equality.

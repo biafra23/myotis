@@ -52,8 +52,10 @@ import java.util.function.LongSupplier;
  * </ul>
  * A source's evidence stays fresh while one of its peers is still connected
  * ({@link #touch}) and for {@value #OBSERVATION_TTL_HOURS} h after. A fork this build
- * does know ({@code forkNext} in {@link NetworkConfig}) never raises one. Not covered: a
- * peer two or more forks ahead (placement is one step from our pin).
+ * does know ({@code forkNext} in {@link NetworkConfig}) never raises one, and once it
+ * passes the watch measures from its successor ({@link ForkIds#effective}), exactly as
+ * our own Status does. Not covered: a peer two or more forks ahead (placement is one step
+ * from the current baseline).
  *
  * <p>One instance per network stack, shared across pause/resume connector rebuilds
  * (like {@link ServeStats}). Thread-safe: observed from Netty event loops, read by
@@ -118,8 +120,9 @@ public final class ForkWatch {
     }
 
     private final String label;
-    private final int localHash;
-    private final long localNext;
+    /** Our pinned fork id; the baseline at a given time is {@link ForkIds#effective} of it. */
+    private final int pinnedHash;
+    private final long pinnedNext;
     private final long genesisTime;
     private final long epochSeconds;
     private final LongSupplier clock;
@@ -137,7 +140,8 @@ public final class ForkWatch {
     /**
      * @param label         network name, for log lines
      * @param localForkHash our own pinned EIP-2124 fork hash (4 bytes)
-     * @param localForkNext our own announced next fork (0 = none known)
+     * @param localForkNext our own announced next fork (0 = none known). Once it passes,
+     *                      the watch measures from its successor, as our Status does
      * @param genesisTime   beacon genesis time — anchors the epoch-aligned activation grid
      * @param epochSeconds  seconds per beacon epoch (0 = only announced activations place)
      * @param clock         wall clock, unix SECONDS (fork activations are wall-clock times)
@@ -145,8 +149,8 @@ public final class ForkWatch {
     public ForkWatch(String label, byte[] localForkHash, long localForkNext,
                      long genesisTime, long epochSeconds, LongSupplier clock) {
         this.label = label;
-        this.localHash = ForkIds.toInt(localForkHash);
-        this.localNext = localForkNext;
+        this.pinnedHash = ForkIds.toInt(localForkHash);
+        this.pinnedNext = localForkNext;
         this.genesisTime = genesisTime;
         this.epochSeconds = epochSeconds;
         this.clock = clock;
@@ -225,9 +229,15 @@ public final class ForkWatch {
     public synchronized Advisory evaluate(long now) {
         bySource.values().removeIf(o -> o.seenAt() < now - OBSERVATION_TTL_SECONDS);
 
+        // Our baseline follows our own schedule: once the fork we know passes, peers on its
+        // successor are on OUR chain, and a further fork they announce is the news.
+        ForkIds.ForkId local = ForkIds.effective(pinnedHash, pinnedNext, now);
+        int localHash = local.hash();
+        long localNext = local.next();
+
         Set<Long> announced = new HashSet<>();
         for (Observation o : bySource.values()) {
-            if (o.hash() == localHash && isForeignActivation(o.next(), now)) announced.add(o.next());
+            if (o.hash() == localHash && isForeignActivation(o.next(), now, localNext)) announced.add(o.next());
         }
         Map<Long, Support> support = new HashMap<>();
         int dissent = 0;
@@ -236,14 +246,14 @@ public final class ForkWatch {
                 long t = o.next();
                 if (t == 0 || t == localNext) {
                     dissent++;                          // on our hash, no unknown fork ahead
-                } else if (isForeignActivation(t, now) && stillCounts(o, t, now)) {
+                } else if (isForeignActivation(t, now, localNext) && stillCounts(o, t, now)) {
                     support.computeIfAbsent(t, k -> new Support()).announced++;
                 }
             } else {
                 long t = ForkIds.activationOf(localHash, o.hash());
                 if (localNext != 0 && t == localNext) {
                     dissent++;                          // past a fork we DO know: not news
-                } else if (plausiblePlacement(t, announced, now)) {
+                } else if (plausiblePlacement(t, announced, now, localNext)) {
                     support.computeIfAbsent(t, k -> new Support()).placed++;
                 }
             }
@@ -292,7 +302,7 @@ public final class ForkWatch {
     }
 
     /** A timestamp activation this build doesn't know, within a plausible horizon. */
-    private boolean isForeignActivation(long t, long now) {
+    private static boolean isForeignActivation(long t, long now, long localNext) {
         return t != 0 && t != localNext && t >= ForkIds.TIMESTAMP_THRESHOLD && t <= now + MAX_HORIZON_SECONDS;
     }
 
@@ -311,7 +321,7 @@ public final class ForkWatch {
      * activation: announced by a source on our hash, or epoch-aligned within the lookback
      * (EL fork timestamps track the CL fork epoch; one epoch of slack for a clock behind).
      */
-    private boolean plausiblePlacement(long t, Set<Long> announced, long now) {
+    private boolean plausiblePlacement(long t, Set<Long> announced, long now, long localNext) {
         if (t < ForkIds.TIMESTAMP_THRESHOLD || t == localNext) return false;
         if (announced.contains(t)) return true;
         return epochSeconds > 0 && t >= genesisTime && (t - genesisTime) % epochSeconds == 0

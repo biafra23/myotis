@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use myotis_core::forkid;
 use myotis_core::nodekey::NodeKey;
 use myotis_net::el::eth::session::{EthConfig, EthSession};
 use myotis_net::el::peer::ManagedPeer;
@@ -29,7 +30,6 @@ const NODE_PUBKEY_HEX: &str =
     "cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd2\
      0adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c";
 const SEPOLIA_GENESIS: &str = "25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9";
-const SEPOLIA_FORK_ID: [u8; 4] = [0x26, 0x89, 0x56, 0xb6];
 
 /// Matches the walker (`reader.rs`).
 const CHUNK_LEN: usize = 64;
@@ -180,8 +180,10 @@ async fn dial() -> ManagedPeer {
     let cfg = Arc::new(EthConfig {
         network_id: 11155111,
         genesis_hash: genesis,
-        fork_id_hash: SEPOLIA_FORK_ID,
-        fork_next: 0,
+        // The engine's own pins, so the handshake announces the fork id the
+        // node does — including across Sepolia's Amsterdam activation.
+        fork_id_hash: forkid::SEPOLIA_FORK_ID_HASH,
+        fork_next: forkid::SEPOLIA_FORK_NEXT,
         head_hash: genesis,
         head_number: 0,
         listen_port: 30303,

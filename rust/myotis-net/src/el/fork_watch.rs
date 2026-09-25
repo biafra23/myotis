@@ -180,8 +180,10 @@ struct Inner {
 
 pub struct ForkWatch {
     label: String,
-    local_hash: u32,
-    local_next: u64,
+    /// Our pinned fork id; the baseline at a given time is
+    /// [`forkid::fork_id_at`] of it.
+    pinned_hash: u32,
+    pinned_next: u64,
     genesis_time: u64,
     epoch_seconds: u64,
     inner: Mutex<Inner>,
@@ -189,9 +191,10 @@ pub struct ForkWatch {
 
 impl ForkWatch {
     /// `local_fork_hash`/`local_fork_next`: what WE announce (the `ElConfig` pin
-    /// — the wire value, not `forkid`'s conformance copy); `genesis_time` +
-    /// `epoch_seconds`: the beacon epoch grid activations sit on (0 = only
-    /// announced activations place).
+    /// — the wire value, not `forkid`'s conformance copy); once `local_fork_next`
+    /// passes, the watch measures from its successor, as our Status does.
+    /// `genesis_time` + `epoch_seconds`: the beacon epoch grid activations sit on
+    /// (0 = only announced activations place).
     pub fn new(
         label: &str,
         local_fork_hash: [u8; 4],
@@ -201,8 +204,8 @@ impl ForkWatch {
     ) -> ForkWatch {
         ForkWatch {
             label: label.to_string(),
-            local_hash: u32::from_be_bytes(local_fork_hash),
-            local_next: local_fork_next,
+            pinned_hash: u32::from_be_bytes(local_fork_hash),
+            pinned_next: local_fork_next,
             genesis_time,
             epoch_seconds,
             inner: Mutex::new(Inner::default()),
@@ -310,28 +313,33 @@ impl ForkWatch {
         let cutoff = now.saturating_sub(OBSERVATION_TTL_SECONDS);
         inner.by_source.retain(|_, o| o.seen_at >= cutoff);
 
+        // Our baseline follows our own schedule: once the fork we know passes,
+        // peers on its successor are on OUR chain, and a further fork they
+        // announce is the news.
+        let (local_hash, local_next) = forkid::fork_id_at(self.pinned_hash, self.pinned_next, now);
+
         let announced: HashSet<u64> = inner
             .by_source
             .values()
-            .filter(|o| o.hash == self.local_hash && self.is_foreign_activation(o.next, now))
+            .filter(|o| o.hash == local_hash && is_foreign_activation(o.next, now, local_next))
             .map(|o| o.next)
             .collect();
         let mut support: HashMap<u64, Support> = HashMap::new();
         let mut dissent = 0usize;
         // One entry per source ⇒ counts are distinct sources.
         for o in inner.by_source.values() {
-            if o.hash == self.local_hash {
+            if o.hash == local_hash {
                 let t = o.next;
-                if t == 0 || t == self.local_next {
+                if t == 0 || t == local_next {
                     dissent += 1; // on our hash, no unknown fork ahead
-                } else if self.is_foreign_activation(t, now) && still_counts(o, t, now) {
+                } else if is_foreign_activation(t, now, local_next) && still_counts(o, t, now) {
                     support.entry(t).or_default().announced += 1;
                 }
             } else {
-                let t = forkid::activation_of(self.local_hash, o.hash);
-                if self.local_next != 0 && t == self.local_next {
+                let t = forkid::activation_of(local_hash, o.hash);
+                if local_next != 0 && t == local_next {
                     dissent += 1; // past a fork we DO know: not news
-                } else if self.plausible_placement(t, &announced, now) {
+                } else if self.plausible_placement(t, &announced, now, local_next) {
                     support.entry(t).or_default().placed += 1;
                 }
             }
@@ -357,25 +365,23 @@ impl ForkWatch {
         Some(Advisory {
             phase,
             activation_time: t,
-            fork_hash: forkid::successor(self.local_hash, t),
+            fork_hash: forkid::successor(local_hash, t),
             peers: best.total(),
         })
-    }
-
-    /// A timestamp activation this build doesn't know, within a plausible horizon.
-    fn is_foreign_activation(&self, t: u64, now: u64) -> bool {
-        t != 0
-            && t != self.local_next
-            && t >= forkid::TIMESTAMP_THRESHOLD
-            && t <= now.saturating_add(MAX_HORIZON_SECONDS)
     }
 
     /// Whether `t`, where [`forkid::activation_of`] put a foreign hash, is a
     /// real activation: announced by a source on our hash, or epoch-aligned
     /// within the lookback (EL fork timestamps track the CL fork epoch; one
     /// epoch of slack for a clock running behind).
-    fn plausible_placement(&self, t: u64, announced: &HashSet<u64>, now: u64) -> bool {
-        if t < forkid::TIMESTAMP_THRESHOLD || t == self.local_next {
+    fn plausible_placement(
+        &self,
+        t: u64,
+        announced: &HashSet<u64>,
+        now: u64,
+        local_next: u64,
+    ) -> bool {
+        if t < forkid::TIMESTAMP_THRESHOLD || t == local_next {
             return false;
         }
         if announced.contains(&t) {
@@ -393,6 +399,14 @@ impl ForkWatch {
     fn tracked(&self) -> usize {
         self.inner.lock().map(|i| i.by_source.len()).unwrap_or(0)
     }
+}
+
+/// A timestamp activation this build doesn't know, within a plausible horizon.
+fn is_foreign_activation(t: u64, now: u64, local_next: u64) -> bool {
+    t != 0
+        && t != local_next
+        && t >= forkid::TIMESTAMP_THRESHOLD
+        && t <= now.saturating_add(MAX_HORIZON_SECONDS)
 }
 
 /// Whether an announcement of `t` still counts: ahead; or made before `t` by a
@@ -664,6 +678,29 @@ mod tests {
         assert_eq!(w.evaluate(BEFORE), None);
         announce(&w, "upgraded", 5, SUCCESSOR, 0, T + DAY);
         assert_eq!(w.evaluate(T + DAY), None);
+    }
+
+    #[test]
+    fn the_baseline_follows_our_own_known_fork() {
+        // A build that carries Glamsterdam: past it, peers on its successor are
+        // on OUR chain, and a further fork they announce is what the watch reports.
+        let next_fork = T + 60 * DAY;
+        let now = T + DAY;
+        let w = watch(T);
+        announce(&w, "upgraded", 3, SUCCESSOR, 0, now);
+        assert_eq!(
+            w.evaluate(now),
+            None,
+            "our own fork's successor is not news"
+        );
+        announce(&w, "upgraded", 3, SUCCESSOR, next_fork, now);
+        let a = w.evaluate(now).expect("advisory");
+        assert_eq!(a.phase, Phase::Scheduled);
+        assert_eq!(a.activation_time, next_fork);
+        assert_eq!(
+            a.fork_hash,
+            forkid::successor(u32::from_be_bytes(SUCCESSOR), next_fork)
+        );
     }
 
     #[test]

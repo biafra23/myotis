@@ -51,9 +51,15 @@ class NetworkConfigForkScheduleTest {
     void sepoliaSchedule() {
         NetworkConfig c = NetworkConfig.SEPOLIA;
         assertSchedule(c.forkSchedule(), 32,
-                new long[]{0, 50, 100, 56832, 132608, 222464, 272640},
-                new int[]{0x90000069, 0x90000070, 0x90000071, 0x90000072, 0x90000073, 0x90000074, 0x90000075});
-        assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x75}, c.currentForkVersion());
+                new long[]{0, 50, 100, 56832, 132608, 222464, 272640, 353024},
+                new int[]{0x90000069, 0x90000070, 0x90000071, 0x90000072, 0x90000073, 0x90000074, 0x90000075,
+                        0x90000076});
+        // Gloas is pinned ahead of its activation (2026-10-06): the digest input flips at
+        // epoch 353024, and its first slot (353024 * 32 = 11296768) still verifies under Fulu.
+        assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x75}, c.forkVersionAtEpoch(353023));
+        assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x76}, c.forkVersionAtEpoch(353024));
+        assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x75}, c.forkSchedule().versionForSignatureSlot(11296768L));
+        assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x76}, c.forkSchedule().versionForSignatureSlot(11296769L));
         assertFalse(c.acceptPriorForkDigest());
         assertNull(c.priorForkVersion());
     }
@@ -81,8 +87,6 @@ class NetworkConfigForkScheduleTest {
     @Test
     void aFutureForkPinnedAheadDoesNotChangeTodaysDigest() {
         for (NetworkConfig c : List.of(NetworkConfig.MAINNET, NetworkConfig.SEPOLIA, NetworkConfig.GNOSIS)) {
-            assertArrayEquals(c.forkSchedule().newest(), c.currentForkVersion(),
-                    c.name() + ": every pinned fork is active today");
             List<ForkSchedule.Fork> forks = new java.util.ArrayList<>(c.forkSchedule().forks());
             forks.add(ForkSchedule.fork(Long.MAX_VALUE / 64, 0x7F000000)); // never activates in this test's lifetime
             NetworkConfig ahead = new NetworkConfig(c.name(), c.networkId(), c.genesisHash(), c.bestBlockHash(),
@@ -119,7 +123,12 @@ class NetworkConfigForkScheduleTest {
     @Test
     void digestsUnchanged() {
         assertArrayEquals(new byte[]{(byte) 0x8C, (byte) 0x9F, 0x62, (byte) 0xFE}, NetworkConfig.MAINNET.currentForkDigest());
-        assertArrayEquals(new byte[]{0x74, (byte) 0xD0, 0x14, 0x59}, NetworkConfig.SEPOLIA.currentForkDigest());
+        // Sepolia, keyed by epoch because Gloas flips it on 2026-10-06. Fulu's is live-verified;
+        // Gloas's is the same Fulu/EIP-7892 formula over 0x90000076 with the BPO2 blob params
+        // (unchanged at Gloas) — derived, to be confirmed against live peers after the fork.
+        // The Rust twin pins both (sepolia_digest_flips_at_gloas).
+        assertArrayEquals(new byte[]{0x74, (byte) 0xD0, 0x14, 0x59}, NetworkConfig.SEPOLIA.forkDigestAtEpoch(353023));
+        assertArrayEquals(new byte[]{0x66, (byte) 0x9E, 0x6C, 0x11}, NetworkConfig.SEPOLIA.forkDigestAtEpoch(353024));
         assertArrayEquals(new byte[]{0x32, 0x37, (byte) 0xDA, (byte) 0xB6}, NetworkConfig.GNOSIS.currentForkDigest());
         assertEquals(1, NetworkConfig.MAINNET.acceptedForkDigests().size());
         assertEquals(1, NetworkConfig.SEPOLIA.acceptedForkDigests().size());

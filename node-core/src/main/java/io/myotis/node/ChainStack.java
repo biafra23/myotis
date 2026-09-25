@@ -1448,7 +1448,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             lastDnsResolveMs = System.currentTimeMillis();
             if (!resolved.isEmpty()) lastDnsSuccessMs = lastDnsResolveMs;
 
-            byte[] ourFork = network.forkIdHash();
+            byte[] ourFork = network.currentForkId().hashBytes();   // effective across a known fork
             LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
             for (Enr e : dnsElPool) {
                 e.tcpAddress().ifPresent(a -> merged.put(a.getHostString() + ":" + a.getPort(), e));

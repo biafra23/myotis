@@ -26,11 +26,13 @@ pub const MAINNET_FORK_ID_HASH: [u8; 4] = [0x07, 0xc9, 0x46, 0x2e];
 /// Gnosis fork-id hash (Fulu/Osaka head), forkNext = 0.
 pub const GNOSIS_FORK_ID_HASH: [u8; 4] = [0xcf, 0xca, 0x38, 0x7c];
 
-/// Sepolia fork-id hash (post-BPO2 / Fusaka head), forkNext = 0.
+/// Sepolia fork-id hash (post-BPO2 / Fusaka head), forkNext = Amsterdam.
 pub const SEPOLIA_FORK_ID_HASH: [u8; 4] = [0x26, 0x89, 0x56, 0xb6];
 
-/// `forkNext` is 0 on all three networks (no scheduled fork announced).
-pub const FORK_NEXT: u64 = 0;
+/// Sepolia's next fork: Amsterdam (Glamsterdam's EL half), 2026-10-06 13:53:36
+/// UTC (ethereum/pm#2205). Announced until then, folded into the hash after
+/// ([`fork_id_at`]): `successor(0x268956b6, it) = 0x6c1d9423`.
+pub const SEPOLIA_FORK_NEXT: u64 = 1_791_294_816;
 
 /// Pinned fork-id hash by canonical network name.
 pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
@@ -39,6 +41,29 @@ pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
         "gnosis" => Some(GNOSIS_FORK_ID_HASH),
         "sepolia" => Some(SEPOLIA_FORK_ID_HASH),
         _ => None,
+    }
+}
+
+/// Pinned `forkNext` by canonical network name: the next fork this build knows
+/// (0 = none) — twin of Java `NetworkConfig.forkNext`.
+pub fn fork_next(network: &str) -> Option<u64> {
+    match network {
+        "mainnet" | "gnosis" => Some(0),
+        "sepolia" => Some(SEPOLIA_FORK_NEXT),
+        _ => None,
+    }
+}
+
+/// The fork id `(hash, next)` in effect at `now` for a build pinned to
+/// `pinned_hash` that knows one more timestamp fork at `pinned_next`: announced
+/// ahead of time (EIP-2124 lets upgraded peers keep us), then folded into the
+/// hash once it passes. A block-number `pinned_next` never switches — every
+/// live fork is timestamped. Twin: Java `ForkIds.effective`.
+pub fn fork_id_at(pinned_hash: u32, pinned_next: u64, now: u64) -> (u32, u64) {
+    if pinned_next >= TIMESTAMP_THRESHOLD && now >= pinned_next {
+        (successor(pinned_hash, pinned_next), 0)
+    } else {
+        (pinned_hash, pinned_next)
     }
 }
 
@@ -192,6 +217,29 @@ mod tests {
         assert_eq!(t, 1_790_207_712);
         assert_eq!((t - 1_655_733_600) % 384, 0);
         assert_eq!(successor(pin, t), 0x47e1_2c82);
+    }
+
+    #[test]
+    fn the_fork_id_switches_when_our_known_fork_passes() {
+        let pin = u32::from_be_bytes(SEPOLIA_FORK_ID_HASH);
+        assert_eq!(fork_next("sepolia"), Some(SEPOLIA_GLAMSTERDAM));
+        assert_eq!(
+            fork_id_at(pin, SEPOLIA_FORK_NEXT, SEPOLIA_GLAMSTERDAM - 1),
+            (pin, SEPOLIA_GLAMSTERDAM)
+        );
+        assert_eq!(
+            fork_id_at(pin, SEPOLIA_FORK_NEXT, SEPOLIA_GLAMSTERDAM),
+            (SEPOLIA_GLAMSTERDAM_FORK_ID, 0)
+        );
+        // No known fork: the pin, forever. A block-number next never switches.
+        let mainnet = u32::from_be_bytes(MAINNET_FORK_ID_HASH);
+        assert_eq!(fork_next("mainnet"), Some(0));
+        assert_eq!(fork_id_at(mainnet, 0, u64::MAX), (mainnet, 0));
+        assert_eq!(
+            fork_id_at(mainnet, 1_150_000, u64::MAX),
+            (mainnet, 1_150_000)
+        );
+        assert_eq!(fork_next("holesky"), None);
     }
 
     #[test]
