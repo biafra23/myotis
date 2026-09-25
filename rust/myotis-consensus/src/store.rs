@@ -3,11 +3,12 @@
 //! clock input (the slot estimate behind `force_rotate_if_past_period`) is a
 //! plain parameter, exactly as the conformance corpus records it.
 
-use crate::fork::ForkSchedule;
+use crate::fork::{ForkSchedule, LcFork};
 use crate::spec;
 use crate::ssz::{self, Root};
 use crate::types::{
-    LightClientFinalityUpdate, LightClientHeader, LightClientUpdate, SyncCommittee,
+    HeaderExecution, LightClientBootstrap, LightClientFinalityUpdate, LightClientHeader,
+    LightClientUpdate, SyncCommittee,
 };
 use crate::verify;
 
@@ -194,16 +195,99 @@ impl LightClientProcessor {
         Self { store, fork_schedule, genesis_validators_root }
     }
 
-    /// `is_valid_light_client_header` (Capella+): the execution payload header is
-    /// bound to the beacon body solely through this branch — the sync-committee
-    /// signature does NOT cover it.
+    /// `is_valid_light_client_header` for a PRE-GLOAS-shaped header at a
+    /// pre-Gloas slot (Capella..Fulu) — kept for callers that hold no fork
+    /// schedule and only ever see that shape. A Gloas-shaped header is refused
+    /// outright rather than checked under a guessed slot fork, so a call site
+    /// that should have moved to [`Self::verify_header`] fails loudly.
     pub fn verify_execution_branch(header: &LightClientHeader) -> bool {
+        header.shape() == LcFork::PreGloas && verify_execution_branch_at(header, LcFork::PreGloas)
+    }
+
+    /// `is_valid_light_client_header` against this chain's schedule: the proof is
+    /// selected by the fork of the header's OWN slot.
+    pub fn verify_header(&self, header: &LightClientHeader) -> bool {
+        verify_execution_branch_at(
+            header,
+            self.fork_schedule.lc_fork_at_slot(header.beacon.slot),
+        )
+    }
+
+    /// The fork whose wire format and proof indices an object with this attested
+    /// (or bootstrap header) slot uses.
+    pub fn lc_fork_at_slot(&self, slot: u64) -> LcFork {
+        self.fork_schedule.lc_fork_at_slot(slot)
+    }
+
+    /// The checks a bootstrap must pass besides the checkpoint pin (which the
+    /// caller owns — it chose the root): its shape matches its slot's fork, the
+    /// current sync committee is in the header's state at that fork's gindex, and
+    /// the execution branch binds the header's execution data to its body.
+    pub fn verify_bootstrap(
+        &self,
+        bootstrap: &LightClientBootstrap,
+    ) -> Result<(), BootstrapReject> {
+        let fork = self.lc_fork_at_slot(bootstrap.header.beacon.slot);
+        if bootstrap.header.shape() != fork {
+            return Err(BootstrapReject::ShapeNotItsForks);
+        }
+        let (depth, gindex) = match fork {
+            LcFork::Gloas => (
+                spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN,
+                spec::CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS,
+            ),
+            LcFork::PreGloas => {
+                let depth = bootstrap.current_sync_committee_branch.len();
+                (depth, spec::sync_committee_gindex(depth))
+            }
+        };
+        if !ssz::verify_merkle_branch(
+            &bootstrap.current_sync_committee.hash_tree_root(),
+            &bootstrap.current_sync_committee_branch,
+            depth,
+            gindex,
+            &bootstrap.header.beacon.state_root,
+        ) {
+            return Err(BootstrapReject::SyncCommitteeBranch);
+        }
+        if !self.verify_header(&bootstrap.header) {
+            return Err(BootstrapReject::ExecutionBranch);
+        }
+        Ok(())
+    }
+
+    /// Cheap structural gate for an update, BEFORE any BLS work: every header in
+    /// it must be in the shape of its ATTESTED slot's fork (a Gloas-format update
+    /// carries even a pre-Gloas finalized header in the Gloas shape), since that
+    /// fork also picks the state-proof indices below. A mismatch is a misrouted
+    /// or forged object, never a genuine one.
+    fn update_shape_ok(&self, attested: &LightClientHeader, finalized: &LightClientHeader) -> bool {
+        let fork = self.lc_fork_at_slot(attested.beacon.slot);
+        attested.shape() == fork && finalized.shape() == fork
+    }
+
+    /// Finality branch against the attested state root, at the attested slot's
+    /// fork's gindex: fixed for Gloas (a progressive `BeaconState` — not
+    /// derivable from the depth), depth-derived before it (6 → 105, 7 → 169).
+    fn verify_finality_branch(
+        &self,
+        attested: &LightClientHeader,
+        finalized: &LightClientHeader,
+        branch: &[Root],
+    ) -> bool {
+        let (depth, gindex) = match self.lc_fork_at_slot(attested.beacon.slot) {
+            LcFork::Gloas => (
+                spec::GLOAS_FINALITY_BRANCH_LEN,
+                spec::FINALIZED_ROOT_GINDEX_GLOAS,
+            ),
+            LcFork::PreGloas => (branch.len(), spec::finalized_root_gindex(branch.len())),
+        };
         ssz::verify_merkle_branch(
-            &header.execution.hash_tree_root(),
-            &header.execution_branch,
-            spec::EXECUTION_PAYLOAD_DEPTH,
-            spec::EXECUTION_PAYLOAD_GINDEX,
-            &header.beacon.body_root,
+            &finalized.beacon.hash_tree_root(),
+            branch,
+            depth,
+            gindex,
+            &attested.beacon.state_root,
         )
     }
 
@@ -234,6 +318,14 @@ impl LightClientProcessor {
             return false;
         };
 
+        if !self.update_shape_ok(&update.attested_header, &update.finalized_header) {
+            tracing::debug!(attested_slot = update.attested_header.beacon.slot,
+                attested_shape = ?update.attested_header.shape(),
+                finalized_shape = ?update.finalized_header.shape(),
+                "update rejected: wire shape is not the attested slot's fork's");
+            return false;
+        }
+
         let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
@@ -252,23 +344,21 @@ impl LightClientProcessor {
         }
 
         // Finality branch: finalizedHeader is finalized in the attested state.
-        let depth = update.finality_branch.len();
-        if !ssz::verify_merkle_branch(
-            &update.finalized_header.beacon.hash_tree_root(),
+        if !self.verify_finality_branch(
+            &update.attested_header,
+            &update.finalized_header,
             &update.finality_branch,
-            depth,
-            spec::finalized_root_gindex(depth),
-            &update.attested_header.beacon.state_root,
         ) {
-            tracing::debug!(depth,
+            tracing::debug!(
+                depth = update.finality_branch.len(),
                 finalized_slot = update.finalized_header.beacon.slot,
                 attested_slot = update.attested_header.beacon.slot,
                 "update rejected: finality branch does not verify");
             return false;
         }
 
-        if !Self::verify_execution_branch(&update.attested_header)
-            || !Self::verify_execution_branch(&update.finalized_header)
+        if !self.verify_header(&update.attested_header)
+            || !self.verify_header(&update.finalized_header)
         {
             tracing::debug!(
                 attested_slot = update.attested_header.beacon.slot,
@@ -279,12 +369,21 @@ impl LightClientProcessor {
 
         // Next sync committee: verify + store when we don't already hold one.
         if self.store.next_sync_committee().is_none() {
-            let depth = update.next_sync_committee_branch.len();
+            let (depth, gindex) = match self.lc_fork_at_slot(update.attested_header.beacon.slot) {
+                LcFork::Gloas => (
+                    spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN,
+                    spec::NEXT_SYNC_COMMITTEE_GINDEX_GLOAS,
+                ),
+                LcFork::PreGloas => {
+                    let depth = update.next_sync_committee_branch.len();
+                    (depth, spec::next_sync_committee_gindex(depth))
+                }
+            };
             if !ssz::verify_merkle_branch(
                 &update.next_sync_committee.hash_tree_root(),
                 &update.next_sync_committee_branch,
                 depth,
-                spec::next_sync_committee_gindex(depth),
+                gindex,
                 &update.attested_header.beacon.state_root,
             ) {
                 tracing::debug!(depth,
@@ -337,6 +436,14 @@ impl LightClientProcessor {
             return false;
         };
 
+        if !self.update_shape_ok(&update.attested_header, &update.finalized_header) {
+            tracing::debug!(attested_slot = update.attested_header.beacon.slot,
+                attested_shape = ?update.attested_header.shape(),
+                finalized_shape = ?update.finalized_header.shape(),
+                "finality update rejected: wire shape is not the attested slot's fork's");
+            return false;
+        }
+
         let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
@@ -353,19 +460,16 @@ impl LightClientProcessor {
             return false;
         }
 
-        let depth = update.finality_branch.len();
-        if !ssz::verify_merkle_branch(
-            &update.finalized_header.beacon.hash_tree_root(),
+        if !self.verify_finality_branch(
+            &update.attested_header,
+            &update.finalized_header,
             &update.finality_branch,
-            depth,
-            spec::finalized_root_gindex(depth),
-            &update.attested_header.beacon.state_root,
         ) {
             return false;
         }
 
-        if !Self::verify_execution_branch(&update.attested_header)
-            || !Self::verify_execution_branch(&update.finalized_header)
+        if !self.verify_header(&update.attested_header)
+            || !self.verify_header(&update.finalized_header)
         {
             return false;
         }
@@ -376,5 +480,70 @@ impl LightClientProcessor {
         self.store.update_optimistic(&update.attested_header, update.signature_slot);
         self.store.apply_next_when_period_changes(old_finalized, finalized_slot);
         true
+    }
+}
+
+/// Why [`LightClientProcessor::verify_bootstrap`] refused a bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapReject {
+    /// The header's wire shape is not its slot's fork's.
+    ShapeNotItsForks,
+    /// The current sync committee is not in the header's state.
+    SyncCommitteeBranch,
+    /// The header's execution data is not bound to its body.
+    ExecutionBranch,
+}
+
+impl std::fmt::Display for BootstrapReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BootstrapReject::ShapeNotItsForks => "wire shape is not its slot's fork's",
+            BootstrapReject::SyncCommitteeBranch => "sync committee branch invalid",
+            BootstrapReject::ExecutionBranch => "execution branch invalid",
+        })
+    }
+}
+
+/// `is_valid_light_client_header` for a header whose OWN slot is in `slot_fork`.
+///
+/// This is the whole binding between the sync-committee-signed beacon header and
+/// the execution layer: the signature covers only `beacon`, so without it a peer
+/// could pair a genuine signed header with an execution payload or block hash of
+/// its choosing, and every state proof downstream would verify against it.
+///
+/// - Pre-Gloas shape at a pre-Gloas slot: the payload header's root at gindex 25.
+/// - Gloas shape at a Gloas slot: the block hash at 2856 — the payload bid's
+///   `parent_block_hash`.
+/// - Gloas shape at a pre-Gloas slot (a Gloas update's finalized header in the
+///   first epochs after the fork): the payload's block hash at 812 (Deneb+),
+///   normalized to 11 nodes with zero padding. Capella's 412 is not accepted: no
+///   header this client meets is pre-Deneb (every network's checkpoint and every
+///   Gloas update's finalized header are far past it), and a Capella header's
+///   genuine proof simply fails here — a rejection, never an acceptance.
+/// - A pre-Gloas shape at a Gloas slot is never genuine: rejected.
+pub fn verify_execution_branch_at(header: &LightClientHeader, slot_fork: LcFork) -> bool {
+    let body_root = &header.beacon.body_root;
+    match (&header.execution, slot_fork) {
+        (HeaderExecution::Payload(payload), LcFork::PreGloas) => ssz::verify_merkle_branch(
+            &payload.hash_tree_root(),
+            &header.execution_branch,
+            spec::EXECUTION_PAYLOAD_DEPTH,
+            spec::EXECUTION_PAYLOAD_GINDEX,
+            body_root,
+        ),
+        (HeaderExecution::Payload(_), LcFork::Gloas) => false,
+        (HeaderExecution::BlockHash(hash), fork) => {
+            let gindex = match fork {
+                LcFork::Gloas => spec::EXECUTION_BLOCK_HASH_GINDEX_GLOAS,
+                LcFork::PreGloas => spec::EXECUTION_BLOCK_HASH_GINDEX_DENEB,
+            };
+            header.execution_branch.len() == spec::GLOAS_EXECUTION_BRANCH_LEN
+                && ssz::verify_normalized_merkle_branch(
+                    hash,
+                    &header.execution_branch,
+                    gindex,
+                    body_root,
+                )
+        }
     }
 }

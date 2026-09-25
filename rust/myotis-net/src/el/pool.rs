@@ -27,6 +27,7 @@ use tokio::time::Instant;
 
 use myotis_core::nodekey::NodeKey;
 
+use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::fork_watch::{self, ForkWatch};
@@ -1139,6 +1140,13 @@ impl PeerPool {
         let _ = self.inner.fork_watch.set(watch);
     }
 
+    /// Start resolving the execution anchor's pending block hashes into headers
+    /// (Gloas — see [`anchor_resolver_loop`]). Runs with the pool's other tasks
+    /// and stops with them.
+    pub fn start_anchor_resolver(&self, anchor: Arc<ExecAnchor>) {
+        self.inner.tasks.spawn(anchor_resolver_loop(Arc::clone(&self.inner), anchor));
+    }
+
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
     /// all held peers (closing them).
     pub async fn stop(&self) {
@@ -1156,6 +1164,57 @@ impl PeerPool {
 impl Drop for PeerPool {
     fn drop(&mut self) {
         self.inner.tasks.abort();
+    }
+}
+
+/// Peers one pending hash is asked of per round, and how long each one gets.
+const RESOLVE_PEERS_PER_ROUND: usize = 4;
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause before asking again for a hash no peer served yet: the block may not
+/// have reached them (a Gloas head names its PARENT payload, so this is rare).
+const RESOLVE_RETRY: Duration = Duration::from_secs(2);
+
+/// Fetch the header for each block hash the execution anchor is waiting on
+/// ([`ExecAnchor::pending_hashes`]) — Gloas light-client headers prove only the
+/// hash — and offer it to the anchor, which adopts it only if the keccak of its
+/// raw RLP IS that hash. Any peer may serve it and none can forge it, so peers
+/// are simply rotated; the anchor, not this loop, is the verifier. Idle until a
+/// hash becomes pending; a hash nobody serves is asked again every
+/// [`RESOLVE_RETRY`] (sooner if a newer one supersedes it).
+async fn anchor_resolver_loop(inner: Arc<PoolInner>, anchor: Arc<ExecAnchor>) {
+    let mut rotation = 0usize;
+    loop {
+        let pending = anchor.pending_hashes();
+        if pending.is_empty() {
+            anchor.pending_changed().await;
+            continue;
+        }
+        inner.prune_closed().await;
+        let peers: Vec<Arc<ManagedPeer>> =
+            inner.peers.lock().await.iter().map(|p| Arc::clone(&p.peer)).collect();
+        for hash in &pending {
+            for i in 0..peers.len().min(RESOLVE_PEERS_PER_ROUND) {
+                let peer = &peers[rotation.wrapping_add(i) % peers.len()];
+                let served =
+                    tokio::time::timeout(RESOLVE_TIMEOUT, peer.get_block_headers_by_hash(hash, 1)).await;
+                if let Ok(Ok(headers)) = served {
+                    if headers.iter().any(|vh| vh.hash == *hash && anchor.resolve_header(vh)) {
+                        tracing::debug!(hash = ?&hash[..8], peer = %peer.addr(),
+                            "execution anchor: header resolved by hash");
+                        break;
+                    }
+                }
+            }
+            rotation = rotation.wrapping_add(1);
+        }
+        if anchor.pending_hashes().is_empty() {
+            continue;
+        }
+        tracing::debug!(peers = peers.len(), "execution anchor: hash still unresolved — retrying");
+        tokio::select! {
+            _ = anchor.pending_changed() => {}
+            _ = tokio::time::sleep(RESOLVE_RETRY) => {}
+        }
     }
 }
 

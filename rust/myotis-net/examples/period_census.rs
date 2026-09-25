@@ -87,6 +87,7 @@ fn bucket(verdict: &Verdict, need: u64) -> &'static str {
 /// Ask one peer for `updates_by_range(period, 1)` — `wire` is that request —
 /// and classify the answer. Returns the verdict and how long it took.
 async fn probe(
+    config: &ChainConfig,
     client: &reqresp::ReqRespClient,
     peer_id: libp2p::PeerId,
     addr: libp2p::Multiaddr,
@@ -105,20 +106,23 @@ async fn probe(
         Ok(Err(RequestError::Timeout)) => Verdict::Timeout,
         Ok(Err(RequestError::ConnectionClosed)) => Verdict::ConnectionClosed,
         Ok(Err(_)) => Verdict::Io,
-        Ok(Ok(raw)) => match codec::decode_multi_chunk_response(&raw, 1) {
+        Ok(Ok(raw)) => match codec::decode_multi_chunk_response_with_digests(&raw, 1) {
             Ok(chunks) => match chunks.into_iter().next() {
-                Some(c) if !c.is_empty() => match LightClientUpdate::decode(&c) {
-                    Ok(u) => {
-                        let bits: u64 = u
-                            .sync_aggregate
-                            .sync_committee_bits
-                            .iter()
-                            .map(|b| b.count_ones() as u64)
-                            .sum();
-                        Verdict::Serves(bits, u.attested_header.beacon.slot)
+                // Decoded by its context bytes, as the wallet does (Gloas).
+                Some((digest, c)) if !c.is_empty() => {
+                    match LightClientUpdate::decode_for(config.lc_fork_of_digest(&digest), &c) {
+                        Ok(u) => {
+                            let bits: u64 = u
+                                .sync_aggregate
+                                .sync_committee_bits
+                                .iter()
+                                .map(|b| b.count_ones() as u64)
+                                .sum();
+                            Verdict::Serves(bits, u.attested_header.beacon.slot)
+                        }
+                        Err(_) => Verdict::RespondedUndecodable,
                     }
-                    Err(_) => Verdict::RespondedUndecodable,
-                },
+                }
                 _ => Verdict::RespondedUndecodable,
             },
             Err(_) => Verdict::RespondedUndecodable,
@@ -268,7 +272,14 @@ async fn main() {
             continue; // the same id pinned twice: its first answer stands
         }
         spawned += 1;
-        let mut ask = probe(&client, peer_id, addr.clone(), finality_wire.clone()).await;
+        let mut ask = probe(
+            &config,
+            &client,
+            peer_id,
+            addr.clone(),
+            finality_wire.clone(),
+        )
+        .await;
         if ask.0 != Verdict::DialFail {
             note_pin_agent(&client, peer_id, &mut pin_agents).await;
         }
@@ -276,7 +287,14 @@ async fn main() {
             println!("  pin {addr}: {}", bucket(&ask.0, need));
         } else {
             tokio::time::sleep(PIN_RETRY_BACKOFF).await;
-            let retry = probe(&client, peer_id, addr.clone(), finality_wire.clone()).await;
+            let retry = probe(
+                &config,
+                &client,
+                peer_id,
+                addr.clone(),
+                finality_wire.clone(),
+            )
+            .await;
             let first = std::mem::replace(&mut ask, retry);
             if ask.0 != Verdict::DialFail && !pin_agents.contains_key(&key) {
                 note_pin_agent(&client, peer_id, &mut pin_agents).await;
@@ -302,9 +320,10 @@ async fn main() {
         let sem = Arc::clone(&sem);
         let res_tx = res_tx.clone();
         let wire = finality_wire.clone();
+        let config = config.clone();
         tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore");
-            let (verdict, secs) = probe(&client, peer_id, addr.clone(), wire).await;
+            let (verdict, secs) = probe(&config, &client, peer_id, addr.clone(), wire).await;
             let _ = res_tx.send((peer_id.to_string(), addr.to_string(), verdict, secs)).await;
         });
     };

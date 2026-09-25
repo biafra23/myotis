@@ -9,9 +9,25 @@
 //! (`sync.rs`, wired in EL-A7b) and read by the verified query ladder
 //! ([`super::verify`]). Every field here is BLS-sync-committee-verified before
 //! it lands — it is the only thing the EL trusts.
+//!
+//! # Gloas: the hash first, the header after
+//!
+//! From Gloas (EIP-7732) a light-client header proves only an execution BLOCK
+//! HASH — no state root, number or timestamp is committed anywhere on the
+//! consensus side any more. The CL loop records such a hash as PENDING
+//! ([`ExecAnchor::note_finalized_hash`] / [`ExecAnchor::note_optimistic_hash`]);
+//! the EL peer pool fetches the header by that hash and offers it
+//! ([`ExecAnchor::resolve_header`]), and the anchor adopts it only when the
+//! keccak of the header's own RLP IS the pending hash. The chain of custody is
+//! sync-committee signature → beacon header → body root → block hash → keccak →
+//! header fields: one hop longer, still nothing taken on a peer's word. Until a
+//! pending finality resolves, the anchor keeps serving the last resolved one —
+//! still final, only older — and does not call it current.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+
+use crate::el::eth::messages::VerifiedHeader;
 
 /// Window cap (twin of `BeaconSyncState.MAX_KNOWN_ROOTS`), matching
 /// `MAX_HEADER_CHAIN_GAP` so the fast-path window and the header-chain bound
@@ -55,18 +71,28 @@ struct Inner {
     optimistic_state_root: Option<[u8; 32]>,
     known_roots: VecDeque<SlottedStateRoot>,
     finality_current: bool,
+    /// Gloas: a finalized execution block hash the light client proved at this
+    /// beacon slot whose header has not been resolved yet. Never older than the
+    /// resolved finality; cleared when resolved or superseded.
+    pending_finalized: Option<(u64, [u8; 32])>,
+    /// The optimistic twin of `pending_finalized`.
+    pending_optimistic: Option<(u64, [u8; 32])>,
 }
 
 /// Shared, mutable execution anchor. Cloneable handle over one `Mutex` — the
 /// CL loop writes, the EL query path reads (both off their own threads).
 pub struct ExecAnchor {
     inner: Mutex<Inner>,
+    /// Wakes the pool's resolver when a hash becomes pending (`notify_one`
+    /// stores a permit, so a hash noted between two waits is not missed).
+    pending_changed: tokio::sync::Notify,
 }
 
 impl Default for ExecAnchor {
     fn default() -> Self {
         ExecAnchor {
             inner: Mutex::new(Inner::default()),
+            pending_changed: tokio::sync::Notify::new(),
         }
     }
 }
@@ -87,11 +113,13 @@ impl ExecAnchor {
         execution_block_hash: [u8; 32],
     ) {
         let mut inner = self.inner.lock().expect("anchor mutex");
-        inner.finalized_slot = finalized_slot;
-        inner.execution_state_root = Some(execution_state_root);
-        inner.execution_block_number = execution_block_number;
-        inner.execution_block_hash = Some(execution_block_hash);
-        push_root(&mut inner.known_roots, finalized_slot, execution_state_root, true);
+        set_finalized(
+            &mut inner,
+            finalized_slot,
+            execution_state_root,
+            execution_block_number,
+            execution_block_hash,
+        );
     }
 
     /// Record the optimistic (attested) execution head (~1-2 slots behind wall
@@ -104,11 +132,115 @@ impl ExecAnchor {
         optimistic_state_root: [u8; 32],
     ) {
         let mut inner = self.inner.lock().expect("anchor mutex");
-        inner.optimistic_slot = optimistic_slot;
-        inner.optimistic_block_number = optimistic_block_number;
-        inner.optimistic_block_hash = Some(optimistic_block_hash);
-        inner.optimistic_state_root = Some(optimistic_state_root);
-        push_root(&mut inner.known_roots, optimistic_slot, optimistic_state_root, true);
+        set_optimistic(
+            &mut inner,
+            optimistic_slot,
+            optimistic_block_number,
+            optimistic_block_hash,
+            optimistic_state_root,
+        );
+    }
+
+    /// Gloas: the light client proved `block_hash` as the finalized execution
+    /// block at beacon slot `slot`. Nothing about that block but its hash is
+    /// known yet, so it waits for [`Self::resolve_header`]. The same hash as the
+    /// resolved finality (payloads empty or withheld since) only moves its slot
+    /// forward; a finality older than the one resolved or pending is ignored.
+    pub fn note_finalized_hash(&self, slot: u64, block_hash: [u8; 32]) {
+        let mut inner = self.inner.lock().expect("anchor mutex");
+        if inner.execution_block_hash == Some(block_hash) {
+            if slot > inner.finalized_slot {
+                inner.finalized_slot = slot;
+                if let Some(root) = inner.execution_state_root {
+                    push_root(&mut inner.known_roots, slot, root, true);
+                }
+            }
+            inner.pending_finalized = None; // this IS the newest finality
+            return;
+        }
+        if slot < inner.finalized_slot || inner.pending_finalized.is_some_and(|(s, _)| s > slot) {
+            return;
+        }
+        if inner.pending_finalized.map(|(_, h)| h) != Some(block_hash) {
+            self.pending_changed.notify_one();
+        }
+        inner.pending_finalized = Some((slot, block_hash));
+    }
+
+    /// The optimistic twin of [`Self::note_finalized_hash`].
+    pub fn note_optimistic_hash(&self, slot: u64, block_hash: [u8; 32]) {
+        let mut inner = self.inner.lock().expect("anchor mutex");
+        if inner.optimistic_block_hash == Some(block_hash) {
+            if slot > inner.optimistic_slot {
+                inner.optimistic_slot = slot;
+                if let Some(root) = inner.optimistic_state_root {
+                    push_root(&mut inner.known_roots, slot, root, true);
+                }
+            }
+            inner.pending_optimistic = None;
+            return;
+        }
+        if slot < inner.optimistic_slot || inner.pending_optimistic.is_some_and(|(s, _)| s > slot) {
+            return;
+        }
+        if inner.pending_optimistic.map(|(_, h)| h) != Some(block_hash) {
+            self.pending_changed.notify_one();
+        }
+        inner.pending_optimistic = Some((slot, block_hash));
+    }
+
+    /// The block hashes waiting for their header — the pending finality first
+    /// (what the header-chain walk anchors on), then the pending optimistic head.
+    pub fn pending_hashes(&self) -> Vec<[u8; 32]> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        let mut out = Vec::with_capacity(2);
+        out.extend(inner.pending_finalized.map(|(_, h)| h));
+        if let Some((_, h)) = inner.pending_optimistic {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    /// Resolves when a hash has become pending since the last wait (or at once,
+    /// if one did while nobody was waiting).
+    pub async fn pending_changed(&self) {
+        self.pending_changed.notified().await;
+    }
+
+    /// Offer an execution header fetched by one of the pending hashes. Adopted
+    /// only if the keccak of ITS RAW RLP is a pending hash — recomputed here,
+    /// not taken from the decoder's `hash` field alone — and then for every
+    /// pending slot that hash names (the finalized and optimistic heads can be
+    /// the same block). Its number and state root become the anchor's, and the
+    /// root joins the `stateRootMatch` window as verified: the hash was proven
+    /// under a sync-committee signature, and only one header hashes to it.
+    /// Returns whether anything was adopted; a header nobody asked for, or for a
+    /// head since superseded, changes nothing.
+    pub fn resolve_header(&self, header: &VerifiedHeader) -> bool {
+        let hash = myotis_core::keccak::keccak256(&header.raw_rlp);
+        if hash != header.hash {
+            return false;
+        }
+        let (number, root) = (header.header.number, header.header.state_root);
+        let mut inner = self.inner.lock().expect("anchor mutex");
+        let mut adopted = false;
+        if let Some((slot, pending)) = inner.pending_finalized {
+            if pending == hash {
+                set_finalized(&mut inner, slot, root, number, hash);
+                inner.pending_finalized = None;
+                adopted = true;
+            }
+        }
+        if let Some((slot, pending)) = inner.pending_optimistic {
+            if pending == hash {
+                set_optimistic(&mut inner, slot, number, hash, root);
+                inner.pending_optimistic = None;
+                adopted = true;
+            }
+        }
+        adopted
     }
 
     /// Record a standalone BLS-attested `(slot, state_root)` into the window
@@ -145,7 +277,7 @@ impl ExecAnchor {
     /// finality with the previous flag.
     pub fn finalized_execution_with_currency(&self) -> (Option<FinalizedExecution>, bool) {
         let inner = self.inner.lock().expect("anchor mutex");
-        (finalized_of(&inner), inner.finality_current)
+        (finalized_of(&inner), is_current(&inner))
     }
 
     pub fn finalized_slot(&self) -> u64 {
@@ -163,10 +295,12 @@ impl ExecAnchor {
     /// Whether [`Self::finalized_execution`] is the network's finality give or
     /// take a few epochs, rather than a value restored from a snapshot or left
     /// behind by a light client still catching up. False until the CL loop says
-    /// otherwise. Not the same question as [`Self::is_synced`], which only asks
-    /// whether ANY finalized root has landed.
+    /// otherwise — and while a newer finality is pending resolution (Gloas): the
+    /// finality served then is the light client's previous one. Not the same
+    /// question as [`Self::is_synced`], which only asks whether ANY finalized
+    /// root has landed.
     pub fn finality_is_current(&self) -> bool {
-        self.inner.lock().expect("anchor mutex").finality_current
+        is_current(&self.inner.lock().expect("anchor mutex"))
     }
 
     /// The optimistic head block hash, for anchoring a header-chain walk at the
@@ -221,6 +355,27 @@ impl ExecAnchor {
     pub fn known_root_count(&self) -> usize {
         self.inner.lock().expect("anchor mutex").known_roots.len()
     }
+}
+
+/// Currency as [`ExecAnchor::finality_is_current`] defines it.
+fn is_current(inner: &Inner) -> bool {
+    inner.finality_current && inner.pending_finalized.is_none()
+}
+
+fn set_finalized(inner: &mut Inner, slot: u64, state_root: [u8; 32], number: u64, hash: [u8; 32]) {
+    inner.finalized_slot = slot;
+    inner.execution_state_root = Some(state_root);
+    inner.execution_block_number = number;
+    inner.execution_block_hash = Some(hash);
+    push_root(&mut inner.known_roots, slot, state_root, true);
+}
+
+fn set_optimistic(inner: &mut Inner, slot: u64, number: u64, hash: [u8; 32], state_root: [u8; 32]) {
+    inner.optimistic_slot = slot;
+    inner.optimistic_block_number = number;
+    inner.optimistic_block_hash = Some(hash);
+    inner.optimistic_state_root = Some(state_root);
+    push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
 /// The finalized execution anchor held in `inner`, if root AND hash have landed.
@@ -352,6 +507,151 @@ mod tests {
         anchor.record_state_root(3, root(6), false);
         assert!(anchor.find_state_root(&root(6)).unwrap().bls_verified);
         assert_eq!(anchor.known_root_count(), 3);
+    }
+
+    /// A genuine header (raw RLP, keccak hash) with this number and state root.
+    fn header(number: u64, state_root: [u8; 32]) -> VerifiedHeader {
+        let (_, genesis) = crate::el::served::mainnet_genesis().expect("embedded genesis");
+        let mut h = myotis_core::header::BlockHeader::decode(&genesis).expect("genesis decodes");
+        h.number = number;
+        h.state_root = state_root;
+        let raw_rlp = h.encode();
+        VerifiedHeader {
+            hash: myotis_core::keccak::keccak256(&raw_rlp),
+            raw_rlp,
+            header: h,
+        }
+    }
+
+    #[test]
+    fn a_gloas_finality_waits_for_its_header_then_adopts_it() {
+        let anchor = ExecAnchor::new();
+        let h = header(21_000_000, root(1));
+        anchor.note_finalized_hash(100, h.hash);
+        assert_eq!(anchor.pending_hashes(), vec![h.hash]);
+        assert!(!anchor.is_synced(), "a hash alone is not an anchor");
+        assert_eq!(anchor.finalized_execution(), None);
+
+        assert!(anchor.resolve_header(&h));
+        let fin = anchor.finalized_execution().expect("resolved");
+        assert_eq!(
+            (fin.slot, fin.block_number, fin.state_root, fin.block_hash),
+            (100, 21_000_000, root(1), h.hash)
+        );
+        assert!(anchor.pending_hashes().is_empty());
+        assert!(anchor
+            .find_state_root(&root(1))
+            .is_some_and(|r| r.bls_verified && r.slot == 100));
+        assert!(!anchor.resolve_header(&h), "nothing pending any more");
+    }
+
+    #[test]
+    fn a_header_is_adopted_only_under_its_own_hash() {
+        let anchor = ExecAnchor::new();
+        let wanted = header(21_000_000, root(1));
+        anchor.note_finalized_hash(100, wanted.hash);
+        // A different block entirely.
+        assert!(!anchor.resolve_header(&header(21_000_000, root(2))));
+        // The pending hash CLAIMED over another header's bytes: the recomputed
+        // keccak disagrees with the claim, so it is refused before any lookup.
+        let mut forged = header(21_000_000, root(2));
+        forged.hash = wanted.hash;
+        assert!(!anchor.resolve_header(&forged));
+        assert_eq!(anchor.finalized_execution(), None);
+        assert_eq!(anchor.pending_hashes(), vec![wanted.hash]);
+    }
+
+    #[test]
+    fn a_newer_finality_supersedes_and_an_older_one_is_ignored() {
+        let anchor = ExecAnchor::new();
+        let (a, b) = (header(1, root(1)), header(2, root(2)));
+        anchor.note_finalized_hash(10, a.hash);
+        anchor.note_finalized_hash(20, b.hash);
+        assert_eq!(anchor.pending_hashes(), vec![b.hash]);
+        anchor.note_finalized_hash(15, a.hash);
+        assert_eq!(
+            anchor.pending_hashes(),
+            vec![b.hash],
+            "an older finality never replaces a newer one"
+        );
+        assert!(!anchor.resolve_header(&a), "superseded");
+        assert!(anchor.resolve_header(&b));
+        assert_eq!(anchor.finalized_slot(), 20);
+        anchor.note_finalized_hash(10, a.hash);
+        assert!(
+            anchor.pending_hashes().is_empty(),
+            "nothing older than the resolved finality"
+        );
+    }
+
+    #[test]
+    fn the_same_block_under_a_newer_slot_needs_no_fetch() {
+        // Payloads empty or withheld for a while: consecutive finalized beacon
+        // blocks name the same parent payload.
+        let anchor = ExecAnchor::new();
+        let h = header(7, root(7));
+        anchor.note_finalized_hash(100, h.hash);
+        assert!(anchor.resolve_header(&h));
+        anchor.note_finalized_hash(132, h.hash);
+        assert!(anchor.pending_hashes().is_empty());
+        assert_eq!(
+            anchor
+                .finalized_execution()
+                .map(|f| (f.slot, f.block_number)),
+            Some((132, 7))
+        );
+    }
+
+    #[test]
+    fn a_pending_finality_is_not_current() {
+        let anchor = ExecAnchor::new();
+        let (a, b) = (header(1, root(1)), header(2, root(2)));
+        anchor.note_finalized_hash(10, a.hash);
+        assert!(anchor.resolve_header(&a));
+        anchor.set_finality_current(true);
+        assert!(anchor.finality_is_current());
+        // The light client moved on; the EL still serves the previous finality.
+        anchor.note_finalized_hash(42, b.hash);
+        assert!(!anchor.finality_is_current());
+        let (fin, current) = anchor.finalized_execution_with_currency();
+        assert_eq!((fin.map(|f| f.block_number), current), (Some(1), false));
+        assert!(anchor.resolve_header(&b));
+        assert!(anchor.finality_is_current());
+    }
+
+    #[test]
+    fn one_header_resolves_both_heads_when_they_name_the_same_block() {
+        let anchor = ExecAnchor::new();
+        let h = header(9, root(9));
+        anchor.note_finalized_hash(64, h.hash);
+        anchor.note_optimistic_hash(65, h.hash);
+        assert_eq!(anchor.pending_hashes(), vec![h.hash], "fetched once");
+        assert!(anchor.resolve_header(&h));
+        assert_eq!(anchor.optimistic_head(), Some((9, h.hash)));
+        assert_eq!(anchor.optimistic_execution(), Some((9, root(9))));
+        assert_eq!(
+            anchor.finalized_execution().map(|f| f.block_number),
+            Some(9)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_pending_hash_wakes_the_resolver() {
+        let anchor = std::sync::Arc::new(ExecAnchor::new());
+        let waiter = {
+            let anchor = std::sync::Arc::clone(&anchor);
+            tokio::spawn(async move { anchor.pending_changed().await })
+        };
+        anchor.note_optimistic_hash(5, header(5, root(5)).hash);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("woken")
+            .unwrap();
+        // Noted while nobody waited: the stored permit wakes the next wait.
+        anchor.note_optimistic_hash(6, header(6, root(6)).hash);
+        tokio::time::timeout(std::time::Duration::from_secs(5), anchor.pending_changed())
+            .await
+            .expect("permit kept");
     }
 
     #[test]

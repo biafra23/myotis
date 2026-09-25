@@ -1477,6 +1477,9 @@ impl ElReader {
                 move || anchor.optimistic_head()
             })),
         );
+        // Gloas: the light client proves only execution block hashes; the pool
+        // fetches their headers for the anchor to verify and adopt.
+        pool.start_anchor_resolver(Arc::clone(&anchor));
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),

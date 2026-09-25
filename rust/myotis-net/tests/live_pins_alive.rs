@@ -46,9 +46,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::Multiaddr;
-use myotis_consensus::store::LightClientProcessor;
+use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{LightClientBootstrap, LightClientUpdate};
-use myotis_consensus::{spec, ssz};
 use myotis_net::codec;
 use myotis_net::reqresp::{self, LocalStatus};
 use myotis_net::status::StatusMessage;
@@ -125,14 +124,15 @@ fn assert_no_cl_env_overrides() {
 /// (even a bare `[0]`) would otherwise count as "serves catch-up", letting the
 /// census meet its floor on peers that cannot advance a stale install. Mirrors
 /// the real catch-up path: split the chunks, then decode one.
-fn served_an_update(raw: &[u8]) -> bool {
+fn served_an_update(config: &ChainConfig, raw: &[u8]) -> bool {
     if raw.first() != Some(&codec::RESULT_SUCCESS) {
         return false;
     }
-    match codec::decode_multi_chunk_response(raw, 1) {
-        Ok(chunks) => chunks
-            .first()
-            .is_some_and(|c| !c.is_empty() && LightClientUpdate::decode(c).is_ok()),
+    match codec::decode_multi_chunk_response_with_digests(raw, 1) {
+        Ok(chunks) => chunks.first().is_some_and(|(digest, c)| {
+            !c.is_empty()
+                && LightClientUpdate::decode_for(config.lc_fork_of_digest(digest), c).is_ok()
+        }),
         Err(_) => false,
     }
 }
@@ -250,7 +250,8 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                     // bootstrap path does not check it either; the checkpoint
                     // pin and the two branches below are the real proof.
                     let verdict = {
-                        match LightClientBootstrap::decode(&d.ssz_payload) {
+                        let fork = config.lc_fork_of_digest(&d.fork_digest);
+                        match LightClientBootstrap::decode_for(fork, &d.ssz_payload) {
                             Err(e) => Err(format!("bootstrap did not decode: {e}")),
                             Ok(b) if b.header.beacon.hash_tree_root() != config.checkpoint_root => {
                                 Err(format!(
@@ -261,22 +262,15 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                                         .collect::<String>()
                                 ))
                             }
-                            Ok(b) => {
-                                let depth = b.current_sync_committee_branch.len();
-                                if !ssz::verify_merkle_branch(
-                                    &b.current_sync_committee.hash_tree_root(),
-                                    &b.current_sync_committee_branch,
-                                    depth,
-                                    spec::sync_committee_gindex(depth),
-                                    &b.header.beacon.state_root,
-                                ) {
-                                    Err("sync-committee branch does not verify".to_string())
-                                } else if !LightClientProcessor::verify_execution_branch(&b.header) {
-                                    Err("execution branch does not verify".to_string())
-                                } else {
-                                    Ok(())
-                                }
-                            }
+                            // The production checks, at the proof indices of the
+                            // header's fork (sync.rs bootstrap path).
+                            Ok(b) => LightClientProcessor::new(
+                                LightClientStore::new(config.slots_per_period()),
+                                config.fork_schedule.clone(),
+                                config.genesis_validators_root,
+                            )
+                            .verify_bootstrap(&b)
+                            .map_err(|reason| reason.to_string()),
                         }
                     };
                     if let Err(why) = verdict {
@@ -320,12 +314,12 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                                     Err(_) => Err("timeout".to_string()),
                                 },
                             );
-                            if matches!(&updates, Some(Ok(raw)) if served_an_update(raw)) {
+                            if matches!(&updates, Some(Ok(raw)) if served_an_update(&config, raw)) {
                                 break;
                             }
                         }
                         match updates.expect("the loop always sets it") {
-                            Ok(raw) if served_an_update(&raw) => {
+                            Ok(raw) if served_an_update(&config, &raw) => {
                                 alive += 1;
                                 eprintln!(
                                     "[pins] OK   {addr} (bootstrap {} B, serves period {period})",
