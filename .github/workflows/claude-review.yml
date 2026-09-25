@@ -9,10 +9,10 @@
 #      API credits instead, swap the input below for
 #      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}.
 #
-# Model strategy — Fable 5 first, Opus 5 when its limit is exhausted:
-#   Usage limits are PER MODEL, so an exhausted Fable 5 limit leaves Opus 5
+# Model strategy — Fable 5 first, the newest Opus when its limit is exhausted:
+#   Usage limits are PER MODEL, so an exhausted Fable 5 limit leaves Opus
 #   untouched. Fable 5 is the more capable reviewer, so it gets first refusal;
-#   Opus 5 covers the gap instead of the review silently not happening (which
+#   Opus covers the gap instead of the review silently not happening (which
 #   is what did happen on 2026-08-07: the job errored at turn 1 for
 #   total_cost_usd 0, having read nothing and posted nothing).
 #
@@ -95,7 +95,7 @@ jobs:
           echo "count=$n" >> "$GITHUB_OUTPUT"
 
       # First choice. continue-on-error so an exhausted Fable 5 limit falls
-      # through to Opus 5 below instead of failing the job.
+      # through to the Opus fallback below instead of failing the job.
       - name: Review (Fable 5)
         id: fable
         continue-on-error: true
@@ -131,17 +131,28 @@ jobs:
             echo "safe=true" >> "$GITHUB_OUTPUT"
           else
             echo "safe=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Fable 5 failed after posting $((now - before)) comment(s) — suppressing the Opus 5 fallback so the PR does not get two overlapping reviews."
+            echo "::warning::Fable 5 failed after posting $((now - before)) comment(s) — suppressing the Opus fallback so the PR does not get two overlapping reviews."
           fi
 
-      - name: Review (Opus 5 — Fable 5 limit exhausted)
+      # `opus` is Claude Code's alias for the latest Opus, not a model ID, so
+      # this fallback moves to each new Opus with no edit here; the full ID it
+      # used to name, `claude-opus-5`, stays on that one model. Claude Code
+      # resolves the alias at run time from Anthropic's model catalog: the one
+      # built into the Claude Code that the floating `@v1` bundles (bumped
+      # nearly daily), or a per-account one when Anthropic's servers supply it.
+      # One trap: an ANTHROPIC_DEFAULT_OPUS_MODEL env var (job env, or `env`
+      # in a committed .claude/settings.json) overrides the alias. Verified
+      # 2026-09-25 with action v1.0.234 / Claude Code 2.1.282: `opus` resolves
+      # to claude-opus-5-5; each run's "Claude Code initialized" log line names
+      # the model it got. To pin one Opus instead, put its full ID here.
+      - name: Review (latest Opus — Fable 5 failed, posted nothing)
         if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
-            --model claude-opus-5
+            --model opus
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
@@ -151,5 +162,5 @@ jobs:
       - name: Fail when the review was left incomplete
         if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe != 'true'
         run: |
-          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus 5 fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
+          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
           exit 1
