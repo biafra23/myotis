@@ -147,6 +147,27 @@ class BeaconLightClientGloasTest {
     }
 
     /**
+     * Relayed objects are served under the fork digest of their OWN slot — the spec's rule —
+     * never the upstream's context bytes, which nothing checks: a Fulu-era object keeps the
+     * Fulu digest after the fork, a Gloas-era one gets the Gloas digest.
+     */
+    @Test
+    void relayedObjectsCarryTheDigestOfTheirOwnSlot() {
+        byte[] gvr = hex("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078");
+        BeaconLightClient blc = client(sepolia().withGloasEpoch(353024), gvr, 0L, new BeaconSyncState());
+        try {
+            blc.setBlobParameters(275712L, 21L);
+            byte[] fulu = hex("74d01459");
+            byte[] gloas = hex("669e6c11");
+            assertArrayEquals(fulu, blc.relayDigest(11_209_280L)); // the pinned checkpoint's slot
+            assertArrayEquals(fulu, blc.relayDigest(353_024L * 32 - 1));
+            assertArrayEquals(gloas, blc.relayDigest(353_024L * 32));
+        } finally {
+            blc.close();
+        }
+    }
+
+    /**
      * What makes the size rule safe (the Rust twin pins it at compile time in
      * {@code myotis_consensus::types}): every Gloas container is smaller than the smallest
      * canonical pre-Gloas encoding of its type, so a Gloas-sized payload is never a pre-Gloas

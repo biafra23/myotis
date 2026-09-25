@@ -264,17 +264,21 @@ public class BeaconP2PService implements AutoCloseable {
     // peers who query us can get the same data back until it ages out.
     // -------------------------------------------------------------------------
 
-    /** Cache a verified finality update with the context bytes it was received under. */
+    /** Cache a verified finality update with the context bytes to serve it under — the
+     *  fork digest of its attested slot ({@code BeaconLightClient.relayDigest}), not the
+     *  upstream's, which nothing checks. */
     public void cacheFinalityUpdate(byte[] forkDigest, byte[] sszPayload) {
         cacheRelay(FINALITY, forkDigest, sszPayload);
     }
 
-    /** Cache an optimistic update with the context bytes it was received under. */
+    /** Cache an optimistic update with the context bytes to serve it under (the fork digest
+     *  of its attested slot, as for {@link #cacheFinalityUpdate}). */
     public void cacheOptimisticUpdate(byte[] forkDigest, byte[] sszPayload) {
         cacheRelay(OPTIMISTIC, forkDigest, sszPayload);
     }
 
-    /** Cache the verified bootstrap for {@code blockRoot32} with its context bytes. */
+    /** Cache the verified bootstrap for {@code blockRoot32} with the context bytes to serve
+     *  it under (the fork digest of its header's slot). */
     public void cacheBootstrap(byte[] blockRoot32, byte[] forkDigest, byte[] sszPayload) {
         if (blockRoot32 != null && blockRoot32.length == 32) {
             this.bootstrapBlockRoot = blockRoot32.clone();

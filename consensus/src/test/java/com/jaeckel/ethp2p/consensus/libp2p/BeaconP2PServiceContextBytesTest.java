@@ -38,8 +38,11 @@ class BeaconP2PServiceContextBytesTest {
                 r.payload(), true, r.forkDigest(), () -> current);
     }
 
+    /** The service serves an object under the digest it was CACHED with — the fork digest
+     *  of the object's own slot, which the caller computes (BeaconLightClient.relayDigest) —
+     *  not the current one. */
     @Test
-    void aRelayedObjectKeepsTheDigestItArrivedWith() throws Exception {
+    void aRelayedObjectIsServedUnderTheDigestItWasCachedWith() throws Exception {
         AtomicReference<byte[]> current = new AtomicReference<>(POST);
         BeaconP2PService svc = service(current);
         byte[] ssz = {1, 2, 3, 4, 5};

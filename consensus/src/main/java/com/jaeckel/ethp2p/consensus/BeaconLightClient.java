@@ -1412,6 +1412,18 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * The context bytes a relayed light-client object is served under: the fork digest of
+     * its OWN slot's epoch — the attested slot for an update, the header slot for a
+     * bootstrap — computed from the schedule the way this client computes its own. Never
+     * the upstream's context bytes: nothing checks those (a Gloas-sized payload decodes
+     * under any digest), and a junk digest re-served by us would make every client that
+     * dispatches on context bytes fail to decode it and down-score us as a server.
+     */
+    byte[] relayDigest(long objectSlot) {
+        return computeForkDigest(forkSchedule.versionAtEpoch(objectSlot / slotsPerEpoch));
+    }
+
+    /**
      * EIP-7892 {@code compute_fork_digest}:
      * <pre>
      *   base_digest = sha256(pad(fork_version, 32) || gvr)  // fork_data_root
@@ -1738,7 +1750,8 @@ public class BeaconLightClient implements AutoCloseable {
                                             bootstrap.header().beacon().slot()));
                                     // Cache the bootstrap so we can relay it to any peer
                                     // that asks us for the same block root.
-                                    p2pService.cacheBootstrap(checkpointRoot, framed.forkDigest(), response);
+                                    p2pService.cacheBootstrap(checkpointRoot,
+                                            relayDigest(bootstrap.header().beacon().slot()), response);
                                     log.info("[beacon] Bootstrap complete from {}, slot={}",
                                             peer, bootstrap.header().beacon().slot());
                                 }
@@ -2166,12 +2179,12 @@ public class BeaconLightClient implements AutoCloseable {
                         .requestFinalityUpdateWithContext(peer, 0L)
                         .get(5, TimeUnit.SECONDS);
                 byte[] response = framed.payload();
-                p2pService.cacheFinalityUpdate(framed.forkDigest(), response);
 
                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
                 LightClientFinalityUpdate update = LightClientFinalityUpdate.decodeFor(
                         lcForkOf(framed.forkDigest(), response.length, LightClientFinalityUpdate.GLOAS_SIZE),
                         response);
+                p2pService.cacheFinalityUpdate(relayDigest(update.attestedHeader().beacon().slot()), response);
                 LightClientHeader finalizedHeader = update.finalizedHeader();
                 long finalizedSlot = finalizedHeader.beacon().slot();
                 // Seeding takes an unverified execution payload's fields; a Gloas header
@@ -2567,7 +2580,7 @@ public class BeaconLightClient implements AutoCloseable {
         // caching per-response from concurrent callbacks could leave a losing,
         // staler update as what we serve peers — the sequential loop always ended
         // on the winner's bytes).
-        p2pService.cacheFinalityUpdate(win.forkDigest(), win.raw());
+        p2pService.cacheFinalityUpdate(relayDigest(win.update().attestedHeader().beacon().slot()), win.raw());
         // Classification harvest (covers the winner too — a decodable response
         // queued it as confirmed — dial-priority signal only, unlike Rust's
         // verified-apply-gated mark_proven; Java's provenLightClient is the
