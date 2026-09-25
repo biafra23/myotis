@@ -39,6 +39,14 @@
 #   - Drafts are skipped until marked ready.
 #   - Fork PRs are skipped: `pull_request` runs from forks get no secrets, so
 #     the job could only fail there. Same-repo PRs are the review target.
+#   - The reviewer's instructions come from the PR's base, not its own tree.
+#     A same-repo branch is not necessarily trusted (a prompt-injected session
+#     can push one and open its PR), so the prompt file is read from the base
+#     commit (see "Assemble review prompt"), and claude-code-action itself
+#     restores the root CLAUDE.md, CLAUDE.local.md and .claude/ from the base
+#     branch (its docs/security.md). It does NOT restore a CLAUDE.md in a
+#     subdirectory, which Claude Code loads once the reviewer reads a file
+#     there — a PR that adds one still reaches the reviewer.
 #   - A PR that edits THIS FILE cannot review itself: the action requires the
 #     workflow to match the default branch and skips (green, but a no-op).
 #     Changes here are only exercised once merged to main.
@@ -66,15 +74,39 @@ jobs:
       # Both attempts below send the identical prompt, so it lives in one file
       # and is assembled once here. GitHub Actions has no YAML anchors, and
       # duplicating the prompt across two steps would drift.
+      #
+      # The file is read from the PR's BASE commit, never from the checkout
+      # above: that checkout is the PR's own tree, and reading the prompt from
+      # it would let the PR under review write its reviewer's instructions. So
+      # a PR that edits .github/claude-review-prompt.md is reviewed with the
+      # base prompt until it is merged — intended. "Base" is whatever branch
+      # the PR targets, so a PR into another unmerged branch gets that
+      # branch's prompt.
       - name: Assemble review prompt
         id: prompt
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
+          # Load-bearing, not tidiness: with an empty BASE_SHA the `git show`
+          # below would read ":<path>" — the index, i.e. the PR's own copy.
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Unexpected base SHA: '$BASE_SHA'"; exit 1; }
+          # The checkout is a depth-1 clone of the merge commit, which does not
+          # include the base commit itself.
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin "$BASE_SHA"
+          # Read before anything is written, so a failure cannot leave an
+          # unterminated block in $GITHUB_OUTPUT.
+          prompt=$(git show "$BASE_SHA:.github/claude-review-prompt.md") \
+            || { echo "::error::The base commit $BASE_SHA has no .github/claude-review-prompt.md, and the prompt is never taken from the PR's own tree. Review this PR by hand, or bring its base branch up to date with main."; exit 1; }
           {
             echo 'text<<CLAUDE_PROMPT_EOF'
-            echo "REPO: ${{ github.repository }}"
-            echo "PR NUMBER: ${{ github.event.pull_request.number }}"
+            echo "REPO: $REPO"
+            echo "PR NUMBER: $PR_NUMBER"
             echo
-            cat .github/claude-review-prompt.md
+            printf '%s\n' "$prompt"
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
