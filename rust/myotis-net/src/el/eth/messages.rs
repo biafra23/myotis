@@ -447,16 +447,19 @@ pub fn decode_new_pooled_tx_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
     if rlp::validate(payload).is_err() {
         return Vec::new();
     }
-    let Ok(items) = rlp::raw_list_prefix(payload, 4) else {
+    // Up to the cap: a prefix holding exactly 3 elements is the whole list.
+    let Ok(items) = rlp::raw_list_prefix(payload, MAX_GOSSIP_HASHES_PER_MSG) else {
         return Vec::new();
     };
     // eth/68: exactly [types, sizes, hashes] where the LAST item is the hash
     // list. A flat eth/66 list of 3 hashes would ALSO be length 3 — the two
     // are distinguished by the last item's kind (list vs 32-byte string).
     if items.len() == 3 && rlp::is_list_prefix(items[2]) {
-        return collect_hashes(items[2]);
+        return rlp::raw_list_prefix(items[2], MAX_GOSSIP_HASHES_PER_MSG)
+            .map(collect_hashes)
+            .unwrap_or_default();
     }
-    collect_hashes(payload)
+    collect_hashes(items)
 }
 
 /// Hash the elements of an inbound `Transactions` (0x12) full-body gossip
@@ -481,12 +484,9 @@ pub fn transactions_gossip_hashes(payload: &[u8]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// The 32-byte strings among the first [`MAX_GOSSIP_HASHES_PER_MSG`] elements
-/// of an already-validated RLP hash list; anything else is skipped.
-fn collect_hashes(list: &[u8]) -> Vec<[u8; 32]> {
-    let Ok(items) = rlp::raw_list_prefix(list, MAX_GOSSIP_HASHES_PER_MSG) else {
-        return Vec::new();
-    };
+/// The 32-byte strings among already-validated raw RLP elements; anything
+/// else is skipped.
+fn collect_hashes(items: Vec<&[u8]>) -> Vec<[u8; 32]> {
     items
         .into_iter()
         .filter(|item| !rlp::is_list_prefix(item))
@@ -605,13 +605,17 @@ fn encode_hash_request(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
 /// call this on every frame a peer sends, so it walks the list instead of
 /// building it (#454). The whole list is still validated, as before.
 pub fn leading_request_id(payload: &[u8]) -> Option<u64> {
-    let head = *rlp::raw_list_prefix(payload, 1).ok()?.first()?;
-    // A canonical u64 encodes in at most 9 bytes. A longer head (a list, or a
-    // longer string) cannot be one, so it is not worth building to find out.
+    request_id_at(rlp::raw_list_prefix(payload, 1).ok()?.first()?).ok()
+}
+
+/// The request id in the raw head element of a `[reqId, …]` message. A
+/// canonical u64 encodes in at most 9 bytes; a longer head (a list, or a
+/// longer string) cannot be one, so it is not worth building to find out.
+fn request_id_at(head: &[u8]) -> Result<u64, CoreError> {
     if head.len() > 9 {
-        return None;
+        return Err(CoreError("eth message: request id is not a u64".into()));
     }
-    rlp::decode(head).ok()?.as_u64().ok()
+    rlp::decode(head)?.as_u64()
 }
 
 /// Refuse a control message too large to be a real one before building its
@@ -627,13 +631,14 @@ fn check_control_size(what: &str, payload: &[u8]) -> Result<(), CoreError> {
 }
 
 /// Strip the `[reqId, payload]` wrapper (present in every eth/66-69 request/
-/// response message), returning `(reqId, payload_raw)`.
+/// response message), returning `(reqId, payload_raw)`. Anything after the
+/// payload is validated but not collected (#454).
 fn strip_request_id(rlp_bytes: &[u8]) -> Result<(u64, &[u8]), CoreError> {
-    let items = rlp::raw_list_items(rlp_bytes)?;
+    let items = rlp::raw_list_prefix(rlp_bytes, 2)?;
     if items.len() < 2 {
         return Err(CoreError("eth message: missing [reqId, payload]".into()));
     }
-    Ok((rlp::decode(items[0])?.as_u64()?, items[1]))
+    Ok((request_id_at(items[0])?, items[1]))
 }
 
 fn fixed32(item: &Item) -> Result<[u8; 32], CoreError> {
