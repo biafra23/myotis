@@ -380,6 +380,18 @@ pub struct VerifiedBlock {
     pub full_transactions: Option<Vec<VerifiedTransaction>>,
 }
 
+/// What a verified block read fetches beyond its anchored header window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockDepth {
+    /// The header alone. The EVM's block context reads nothing else, so its
+    /// setup skips the body download (a head block's body is the bulk of the
+    /// bytes, and every `eth_call` / `eth_estimateGas` starts with this read).
+    HeaderOnly,
+    /// The body too, its transactions verified against the header's
+    /// `transactions_root`: hashes only, or fully decoded.
+    Body { full_transactions: bool },
+}
+
 /// How far below its window's anchor a block pin may be and still verify
 /// cheaply: the header window `[target ..= top]` is fetched in one request, so
 /// this bounds its size. The top is the finalized block for a pin at or below
@@ -5634,7 +5646,10 @@ impl ElReader {
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         let fin = self.require_finalized_execution(what)?;
-        let Some(block) = self.get_block_by_number(Some(fin.block_number), false).await? else {
+        let Some((hash, header)) = self
+            .verified_header_by_number(Some(fin.block_number))
+            .await?
+        else {
             return Err(format!(
                 "finalized block {} not fetchable for {what}",
                 fin.block_number
@@ -5643,34 +5658,35 @@ impl ElReader {
         // The window was anchored at the finalized hash itself; pin the header
         // to the finalized anchor once more (belt and braces — the finalized
         // payload is the trust anchor this mode advertises).
-        if block.hash != fin.block_hash {
+        if hash != fin.block_hash {
             return Err(format!(
                 "finalized-block hash mismatch at {} for {what}",
                 fin.block_number
             ));
         }
-        if block.header.state_root != fin.state_root {
+        if header.state_root != fin.state_root {
             return Err(format!(
                 "finalized-block state-root mismatch at {} for {what}",
                 fin.block_number
             ));
         }
-        let ctx = block_context(&block.header, chain_id)?;
+        let ctx = block_context(&header, chain_id)?;
         self.evm_executor_for(ctx, what, true).await
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
-    /// from the verified head + an [`EvmExecutor`] over a fresh snap-peer snapshot and
-    /// the reader's cross-call caches. `what` names the caller in the error messages.
+    /// from the verified head header (no body: the context reads nothing else) +
+    /// an [`EvmExecutor`] over a fresh snap-peer snapshot and the reader's
+    /// cross-call caches. `what` names the caller in the error messages.
     async fn evm_setup(
         &self,
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some(block) = self.get_block_by_number(None, false).await? else {
+        let Some((_, header)) = self.verified_header_by_number(None).await? else {
             return Err(format!("no verified head to run {what} against"));
         };
-        let ctx = block_context(&block.header, chain_id)?;
+        let ctx = block_context(&header, chain_id)?;
         self.evm_executor_for(ctx, what, false).await
     }
 
@@ -5723,12 +5739,36 @@ impl ElReader {
         target: Option<u64>,
         full_transactions: bool,
     ) -> Result<Option<VerifiedBlock>, String> {
+        self.block_by_number(target, BlockDepth::Body { full_transactions })
+            .await
+    }
+
+    /// [`Self::get_block_by_number`]'s header alone — `(hash, header)` verified
+    /// the same way (the anchored window), with no body download. Same
+    /// `Ok(None)` / `Err` semantics.
+    async fn verified_header_by_number(
+        &self,
+        target: Option<u64>,
+    ) -> Result<Option<([u8; 32], BlockHeader)>, String> {
+        Ok(self
+            .block_by_number(target, BlockDepth::HeaderOnly)
+            .await?
+            .map(|block| (block.hash, block.header)))
+    }
+
+    /// The read behind [`Self::get_block_by_number`] and
+    /// [`Self::verified_header_by_number`], at `depth`.
+    async fn block_by_number(
+        &self,
+        target: Option<u64>,
+        depth: BlockDepth,
+    ) -> Result<Option<VerifiedBlock>, String> {
         // Tip-lag retry for `latest` only — see TIP_LAG_RETRIES. Each attempt
         // re-reads the anchor (it advances) and the pool ladder (the rotation
         // may have swapped in fresher peers between attempts).
         let mut attempt = 0;
         loop {
-            match self.get_block_by_number_inner(target, full_transactions).await {
+            match self.get_block_by_number_inner(target, depth).await {
                 Err(PoolReadError::TipLag { error, failed }) => {
                     if target.is_none() && attempt < TIP_LAG_RETRIES {
                         attempt += 1;
@@ -5761,7 +5801,7 @@ impl ElReader {
     async fn get_block_by_number_inner(
         &self,
         target: Option<u64>,
-        full_transactions: bool,
+        depth: BlockDepth,
     ) -> Result<Option<VerifiedBlock>, PoolReadError> {
         let (head_num, head_hash) = self.anchored_head().map_err(PoolReadError::Fatal)?;
         let target_num = target.unwrap_or(head_num);
@@ -5807,7 +5847,7 @@ impl ElReader {
             &peers,
             block_hedge_delay(span),
             |peer: std::sync::Arc<ManagedPeer>| async move {
-                match self.get_block_from(&peer, target_num, top, full_transactions).await {
+                match self.get_block_from(&peer, target_num, top, depth).await {
                     Ok(block) => Ok(BlockAttempt::Block(Box::new(block))),
                     Err(BlockFromError::Undecodable(e)) => Ok(BlockAttempt::Undecodable(e)),
                     Err(BlockFromError::Peer(e)) => Err(e),
@@ -5837,8 +5877,11 @@ impl ElReader {
 
     /// Fetch + verify one block against a single peer. Fetches the header window
     /// [target..top] (`top` = the beacon-anchored block the window chains up
-    /// to, see `choose_window_top`), then fetches the target's body and verifies
-    /// its transactions against the header's `transactions_root`. A
+    /// to, see `choose_window_top`), then — unless `depth` is
+    /// [`BlockDepth::HeaderOnly`] — fetches the target's body and verifies its
+    /// transactions against the header's `transactions_root`. A header-only
+    /// read returns no transactions (`tx_hashes` empty), and only
+    /// [`Self::verified_header_by_number`] asks for one. A
     /// [`BlockFromError::Peer`] (mismatch / transport) is this peer's failure —
     /// the caller loop tries the next one; a [`BlockFromError::Undecodable`] is
     /// deterministic across peers and must short-circuit the loop.
@@ -5847,7 +5890,7 @@ impl ElReader {
         peer: &ManagedPeer,
         target_num: u64,
         top: WindowTop,
-        full_transactions: bool,
+        depth: BlockDepth,
     ) -> Result<VerifiedBlock, BlockFromError> {
         // The contiguous forward window [target .. top], in one request. The
         // caller's BLOCK_LOOKBACK_MAX (512) check bounds this to ~300 KB, within
@@ -5859,6 +5902,20 @@ impl ElReader {
         let window =
             fetch_anchored_window(peer, target_num, top).await.map_err(BlockFromError::Peer)?;
         let vh = &window[0];
+        let full_transactions = match depth {
+            BlockDepth::HeaderOnly => {
+                // The window verified the header (and its hash↔number) against
+                // the beacon anchor; nothing past it is wanted.
+                self.remember_block_number(vh.hash, vh.header.number);
+                return Ok(VerifiedBlock {
+                    hash: vh.hash,
+                    header: vh.header.clone(),
+                    tx_hashes: Vec::new(),
+                    full_transactions: None,
+                });
+            }
+            BlockDepth::Body { full_transactions } => full_transactions,
+        };
         // Body: verify its transactions against the (now trusted) transactions_root.
         let bodies = peer.get_block_bodies(&[vh.hash]).await.map_err(BlockFromError::Peer)?;
         let body = bodies
