@@ -1,9 +1,11 @@
 package com.jaeckel.ethp2p.networking;
 
 import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
+import com.jaeckel.ethp2p.core.consensus.LcFork;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.OptionalLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -60,6 +62,13 @@ class NetworkConfigForkScheduleTest {
         assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x76}, c.forkVersionAtEpoch(353024));
         assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x75}, c.forkSchedule().versionForSignatureSlot(11296768L));
         assertArrayEquals(new byte[]{(byte) 0x90, 0, 0, 0x76}, c.forkSchedule().versionForSignatureSlot(11296769L));
+        // ...while the light-client wire format has no off-by-one: that first slot's
+        // objects are already Gloas-shaped (block hash, fixed Gloas gindices).
+        assertEquals(OptionalLong.of(353024), c.forkSchedule().gloasEpoch());
+        assertEquals(LcFork.PRE_GLOAS, c.forkSchedule().lcForkAtEpoch(353023));
+        assertEquals(LcFork.GLOAS, c.forkSchedule().lcForkAtEpoch(353024));
+        assertEquals(LcFork.PRE_GLOAS, c.forkSchedule().lcForkAtSlot(11296767L));
+        assertEquals(LcFork.GLOAS, c.forkSchedule().lcForkAtSlot(11296768L));
         assertFalse(c.acceptPriorForkDigest());
         assertNull(c.priorForkVersion());
     }

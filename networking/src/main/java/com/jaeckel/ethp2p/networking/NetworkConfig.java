@@ -268,7 +268,7 @@ public record NetworkConfig(
                     ForkSchedule.fork(222464, 0x90000074), // electra
                     ForkSchedule.fork(272640, 0x90000075), // fulu
                     ForkSchedule.fork(353024, 0x90000076)  // gloas
-            ),
+            ).withGloasEpoch(353024),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia:
             // BPO2 at epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28). Folds into
             // the fork digest XOR — see activeBlobParams.

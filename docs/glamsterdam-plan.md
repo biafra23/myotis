@@ -1,9 +1,13 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
-Status: PLANNING — written 2026-08-19; updated 2026-09-25 (Sepolia date and
-parameters decided; A.2's EL detector implemented, Sepolia-gated, and
-hardened after review — see A.2). Dates
-without a decision are projections and move whenever testing finds something.
+Status: IN PROGRESS — written 2026-08-19; updated 2026-09-25. Sepolia's date
+and parameters are decided; A.2's EL detector shipped (#491). On the branch
+after it: A.1 (Sepolia schedule + time-gated fork id, both engines), B.0 (the
+pinned delta below), B.4 (Amsterdam EVM: served by revm 43, refused by Besu
+26.4), and B.1–B.3 in progress — the Gloas light client, fork-keyed decoding,
+and the execution anchor resolved by block hash (see "The EL anchor after
+Gloas"). Dates without a decision are projections and move whenever testing
+finds something.
 Sources of truth to re-check while executing: `ethereum/consensus-specs`
 (`specs/gloas/light-client/`), the EF fork announcement blog posts (they carry
 the final epochs, timestamps and fork versions per network), and a fork
@@ -35,19 +39,25 @@ implicit decoder ceiling is **Electra**. Gloas is the first fork since we
 shipped that breaks the shapes, in **both** engines (`consensus/` and
 `rust/myotis-consensus/`).
 
-What survives untouched: the trust model itself. Sync-committee BLS signatures
-stay the anchor (Altair machinery is not modified), the EL state remains
-committed under the signed header (the proof path moves, the chain of custody
-does not), and a withholding builder is a liveness problem, not a safety one —
-same class as roost withholding: nothing verifies wrong. (Caveat found while
-building A.2: detection is slower than CLAUDE.md suggests. The Rust engine
-drops out of SYNCED ~5 epochs after finality stalls; the Java engine has no
-finality-freshness gate and stays SYNCED until the next sync-committee period
-— up to ~27 h. And `beaconNotSynced` only fires on a store that never
-finalized, in both engines; a stalled one keeps serving the last finalized
-head until `headerChainGapTooLarge`. Tracked as a separate fix.) Bandwidth/storage on mobile
-are unaffected: BALs (~70 KB/block) are a full-node artifact never fetched by
-the LC path, and PeerDAS-style data is not in this fork.
+What survives: the trust model itself. Sync-committee BLS signatures stay the
+anchor (Altair machinery is not modified), and a withholding builder is a
+liveness problem, not a safety one — same class as roost withholding: nothing
+verifies wrong. What does NOT survive (B.0 finding, correcting this plan's
+first draft): the EL state root is no longer committed anywhere on the
+consensus side. Gloas removes `latest_execution_payload_header` from the state
+and the payload from the body; a light-client header proves only an EL BLOCK
+HASH. The chain of custody gains a hop — signature → beacon header → body root
+→ block hash → keccak of a devp2p header → its state root — still trustless,
+but every reader of the LC's state root / block number, and both engines'
+SYNCED derivations, had to change (see "The EL anchor after Gloas").
+(Caveat found while building A.2: detection is slower than CLAUDE.md suggests.
+Both engines drop out of SYNCED ~5 epochs after finality stalls — the Java
+gate landed in #490, `BeaconSyncState.SYNCED_SLOT_SLACK_EPOCHS`. But
+`beaconNotSynced` only fires on a store that never finalized, in both engines;
+a stalled one keeps serving the last finalized head until
+`headerChainGapTooLarge`.) Bandwidth/storage on mobile are unaffected: BALs
+(~70 KB/block) are a full-node artifact never fetched by the LC path, and
+PeerDAS-style data is not in this fork.
 
 ## Schedule (as of 2026-09-24)
 
@@ -106,6 +116,17 @@ CL side (`forkVersionBefore/After` + epoch). This is deliberately the seed of
 B.3's fork schedule — build it once, in config, and let B consume it.
 
 Re-pin the cross-engine golden conformance bytes for the fork-ID values.
+
+**Status: IMPLEMENTED for Sepolia (both engines).** The shape landed simpler
+than the pair above: the build's one known next fork is its `forkNext`, so
+the effective id is `ForkIds.effective(pin, forkNext, now)` /
+`forkid::fork_id_at` — the pin with `forkNext` announced before `T`, and
+`successor(pin, T)` with `next = 0` from `T` on. The eth `Status`, the DNS-pool
+filter and the fork watch all read the effective id; the conformance corpus
+pins `forkid.afterNext.<net>` so both engines' CRC32 must agree on
+`0x6c1d9423`. The CL side is the Gloas entry `(353024, 0x90000076)` in each
+engine's Sepolia schedule, read by epoch (`forkDigestAtEpoch` /
+`fork_digest_at_epoch`), plus the schedule's Gloas epoch for B's format.
 
 ### A.2 Fork detection & upgrade advisory
 
@@ -184,12 +205,12 @@ verification), but the liveness failure is mute.
   logged, never compared). The req/resp context bytes are extracted in
   `ReqRespCodec` but dropped at every call site, so they need plumbing first.
 - Schedule-known mode (an explicit `unsupportedFork` once a configured epoch
-  is crossed) — depends on A.1. **A.1 must also move the watch's baseline**:
-  today it is the static pin, fixed when the watch is built. Once the
-  time-gated pair lands, the watch has to use the currently effective hash
-  and `forkNext` — otherwise, after `T`, it ignores peers on the new hash
-  that announce the next fork. Likewise, a build that carries Gloas but
-  forgets its `forkNext` would tell its own users to update.
+  is crossed) — depends on A.1. Done with A.1: the watch measures from the
+  effective fork id, so after `T` peers on its successor are dissent and a
+  further fork announced on top of it is still detected. A build that carries
+  a fork in its `forkNext` stays silent about it — correct only because that
+  build also carries B; a release with A.1 but without B would not warn its
+  Sepolia users (the owner decides what ships).
 - Two or more forks ahead: placement is one step from our pin, so a stale
   build loses its placed evidence once a further fork (e.g. a BPO soon after
   Glamsterdam) moves upgraded peers two steps away; only announced/connected
@@ -212,10 +233,13 @@ Correction to the original plan: the UI seam is `NodeController.snapshots()` →
 ### A.3 Confirm the EL path is genuinely inert
 
 `BlockHeader` decode is forward-tolerant (post-London fields behind
-`isComplete()`, hash over raw RLP), so Amsterdam's new header field
-(EIP-7928 `block_access_list_hash`) is carried through hashing untouched —
-same treatment as `requestsHash` today. Add a decode/hash round-trip test
-with a synthetic Amsterdam header (extra trailing field) to pin that.
+`isComplete()`, hash over raw RLP), so Amsterdam's new header fields — EIP-7928
+`block_access_list_hash` and EIP-7843 `slot_number`, both trailing — are carried
+through hashing untouched, same treatment as `requestsHash` today. Pinned by
+decode/hash round-trip tests over a synthetic Amsterdam header with both
+fields (Rust `header.rs`, Java `BlockHeaderAmsterdamTest`); the Rust decoder
+also exposes the pair (SLOTNUM, B.4). This matters more after Gloas than
+before: the header fetched by hash IS the EL anchor now.
 
 **Definition of done (per network):** daemon on the forked network keeps
 peers past the boundary (fork-ID accepted both sides), EL header fetch works
@@ -260,69 +284,159 @@ release/devnet tag used), enumerate:
 Deliverable: a short addendum to this file with the pinned constants, plus
 the chosen consensus-spec-tests version for vectors.
 
+#### B.0 result — pinned Gloas light-client delta (researched 2026-09-25)
+
+- **Spec pin:** consensus-specs `v1.7.0-beta.2` (`5afdff62`). The LC wire
+  format has not changed since `v1.7.0-alpha.12` (EIP-7688 landed then); on
+  every new tag, re-diff `specs/gloas/light-client/` and the field order of
+  Gloas `BeaconState`, `BeaconBlockBody` and `ExecutionPayloadBid`. Client dev
+  branches: Lighthouse, Teku, Lodestar and Nimbus pin beta.2; Prysm beta.0
+  (LC-identical).
+- **Vectors:** consensus-specs release assets `v1.7.0-beta.2/{mainnet,minimal}.tar.gz`
+  (`consensus-spec-tests` is archived). The subset both engines pin lives in
+  `rust/testdata/lc/gloas-spec/` (README there): mainnet `ssz_static` for the
+  layouts and roots; minimal `light_client/sync` and the Fulu→Gloas
+  `gloas_fork` transition, sliced by hand (32-member committee).
+- **Header:** `LightClientHeader{beacon, execution_block_hash: Hash32,
+  execution_branch: Vector[Bytes32, 11]}`, 496 B, fixed size.
+  `execution_block_hash = body.signed_execution_payload_bid.message.parent_block_hash`.
+- **Containers (mainnet, fixed size, no offsets):** Bootstrap 25472, Update
+  26424, FinalityUpdate 1448, OptimisticUpdate 664.
+- **Gindex / depth (Gloas):** finalized root 735/9; current sync committee
+  2945/11; next 2946/11; execution block hash 2856/11 (pre-Gloas headers in the
+  Gloas shape: 812/9, normalized to 11). Electra/Fulu keep 169/7, 86/6, 87/6,
+  25/4. Selected by the fork of the ATTESTED slot (a bootstrap: its header's)
+  and checked with `is_valid_normalized_merkle_branch` — never derived from the
+  branch length (Gloas `BeaconState` is a 46-field ProgressiveContainer; the
+  depth formulas give 553/2070/2071).
+- **Unchanged:** BeaconBlockHeader, SyncCommittee, SyncAggregate, Checkpoint,
+  ForkData, the signing domain. The LC path needs no progressive merkleization.
+- **EL anchor:** the LC proves only an EL block hash — the parent payload's,
+  which for the finalized header is the EL finalized hash
+  (`finalized_block_bid.parent_block_hash`). No EL state root is committed on
+  the consensus side; number and state root come from the devp2p header whose
+  keccak matches.
+- **Cross-fork:** each object keeps its own fork's format on the wire (context
+  bytes = digest of the attested slot's fork). A Gloas update can carry a
+  pre-Gloas finalized header (812 branch, 2 zero nodes) for the first epochs
+  after the fork. The Sepolia fork epoch 353024 is exactly the period-1379
+  boundary.
+- **Digest:** the Fulu rule is unchanged (Gloas redefines only
+  `compute_fork_version`). Sepolia: Gloas `0x669e6c11` (derived; the Fulu
+  digest `0x74d01459` matches live). `BLOB_SCHEDULE` unchanged; EL
+  `amsterdamTime 1791294816`.
+- **Who serves Gloas LC data over p2p:** only Nimbus (on by default, v26.8.0+)
+  and Lodestar (on by default, v1.48.0+). Lighthouse unstable: not implemented
+  (prerequisite sigp/lighthouse#9790, progressive Merkle proofs, open). Prysm:
+  not implemented and off by default. Teku and Grandine: no p2p LC serving at
+  all. roost relays whatever its upstream serves — a Nimbus upstream serves
+  Gloas.
+- **Settled:** B.1 decodes by fork. Beyond the LC objects, the Gloas
+  `BeaconBlockBody`'s fixed part is 396 B — the same as Electra's — so size
+  sniffing would misread a body outright.
+
 ### B.1 Java engine (`consensus/`)
 
-- `BeaconChainSpec`: Gloas execution-proof gindex/depth (per B.0), keeping
-  the existing derive-from-branch-length helpers where they still apply.
-- `types/`: Gloas variants of `LightClientHeader`, the execution
-  header/bid container, `LightClientBootstrap`/`Update`/`FinalityUpdate`;
-  `BeaconBlockBody`/`BeaconBlockParser` if B.0(5) says the live path needs
-  them.
-- `LightClientProcessor.verifyExecutionBranch()`: new proof path; keep the
-  existing doc discipline (this function IS the EL trust path).
-- `BeaconLightClient`: accept the fork-schedule from A.1 — per-epoch fork
-  version for the BLS domain, per-slot digest for topics/req-resp,
-  `acceptedForkVersions()` spanning {Electra/Fulu, Gloas} through the
-  transition, and boundary handling for updates whose attested/finalized
-  headers straddle the fork.
-- **Decision point (owner):** the size-sniffing decoder idiom is at its
-  limit — Gloas shapes may collide by size with Electra ones. Recommended:
-  key decoding on the fork at the object's slot (known from A.1's schedule)
-  and keep sniffing only as a cross-check. That is an architecture change to
-  a deliberate convention, so it is the owner's call; the alternative is
-  adding Gloas size thresholds and accepting the brittleness.
+- `BeaconChainSpec`: the Gloas gindices as constants (B.0) — the
+  derive-from-branch-length helpers stay for pre-Gloas objects only.
+- `types/`: `LightClientHeader` in both shapes (payload header + 4-node
+  branch, or block hash + 11-node branch); fixed-size Gloas decoders for
+  `LightClientBootstrap`/`Update`/`FinalityUpdate` behind `decodeFor(LcFork)`.
+- `LightClientProcessor`: a shape gate before BLS (every header of an update
+  is in its ATTESTED slot's fork's shape), finality / next-committee gindices
+  by that fork, and `verifyExecutionBranchAt(header, fork of its own slot)` —
+  2856 for a Gloas header, 812 normalized for a pre-Gloas one in the Gloas
+  shape, 25 for the payload shape. Keeps the doc discipline: this function IS
+  the EL trust path.
+- `ForkSchedule` (`:core`) knows its Gloas epoch (`withGloasEpoch`, checked
+  against the version list) and answers `lcForkAtSlot`.
+- **Decided: decode by fork.** Context bytes (the digest of the object's
+  attested epoch) pick the decoder; the processor's shape gate cross-checks
+  the decoded object against its attested slot. Gloas-vs-pre-Gloas sizes do
+  not collide for LC objects, but they do for `BeaconBlockBody` (B.0), and
+  gindices cannot be derived from lengths at all, so sniffing is at its limit.
+- `BeaconP2PService` drops the context bytes today; plumbing them to the
+  decode sites is part of B.3.
 
 ### B.2 Rust twin (`rust/myotis-consensus/`) + golden corpus
 
-Mirror every B.1 decoder change in `types.rs` (same runtime behavior,
-including whatever B.1's sniffing decision is). Source fixtures from
-`ethereum/consensus-spec-tests` Gloas light-client vectors and captured
-Platåberget/Sepolia wire objects; pin them as cross-engine goldens in both
-directions, per the established corpus pattern. `rust/roost` is already
-Gloas-tolerant on scheduling (`forks.rs` parks unknown forks at
-`u64::MAX`) — verify it relays Gloas LC objects as opaque bytes and only
-needs digest awareness, not shape awareness.
+Mirrors B.1 (`types.rs` `HeaderExecution`, `decode_for`; `store.rs`
+`verify_execution_branch_at`, `verify_bootstrap`; `fork.rs` `LcFork`). Pinned
+in both engines: the spec vectors (`rust/testdata/lc/gloas-spec`), a signed
+Fulu→Gloas walk over synthetic trees (`gloas_boundary.rs` ↔
+`GloasBoundaryTest`), and the snapshot format below. **LCSS v2**: one shape
+tag per header, written only once a Gloas-shaped header is held — a
+payload-shaped store still writes v1 byte-for-byte, so an older build can
+resume it. Cross-engine golden `rust/testdata/snapshot/lcss-v2-golden.bin`.
+`rust/roost` needed one change: `participation_of` reads Gloas updates (by
+their fixed size) so a better copy of a Gloas period can replace a weaker one;
+it already stamps each object's context bytes from the fork schedule.
 
 ### B.3 Runtime fork awareness
 
 Consume A.1's schedule everywhere a fork constant is used at runtime: BLS
-signing domain by epoch, fork digest by slot, gossip topic re-subscription at
-the boundary, req/resp context handling. `rust/roost/src/forks.rs` is the
-in-repo model for the shape of this.
+signing domain by epoch (done in #295's `version_for_signature_slot`), the
+decoder by the chunk's context bytes (`ChainConfig::lc_fork_of_digest`;
+`codec::decode_multi_chunk_response_with_digests` keeps the per-chunk digest,
+since one range response can span the fork), gossip topic re-subscription at
+the boundary (Java; the Rust engine consumes no LC gossip), req/resp context
+handling. `rust/roost/src/forks.rs` is the in-repo model for the shape of this.
+The Java chain fill (`fillChainStateRoots`, the one `BeaconBlockBody`
+consumer) must stop at Gloas slots: a Gloas body carries no payload and no
+state root, and its 396-byte fixed part is read as Electra.
 
-### B.4 EVM: Amsterdam rung (upstream-gated, then mechanical)
+### The EL anchor after Gloas (both engines)
 
-- **Besu (Java):** needs a release past 26.4.0 with
-  `MainnetEVMs.amsterdam` / `AmsterdamGasCalculator` /
-  `EvmSpecVersion.AMSTERDAM`. Besu is active on the Glamsterdam devnets, so
-  this lands before mainnet; bump `gradle/libs.versions.toml` when it ships
-  (and fix the stale `24.12.2` comment in `myotis-evm/build.gradle.kts`).
-- **revm (Rust):** already there — revm v114 aligns with Glamsterdam
-  devnet-7 fixtures. Bump and add the rung.
-- Add the rung in ONE coordinated change across both fork tables
-  (`EvmFactory.java` cascade + `AMSTERDAM_TIME` ×3 chains;
-  `rust/myotis-evm/src/fork.rs` `SpecId::AMSTERDAM`), twinned boundary tests
-  like the Osaka pair (`OsakaBoundaryTest` ↔
-  `osaka_boundaries_map_on_every_chain`).
-- **Guard against the silent-Osaka fallback:** the timestamp cascade would
-  otherwise price Amsterdam blocks with Osaka rules (wrong, undetectable —
-  exactly the CLAUDE.md "applied or refused" violation). Until the rung
-  exists, `buildForBlock()` past a configured Amsterdam timestamp must
-  refuse (permanent error), not silently compute.
-- **Android long pole:** `biafra23/besu` (`24.12.2-android.2`) must be
-  rebased to an Amsterdam-capable Besu. De-risk by doing the pending 26.4
-  rebase NOW, so Amsterdam is one hop instead of a double jump under time
-  pressure.
+Before Gloas the light client handed the EL `{number, block_hash, state_root}`
+straight from the proven payload header. After it, only the block hash:
+
+1. The CL loop records a Gloas header's hash as PENDING (Rust
+   `ExecAnchor::note_finalized_hash` / `note_optimistic_hash`; Java
+   `BeaconSyncState` twin).
+2. The EL peer pool fetches `GetBlockHeaders(origin = hash, 1)` from any peer
+   (Rust `PeerPool::start_anchor_resolver`) and offers the result.
+3. The anchor adopts it only if the keccak of the header's OWN raw RLP is the
+   pending hash — recomputed at the anchor, not taken from the decoder — and
+   then takes number and state root from that header. The root joins the
+   `stateRootMatch` window as verified.
+4. Until then it keeps serving the last resolved finality (final, only older)
+   and reports it NOT current, so the log index's restart claim never weighs a
+   superseded finality as current. The published state is SYNCED only while
+   the resolved finality is within the finality gate's own slack — a resolver
+   that no peer serves drops out of SYNCED instead of reading as
+   verification-ready.
+5. After empty or withheld payloads, consecutive beacon headers name the same
+   parent payload: the same hash only moves the anchor's slot, no fetch.
+
+Before Gloas the anchor's finality IS the store's, so none of this changes
+behaviour on mainnet or gnosis today.
+
+### B.4 EVM: Amsterdam rung
+
+- **revm (Rust): served.** revm `=43.0.3` (reth main's pin; 41 → 43 needed no
+  API change) maps `SEPOLIA_AMSTERDAM_TIME` to `SpecId::AMSTERDAM`, with
+  EIP-8037 state gas and EIP-2780 intrinsic gas on exactly for Amsterdam specs
+  (what reth's `CfgEnv::new_with_spec` does; revm's EIP-7708/EIP-8246 opt-outs
+  stay at their defaults, i.e. active). The flat-21000 estimate shortcut stops
+  at Amsterdam (EIP-2780 reprices transfers; a value transfer to an empty
+  account pays new-account state gas). SLOTNUM (EIP-7843) reads the verified
+  header's `slot_number`; an Amsterdam-spec context without one is refused
+  permanently (`EvmError::MissingSlotNumber`, -32602), never run with 0.
+  Engine ABI 33. Open: the JVM and iOS hosts still turn the Rust engine's
+  -32602 into the retryable "unavailable" (`RustVerifiedReads`,
+  `IosRpcBackend`) — mapping it to `REFUSED` would make every Rust-engine
+  refusal permanent at the wallet, not just this one.
+- **Besu (Java): refused.** Besu 26.4 ships an early `MainnetEVMs.amsterdam`
+  without EIP-2780, so it cannot price Sepolia's schedule. `EvmFactory`
+  refuses Sepolia blocks at/after the activation with
+  `EvmExecutionError.UnsupportedFork` (also ahead of the estimate's
+  plain-transfer shortcut and before any prefetch), and the engine contract
+  gained `CallResult`/`EstimateResult` status `REFUSED`, served as the
+  permanent -32602 (never the retryable -32000). The Besu bump turns the
+  refusal into an `amsterdam()` builder.
+- **Android:** the Besu fork is on `26.4.0-android.1` (`besuForkVersion`,
+  `android-app/build.gradle.kts`); Amsterdam is one rebase away once Besu
+  releases an EIP-2780-capable EVM.
 - Revisit `estimateGas` ceilings once the 200M gas-limit floor is real
   (current 30M ceiling; Osaka already left the EIP-7825 2^24 per-tx cap as a
   known residual).
@@ -355,10 +469,12 @@ index) eventually needs eth/70. Separate ticket, not part of A or B DoD.
 
 | Risk | Exposure | Mitigation |
 |---|---|---|
-| Spec churn until Gloas LC spec is final | B.0/B.1 rework | pin a spec tag per devnet; re-diff on bumps |
-| Besu Amsterdam release timing | B.4 Java only | revm path is done; EVM lag is estimation-accuracy only, never a verification gap — with the refuse-guard in place |
-| Android Besu-fork rebase capacity | B.4 Android | start the 26.4 rebase now |
-| Size-sniffing shape collision | B.1 correctness of *rejection reasons* (not of results) | fork-keyed decoding decision (owner) |
+| Spec churn until Gloas LC spec is final | B.0/B.1 rework | pinned to v1.7.0-beta.2 (LC format unchanged since alpha.12); re-diff on bumps |
+| Besu Amsterdam release timing | B.4 Java only | Java refuses Amsterdam blocks with a permanent -32602 until a Besu with EIP-2780 ships; the Rust engine serves them |
+| Android Besu-fork rebase capacity | B.4 Android | fork is on 26.4.0-android.1; Amsterdam is one rebase |
+| Size-sniffing shape collision | B.1 correctness of *rejection reasons* (not of results) | decided: fork-keyed decoding by context bytes, shape gate against the attested slot |
+| Few Gloas LC servers | liveness after the fork | Sepolia: Nimbus and Lodestar only (+ roost on a Nimbus upstream) — upgrade the dedicated node's Nimbus before 10-06. Mainnet: Lighthouse, likely the largest LC-serving population, has no Gloas LC yet (sigp/lighthouse#9790) — track before the mainnet date |
+| No EL peer serves the anchor's header | Gloas liveness (never safety) | any peer can serve it, none can forge it; the anchor falls back to the last resolved finality and SYNCED drops after the finality gate's slack |
 | Dates slip | deadline planning | Sepolia date is the tripwire; A is small enough to hold ready |
 
 Suggested order: **A.1–A.3 + B.0 now** (A is shippable independently and its

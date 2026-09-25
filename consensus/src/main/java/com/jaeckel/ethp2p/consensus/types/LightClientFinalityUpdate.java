@@ -1,5 +1,7 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.core.consensus.LcFork;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -21,15 +23,23 @@ import java.util.Arrays;
  *   160B  syncAggregate
  *   8B  signatureSlot
  *   Total fixed: 4 + 4 + 192 + 160 + 8 = 368 bytes
+ *
+ * Gloas: every field fixed-size, no offsets — attestedHeader 496 + finalizedHeader
+ * 496 (both Gloas shape) + finalityBranch 9 x 32 + syncAggregate 160 + signatureSlot 8.
  */
 public final class LightClientFinalityUpdate {
 
     /** Minimum fixed size (pre-Electra, 6-node finality branch). */
     public static final int FIXED_SIZE = 4 + 4 + 6 * 32 + 160 + 8; // 368
+    /** Gloas finality branch: {@code Vector[Bytes32, floorlog2(FINALIZED_ROOT_GINDEX_GLOAS)]}. */
+    private static final int GLOAS_FINALITY_BRANCH_NODES = 9;
+    /** Gloas: attested 496 + finalized 496 + 9 x 32 + aggregate 160 + slot 8, fixed. */
+    public static final int GLOAS_SIZE =
+            2 * LightClientHeader.GLOAS_SIZE + GLOAS_FINALITY_BRANCH_NODES * 32 + 160 + 8; // 1448
 
     private final LightClientHeader attestedHeader;
     private final LightClientHeader finalizedHeader;
-    private final byte[][] finalityBranch; // 6 or 7 x 32 (fork-dependent)
+    private final byte[][] finalityBranch; // 6 or 7 x 32 (fork-dependent); 9 (Gloas)
     private final SyncAggregate syncAggregate;
     private final long signatureSlot;
 
@@ -40,8 +50,9 @@ public final class LightClientFinalityUpdate {
             SyncAggregate syncAggregate,
             long signatureSlot
     ) {
-        if (finalityBranch.length < 6 || finalityBranch.length > 7) {
-            throw new IllegalArgumentException("finalityBranch must have 6 or 7 nodes, got " + finalityBranch.length);
+        int nodes = finalityBranch.length;
+        if ((nodes < 6 || nodes > 7) && nodes != GLOAS_FINALITY_BRANCH_NODES) {
+            throw new IllegalArgumentException("finalityBranch must have 6 or 7 nodes (9 for Gloas), got " + nodes);
         }
         this.attestedHeader = attestedHeader;
         this.finalizedHeader = finalizedHeader;
@@ -125,6 +136,34 @@ public final class LightClientFinalityUpdate {
         LightClientHeader finalizedHeader = LightClientHeader.decode(finalizedBytes);
 
         return new LightClientFinalityUpdate(attestedHeader, finalizedHeader, finalityBranch, syncAggregate, signatureSlot);
+    }
+
+    /**
+     * Decode the Gloas format: exactly {@link #GLOAS_SIZE} bytes.
+     *
+     * @throws IllegalArgumentException on any other length
+     */
+    public static LightClientFinalityUpdate decodeGloas(byte[] ssz) {
+        if (ssz == null || ssz.length != GLOAS_SIZE) {
+            throw new IllegalArgumentException("Gloas LightClientFinalityUpdate requires " + GLOAS_SIZE
+                    + " bytes, got " + (ssz == null ? "null" : ssz.length));
+        }
+        int h = LightClientHeader.GLOAS_SIZE;
+        int finBranch = 2 * h;
+        int agg = finBranch + GLOAS_FINALITY_BRANCH_NODES * 32;
+        int slot = agg + 160;
+        return new LightClientFinalityUpdate(
+                LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, 0, h)),
+                LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, h, finBranch)),
+                LightClientHeader.readNodes(ssz, finBranch, GLOAS_FINALITY_BRANCH_NODES),
+                SyncAggregate.decode(Arrays.copyOfRange(ssz, agg, slot)),
+                ByteBuffer.wrap(ssz, slot, 8).order(ByteOrder.LITTLE_ENDIAN).getLong());
+    }
+
+    /** Decode in the wire format of {@code fork} (the fork of the attested slot). */
+    public static LightClientFinalityUpdate decodeFor(LcFork fork, byte[] ssz) {
+        if (fork == null) throw new IllegalArgumentException("LightClientFinalityUpdate: fork is required");
+        return fork == LcFork.GLOAS ? decodeGloas(ssz) : decode(ssz);
     }
 
     public LightClientHeader attestedHeader() { return attestedHeader; }

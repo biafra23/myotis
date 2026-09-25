@@ -45,6 +45,40 @@ public final class BeaconChainSpec {
     public static final int FINALIZED_ROOT_DEPTH = 6;
     public static final int FINALIZED_CHECKPOINT_FIELD_INDEX = 20;
 
+    // Gloas (EIP-7732 ePBS + EIP-7688 progressive containers), consensus-specs
+    // v1.7.0-beta.2 specs/gloas/light-client/sync-protocol.md. The body carries a
+    // payload BID instead of the payload, so a header proves only the execution
+    // block hash — signed_execution_payload_bid.message.parent_block_hash — and the
+    // Gloas BeaconState is a progressive container, so the state gindices move even
+    // though the field indices (20, 22, 23) do not. They are NOT derivable from a
+    // branch length the way the pre-Gloas ones are (the depth-derived helpers below
+    // give 553/2070/2071 for depths 9/11/11): select them by the fork of the attested
+    // slot, as the spec's *_gindex_at_slot helpers do. Rust twin: spec.rs.
+
+    /** {@code get_generalized_index(BeaconState, 'finalized_checkpoint', 'root')} (Gloas). */
+    public static final int FINALIZED_ROOT_GINDEX_GLOAS = 735;
+    /** {@code get_generalized_index(BeaconState, 'current_sync_committee')} (Gloas). */
+    public static final int CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS = 2945;
+    /** {@code get_generalized_index(BeaconState, 'next_sync_committee')} (Gloas). */
+    public static final int NEXT_SYNC_COMMITTEE_GINDEX_GLOAS = 2946;
+    /** {@code get_generalized_index(BeaconBlockBody, 'signed_execution_payload_bid',
+     *  'message', 'parent_block_hash')} (Gloas). */
+    public static final int EXECUTION_BLOCK_HASH_GINDEX_GLOAS = 2856;
+    /** {@code get_generalized_index(deneb.BeaconBlockBody, 'execution_payload', 'block_hash')}:
+     *  where a pre-Gloas header carried in the Gloas shape proves its block hash
+     *  (normalized to the Gloas branch length with leading zeros). */
+    public static final int EXECUTION_BLOCK_HASH_GINDEX_DENEB = 812;
+
+    /** Gloas branch lengths — the SSZ vector lengths on the wire, all fixed. */
+    public static final int GLOAS_EXECUTION_BRANCH_LEN = gindexDepth(EXECUTION_BLOCK_HASH_GINDEX_GLOAS); // 11
+    public static final int GLOAS_SYNC_COMMITTEE_BRANCH_LEN = gindexDepth(CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS); // 11
+    public static final int GLOAS_FINALITY_BRANCH_LEN = gindexDepth(FINALIZED_ROOT_GINDEX_GLOAS); // 9
+
+    /** {@code floorlog2} of a generalized index: the depth of the node it names. */
+    public static int gindexDepth(int gindex) {
+        return 31 - Integer.numberOfLeadingZeros(gindex);
+    }
+
     /**
      * Compute the generalized index for current_sync_committee given the branch depth.
      * This handles fork-dependent tree structure changes (e.g. Electra adds fields).

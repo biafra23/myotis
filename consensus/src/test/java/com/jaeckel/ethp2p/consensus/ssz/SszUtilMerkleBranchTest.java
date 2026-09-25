@@ -160,4 +160,32 @@ class SszUtilMerkleBranchTest {
         longBranch[3] = new byte[32];
         assertFalse(SszUtil.verifyMerkleBranch(leaves[0], longBranch, 3, 0, root));
     }
+
+    /** Rust twin: {@code ssz.rs} normalized_branch_accepts_only_zero_padding. */
+    @Test
+    void normalizedBranchAcceptsOnlyZeroPadding() {
+        byte[][] leaves = new byte[4][];
+        for (int i = 0; i < 4; i++) {
+            leaves[i] = new byte[32];
+            Arrays.fill(leaves[i], (byte) i);
+        }
+        byte[] root = SszUtil.merkleize(leaves);
+        byte[][] branch = {leaves[3], SszUtil.sha256(leaves[0], leaves[1])};
+        assertTrue(SszUtil.verifyNormalizedMerkleBranch(leaves[2], branch, 6, root));
+        // Two zero nodes in front: the same proof, normalized to length 4.
+        byte[][] padded = {new byte[32], new byte[32], branch[0], branch[1]};
+        assertTrue(SszUtil.verifyNormalizedMerkleBranch(leaves[2], padded, 6, root));
+        // A non-zero pad node is not padding.
+        byte[][] dirty = {new byte[32], new byte[32], branch[0], branch[1]};
+        dirty[0][31] = 1;
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], dirty, 6, root));
+        // Shorter than the depth, a wrong gindex, and the degenerate gindices.
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], new byte[][]{branch[0]}, 6, root));
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], padded, 7, root));
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], new byte[0][], 1, root));
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], new byte[0][], 0, root));
+        // Java only (a Rust node is always 32 bytes): a short pad node is not a zero node.
+        byte[][] shortPad = {new byte[31], new byte[32], branch[0], branch[1]};
+        assertFalse(SszUtil.verifyNormalizedMerkleBranch(leaves[2], shortPad, 6, root));
+    }
 }

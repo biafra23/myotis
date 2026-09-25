@@ -1,5 +1,7 @@
 package com.jaeckel.ethp2p.consensus.types;
 
+import com.jaeckel.ethp2p.core.consensus.LcFork;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -19,24 +21,35 @@ import java.util.Arrays;
  *   [offset..)   header bytes (variable)
  *
  * Total fixed part: 4 + 24624 + 160 = 24788 bytes
+ *
+ * Gloas: every field fixed-size, no offset —
+ *   [0..496)       header (Gloas shape)
+ *   [496..25120)   currentSyncCommittee
+ *   [25120..25472) currentSyncCommitteeBranch (Vector[Bytes32, 11])
  */
 public final class LightClientBootstrap {
 
     /** Minimum fixed size (pre-Electra, 5 branch nodes). */
     public static final int FIXED_SIZE = 4 + SyncCommittee.ENCODED_SIZE + 5 * 32; // 24788
+    /** Gloas branch: {@code Vector[Bytes32, floorlog2(CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS)]}. */
+    private static final int GLOAS_BRANCH_NODES = 11;
+    /** Gloas: header 496 + committee 24624 + 11 x 32, fixed. */
+    public static final int GLOAS_SIZE =
+            LightClientHeader.GLOAS_SIZE + SyncCommittee.ENCODED_SIZE + GLOAS_BRANCH_NODES * 32; // 25472
 
     private final LightClientHeader header;
     private final SyncCommittee currentSyncCommittee;
-    private final byte[][] currentSyncCommitteeBranch; // 5 or 6 x 32 bytes (fork-dependent)
+    private final byte[][] currentSyncCommitteeBranch; // 5 or 6 x 32 bytes (fork-dependent); 11 (Gloas)
 
     public LightClientBootstrap(
             LightClientHeader header,
             SyncCommittee currentSyncCommittee,
             byte[][] currentSyncCommitteeBranch
     ) {
-        if (currentSyncCommitteeBranch.length < 5 || currentSyncCommitteeBranch.length > 6) {
-            throw new IllegalArgumentException("currentSyncCommitteeBranch must have 5 or 6 nodes, got "
-                    + currentSyncCommitteeBranch.length);
+        int nodes = currentSyncCommitteeBranch.length;
+        if ((nodes < 5 || nodes > 6) && nodes != GLOAS_BRANCH_NODES) {
+            throw new IllegalArgumentException("currentSyncCommitteeBranch must have 5 or 6 nodes (11 for Gloas), got "
+                    + nodes);
         }
         for (byte[] node : currentSyncCommitteeBranch) {
             if (node.length != 32) throw new IllegalArgumentException("each branch node must be 32 bytes");
@@ -94,6 +107,30 @@ public final class LightClientBootstrap {
         LightClientHeader header = LightClientHeader.decode(headerBytes);
 
         return new LightClientBootstrap(header, currentSyncCommittee, branch);
+    }
+
+    /**
+     * Decode the Gloas format: exactly {@link #GLOAS_SIZE} bytes.
+     *
+     * @throws IllegalArgumentException on any other length
+     */
+    public static LightClientBootstrap decodeGloas(byte[] ssz) {
+        if (ssz == null || ssz.length != GLOAS_SIZE) {
+            throw new IllegalArgumentException("Gloas LightClientBootstrap requires " + GLOAS_SIZE
+                    + " bytes, got " + (ssz == null ? "null" : ssz.length));
+        }
+        int h = LightClientHeader.GLOAS_SIZE;
+        int c = h + SyncCommittee.ENCODED_SIZE;
+        LightClientHeader header = LightClientHeader.decodeGloas(Arrays.copyOfRange(ssz, 0, h));
+        SyncCommittee currentSyncCommittee = SyncCommittee.decode(Arrays.copyOfRange(ssz, h, c));
+        byte[][] branch = LightClientHeader.readNodes(ssz, c, GLOAS_BRANCH_NODES);
+        return new LightClientBootstrap(header, currentSyncCommittee, branch);
+    }
+
+    /** Decode in the wire format of {@code fork} (the fork of the header's slot). */
+    public static LightClientBootstrap decodeFor(LcFork fork, byte[] ssz) {
+        if (fork == null) throw new IllegalArgumentException("LightClientBootstrap: fork is required");
+        return fork == LcFork.GLOAS ? decodeGloas(ssz) : decode(ssz);
     }
 
     public LightClientHeader header() { return header; }

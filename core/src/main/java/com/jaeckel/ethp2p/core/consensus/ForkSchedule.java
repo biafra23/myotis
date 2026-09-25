@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.core.encoding.Hex;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.OptionalLong;
 
 /**
  * A beacon chain's fork schedule: the append-only, ascending list of
@@ -34,15 +35,20 @@ import java.util.Objects;
  *
  * <p>Lives in {@code :core} because both {@code :networking} (the config) and
  * {@code :consensus} (the processor) need it and neither depends on the other.
- * Android-safe: arrays and {@link List} only.
+ * Android-safe: arrays, {@link List} and {@link OptionalLong} only.
  *
  * @param slotsPerEpoch slots per epoch for THIS chain (32 on the mainnet preset,
  *                      16 on gnosis). Bundled with the schedule so it can never be
  *                      read with another chain's geometry; {@code NetworkConfig}
  *                      refuses a schedule whose geometry differs from the chain's.
  * @param forks         the entries, ascending by activation epoch, genesis first
+ * @param gloasEpoch    activation epoch of Gloas, empty while this chain has none
+ *                      scheduled. Always one of {@code forks}' epochs (see
+ *                      {@link #withGloasEpoch(long)}): the version list says WHICH
+ *                      domain signs a slot, this says which wire format and which
+ *                      proof indices its light-client objects use ({@link LcFork}).
  */
-public record ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
+public record ForkSchedule(int slotsPerEpoch, List<Fork> forks, OptionalLong gloasEpoch) {
 
     /**
      * One scheduled fork. The version is held as the {@code int} the usual hex
@@ -65,10 +71,11 @@ public record ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
 
     /**
      * Validates on construction. Throws on: a non-positive {@code slotsPerEpoch},
-     * an empty list, a first entry not at epoch 0, or epochs that are not strictly
-     * ascending. Each would silently select a wrong signing domain for some slot —
-     * the "accepted and silently ignored" failure CLAUDE.md forbids for anything that
-     * can change the answer — so the constructor refuses rather than defaults.
+     * an empty list, a first entry not at epoch 0, epochs that are not strictly
+     * ascending, or a Gloas epoch that is not one of the entries' epochs. Each would
+     * silently select a wrong signing domain (or wire format) for some slot — the
+     * "accepted and silently ignored" failure CLAUDE.md forbids for anything that can
+     * change the answer — so the constructor refuses rather than defaults.
      */
     public ForkSchedule {
         if (slotsPerEpoch <= 0)
@@ -84,6 +91,20 @@ public record ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
                         + forks.get(i - 1).epoch() + " then " + forks.get(i).epoch() + ")");
         }
         forks = List.copyOf(forks);
+        Objects.requireNonNull(gloasEpoch, "fork schedule: gloasEpoch (OptionalLong.empty() for none)");
+        if (gloasEpoch.isPresent()) {
+            long epoch = gloasEpoch.getAsLong();
+            boolean scheduled = false;
+            for (Fork f : forks) scheduled |= f.epoch() == epoch;
+            if (!scheduled)
+                throw new IllegalArgumentException("fork schedule: the Gloas epoch " + epoch
+                        + " must be a scheduled activation");
+        }
+    }
+
+    /** A schedule with no Gloas epoch (see the canonical constructor for what is refused). */
+    public ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
+        this(slotsPerEpoch, forks, OptionalLong.empty());
     }
 
     /** Build a schedule from entries (see the canonical constructor for what is refused). */
@@ -168,6 +189,42 @@ public record ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
         return versionAtEpoch(slot / slotsPerEpoch);
     }
 
+    /**
+     * A copy with the scheduled fork activating at {@code epoch} marked as Gloas.
+     * THROWS unless {@code epoch} is one of the schedule's activation epochs: a Gloas
+     * epoch that disagrees with the version list would decode and verify a slot's
+     * objects in one fork's format while signing them under another's domain.
+     */
+    public ForkSchedule withGloasEpoch(long epoch) {
+        return new ForkSchedule(slotsPerEpoch, forks, OptionalLong.of(epoch));
+    }
+
+    /**
+     * The light-client wire format of objects at {@code epoch}. With no Gloas
+     * scheduled that is always {@link LcFork#PRE_GLOAS} — no date is not a far-future
+     * date.
+     *
+     * <p>{@code epoch} is an SSZ {@code uint64}, compared unsigned exactly as the Rust
+     * twin does: a value at or above 2^63 arrives negative in a {@code long} and is the
+     * far future, never the past.
+     */
+    public LcFork lcForkAtEpoch(long epoch) {
+        return gloasEpoch.isPresent() && Long.compareUnsigned(epoch, gloasEpoch.getAsLong()) >= 0
+                ? LcFork.GLOAS
+                : LcFork.PRE_GLOAS;
+    }
+
+    /**
+     * The light-client wire format of objects at {@code slot} (an update's attested
+     * slot, a bootstrap's header slot, a header's own slot), with this schedule's own
+     * {@code slotsPerEpoch}. Unlike the signing domain there is no {@code - 1}: the
+     * first slot of the Gloas epoch is Gloas-shaped even though a signature AT that
+     * slot still verifies under the old domain. Unsigned, as {@link #lcForkAtEpoch}.
+     */
+    public LcFork lcForkAtSlot(long slot) {
+        return lcForkAtEpoch(Long.divideUnsigned(slot, slotsPerEpoch));
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder("ForkSchedule{slotsPerEpoch=").append(slotsPerEpoch).append(", [");
@@ -176,6 +233,8 @@ public record ForkSchedule(int slotsPerEpoch, List<Fork> forks) {
             if (i > 0) sb.append(", ");
             sb.append(f.epoch()).append(':').append(Hex.formatHex(f.versionBytes()));
         }
-        return sb.append("]}").toString();
+        sb.append(']');
+        if (gloasEpoch.isPresent()) sb.append(", gloasEpoch=").append(gloasEpoch.getAsLong());
+        return sb.append('}').toString();
     }
 }
