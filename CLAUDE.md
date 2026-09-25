@@ -479,6 +479,12 @@ that produced this note.
 
 - Peer trusted is never an option everything has to be cryptographically verified
 - The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- **One bounded exception to the two rules above (owner's decision,
+  2026-09-25):** a seeded log history of a root-committing protocol is served
+  on its publisher's word. The client's on-chain root check keeps forged
+  leaves out of its tree; it does not surface a withheld or altered one, so
+  the wallet's displayed balance rests on the publisher. Scope and limits: the
+  carve-out under *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -518,6 +524,31 @@ that produced this note.
     peers can no longer prove against it or the header chain passes 8192
     blocks (`headerChainGapTooLarge`). The signal is the beacon status, not a
     read error.
+- **Carve-out for seeded log histories of root-committing protocols (owner's
+  decision, 2026-09-25).** The log index MAY serve a contract's history from an
+  imported seed myotis did not walk, on the word of the protocol maintainers
+  who publish and vouch for it, when the protocol's client rebuilds its
+  note-commitment tree from the logs and checks the root on-chain. Myotis
+  walks and verifies everything above the seed's top, as for any import. This
+  is publisher trust for the DISPLAYED BALANCE, with one hard bound: a client
+  that inserts leaves only under a root the contract held never holds a
+  forged leaf, so no spend is built on a fake tree. It does not make tampering
+  visible. RAILGUN's contract keeps every root a tree ever had (`rootHistory`)
+  and its stock engine stops quietly at the first bad or missing leaf, so a
+  seed that withholds or alters a commitment understates the balance with no
+  error; a replaced Shield ciphertext or a withheld nullifier overstates it.
+  Detail, the client-side checks that would close most of it, and the
+  preconditions: docs/seeded-log-histories.md.
+  Two boundaries this carve-out does **not** cross:
+  - **The client's root check is load-bearing, and must actually run.** No
+    on-chain root, or a client that skips the check, keeps the walk — kohaku's
+    Tornado Cash client ships with it off.
+  - **The check is the client's, not the index's.** Any other consumer reading
+    the span over `eth_getLogs` cannot tell seeded logs from walked ones, so a
+    seed is not a production path until the index marks its provenance. Nor
+    does this rule let this repo's own tooling GENERATE a seed from a node
+    over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
+    DEMO (docs/railgun-poc.md).
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
