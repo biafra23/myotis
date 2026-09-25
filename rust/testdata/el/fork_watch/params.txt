@@ -1,0 +1,11 @@
+# The fork watch's rule constants, pinned identically by BOTH engines' tests:
+# Java ForkWatchTest.constantsMatchTheSharedTwinPins and Rust
+# fork_watch::tests::constants_match_the_shared_twin_pins. Change a value here
+# AND in both engines (ForkWatch.java, fork_watch.rs), or a suite fails.
+min_peers=3
+observation_ttl_seconds=86400
+activation_grace_seconds=21600
+max_horizon_seconds=34560000
+lookback_seconds=34560000
+max_tracked=512
+enabled_networks=sepolia

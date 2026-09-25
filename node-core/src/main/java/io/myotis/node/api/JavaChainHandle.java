@@ -3,6 +3,7 @@ package io.myotis.node.api;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
+import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
@@ -17,6 +18,8 @@ import io.myotis.api.NodeStatusReads;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
+import io.myotis.api.UpgradeAdvisory;
+import io.myotis.api.UpgradePhase;
 import io.myotis.api.VerifiedReads;
 import io.myotis.node.ChainStack;
 import io.myotis.node.VerifiedAccountQuery;
@@ -188,7 +191,19 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.lcHunting(),
                 stack.elHunting(),
                 stack.rpcListenPort(),
-                stack.rpcServing());
+                stack.rpcServing(),
+                upgradeAdvisory(stack.forkWatch()));
+    }
+
+    /** The fork watch's current advisory as the API shape; null when there is none or the
+     *  watch isn't enabled on this network. The watch is stack-owned, so a pause keeps its
+     *  evidence — which still ages out a day after its sources were last seen connected; a
+     *  long sleep re-derives it from the peers dialed on resume. */
+    static UpgradeAdvisory upgradeAdvisory(ForkWatch watch) {
+        ForkWatch.Advisory a = watch != null ? watch.advisory() : null;
+        if (a == null) return null;
+        return new UpgradeAdvisory(UpgradePhase.valueOf(a.phase().name()), a.activationTime(),
+                a.forkHashHex(), a.peers());
     }
 
     /** {@link NodeStatusReads}: node uptime for the JSON-RPC status result's {@code uptimeSeconds}. */

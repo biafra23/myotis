@@ -186,6 +186,21 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
   Engines before ABI 27 ignore `block` and always answer from the head, so a
   host that forwards a block number must gate on `init() >= 27`.
+- **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
+  `{ phase, activationTime, forkId, observedPeers }` when peers announce
+  (`"SCHEDULED"`, `activationTime` ahead) or have already activated
+  (`"ACTIVE"`) a network upgrade this engine build does not support (EIP-2124
+  stale-software detection over the peers' eth Status; enabled on Sepolia for
+  now). Tell the user an update is required, with the date while it is
+  SCHEDULED. It is advisory only: derived from what peers announce
+  (unverified; `observedPeers` counts distinct peer networks, and a minority
+  can't outvote the peers it contradicts), never from anything verification
+  reads — so it can raise a false alarm but never make an unverified answer
+  look verified. Hence: say "this version can no longer verify" only when the
+  engine's own status agrees (`beaconState` not SYNCED, or a stale verified
+  head); while it still verifies, an ACTIVE advisory means "update soon". Its
+  evidence survives `pause()`, but ages out a day after its peers were last
+  seen connected (a long sleep re-derives it from the peers dialed on wake).
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but

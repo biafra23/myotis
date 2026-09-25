@@ -4438,6 +4438,12 @@ impl ElReader {
         self.pool.set_served_block_window(blocks);
     }
 
+    /// Attach the host-owned fork watch to this reader's peer pool (see
+    /// `PeerPool::set_fork_watch`).
+    pub fn set_fork_watch(&self, watch: std::sync::Arc<crate::el::fork_watch::ForkWatch>) {
+        self.pool.set_fork_watch(watch);
+    }
+
     /// Replace the HOST-supplied EL seed pins (`myotis_set_boot_enodes`, #465):
     /// dialed like the network's own pins — a changed list at once, then by
     /// the maintainer while the pool is below target or nobody serves, and

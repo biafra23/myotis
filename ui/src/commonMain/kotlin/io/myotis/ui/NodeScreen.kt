@@ -283,9 +283,17 @@ private fun NetworkChips(
 private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
     val (color, height, label) = when {
         s != null && s.lifecycle == "PAUSED" ->
-            Triple(Color(0xFF78909C), 3.dp, "Node readiness: sleeping — a request wakes it")
+            Triple(Color(0xFF78909C), 3.dp,
+                if (s.upgrade == null) "Node readiness: sleeping — a request wakes it"
+                else "Node readiness: sleeping — peers report a network upgrade this version doesn't support")
         s == null || !s.running ->
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
+        // An unsupported upgrade the node's own state corroborates outranks a stale-anchor
+        // park: updating the app fixes both (a new build ships a fresh checkpoint too),
+        // while consenting to the old anchor cannot make this build follow the fork.
+        upgradeCutOff(s) ->
+            Triple(Color(0xFFD32F2F), 3.dp,
+                "Node readiness: not verifying — peers report a network upgrade this version doesn't support; update the app")
         s.beaconState == "STALE_ANCHOR" ->
             Triple(Color(0xFFD32F2F), 3.dp,
                 "Node readiness: sync anchor too old — paused awaiting your consent")
@@ -710,6 +718,10 @@ private fun StatusTab(
         if (snap == null) {
             Text("Node stopped — no data for $primary")
         } else {
+            snap.upgrade?.let {
+                UpgradeBanner(it, cutOff = upgradeCutOff(snap))
+                Spacer(Modifier.height(16.dp))
+            }
             HuntBanner(snap)
             SyncProgressBar(snap)
             StatusView(snap, hostSleeps = settings.supportsIdleSleep())
@@ -889,6 +901,69 @@ private fun PeerRowView(p: PeerRow) {
             fontFamily = FontFamily.Monospace, fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * An ACTIVE upgrade advisory that the node's OWN verified state corroborates: the beacon
+ * feed is not SYNCED, or its verified head has gone stale. The advisory is unverified peer
+ * data, so on its own it never turns readiness red or claims the node stopped verifying —
+ * a SYNCED, fresh node is verifying, whatever peers say.
+ */
+private fun upgradeCutOff(s: NodeSnapshot): Boolean =
+    s.upgrade?.active == true && (s.beaconState != "SYNCED" || s.verifiedHeadAgeMs > READY_HEAD_WARM_MS)
+
+/**
+ * Upgrade banner (Status + Query): peers announce — or report already activated — a network
+ * upgrade this build doesn't support. SCHEDULED is a heads-up with the date. ACTIVE is an
+ * alarm only when [cutOff] (the node's own verified state agrees it stopped verifying);
+ * otherwise it is a softer "update the app" while the node still verifies. Nothing it shows
+ * feeds verification (advisory only), so a false report can't make a wrong answer look right.
+ */
+@Composable
+private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
+    val tz = remember { TimeZone.currentSystemDefault() }
+    val at = formatDateTime(u.activationEpochSec * 1000, tz)
+    val alarm = u.active && cutOff
+    val container = if (alarm) MaterialTheme.colorScheme.errorContainer
+        else MaterialTheme.colorScheme.tertiaryContainer
+    val onContainer = if (alarm) MaterialTheme.colorScheme.onErrorContainer
+        else MaterialTheme.colorScheme.onTertiaryContainer
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(container)
+            .padding(12.dp)
+            .semantics(mergeDescendants = true) {},
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            when {
+                alarm -> "Update required"
+                u.active -> "Network upgrade reported — update the app"
+                else -> "Network upgrade ahead — update required"
+            },
+            style = MaterialTheme.typography.titleSmall,
+            color = onContainer,
+        )
+        Text(
+            when {
+                alarm -> "Peers report the network upgraded on $at, and this node is no longer " +
+                    "verifying new blocks. This version can't follow the upgrade — update the app."
+                u.active -> "Peers report the network upgraded on $at to rules this version " +
+                    "doesn't support. This node is still verifying for now — update the app " +
+                    "before it stops."
+                else -> "Peers announce a network upgrade on $at that this version doesn't " +
+                    "support. Update the app before then — otherwise it stops verifying at the upgrade."
+            },
+            fontSize = 13.sp,
+            color = onContainer,
+        )
+        Text(
+            "Reported by peers in ${u.observedPeers} distinct networks · fork id ${u.forkId}",
+            fontSize = 11.sp,
+            color = onContainer,
         )
     }
 }
@@ -1158,6 +1233,12 @@ private fun QueryTab(
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        snap?.let { s ->
+            s.upgrade?.let {
+                UpgradeBanner(it, cutOff = upgradeCutOff(s))
+                Spacer(Modifier.height(12.dp))
+            }
+        }
         if (!running) {
             Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer).padding(12.dp)) {
                 Text(
@@ -1814,6 +1895,12 @@ private fun formatDuration(ms: Long): String {
         else -> "${sec}s"
     }
 }
+
+/** yyyy-MM-dd HH:mm in [tz] (a date the user plans around, not a log stamp) — cut from
+ *  the ISO-8601 form, which is stable across kotlinx-datetime's field renames. */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun formatDateTime(ms: Long, tz: TimeZone): String =
+    Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
 
 /** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
 // kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still

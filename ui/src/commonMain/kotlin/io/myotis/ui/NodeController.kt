@@ -437,7 +437,25 @@ data class NodeSnapshot(
     // anchor's period and syncTargetPeriod the wall clock, so target - current is
     // the anchor age the stale-anchor dialog explains.
     val wsBoundPeriods: Long = 0,
+    // Fork watch: peers announce — or have already activated — a network upgrade
+    // this build doesn't support (the API's UpgradeAdvisory). null = nothing
+    // detected, or not watched on this network (staged rollout: Sepolia first).
+    val upgrade: UpgradeNotice? = null,
 )
+
+/**
+ * A network upgrade this build doesn't support, as the hosts map it from the engine
+ * API's `UpgradeAdvisory`. Advisory only — derived from what peers announce (unverified),
+ * never from anything verification reads.
+ */
+data class UpgradeNotice(
+    val phase: String,              // SCHEDULED (activation ahead) / ACTIVE (already passed)
+    val activationEpochSec: Long,   // unix seconds of the activation
+    val forkId: String,             // EIP-2124 fork hash upgraded peers use, "0x…"
+    val observedPeers: Int,         // distinct peer networks (IPv4 /24, IPv6 /48) backing it
+) {
+    val active: Boolean get() = phase == "ACTIVE"
+}
 
 /** One connected READY peer, for the Status peer list. */
 data class PeerRow(

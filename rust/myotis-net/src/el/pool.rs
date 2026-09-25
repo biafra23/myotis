@@ -29,6 +29,7 @@ use myotis_core::nodekey::NodeKey;
 
 use crate::el::discv4::TableEntry;
 use crate::el::eth::session::{EthConfig, EthSession};
+use crate::el::fork_watch::{self, ForkWatch};
 use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
 use crate::el::peercache::{ElPeerCache, SnapQuality};
@@ -465,6 +466,11 @@ struct PoolInner {
     /// cache-/warm-start peer may never enter the table on its own). Best-effort
     /// `try_send`; `None` for pools without discovery (tests).
     probe: Option<mpsc::Sender<SocketAddr>>,
+    /// The host-owned fork watch (EIP-2124 stale-software detection), fed the
+    /// fork id of every compatible peer's Status. Set once right after start —
+    /// the handle owns it so it outlives this pool across pause/resume; unset
+    /// on networks where the watch isn't enabled.
+    fork_watch: std::sync::OnceLock<Arc<ForkWatch>>,
 }
 
 impl PoolInner {
@@ -772,6 +778,18 @@ impl PoolInner {
                 let _ = probe.try_send(addr);
             }
         }
+        // Feed the fork watch from every compatible session (snap or not) — the
+        // handshake gate already confirmed network id + genesis. We judge no fork
+        // id ourselves: an upgraded peer sends its Status before dropping our
+        // stale one, and that Status is exactly the evidence the watch wants.
+        // Keyed by source network, not node id: ids are free, networks are not.
+        if let (Ok(session), Some(watch)) = (&result, self.fork_watch.get()) {
+            watch.observe(
+                &fork_watch::source_of(addr.ip()),
+                session.peer_status.fork_id_hash,
+                session.peer_status.fork_next,
+            );
+        }
         match result {
             Ok(session) if session.snap => {
                 // Admission by announced head (#465): a peer whose fresh Status
@@ -949,6 +967,7 @@ impl PeerPool {
             online_signal: Mutex::new(None),
             tx_watch,
             probe,
+            fork_watch: std::sync::OnceLock::new(),
         });
         inner.tasks.spawn(dialer_loop(Arc::clone(&inner), rx));
         inner.tasks.spawn(maintainer_loop(Arc::clone(&inner)));
@@ -1112,6 +1131,12 @@ impl PeerPool {
     /// and the maintainer is in emergency mode (see EL_HUNT_STALL).
     pub fn el_hunting(&self) -> bool {
         self.inner.hunting.load(Ordering::Relaxed)
+    }
+
+    /// Attach the host-owned fork watch (first call wins; the pool is rebuilt
+    /// on resume, the watch is not).
+    pub fn set_fork_watch(&self, watch: Arc<ForkWatch>) {
+        let _ = self.inner.fork_watch.set(watch);
     }
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
@@ -1584,6 +1609,19 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // Keep the fork watch's evidence from the peers we still hold fresh: a
+        // full pool dials nobody new, and their word is exactly what matters
+        // across a fork (Java twin: ChainStack.touchForkWatch).
+        if let Some(watch) = inner.fork_watch.get() {
+            let sources: Vec<String> = inner
+                .peers
+                .lock()
+                .await
+                .iter()
+                .map(|p| fork_watch::source_of(p.addr.ip()))
+                .collect();
+            watch.touch(&sources);
+        }
         // The HUNT keys on peers that could actually serve reads right now:
         // read-benched peers don't count, and neither (since #465) does a
         // peer whose fresh announcement says it lacks the anchored head —

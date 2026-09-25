@@ -11,6 +11,7 @@ import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.LifecycleState;
@@ -169,6 +170,9 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
      *  Stack-owned for the same reason as ServeStats: the backend is rebuilt on
      *  every pause/resume and the counters must not reset with it. */
     private final io.myotis.evm.world.ReadStats readStats = new io.myotis.evm.world.ReadStats();
+    /** EIP-2124 stale-software detector over peers' Status fork ids; stack-owned for the
+     *  same reason as serveStats. Null where not enabled (staged rollout: Sepolia). */
+    private final ForkWatch forkWatch;
     private volatile RLPxConnector connector;
     private volatile DiscV4Service discV4;
     private volatile DiscV5Service discV5;
@@ -204,6 +208,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.clPeerCache = clPeerCache;
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
+        this.forkWatch = ForkWatch.enabledFor(network) ? ForkWatch.forNetwork(network) : null;
         this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::notReadyDetail,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
                 System::currentTimeMillis, WAKE_POLL_MS, network.name());
@@ -668,6 +673,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
     public io.myotis.evm.world.ReadStats readStats() { return readStats; }
+    /** The fork watch, or null where it is not enabled for this network. */
+    public ForkWatch forkWatch() { return forkWatch; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
@@ -843,7 +850,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                     // discovery nudge must never break the READY path
                 }
             }
-        }, serveStats);
+        }, serveStats, forkWatch);
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);
@@ -1282,6 +1289,21 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         // organically (a couple of probes + query walks). Top the served window up
         // toward the announced head, bounded per tick.
         peerMaintainer.scheduleWithFixedDelay(this::backfillServedHeaders, 7, 15, TimeUnit.SECONDS);
+        if (forkWatch != null) {
+            peerMaintainer.scheduleWithFixedDelay(this::touchForkWatch, 10, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    /** Tell the fork watch which sources are still connected: a stable pool makes no new
+     *  handshakes, and its peers' word must not age out while they stay (twin: the Rust
+     *  pool's maintainer tick). */
+    private void touchForkWatch() {
+        try {
+            RLPxConnector conn = connector;
+            if (conn != null) forkWatch.touch(conn.liveForkWatchSources());
+        } catch (RuntimeException e) {   // a throw would silently cancel the schedule
+            log.warn("[{}][fork-watch] touch failed: {}", network.name(), e.toString());
+        }
     }
 
     /** Keep {@code activeSnapHandlers() >= targetSnapPeers}: re-dial cached snap peers,

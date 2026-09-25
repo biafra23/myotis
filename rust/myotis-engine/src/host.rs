@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
+use myotis_net::el::fork_watch::{self, ForkWatch};
 use myotis_net::el::pool::Enode;
 use myotis_net::el::reader::{parse_enode, ElReader};
 use myotis_net::el::readstats::ReadStats;
@@ -124,6 +125,14 @@ struct EngineState {
     /// re-polls). Kept at the JSON layer so a hit costs a String clone, never
     /// a result rebuild. Entries die with their handle (see `stop`).
     fee_history_cache: Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
+    /// Per-handle fork watch (EIP-2124 stale-software detection): created on the
+    /// handle's first spin_up, handed to every rebuilt EL pool, and read by
+    /// `status_json` in EVERY lifecycle state, so its evidence outlives a
+    /// pause/resume (the Java twin is ChainStack-owned for the same reason).
+    /// Evidence still ages out `OBSERVATION_TTL_SECONDS` after its source was
+    /// last seen connected: a long sleep re-derives it from the peers dialed on
+    /// wake. Only for networks the watch is enabled on. Dies with the handle.
+    fork_watches: Mutex<HashMap<i64, Arc<ForkWatch>>>,
     /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
     /// anchor-marker read/write, registration). Every guard in those paths is
     /// check-then-act against the filesystem and the handle map; without one
@@ -168,6 +177,7 @@ fn engine() -> Option<&'static EngineState> {
                     boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
+                    fork_watches: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
                 }),
@@ -683,6 +693,8 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             None
         }
     };
+    // What WE announce on the wire (the ElConfig pin) — the fork watch's baseline.
+    let el_fork_id = el_config.as_ref().map(|c| (c.fork_id_hash, c.fork_next));
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
             let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
@@ -705,6 +717,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             if let Some(&w) = pending.get(&handle) {
                 reader.set_served_block_window(w);
             }
+        }
+        if let Some(watch) = el_fork_id.and_then(|id| fork_watch_for(engine, handle, &config, id)) {
+            reader.set_fork_watch(watch);
         }
         // Activate a portable log-index snapshot found on disk (the drop-in
         // path): its presence in the engine's own data dir is the opt-in —
@@ -755,7 +770,17 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             true
         }
         _ => {
+            // A concurrent stop() removed the handle while we were starting, so
+            // the watch fork_watch_for() may have just re-inserted for it has no
+            // owner left: drop it (ids are never reused). A racing start/resume
+            // that already published keeps it — its reader holds the same Arc.
+            let gone = map.get(&handle).is_none();
             drop(map);
+            if gone {
+                if let Ok(mut watches) = engine.fork_watches.lock() {
+                    watches.remove(&handle);
+                }
+            }
             shutdown(engine, sync, reader);
             false
         }
@@ -899,10 +924,22 @@ pub fn status_json(handle: i64) -> String {
             None => Snap::Unknown,
         }
     };
+    // The handle's fork-watch advisory, read in every lifecycle state (the watch
+    // is handle-owned, not torn down with the pool on pause).
+    let upgrade_advisory = engine
+        .fork_watches
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&handle).cloned())
+        .and_then(|w| w.advisory());
     match snap {
-        Snap::Created(network, wall) => {
-            status_object(Lifecycle::NotStarted, network, None, wall, ElCounts::default())
-        }
+        Snap::Created(network, wall) => status_object(
+            Lifecycle::NotStarted,
+            network,
+            None,
+            wall,
+            ElCounts { upgrade_advisory, ..ElCounts::default() },
+        ),
         Snap::Running(network, status, wall, reader) => {
             let el = match reader {
                 Some(r) => engine.rt.block_on(async {
@@ -923,17 +960,23 @@ pub fn status_json(handle: i64) -> String {
                             body_requests: b_asked,
                             body_requests_served: b_served,
                             el_hunting: r.el_hunting(),
+                            upgrade_advisory,
                         }
                     }
                 }),
-                None => ElCounts::default(),
+                None => ElCounts { upgrade_advisory, ..ElCounts::default() },
             };
             status_object(Lifecycle::Running, network, Some(status), wall, el)
         }
-        // EL counts are zero while paused: the pool/discovery are torn down.
-        Snap::Paused(network, frozen, wall) => {
-            status_object(Lifecycle::Paused, network, Some(frozen), wall, ElCounts::default())
-        }
+        // EL counts are zero while paused: the pool/discovery are torn down. The
+        // advisory is not a live count — it survives the pause with its watch.
+        Snap::Paused(network, frozen, wall) => status_object(
+            Lifecycle::Paused,
+            network,
+            Some(frozen),
+            wall,
+            ElCounts { upgrade_advisory, ..ElCounts::default() },
+        ),
         Snap::Unknown => "{}".to_string(),
     }
 }
@@ -971,6 +1014,36 @@ struct ElCounts {
     /// EL hunt engaged: the snap serving pool has been empty past the stall
     /// window and the pool maintainer is in emergency re-dial mode.
     el_hunting: bool,
+    /// Peers announce (or already activated) a network upgrade this build does
+    /// not support — EL-derived like the counts, but NOT zeroed while paused.
+    upgrade_advisory: Option<fork_watch::Advisory>,
+}
+
+/// The handle's fork watch — created on its first spin_up from the network's
+/// wire fork id + beacon epoch grid, then reused across pause/resume. None where
+/// the watch isn't enabled (staged rollout: `fork_watch::ENABLED_NETWORKS`).
+fn fork_watch_for(
+    engine: &EngineState,
+    handle: i64,
+    config: &ChainConfig,
+    (fork_hash, fork_next): ([u8; 4], u64),
+) -> Option<Arc<ForkWatch>> {
+    if !fork_watch::enabled_for(config.name) {
+        return None;
+    }
+    let mut map = engine.fork_watches.lock().ok()?;
+    let watch = map.entry(handle).or_insert_with(|| {
+        Arc::new(ForkWatch::new(
+            config.name,
+            fork_hash,
+            fork_next,
+            config.genesis_time,
+            config
+                .slots_per_epoch
+                .saturating_mul(config.seconds_per_slot),
+        ))
+    });
+    Some(Arc::clone(watch))
 }
 
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
@@ -1007,6 +1080,9 @@ pub fn stop(handle: i64) {
     }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
         bits.remove(&handle);
+    }
+    if let Ok(mut watches) = engine.fork_watches.lock() {
+        watches.remove(&handle);
     }
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
@@ -2623,6 +2699,20 @@ fn status_object(
     obj.insert("executionBlockNumber".into(), el.finalized_block.into());
     // EL hunt flag (snap serving pool empty past the stall window).
     obj.insert("elHunting".into(), el.el_hunting.into());
+    // Fork-watch advisory: null, or the API `UpgradeAdvisory` shape. Older Java
+    // wrappers ignore the unknown key; newer ones parse it tolerantly.
+    obj.insert(
+        "upgradeAdvisory".into(),
+        match el.upgrade_advisory {
+            Some(a) => serde_json::json!({
+                "phase": a.phase.as_str(),
+                "activationTime": a.activation_time,
+                "forkId": a.fork_hash_hex(),
+                "observedPeers": a.peers,
+            }),
+            None => serde_json::Value::Null,
+        },
+    );
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -2644,7 +2734,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
-    r#""peerBodyRequests":0,"peerBodyRequestsServed":0}"#,
+    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null}"#,
 );
 
 #[cfg(test)]
@@ -2999,6 +3089,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000"
         );
         assert_eq!(v["elReaderAvailable"], false);
+        assert!(v["upgradeAdvisory"].is_null(), "no advisory before any peer was seen");
         // EL counts are zero for a not-started handle.
         for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
                   "attemptedDials", "backedOffPeers", "blacklistedPeers",
@@ -3009,6 +3100,44 @@ mod tests {
         let fb: serde_json::Value =
             serde_json::from_str(NOT_STARTED_FALLBACK).expect("fallback valid json");
         assert_eq!(v, fb);
+    }
+
+    #[test]
+    fn upgrade_advisory_serializes_in_every_lifecycle() {
+        // Paused included: the advisory rides on the handle-owned watch, not the pool.
+        let adv = fork_watch::Advisory {
+            phase: fork_watch::Phase::Scheduled,
+            activation_time: 1_791_294_816,
+            fork_hash: 0x6c1d_9423,
+            peers: 4,
+        };
+        for lc in [Lifecycle::NotStarted, Lifecycle::Running, Lifecycle::Paused] {
+            let el = ElCounts { upgrade_advisory: Some(adv), ..ElCounts::default() };
+            let v: serde_json::Value =
+                serde_json::from_str(&status_object(lc, "sepolia", None, 0, el)).expect("json");
+            assert_eq!(
+                v["upgradeAdvisory"],
+                serde_json::json!({
+                    "phase": "SCHEDULED",
+                    "activationTime": 1_791_294_816u64,
+                    "forkId": "0x6c1d9423",
+                    "observedPeers": 4,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn fork_watch_is_per_handle_reused_and_sepolia_only() {
+        let engine = engine().expect("engine");
+        let sepolia = ChainConfig::sepolia();
+        let pin = ([0x26, 0x89, 0x56, 0xb6], 0);
+        let a = fork_watch_for(engine, 9_000_001, &sepolia, pin).expect("enabled on sepolia");
+        let b = fork_watch_for(engine, 9_000_001, &sepolia, pin).expect("still there");
+        assert!(Arc::ptr_eq(&a, &b), "a resume must reuse the handle's watch");
+        assert!(fork_watch_for(engine, 9_000_002, &ChainConfig::mainnet(), pin).is_none());
+        stop(9_000_001); // not in the handle map, but its watch must still die
+        assert!(engine.fork_watches.lock().unwrap().get(&9_000_001).is_none());
     }
 
     #[test]
@@ -3064,6 +3193,7 @@ mod tests {
             body_requests: 1,
             body_requests_served: 0,
             el_hunting: false,
+            upgrade_advisory: None,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,

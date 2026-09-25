@@ -30,6 +30,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.ObjLongConsumer;
 
 /**
  * eth/68 protocol handler.
@@ -260,6 +261,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         this.txGossipObserver = observer;
     }
 
+    /** Receives the EIP-2124 fork id (hash, forkNext) a peer ON OUR CHAIN presented in its
+     *  Status — the {@link ForkWatch} feed. Null = not reported. */
+    private volatile ObjLongConsumer<byte[]> forkIdObserver;
+
+    /** Set the fork-id observer; the connector binds it to this peer's identity. */
+    public void setForkIdObserver(ObjLongConsumer<byte[]> observer) {
+        this.forkIdObserver = observer;
+    }
+
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
                       ChainHead chainHead, ServedHeaderWindow servedWindow, ServeStats serveStats,
                       Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
@@ -483,6 +493,18 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 incompatibleNetwork = true;
                 ctx.close();
                 return;
+            }
+            // Feed the fork watch only from peers on our chain. Deliberately BEFORE any
+            // fork-id judgement (we make none): an upgraded peer presents its Status and
+            // THEN drops our stale one, and that Status is exactly the evidence we want.
+            ObjLongConsumer<byte[]> forkIds = forkIdObserver;
+            if (forkIds != null && status.forkIdHash != null && status.forkIdHash.size() == 4) {
+                try {
+                    forkIds.accept(status.forkIdHash.toArray(), status.forkNext);
+                } catch (RuntimeException e) {
+                    // Advisory only, by construction: the watch must never cost us the peer.
+                    log.warn("[eth] fork watch failed on {}'s Status: {}", remoteAddress, e.toString());
+                }
             }
             // Update chain head only after confirming the peer is on our network.
             // Peers on foreign networks (e.g. BOB Network networkId=60808 with its

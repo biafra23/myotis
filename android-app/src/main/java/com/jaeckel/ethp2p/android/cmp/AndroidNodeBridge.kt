@@ -20,6 +20,7 @@ import io.myotis.ui.QueryHistoryEntry
 import io.myotis.ui.Settings
 import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
+import io.myotis.ui.UpgradeNotice
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -297,6 +298,9 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     rpcPort = rpcPort(),
     rpcServing = rpcServing(),
     wsBoundPeriods = wsBoundPeriods(),
+    upgrade = upgradeAdvisory()?.let {
+        UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
+    },
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */

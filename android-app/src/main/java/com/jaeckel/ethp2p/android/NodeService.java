@@ -1397,9 +1397,12 @@ public final class NodeService extends Service {
             boolean elHunting,            // EL hunt engaged (snap serving pool empty past stall)
             int rpcPort,                  // configured JSON-RPC port (0 = none)
             boolean rpcServing,           // listener bound and live on 127.0.0.1:rpcPort
-            long wsBoundPeriods) {}       // weak-subjectivity bound (periods) the engine enforces;
+            long wsBoundPeriods,          // weak-subjectivity bound (periods) the engine enforces;
                                           // with beaconState STALE_ANCHOR, syncTargetPeriod -
                                           // syncCurrentPeriod is the refused anchor's age
+            // Fork watch: peers announce (or already activated) a network upgrade this
+            // build doesn't support; null = none / not watched here. Kept while paused.
+            io.myotis.api.UpgradeAdvisory upgradeAdvisory) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -2160,7 +2163,8 @@ public final class NodeService extends Service {
                     s.lastResumeEpochMs(), s.lastWakeReason(),
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods());
+                    s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
+                    s.upgradeAdvisory());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -2176,7 +2180,8 @@ public final class NodeService extends Service {
                 s.lastResumeEpochMs(), s.lastWakeReason(),
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
-                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods());
+                s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
+                s.upgradeAdvisory());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

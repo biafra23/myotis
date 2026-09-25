@@ -2,6 +2,7 @@ package io.myotis.engines;
 
 import com.eclipsesource.json.Json;
 import com.eclipsesource.json.JsonObject;
+import com.eclipsesource.json.JsonValue;
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
 import io.myotis.api.BeaconStatus;
@@ -20,6 +21,8 @@ import io.myotis.api.NodeStatusReads;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
+import io.myotis.api.UpgradeAdvisory;
+import io.myotis.api.UpgradePhase;
 import io.myotis.api.VerifiedReads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -452,7 +455,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             long peerBodyRequestsServed,
             boolean lcHunting,
             boolean elHunting,
-            long wsBoundPeriods) {
+            long wsBoundPeriods,
+            UpgradeAdvisory upgradeAdvisory) {
 
         /** {@code beaconState} tolerant of a NEWER .so than this wrapper: an
          *  unrecognized value maps to STARTING (not-ready, fail closed) instead of
@@ -504,7 +508,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         o.getBoolean("lcHunting", false),
                         o.getBoolean("elHunting", false),
                         // Older .so vintages don't emit it; 0 = "bound unknown".
-                        o.getLong("wsBoundPeriods", 0L));
+                        o.getLong("wsBoundPeriods", 0L),
+                        parseAdvisory(o.get("upgradeAdvisory")));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -513,7 +518,23 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null);
+        }
+
+        /** The optional nested {@code upgradeAdvisory} object → the API record. Absent
+         *  (older natives), JSON null, a non-object, or a phase this wrapper doesn't know
+         *  (a newer native) → null: an advisory is display-only and must never turn a
+         *  status read into a "malformed status" failure. */
+        static UpgradeAdvisory parseAdvisory(JsonValue v) {
+            if (v == null || !v.isObject()) return null;
+            JsonObject a = v.asObject();
+            try {
+                return new UpgradeAdvisory(UpgradePhase.valueOf(a.getString("phase", "")),
+                        a.getLong("activationTime", 0L), a.getString("forkId", ""),
+                        a.getInt("observedPeers", 0));
+            } catch (RuntimeException unknownPhaseOrWrongType) {
+                return null;
+            }
         }
     }
 
@@ -630,7 +651,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 // server is live right now. Only a STOPPED handle reports 0, hiding
                 // the row instead of faking a red bind failure.
                 (s.running() || s.paused()) && rpcPort > 0 ? rpcPort : 0,
-                rpcServing());
+                rpcServing(),
+                s.upgradeAdvisory());
     }
 
     @Override

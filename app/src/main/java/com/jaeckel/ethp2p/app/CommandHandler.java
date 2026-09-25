@@ -23,6 +23,7 @@ import io.myotis.api.EnsTextResult;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
+import io.myotis.api.UpgradeAdvisory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -158,6 +159,8 @@ public class CommandHandler {
                 : jsonError("resume failed (lifecycle: " + handle.lifecycle() + ")");
     }
 
+    // Mirrored field-for-field by JSON-RPC myotis_status (StatusJson.kt) — except the
+    // trailing upgradeAdvisory, which is IPC-only on purpose (see StatusJson's KDoc).
     private String handleStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         StatusSnapshot s = handle.status();
@@ -180,7 +183,8 @@ public class CommandHandler {
                 + ",\"totalPausedMs\":" + s.totalPausedMs()
                 + ",\"lastPauseEpochMs\":" + s.lastPauseEpochMs()
                 + ",\"lastResumeEpochMs\":" + s.lastResumeEpochMs()
-                + ",\"lastWakeReason\":" + wakeReason + "}";
+                + ",\"lastWakeReason\":" + wakeReason
+                + ",\"upgradeAdvisory\":" + buildUpgradeAdvisoryJson(s.upgradeAdvisory()) + "}";
     }
 
     private String handlePeers() {
@@ -244,6 +248,9 @@ public class CommandHandler {
     private String handleBeaconStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         BeaconStatus bs = handle.beaconStatus();
+        // The fork-watch advisory rides on the EL status shape; surface it here too —
+        // beacon-status is where an operator looks first when the node stops syncing.
+        String advisory = ",\"upgradeAdvisory\":" + buildUpgradeAdvisoryJson(handle.status().upgradeAdvisory());
         String peerStats = "\"uptimeSeconds\":" + uptimeSec
                 + ",\"discoveredPeers\":" + bs.discv5TableSize()
                 + ",\"connectedPeers\":" + bs.connectedPeers()
@@ -265,6 +272,7 @@ public class CommandHandler {
                     + " bound (-Dmyotis.beacon.wsBoundPeriods=N), or send accept-stale-anchor"
                     + " to sync anyway at your own risk\","
                     + peerStats
+                    + advisory
                     + ",\"peers\":" + peersJson + "}";
         }
         if (bs.state() == BeaconState.SYNCING || bs.state() == BeaconState.STARTING) {
@@ -274,6 +282,7 @@ public class CommandHandler {
                     + ",\"finalizedSlot\":0,\"optimisticSlot\":0"
                     + ",\"executionStateRoot\":null"
                     + ",\"knownStateRoots\":" + bs.knownStateRoots()
+                    + advisory
                     + ",\"peers\":" + peersJson + "}";
         }
         String stateRootHex = bs.executionStateRootHex() != null
@@ -291,7 +300,31 @@ public class CommandHandler {
                 + ",\"knownStateRoots\":" + bs.knownStateRoots()
                 + ",\"fillThreshold\":" + bs.fillThreshold()
                 + ",\"wsBoundPeriods\":" + bs.wsBoundPeriods()
+                + advisory
                 + ",\"peers\":" + peersJson + "}";
+    }
+
+    /**
+     * The fork-watch advisory as JSON: {@code null}, or
+     * {@code {"phase":…,"activationTime":…,"forkId":…,"observedPeers":…,"message":…}} —
+     * the Rust engine's status key plus a human-readable line for operators (the
+     * daemon also logs it at WARN when it first appears).
+     */
+    static String buildUpgradeAdvisoryJson(UpgradeAdvisory a) {
+        if (a == null) return "null";
+        String when = java.time.Instant.ofEpochSecond(a.activationTime()).toString();
+        // Attributed to peers: the advisory is unverified peer data (see ForkWatch).
+        String message = switch (a.phase()) {
+            case SCHEDULED -> "peers announce a network upgrade at " + when
+                    + " that this build does not support - update before then";
+            case ACTIVE -> "peers report the network upgraded at " + when
+                    + " to rules this build does not support - update required";
+        };
+        return "{\"phase\":\"" + a.phase().name() + "\""
+                + ",\"activationTime\":" + a.activationTime()
+                + ",\"forkId\":\"" + escapeJson(a.forkId()) + "\""
+                + ",\"observedPeers\":" + a.observedPeers()
+                + ",\"message\":\"" + escapeJson(message) + "\"}";
     }
 
     private static String buildBeaconPeersJson(java.util.List<ClPeerInfo> peers) {
