@@ -3813,12 +3813,27 @@ fn build_log_index_status(
         s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
-        // All optional-by-context so the shape stays honest: no cursor yet →
-        // no remaining; no rate yet → no ETA (hosts then show x/y instead).
+        // All optional-by-context so the shape stays honest: nothing indexed
+        // and no cursor yet → no remaining; already fully covered → remaining
+        // is 0 even before a cursor exists (there is nothing left to walk,
+        // whether or not the head-follow appender has run yet); no rate yet →
+        // no ETA (hosts then show x/y instead).
         if let Some(target_low) = ix.config().watch.iter().map(|w| w.from_block).min() {
             s.push_str(",\"targetLow\":");
             s.push_str(&target_low.to_string());
-            if let Some((n, _)) = ix.cursor {
+            // Whether the descending walk has anything left to do at all —
+            // per ENTRY (`LogIndex::backfill_complete`), not by comparing
+            // `cursor` to `target_low` alone: `cursor` can sit far above
+            // `target_low` for a reason other than unfinished work (a bundled
+            // seed already reaching every entry's deployment block, with
+            // backfill paused so nothing ever pulls a head-seeded `cursor`
+            // back down — see that method's doc comment for the full
+            // account). Without this, `cursor - target_low` overcounted the
+            // RAILGUN PoC's seed as 11.29M blocks "unindexed and refused" for
+            // an index that was in fact serving every one of them.
+            if ix.backfill_complete() {
+                s.push_str(",\"blocksRemaining\":0");
+            } else if let Some((n, _)) = ix.cursor {
                 let remaining = n.saturating_sub(target_low);
                 s.push_str(",\"blocksRemaining\":");
                 s.push_str(&remaining.to_string());
@@ -4266,6 +4281,43 @@ mod log_index_json_tests {
         let s2 = build_log_index_status(&ix, None, 0);
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
+    }
+
+    /// The RAILGUN PoC's exact shape: coverage already reaches `from_block`
+    /// but `cursor` sits far above it, as a bundled seed installs it (see
+    /// `LogIndex::backfill_complete`'s doc comment for why that is not a
+    /// sign of unfinished work). Pins the integration: `build_log_index_status`
+    /// must ask `backfill_complete()`, not compare `cursor` to `target_low`
+    /// itself. `logindex.rs`'s own tests cover `backfill_complete()` in
+    /// isolation, including the tied-`from_block` case a naive per-entry
+    /// filter would get wrong.
+    #[test]
+    fn blocks_remaining_is_zero_once_the_target_entry_is_already_complete() {
+        let w = myotis_net::el::logindex::WatchEntry {
+            address: [0x11; 20],
+            from_block: 100,
+            topic0s: vec![],
+            name: String::new(),
+        };
+        let cfg = myotis_net::el::logindex::LogIndexConfig {
+            enabled: true,
+            max_speed: true,
+            backfill_paused: true,
+            watch: vec![w],
+        };
+        let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
+        // Coverage already reaches from_block — the seed's own claim, exactly
+        // as `walk_resumable` treats a done entry (`low <= from_block`).
+        ix.backfill_block(100, [0u8; 32], vec![]).unwrap();
+        // …but the cursor sits far above it, as if the head-follow appender
+        // seeded it near the head sometime after the seed installed (the seed
+        // itself ships no cursor; see the doc comment above).
+        ix.cursor = Some((5000, [0u8; 32]));
+        let s = build_log_index_status(&ix, Some(9.44), 0);
+        assert!(s.contains("\"targetLow\":100"), "{s}");
+        assert!(s.contains("\"blocksRemaining\":0"), "{s}");
+        // Nothing left to estimate a rate or an ETA for.
+        assert!(!s.contains("etaSeconds"), "{s}");
     }
 }
 
