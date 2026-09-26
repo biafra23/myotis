@@ -56,10 +56,13 @@
 
     <!-- RPC access log: one concise INFO line per JSON-RPC call the server answers
          (method/id/outcome/latency), incl. parse/batch errors, plus one DEBUG line with the
-         (size-capped) request/response bodies — matching Android, which logs those at debug.
-         Pinned independently of the app/wire levels: DEBUG by default; quiet it with
-         -Dmyotis.log.rpc.level=INFO. In the Logs tab, filter on "rpc". -->
-    <logger name="io.myotis.jsonrpc.access" level="${myotis.log.rpc.level:-DEBUG}"/>
+         (size-capped, unredacted) request/response bodies. The bodies contain addresses and
+         signed transactions, so they are OFF by default and are NOT persisted unless asked for:
+         picking DEBUG on the Logs-tab chip turns them on at runtime (DesktopLogSource.setLevel;
+         any other chip turns them off, as on Android where the chip is the single gate), or
+         launch with -Dmyotis.log.rpc.level=DEBUG. Pinned so the INFO summaries stay visible at
+         WARN/ERROR chips. In the Logs tab, filter on "rpc". -->
+    <logger name="io.myotis.jsonrpc.access" level="${myotis.log.rpc.level:-INFO}"/>
     <!-- Slow-call watchdog (#312): a JSON-RPC call still unanswered after ~1 s is logged at
          WARN while it is stuck (method/id/phase) and again when it finishes. Pinned so it
          stays visible whatever the app level. In the Logs tab, filter on "slow call". -->
