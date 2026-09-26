@@ -3,12 +3,14 @@ package com.jaeckel.ethp2p.core.consensus;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.OptionalLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Rust twin: {@code rust/myotis-consensus/src/fork.rs} unit tests. */
 class ForkScheduleTest {
@@ -97,6 +99,58 @@ class ForkScheduleTest {
         assertEquals("ForkSchedule{slotsPerEpoch=32, [0:05000000, 10:06000000, 20:07000000]}", three().toString());
         assertEquals(List.of(ForkSchedule.fork(0, 0x05000000), ForkSchedule.fork(10, 0x06000000), ForkSchedule.fork(20, 0x07000000)),
                 three().forks());
+    }
+
+    @Test
+    void theLcFormatSwitchesAtTheGloasEpoch() {
+        ForkSchedule s = three();
+        assertEquals(OptionalLong.empty(), s.gloasEpoch());
+        // No date is not a far-future date: not even u64::MAX (-1L) reads as Gloas.
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtEpoch(-1L));
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtEpoch(Long.MAX_VALUE));
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtSlot(-1L));
+        s = three().withGloasEpoch(20);
+        assertEquals(OptionalLong.of(20), s.gloasEpoch());
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtEpoch(19));
+        assertEquals(LcFork.GLOAS, s.lcForkAtEpoch(20));
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtSlot(639)); // epoch 19
+        assertEquals(LcFork.GLOAS, s.lcForkAtSlot(640)); // epoch 20
+
+        // Unlike the signing domain, the format is the slot's own fork — no
+        // off-by-one: the first Gloas slot's objects are Gloas-shaped even though
+        // a signature AT that slot still verifies under the old domain.
+        assertArrayEquals(B, s.versionForSignatureSlot(640));
+
+        // SSZ uint64 >= 2^63 arrives negative in a long: far future, not the past.
+        assertEquals(LcFork.GLOAS, s.lcForkAtSlot(-1L));
+        assertEquals(LcFork.GLOAS, s.lcForkAtSlot(Long.MIN_VALUE));
+    }
+
+    @Test
+    void lcForkAtSlotUsesTheSchedulesOwnGeometry() {
+        ForkSchedule s = ForkSchedule.of(16, ForkSchedule.fork(0, 0x05000000), ForkSchedule.fork(10, 0x06000000))
+                .withGloasEpoch(10);
+        assertEquals(LcFork.PRE_GLOAS, s.lcForkAtSlot(159)); // epoch 9
+        assertEquals(LcFork.GLOAS, s.lcForkAtSlot(160)); // epoch 10
+    }
+
+    @Test
+    void rejectsAGloasEpochOffTheSchedule() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> three().withGloasEpoch(15));
+        assertTrue(e.getMessage().contains("must be a scheduled activation"), e.getMessage());
+        assertThrows(IllegalArgumentException.class, () -> new ForkSchedule(32, three().forks(), OptionalLong.of(21)));
+        assertThrows(NullPointerException.class, () -> new ForkSchedule(32, three().forks(), null));
+    }
+
+    @Test
+    void theGloasEpochIsPartOfTheValue() {
+        assertEquals(three().withGloasEpoch(20), three().withGloasEpoch(20));
+        assertEquals(three().withGloasEpoch(20).hashCode(), three().withGloasEpoch(20).hashCode());
+        assertNotEquals(three(), three().withGloasEpoch(20));
+        assertNotEquals(three().withGloasEpoch(10), three().withGloasEpoch(20));
+        assertEquals(three(), new ForkSchedule(32, three().forks(), OptionalLong.empty()));
+        assertEquals("ForkSchedule{slotsPerEpoch=32, [0:05000000, 10:06000000, 20:07000000], gloasEpoch=20}",
+                three().withGloasEpoch(20).toString());
     }
 
     @Test

@@ -30,6 +30,14 @@ pub struct BlockContext {
     pub chain_id: u64,
     /// Block gas limit: GASLIMIT opcode.
     pub gas_limit: u64,
+    /// EIP-7843 slot number from the verified header: the SLOTNUM opcode.
+    /// `None` before Amsterdam, whose headers carry no such field. The executor
+    /// refuses an AMSTERDAM-spec context without it
+    /// ([`EvmError::MissingSlotNumber`](crate::EvmError::MissingSlotNumber))
+    /// rather than run SLOTNUM against a made-up 0, and an earlier-spec context
+    /// with it ([`EvmError::UnexpectedSlotNumber`](crate::EvmError::UnexpectedSlotNumber)):
+    /// an Amsterdam block the fork table does not know about.
+    pub slot_number: Option<u64>,
 }
 
 impl BlockContext {
@@ -44,6 +52,11 @@ impl BlockContext {
     /// `BlockContext` carries no excess-blob-gas field yet (matching the Java
     /// `BlockContextValues`, which maps no blob fields). Add a `difficulty` /
     /// `excess_blob_gas` field here if pre-merge or blob-fee `eth_call` is ever needed.
+    ///
+    /// SLOTNUM (EIP-7843) reads `slot_num`. It is an invalid opcode before
+    /// Amsterdam, so the value is never read there; from Amsterdam the executor
+    /// has already refused a context without a slot, so the `0` fallback below
+    /// is never observable.
     pub fn block_env(&self) -> BlockEnv {
         BlockEnv {
             number: U256::from(self.block_number),
@@ -53,6 +66,7 @@ impl BlockContext {
             beneficiary: Address::from(self.coinbase),
             difficulty: U256::ZERO,
             prevrandao: Some(B256::from(self.prev_randao)),
+            slot_num: self.slot_number.unwrap_or(0),
             ..BlockEnv::default()
         }
     }

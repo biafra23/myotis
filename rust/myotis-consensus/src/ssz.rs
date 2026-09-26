@@ -141,6 +141,28 @@ pub fn verify_merkle_branch(
     value == *root
 }
 
+/// `is_valid_normalized_merkle_branch` (consensus-specs, Electra light client):
+/// a branch LONGER than the depth of `gindex` is accepted only when every extra
+/// leading node is zero — how an object carried in a later fork's shape pads a
+/// shallower proof (a Gloas update's pre-Gloas finalized header proves its block
+/// hash at depth 9 inside an 11-node vector). A shorter branch is a rejection.
+pub fn verify_normalized_merkle_branch(
+    leaf: &Root,
+    branch: &[Root],
+    gindex: u64,
+    root: &Root,
+) -> bool {
+    if gindex < 2 {
+        return false; // gindex 1 is the root itself; 0 names nothing
+    }
+    let depth = (63 - gindex.leading_zeros()) as usize;
+    let Some(extra) = branch.len().checked_sub(depth) else {
+        return false;
+    };
+    branch[..extra].iter().all(|node| *node == [0u8; 32])
+        && verify_merkle_branch(leaf, &branch[extra..], depth, gindex, root)
+}
+
 // ---- little-endian readers over untrusted input (checked) ----
 
 pub fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
@@ -177,5 +199,38 @@ mod tests {
         let branch = [leaves[3], sha256_pair(&leaves[0], &leaves[1])];
         assert!(verify_merkle_branch(&leaves[2], &branch, 2, 6, &root));
         assert!(!verify_merkle_branch(&leaves[2], &branch, 2, 7, &root));
+    }
+
+    #[test]
+    fn normalized_branch_accepts_only_zero_padding() {
+        let leaves: Vec<Root> = (0u8..4).map(|i| [i; 32]).collect();
+        let root = merkleize(&leaves);
+        let branch = [leaves[3], sha256_pair(&leaves[0], &leaves[1])];
+        assert!(verify_normalized_merkle_branch(
+            &leaves[2], &branch, 6, &root
+        ));
+        // Two zero nodes in front: the same proof, normalized to length 4.
+        let padded = [[0u8; 32], [0u8; 32], branch[0], branch[1]];
+        assert!(verify_normalized_merkle_branch(
+            &leaves[2], &padded, 6, &root
+        ));
+        // A non-zero pad node is not padding.
+        let mut dirty = padded;
+        dirty[0][31] = 1;
+        assert!(!verify_normalized_merkle_branch(
+            &leaves[2], &dirty, 6, &root
+        ));
+        // Shorter than the depth, a wrong gindex, and the degenerate gindices.
+        assert!(!verify_normalized_merkle_branch(
+            &leaves[2],
+            &branch[..1],
+            6,
+            &root
+        ));
+        assert!(!verify_normalized_merkle_branch(
+            &leaves[2], &padded, 7, &root
+        ));
+        assert!(!verify_normalized_merkle_branch(&leaves[2], &[], 1, &root));
+        assert!(!verify_normalized_merkle_branch(&leaves[2], &[], 0, &root));
     }
 }

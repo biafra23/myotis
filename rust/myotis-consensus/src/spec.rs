@@ -11,6 +11,41 @@ pub const DOMAIN_SYNC_COMMITTEE: [u8; 4] = [0x07, 0x00, 0x00, 0x00];
 pub const EXECUTION_PAYLOAD_GINDEX: u64 = 25;
 pub const EXECUTION_PAYLOAD_DEPTH: usize = 4;
 
+// Gloas (EIP-7732 ePBS + EIP-7688 progressive containers), consensus-specs
+// v1.7.0-beta.2 `specs/gloas/light-client/sync-protocol.md`. The body carries a
+// payload BID instead of the payload, so a header proves only the execution
+// block hash — `signed_execution_payload_bid.message.parent_block_hash` — and
+// the Gloas `BeaconState` is a progressive container, so the state gindices move
+// even though the field indices (20, 22, 23) do not. They are NOT derivable from
+// a branch length the way the pre-Gloas ones are (the depth-derived formulas
+// below give 553/2070/2071 for depths 9/11/11): select them by the fork of the
+// attested slot, as the spec's `*_gindex_at_slot` helpers do.
+
+/// `get_generalized_index(BeaconState, 'finalized_checkpoint', 'root')` (Gloas).
+pub const FINALIZED_ROOT_GINDEX_GLOAS: u64 = 735;
+/// `get_generalized_index(BeaconState, 'current_sync_committee')` (Gloas).
+pub const CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS: u64 = 2945;
+/// `get_generalized_index(BeaconState, 'next_sync_committee')` (Gloas).
+pub const NEXT_SYNC_COMMITTEE_GINDEX_GLOAS: u64 = 2946;
+/// `get_generalized_index(BeaconBlockBody, 'signed_execution_payload_bid',
+/// 'message', 'parent_block_hash')` (Gloas).
+pub const EXECUTION_BLOCK_HASH_GINDEX_GLOAS: u64 = 2856;
+/// `get_generalized_index(deneb.BeaconBlockBody, 'execution_payload',
+/// 'block_hash')`: where a pre-Gloas header carried in the Gloas shape proves
+/// its block hash (normalized to the Gloas branch length with leading zeros).
+pub const EXECUTION_BLOCK_HASH_GINDEX_DENEB: u64 = 812;
+
+/// `floorlog2` of a generalized index: the depth of the node it names.
+pub const fn gindex_depth(gindex: u64) -> usize {
+    (63 - gindex.leading_zeros()) as usize
+}
+
+/// Gloas branch lengths — the SSZ vector lengths on the wire, all fixed.
+pub const GLOAS_EXECUTION_BRANCH_LEN: usize = gindex_depth(EXECUTION_BLOCK_HASH_GINDEX_GLOAS); // 11
+pub const GLOAS_SYNC_COMMITTEE_BRANCH_LEN: usize =
+    gindex_depth(CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS); // 11
+pub const GLOAS_FINALITY_BRANCH_LEN: usize = gindex_depth(FINALIZED_ROOT_GINDEX_GLOAS); // 9
+
 const CURRENT_SYNC_COMMITTEE_FIELD_INDEX: u64 = 22;
 const NEXT_SYNC_COMMITTEE_FIELD_INDEX: u64 = 23;
 const FINALIZED_CHECKPOINT_FIELD_INDEX: u64 = 20;
@@ -95,5 +130,29 @@ mod tests {
         assert_eq!(sync_committee_gindex(6), 86);
         assert_eq!(next_sync_committee_gindex(6), 87);
         assert_eq!(finalized_root_gindex(7), 169);
+    }
+
+    /// The Gloas constants against the spec's own values, and the reason they
+    /// are constants: the depth-derived formulas miss them.
+    #[test]
+    fn gloas_gindices_are_constants_not_depth_derived() {
+        assert_eq!(GLOAS_EXECUTION_BRANCH_LEN, 11);
+        assert_eq!(GLOAS_SYNC_COMMITTEE_BRANCH_LEN, 11);
+        assert_eq!(gindex_depth(NEXT_SYNC_COMMITTEE_GINDEX_GLOAS), 11);
+        assert_eq!(GLOAS_FINALITY_BRANCH_LEN, 9);
+        assert_eq!(gindex_depth(EXECUTION_BLOCK_HASH_GINDEX_DENEB), 9);
+        assert_eq!(
+            gindex_depth(EXECUTION_PAYLOAD_GINDEX),
+            EXECUTION_PAYLOAD_DEPTH
+        );
+        assert_ne!(
+            sync_committee_gindex(11),
+            CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS
+        );
+        assert_ne!(
+            next_sync_committee_gindex(11),
+            NEXT_SYNC_COMMITTEE_GINDEX_GLOAS
+        );
+        assert_ne!(finalized_root_gindex(9), FINALIZED_ROOT_GINDEX_GLOAS);
     }
 }

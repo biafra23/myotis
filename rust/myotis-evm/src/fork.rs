@@ -10,6 +10,12 @@
 //! Java "Shanghai keeps Istanbul precompiles" nuance needs no special handling
 //! here: revm's `SpecId::SHANGHAI` predates the Cancun KZG point-evaluation
 //! precompile (0x0A), exactly as intended.
+//!
+//! One deliberate asymmetry with the Java cascade: the AMSTERDAM rung (sepolia
+//! only, [`SEPOLIA_AMSTERDAM_TIME`]). revm prices Amsterdam, so this table
+//! SERVES it; the Java engine's Besu (26.4) cannot, so `EvmFactory` REFUSES the
+//! same blocks with a permanent error until its Besu bump adds the rung. Both
+//! sides pin the same activation constant.
 
 use revm::primitives::hardfork::SpecId;
 
@@ -41,6 +47,15 @@ pub const SEPOLIA_CANCUN_TIME: u64 = 1_706_655_072;
 pub const SEPOLIA_PRAGUE_TIME: u64 = 1_741_159_776;
 /// Sepolia Osaka — go-ethereum SepoliaChainConfig.OsakaTime (2025-10-14).
 pub const SEPOLIA_OSAKA_TIME: u64 = 1_760_427_360;
+/// Sepolia Amsterdam — Glamsterdam's EL fork (EIP-8037 state gas, EIP-2780
+/// intrinsic gas, EIP-8038 access repricing, …): ethereum/pm#2205, epoch 353024
+/// (2026-10-06 13:53:36 UTC); alloy-hardforks `SEPOLIA_AMSTERDAM_TIMESTAMP`.
+/// Mainnet and gnosis have no Amsterdam date yet, so they stay on OSAKA.
+///
+/// The Java `EvmFactory` pins the same constant but REFUSES blocks at/after it
+/// (Besu 26.4 cannot price Amsterdam) — see the module docs. The twinned tests are
+/// `amsterdam_boundaries_map_on_every_chain` ↔ the Java `AmsterdamBoundaryTest`.
+pub const SEPOLIA_AMSTERDAM_TIME: u64 = 1_791_294_816;
 
 /// The revm `SpecId` a `(chain_id, block_number, timestamp)` activates:
 /// [`EvmError::UnsupportedChain`] for a chain with no table here,
@@ -85,6 +100,9 @@ fn mainnet_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
 /// The sepolia cascade — all timestamp-gated (sepolia merged before Shanghai, and
 /// nothing pre-Shanghai is servable by a beacon-anchored engine).
 fn sepolia_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= SEPOLIA_AMSTERDAM_TIME {
+        return Ok(SpecId::AMSTERDAM);
+    }
     if timestamp >= SEPOLIA_OSAKA_TIME {
         return Ok(SpecId::OSAKA);
     }
@@ -196,6 +214,67 @@ mod tests {
         let g = 100u64;
         assert_eq!(spec_for(g, 30_000_000, GNOSIS_OSAKA_TIME).unwrap(), SpecId::OSAKA);
         assert_eq!(spec_for(g, 30_000_000, GNOSIS_OSAKA_TIME - 1).unwrap(), SpecId::PRAGUE);
+    }
+
+    #[test]
+    fn amsterdam_boundaries_map_on_every_chain() {
+        // Twin of the Java AmsterdamBoundaryTest — which REFUSES at T where this
+        // serves AMSTERDAM (Besu 26.4 cannot price it); T-1 is Osaka on both.
+        // Sepolia: the only chain with an Amsterdam date.
+        let s = 11_155_111u64;
+        assert_eq!(
+            spec_for(s, 10_000_000, SEPOLIA_AMSTERDAM_TIME).unwrap(),
+            SpecId::AMSTERDAM
+        );
+        assert_eq!(
+            spec_for(s, 10_000_000, SEPOLIA_AMSTERDAM_TIME - 1).unwrap(),
+            SpecId::OSAKA
+        );
+        assert_eq!(
+            spec_for(s, 10_000_000, u64::MAX).unwrap(),
+            SpecId::AMSTERDAM
+        );
+        // Mainnet and gnosis have NO Amsterdam date: sepolia's activation must not
+        // flip them, and neither may any far-future timestamp.
+        assert_eq!(
+            spec_for(1, 25_000_000, SEPOLIA_AMSTERDAM_TIME).unwrap(),
+            SpecId::OSAKA
+        );
+        assert_eq!(spec_for(1, 25_000_000, u64::MAX).unwrap(), SpecId::OSAKA);
+        let g = 100u64;
+        assert_eq!(
+            spec_for(g, 45_000_000, SEPOLIA_AMSTERDAM_TIME).unwrap(),
+            SpecId::OSAKA
+        );
+        assert_eq!(spec_for(g, 45_000_000, u64::MAX).unwrap(), SpecId::OSAKA);
+    }
+
+    #[test]
+    fn amsterdam_time_pins_its_source() {
+        // Cross-base pin, like osaka_times_pin_their_sources. Sources:
+        // ethereum/pm#2205 (EL timestamp 1791294816) and alloy-hardforks
+        // SEPOLIA_AMSTERDAM_TIMESTAMP.
+        assert_eq!(SEPOLIA_AMSTERDAM_TIME, 0x6ac4_fd60); // 1_791_294_816, 2026-10-06 13:53:36 UTC
+    }
+
+    #[test]
+    fn amsterdam_keeps_the_osaka_precompile_set() {
+        // Amsterdam adds no precompile: revm maps it onto the OSAKA set. Pin it
+        // (P256VERIFY stays served) rather than trust the mapping across bumps.
+        use revm::precompile::{PrecompileSpecId, Precompiles};
+        assert_eq!(
+            PrecompileSpecId::from_spec_id(SpecId::AMSTERDAM),
+            PrecompileSpecId::OSAKA
+        );
+        let mut p256 = [0u8; 20];
+        p256[18] = 0x01;
+        let addr = revm::primitives::Address::from(p256);
+        assert!(
+            Precompiles::new(PrecompileSpecId::from_spec_id(SpecId::AMSTERDAM))
+                .get(&addr)
+                .is_some(),
+            "P256VERIFY must stay served under Amsterdam"
+        );
     }
 
     #[test]

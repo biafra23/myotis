@@ -32,6 +32,23 @@
 
 use crate::spec;
 
+/// The light-client wire format of a slot's objects.
+///
+/// Before Gloas a `LightClientHeader` carries the whole execution payload header
+/// (Capella through Fulu; the decoders tell those shapes apart by their offsets,
+/// as they always have). From Gloas on it carries only the execution block hash
+/// (EIP-7732: the body holds a payload bid, not a payload), and every container
+/// is fixed-size — nothing left to sniff. Which one an object uses is decided by
+/// the fork of its attested slot (a bootstrap's: its header's slot), exactly as
+/// the spec's `*_gindex_at_slot` helpers and the req/resp context bytes do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LcFork {
+    /// Capella..Fulu: execution payload header, depth-derived state gindices.
+    PreGloas,
+    /// Gloas: execution block hash, fixed Gloas gindices.
+    Gloas,
+}
+
 /// Ordered fork schedule for one chain. Constructed once per network from
 /// compile-time constants; invalid geometry is a build error surfacing, so the
 /// constructor panics rather than returning a `Result` nobody would handle.
@@ -45,6 +62,11 @@ pub struct ForkSchedule {
     /// `(activation_epoch, fork_version)`, strictly ascending by epoch, first
     /// entry at epoch 0 (the genesis fork).
     forks: Vec<(u64, [u8; 4])>,
+    /// Activation epoch of Gloas, `None` while this chain has none scheduled.
+    /// Always one of `forks`' epochs (see [`Self::with_gloas_epoch`]): the
+    /// version list says WHICH domain signs a slot, this says which wire format
+    /// and which proof indices its light-client objects use.
+    gloas_epoch: Option<u64>,
 }
 
 impl ForkSchedule {
@@ -65,7 +87,45 @@ impl ForkSchedule {
                 w[1].0
             );
         }
-        Self { slots_per_epoch, forks: forks.to_vec() }
+        Self {
+            slots_per_epoch,
+            forks: forks.to_vec(),
+            gloas_epoch: None,
+        }
+    }
+
+    /// Mark the scheduled fork activating at `epoch` as Gloas. PANICS unless
+    /// `epoch` is one of the schedule's activation epochs: a Gloas epoch that
+    /// disagrees with the version list would decode and verify a slot's objects
+    /// in one fork's format while signing them under another's domain.
+    pub fn with_gloas_epoch(mut self, epoch: u64) -> Self {
+        assert!(
+            self.forks
+                .iter()
+                .any(|(activation, _)| *activation == epoch),
+            "fork schedule: the Gloas epoch {epoch} must be a scheduled activation"
+        );
+        self.gloas_epoch = Some(epoch);
+        self
+    }
+
+    /// Gloas' activation epoch, if this chain has one scheduled.
+    pub fn gloas_epoch(&self) -> Option<u64> {
+        self.gloas_epoch
+    }
+
+    /// The light-client wire format of objects at `epoch`.
+    pub fn lc_fork_at_epoch(&self, epoch: u64) -> LcFork {
+        match self.gloas_epoch {
+            Some(gloas) if epoch >= gloas => LcFork::Gloas,
+            _ => LcFork::PreGloas,
+        }
+    }
+
+    /// The light-client wire format of objects at `slot` (an update's attested
+    /// slot, a bootstrap's header slot, a header's own slot).
+    pub fn lc_fork_at_slot(&self, slot: u64) -> LcFork {
+        self.lc_fork_at_epoch(slot / self.slots_per_epoch)
     }
 
     /// One version for every slot — a schedule with no boundary. For tests and
@@ -224,5 +284,29 @@ mod tests {
     #[should_panic(expected = "slots_per_epoch")]
     fn rejects_zero_slots_per_epoch() {
         ForkSchedule::new(0, &[(0, A)]);
+    }
+
+    #[test]
+    fn the_lc_format_switches_at_the_gloas_epoch() {
+        let s = three();
+        assert_eq!(s.gloas_epoch(), None);
+        assert_eq!(s.lc_fork_at_epoch(u64::MAX), LcFork::PreGloas, "no date is not a far-future date");
+        let s = three().with_gloas_epoch(20);
+        assert_eq!(s.gloas_epoch(), Some(20));
+        assert_eq!(s.lc_fork_at_epoch(19), LcFork::PreGloas);
+        assert_eq!(s.lc_fork_at_epoch(20), LcFork::Gloas);
+        assert_eq!(s.lc_fork_at_slot(639), LcFork::PreGloas); // epoch 19
+        assert_eq!(s.lc_fork_at_slot(640), LcFork::Gloas); // epoch 20
+
+        // Unlike the signing domain, the format is the slot's own fork — no
+        // off-by-one: the first Gloas slot's objects are Gloas-shaped even
+        // though a signature AT that slot still verifies under the old domain.
+        assert_eq!(s.version_for_signature_slot(640), B);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a scheduled activation")]
+    fn rejects_a_gloas_epoch_off_the_schedule() {
+        let _ = three().with_gloas_epoch(15);
     }
 }

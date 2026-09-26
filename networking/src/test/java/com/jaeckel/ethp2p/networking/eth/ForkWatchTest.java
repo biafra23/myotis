@@ -268,6 +268,88 @@ class ForkWatchTest {
     }
 
     @Test
+    void theBaselineFollowsOurOwnKnownFork() {
+        // A build that carries Glamsterdam: past it, peers on its successor are on OUR
+        // chain, and a further fork they announce is what the watch reports.
+        long nextFork = SEPOLIA_GLAMSTERDAM + 60 * DAY;
+        clock.set(SEPOLIA_GLAMSTERDAM + DAY);
+        ForkWatch w = watch(SEPOLIA_GLAMSTERDAM);
+        announce(w, "upgraded", 3, SUCCESSOR, 0);
+        assertNull(w.advisory(), "our own fork's successor is not news");
+        announce(w, "upgraded", 3, SUCCESSOR, nextFork);
+        ForkWatch.Advisory a = w.advisory();
+        assertNotNull(a);
+        assertEquals(ForkWatch.Phase.SCHEDULED, a.phase());
+        assertEquals(nextFork, a.activationTime());
+        assertEquals(ForkIds.successor(SEPOLIA_GLAMSTERDAM_FORK_ID, nextFork), a.forkHash());
+    }
+
+    @Test
+    void aRescheduledForkStaysNewsPastTheDateThisBuildKnows() {
+        // Glamsterdam moves AFTER this build shipped (it moved once already, 09-21 → 10-06).
+        // Past OUR date we present its successor, which peers on the new date reject — but
+        // they show their Status first, still on the pin: that is the whole signal then.
+        long moved = SEPOLIA_GLAMSTERDAM + 7 * DAY;
+        int movedForkId = ForkIds.successor(ForkIds.toInt(LOCAL), moved);
+        clock.set(SEPOLIA_GLAMSTERDAM - 3600);
+        ForkWatch w = watch(SEPOLIA_GLAMSTERDAM);
+        announce(w, "upgraded", 3, LOCAL, moved);
+        ForkWatch.Advisory scheduled = new ForkWatch.Advisory(ForkWatch.Phase.SCHEDULED, moved, movedForkId, 3);
+        assertEquals(scheduled, w.advisory());
+        assertEquals(scheduled, w.evaluate(SEPOLIA_GLAMSTERDAM + 3600),
+                "past our date the pin still measures them: their fork id, not a successor of ours");
+        clock.set(moved + DAY);
+        announce(w, "upgraded", 3, bytes(movedForkId), 0);
+        assertEquals(new ForkWatch.Advisory(ForkWatch.Phase.ACTIVE, moved, movedForkId, 3), w.advisory(),
+                "once their date passed, their hash places from the pin");
+    }
+
+    @Test
+    void thePoolFromBeforeOurDateStillDissentsPastIt() {
+        // A stable pool that handshook before our date and stays connected across it. Its
+        // Status is still on the pin — four on our date, one on none — and right after T it
+        // is most of what we know: if its verdict lapsed at OUR date, a few fresh sources
+        // minting a "successor of ours" would face no dissent at all.
+        clock.set(SEPOLIA_GLAMSTERDAM - 3600);
+        ForkWatch w = watch(SEPOLIA_GLAMSTERDAM);
+        List<String> pool = new ArrayList<>(announce(w, "on-our-date", 4, LOCAL, SEPOLIA_GLAMSTERDAM));
+        pool.addAll(announce(w, "not-upgraded", 1, LOCAL, 0));
+        clock.set(SEPOLIA_GLAMSTERDAM + 3600);
+        w.touch(pool);
+        long forgedAt = SEPOLIA_GLAMSTERDAM + EPOCH;   // grid-aligned, one epoch past ours
+        byte[] forged = bytes(ForkIds.successor(SEPOLIA_GLAMSTERDAM_FORK_ID, forgedAt));
+        announce(w, "forger", 3, forged, 0);
+        assertNull(w.advisory());
+        announce(w, "forger", 5, forged, 0);
+        assertNull(w.advisory(), "a tie is not a majority");
+        w.observe("forger5", forged, 0);
+        ForkWatch.Advisory a = w.advisory();
+        assertNotNull(a);
+        assertEquals(forgedAt, a.activationTime());
+        assertEquals(ForkIds.toInt(forged), a.forkHash());
+        assertEquals(6, a.peers());
+    }
+
+    @Test
+    void theSameDateFromEitherBaselineIsTwoForks() {
+        // Past our date, "a fork after ours at t" (announced on its successor) and "our fork
+        // moved to t" (announced on the pin) are different forks with different ids: they
+        // must not pool their sources into one vote.
+        long later = SEPOLIA_GLAMSTERDAM + 30 * DAY;
+        clock.set(SEPOLIA_GLAMSTERDAM + DAY);
+        ForkWatch w = watch(SEPOLIA_GLAMSTERDAM);
+        announce(w, "after-ours", 3, SUCCESSOR, later);
+        announce(w, "moved", 3, LOCAL, later);
+        assertEquals(ForkIds.successor(SEPOLIA_GLAMSTERDAM_FORK_ID, later), w.advisory().forkHash(),
+                "on a full tie, the current baseline's reading wins");
+        announce(w, "current", 3, SUCCESSOR, 0);
+        assertNull(w.advisory(), "three and three are not six");
+        w.observe("moved3", LOCAL, later);
+        assertEquals(new ForkWatch.Advisory(ForkWatch.Phase.SCHEDULED, later,
+                ForkIds.successor(ForkIds.toInt(LOCAL), later), 4), w.advisory());
+    }
+
+    @Test
     void implausibleAnnouncementsAreIgnored() {
         ForkWatch w = watch(0);
         announce(w, "s", 4, LOCAL, 1_150_000);                                       // a block number

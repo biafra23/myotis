@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
+import com.jaeckel.ethp2p.core.consensus.LcFork;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -117,6 +118,135 @@ class LightClientStoreSnapshotTest {
                 committee(1), null, 1, 1, 1), fill(32, 1));
         assertNull(LightClientStoreSnapshot.deserialize(Arrays.copyOf(bytes, bytes.length - 100), fill(32, 1)),
                 "truncated snapshot must be rejected, not partially loaded");
+    }
+
+    // ---- LCSS v2 (Gloas). Rust twin: snapshot.rs v2_* tests ----
+
+    /** A Gloas-shaped header: block hash + 11 branch nodes. */
+    private static LightClientHeader gloasHeader(int seed) {
+        BeaconBlockHeader beacon = new BeaconBlockHeader(
+                11_296_768L + seed, 7L + seed, fill(32, seed), fill(32, seed + 1), fill(32, seed + 2));
+        byte[][] branch = new byte[11][];
+        for (int i = 0; i < 11; i++) branch[i] = fill(32, seed + 30 + i);
+        return LightClientHeader.gloas(beacon, fill(32, seed + 3), branch);
+    }
+
+    /** Finalized header still payload-shaped (the first epochs after the fork),
+     *  optimistic header Gloas-shaped — the mixed state v2 exists for. */
+    private static LightClientStore.Snapshot gloasSnapshot() {
+        return new LightClientStore.Snapshot(header(1, true, fill(11, 1)), gloasHeader(60),
+                committee(3), committee(7), 11_296_700L, 11_296_829L, 1379L);
+    }
+
+    private static LightClientStore.Snapshot payloadSnapshot() {
+        return new LightClientStore.Snapshot(header(1, true, fill(11, 1)), header(50, false, new byte[0]),
+                committee(3), committee(7), 14_600_001L, 14_600_033L, 1795L);
+    }
+
+    /**
+     * Payload-shaped state keeps writing v1 byte-for-byte (an older build can still
+     * resume it); a Gloas-shaped header switches the file to v2, which round-trips
+     * both shapes.
+     */
+    @Test
+    void v2OnlyWhenAHeaderNeedsIt() {
+        byte[] gvr = fill(32, 99);
+        assertEquals(1, LightClientStoreSnapshot.serialize(payloadSnapshot(), gvr)[4]);
+        LightClientStore.Snapshot s = gloasSnapshot();
+        byte[] bytes = LightClientStoreSnapshot.serialize(s, gvr);
+        assertEquals(2, bytes[4]);
+        assertSnapshotEquals(s, LightClientStoreSnapshot.deserialize(bytes, gvr));
+        LightClientStore.Snapshot both = new LightClientStore.Snapshot(gloasHeader(2), s.optimisticHeader(),
+                s.currentSyncCommittee(), s.nextSyncCommittee(), s.finalizedSlot(), s.optimisticSlot(),
+                s.currentSyncCommitteePeriod());
+        assertSnapshotEquals(both, LightClientStoreSnapshot.deserialize(
+                LightClientStoreSnapshot.serialize(both, gvr), gvr));
+    }
+
+    /** An unknown shape tag is a corrupt (or future) file: refuse, don't guess. */
+    @Test
+    void v2RejectsAnUnknownShapeTag() {
+        byte[] gvr = fill(32, 99);
+        byte[] bytes = LightClientStoreSnapshot.serialize(gloasSnapshot(), gvr);
+        // magic 4 + version 1 + gvr 32 + 3 x u64 + finalized beacon 112.
+        int tagAt = 4 + 1 + 32 + 24 + 112;
+        assertEquals(0, bytes[tagAt]);
+        bytes[tagAt] = 2;
+        assertNull(LightClientStoreSnapshot.deserialize(bytes, gvr));
+    }
+
+    @Test
+    void v2RejectsTruncationAndAnUnknownVersion() {
+        byte[] gvr = fill(32, 99);
+        byte[] v2 = LightClientStoreSnapshot.serialize(gloasSnapshot(), gvr);
+        for (int cut : new int[]{5, 173, 174, 700, v2.length - 1}) {
+            assertNull(LightClientStoreSnapshot.deserialize(Arrays.copyOf(v2, cut), gvr), "v2 cut at " + cut);
+        }
+        byte[] wrongVersion = LightClientStoreSnapshot.serialize(payloadSnapshot(), gvr);
+        wrongVersion[4] = 3;
+        assertNull(LightClientStoreSnapshot.deserialize(wrongVersion, gvr));
+    }
+
+    /** A Gloas-shaped store snapshots and restores like any other. */
+    @Test
+    void restoresAGloasSnapshotIntoStore() {
+        byte[] gvr = fill(32, 99);
+        LightClientStore store = new LightClientStore();
+        store.restore(LightClientStoreSnapshot.deserialize(
+                LightClientStoreSnapshot.serialize(gloasSnapshot(), gvr), gvr));
+        assertEquals(LcFork.GLOAS, store.getOptimisticHeader().shape());
+        assertSnapshotEquals(gloasSnapshot(), store.snapshot());
+    }
+
+    /**
+     * Field-for-field equality of two snapshots, in either header shape (the consensus
+     * types define no {@code equals} of their own). Shared with the golden test.
+     */
+    static void assertSnapshotEquals(LightClientStore.Snapshot want, LightClientStore.Snapshot got) {
+        assertNotNull(got, "snapshot did not decode");
+        assertEquals(want.currentSyncCommitteePeriod(), got.currentSyncCommitteePeriod());
+        assertEquals(want.finalizedSlot(), got.finalizedSlot());
+        assertEquals(want.optimisticSlot(), got.optimisticSlot());
+        assertLcHeaderEquals(want.finalizedHeader(), got.finalizedHeader());
+        assertLcHeaderEquals(want.optimisticHeader(), got.optimisticHeader());
+        assertEquals(want.currentSyncCommittee(), got.currentSyncCommittee());
+        assertEquals(want.nextSyncCommittee(), got.nextSyncCommittee());
+    }
+
+    private static void assertLcHeaderEquals(LightClientHeader want, LightClientHeader got) {
+        assertEquals(want.beacon(), got.beacon());
+        assertEquals(want.shape(), got.shape());
+        assertArrayEquals(want.executionBlockHash(), got.executionBlockHash());
+        assertEquals(want.executionBranch().length, got.executionBranch().length);
+        for (int i = 0; i < want.executionBranch().length; i++) {
+            assertArrayEquals(want.executionBranch()[i], got.executionBranch()[i], "branch node " + i);
+        }
+        if (want.shape() == LcFork.GLOAS) {
+            assertNull(got.execution());
+            return;
+        }
+        ExecutionPayloadHeader a = want.execution();
+        ExecutionPayloadHeader b = got.execution();
+        assertArrayEquals(a.parentHash(), b.parentHash());
+        assertArrayEquals(a.feeRecipient(), b.feeRecipient());
+        assertArrayEquals(a.stateRoot(), b.stateRoot());
+        assertArrayEquals(a.receiptsRoot(), b.receiptsRoot());
+        assertArrayEquals(a.logsBloom(), b.logsBloom());
+        assertArrayEquals(a.prevRandao(), b.prevRandao());
+        assertEquals(a.blockNumber(), b.blockNumber());
+        assertEquals(a.gasLimit(), b.gasLimit());
+        assertEquals(a.gasUsed(), b.gasUsed());
+        assertEquals(a.timestamp(), b.timestamp());
+        assertArrayEquals(a.extraData(), b.extraData());
+        assertArrayEquals(a.baseFeePerGas(), b.baseFeePerGas());
+        assertArrayEquals(a.blockHash(), b.blockHash());
+        assertArrayEquals(a.transactionsRoot(), b.transactionsRoot());
+        assertArrayEquals(a.withdrawalsRoot(), b.withdrawalsRoot());
+        assertEquals(a.blobGasUsed(), b.blobGasUsed());
+        assertEquals(a.excessBlobGas(), b.excessBlobGas());
+        assertArrayEquals(a.depositRequestsRoot(), b.depositRequestsRoot());
+        assertArrayEquals(a.withdrawalRequestsRoot(), b.withdrawalRequestsRoot());
+        assertArrayEquals(a.consolidationRequestsRoot(), b.consolidationRequestsRoot());
     }
 
     @Test

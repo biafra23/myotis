@@ -36,9 +36,11 @@ pub const INVALID_PARAMS: i32 = -32602;
 /// `{"error": "...", "code": -32602}` — a PERMANENT refusal of the request's
 /// parameters: no retry can make this request succeed on this node, so a host
 /// that speaks JSON-RPC answers it with exactly this code. Emitted by eth_call
-/// today. A plain [`error_json`] (no `code`) makes no such promise, and hosts
-/// answer it with the retryable -32000. Old hosts see an ordinary `{"error"}`
-/// and lose nothing but the classification.
+/// today, and by eth_call / eth_estimateGas for an executor refusal
+/// ([`CallOutcome::Refused`], [`GasOutcome::Refused`]). A plain [`error_json`]
+/// (no `code`) makes no such promise, and hosts answer it with the retryable
+/// -32000. Old hosts see an ordinary `{"error"}` and lose nothing but the
+/// classification.
 ///
 /// `error` is always the FIRST key, whatever serde_json's key-order feature is,
 /// so a prefix check for `{"error"` still recognises it. NOT for the JSON-string
@@ -576,9 +578,12 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// data keys only.
 /// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
 /// (matching the reference engine, which treats revert/unavailable as "no answer").
+/// A refusal (never answerable on this build) is the permanent
+/// [`invalid_params_json`] envelope instead — it ran nowhere, so it names no block.
 pub fn call_json(answer: &CallAnswer) -> String {
     let mut obj = serde_json::Map::new();
     match &answer.outcome {
+        CallOutcome::Refused(reason) => return invalid_params_json(reason),
         CallOutcome::Success(data) => {
             obj.insert("status".into(), "ok".into());
             obj.insert("resultHex".into(), hex0x_var(data).into());
@@ -703,10 +708,12 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
 /// a verified answer; the host serves the standard code-3 error with the raw
 /// payload, same shape as `call_json`'s revert), or
 /// `{"status":"unavailable","reason":"…"}` (retryable — the Java side maps it
-/// to null / the host's -32000).
+/// to null / the host's -32000), or the permanent [`invalid_params_json`]
+/// envelope for a refusal (never answerable on this build).
 pub fn estimate_json(outcome: &GasOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
+        GasOutcome::Refused(reason) => return invalid_params_json(reason),
         GasOutcome::Estimate(gas) => {
             obj.insert("status".into(), "ok".into());
             obj.insert("gas".into(), json_u64(*gas));
@@ -1040,6 +1047,28 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_call_or_estimate_is_the_permanent_envelope() {
+        // An executor refusal (e.g. an Amsterdam block whose header has no slot
+        // number) can never succeed on this build: the -32602 envelope, never a
+        // retryable `unavailable` status, and it names no block (it ran nowhere).
+        let why = "block 7 is an Amsterdam block but its header has no slot number";
+        let call = call_json(&CallAnswer {
+            outcome: CallOutcome::Refused(why.to_string()),
+            block_number: 21_000_000,
+            finalized: false,
+        });
+        assert_eq!(call, invalid_params_json(why));
+        assert_eq!(
+            estimate_json(&GasOutcome::Refused(why.to_string())),
+            invalid_params_json(why)
+        );
+        let v: serde_json::Value = serde_json::from_str(&call).unwrap();
+        assert_eq!(v["code"], INVALID_PARAMS);
+        assert_eq!(v["error"], why);
+        assert!(v.get("status").is_none() && v.get("blockNumber").is_none());
+    }
+
+    #[test]
     fn ens_json_shapes() {
         let ok: serde_json::Value = serde_json::from_str(&ens_json(&EnsOutcome::Resolved {
             address: [0xd8; 20],
@@ -1215,6 +1244,8 @@ mod tests {
             blob_gas_used: Some(131_072),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some([0x88; 32]),
+            block_access_list_hash: None,
+            slot_number: None,
         };
         VB {
             hash: [0x99; 32],

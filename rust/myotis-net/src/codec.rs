@@ -269,11 +269,32 @@ pub fn decode_response(raw: &[u8], has_context_bytes: bool) -> Result<DecodeResu
 /// `result(1) || fork_digest(4) || varint(uncompressed len) || snappy_frames`.
 /// Stops at the first error chunk (logging it) or after `expected_count` items,
 /// returning whatever decoded cleanly — the same salvage behavior as the Java.
+/// Payloads only; see [`decode_multi_chunk_response_with_digests`] for the
+/// per-chunk context bytes.
 pub fn decode_multi_chunk_response(
     raw: &[u8],
     expected_count: usize,
 ) -> Result<Vec<Vec<u8>>, CodecError> {
-    let mut items: Vec<Vec<u8>> = Vec::new();
+    Ok(
+        decode_multi_chunk_response_with_digests(raw, expected_count)?
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect(),
+    )
+}
+
+/// One response chunk: its context bytes (a fork digest) and its SSZ payload.
+pub type ContextChunk = ([u8; 4], Vec<u8>);
+
+/// [`decode_multi_chunk_response`] keeping each chunk's context bytes — the
+/// fork digest of THAT object's epoch, which is what picks its decoder once a
+/// fork changes the wire shape (Gloas): one `updates_by_range` response can
+/// span the fork, so the digest is per chunk, not per response.
+pub fn decode_multi_chunk_response_with_digests(
+    raw: &[u8],
+    expected_count: usize,
+) -> Result<Vec<ContextChunk>, CodecError> {
+    let mut items: Vec<ContextChunk> = Vec::new();
     let mut pos = 0usize;
     while pos < raw.len() && items.len() < expected_count {
         let result_code = raw[pos];
@@ -293,7 +314,8 @@ pub fn decode_multi_chunk_response(
         if pos + 4 > raw.len() {
             break;
         }
-        pos += 4; // fork digest (per-chunk; the payload's own fork sniffing governs decode)
+        let fork_digest: [u8; 4] = raw[pos..pos + 4].try_into().expect("4 bytes");
+        pos += 4;
         // A truncated TAIL (the reader's total budget cutting a long paced
         // response mid-chunk) must not discard the complete chunks before it.
         // Salvage ONLY when the failure is consistent with the buffer simply
@@ -316,7 +338,7 @@ pub fn decode_multi_chunk_response(
         if uncompressed_len == 0 {
             tracing::info!(item = items.len(), raw_len = raw.len(),
                 "multi-chunk item has uncompressedLength=0");
-            items.push(Vec::new());
+            items.push((fork_digest, Vec::new()));
             continue;
         }
         let snappy_start = pos;
@@ -350,7 +372,7 @@ pub fn decode_multi_chunk_response(
             );
             break;
         }
-        items.push(decompressed);
+        items.push((fork_digest, decompressed));
     }
     Ok(items)
 }
@@ -570,6 +592,24 @@ mod tests {
         let wire = encode_error_response(RESULT_RESOURCE_UNAVAILABLE, "pruned");
         let e = decode_response(&wire, true).unwrap_err();
         assert!(e.0.contains("ResourceUnavailable"), "{e}");
+    }
+
+    /// A range response can span a fork: each chunk keeps ITS context bytes,
+    /// because that digest — not the response's first — picks the decoder.
+    #[test]
+    fn multi_chunk_keeps_each_chunks_digest() {
+        let mut wire = encode_success_response(&[0x01; 40], Some([0x74, 0xD0, 0x14, 0x59]));
+        wire.extend_from_slice(&encode_success_response(
+            &[0x02; 60],
+            Some([0x66, 0x9E, 0x6C, 0x11]),
+        ));
+        let items = decode_multi_chunk_response_with_digests(&wire, 2).unwrap();
+        assert_eq!(items[0], ([0x74, 0xD0, 0x14, 0x59], vec![0x01; 40]));
+        assert_eq!(items[1], ([0x66, 0x9E, 0x6C, 0x11], vec![0x02; 60]));
+        assert_eq!(
+            decode_multi_chunk_response(&wire, 2).unwrap(),
+            vec![vec![0x01; 40], vec![0x02; 60]]
+        );
     }
 
     #[test]

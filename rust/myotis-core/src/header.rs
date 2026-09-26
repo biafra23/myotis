@@ -7,7 +7,9 @@
 //! while the list has more items (not by fork detection): baseFeePerGas
 //! (EIP-1559), withdrawalsRoot (EIP-4895), blobGasUsed/excessBlobGas
 //! (EIP-4844), parentBeaconBlockRoot (EIP-4788). EIP-7685 `requestsHash` is
-//! read-and-discarded, and further unknown trailing fields are tolerated —
+//! read-and-discarded; Amsterdam's blockAccessListHash (EIP-7928) and
+//! slotNumber (EIP-7843) after it are read when they are well-formed (the EVM's
+//! SLOTNUM needs the slot), and further unknown trailing fields are tolerated —
 //! the header HASH still covers them because it is `keccak256` of the raw
 //! encoding, never of a re-encode of what we understood.
 
@@ -51,6 +53,13 @@ pub struct BlockHeader {
     pub excess_blob_gas: Option<u64>,
     /// EIP-4788; `None` pre-Cancun.
     pub parent_beacon_block_root: Option<[u8; 32]>,
+    /// EIP-7928 (Amsterdam): keccak of the block access list; `None` before
+    /// Amsterdam. Rust-only: the Java twin never reads past requestsHash.
+    pub block_access_list_hash: Option<[u8; 32]>,
+    /// EIP-7843 (Amsterdam): the beacon slot of this block, which the SLOTNUM
+    /// opcode returns; `None` before Amsterdam (or when the pair after
+    /// requestsHash isn't well-formed — see [`BlockHeader::decode`]). Rust-only.
+    pub slot_number: Option<u64>,
 }
 
 /// keccak256 of the RLP-encoded header — the verifiable anchor. Always hash
@@ -114,6 +123,25 @@ impl BlockHeader {
             it.as_bytes()
                 .map_err(|e| CoreError(format!("header: requestsHash: {}", e.0)))?;
         }
+        // Amsterdam appends blockAccessListHash (EIP-7928), then slotNumber
+        // (EIP-7843) — the order of the reference `Header` (execution-specs,
+        // forks/amsterdam/blocks.py: `requests_hash: Hash32`,
+        // `block_access_list_hash: Hash32`, `slot_number: U64`). Recognised
+        // only as that pair — a 32-byte hash followed by a canonical u64 — and
+        // never an error: past requestsHash every field stays tolerated as
+        // before (Java never reads this far, and the corpus pins the
+        // tolerance: 006-header-future-extra). A malformed or absent
+        // pair just leaves `slot_number` None, which the EVM refuses for an
+        // Amsterdam block rather than guessing a slot.
+        let block_access_list_hash = f.next().and_then(|it| it.as_fixed_bytes(32).ok()).map(|b| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(b);
+            out
+        });
+        let slot_number = match block_access_list_hash {
+            Some(_) => f.next().and_then(|it| it.as_u64().ok()),
+            None => None,
+        };
         // Anything a future fork appends beyond that: tolerated and ignored
         // (the raw-bytes hash still covers it; Java never reads this far).
         Ok(BlockHeader {
@@ -137,12 +165,17 @@ impl BlockHeader {
             blob_gas_used,
             excess_blob_gas,
             parent_beacon_block_root,
+            block_access_list_hash,
+            slot_number,
         })
     }
 
-    /// Canonical re-encode of the KNOWN fields. Matches the input bytes for
-    /// headers without discarded trailing fields (requestsHash etc.); callers
-    /// that need the hash of a received header must hash the raw bytes.
+    /// Canonical re-encode of the fields through parentBeaconBlockRoot.
+    /// requestsHash is discarded at decode, so it — and everything after it,
+    /// including the Amsterdam blockAccessListHash/slotNumber — is dropped
+    /// rather than shifted into its slot: the output matches the input bytes
+    /// only for pre-Prague headers. Callers that need the hash of a received
+    /// header must hash the raw bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut items: Vec<Item> = vec![
             Item::Bytes(self.parent_hash.to_vec()),
@@ -212,4 +245,126 @@ fn u64_field(item: Option<&Item>, name: &str) -> Result<u64, CoreError> {
     let it = item.ok_or_else(|| CoreError(format!("header: missing field {name}")))?;
     it.as_u64_fitting_long()
         .map_err(|e| CoreError(format!("header: {name}: {}", e.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sepolia's first Amsterdam slot (ethereum/pm#2205, 0xac6000).
+    const SLOT: u64 = 11_296_768;
+
+    /// A Prague-shaped header (21 fields, requestsHash last) with `extra`
+    /// appended after requestsHash.
+    fn header_rlp(extra: Vec<Item>) -> Vec<u8> {
+        let base = BlockHeader {
+            parent_hash: [0x01; 32],
+            ommers_hash: [0x02; 32],
+            beneficiary: vec![0x03; 20],
+            state_root: [0x04; 32],
+            transactions_root: [0x05; 32],
+            receipts_root: [0x06; 32],
+            logs_bloom: vec![0; 256],
+            difficulty: Vec::new(),
+            number: 10_000_000,
+            gas_limit: 60_000_000,
+            gas_used: 21_000,
+            timestamp: 1_791_294_816,
+            extra_data: b"myotis-amsterdam".to_vec(),
+            mix_hash_or_prev_randao: [0x07; 32],
+            nonce: vec![0; 8],
+            base_fee_per_gas: Some(vec![0x07]),
+            withdrawals_root: Some([0x08; 32]),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some([0x09; 32]),
+            ..BlockHeader::default()
+        };
+        let mut items = rlp::decode(&base.encode())
+            .unwrap()
+            .as_list()
+            .unwrap()
+            .to_vec();
+        items.push(Item::Bytes(vec![0x0a; 32])); // requestsHash
+        items.extend(extra);
+        rlp::encode(&Item::List(items))
+    }
+
+    /// blockAccessListHash + slotNumber, as Amsterdam appends them.
+    fn amsterdam_pair(slot: &[u8]) -> Vec<Item> {
+        vec![Item::Bytes(vec![0x0b; 32]), Item::Bytes(slot.to_vec())]
+    }
+
+    #[test]
+    fn amsterdam_header_round_trips_through_decode_and_hash() {
+        // A.3 (twin of the Java BlockHeaderAmsterdamTest): the two trailing
+        // Amsterdam fields are not rejected and shift nothing before them, and
+        // the block hash is keccak of the RAW bytes, which cover them.
+        let raw = header_rlp(amsterdam_pair(&rlp::u64_to_minimal_be(SLOT)));
+        let h = BlockHeader::decode(&raw).expect("an Amsterdam header must decode");
+        assert_eq!(h.number, 10_000_000);
+        assert_eq!(h.state_root, [0x04; 32]);
+        assert_eq!(h.parent_beacon_block_root, Some([0x09; 32]));
+        assert_eq!(h.block_access_list_hash, Some([0x0b; 32]));
+        assert_eq!(h.slot_number, Some(SLOT));
+        assert_eq!(hash(&raw), keccak256(&raw));
+        // A re-encode drops requestsHash and the pair, so hashing it would name
+        // a different block: the hash must come from the bytes as received.
+        assert_ne!(hash(&raw), keccak256(&h.encode()));
+        assert_ne!(hash(&raw), hash(&header_rlp(Vec::new())));
+    }
+
+    #[test]
+    fn pre_amsterdam_header_has_no_slot_number() {
+        let h = BlockHeader::decode(&header_rlp(Vec::new())).unwrap();
+        assert_eq!(h.block_access_list_hash, None);
+        assert_eq!(h.slot_number, None);
+    }
+
+    #[test]
+    fn slot_zero_is_the_empty_string() {
+        let h = BlockHeader::decode(&header_rlp(amsterdam_pair(&[]))).unwrap();
+        assert_eq!(h.slot_number, Some(0));
+    }
+
+    #[test]
+    fn a_malformed_pair_is_tolerated_but_yields_no_slot() {
+        for (why, extra) in [
+            // The corpus's 006-header-future-extra shape: a 20-byte unknown field.
+            (
+                "short hash",
+                vec![Item::Bytes(vec![0x0c; 20]), Item::Bytes(vec![0x2a])],
+            ),
+            ("hash without a slot", vec![Item::Bytes(vec![0x0b; 32])]),
+            ("leading-zero slot", amsterdam_pair(&[0x00, 0x2a])),
+            ("oversized slot", amsterdam_pair(&[0x01; 9])),
+            (
+                "list slot",
+                vec![Item::Bytes(vec![0x0b; 32]), Item::List(Vec::new())],
+            ),
+        ] {
+            let h = BlockHeader::decode(&header_rlp(extra)).unwrap_or_else(|e| {
+                panic!("{why}: nothing past requestsHash is rejected: {}", e.0)
+            });
+            assert_eq!(h.slot_number, None, "{why}");
+            assert_eq!(h.number, 10_000_000, "{why}");
+        }
+    }
+
+    #[test]
+    fn fields_after_the_slot_are_tolerated() {
+        let mut extra = amsterdam_pair(&rlp::u64_to_minimal_be(SLOT));
+        extra.push(Item::Bytes(b"a-later-fork".to_vec()));
+        let h = BlockHeader::decode(&header_rlp(extra)).unwrap();
+        assert_eq!(h.slot_number, Some(SLOT));
+    }
+
+    #[test]
+    fn encode_drops_rather_than_shifts_the_amsterdam_fields() {
+        let h = BlockHeader::decode(&header_rlp(amsterdam_pair(&[0x2a]))).unwrap();
+        let re = BlockHeader::decode(&h.encode()).unwrap();
+        assert_eq!(re.parent_beacon_block_root, h.parent_beacon_block_root);
+        assert_eq!(re.block_access_list_hash, None);
+        assert_eq!(re.slot_number, None);
+    }
 }

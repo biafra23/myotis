@@ -1,6 +1,8 @@
 package com.jaeckel.ethp2p.consensus;
 
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
+import com.jaeckel.ethp2p.core.types.BlockHeader;
+import org.apache.tuweni.bytes.Bytes;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -20,6 +22,20 @@ import java.util.concurrent.atomic.AtomicReference;
  * beacon block headers (both finalized and attested). This allows verifying that
  * a peer's claimed state root corresponds to an actual beacon chain block, even
  * if it doesn't match the current finalized state root.
+ *
+ * <p><b>Gloas: the hash first, the header after.</b> From Gloas (EIP-7732) a
+ * light-client header proves only an execution BLOCK HASH — no state root, number
+ * or timestamp is committed on the consensus side any more. The light client records
+ * such a hash as PENDING ({@link #noteFinalizedHash} / {@link #noteOptimisticHash});
+ * the EL resolver fetches the header by that hash and offers its raw RLP
+ * ({@link #resolveHeader}), which is adopted only when its keccak, recomputed here,
+ * IS a pending hash. The chain of custody is sync-committee signature → beacon
+ * header → body root → block hash → keccak → header fields: one hop longer, still
+ * nothing taken on a peer's word. Until a pending finality resolves, the resolved
+ * one keeps being served — still final, only older — and since {@link #syncStateAt}
+ * reads the resolved finality, SYNCED follows resolution: a resolver no peer serves
+ * drops out of SYNCED after the finality slack. Twin of the Rust engine's
+ * {@code ExecAnchor} ({@code rust/myotis-net/src/el/anchor.rs}).
  */
 public class BeaconSyncState {
 
@@ -72,10 +88,15 @@ public class BeaconSyncState {
      */
     public enum State { SYNCING, CATCHING_UP, SYNCED, STALE_ANCHOR }
 
+    /** {@code finalizedElHeader}: the finalized block's execution header when it was
+     *  resolved by hash (Gloas), else null — see {@link #getFinalizedExecutionHeader}. */
     private record InnerState(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
                           long executionBlockNumber, byte[] executionBlockHash,
                           long optimisticBlockNumber, byte[] optimisticBlockHash,
-                          byte[] optimisticStateRoot) {}
+                          byte[] optimisticStateRoot, BlockHeader finalizedElHeader) {}
+
+    /** A block hash the light client proved at a beacon slot, awaiting its header. */
+    private record PendingHash(long slot, byte[] hash) {}
 
     /** A beacon-attested (slot, executionStateRoot) pair with verification status. */
     public record SlottedStateRoot(long slot, byte[] stateRoot, boolean blsVerified) {}
@@ -83,7 +104,23 @@ public class BeaconSyncState {
     private static final int MAX_KNOWN_ROOTS = 8192;
 
     private final AtomicReference<InnerState> state = new AtomicReference<>(
-            new InnerState(0, null, 0, 0, null, 0, null, null));
+            new InnerState(0, null, 0, 0, null, 0, null, null, null));
+
+    /**
+     * Serializes every writer of {@link #state}, the pending hashes and the roots window.
+     * Readers stay lock-free (one atomic read of the immutable record). Since Gloas two
+     * threads write — the light client (updates, notes) and the EL resolver (resolution) —
+     * so a read-modify-write of {@link #state} must never interleave with another.
+     */
+    private final Object lock = new Object();
+    /** Gloas: a finalized execution block hash proven at this beacon slot whose header is
+     *  not resolved yet. Never older than the resolved finality; cleared when resolved or
+     *  superseded. Guarded by {@link #lock}. */
+    private PendingHash pendingFinalized;
+    /** The optimistic twin of {@link #pendingFinalized}. Guarded by {@link #lock}. */
+    private PendingHash pendingOptimistic;
+    /** Woken (outside the lock) when a new hash becomes pending — the EL resolver. */
+    private volatile Runnable pendingListener;
 
     /** Period of the committee currently held by the light-client store. Separate from the
      *  InnerState record because it's written by rotation events (not by the finalized update
@@ -116,9 +153,11 @@ public class BeaconSyncState {
      * @param optimisticSlot      the latest optimistic (attested) slot
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {
-        InnerState prev = state.get();
-        state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot, 0, null,
-                prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot()));
+        synchronized (lock) {
+            InnerState prev = state.get();
+            state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot, 0, null,
+                    prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot(), null));
+        }
     }
 
     /**
@@ -126,9 +165,12 @@ public class BeaconSyncState {
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
                        long executionBlockNumber) {
-        InnerState prev = state.get();
-        state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot, executionBlockNumber, null,
-                prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot()));
+        synchronized (lock) {
+            InnerState prev = state.get();
+            state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot, executionBlockNumber,
+                    null, prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot(),
+                    null));
+        }
     }
 
     /**
@@ -136,10 +178,12 @@ public class BeaconSyncState {
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
                        long executionBlockNumber, byte[] executionBlockHash) {
-        InnerState prev = state.get();
-        state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot,
-                executionBlockNumber, executionBlockHash != null ? executionBlockHash.clone() : null,
-                prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot()));
+        synchronized (lock) {
+            InnerState prev = state.get();
+            state.set(new InnerState(finalizedSlot, executionStateRoot, optimisticSlot,
+                    executionBlockNumber, executionBlockHash != null ? executionBlockHash.clone() : null,
+                    prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot(), null));
+        }
     }
 
     /**
@@ -151,12 +195,160 @@ public class BeaconSyncState {
      */
     public void updateOptimisticExecution(long optimisticBlockNumber, byte[] optimisticBlockHash,
                                           byte[] optimisticStateRoot) {
-        InnerState prev = state.get();
-        state.set(new InnerState(prev.finalizedSlot(), prev.executionStateRoot(), prev.optimisticSlot(),
-                prev.executionBlockNumber(), prev.executionBlockHash(),
-                optimisticBlockNumber,
-                optimisticBlockHash != null ? optimisticBlockHash.clone() : null,
-                optimisticStateRoot != null ? optimisticStateRoot.clone() : null));
+        synchronized (lock) {
+            InnerState prev = state.get();
+            state.set(new InnerState(prev.finalizedSlot(), prev.executionStateRoot(), prev.optimisticSlot(),
+                    prev.executionBlockNumber(), prev.executionBlockHash(),
+                    optimisticBlockNumber,
+                    optimisticBlockHash != null ? optimisticBlockHash.clone() : null,
+                    optimisticStateRoot != null ? optimisticStateRoot.clone() : null,
+                    prev.finalizedElHeader()));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Gloas: pending block hashes, resolved by the EL
+    // -------------------------------------------------------------------------
+
+    /**
+     * Gloas: the light client proved {@code blockHash} as the finalized execution block at
+     * beacon slot {@code slot}. Nothing about that block but its hash is known yet, so it
+     * waits for {@link #resolveHeader}. The same hash as the resolved finality (payloads
+     * empty or withheld since) only moves its slot forward — no fetch; a finality older
+     * than the one resolved or pending is ignored; a newer one supersedes the pending one.
+     */
+    public void noteFinalizedHash(long slot, byte[] blockHash) {
+        if (blockHash == null || blockHash.length != 32) return;
+        boolean wake;
+        synchronized (lock) {
+            InnerState s = state.get();
+            if (Arrays.equals(s.executionBlockHash(), blockHash)) {
+                if (slot > s.finalizedSlot()) {
+                    state.set(new InnerState(slot, s.executionStateRoot(), s.optimisticSlot(),
+                            s.executionBlockNumber(), s.executionBlockHash(), s.optimisticBlockNumber(),
+                            s.optimisticBlockHash(), s.optimisticStateRoot(), s.finalizedElHeader()));
+                    if (s.executionStateRoot() != null) recordStateRoot(slot, s.executionStateRoot(), true);
+                }
+                // This IS the newest finality — unless a newer one is already pending.
+                if (pendingFinalized != null && pendingFinalized.slot() <= slot) pendingFinalized = null;
+                return;
+            }
+            if (slot < s.finalizedSlot() || (pendingFinalized != null && pendingFinalized.slot() > slot)) {
+                return;
+            }
+            wake = pendingFinalized == null || !Arrays.equals(pendingFinalized.hash(), blockHash);
+            pendingFinalized = new PendingHash(slot, blockHash.clone());
+        }
+        if (wake) notifyPending();
+    }
+
+    /** The optimistic twin of {@link #noteFinalizedHash}. */
+    public void noteOptimisticHash(long slot, byte[] blockHash) {
+        if (blockHash == null || blockHash.length != 32) return;
+        boolean wake;
+        synchronized (lock) {
+            InnerState s = state.get();
+            if (Arrays.equals(s.optimisticBlockHash(), blockHash)) {
+                if (slot > s.optimisticSlot()) {
+                    state.set(new InnerState(s.finalizedSlot(), s.executionStateRoot(), slot,
+                            s.executionBlockNumber(), s.executionBlockHash(), s.optimisticBlockNumber(),
+                            s.optimisticBlockHash(), s.optimisticStateRoot(), s.finalizedElHeader()));
+                    if (s.optimisticStateRoot() != null) recordStateRoot(slot, s.optimisticStateRoot(), true);
+                }
+                if (pendingOptimistic != null && pendingOptimistic.slot() <= slot) pendingOptimistic = null;
+                return;
+            }
+            if (slot < s.optimisticSlot() || (pendingOptimistic != null && pendingOptimistic.slot() > slot)) {
+                return;
+            }
+            wake = pendingOptimistic == null || !Arrays.equals(pendingOptimistic.hash(), blockHash);
+            pendingOptimistic = new PendingHash(slot, blockHash.clone());
+        }
+        if (wake) notifyPending();
+    }
+
+    /**
+     * The block hashes waiting for their header — the pending finality first (what the
+     * header-chain walk anchors on), then the pending optimistic head; one entry when both
+     * name the same block. Fresh copies.
+     */
+    public List<byte[]> pendingHashes() {
+        synchronized (lock) {
+            List<byte[]> out = new ArrayList<>(2);
+            if (pendingFinalized != null) out.add(pendingFinalized.hash().clone());
+            if (pendingOptimistic != null
+                    && (pendingFinalized == null || !Arrays.equals(pendingFinalized.hash(), pendingOptimistic.hash()))) {
+                out.add(pendingOptimistic.hash().clone());
+            }
+            return out;
+        }
+    }
+
+    /**
+     * Offer the raw RLP of an execution header fetched by one of the pending hashes.
+     * Adopted only if ITS keccak — computed here from these exact bytes, never taken from
+     * the peer or a decoder — is a pending hash, and then for every pending head that hash
+     * names (the finalized and optimistic heads can be the same block). The header is
+     * decoded only after the hash matched; its number and state root become the anchor's
+     * exactly as {@link #update} / {@link #updateOptimisticExecution} set them for a
+     * payload-shaped header, and the root joins the window as BLS-verified: the hash was
+     * proven under a sync-committee signature, and only one header hashes to it.
+     *
+     * @return whether anything was adopted; a header nobody asked for, one for a head
+     *         since superseded, or bytes that do not decode change nothing
+     */
+    public boolean resolveHeader(byte[] rawRlp) {
+        if (rawRlp == null || rawRlp.length == 0) return false;
+        byte[] hash = BlockHeader.hash(Bytes.wrap(rawRlp)).toArray();
+        synchronized (lock) {
+            boolean fin = pendingFinalized != null && Arrays.equals(pendingFinalized.hash(), hash);
+            boolean opt = pendingOptimistic != null && Arrays.equals(pendingOptimistic.hash(), hash);
+            if (!fin && !opt) return false;
+            BlockHeader header;
+            try {
+                header = BlockHeader.decode(Bytes.wrap(rawRlp));
+            } catch (RuntimeException e) {
+                return false;
+            }
+            byte[] root = header.stateRoot.toArray();
+            if (fin) {
+                long slot = pendingFinalized.slot();
+                InnerState s = state.get();
+                state.set(new InnerState(slot, root, s.optimisticSlot(), header.number, hash.clone(),
+                        s.optimisticBlockNumber(), s.optimisticBlockHash(), s.optimisticStateRoot(), header));
+                recordStateRoot(slot, root, true);
+                pendingFinalized = null;
+            }
+            if (opt) {
+                long slot = pendingOptimistic.slot();
+                InnerState s = state.get();
+                state.set(new InnerState(s.finalizedSlot(), s.executionStateRoot(), slot,
+                        s.executionBlockNumber(), s.executionBlockHash(), header.number, hash.clone(),
+                        root.clone(), s.finalizedElHeader()));
+                recordStateRoot(slot, root, true);
+                pendingOptimistic = null;
+            }
+            return true;
+        }
+    }
+
+    /**
+     * Register the resolver's wake-up: run (outside every lock, on the noting thread) when
+     * a new hash becomes pending, so a fresh head is fetched at once instead of at the
+     * resolver's next timer tick. The resolver must still retry on its own timer.
+     */
+    public void setPendingListener(Runnable listener) {
+        this.pendingListener = listener;
+    }
+
+    private void notifyPending() {
+        Runnable l = pendingListener;
+        if (l == null) return;
+        try {
+            l.run();
+        } catch (RuntimeException ignored) {
+            // A resolver hiccup must never break the light client's loop.
+        }
     }
 
     /**
@@ -184,6 +376,16 @@ public class BeaconSyncState {
         InnerState s = state.get();
         return new FinalizedExecution(
                 s.executionBlockNumber(), s.executionStateRoot(), s.executionBlockHash());
+    }
+
+    /**
+     * The finalized block's whole execution header when it was resolved by hash (Gloas,
+     * {@link #resolveHeader}): every field bound to the proven block hash by its keccak.
+     * Null while the finality came from a payload-shaped light-client header (the store's
+     * header carries those fields) or nothing has resolved yet.
+     */
+    public BlockHeader getFinalizedExecutionHeader() {
+        return state.get().finalizedElHeader();
     }
 
     /**
@@ -379,20 +581,24 @@ public class BeaconSyncState {
      */
     public void recordStateRoot(long slot, byte[] stateRoot, boolean blsVerified) {
         if (stateRoot == null || stateRoot.length != 32) return;
-        // Check for duplicates; upgrade unverified → verified if applicable
-        for (SlottedStateRoot entry : knownStateRoots) {
-            if (entry.slot() == slot && Arrays.equals(entry.stateRoot(), stateRoot)) {
-                if (blsVerified && !entry.blsVerified()) {
-                    knownStateRoots.remove(entry);
-                    break; // re-add as verified below
+        // Serialized with the other writers: the dedup/upgrade check-then-act below is not
+        // atomic on its own, and the EL resolver records roots off the light client's thread.
+        synchronized (lock) {
+            // Check for duplicates; upgrade unverified → verified if applicable
+            for (SlottedStateRoot entry : knownStateRoots) {
+                if (entry.slot() == slot && Arrays.equals(entry.stateRoot(), stateRoot)) {
+                    if (blsVerified && !entry.blsVerified()) {
+                        knownStateRoots.remove(entry);
+                        break; // re-add as verified below
+                    }
+                    return; // already present with same or better verification
                 }
-                return; // already present with same or better verification
             }
-        }
-        knownStateRoots.addLast(new SlottedStateRoot(slot, stateRoot.clone(), blsVerified));
-        // Evict oldest entries if window is full
-        while (knownStateRoots.size() > MAX_KNOWN_ROOTS) {
-            knownStateRoots.pollFirst();
+            knownStateRoots.addLast(new SlottedStateRoot(slot, stateRoot.clone(), blsVerified));
+            // Evict oldest entries if window is full
+            while (knownStateRoots.size() > MAX_KNOWN_ROOTS) {
+                knownStateRoots.pollFirst();
+            }
         }
     }
 

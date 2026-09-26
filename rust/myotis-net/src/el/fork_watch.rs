@@ -28,8 +28,12 @@
 //! verify" only when the node's own verified state agrees). A source's evidence
 //! stays fresh while one of its peers is connected ([`ForkWatch::touch`]) and
 //! for [`OBSERVATION_TTL_SECONDS`] after. A fork this build knows (its own
-//! `fork_next`) never raises one; a peer two or more forks ahead is not covered
-//! (placement is one step from our pin).
+//! `fork_next`) never raises one, and once it passes the watch measures from
+//! its successor ([`forkid::fork_id_at`]), exactly as our own Status does —
+//! while peers still on the pinned hash keep being judged against the pinned
+//! fork id, so a date moved after this build shipped stays news past ours. Not
+//! covered: a peer two or more forks ahead (placement is one step from a
+//! baseline).
 //!
 //! One instance per HANDLE, owned by the engine host so it survives pause/resume
 //! (the Java twin is ChainStack-owned for the same reason). Clock values are
@@ -171,6 +175,23 @@ impl Support {
     }
 }
 
+/// A fork id the watch measures from, and the foreign activations announced on it.
+struct Baseline {
+    hash: u32,
+    next: u64,
+    announced: HashSet<u64>,
+}
+
+impl Baseline {
+    fn new(hash: u32, next: u64) -> Baseline {
+        Baseline {
+            hash,
+            next,
+            announced: HashSet::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// Latest observation per source network.
@@ -180,8 +201,11 @@ struct Inner {
 
 pub struct ForkWatch {
     label: String,
-    local_hash: u32,
-    local_next: u64,
+    /// Our pinned fork id; the baseline at a given time is
+    /// [`forkid::fork_id_at`] of it, plus the pin itself once `pinned_next`
+    /// has passed.
+    pinned_hash: u32,
+    pinned_next: u64,
     genesis_time: u64,
     epoch_seconds: u64,
     inner: Mutex<Inner>,
@@ -189,9 +213,11 @@ pub struct ForkWatch {
 
 impl ForkWatch {
     /// `local_fork_hash`/`local_fork_next`: what WE announce (the `ElConfig` pin
-    /// — the wire value, not `forkid`'s conformance copy); `genesis_time` +
-    /// `epoch_seconds`: the beacon epoch grid activations sit on (0 = only
-    /// announced activations place).
+    /// — the wire value, not `forkid`'s conformance copy); once `local_fork_next`
+    /// passes, the watch measures from its successor, as our Status does, and
+    /// from the pin for peers still on it.
+    /// `genesis_time` + `epoch_seconds`: the beacon epoch grid activations sit on
+    /// (0 = only announced activations place).
     pub fn new(
         label: &str,
         local_fork_hash: [u8; 4],
@@ -201,8 +227,8 @@ impl ForkWatch {
     ) -> ForkWatch {
         ForkWatch {
             label: label.to_string(),
-            local_hash: u32::from_be_bytes(local_fork_hash),
-            local_next: local_fork_next,
+            pinned_hash: u32::from_be_bytes(local_fork_hash),
+            pinned_next: local_fork_next,
             genesis_time,
             epoch_seconds,
             inner: Mutex::new(Inner::default()),
@@ -310,44 +336,67 @@ impl ForkWatch {
         let cutoff = now.saturating_sub(OBSERVATION_TTL_SECONDS);
         inner.by_source.retain(|_, o| o.seen_at >= cutoff);
 
-        let announced: HashSet<u64> = inner
-            .by_source
-            .values()
-            .filter(|o| o.hash == self.local_hash && self.is_foreign_activation(o.next, now))
-            .map(|o| o.next)
-            .collect();
-        let mut support: HashMap<u64, Support> = HashMap::new();
+        // Our baseline follows our own schedule: once the fork we know passes,
+        // peers on its successor are on OUR chain, and a further fork they
+        // announce is the news. The pin stays a second baseline for peers still
+        // on its hash: their Status doesn't change at OUR date, so neither does
+        // its verdict. A date moved after this build shipped keeps counting
+        // (announced, then placed from the pin once it passes), and peers on
+        // our date, or on none, keep dissenting.
+        let (local_hash, local_next) = forkid::fork_id_at(self.pinned_hash, self.pinned_next, now);
+        let mut baselines = vec![Baseline::new(local_hash, local_next)];
+        if local_hash != self.pinned_hash {
+            baselines.push(Baseline::new(self.pinned_hash, self.pinned_next));
+        }
+
+        for o in inner.by_source.values() {
+            for b in &mut baselines {
+                if o.hash == b.hash && is_foreign_activation(o.next, now, b.next) {
+                    b.announced.insert(o.next);
+                }
+            }
+        }
+        // Keyed by (baseline hash, activation): one fork.
+        let mut support: HashMap<(u32, u64), Support> = HashMap::new();
         let mut dissent = 0usize;
         // One entry per source ⇒ counts are distinct sources.
         for o in inner.by_source.values() {
-            if o.hash == self.local_hash {
+            if let Some(on) = baselines.iter().find(|b| b.hash == o.hash) {
                 let t = o.next;
-                if t == 0 || t == self.local_next {
-                    dissent += 1; // on our hash, no unknown fork ahead
-                } else if self.is_foreign_activation(t, now) && still_counts(o, t, now) {
-                    support.entry(t).or_default().announced += 1;
+                if t == 0 || t == on.next {
+                    dissent += 1; // on a baseline, no unknown fork ahead
+                } else if is_foreign_activation(t, now, on.next) && still_counts(o, t, now) {
+                    support.entry((on.hash, t)).or_default().announced += 1;
                 }
-            } else {
-                let t = forkid::activation_of(self.local_hash, o.hash);
-                if self.local_next != 0 && t == self.local_next {
+                continue;
+            }
+            // The current baseline first: one vote per source.
+            for b in &baselines {
+                let t = forkid::activation_of(b.hash, o.hash);
+                if b.next != 0 && t == b.next {
                     dissent += 1; // past a fork we DO know: not news
-                } else if self.plausible_placement(t, &announced, now) {
-                    support.entry(t).or_default().placed += 1;
+                    break;
+                }
+                if self.plausible_placement(t, &b.announced, now, b.next) {
+                    support.entry((b.hash, t)).or_default().placed += 1;
+                    break;
                 }
             }
         }
 
-        // Most-backed activation; ties → more placed, then earliest. It must
-        // clear both the absolute floor and the dissent: a minority can't
-        // outvote the peers it contradicts.
-        let (t, best) = support
+        // Most-backed fork; ties → more placed, then earliest, then the current
+        // baseline's. It must clear both the absolute floor and the dissent: a
+        // minority can't outvote the peers it contradicts. The same date from
+        // two baselines is two forks: never pooled.
+        let ((base, t), best) = support
             .into_iter()
             .filter(|(_, s)| s.total() >= MIN_PEERS && s.total() > dissent)
-            .max_by(|(ta, a), (tb, b)| {
+            .max_by(|((ba, ta), a), ((bb, tb), b)| {
                 a.total()
                     .cmp(&b.total())
                     .then(a.placed.cmp(&b.placed))
                     .then(tb.cmp(ta))
+                    .then((*ba == local_hash).cmp(&(*bb == local_hash)))
             })?;
         let phase = if t <= now || best.placed >= MIN_PEERS {
             Phase::Active
@@ -357,25 +406,23 @@ impl ForkWatch {
         Some(Advisory {
             phase,
             activation_time: t,
-            fork_hash: forkid::successor(self.local_hash, t),
+            fork_hash: forkid::successor(base, t),
             peers: best.total(),
         })
     }
 
-    /// A timestamp activation this build doesn't know, within a plausible horizon.
-    fn is_foreign_activation(&self, t: u64, now: u64) -> bool {
-        t != 0
-            && t != self.local_next
-            && t >= forkid::TIMESTAMP_THRESHOLD
-            && t <= now.saturating_add(MAX_HORIZON_SECONDS)
-    }
-
     /// Whether `t`, where [`forkid::activation_of`] put a foreign hash, is a
-    /// real activation: announced by a source on our hash, or epoch-aligned
-    /// within the lookback (EL fork timestamps track the CL fork epoch; one
-    /// epoch of slack for a clock running behind).
-    fn plausible_placement(&self, t: u64, announced: &HashSet<u64>, now: u64) -> bool {
-        if t < forkid::TIMESTAMP_THRESHOLD || t == self.local_next {
+    /// real activation: announced by a source on the baseline it was placed
+    /// from, or epoch-aligned within the lookback (EL fork timestamps track the
+    /// CL fork epoch; one epoch of slack for a clock running behind).
+    fn plausible_placement(
+        &self,
+        t: u64,
+        announced: &HashSet<u64>,
+        now: u64,
+        local_next: u64,
+    ) -> bool {
+        if t < forkid::TIMESTAMP_THRESHOLD || t == local_next {
             return false;
         }
         if announced.contains(&t) {
@@ -393,6 +440,14 @@ impl ForkWatch {
     fn tracked(&self) -> usize {
         self.inner.lock().map(|i| i.by_source.len()).unwrap_or(0)
     }
+}
+
+/// A timestamp activation this build doesn't know, within a plausible horizon.
+fn is_foreign_activation(t: u64, now: u64, local_next: u64) -> bool {
+    t != 0
+        && t != local_next
+        && t >= forkid::TIMESTAMP_THRESHOLD
+        && t <= now.saturating_add(MAX_HORIZON_SECONDS)
 }
 
 /// Whether an announcement of `t` still counts: ahead; or made before `t` by a
@@ -664,6 +719,117 @@ mod tests {
         assert_eq!(w.evaluate(BEFORE), None);
         announce(&w, "upgraded", 5, SUCCESSOR, 0, T + DAY);
         assert_eq!(w.evaluate(T + DAY), None);
+    }
+
+    #[test]
+    fn the_baseline_follows_our_own_known_fork() {
+        // A build that carries Glamsterdam: past it, peers on its successor are
+        // on OUR chain, and a further fork they announce is what the watch reports.
+        let next_fork = T + 60 * DAY;
+        let now = T + DAY;
+        let w = watch(T);
+        announce(&w, "upgraded", 3, SUCCESSOR, 0, now);
+        assert_eq!(
+            w.evaluate(now),
+            None,
+            "our own fork's successor is not news"
+        );
+        announce(&w, "upgraded", 3, SUCCESSOR, next_fork, now);
+        let a = w.evaluate(now).expect("advisory");
+        assert_eq!(a.phase, Phase::Scheduled);
+        assert_eq!(a.activation_time, next_fork);
+        assert_eq!(
+            a.fork_hash,
+            forkid::successor(u32::from_be_bytes(SUCCESSOR), next_fork)
+        );
+    }
+
+    #[test]
+    fn a_rescheduled_fork_stays_news_past_the_date_this_build_knows() {
+        // Glamsterdam moves AFTER this build shipped (it moved once already,
+        // 09-21 → 10-06). Past OUR date we present its successor, which peers
+        // on the new date reject — but they show their Status first, still on
+        // the pin: that is the whole signal then.
+        let moved = T + 7 * DAY;
+        let moved_fork_id = forkid::successor(u32::from_be_bytes(SEPOLIA_PIN), moved);
+        let w = watch(T);
+        announce(&w, "upgraded", 3, SEPOLIA_PIN, moved, T - 3600);
+        let scheduled = Advisory {
+            phase: Phase::Scheduled,
+            activation_time: moved,
+            fork_hash: moved_fork_id,
+            peers: 3,
+        };
+        assert_eq!(w.evaluate(T - 3600), Some(scheduled));
+        assert_eq!(
+            w.evaluate(T + 3600),
+            Some(scheduled),
+            "past our date the pin still measures them: their fork id, not a successor of ours"
+        );
+        let now = moved + DAY;
+        announce(&w, "upgraded", 3, moved_fork_id.to_be_bytes(), 0, now);
+        assert_eq!(
+            w.evaluate(now),
+            Some(Advisory {
+                phase: Phase::Active,
+                ..scheduled
+            }),
+            "once their date passed, their hash places from the pin"
+        );
+    }
+
+    #[test]
+    fn the_pool_from_before_our_date_still_dissents_past_it() {
+        // A stable pool that handshook before our date and stays connected
+        // across it. Its Status is still on the pin — four on our date, one on
+        // none — and right after T it is most of what we know: if its verdict
+        // lapsed at OUR date, a few fresh sources minting a "successor of ours"
+        // would face no dissent at all.
+        let w = watch(T);
+        let mut pool = announce(&w, "on-our-date", 4, SEPOLIA_PIN, T, T - 3600);
+        pool.extend(announce(&w, "not-upgraded", 1, SEPOLIA_PIN, 0, T - 3600));
+        let now = T + 3600;
+        w.touch_at(&pool, now);
+        let forged_at = T + EPOCH; // grid-aligned, one epoch past ours
+        let forged = forkid::successor(u32::from_be_bytes(SUCCESSOR), forged_at).to_be_bytes();
+        announce(&w, "forger", 3, forged, 0, now);
+        assert_eq!(w.evaluate(now), None);
+        announce(&w, "forger", 5, forged, 0, now);
+        assert_eq!(w.evaluate(now), None, "a tie is not a majority");
+        w.observe_at("forger5", forged, 0, now);
+        let a = w.evaluate(now).expect("a majority raises it");
+        assert_eq!(a.activation_time, forged_at);
+        assert_eq!(a.fork_hash, u32::from_be_bytes(forged));
+        assert_eq!(a.peers, 6);
+    }
+
+    #[test]
+    fn the_same_date_from_either_baseline_is_two_forks() {
+        // Past our date, "a fork after ours at t" (announced on its successor)
+        // and "our fork moved to t" (announced on the pin) are different forks
+        // with different ids: they must not pool their sources into one vote.
+        let later = T + 30 * DAY;
+        let now = T + DAY;
+        let w = watch(T);
+        announce(&w, "after-ours", 3, SUCCESSOR, later, now);
+        announce(&w, "moved", 3, SEPOLIA_PIN, later, now);
+        assert_eq!(
+            w.evaluate(now).map(|a| a.fork_hash),
+            Some(forkid::successor(u32::from_be_bytes(SUCCESSOR), later)),
+            "on a full tie, the current baseline's reading wins"
+        );
+        announce(&w, "current", 3, SUCCESSOR, 0, now);
+        assert_eq!(w.evaluate(now), None, "three and three are not six");
+        w.observe_at("moved3", SEPOLIA_PIN, later, now);
+        assert_eq!(
+            w.evaluate(now),
+            Some(Advisory {
+                phase: Phase::Scheduled,
+                activation_time: later,
+                fork_hash: forkid::successor(u32::from_be_bytes(SEPOLIA_PIN), later),
+                peers: 4,
+            })
+        );
     }
 
     #[test]

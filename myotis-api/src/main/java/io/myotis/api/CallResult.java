@@ -18,6 +18,11 @@ package io.myotis.api;
  *   <li>{@link Status#UNAVAILABLE} — no verified answer right now (not synced /
  *       no peer / out-of-window block); retryable, hosts keep the existing
  *       -32000 mapping. {@code detail} may carry a diagnostic reason.</li>
+ *   <li>{@link Status#REFUSED} — this engine will not answer this request on
+ *       this build, and no retry changes that (e.g. the Java engine past an EVM
+ *       fork its Besu cannot price). {@code detail} says why. Hosts serve the
+ *       PERMANENT JSON-RPC -32602, never the retryable -32000 a client would
+ *       spin on (CLAUDE.md: a refusal is permanent).</li>
  * </ul>
  *
  * <p>Flat record over FFI-portable types (enum, {@code byte[]}, {@code String})
@@ -30,7 +35,7 @@ public record CallResult(Status status, byte[] data, String detail) {
         java.util.Objects.requireNonNull(status, "status");
     }
 
-    public enum Status { OK, REVERTED, UNAVAILABLE }
+    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED }
 
     public static CallResult ok(byte[] data) {
         return new CallResult(Status.OK, data == null ? new byte[0] : data, null);
@@ -42,5 +47,9 @@ public record CallResult(Status status, byte[] data, String detail) {
 
     public static CallResult unavailable(String detail) {
         return new CallResult(Status.UNAVAILABLE, null, detail);
+    }
+
+    public static CallResult refused(String detail) {
+        return new CallResult(Status.REFUSED, null, detail);
     }
 }

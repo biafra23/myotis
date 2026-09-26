@@ -997,8 +997,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private void sendStatus(ChannelHandlerContext ctx) {
         // Always use chain-head mode with current forkId (post-merge standard)
         ChainHead.Head head = chainHead.get();
-        byte[] forkIdHash = network.forkIdHash();
-        long forkNext = network.forkNext();
+        // The fork id in effect NOW: a known next fork is announced until it passes,
+        // then folded into the hash (EIP-2124), so upgraded peers keep us across it.
+        ForkIds.ForkId forkId = network.currentForkId();
+        byte[] forkIdHash = forkId.hashBytes();
+        long forkNext = forkId.next();
         org.apache.tuweni.bytes.Bytes32 headHash = head.blockNumber() > 0 ? head.blockHash() : network.bestBlockHash();
         long blockNumber = head.blockNumber();
         // eth/69 block range: advertise only what we actually hold, never [0, head] and
@@ -1133,6 +1136,31 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 HEADER_REQUEST_DEADLINE_MS);
         log.debug("[eth] GetBlockHeaders (async) block={} count={} reqId={}", blockNumber, count, reqId);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
+    }
+
+    /**
+     * Fetch the header of block {@code hash} from THIS peer (GetBlockHeaders by hash, one
+     * header), with an in-method {@code deadlineMs}. Nothing is trusted here: the caller
+     * hashes the returned raw RLP itself — the execution anchor adopts a header only when
+     * its keccak IS the hash it waited for (Gloas: {@code BeaconSyncState.resolveHeader}).
+     * Registered through {@link #trackHeaderRequest}, so the one header whose hash matches
+     * the request is also admitted to the serve caches, like every by-hash probe.
+     *
+     * @return the served headers (possibly empty), or a failed future if not READY
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeaderByHashAsync(
+            org.apache.tuweni.bytes.Bytes32 hash, long deadlineMs) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) {
+            return Futures.failedFuture(new IllegalStateException("EthHandler not READY"));
+        }
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+            trackHeaderRequest(ctx, reqId, HeaderReq.byHash(hash), deadlineMs);
+        byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.debug("[eth] GetBlockHeaders (by hash {}) reqId={}", hash.toShortHexString(), reqId);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
         return future;
     }

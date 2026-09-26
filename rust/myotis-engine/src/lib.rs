@@ -132,7 +132,17 @@ uniffi::setup_scaffolding!();
 ///      and the iOS wrapper moved with it. The `io.myotis.api` state reads
 ///      still have no block parameter, and the Java engine still maps
 ///      `finalized` to the head (#366).
-pub const ABI_VERSION: i32 = 32;
+/// v33: eth_call_json / eth_call_overrides_json / estimate_gas_json may return
+///      the permanent `{"error","code":-32602}` envelope for an executor
+///      REFUSAL — today a header and fork table that disagree about Amsterdam:
+///      an Amsterdam block whose header lacks EIP-7843's `slot_number` (refused
+///      rather than run with SLOTNUM = 0), or a `slot_number` on a block the
+///      table puts before Amsterdam (refused rather than run under the older
+///      fork's rules). And on a Gloas network the status JSON's beacon state
+///      is SYNCED only once the finalized execution header has been fetched
+///      and verified by hash (a Gloas light-client header proves only the
+///      block hash). Behavior changes, no signature change.
+pub const ABI_VERSION: i32 = 33;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

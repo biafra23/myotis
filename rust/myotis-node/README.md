@@ -186,6 +186,14 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
   Engines before ABI 27 ignore `block` and always answer from the head, so a
   host that forwards a block number must gate on `init() >= 27`.
+- **Executor refusals** (ABI 33): `ethCallJson`, `ethCallOverridesJson` and
+  `estimateGasJson` answer `{"error": "…", "code": -32602}` — **permanent**,
+  like the refusals above — when the verified head's header and this engine
+  build's fork table disagree about Amsterdam: an Amsterdam block without
+  EIP-7843's slot number, or a slot number on a block the table puts before
+  Amsterdam (the fork was scheduled or moved after this build shipped). It ran
+  nowhere, so it carries no `blockNumber`. Before ABI 33, `estimateGasJson`
+  never carried a `code`.
 - **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
   `{ phase, activationTime, forkId, observedPeers }` when peers announce
   (`"SCHEDULED"`, `activationTime` ahead) or have already activated

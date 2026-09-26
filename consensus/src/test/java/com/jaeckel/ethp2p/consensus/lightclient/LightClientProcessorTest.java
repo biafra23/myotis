@@ -254,19 +254,103 @@ class LightClientProcessorTest {
         assertFalse(newOnly.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT, OLD_FORK)));
     }
 
+    // ---- Which update may supply the next committee (Rust twin: tests/next_committee_adoption.rs) ----
+
+    /** The store's period in the two tests below. */
+    private static final long P = 2;
+    private static final long PERIOD = BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD;
+
+    /** A store bootstrapped at period P with {@link #syncCommittee} as committee(P). */
+    private static LightClientProcessor processorAtPeriodP() {
+        LightClientStore s = new LightClientStore();
+        s.initialize(TestUtil.dummyLightClientHeader(
+                new BeaconBlockHeader(P * PERIOD + 100, 0L, new byte[32], new byte[32], new byte[32])), syncCommittee);
+        return new LightClientProcessor(s, ForkSchedule.single(FORK_VERSION), GVR);
+    }
+
+    /**
+     * The last block of P-1, signed at the first slot of P by committee(P), with its attested
+     * state's genuine next committee — committee(P), ours — filled in. Honest servers leave it
+     * empty for such an update, but it is public chain data, so any server can fill it in.
+     */
+    private LightClientUpdate crossPeriodUpdate() {
+        LightClientUpdate u = (LightClientUpdate) SIGNED.computeIfAbsent("cross-period",
+                k -> buildUpdate(P * PERIOD - 1, P * PERIOD, P * PERIOD - 64, syncCommittee, FORK_VERSION));
+        assertEquals(P - 1, BeaconChainSpec.computeSyncCommitteePeriod(u.attestedHeader().beacon().slot()));
+        assertEquals(P, BeaconChainSpec.computeSyncCommitteePeriod(u.signatureSlot()));
+        return u;
+    }
+
+    /**
+     * An update carries the next committee of its ATTESTED state — the committee of
+     * period(attested) + 1 — so a store at P holding none may adopt it only from an update
+     * attested in P (spec validate_light_client_update). Everything in the cross-period update
+     * verifies, which is what made it dangerous: adopted, it installs committee(P) as P+1's at
+     * the next rotation, and every genuine P+1 update then fails BLS.
+     */
+    @Test
+    void aCrossPeriodUpdateDoesNotSupplyTheNextCommittee() {
+        LightClientProcessor p = processorAtPeriodP();
+        LightClientUpdate cross = crossPeriodUpdate();
+        assertTrue(SyncCommitteeVerifier.verify(cross.syncAggregate(), syncCommittee,
+                cross.attestedHeader().beacon(), FORK_VERSION, GVR), "its signature verifies");
+
+        assertFalse(p.processUpdate(cross), "an update attested in P-1 carries committee(P), not committee(P+1)");
+        assertNull(p.getStore().getNextSyncCommittee());
+        assertEquals(P, p.getStore().getCurrentSyncCommitteePeriod());
+        assertEquals(P * PERIOD + 100, p.getStore().getFinalizedSlot());
+    }
+
+    /**
+     * The consequence, end to end: after a cross-period update was offered, the store still
+     * adopts the genuine next committee from P's own update, and the rotation installs THAT
+     * committee for P+1 — the one every P+1 update is signed by.
+     */
+    @Test
+    void theStoreStillRotatesIntoTheRightCommitteeAfterACrossPeriodUpdate() {
+        // committee(P+1): only its root matters here, so its keys never sign anything.
+        byte[][] nextPubkeys = new byte[512][];
+        for (int i = 0; i < 512; i++) nextPubkeys[i] = TestUtil.getPublicKey(TestUtil.generateSecretKey(31_000 + i));
+        SyncCommittee committeeP1 = new SyncCommittee(nextPubkeys, aggregatePubkeys(nextPubkeys));
+        assertFalse(Arrays.equals(syncCommittee.hashTreeRoot(), committeeP1.hashTreeRoot()));
+        LightClientProcessor p = processorAtPeriodP();
+
+        p.processUpdate(crossPeriodUpdate());
+
+        // P's own update: attested and signed in P, finalized in P.
+        LightClientUpdate own = buildUpdate(P * PERIOD + 300, P * PERIOD + 301, P * PERIOD + 256,
+                committeeP1, FORK_VERSION);
+        assertTrue(p.processUpdate(own));
+        assertArrayEquals(committeeP1.hashTreeRoot(), p.getStore().getNextSyncCommittee().hashTreeRoot(),
+                "the next committee is the one P's own update proves");
+
+        p.getStore().forceRotateIfPastPeriod((P + 1) * PERIOD + 1);
+        assertEquals(P + 1, p.getStore().getCurrentSyncCommitteePeriod());
+        assertArrayEquals(committeeP1.hashTreeRoot(), p.getStore().getCurrentSyncCommittee().hashTreeRoot(),
+                "P+1 is verified against committee(P+1)");
+    }
+
+    /** {@link #buildUpdate(long, long, long, SyncCommittee, byte[])} attested at its signature slot,
+     *  carrying the current committee. */
+    private LightClientUpdate buildUpdate(long finalizedSlot, long signatureSlot, byte[] forkVersion) {
+        return buildUpdate(signatureSlot, signatureSlot, finalizedSlot, syncCommittee, forkVersion);
+    }
+
     /**
      * A LightClientUpdate whose finality branch (depth 6, gindex 105) and
      * next-sync-committee branch (depth 5, gindex 55) both verify against ONE
      * attested state root: a 32-leaf state tree with the checkpoint container
-     * at field 20 (epoch root || finalized root) and the committee at field 23.
+     * at field 20 (epoch root || finalized root) and {@code next} at field 23.
+     * Signed by the current committee's first {@link #MIN_PARTICIPANTS} keys.
      */
-    private LightClientUpdate buildUpdate(long finalizedSlot, long signatureSlot, byte[] forkVersion) {
+    private LightClientUpdate buildUpdate(long attestedSlot, long signatureSlot, long finalizedSlot,
+                                          SyncCommittee next, byte[] forkVersion) {
         LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
                 finalizedSlot, 0L, new byte[32], new byte[32]);
         byte[] zero = new byte[32];
         byte[][] leaves = new byte[32][32];
         leaves[20] = SszUtil.sha256(zero, finalizedHeader.beacon().hashTreeRoot()); // Checkpoint{epoch, root}
-        leaves[23] = syncCommittee.hashTreeRoot();
+        leaves[23] = next.hashTreeRoot();
         byte[][] tree = TestUtil.buildMerkleTree(leaves);
         byte[][] checkpointBranch = TestUtil.extractBranch(tree, 5, 20);
         byte[][] finalityBranch = new byte[6][];
@@ -275,9 +359,9 @@ class LightClientProcessorTest {
         byte[][] committeeBranch = TestUtil.extractBranch(tree, 5, 23);
 
         LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
-                signatureSlot, 0L, new byte[32], tree[1]);
+                attestedSlot, 0L, new byte[32], tree[1]);
         SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), MIN_PARTICIPANTS, forkVersion);
-        return new LightClientUpdate(attestedHeader, syncCommittee, committeeBranch,
+        return new LightClientUpdate(attestedHeader, next, committeeBranch,
                 finalizedHeader, finalityBranch, agg, signatureSlot);
     }
 

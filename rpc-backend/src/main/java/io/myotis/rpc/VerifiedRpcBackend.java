@@ -1490,18 +1490,29 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         RpcCallContext ctx = buildAnchoredHead();
                         lastGoodHead.set(new HeadWithTimestamp(ctx, clock.elapsedMillis()));
                         f.complete(ctx);
-                        // After the future is completed (readers unblocked), prime the
-                        // confirm-critical contracts at this root so a wallet's first
-                        // confirm-screen calls start from warm state — see the method doc.
-                        primeConfirmContracts(ctx);
-                        // ...then replay the wallet's recurring calls against this head
-                        // (async, heavy lane) so its next poll hits the result cache.
-                        // Guarded: an escaping throw here would land in the build's
-                        // catch and null out rpcCallCtx even though the head is good.
-                        try {
-                            replayHotCalls(ctx);
-                        } catch (Throwable t) {
-                            log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                        // Warm only a head the EVM will run against: past a fork this
+                        // engine refuses (Sepolia past Amsterdam on Besu 26.4) every call
+                        // and estimate is REFUSED, so the prime would spend snap fetches
+                        // on contracts nothing will execute and the replay would only
+                        // start every hot shape's backoff. evmRefusalOf never throws.
+                        String evmRefusal = evmRefusalOf(ctx.blockCtx());
+                        if (evmRefusal != null) {
+                            log.info("[rpc] head warm skipped at block #" + ctx.blockNumber()
+                                    + ": " + evmRefusal);
+                        } else {
+                            // After the future is completed (readers unblocked), prime the
+                            // confirm-critical contracts at this root so a wallet's first
+                            // confirm-screen calls start from warm state — see the method doc.
+                            primeConfirmContracts(ctx);
+                            // ...then replay the wallet's recurring calls against this head
+                            // (async, heavy lane) so its next poll hits the result cache.
+                            // Guarded: an escaping throw here would land in the build's
+                            // catch and null out rpcCallCtx even though the head is good.
+                            try {
+                                replayHotCalls(ctx);
+                            } catch (Throwable t) {
+                                log.info("[rpc] hot-call replay skipped: " + unwrap(t));
+                            }
                         }
                     } catch (Throwable t) {
                         f.completeExceptionally(t);
@@ -1556,6 +1567,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /**
+     * Why the EVM would refuse to run against {@code blockCtx} — the refusal of
+     * {@link io.myotis.evm.besu.EvmFactory#requireSupported} (an unknown chain, a block
+     * below the fork floor, or a fork this engine cannot price, e.g. Sepolia past
+     * Amsterdam on Besu 26.4) — or null when it would run. Cheap: selects the fork,
+     * builds nothing. Never throws, so the head-build thread can gate its warm-up on it.
+     */
+    static String evmRefusalOf(io.myotis.evm.BlockContext blockCtx) {
+        try {
+            io.myotis.evm.besu.EvmFactory.requireSupported(blockCtx);
+            return null;
+        } catch (RuntimeException e) {
+            return e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+        }
+    }
+
+    /**
      * Prime the confirm-critical contracts at a freshly-built head: fetch each
      * account record (banked per-root in the {@link #stateProofCache}) and its
      * bytecode (banked forever in the {@link #bytecodeCache} — code is keyed by
@@ -1587,21 +1614,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
-     *  beacon-finalized execution root (same headerChain method as get-account). */
+     *  beacon-finalized execution root (same headerChain method as get-account). The
+     *  finalized (number, root) pair is BeaconSyncState's — one atomic read — so it holds
+     *  before and after Gloas (where the light-client header proves only a block hash and
+     *  the pair appears once the EL header behind it is resolved). */
     private boolean anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot) throws Exception {
         BeaconLightClient blc = beaconLightClient;
         RLPxConnector conn = connector;
         if (blc == null || conn == null) return false;
-        com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
-                blc.getStore().getFinalizedHeader();
-        if (fin == null) return false;
-        com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-        if (exec.blockNumber() == peerBlock) {
+        if (blc.getStore().getFinalizedHeader() == null) return false;
+        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+        if (fin.stateRoot() == null) return false; // Gloas finality not resolved yet
+        if (fin.blockNumber() == peerBlock) {
             // Head is exactly the finalized block — roots must match directly.
-            return java.util.Arrays.equals(exec.stateRoot(), peerStateRoot);
+            return java.util.Arrays.equals(fin.stateRoot(), peerStateRoot);
         }
-        return verifyHeaderChainBatched(conn, exec.blockNumber(), peerBlock,
-                exec.stateRoot(), peerStateRoot)
+        return verifyHeaderChainBatched(conn, fin.blockNumber(), peerBlock,
+                fin.stateRoot(), peerStateRoot)
                 .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
     }
 
@@ -1641,23 +1670,50 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             com.jaeckel.ethp2p.consensus.types.LightClientHeader fin = blc.getStore().getFinalizedHeader();
             if (fin == null) throw new IllegalStateException("no beacon-verified finalized header yet");
             com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader exec = fin.execution();
-            Bytes32 finRoot = Bytes32.wrap(exec.stateRoot());
-            pinned = firstPeerServing(snapPeers, finRoot);
-            if (pinned == null) {
-                throw new IllegalStateException(
-                        "no snap peer retains the beacon-finalized state (block #"
-                        + exec.blockNumber() + ")");
+            if (exec != null) {
+                Bytes32 finRoot = Bytes32.wrap(exec.stateRoot());
+                pinned = firstPeerServing(snapPeers, finRoot);
+                if (pinned == null) {
+                    throw new IllegalStateException(
+                            "no snap peer retains the beacon-finalized state (block #"
+                            + exec.blockNumber() + ")");
+                }
+                blockCtx = new io.myotis.evm.BlockContext(
+                        exec.stateRoot(),
+                        exec.blockNumber(),
+                        exec.timestamp(),
+                        leUint256ToBigInteger(exec.baseFeePerGas()),
+                        io.myotis.evm.Address.of(exec.feeRecipient()),
+                        exec.prevRandao(),
+                        java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                        exec.gasLimit());
+                blockNumber = exec.blockNumber();
+            } else {
+                // Gloas: the light-client header proves only the execution block hash; the
+                // EL header that hashes to it — resolved by BeaconSyncState, every field
+                // bound to the proven hash by its keccak — carries the block context. It
+                // lags the store's finality until resolved: still final, only older.
+                BlockHeader el = beaconSyncState.getFinalizedExecutionHeader();
+                if (el == null) {
+                    throw new IllegalStateException(
+                            "beacon-finalized execution header not resolved yet (Gloas: only its hash is proven)");
+                }
+                pinned = firstPeerServing(snapPeers, el.stateRoot);
+                if (pinned == null) {
+                    throw new IllegalStateException(
+                            "no snap peer retains the beacon-finalized state (block #" + el.number + ")");
+                }
+                blockCtx = new io.myotis.evm.BlockContext(
+                        el.stateRoot.toArrayUnsafe(),
+                        el.number,
+                        el.timestamp,
+                        el.baseFeePerGas,
+                        io.myotis.evm.Address.of(el.beneficiary.toArrayUnsafe()),
+                        el.mixHashOrPrevRandao.toArrayUnsafe(),
+                        java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                        el.gasLimit);
+                blockNumber = el.number;
             }
-            blockCtx = new io.myotis.evm.BlockContext(
-                    exec.stateRoot(),
-                    exec.blockNumber(),
-                    exec.timestamp(),
-                    leUint256ToBigInteger(exec.baseFeePerGas()),
-                    io.myotis.evm.Address.of(exec.feeRecipient()),
-                    exec.prevRandao(),
-                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                    exec.gasLimit());
-            blockNumber = exec.blockNumber();
             verified = true;
         } else {
             // PEER_HEAD: each peer's bleeding-edge head root is frequently NOT yet
@@ -1676,14 +1732,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // head for 5+ min starved number-pinned reads.
             long finalizedFloor = -1;
             long optimisticHeadNum = -1;
+            // BeaconSyncState's resolved numbers: before Gloas they are the store's headers'
+            // own, after it the EL headers the proven block hashes resolved to.
             BeaconLightClient blcFloor = beaconLightClient;
             if (blcFloor != null) {
-                com.jaeckel.ethp2p.consensus.types.LightClientHeader finHdr =
-                        blcFloor.getStore().getFinalizedHeader();
-                if (finHdr != null) finalizedFloor = finHdr.execution().blockNumber();
-                com.jaeckel.ethp2p.consensus.types.LightClientHeader optHdr =
-                        blcFloor.getStore().getOptimisticHeader();
-                if (optHdr != null) optimisticHeadNum = optHdr.execution().blockNumber();
+                if (blcFloor.getStore().getFinalizedHeader() != null) {
+                    BeaconSyncState.FinalizedExecution finExec = beaconSyncState.getFinalizedExecution();
+                    if (finExec.stateRoot() != null) finalizedFloor = finExec.blockNumber();
+                }
+                if (blcFloor.getStore().getOptimisticHeader() != null
+                        && beaconSyncState.getOptimisticBlockHash() != null) {
+                    optimisticHeadNum = beaconSyncState.getOptimisticBlockNumber();
+                }
             }
             final long headFloor = Math.max(minHead, finalizedFloor);
             // When we have a beacon finalized anchor, probe each peer for its LIVE head by
@@ -2005,7 +2065,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /** eth_call over the shared anchored head, three-way: OK bytes, REVERTED with the
      *  revert payload (a verified answer — the EVM ran and the contract said no), or
-     *  UNAVAILABLE (no verified head / no peer / timeout — the retryable case). */
+     *  UNAVAILABLE (no verified head / no peer / timeout — the retryable case). Plus
+     *  REFUSED for a head whose fork this engine cannot price (permanent). */
     private io.myotis.api.CallResult rpcCallDetailed(byte[] from, byte[] to, byte[] data,
                                                      java.math.BigInteger value, String block) {
         // Keep the early-rejection logs correlatable with the wallet call that triggered
@@ -2175,6 +2236,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         + (leader ? "" : " (deduped)"));
                 return io.myotis.api.CallResult.reverted(revert);
             }
+            // A fork this engine cannot price (Sepolia past Amsterdam on Besu 26.4)
+            // is not "no verified answer right now": no retry can change it, so it
+            // is REFUSED — served as the permanent -32602, not the -32000 a wallet
+            // would spin on.
+            String refusal = unsupportedForkOf(e);
+            if (refusal != null) {
+                log.info("[rpc] eth_call " + desc + " -> refused: " + refusal);
+                return io.myotis.api.CallResult.refused(refusal);
+            }
             log.info("[rpc] eth_call " + desc + " -> error after "
                     + (clock.elapsedMillis() - t0) + "ms"
                     + (leader ? "" : " (deduped)") + ": " + describeEvmError(e));
@@ -2194,6 +2264,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             if (c instanceof io.myotis.evm.EvmExecutionException ee
                     && ee.error() instanceof io.myotis.evm.EvmExecutionError.Reverted r) {
                 return r.data();
+            }
+        }
+        return null;
+    }
+
+    /** The refusal reason when the throwable chain holds an
+     *  {@link io.myotis.evm.EvmExecutionError.UnsupportedFork} (a fork this engine
+     *  cannot price — permanent for this build), else null. Same cause-walk as
+     *  {@link #revertDataOf}; package-private as a test seam. */
+    static String unsupportedForkOf(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.UnsupportedFork u) {
+                return u.detail();
             }
         }
         return null;
@@ -2733,9 +2817,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         BeaconLightClient blc = beaconLightClient;
         if (blc == null) return -1;
         try {
-            com.jaeckel.ethp2p.consensus.types.LightClientHeader fin =
-                    blc.getStore().getFinalizedHeader();
-            return fin != null ? fin.execution().blockNumber() : -1;
+            if (blc.getStore().getFinalizedHeader() == null) return -1;
+            // BeaconSyncState's resolved finality (before Gloas: the store header's own).
+            BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+            return fin.stateRoot() != null ? fin.blockNumber() : -1;
         } catch (Exception e) {
             return -1;
         }
@@ -3887,7 +3972,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * payload (a verified answer — the tx cannot succeed as composed; the router
      * serves code 3 and the wallet must not broadcast it); UNAVAILABLE is the
      * retryable case (no anchored head / no peer / timeout; contract creation is
-     * also not served verified yet).
+     * also not served verified yet); REFUSED is a head whose fork this engine
+     * cannot price (permanent — see {@link #rpcCallDetailed}).
      */
     private io.myotis.api.EstimateResult rpcEstimateGasDetailed(byte[] from, byte[] to, byte[] data,
                                                                 java.math.BigInteger value) {
@@ -3908,6 +3994,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         Long cachedGas = estimateCache.get(estKey, clock.elapsedMillis());
         if (cachedGas != null) return io.myotis.api.EstimateResult.ok(cachedGas);
         try {
+            // Fork validation FIRST (the Rust estimate's spec_for twin): the fast path
+            // below never reaches the EVM factory, so without this a head the executor
+            // REFUSES — Sepolia past Amsterdam, which Besu 26.4 cannot price — would
+            // still get 21000, a pre-Amsterdam answer (EIP-2780 reprices transfers).
+            // Cheap: selects the fork, builds nothing.
+            io.myotis.evm.besu.EvmFactory.requireSupported(h.blockCtx());
             // Fast path: a value transfer with no calldata to a plain account costs
             // exactly 21000 — no EVM execution, no 15% headroom (it's exact). This is
             // MetaMask's send-ETH flow. We still fetch the recipient ONCE to confirm
@@ -3957,6 +4049,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // probes re-run the estimate; nothing dedups them beyond the EVM lanes.
                 log.info("[rpc] eth_estimateGas -> reverted (" + revert.length + " bytes)");
                 return io.myotis.api.EstimateResult.reverted(revert);
+            }
+            // Permanent for this build (see rpcCallDetailed): REFUSED, not retryable.
+            String refusal = unsupportedForkOf(e);
+            if (refusal != null) {
+                log.info("[rpc] eth_estimateGas -> refused: " + refusal);
+                return io.myotis.api.EstimateResult.refused(refusal);
             }
             log.info("[rpc] eth_estimateGas -> error: " + describeEvmError(e));
             if (isStateUnavailable(e)) evictUnservableHead(h);

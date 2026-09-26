@@ -151,6 +151,21 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private volatile long dnsDialWindowStartMs = 0L;
     private final AtomicInteger dnsDialsInWindow = new AtomicInteger(0);
     private volatile ScheduledExecutorService peerMaintainer;
+
+    // -- execution-anchor resolver (Gloas) --------------------------------------
+    /** Peers one pending block hash is asked of per round, and each one's deadline
+     *  (Rust twins: RESOLVE_PEERS_PER_ROUND / RESOLVE_TIMEOUT in el/pool.rs). */
+    static final int ANCHOR_RESOLVE_PEERS = 4;
+    static final long ANCHOR_RESOLVE_TIMEOUT_MS = 5_000L;
+    /** Retry cadence for a hash no peer served yet (Rust: RESOLVE_RETRY) — the block may
+     *  not have reached them; a Gloas head names its PARENT payload, so this is rare. */
+    static final long ANCHOR_RESOLVE_RETRY_MS = 2_000L;
+    /** Resolves BeaconSyncState's pending block hashes into headers (Gloas light-client
+     *  headers prove only the hash). Networking-scoped: built by start()/resume(), closed
+     *  with the other timers on pause/shutdown. */
+    private volatile ScheduledExecutorService anchorResolver;
+    /** At most one listener-triggered pass queued behind the running one. */
+    private final AtomicBoolean anchorResolvePassQueued = new AtomicBoolean(false);
     /** Monotonic ms (nanoTime-derived) when the snap serving pool went empty. Only
      *  meaningful while {@link #snapZeroActive}; nanoTime's origin is arbitrary (can
      *  be ≤ 0), so an explicit flag marks validity instead of a 0 sentinel. Written
@@ -335,8 +350,12 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
 
             // 4. Beacon: sync-state + discv5 (CL discovery) + light client.
             this.beaconSyncState = new BeaconSyncState();
+            // Gloas: a newly pending block hash wakes the resolver at once (the state
+            // outlives pause/resume, so the hook is set once and reads the live executor).
+            this.beaconSyncState.setPendingListener(this::wakeAnchorResolver);
             startDiscV5();
             buildAndStartBeacon(dnsClEnrs);
+            startAnchorResolver();
 
             // 5. Verified JSON-RPC (best-effort; a bind failure here does not fail the stack).
             //    Warm-up window first (WakeGate#beginWarmup): reads that arrive while the
@@ -420,6 +439,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             startDiscV5();                   // non-essential, warn-and-continue
             BeaconLightClient blc = beaconLightClient;
             if (blc != null) blc.resume();
+            startAnchorResolver();
             io.myotis.jsonrpc.MyotisRpcServer liveServer = rpcServer;
             if (liveServer != null && liveServer.isServing()) {
                 // The listener survived the pause; swap a fresh backend in behind
@@ -473,6 +493,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         elHunting = false;
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
+        stopAnchorResolver();
         io.myotis.rpc.VerifiedRpcBackend backend = rpcBackend;
         if (backend != null) {
             rpcBackend = null; // gate re-reads this; null → requests hold instead of hitting a closed backend
@@ -506,6 +527,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         started = false;   // a fresh start() after shutdown re-anchors uptime to that run
         ScheduledExecutorService pm = peerMaintainer;
         if (pm != null) { pm.shutdownNow(); peerMaintainer = null; }
+        stopAnchorResolver();
         if (rpcServer != null) { try { rpcServer.stop(); } catch (Throwable ignored) {} }
         // A stopped stack has no listener EXPECTATION either — zero the recorded
         // port so the status row hides instead of misreporting a normal stop as
@@ -1276,6 +1298,80 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         return headers.get(headers.size() - 1).hash().equals(anchor.topHash());
     }
 
+    // -------------------------------------------------------------------------
+    // Execution-anchor resolver (Gloas)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Start resolving the execution anchor's pending block hashes into headers — Gloas
+     * light-client headers prove only the hash (see {@link BeaconSyncState#resolveHeader}).
+     * One pass right away (anything noted while paused), then every
+     * {@link #ANCHOR_RESOLVE_RETRY_MS} — an idle pass is one lock and an empty list — and
+     * at once whenever a new hash becomes pending ({@link #wakeAnchorResolver}). Twin of the
+     * Rust {@code PeerPool::start_anchor_resolver}.
+     *
+     * <p>Only on a network whose fork schedule has a Gloas epoch: before Gloas a header
+     * carries its execution payload and nothing is ever pending, so elsewhere there is no
+     * thread and no tick. The pending listener stays wired either way — with no resolver
+     * running, {@link #wakeAnchorResolver} is a no-op.
+     */
+    private void startAnchorResolver() {
+        if (anchorResolver != null || !network.forkSchedule().gloasEpoch().isPresent()) return;
+        ScheduledExecutorService ex = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "anchor-resolver-" + network.name());
+            t.setDaemon(true);
+            return t;
+        });
+        anchorResolvePassQueued.set(false);
+        anchorResolver = ex;
+        ex.scheduleWithFixedDelay(this::resolvePendingAnchors, 0, ANCHOR_RESOLVE_RETRY_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopAnchorResolver() {
+        ScheduledExecutorService ex = anchorResolver;
+        if (ex != null) { anchorResolver = null; ex.shutdownNow(); }
+    }
+
+    /** BeaconSyncState's pending hook: a hash just became pending — resolve now rather than
+     *  at the next tick. Runs on the light client's thread, so it only queues a pass. */
+    private void wakeAnchorResolver() {
+        ScheduledExecutorService ex = anchorResolver;
+        if (ex == null || !anchorResolvePassQueued.compareAndSet(false, true)) return;
+        try {
+            ex.execute(() -> {
+                anchorResolvePassQueued.set(false);
+                resolvePendingAnchors();
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            anchorResolvePassQueued.set(false); // paused or shutting down
+        }
+    }
+
+    /**
+     * One resolver pass: for each pending hash, ask up to {@link #ANCHOR_RESOLVE_PEERS}
+     * ready EL peers in rotation ({@link #ANCHOR_RESOLVE_TIMEOUT_MS} each) and offer what
+     * they serve to the anchor, which adopts a header only when the keccak of its raw RLP
+     * IS the hash. Any peer may serve it and none can forge it; the anchor, not this loop,
+     * is the verifier. Never throws (a throw would cancel the fixed-delay schedule).
+     */
+    private void resolvePendingAnchors() {
+        try {
+            BeaconSyncState bss = beaconSyncState;
+            RLPxConnector conn = connector;
+            if (bss == null || conn == null) return;
+            for (byte[] hash : bss.pendingHashes()) {
+                if (Thread.currentThread().isInterrupted()) return;
+                org.apache.tuweni.bytes.Bytes32 h = org.apache.tuweni.bytes.Bytes32.wrap(hash);
+                boolean resolved = conn.fetchHeaderByHash(h, ANCHOR_RESOLVE_PEERS,
+                        ANCHOR_RESOLVE_TIMEOUT_MS, bss::resolveHeader);
+                log.debug("[{}] execution anchor: header {} {}", network.name(), h.toShortHexString(),
+                        resolved ? "resolved by hash" : "not served yet — retrying");
+            }
+        } catch (Throwable t) {
+            log.debug("[{}] execution anchor resolver pass failed: {}", network.name(), t.toString());
+        }
+    }
+
     private void startPeerMaintainer() {
         if (peerMaintainer != null) return;
         peerMaintainer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1448,7 +1544,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             lastDnsResolveMs = System.currentTimeMillis();
             if (!resolved.isEmpty()) lastDnsSuccessMs = lastDnsResolveMs;
 
-            byte[] ourFork = network.forkIdHash();
+            byte[] ourFork = network.currentForkId().hashBytes();   // effective across a known fork
             LinkedHashMap<String, Enr> merged = new LinkedHashMap<>();
             for (Enr e : dnsElPool) {
                 e.tcpAddress().ifPresent(a -> merged.put(a.getHostString() + ":" + a.getPort(), e));

@@ -294,14 +294,43 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
-    void callInvalidParamsEnvelopeIsStillAnError() {
+    void callInvalidParamsEnvelopeIsAPermanentRefusal() {
         // ABI 27: eth_call's permanent block refusal carries a JSON-RPC code
-        // (eljson::invalid_params_json, pinned there by invalid_params_json_shape).
-        // The second key must not make it read as a result with no status.
+        // (eljson::invalid_params_json, pinned there by invalid_params_json_shape);
+        // since ABI 33 an executor refusal uses the same envelope. CLAUDE.md
+        // requires a refusal to be PERMANENT (-32602), so it must reach the
+        // wallet as REFUSED (the router serves -32602), not as an error the
+        // adapter reads as UNAVAILABLE (the retryable -32000 a client spins on).
+        // The second key must not make it read as a result with no status either.
         String json = "{\"error\":\"block \\\"0x1\\\" is too old\",\"code\":-32602}";
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(json);
+        assertEquals(io.myotis.api.CallResult.Status.REFUSED, r.status());
+        assertEquals("block \"0x1\" is too old", r.detail());
+        assertNull(r.data());
+        // The legacy two-state view has no refusal: null, like any non-ok outcome.
+        assertNull(RustChainHandle.callResultFromJson(json));
+        // Only -32602 is a refusal: an error with another code still throws
+        // (the adapter's retryable UNAVAILABLE), as a plain {"error"} does.
         EngineException e = assertThrows(EngineException.class,
-                () -> RustChainHandle.callDetailedFromJson(json));
-        assertEquals("block \"0x1\" is too old", e.getMessage());
+                () -> RustChainHandle.callDetailedFromJson("{\"error\":\"busy\",\"code\":-32000}"));
+        assertEquals("busy", e.getMessage());
+    }
+
+    @Test
+    void estimateInvalidParamsEnvelopeIsAPermanentRefusal() {
+        // ABI 33: estimate_gas_json returns the same permanent envelope for an
+        // executor refusal (an Amsterdam block without EIP-7843's slot_number,
+        // eljson::estimate_json over GasOutcome::Refused). CLAUDE.md: a refusal
+        // is PERMANENT (-32602) — REFUSED, never the retryable UNAVAILABLE.
+        String why = "block 0x10 is an Amsterdam block without a slot number";
+        String json = "{\"error\":\"" + why + "\",\"code\":-32602}";
+        io.myotis.api.EstimateResult r = RustChainHandle.estimateGasDetailedFromJson(json);
+        assertEquals(io.myotis.api.EstimateResult.Status.REFUSED, r.status());
+        assertEquals(why, r.detail());
+        assertNull(r.revertData());
+        // A plain error envelope is still a failure to answer, not a refusal.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasDetailedFromJson("{\"error\":\"handle not started\"}"));
     }
 
     // ---- eth_estimateGas (estimateGasFromJson) ----

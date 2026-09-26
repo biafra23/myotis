@@ -86,6 +86,30 @@ public class BeaconP2PService implements AutoCloseable {
         byte[] handle(byte[] requestSsz, String peerId) throws Exception;
     }
 
+    /**
+     * One req/resp response chunk: its context bytes — the fork digest of THAT object's
+     * epoch, which picks its decoder once a fork changes the wire shape (Gloas) — and its
+     * SSZ payload. A range response can span a fork, so the digest is per chunk.
+     */
+    public record ContextPayload(byte[] forkDigest, byte[] payload) {}
+
+    /**
+     * A responder whose answer carries its own context bytes: a relayed light-client object
+     * keeps the fork digest it was received and verified under, whatever fork is current
+     * when a peer asks (a pre-fork object stays tagged pre-fork after the fork, and vice
+     * versa). A null digest falls back to the current fork digest.
+     */
+    @FunctionalInterface
+    interface ContextReqRespHandler extends ReqRespHandler {
+        ContextPayload respond(byte[] requestSsz, String peerId) throws Exception;
+
+        @Override
+        default byte[] handle(byte[] requestSsz, String peerId) throws Exception {
+            ContextPayload r = respond(requestSsz, peerId);
+            return r != null ? r.payload() : null;
+        }
+    }
+
     private volatile Host host;
     private Identify identifyBinding;
 
@@ -140,13 +164,15 @@ public class BeaconP2PService implements AutoCloseable {
      * Relay cache: the most recent successful response we observed for a
      * given protocol. Used to serve peer-initiated requests for the same
      * protocol without needing a full-node view — we simply forward whatever
-     * upstream peer last gave us, provided it is still fresh. Values are the
-     * raw SSZ payload, not the wire-format response frame.
+     * upstream peer last gave us, provided it is still fresh. Each entry holds
+     * the raw SSZ payload (not the wire-format response frame) together with
+     * the context bytes it arrived with, served back verbatim: the digest names
+     * the object's own fork, not the one current when a peer asks.
      */
-    private final Map<String, byte[]> relayCache = new ConcurrentHashMap<>();
+    private final Map<String, RelayEntry> relayCache = new ConcurrentHashMap<>();
 
-    /** Wall-clock timestamp (ms) when each relay entry was last updated. */
-    private final Map<String, Long> relayCacheAtMs = new ConcurrentHashMap<>();
+    /** A relayed object: its context bytes, its SSZ, and when it was cached (wall ms). */
+    private record RelayEntry(byte[] forkDigest, byte[] payload, long atMs) {}
 
     /** Max age we'll relay a cached response. Older than this we 503 the peer. */
     private static final long RELAY_MAX_AGE_MS = 90_000; // 3 slots * 12s + buffer
@@ -238,33 +264,41 @@ public class BeaconP2PService implements AutoCloseable {
     // peers who query us can get the same data back until it ages out.
     // -------------------------------------------------------------------------
 
-    public void cacheFinalityUpdate(byte[] sszPayload) {
-        cacheRelay(FINALITY, sszPayload);
+    /** Cache a verified finality update with the context bytes to serve it under — the
+     *  fork digest of its attested slot ({@code BeaconLightClient.relayDigest}), not the
+     *  upstream's, which nothing checks. */
+    public void cacheFinalityUpdate(byte[] forkDigest, byte[] sszPayload) {
+        cacheRelay(FINALITY, forkDigest, sszPayload);
     }
 
-    public void cacheOptimisticUpdate(byte[] sszPayload) {
-        cacheRelay(OPTIMISTIC, sszPayload);
+    /** Cache an optimistic update with the context bytes to serve it under (the fork digest
+     *  of its attested slot, as for {@link #cacheFinalityUpdate}). */
+    public void cacheOptimisticUpdate(byte[] forkDigest, byte[] sszPayload) {
+        cacheRelay(OPTIMISTIC, forkDigest, sszPayload);
     }
 
-    public void cacheBootstrap(byte[] blockRoot32, byte[] sszPayload) {
+    /** Cache the verified bootstrap for {@code blockRoot32} with the context bytes to serve
+     *  it under (the fork digest of its header's slot). */
+    public void cacheBootstrap(byte[] blockRoot32, byte[] forkDigest, byte[] sszPayload) {
         if (blockRoot32 != null && blockRoot32.length == 32) {
             this.bootstrapBlockRoot = blockRoot32.clone();
         }
-        cacheRelay(BOOTSTRAP, sszPayload);
+        cacheRelay(BOOTSTRAP, forkDigest, sszPayload);
     }
 
-    private void cacheRelay(String protocolId, byte[] sszPayload) {
+    /** An object without its 4-byte context is not cached: relaying it under a guessed
+     *  digest could hand a peer the wrong fork's decoder. */
+    private void cacheRelay(String protocolId, byte[] forkDigest, byte[] sszPayload) {
         if (sszPayload == null || sszPayload.length == 0) return;
-        relayCache.put(protocolId, sszPayload);
-        relayCacheAtMs.put(protocolId, System.currentTimeMillis());
+        if (forkDigest == null || forkDigest.length != 4) return;
+        relayCache.put(protocolId, new RelayEntry(forkDigest.clone(), sszPayload, System.currentTimeMillis()));
     }
 
-    private byte[] freshRelay(String protocolId) {
-        byte[] payload = relayCache.get(protocolId);
-        Long at = relayCacheAtMs.get(protocolId);
-        if (payload == null || at == null) return null;
-        if (System.currentTimeMillis() - at > RELAY_MAX_AGE_MS) return null;
-        return payload;
+    private RelayEntry freshRelay(String protocolId) {
+        RelayEntry e = relayCache.get(protocolId);
+        if (e == null) return null;
+        if (System.currentTimeMillis() - e.atMs() > RELAY_MAX_AGE_MS) return null;
+        return e;
     }
 
     /**
@@ -584,14 +618,14 @@ public class BeaconP2PService implements AutoCloseable {
      * recently received upstream. Returns null (ResourceUnavailable) when
      * the cache is empty or stale; peers interpret that as "ask someone else".
      */
-    private ReqRespHandler relayHandler(String protoId) {
-        return (req, peerId) -> {
-            byte[] cached = freshRelay(protoId);
+    ReqRespHandler relayHandler(String protoId) {
+        return (ContextReqRespHandler) (req, peerId) -> {
+            RelayEntry cached = freshRelay(protoId);
             if (cached == null) {
                 log.debug("[beacon-p2p] relay miss for {}, returning ResourceUnavailable", protoId);
                 return null;
             }
-            return cached;
+            return new ContextPayload(cached.forkDigest(), cached.payload());
         };
     }
 
@@ -600,9 +634,9 @@ public class BeaconP2PService implements AutoCloseable {
      * exactly the block root we bootstrapped from. That's the only root we
      * have verified branches for, so anything else must be ResourceUnavailable.
      */
-    private ReqRespHandler bootstrapHandler() {
-        return (req, peerId) -> {
-            byte[] cached = freshRelay(BOOTSTRAP);
+    ReqRespHandler bootstrapHandler() {
+        return (ContextReqRespHandler) (req, peerId) -> {
+            RelayEntry cached = freshRelay(BOOTSTRAP);
             byte[] expectedRoot = bootstrapBlockRoot;
             if (cached == null || expectedRoot == null) return null;
             if (req == null || req.length != 32) {
@@ -612,7 +646,7 @@ public class BeaconP2PService implements AutoCloseable {
                 log.debug("[beacon-p2p] bootstrap request for unknown root, returning ResourceUnavailable");
                 return null;
             }
-            return cached;
+            return new ContextPayload(cached.forkDigest(), cached.payload());
         };
     }
 
@@ -1085,6 +1119,11 @@ public class BeaconP2PService implements AutoCloseable {
     }
 
     public CompletableFuture<byte[]> requestBootstrap(String peerMultiaddr, byte[] blockRoot32) {
+        return requestBootstrapWithContext(peerMultiaddr, blockRoot32).thenApply(ContextPayload::payload);
+    }
+
+    /** {@link #requestBootstrap} keeping the response's context bytes (its fork digest). */
+    public CompletableFuture<ContextPayload> requestBootstrapWithContext(String peerMultiaddr, byte[] blockRoot32) {
         if (blockRoot32 == null || blockRoot32.length != 32) {
             return Futures.failedFuture(
                     new IllegalArgumentException("blockRoot32 must be exactly 32 bytes"));
@@ -1096,7 +1135,7 @@ public class BeaconP2PService implements AutoCloseable {
             return Futures.failedFuture(e);
         }
         return doReqResp(peerMultiaddr, BOOTSTRAP, requestPayload)
-                .thenApply(BeaconP2PService::decodeSingleResponse);
+                .thenApply(BeaconP2PService::decodeSingleResponseWithContext);
     }
 
     public CompletableFuture<byte[]> requestFinalityUpdate(String peerMultiaddr) {
@@ -1112,15 +1151,25 @@ public class BeaconP2PService implements AutoCloseable {
      * fan-out, which opens up to 16 streams per round.
      */
     public CompletableFuture<byte[]> requestFinalityUpdate(String peerMultiaddr, long timeoutMs) {
+        return requestFinalityUpdateWithContext(peerMultiaddr, timeoutMs).thenApply(ContextPayload::payload);
+    }
+
+    /** {@link #requestFinalityUpdate(String, long)} keeping the response's context bytes. */
+    public CompletableFuture<ContextPayload> requestFinalityUpdateWithContext(String peerMultiaddr, long timeoutMs) {
         // No request body for finality_update — send nothing, just close write side
         return doReqResp(peerMultiaddr, FINALITY, new byte[0], timeoutMs)
-                .thenApply(BeaconP2PService::decodeSingleResponse);
+                .thenApply(BeaconP2PService::decodeSingleResponseWithContext);
     }
 
     public CompletableFuture<byte[]> requestOptimisticUpdate(String peerMultiaddr) {
+        return requestOptimisticUpdateWithContext(peerMultiaddr).thenApply(ContextPayload::payload);
+    }
+
+    /** {@link #requestOptimisticUpdate} keeping the response's context bytes. */
+    public CompletableFuture<ContextPayload> requestOptimisticUpdateWithContext(String peerMultiaddr) {
         // No request body for optimistic_update — send nothing, just close write side
         return doReqResp(peerMultiaddr, OPTIMISTIC, new byte[0])
-                .thenApply(BeaconP2PService::decodeSingleResponse);
+                .thenApply(BeaconP2PService::decodeSingleResponseWithContext);
     }
 
     public CompletableFuture<List<byte[]>> requestUpdatesByRange(
@@ -1137,6 +1186,16 @@ public class BeaconP2PService implements AutoCloseable {
      */
     public CompletableFuture<List<byte[]>> requestUpdatesByRange(
             String peerMultiaddr, long startPeriod, int count, long timeoutMs) {
+        return requestUpdatesByRangeWithContext(peerMultiaddr, startPeriod, count, timeoutMs)
+                .thenApply(BeaconP2PService::payloadsOf);
+    }
+
+    /**
+     * {@link #requestUpdatesByRange(String, long, int, long)} keeping each chunk's context
+     * bytes: one response can span a fork, so every update carries its own digest.
+     */
+    public CompletableFuture<List<ContextPayload>> requestUpdatesByRangeWithContext(
+            String peerMultiaddr, long startPeriod, int count, long timeoutMs) {
         byte[] sszRequest = encodeUpdatesByRangeRequest(startPeriod, count);
         byte[] requestPayload;
         try {
@@ -1147,11 +1206,17 @@ public class BeaconP2PService implements AutoCloseable {
         return doReqResp(peerMultiaddr, UPDATES, requestPayload, timeoutMs)
                 .thenApply(raw -> {
                     try {
-                        return decodeUpdatesByRangeResponse(raw, count);
+                        return decodeMultiChunkResponseWithContext(raw, count);
                     } catch (IOException e) {
                         throw new RuntimeException("Failed to decode updates_by_range response", e);
                     }
                 });
+    }
+
+    private static List<byte[]> payloadsOf(List<ContextPayload> chunks) {
+        List<byte[]> out = new ArrayList<>(chunks.size());
+        for (ContextPayload c : chunks) out.add(c.payload());
+        return out;
     }
 
     /**
@@ -1185,6 +1250,18 @@ public class BeaconP2PService implements AutoCloseable {
 
     private static byte[] decodeSingleResponse(byte[] raw) {
         return decodeSingleResponse(raw, true);
+    }
+
+    /** A context-bearing single response: its fork digest and its SSZ payload. */
+    static ContextPayload decodeSingleResponseWithContext(byte[] raw) {
+        try {
+            ReqRespCodec.DecodeResult result = ReqRespCodec.decodeResponse(raw, true);
+            return new ContextPayload(result.forkDigest(), result.sszPayload());
+        } catch (Exception e) {
+            log.warn("[beacon-p2p] Failed to decode response ({} bytes): {} — first 20 bytes: {}",
+                    raw.length, e.getMessage(), bytesToHex(raw, 20));
+            throw new RuntimeException("Failed to decode response: " + e.getMessage(), e);
+        }
     }
 
     /**
@@ -1412,9 +1489,9 @@ public class BeaconP2PService implements AutoCloseable {
         return buf.array();
     }
 
-    private static List<byte[]> decodeUpdatesByRangeResponse(byte[] raw, int expectedCount)
+    private static List<byte[]> decodeMultiChunkResponse(byte[] raw, long expectedCount)
             throws IOException {
-        return decodeMultiChunkResponse(raw, expectedCount);
+        return payloadsOf(decodeMultiChunkResponseWithContext(raw, expectedCount));
     }
 
     /**
@@ -1425,9 +1502,9 @@ public class BeaconP2PService implements AutoCloseable {
      * length to resolve ambiguity between snappy compressed frames (type 0x00) and
      * the next chunk's result code (also 0x00).
      */
-    private static List<byte[]> decodeMultiChunkResponse(byte[] raw, long expectedCount)
+    static List<ContextPayload> decodeMultiChunkResponseWithContext(byte[] raw, long expectedCount)
             throws IOException {
-        List<byte[]> items = new ArrayList<>();
+        List<ContextPayload> items = new ArrayList<>();
         int pos = 0;
         while (pos < raw.length && items.size() < expectedCount) {
             byte resultCode = raw[pos];
@@ -1470,14 +1547,16 @@ public class BeaconP2PService implements AutoCloseable {
             }
             pos++;
             if (pos + 4 > raw.length) break;
-            pos += 4; // skip fork digest
+            // The chunk's fork digest: per chunk, since one response can span a fork.
+            byte[] forkDigest = java.util.Arrays.copyOfRange(raw, pos, pos + 4);
+            pos += 4;
             ReqRespCodec.VarintResult varint = ReqRespCodec.readVarint(raw, pos);
             pos = varint.nextPos();
             int uncompressedLength = varint.value();
             if (uncompressedLength == 0) {
                 log.info("[beacon-p2p] Multi-chunk chunk {} has uncompressedLength=0 (raw {} bytes, first 32: {})",
                         items.size(), raw.length, bytesToHex(raw, Math.min(32, raw.length)));
-                items.add(new byte[0]);
+                items.add(new ContextPayload(forkDigest, new byte[0]));
                 continue;
             }
 
@@ -1506,7 +1585,7 @@ public class BeaconP2PService implements AutoCloseable {
                         bytesToHex(raw, Math.min(48, raw.length)));
                 break;
             }
-            items.add(decompressed);
+            items.add(new ContextPayload(forkDigest, decompressed));
         }
         return items;
     }
@@ -2053,8 +2132,15 @@ public class BeaconP2PService implements AutoCloseable {
             }
 
             byte[] responseSsz;
+            byte[] ownContext = null;
             try {
-                responseSsz = handler.handle(reqSsz, peerId);
+                if (handler instanceof ContextReqRespHandler contextual) {
+                    ContextPayload r = contextual.respond(reqSsz, peerId);
+                    responseSsz = r != null ? r.payload() : null;
+                    ownContext = r != null ? r.forkDigest() : null;
+                } else {
+                    responseSsz = handler.handle(reqSsz, peerId);
+                }
             } catch (IllegalArgumentException e) {
                 writeError(ctx, (byte) 0x01, "InvalidRequest: " + e.getMessage());
                 return;
@@ -2071,7 +2157,8 @@ public class BeaconP2PService implements AutoCloseable {
             }
 
             try {
-                byte[] response = encodeSuccessResponse(responseSsz);
+                byte[] response = encodeSuccessResponse(responseSsz, hasContextBytes, ownContext,
+                        forkDigestSupplier);
                 ctx.writeAndFlush(Unpooled.wrappedBuffer(response)).addListener(f -> {
                     long dur = System.currentTimeMillis() - startMs;
                     log.debug("[beacon-p2p] responder proto={} peer={} agent={} wrote {}B success={} durMs={}",
@@ -2103,12 +2190,18 @@ public class BeaconP2PService implements AutoCloseable {
             }
         }
 
-        private byte[] encodeSuccessResponse(byte[] ssz) throws IOException {
+        /**
+         * The success frame {@code 0x00 || [context bytes] || varint(len) || snappy(ssz)}.
+         * The context bytes are the response's own ({@code ownContext}, a relayed object's
+         * digest as received) when it carries a 4-byte one, else the current fork digest.
+         */
+        static byte[] encodeSuccessResponse(byte[] ssz, boolean hasContextBytes, byte[] ownContext,
+                                            Supplier<byte[]> currentForkDigest) throws IOException {
             byte[] compressed = ReqRespCodec.snappyCompress(ssz);
             ByteArrayOutputStream out = new ByteArrayOutputStream(compressed.length + 16);
             out.write(0x00);
             if (hasContextBytes) {
-                byte[] fd = forkDigestSupplier.get();
+                byte[] fd = ownContext != null && ownContext.length == 4 ? ownContext : currentForkDigest.get();
                 if (fd == null || fd.length != 4) fd = new byte[4];
                 out.write(fd);
             }

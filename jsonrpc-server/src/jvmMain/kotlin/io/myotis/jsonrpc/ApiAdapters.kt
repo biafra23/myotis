@@ -71,6 +71,7 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
             io.myotis.api.CallResult.Status.OK -> RpcCallResult.ok(r.data() ?: ByteArray(0))
             io.myotis.api.CallResult.Status.REVERTED -> RpcCallResult.reverted(r.data() ?: ByteArray(0))
             io.myotis.api.CallResult.Status.UNAVAILABLE -> RpcCallResult.unavailable(r.detail())
+            io.myotis.api.CallResult.Status.REFUSED -> RpcCallResult.refused(r.detail() ?: "refused by the engine")
         }
     }
     override fun getBalance(address: ByteArray, block: String): String? = v.getBalance(address, block)
@@ -107,6 +108,8 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
             io.myotis.api.EstimateResult.Status.REVERTED ->
                 RpcEstimateResult.reverted(r.revertData() ?: ByteArray(0))
             io.myotis.api.EstimateResult.Status.UNAVAILABLE -> RpcEstimateResult.unavailable(r.detail())
+            io.myotis.api.EstimateResult.Status.REFUSED ->
+                RpcEstimateResult.refused(r.detail() ?: "refused by the engine")
         }
     }
 }

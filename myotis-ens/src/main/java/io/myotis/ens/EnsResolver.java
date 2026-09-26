@@ -440,7 +440,7 @@ public final class EnsResolver {
             System.arraycopy(EXTENDED_RESOLVER_INTERFACE_ID, 0, arg, 0, 4);
             byte[] supportsCall = AbiEncoder.encodeCall(SUPPORTS_INTERFACE, AbiEncoder.bytes32(arg));
             return executor.callView(resolver, supportsCall, ctx)
-                    .handle(EnsResolver::decodeBool)
+                    .handle(EnsResolver::decodeSupportsInterface)
                     .thenApply(extended -> {
                         ResolverInfo info = new ResolverInfo(resolver, exact, extended);
                         RESOLVER_CACHE.put(cacheKey, new CachedResolver(
@@ -450,21 +450,47 @@ public final class EnsResolver {
         });
     }
 
-    /** Try {@code registry.resolver(namehash(labels[i:]))}; recurse to the parent on zero/error. */
+    /**
+     * Try {@code registry.resolver(namehash(labels[i:]))}; recurse to the parent on a zero
+     * address or a revert. Any other failure — an oracle or network error, a block the EVM
+     * refuses to run (Sepolia past Amsterdam on Besu 26.4) — fails the walk instead: its
+     * empty result means "unregistered", a definitive answer, and a failure read as one is
+     * a well-formed wrong answer (every name "does not resolve"). Rust twin:
+     * {@code find_resolver}, which continues only on a revert.
+     */
     private CompletableFuture<Optional<Found>> walkResolver(String[] labels, int i, BlockContext ctx) {
         if (i >= labels.length) return CompletableFuture.completedFuture(Optional.empty());
         String suffix = String.join(".", java.util.Arrays.asList(labels).subList(i, labels.length));
         byte[] node = Namehash.of(suffix);
         byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
         return executor.callView(registry, calldata, ctx)
-                .handle((res, err) -> err == null ? decodeAddressOrEmpty(res) : Optional.<Address>empty())
+                .handle((res, err) -> {
+                    if (err == null) return decodeAddressOrEmpty(res);
+                    if (isRevert(err)) return Optional.<Address>empty();
+                    throw new CompletionException(unwrap(err));
+                })
                 .thenCompose(addr -> addr.isPresent()
                         ? CompletableFuture.completedFuture(Optional.of(new Found(addr.get(), i == 0)))
                         : walkResolver(labels, i + 1, ctx));
     }
 
-    private static boolean decodeBool(byte[] result, Throwable error) {
-        return error == null && result != null && result.length >= 32 && result[31] != 0;
+    /**
+     * ERC-165 {@code supportsInterface}: false on a revert (a resolver without ERC-165); any
+     * other failure propagates rather than silently choosing the legacy path, which would
+     * then be cached for {@link #RESOLVER_CACHE_TTL_MS}. Rust twin: {@code supports_interface}.
+     */
+    private static boolean decodeSupportsInterface(byte[] result, Throwable error) {
+        if (error != null) {
+            if (isRevert(error)) return false;
+            throw new CompletionException(unwrap(error));
+        }
+        return result != null && result.length >= 32 && result[31] != 0;
+    }
+
+    /** Whether {@code error} is an EVM revert — a contract's answer, unlike every other failure. */
+    private static boolean isRevert(Throwable error) {
+        return unwrap(error) instanceof EvmExecutionException eee
+                && eee.error() instanceof EvmExecutionError.Reverted;
     }
 
     // ---- Reverse-path step-by-step calls ----------------------------------

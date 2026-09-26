@@ -241,6 +241,37 @@ class RpcRouterTest {
         assertEquals("0x", err["data"]!!.jsonPrimitive.content)
     }
 
+    @Test fun engineRefusal_isThePermanentMinus32602_withItsReason() {
+        // A REFUSAL (the Java engine past an EVM fork its Besu cannot price) is
+        // permanent for that build: -32602 with the engine's reason, never the
+        // retryable -32000 a client would spin on — and never proxied, since the
+        // engine engaged and decided.
+        val b = FakeBackend(callResult = byteArrayOf(0x2a))
+        b.refusal = "Amsterdam is not supported by the Java engine"
+        b.estimateResult = 21_000L
+        val logger = MethodLogger()
+        val router = RpcRouter(UpstreamProxy("http://127.0.0.1:1"), logger, VerifiedReadsBackend(b))
+        val call = runBlocking {
+            router.handle("""{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","data":"0x313ce567"},"latest"]}""")
+        }
+        val est = runBlocking {
+            router.handle("""{"jsonrpc":"2.0","id":2,"method":"eth_estimateGas",
+               "params":[{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0x1"}]}""")
+        }
+        for ((m, resp) in listOf("eth_call" to call, "eth_estimateGas" to est)) {
+            assertEquals(-32602, errorCode(resp), "$m: $resp")
+            val msg = json.parseToJsonElement(resp).jsonObject["error"]!!
+                .jsonObject["message"]!!.jsonPrimitive.content
+            assertTrue(msg.contains("Amsterdam is not supported by the Java engine"), "$m: $msg")
+            // Counted as an error, never as a verified answer.
+            val cov = logger.coverage()[m]!!.jsonObject
+            assertEquals(1, cov["error"]!!.jsonPrimitive.content.toInt(), m)
+            assertEquals(0, cov["verified"]!!.jsonPrimitive.content.toInt(), m)
+            assertEquals(0, cov["proxied"]!!.jsonPrimitive.content.toInt(), m)
+        }
+    }
+
     @Test fun anImplementationThatDoesNotOverride_inheritsUnsupported() {
         // Pins the property the design calls load-bearing: an engine that simply
         // doesn't implement callWithOverrides inherits the interface default
@@ -369,14 +400,20 @@ class RpcRouterTest {
 
         /** When set, estimateGasDetailed reports a REVERT carrying these bytes. */
         var estimateRevertData: ByteArray? = null
+
+        /** When set, callDetailed AND estimateGasDetailed report a permanent
+         *  engine REFUSAL with this reason. */
+        var refusal: String? = null
         override fun estimateGasDetailed(from: ByteArray?, to: ByteArray?, data: ByteArray?,
                                          valueWei: String?): io.myotis.api.EstimateResult {
+            refusal?.let { return io.myotis.api.EstimateResult.refused(it) }
             estimateRevertData?.let { return io.myotis.api.EstimateResult.reverted(it) }
             return super.estimateGasDetailed(from, to, data, valueWei)
         }
         override fun callDetailed(from: ByteArray?, to: ByteArray?, data: ByteArray,
                                   valueWei: String?, block: String,
                                   stateOverridesJson: String?): io.myotis.api.CallResult {
+            refusal?.let { return io.myotis.api.CallResult.refused(it) }
             revertData?.let { return io.myotis.api.CallResult.reverted(it) }
             return super.callDetailed(from, to, data, valueWei, block, stateOverridesJson)
         }

@@ -913,7 +913,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     /** Package-private test seam: call JSON → result bytes (or null) without JNI.
      *  The legacy two-state view of {@link #callDetailedFromJson}: only "ok"
-     *  carries bytes; a revert or unavailable outcome reads as null. */
+     *  carries bytes; a revert, unavailable or refused outcome reads as null. */
     static byte[] callResultFromJson(String json) {
         io.myotis.api.CallResult r = callDetailedFromJson(json);
         return r.status() == io.myotis.api.CallResult.Status.OK ? r.data() : null;
@@ -927,9 +927,15 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  since ABI 30 — all pinned by the eljson golden tests; the two extra keys
      *  are not surfaced through {@link io.myotis.api.CallResult} yet. A revert
      *  is a VERIFIED answer whose payload the host serves as the standard
-     *  code-3 error. */
+     *  code-3 error. The permanent {@code {"error","code":-32602}} envelope (a
+     *  block the node will never serve since ABI 27, an executor refusal since
+     *  ABI 33) is {@link io.myotis.api.CallResult.Status#REFUSED}; a plain
+     *  {@code {"error"}} still throws. */
     static io.myotis.api.CallResult callDetailedFromJson(String json) {
-        JsonObject o = parseResultOrThrow(json, "call");
+        JsonObject o = parseJsonObject(json, "call");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.CallResult.refused(refusal);
+        throwIfError(o);
         try {
             String status = stringOrNull(o, "status");
             if ("ok".equals(status)) {
@@ -1026,9 +1032,15 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  The Rust side emits {@code {"status":"ok","gas":N}} /
      *  {@code {"status":"revert","dataHex"}} (ABI v23) / {@code {"status":
      *  "unavailable","reason"}}; a revert is a VERIFIED answer whose payload the
-     *  host serves as the standard code-3 error. */
+     *  host serves as the standard code-3 error. An executor refusal (ABI 33)
+     *  arrives as the permanent {@code {"error","code":-32602}} envelope and is
+     *  {@link io.myotis.api.EstimateResult.Status#REFUSED}, as for
+     *  {@link #callDetailedFromJson}. */
     static io.myotis.api.EstimateResult estimateGasDetailedFromJson(String json) {
-        JsonObject o = parseResultOrThrow(json, "estimateGas");
+        JsonObject o = parseJsonObject(json, "estimateGas");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.EstimateResult.refused(refusal);
+        throwIfError(o);
         String status = stringOrNull(o, "status");
         if ("revert".equals(status)) {
             try {
@@ -1450,24 +1462,57 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * it is a full result whose {@code failReason} is set, and is returned normally.
      */
     private static JsonObject parseResultOrThrow(String json, String what) {
+        JsonObject o = parseJsonObject(json, what);
+        throwIfError(o);
+        return o;
+    }
+
+    /** The first half of {@link #parseResultOrThrow}: a null/blank/malformed
+     *  payload throws, an error envelope is returned like any other object. */
+    private static JsonObject parseJsonObject(String json, String what) {
         if (json == null || json.isBlank()) {
             throw new EngineException((json == null ? "null" : "blank") + " " + what
                     + " JSON from the Rust engine (native failure?)");
         }
-        JsonObject o;
         try {
-            o = Json.parse(json).asObject();
+            return Json.parse(json).asObject();
         } catch (RuntimeException e) {
             throw new EngineException(
                     "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
         }
+    }
+
+    /** The second half of {@link #parseResultOrThrow}: an {@code {"error": ...}}
+     *  envelope becomes an {@link EngineException} carrying its message. */
+    private static void throwIfError(JsonObject o) {
         var error = o.get("error");
         if (error != null && !error.isNull()) {
             // The Rust side always emits a string error, but tolerate a
             // structured value rather than throwing a raw library exception.
             throw new EngineException(error.isString() ? error.asString() : error.toString());
         }
-        return o;
+    }
+
+    /** JSON-RPC's "invalid params" code: the Rust engine's PERMANENT refusal. */
+    private static final int INVALID_PARAMS = -32602;
+
+    /**
+     * The message of the engine's permanent refusal envelope,
+     * {@code {"error": "...", "code": -32602}} ({@code eljson::invalid_params_json}),
+     * or null for anything else: a result, a plain {@code {"error"}} (retryable,
+     * the host's -32000), or an error with some other code. No retry can make
+     * the refused request succeed, so the detailed call/estimate reads surface
+     * it as REFUSED and the router serves -32602, never the retryable -32000 a
+     * client would spin on (CLAUDE.md: a refusal is permanent).
+     */
+    private static String permanentRefusalOrNull(JsonObject o) {
+        var error = o.get("error");
+        var code = o.get("code");
+        if (error == null || error.isNull() || code == null || !code.isNumber()
+                || code.asDouble() != INVALID_PARAMS) {
+            return null;
+        }
+        return error.isString() ? error.asString() : error.toString();
     }
 
     /** A JSON string field, or null when absent/JSON-null. */

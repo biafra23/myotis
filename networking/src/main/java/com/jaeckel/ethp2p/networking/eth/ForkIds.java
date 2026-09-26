@@ -47,6 +47,31 @@ public final class ForkIds {
 
     private ForkIds() {}
 
+    /**
+     * An EIP-2124 fork id as announced in the eth Status: the hash of the forks passed,
+     * and the activation of the next one this build knows (0 = none).
+     */
+    public record ForkId(int hash, long next) {
+        /** The hash as the 4 big-endian bytes the wire carries. */
+        public byte[] hashBytes() {
+            return new byte[]{(byte) (hash >>> 24), (byte) (hash >>> 16), (byte) (hash >>> 8), (byte) hash};
+        }
+    }
+
+    /**
+     * The fork id in effect at {@code nowSeconds} for a build pinned to {@code pinnedHash}
+     * that knows one more timestamp fork at {@code pinnedNext}: announced ahead of time
+     * (EIP-2124 lets upgraded peers keep us), then folded into the hash once it passes.
+     * A block-number {@code pinnedNext} never switches — every live fork is timestamped.
+     * Twin: Rust {@code forkid::fork_id_at}.
+     */
+    public static ForkId effective(int pinnedHash, long pinnedNext, long nowSeconds) {
+        if (pinnedNext >= TIMESTAMP_THRESHOLD && nowSeconds >= pinnedNext) {
+            return new ForkId(successor(pinnedHash, pinnedNext), 0);
+        }
+        return new ForkId(pinnedHash, pinnedNext);
+    }
+
     /** CRC32 of {@code data} continued from the checksum {@code crc} (0 = a fresh CRC). */
     public static int update(int crc, byte[] data) {
         int c = ~crc;

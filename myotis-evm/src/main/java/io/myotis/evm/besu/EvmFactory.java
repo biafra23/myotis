@@ -2,6 +2,8 @@ package io.myotis.evm.besu;
 
 import com.jaeckel.ethp2p.core.math.BigIntegers;
 import io.myotis.evm.BlockContext;
+import io.myotis.evm.EvmExecutionError;
+import io.myotis.evm.EvmExecutionException;
 import org.hyperledger.besu.evm.EVM;
 import org.hyperledger.besu.evm.EvmSpecVersion;
 import org.hyperledger.besu.evm.MainnetEVMs;
@@ -37,6 +39,14 @@ import org.hyperledger.besu.evm.precompile.PrecompileContractRegistry;
  * timestamp because a single block-number boundary doesn't cleanly capture
  * the timestamp-keyed forks.
  *
+ * <p>Amsterdam (Glamsterdam's EL fork) is REFUSED, not built: Sepolia blocks
+ * at/after {@link #SEPOLIA_AMSTERDAM_TIME} fail with
+ * {@link EvmExecutionError.UnsupportedFork} because Besu 26.4 cannot price
+ * them, and falling through to the Osaka rung would price them with the wrong
+ * gas model and nobody could tell. This is deliberately asymmetric with the
+ * Rust {@code spec_for}, whose revm SERVES the rung; the Besu bump turns the
+ * refusal into an {@code amsterdam()} builder.
+ *
  * <p>Pre-London is intentionally not supported: the wallet only operates on
  * recent finalised heads. If a future caller needs older blocks, add the
  * earlier branches and verify the {@link GasCalculator}/precompile pairings
@@ -60,6 +70,13 @@ public final class EvmFactory {
     public static final long SEPOLIA_CANCUN_TIME   = 1_706_655_072L;
     public static final long SEPOLIA_PRAGUE_TIME   = 1_741_159_776L;
     public static final long SEPOLIA_OSAKA_TIME    = 1_760_427_360L;
+    /** Sepolia Amsterdam — ethereum/pm#2205, epoch 353024 (2026-10-06 13:53:36
+     *  UTC); the Rust {@code SEPOLIA_AMSTERDAM_TIME} twin. Blocks at/after it are
+     *  REFUSED ({@link EvmExecutionError.UnsupportedFork}): Besu 26.4's early
+     *  {@code MainnetEVMs.amsterdam} predates the schedule Sepolia activates (it
+     *  has no EIP-2780 intrinsic-gas model), so neither it nor the Osaka rung may
+     *  price them. Mainnet and gnosis have no Amsterdam date yet (both Osaka). */
+    public static final long SEPOLIA_AMSTERDAM_TIME = 1_791_294_816L;
 
     // Gnosis fork-activation timestamps (nethermind gnosis.json, hex-sourced:
     // 0x64c8edbc / 0x65ef4dbc / 0x68122dbc / 0x69de2dbc — pinned cross-base in
@@ -75,9 +92,43 @@ public final class EvmFactory {
      * Build an {@link EVM} instance whose rules match the active fork at {@code ctx} —
      * PER CHAIN (the Rust {@code spec_for} twin, one cascade per hosted chain; an
      * unknown chain id fails closed exactly like the Rust engine's UnsupportedChain
-     * rather than silently getting mainnet fork times).
+     * rather than silently getting mainnet fork times). Refuses exactly what
+     * {@link #specFor} refuses.
      */
     public static EvmAndPrecompiles buildForBlock(BlockContext ctx) {
+        EvmSpecVersion spec = specFor(ctx);
+        java.math.BigInteger chainId = ctx.chainId();
+        EvmConfiguration cfg = EvmConfiguration.DEFAULT;
+        return switch (spec) {
+            case OSAKA -> osaka(chainId, cfg);
+            case PRAGUE -> prague(chainId, cfg);
+            case CANCUN -> cancun(chainId, cfg);
+            case SHANGHAI -> shanghai(chainId, cfg);
+            case PARIS -> paris(chainId, cfg);
+            case LONDON -> london(chainId, cfg);
+            default -> throw new IllegalStateException("no EVM builder for " + spec);
+        };
+    }
+
+    /**
+     * Refuse {@code ctx} exactly as {@link #buildForBlock} would, without building
+     * anything: for a caller that answers without running the EVM (the estimate's
+     * plain-transfer fast path), so it applies the same refusals first — the Rust
+     * estimate's {@code spec_for} twin. Void on purpose: callers outside this
+     * module don't see Besu's types (see {@link #specFor}).
+     */
+    public static void requireSupported(BlockContext ctx) {
+        specFor(ctx);
+    }
+
+    /**
+     * The fork {@code ctx} executes under — the selection half of
+     * {@link #buildForBlock}. Throws {@link IllegalArgumentException} for an
+     * unknown chain or a pre-floor block, and {@link EvmExecutionException}
+     * carrying {@link EvmExecutionError.UnsupportedFork} for a fork this engine
+     * cannot price.
+     */
+    public static EvmSpecVersion specFor(BlockContext ctx) {
         java.util.Objects.requireNonNull(ctx, "ctx");
         final long chainId;
         try {
@@ -103,41 +154,37 @@ public final class EvmFactory {
     }
 
     /** Mainnet: pre-merge forks by block number, post-merge by timestamp. */
-    private static EvmAndPrecompiles mainnetSpec(BlockContext ctx) {
+    private static EvmSpecVersion mainnetSpec(BlockContext ctx) {
         long ts = ctx.timestamp();
         long blockNumber = ctx.blockNumber();
-        java.math.BigInteger chainId = ctx.chainId();
-        EvmConfiguration cfg = EvmConfiguration.DEFAULT;
-        if (ts >= OSAKA_TIME) return osaka(chainId, cfg);
-        if (ts >= PRAGUE_TIME) return prague(chainId, cfg);
-        if (ts >= CANCUN_TIME) return cancun(chainId, cfg);
-        if (ts >= SHANGHAI_TIME) return shanghai(chainId, cfg);
-        if (blockNumber >= PARIS_BLOCK) return paris(chainId, cfg);
-        if (blockNumber >= LONDON_BLOCK) return london(chainId, cfg);
+        if (ts >= OSAKA_TIME) return EvmSpecVersion.OSAKA;
+        if (ts >= PRAGUE_TIME) return EvmSpecVersion.PRAGUE;
+        if (ts >= CANCUN_TIME) return EvmSpecVersion.CANCUN;
+        if (ts >= SHANGHAI_TIME) return EvmSpecVersion.SHANGHAI;
+        if (blockNumber >= PARIS_BLOCK) return EvmSpecVersion.PARIS;
+        if (blockNumber >= LONDON_BLOCK) return EvmSpecVersion.LONDON;
         throw tooOld(blockNumber, ts);
     }
 
-    /** Sepolia: all timestamp-gated (merged pre-Shanghai; older is unservable). */
-    private static EvmAndPrecompiles sepoliaSpec(BlockContext ctx) {
+    /** Sepolia: all timestamp-gated (merged pre-Shanghai; older is unservable).
+     *  Amsterdam onward is refused (see {@link #SEPOLIA_AMSTERDAM_TIME}). */
+    private static EvmSpecVersion sepoliaSpec(BlockContext ctx) {
         long ts = ctx.timestamp();
-        java.math.BigInteger chainId = ctx.chainId();
-        EvmConfiguration cfg = EvmConfiguration.DEFAULT;
-        if (ts >= SEPOLIA_OSAKA_TIME) return osaka(chainId, cfg);
-        if (ts >= SEPOLIA_PRAGUE_TIME) return prague(chainId, cfg);
-        if (ts >= SEPOLIA_CANCUN_TIME) return cancun(chainId, cfg);
-        if (ts >= SEPOLIA_SHANGHAI_TIME) return shanghai(chainId, cfg);
+        if (ts >= SEPOLIA_AMSTERDAM_TIME) throw amsterdamUnsupported(ctx);
+        if (ts >= SEPOLIA_OSAKA_TIME) return EvmSpecVersion.OSAKA;
+        if (ts >= SEPOLIA_PRAGUE_TIME) return EvmSpecVersion.PRAGUE;
+        if (ts >= SEPOLIA_CANCUN_TIME) return EvmSpecVersion.CANCUN;
+        if (ts >= SEPOLIA_SHANGHAI_TIME) return EvmSpecVersion.SHANGHAI;
         throw tooOld(ctx.blockNumber(), ts);
     }
 
     /** Gnosis: all timestamp-gated (merged pre-Shanghai; older is unservable). */
-    private static EvmAndPrecompiles gnosisSpec(BlockContext ctx) {
+    private static EvmSpecVersion gnosisSpec(BlockContext ctx) {
         long ts = ctx.timestamp();
-        java.math.BigInteger chainId = ctx.chainId();
-        EvmConfiguration cfg = EvmConfiguration.DEFAULT;
-        if (ts >= GNOSIS_OSAKA_TIME) return osaka(chainId, cfg);
-        if (ts >= GNOSIS_PRAGUE_TIME) return prague(chainId, cfg);
-        if (ts >= GNOSIS_CANCUN_TIME) return cancun(chainId, cfg);
-        if (ts >= GNOSIS_SHANGHAI_TIME) return shanghai(chainId, cfg);
+        if (ts >= GNOSIS_OSAKA_TIME) return EvmSpecVersion.OSAKA;
+        if (ts >= GNOSIS_PRAGUE_TIME) return EvmSpecVersion.PRAGUE;
+        if (ts >= GNOSIS_CANCUN_TIME) return EvmSpecVersion.CANCUN;
+        if (ts >= GNOSIS_SHANGHAI_TIME) return EvmSpecVersion.SHANGHAI;
         throw tooOld(ctx.blockNumber(), ts);
     }
 
@@ -185,6 +232,14 @@ public final class EvmFactory {
         return new IllegalArgumentException(
                 "pre-fork-floor blocks are not supported (blockNumber=" + blockNumber
                         + ", timestamp=" + ts + ")");
+    }
+
+    private static EvmExecutionException amsterdamUnsupported(BlockContext ctx) {
+        return new EvmExecutionException(new EvmExecutionError.UnsupportedFork(
+                "Amsterdam is not supported by the Java engine (Besu 26.4 cannot price it; "
+                        + "the Rust engine serves it) — refusing blockNumber=" + ctx.blockNumber()
+                        + ", timestamp=" + ctx.timestamp()
+                        + " rather than executing it under Osaka rules"));
     }
 
     /**

@@ -4,9 +4,10 @@
 // proves the integration end-to-end. Later phases swap the fixture for a
 // SNAP-backed oracle without touching this file.
 //
-// Source/target is Java 21 because org.hyperledger.besu:evm:24.12.2 publishes
+// Source/target is Java 21 because org.hyperledger.besu:besu-evm:26.4.0 publishes
 // Gradle module metadata declaring a JVM-21 floor (same situation as the
-// ConsenSys discv5 library used by :networking). CLAUDE.md's default is
+// ConsenSys discv5 library used by :networking; :android-app substitutes the
+// biafra23/besu fork, 26.4.0-android.1, for it). CLAUDE.md's default is
 // Java 17, with explicit licence to diverge when a transitive forces it; this
 // is one of those cases. AGP 8.7's D8 accepts Java 21 class files as input
 // for the Android module, verified by the existing :networking pipeline.

@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use myotis_core::forkid;
 use myotis_core::rlp::{self, Item};
 
 use crate::el::rlpx::frame::MAX_CONTROL_MSG_SIZE;
@@ -40,6 +41,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct EthConfig {
     pub network_id: u64,
     pub genesis_hash: [u8; 32],
+    /// The pinned fork id; what goes on the wire is [`EthConfig::fork_id_at`].
     pub fork_id_hash: [u8; 4],
     pub fork_next: u64,
     /// The block hash/number we advertise as our head (a light client can send
@@ -50,6 +52,17 @@ pub struct EthConfig {
     /// Raw genesis header RLP for serve-window seeding (mainnet only today);
     /// verified against `genesis_hash` before use. None → no genesis serving.
     pub genesis_header_rlp: Option<Vec<u8>>,
+}
+
+impl EthConfig {
+    /// The fork id we announce at `now` (unix seconds): the pin with its known
+    /// next fork until that passes, then the successor with none (EIP-2124),
+    /// so upgraded peers keep us across it. Java twin: `NetworkConfig.forkIdAt`.
+    pub fn fork_id_at(&self, now: u64) -> ([u8; 4], u64) {
+        let (hash, next) =
+            forkid::fork_id_at(u32::from_be_bytes(self.fork_id_hash), self.fork_next, now);
+        (hash.to_be_bytes(), next)
+    }
 }
 
 /// A negotiated, READY eth session over one peer connection.
@@ -100,7 +113,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             let (eth_version, snap) = negotiate(&peer_hello)
                 .ok_or_else(|| format!("no common eth version with {:?}", peer_hello.client_id))?;
 
-            // Send our Status in the negotiated version.
+            // Send our Status in the negotiated version, with the fork id in
+            // effect now (a known next fork is announced until it passes).
+            let (fork_hash, fork_next) = cfg.fork_id_at(crate::el::fork_watch::wall_clock_secs());
             let status = if eth_version >= 69 {
                 // eth/69 (EIP-7642) block range: a promise of what we can SERVE — only
                 // blocks the pool's ServedHeaders window actually holds (both ends of
@@ -120,8 +135,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                     cfg.network_id,
                     &cfg.genesis_hash,
                     &latest_hash,
-                    &cfg.fork_id_hash,
-                    cfg.fork_next,
+                    &fork_hash,
+                    fork_next,
                     earliest,
                     latest,
                 )
@@ -131,8 +146,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                     cfg.network_id,
                     &cfg.genesis_hash,
                     &cfg.head_hash,
-                    &cfg.fork_id_hash,
-                    cfg.fork_next,
+                    &fork_hash,
+                    fork_next,
                 )
             };
             tracing::debug!(
@@ -616,6 +631,21 @@ mod tests {
             listen_port: 30303,
             genesis_header_rlp: None,
         }
+    }
+
+    #[test]
+    fn the_announced_fork_id_switches_when_our_known_fork_passes() {
+        // Sepolia's pin and Amsterdam (Java twin: ForkIdsTest).
+        let t = 1_791_294_816;
+        let cfg = EthConfig {
+            fork_id_hash: [0x26, 0x89, 0x56, 0xb6],
+            fork_next: t,
+            ..test_config()
+        };
+        assert_eq!(cfg.fork_id_at(t - 1), ([0x26, 0x89, 0x56, 0xb6], t));
+        assert_eq!(cfg.fork_id_at(t), ([0x6c, 0x1d, 0x94, 0x23], 0));
+        // No known fork: the pin, whatever the time.
+        assert_eq!(test_config().fork_id_at(u64::MAX), (FORK_HASH, 0));
     }
 
     /// Our side (the initiator) and the peer's side of one FRAMED connection

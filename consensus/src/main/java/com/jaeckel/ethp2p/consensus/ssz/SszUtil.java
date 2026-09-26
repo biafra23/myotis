@@ -171,6 +171,44 @@ public final class SszUtil {
     }
 
     /**
+     * {@code is_valid_normalized_merkle_branch} (consensus-specs, Electra light client):
+     * a branch LONGER than the depth of {@code gindex} is accepted only when every extra
+     * leading node is zero — how an object carried in a later fork's shape pads a
+     * shallower proof (a Gloas update's pre-Gloas finalized header proves its block hash
+     * at depth 9 inside an 11-node vector). A shorter branch is a rejection. Rust twin:
+     * {@code ssz::verify_normalized_merkle_branch}.
+     *
+     * @param leaf   32-byte leaf value (already hashed)
+     * @param branch sibling hashes, bottom-up, possibly led by zero padding
+     * @param gindex generalized index of the leaf; its depth is {@code floorlog2(gindex)}
+     * @param root   expected 32-byte Merkle root
+     * @return true if the padding is all zero and the rest is a valid branch
+     */
+    public static boolean verifyNormalizedMerkleBranch(byte[] leaf, byte[][] branch, int gindex, byte[] root) {
+        if (gindex < 2) {
+            return false; // gindex 1 is the root itself; 0 names nothing
+        }
+        int depth = 31 - Integer.numberOfLeadingZeros(gindex);
+        int extra = branch.length - depth;
+        if (extra < 0) {
+            return false;
+        }
+        for (int i = 0; i < extra; i++) {
+            if (!isZeroNode(branch[i])) return false;
+        }
+        return verifyMerkleBranch(leaf, Arrays.copyOfRange(branch, extra, branch.length), depth, gindex, root);
+    }
+
+    /** A 32-byte all-zero node — the only thing a normalized branch may be padded with. */
+    private static boolean isZeroNode(byte[] node) {
+        if (node == null || node.length != 32) return false;
+        for (byte b : node) {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
+    /**
      * Merkleize with a large limit efficiently using recursive zero-hash pruning.
      * For a tree with limit=1M but only 100 actual chunks, this does ~2000 hashes
      * instead of 1M by short-circuiting all-zero subtrees.

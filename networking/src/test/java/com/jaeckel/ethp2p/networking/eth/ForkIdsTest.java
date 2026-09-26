@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.SplittableRandom;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -83,6 +84,21 @@ class ForkIdsTest {
         assertEquals(1_790_207_712L, t);
         assertEquals(0, (t - NetworkConfig.SEPOLIA.clGenesisTime()) % (32 * 12));
         assertEquals(0x47e12c82, ForkIds.successor(pin, t));
+    }
+
+    @Test
+    void theForkIdSwitchesWhenOurKnownForkPasses() {
+        NetworkConfig sepolia = NetworkConfig.SEPOLIA;
+        assertEquals(SEPOLIA_GLAMSTERDAM, sepolia.forkNext());
+        assertEquals(new ForkIds.ForkId(0x268956b6, SEPOLIA_GLAMSTERDAM), sepolia.forkIdAt(SEPOLIA_GLAMSTERDAM - 1));
+        assertEquals(new ForkIds.ForkId(SEPOLIA_GLAMSTERDAM_FORK_ID, 0), sepolia.forkIdAt(SEPOLIA_GLAMSTERDAM));
+        assertArrayEquals(new byte[]{0x6c, 0x1d, (byte) 0x94, 0x23}, sepolia.forkIdAt(SEPOLIA_GLAMSTERDAM).hashBytes());
+        // No known fork: the pin, forever. A block-number next never switches.
+        for (NetworkConfig c : List.of(NetworkConfig.MAINNET, NetworkConfig.GNOSIS)) {
+            assertEquals(new ForkIds.ForkId(ForkIds.toInt(c.forkIdHash()), 0), c.forkIdAt(Long.MAX_VALUE), c.name());
+        }
+        assertEquals(new ForkIds.ForkId(0x07c9462e, 1_150_000),
+                ForkIds.effective(0x07c9462e, 1_150_000, Long.MAX_VALUE));
     }
 
     @Test

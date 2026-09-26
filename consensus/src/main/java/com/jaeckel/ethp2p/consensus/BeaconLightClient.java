@@ -1,14 +1,15 @@
 package com.jaeckel.ethp2p.consensus;
 
 import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
+import com.jaeckel.ethp2p.core.consensus.LcFork;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStore;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientStoreSnapshot;
-import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockHeader;
 import com.jaeckel.ethp2p.consensus.types.BeaconBlockParser;
+import com.jaeckel.ethp2p.consensus.types.ExecutionPayloadHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
@@ -1370,6 +1371,59 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * The light-client wire format of a req/resp chunk, from its context bytes — the fork
+     * digest of the object's own (attested) epoch. The digest of the schedule's Gloas epoch
+     * (computed the way this client computes its own: {@link #computeForkDigest} over
+     * {@code forkSchedule.versionAtEpoch(gloasEpoch)}, BPO fold included) means the Gloas
+     * format; anything else decodes as before, where the pre-Gloas decoders tell their own
+     * sub-shapes apart. Either way the processor then checks the decoded object against the
+     * fork of its attested slot, so a peer lying in its context bytes gets a rejection,
+     * never a misread. Rust twin: the digest half of {@code ChainConfig::lc_fork_of_chunk}.
+     */
+    LcFork lcForkOfDigest(byte[] digest) {
+        java.util.OptionalLong gloas = forkSchedule.gloasEpoch();
+        if (gloas.isPresent() && digest != null
+                && Arrays.equals(computeForkDigest(forkSchedule.versionAtEpoch(gloas.getAsLong())), digest)) {
+            return LcFork.GLOAS;
+        }
+        return LcFork.PRE_GLOAS;
+    }
+
+    /**
+     * The light-client wire format of a req/resp chunk: Gloas when its context bytes are the
+     * fork digest of the schedule's Gloas epoch ({@link #lcForkOfDigest}), or when its payload
+     * is exactly {@code gloasSize} — the Gloas size of the type being read (e.g.
+     * {@link LightClientUpdate#GLOAS_SIZE}); otherwise the pre-Gloas format, whose decoders
+     * tell their own sub-shapes apart. Never Gloas on a network with no Gloas epoch.
+     *
+     * <p>The size rule is what survives a later blob-parameter fork: its digest is not one
+     * this client computes (a single configured BPO), and without the rule every Gloas object
+     * after it would fail to decode. It cannot misread a pre-Gloas object, which is never that
+     * size: every Gloas container is fixed-size and smaller than the smallest canonical
+     * pre-Gloas encoding of its type (pinned by {@code BeaconLightClientGloasTest}). Either way
+     * the processor then checks the decoded object against the fork of its attested slot, so
+     * a peer lying in its context bytes gets a rejection, never a misread. Rust twin:
+     * {@code ChainConfig::lc_fork_of_chunk}.
+     */
+    LcFork lcForkOf(byte[] digest, int payloadLength, int gloasSize) {
+        if (!forkSchedule.gloasEpoch().isPresent()) return LcFork.PRE_GLOAS;
+        return payloadLength == gloasSize || lcForkOfDigest(digest) == LcFork.GLOAS
+                ? LcFork.GLOAS : LcFork.PRE_GLOAS;
+    }
+
+    /**
+     * The context bytes a relayed light-client object is served under: the fork digest of
+     * its OWN slot's epoch — the attested slot for an update, the header slot for a
+     * bootstrap — computed from the schedule the way this client computes its own. Never
+     * the upstream's context bytes: nothing checks those (a Gloas-sized payload decodes
+     * under any digest), and a junk digest re-served by us would make every client that
+     * dispatches on context bytes fail to decode it and down-score us as a server.
+     */
+    byte[] relayDigest(long objectSlot) {
+        return computeForkDigest(forkSchedule.versionAtEpoch(objectSlot / slotsPerEpoch));
+    }
+
+    /**
      * EIP-7892 {@code compute_fork_digest}:
      * <pre>
      *   base_digest = sha256(pad(fork_version, 32) || gvr)  // fork_data_root
@@ -1549,7 +1603,11 @@ public class BeaconLightClient implements AutoCloseable {
             log.info("[beacon] HTTP bootstrap received {} bytes", ssz.length);
 
             com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", ssz);
-            LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
+            // No context bytes over HTTP: the Gloas format is fixed-size, so its exact
+            // length selects it (lcForkOf's size rule) — and verifyBootstrap's shape check
+            // cross-validates that against the fork of the header's own slot.
+            LightClientBootstrap bootstrap = LightClientBootstrap.decodeFor(
+                    lcForkOf(null, ssz.length, LightClientBootstrap.GLOAS_SIZE), ssz);
 
             try {
                 verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
@@ -1558,23 +1616,12 @@ public class BeaconLightClient implements AutoCloseable {
                 return false;
             }
 
-            int branchDepth = bootstrap.currentSyncCommitteeBranch().length;
-            int gindex = BeaconChainSpec.syncCommitteeGindex(branchDepth);
-            boolean branchValid = SszUtil.verifyMerkleBranch(
-                    bootstrap.currentSyncCommittee().hashTreeRoot(),
-                    bootstrap.currentSyncCommitteeBranch(),
-                    branchDepth,
-                    gindex,
-                    bootstrap.header().beacon().stateRoot());
-
-            if (!branchValid) {
-                log.warn("[beacon] HTTP bootstrap sync committee branch invalid (depth={}, gindex={})",
-                        branchDepth, gindex);
-                return false;
-            }
-
-            if (!LightClientProcessor.verifyExecutionBranch(bootstrap.header())) {
-                log.warn("[beacon] HTTP bootstrap execution branch invalid");
+            // Shape vs its slot's fork, the committee in the header's state, and the
+            // execution branch — each at the gindex of the header's fork.
+            LightClientProcessor.BootstrapReject reject = processor.verifyBootstrap(bootstrap);
+            if (reject != null) {
+                log.warn("[beacon] HTTP bootstrap rejected: {} (slot={})",
+                        reject.reason(), bootstrap.header().beacon().slot());
                 return false;
             }
 
@@ -1624,8 +1671,8 @@ public class BeaconLightClient implements AutoCloseable {
 
         for (String peer : peers) {
             if (!running) return;
-            p2pService.requestBootstrap(peer, checkpointRoot)
-                    .whenComplete((response, ex) -> {
+            p2pService.requestBootstrapWithContext(peer, checkpointRoot)
+                    .whenComplete((framed, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;
                             while (root.getCause() != null) root = root.getCause();
@@ -1640,10 +1687,13 @@ public class BeaconLightClient implements AutoCloseable {
                             }
                             return;
                         }
+                        byte[] response = framed.payload();
                         log.info("[beacon] Bootstrap response: {} bytes from {}", response.length, peer);
                         try {
                             com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("bootstrap", response);
-                            LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
+                            LightClientBootstrap bootstrap = LightClientBootstrap.decodeFor(
+                                    lcForkOf(framed.forkDigest(), response.length,
+                                            LightClientBootstrap.GLOAS_SIZE), response);
 
                             try {
                                 verifyCheckpointPin(bootstrap.header().beacon(), checkpointRoot);
@@ -1657,27 +1707,17 @@ public class BeaconLightClient implements AutoCloseable {
                                 return;
                             }
 
-                            int bDepth = bootstrap.currentSyncCommitteeBranch().length;
-                            int bGindex = BeaconChainSpec.syncCommitteeGindex(bDepth);
-                            boolean branchValid = SszUtil.verifyMerkleBranch(
-                                    bootstrap.currentSyncCommittee().hashTreeRoot(),
-                                    bootstrap.currentSyncCommitteeBranch(),
-                                    bDepth,
-                                    bGindex,
-                                    bootstrap.header().beacon().stateRoot());
-
-                            if (!branchValid) {
-                                log.warn("[beacon] Bootstrap sync committee branch invalid from {}", peer);
-                                if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
-                                    winnerFuture.completeExceptionally(
-                                            new RuntimeException("All peers failed bootstrap"));
+                            // Shape vs its slot's fork, the committee in the header's state,
+                            // and the execution branch — each at the gindex of the header's fork.
+                            LightClientProcessor.BootstrapReject reject = processor.verifyBootstrap(bootstrap);
+                            if (reject != null) {
+                                log.warn("[beacon] Bootstrap from {} rejected: {} (slot={})",
+                                        peer, reject.reason(), bootstrap.header().beacon().slot());
+                                // A committee-branch miss was never a strike (as before); a
+                                // header whose shape or execution data does not verify is.
+                                if (reject != LightClientProcessor.BootstrapReject.SYNC_COMMITTEE_BRANCH) {
+                                    notifyPeerFailure(peer);
                                 }
-                                return;
-                            }
-
-                            if (!LightClientProcessor.verifyExecutionBranch(bootstrap.header())) {
-                                log.warn("[beacon] Bootstrap execution branch invalid from {}", peer);
-                                notifyPeerFailure(peer);
                                 if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
                                     winnerFuture.completeExceptionally(
                                             new RuntimeException("All peers failed bootstrap"));
@@ -1710,7 +1750,8 @@ public class BeaconLightClient implements AutoCloseable {
                                             bootstrap.header().beacon().slot()));
                                     // Cache the bootstrap so we can relay it to any peer
                                     // that asks us for the same block root.
-                                    p2pService.cacheBootstrap(checkpointRoot, response);
+                                    p2pService.cacheBootstrap(checkpointRoot,
+                                            relayDigest(bootstrap.header().beacon().slot()), response);
                                     log.info("[beacon] Bootstrap complete from {}, slot={}",
                                             peer, bootstrap.header().beacon().slot());
                                 }
@@ -1977,7 +2018,7 @@ public class BeaconLightClient implements AutoCloseable {
             // Pass the deadline into the req/resp layer (not orTimeout out here)
             // so it can actually close the underlying libp2p stream when it
             // fires — otherwise channelRead0 would keep buffering bytes.
-            p2pService.requestUpdatesByRange(peer, bootstrapPeriod, count, 15_000L)
+            p2pService.requestUpdatesByRangeWithContext(peer, bootstrapPeriod, count, 15_000L)
                     .whenCompleteAsync((responses, ex) -> {
                         if (ex != null) {
                             Throwable root = ex;
@@ -2061,13 +2102,18 @@ public class BeaconLightClient implements AutoCloseable {
      * Decode and process a list of catch-up response SSZ blobs, returning the number applied.
      * Must be called while holding {@code catchUpApplyLock} (writer serialization).
      */
-    private int applyCatchUpResponses(List<byte[]> responses, long currentSlotEstimate,
+    private int applyCatchUpResponses(List<BeaconP2PService.ContextPayload> responses, long currentSlotEstimate,
                                       String peer, long servedFromPeriod) {
         int applied = 0;
-        for (byte[] responseSsz : responses) {
+        for (BeaconP2PService.ContextPayload chunk : responses) {
+            byte[] responseSsz = chunk.payload();
             try {
                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("update", responseSsz);
-                LightClientUpdate update = LightClientUpdate.decode(responseSsz);
+                // Each chunk decodes in the format ITS context bytes name: one response can
+                // span the fork.
+                LightClientUpdate update = LightClientUpdate.decodeFor(
+                        lcForkOf(chunk.forkDigest(), responseSsz.length, LightClientUpdate.GLOAS_SIZE),
+                        responseSsz);
                 if (processor.processUpdate(update)) {
                     applied++;
                     if (applied == 1) {
@@ -2129,30 +2175,39 @@ public class BeaconLightClient implements AutoCloseable {
             if (!running) return;
             log.debug("[beacon] Trying finality update peer {}/{}: {}", i + 1, peers.size(), peer);
             try {
-                byte[] response = p2pService
-                        .requestFinalityUpdate(peer)
+                BeaconP2PService.ContextPayload framed = p2pService
+                        .requestFinalityUpdateWithContext(peer, 0L)
                         .get(5, TimeUnit.SECONDS);
-                p2pService.cacheFinalityUpdate(response);
+                byte[] response = framed.payload();
 
                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
-                LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
+                LightClientFinalityUpdate update = LightClientFinalityUpdate.decodeFor(
+                        lcForkOf(framed.forkDigest(), response.length, LightClientFinalityUpdate.GLOAS_SIZE),
+                        response);
+                p2pService.cacheFinalityUpdate(relayDigest(update.attestedHeader().beacon().slot()), response);
                 LightClientHeader finalizedHeader = update.finalizedHeader();
                 long finalizedSlot = finalizedHeader.beacon().slot();
-                byte[] executionStateRoot = finalizedHeader.execution().stateRoot();
+                // Seeding takes an unverified execution payload's fields; a Gloas header
+                // proves only a block hash, and resolving that by hash would record the
+                // result as BLS-verified — which a seed is not. Not seedable, not a strike.
+                ExecutionPayloadHeader finalizedExec = finalizedHeader.execution();
+                byte[] executionStateRoot = finalizedExec != null ? finalizedExec.stateRoot() : null;
 
                 if (executionStateRoot == null || executionStateRoot.length != 32) {
-                    log.warn("[beacon] Finality update from {} has no execution state root", peer);
+                    log.warn("[beacon] Finality update from {} has no execution state root{}", peer,
+                            finalizedExec == null ? " (Gloas shape — only a block hash, not seedable)" : "");
                     continue;
                 }
 
                 // Seed the sync state directly (trusted peer, no BLS verification)
-                long execBlockNum = finalizedHeader.execution().blockNumber();
-                byte[] execBlockHash = finalizedHeader.execution().blockHash();
+                long execBlockNum = finalizedExec.blockNumber();
+                byte[] execBlockHash = finalizedExec.blockHash();
                 syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot(), execBlockNum, execBlockHash);
                 syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
                 // Also record the attested header's execution state root
                 long attestedSlot = update.attestedHeader().beacon().slot();
-                byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
+                ExecutionPayloadHeader attestedExec = update.attestedHeader().execution();
+                byte[] attestedRoot = attestedExec != null ? attestedExec.stateRoot() : null;
                 if (attestedRoot != null && attestedRoot.length == 32) {
                     syncState.recordStateRoot(attestedSlot, attestedRoot, false);
                 }
@@ -2269,6 +2324,13 @@ public class BeaconLightClient implements AutoCloseable {
         } catch (Exception e) {
             log.warn("[beacon] Beacon API finality seed failed: {}", e.getMessage());
         }
+    }
+
+    /** A missing or all-zero 32-byte value (a pre-merge / absent execution block hash). */
+    private static boolean isZero(byte[] b) {
+        if (b == null) return true;
+        for (byte x : b) if (x != 0) return false;
+        return true;
     }
 
     private static byte[] hexToBytes(String hex) {
@@ -2403,8 +2465,8 @@ public class BeaconLightClient implements AutoCloseable {
             // the catch-up fan-out honors the same rule), and its single thread
             // both serializes the up-to-16 verifies and makes the isDone bail
             // free for every response behind the winner.
-            p2pService.requestFinalityUpdate(peer, 10_000L)
-                    .whenCompleteAsync((response, ex) -> {
+            p2pService.requestFinalityUpdateWithContext(peer, 10_000L)
+                    .whenCompleteAsync((framed, ex) -> {
                         // A finished round ignores stragglers entirely: no strike
                         // (they raced a success), no apply (the winner advanced us).
                         if (winner.isDone()) return;
@@ -2423,8 +2485,11 @@ public class BeaconLightClient implements AutoCloseable {
                             roundFailures.add(peer);
                         } else {
                             try {
+                                byte[] response = framed.payload();
                                 com.jaeckel.ethp2p.consensus.lightclient.VectorDump.maybeDump("finality", response);
-                                LightClientFinalityUpdate update = LightClientFinalityUpdate.decode(response);
+                                LightClientFinalityUpdate update = LightClientFinalityUpdate.decodeFor(
+                                        lcForkOf(framed.forkDigest(), response.length,
+                                                LightClientFinalityUpdate.GLOAS_SIZE), response);
                                 // Decodable update ⇒ the peer serves the LC protocol,
                                 // whether or not it wins the round. Dial-priority signal
                                 // only — trust still requires the verified apply below.
@@ -2441,15 +2506,20 @@ public class BeaconLightClient implements AutoCloseable {
                                             && processor.processFinalityUpdate(update);
                                 }
                                 if (finalityApplied) {
-                                    winner.complete(new FinalityPollWin(peer, response, update, true));
+                                    winner.complete(new FinalityPollWin(
+                                            peer, framed.forkDigest(), response, update, true));
                                     return;
                                 }
                                 if (!store.isInitialized()) {
                                     // Seeded mode: any decodable update with a plausible exec
                                     // state root wins; the poll thread runs the seed branch.
-                                    byte[] sr = update.finalizedHeader().execution().stateRoot();
+                                    // A Gloas-shaped update carries no payload to seed from
+                                    // (see seedFromFinalityUpdate) — simply not a candidate.
+                                    ExecutionPayloadHeader seedExec = update.finalizedHeader().execution();
+                                    byte[] sr = seedExec != null ? seedExec.stateRoot() : null;
                                     if (sr != null && sr.length == 32) {
-                                        winner.complete(new FinalityPollWin(peer, response, update, false));
+                                        winner.complete(new FinalityPollWin(
+                                                peer, framed.forkDigest(), response, update, false));
                                         return;
                                     }
                                 }
@@ -2510,7 +2580,7 @@ public class BeaconLightClient implements AutoCloseable {
         // caching per-response from concurrent callbacks could leave a losing,
         // staler update as what we serve peers — the sequential loop always ended
         // on the winner's bytes).
-        p2pService.cacheFinalityUpdate(win.raw());
+        p2pService.cacheFinalityUpdate(relayDigest(win.update().attestedHeader().beacon().slot()), win.raw());
         // Classification harvest (covers the winner too — a decodable response
         // queued it as confirmed — dial-priority signal only, unlike Rust's
         // verified-apply-gated mark_proven; Java's provenLightClient is the
@@ -2536,14 +2606,18 @@ public class BeaconLightClient implements AutoCloseable {
             return;
         }
 
-        // Seeded mode: update sync state directly from the winning finality update.
+        // Seeded mode: update sync state directly from the winning finality update
+        // (payload-shaped by construction — a seed candidate needs a payload, see above).
         LightClientHeader fh = win.update().finalizedHeader();
-        byte[] sr = fh.execution().stateRoot();
+        ExecutionPayloadHeader fhExec = fh.execution();
+        if (fhExec == null) return;
+        byte[] sr = fhExec.stateRoot();
         long slot = fh.beacon().slot();
         syncState.recordStateRoot(slot, sr, false);
         // Also record the attested header's execution state root
         long attestedSlot = win.update().attestedHeader().beacon().slot();
-        byte[] attestedRoot = win.update().attestedHeader().execution().stateRoot();
+        ExecutionPayloadHeader attestedExec = win.update().attestedHeader().execution();
+        byte[] attestedRoot = attestedExec != null ? attestedExec.stateRoot() : null;
         if (attestedRoot != null && attestedRoot.length == 32) {
             syncState.recordStateRoot(attestedSlot, attestedRoot, false);
         }
@@ -2554,20 +2628,20 @@ public class BeaconLightClient implements AutoCloseable {
         fillChainStateRoots(win.peer(), false, slot, attestedSlot, attestedBlockRoot);
         notifyPeerSuccess(win.peer());
         if (slot > syncState.getFinalizedSlot()) {
-            long execBlockNum = fh.execution().blockNumber();
-            byte[] execBlockHash = fh.execution().blockHash();
+            long execBlockNum = fhExec.blockNumber();
+            byte[] execBlockHash = fhExec.blockHash();
             syncState.update(slot, sr, win.update().signatureSlot(), execBlockNum, execBlockHash);
             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", win.peer(), slot);
         }
     }
 
-    /** A finality-poll round's winning response: the peer, the raw SSZ (for the
-     *  relay cache — cached on the poll thread so the winner's bytes are what we
-     *  serve), the decoded update, and whether it was a VERIFIED store apply
-     *  ({@code applied}) or a seeded-mode candidate the poll thread still has to
-     *  run the seed branch for. */
+    /** A finality-poll round's winning response: the peer, its context bytes and raw SSZ
+     *  (for the relay cache — cached on the poll thread so the winner's bytes, under the
+     *  digest they arrived with, are what we serve), the decoded update, and whether it
+     *  was a VERIFIED store apply ({@code applied}) or a seeded-mode candidate the poll
+     *  thread still has to run the seed branch for. */
     private record FinalityPollWin(
-            String peer, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
+            String peer, byte[] forkDigest, byte[] raw, LightClientFinalityUpdate update, boolean applied) {}
 
     /**
      * Apply a poll round's classification harvest (poll thread, once per round):
@@ -2631,22 +2705,33 @@ public class BeaconLightClient implements AutoCloseable {
      * can be verified against beacon-attested headers.
      */
     private void updateSyncState() {
+        // A payload-shaped header hands its execution fields over directly. A Gloas-shaped
+        // one proves only the block hash: BeaconSyncState holds it PENDING until the EL
+        // resolver fetches the header whose keccak it is (resolveHeader) — the number and
+        // state root come from there. Slots as for the payload shape, so the pending
+        // bookkeeping compares like with like.
         LightClientHeader finalizedHeader = store.getFinalizedHeader();
         if (finalizedHeader != null) {
-            byte[] stateRoot = finalizedHeader.execution().stateRoot();
-            long execBlockNum = finalizedHeader.execution().blockNumber();
-            byte[] execBlockHash = finalizedHeader.execution().blockHash();
-            syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(), execBlockNum, execBlockHash);
-            syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
+            ExecutionPayloadHeader exec = finalizedHeader.execution();
+            if (exec != null) {
+                byte[] stateRoot = exec.stateRoot();
+                syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(),
+                        exec.blockNumber(), exec.blockHash());
+                syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
+            } else if (finalizedHeader.shape() == LcFork.GLOAS && !isZero(finalizedHeader.executionBlockHash())) {
+                syncState.noteFinalizedHash(store.getFinalizedSlot(), finalizedHeader.executionBlockHash());
+            }
         }
         LightClientHeader optimisticHeader = store.getOptimisticHeader();
         if (optimisticHeader != null) {
-            byte[] optRoot = optimisticHeader.execution().stateRoot();
-            syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
-            syncState.updateOptimisticExecution(
-                    optimisticHeader.execution().blockNumber(),
-                    optimisticHeader.execution().blockHash(),
-                    optRoot);
+            ExecutionPayloadHeader exec = optimisticHeader.execution();
+            if (exec != null) {
+                byte[] optRoot = exec.stateRoot();
+                syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
+                syncState.updateOptimisticExecution(exec.blockNumber(), exec.blockHash(), optRoot);
+            } else if (optimisticHeader.shape() == LcFork.GLOAS && !isZero(optimisticHeader.executionBlockHash())) {
+                syncState.noteOptimisticHash(store.getOptimisticSlot(), optimisticHeader.executionBlockHash());
+            }
         }
         // Mirror the store's committee period into the observable sync state so
         // beacon-status' SYNCED gate and verification callers don't need a store
@@ -2709,9 +2794,9 @@ public class BeaconLightClient implements AutoCloseable {
      * @param attestedSlot       the attested/optimistic slot (end of range)
      * @param attestedBlockRoot  hash tree root of the attested beacon block header (for chain verification), or null
      */
-    private boolean fillChainStateRoots(String peer, boolean blsVerified,
-                                      long finalizedSlot, long attestedSlot,
-                                      byte[] attestedBlockRoot) {
+    boolean fillChainStateRoots(String peer, boolean blsVerified,
+                                long finalizedSlot, long attestedSlot,
+                                byte[] attestedBlockRoot) {
         // Returns whether this peer actually produced state roots. It used to be
         // void AND swallow every exception, which made fillChainStateRootsFromAnyPeer's
         // catch unreachable: that loop returned after the FIRST peer whether or
@@ -2719,6 +2804,12 @@ public class BeaconLightClient implements AutoCloseable {
         // second one. A peer that cannot serve beacon_blocks_by_range — roost by
         // design, and any beacon node under load — therefore ended the round.
         if (attestedSlot <= finalizedSlot + 1) return true; // nothing to fill: not a failure
+        // Gloas: a block body carries a payload BID, not the payload — no execution state
+        // root to record — and the parser would read its fixed part as Electra's, fail the
+        // hash chain at the first block, and send the fallback sweeping every peer for
+        // nothing. The walk anchors at the attested block, so a Gloas attested slot means
+        // there is nothing to fill: not a failure either.
+        if (forkSchedule.lcForkAtSlot(attestedSlot) == LcFork.GLOAS) return true;
 
         long startSlot = finalizedSlot + 1;
         long count = attestedSlot - finalizedSlot; // includes the attested slot

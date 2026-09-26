@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Java half of the LCSS-v1 cross-engine golden contract: the snapshot file
@@ -22,13 +23,20 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * the SAME bytes. Both sides build the identical patterned snapshot, so a codec
  * change on either side that shifts a single byte fails one of the two suites.
  *
- * <p>Generates the fixture when absent (mirrors LcVectorConformanceTest's
+ * <p>Generates the v1 fixture when absent (mirrors LcVectorConformanceTest's
  * generate-when-missing convention); asserts byte-identity when present.
+ *
+ * <p>LCSS v2 (a Gloas-shaped header held) has its own golden,
+ * {@code rust/testdata/snapshot/lcss-v2-golden.bin}, written by the RUST codec from
+ * its patterned {@code gloas_snapshot()}. It is never generated here — a Java-written
+ * file would pin nothing — so a missing v2 fixture is a failure.
  */
 class SnapshotGoldenConformanceTest {
 
     private static final Path GOLDEN =
             Path.of("..", "rust", "testdata", "snapshot", "lcss-v1-golden.bin");
+    private static final Path GOLDEN_V2 =
+            Path.of("..", "rust", "testdata", "snapshot", "lcss-v2-golden.bin");
 
     // ---- the patterned snapshot — MUST match snapshot.rs tests exactly ----
 
@@ -76,6 +84,22 @@ class SnapshotGoldenConformanceTest {
                 14_600_001L, 14_600_033L, 1795L);
     }
 
+    /** A Gloas-shaped header: block hash + 11 branch nodes — snapshot.rs gloas_header. */
+    private static LightClientHeader gloasHeader(int seed) {
+        BeaconBlockHeader beacon = new BeaconBlockHeader(
+                11_296_768L + seed, 7L + seed, root(seed), root(seed + 1), root(seed + 2));
+        byte[][] branch = new byte[11][];
+        for (int i = 0; i < 11; i++) branch[i] = root(seed + 30 + i);
+        return LightClientHeader.gloas(beacon, root(seed + 3), branch);
+    }
+
+    /** Finalized header still payload-shaped, optimistic Gloas-shaped — snapshot.rs gloas_snapshot. */
+    private static LightClientStore.Snapshot gloasSnapshot() {
+        return new LightClientStore.Snapshot(
+                header(1, true), gloasHeader(60), committee(3), committee(7),
+                11_296_700L, 11_296_829L, 1379L);
+    }
+
     @Test
     void goldenFixtureIsByteStable() throws Exception {
         byte[] gvr = root(99);
@@ -99,5 +123,25 @@ class SnapshotGoldenConformanceTest {
         assertEquals(1795L, back.currentSyncCommitteePeriod());
         assertEquals(14_600_001L, back.finalizedSlot());
         assertArrayEquals(bytes, LightClientStoreSnapshot.serialize(back, gvr));
+    }
+
+    /**
+     * Java half of the LCSS-v2 golden (Rust half: snapshot.rs
+     * v2_golden_fixture_is_the_shared_gloas_snapshot): the committed Rust-written bytes
+     * decode to the identical patterned Gloas snapshot, and that snapshot encodes to
+     * exactly those bytes.
+     */
+    @Test
+    void v2GoldenFixtureIsTheSharedGloasSnapshot() throws Exception {
+        assertTrue(Files.exists(GOLDEN_V2), "LCSS-v2 golden fixture missing at " + GOLDEN_V2.toAbsolutePath()
+                + " — it is written by the Rust codec, never by this test");
+        byte[] committed = Files.readAllBytes(GOLDEN_V2);
+        byte[] gvr = root(99);
+        assertEquals(2, committed[4], "the v2 golden must be an LCSS v2 file");
+        LightClientStoreSnapshotTest.assertSnapshotEquals(gloasSnapshot(),
+                LightClientStoreSnapshot.deserialize(committed, gvr));
+        assertArrayEquals(committed, LightClientStoreSnapshot.serialize(gloasSnapshot(), gvr),
+                "LCSS-v2 byte layout drifted from the Rust-written golden fixture — this format is a "
+                + "cross-engine on-disk contract; change BOTH codecs and regenerate it from Rust");
     }
 }

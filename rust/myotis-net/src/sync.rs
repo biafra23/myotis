@@ -19,11 +19,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, watch};
 
-use myotis_consensus::fork::ForkSchedule;
+use myotis_consensus::fork::{ForkSchedule, LcFork};
 use myotis_consensus::spec;
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
-use myotis_consensus::types::{LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate};
-use myotis_consensus::ssz;
+use myotis_consensus::types::{
+    HeaderExecution, LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate,
+};
 
 use crate::codec;
 use crate::discovery::{self, DiscoveryConfig};
@@ -260,7 +261,9 @@ impl ChainConfig {
             name: "sepolia",
             chain_id: 11_155_111,
             // eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH / *_FORK_VERSION.
-            // Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            // Fulu (0x90000075) activated at epoch 272640 (2025-10-14); Gloas
+            // (Glamsterdam's CL half) activates at epoch 353024, 2026-10-06
+            // 13:53:36 UTC (ethereum/pm#2205), pinned ahead of activation.
             fork_schedule: ForkSchedule::new(slots_per_epoch, &[
                 (0, [0x90, 0x00, 0x00, 0x69]),       // phase0 (genesis)
                 (50, [0x90, 0x00, 0x00, 0x70]),      // altair
@@ -269,7 +272,10 @@ impl ChainConfig {
                 (132_608, [0x90, 0x00, 0x00, 0x73]), // deneb
                 (222_464, [0x90, 0x00, 0x00, 0x74]), // electra
                 (272_640, [0x90, 0x00, 0x00, 0x75]), // fulu
-            ]),
+                (353_024, [0x90, 0x00, 0x00, 0x76]), // gloas
+            ])
+            // Gloas changes the light-client wire format and proof indices.
+            .with_gloas_epoch(353_024),
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
             accept_prior_fork_digest: false,
@@ -421,7 +427,12 @@ impl ChainConfig {
     /// verification reads the schedule per update
     /// (`ForkSchedule::version_for_signature_slot`).
     pub fn current_fork_version(&self) -> [u8; 4] {
-        self.fork_schedule.version_at_epoch(self.wall_clock_epoch())
+        self.fork_version_at_epoch(self.wall_clock_epoch())
+    }
+
+    /// The schedule's fork version at `epoch` (the digest input at that epoch).
+    pub fn fork_version_at_epoch(&self, epoch: u64) -> [u8; 4] {
+        self.fork_schedule.version_at_epoch(epoch)
     }
 
     /// The version of the fork before the active one when its digest is
@@ -440,12 +451,44 @@ impl ChainConfig {
     }
 
     pub fn current_fork_digest(&self) -> [u8; 4] {
+        self.fork_digest_at_epoch(self.wall_clock_epoch())
+    }
+
+    /// [`current_fork_digest`](Self::current_fork_digest) as of `epoch`: the
+    /// digest of the fork active then. Pure in the clock, so a digest on either
+    /// side of a pinned fork can be checked (Java twin:
+    /// `NetworkConfig.forkDigestAtEpoch`).
+    pub fn fork_digest_at_epoch(&self, epoch: u64) -> [u8; 4] {
         fork_digest_bpo(
-            self.current_fork_version(),
+            self.fork_version_at_epoch(epoch),
             self.genesis_validators_root,
             self.blob_params_epoch,
             self.blob_params_max_blobs,
         )
+    }
+
+    /// The light-client wire format of a req/resp chunk: Gloas when its context
+    /// bytes are the fork digest of Gloas' first epoch, or when its payload is
+    /// exactly `gloas_size` — the Gloas size of the type being read (e.g.
+    /// `LightClientUpdate::GLOAS_SIZE`); otherwise the pre-Gloas format, whose
+    /// decoders tell their own sub-shapes apart. Never Gloas on a network with
+    /// no Gloas epoch.
+    ///
+    /// The size rule is what survives a later blob-parameter fork: its digest
+    /// is not one this config computes, and without the rule every Gloas
+    /// object after it would fail to decode. It cannot misread a pre-Gloas
+    /// object, which is never that size (pinned at compile time in
+    /// `myotis_consensus::types`). Either way the processor then checks the
+    /// decoded object against the fork of its attested slot
+    /// (`LightClientProcessor::update_shape_ok`), so a peer lying in its
+    /// context bytes gets a rejection, never a misread.
+    pub fn lc_fork_of_chunk(&self, digest: &[u8], payload_len: usize, gloas_size: usize) -> LcFork {
+        match self.fork_schedule.gloas_epoch() {
+            Some(epoch) if payload_len == gloas_size || self.fork_digest_at_epoch(epoch) == digest => {
+                LcFork::Gloas
+            }
+            _ => LcFork::PreGloas,
+        }
     }
 
     /// Wall-clock sync-committee period — the catch-up target the store's period
@@ -1909,7 +1952,7 @@ async fn run_sync(
                     // decodable response marks the peer lc-confirmed (it can't
                     // APPLY without a committee, and that's fine — the confirm
                     // feeds the next bootstrap round's prefer tier).
-                    hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+                    hunt_round(&config, &client, &mut pool, &mut processor, &mut clcache,
                         &mut hunt.probed, &mut hunt.confirmed)
                         .await;
                     clcache.flush();
@@ -1980,7 +2023,7 @@ async fn run_sync(
                 // catch_up returned with no period progress while starved —
                 // probe for new servers before the next round (lc-confirms
                 // feed both the cache and catch-up's prefer tier).
-                hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+                hunt_round(&config, &client, &mut pool, &mut processor, &mut clcache,
                     &mut hunt.probed, &mut hunt.confirmed)
                     .await;
                 clcache.flush();
@@ -2026,7 +2069,7 @@ async fn run_sync(
 
         in_catchup = false; // reaching here means the committee is current
         let applied =
-            poll_finality(&client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
+            poll_finality(&config, &client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
                 .await;
         if applied {
             // A finality update verified against the (possibly restored)
@@ -2035,7 +2078,7 @@ async fn run_sync(
         } else if hunt.hunting {
             // Starved and the proven/preferred tiers came up dry — burst-probe
             // the unproven pool tail for new LC servers.
-            hunt_round(&client, &mut pool, &mut processor, &mut clcache,
+            hunt_round(&config, &client, &mut pool, &mut processor, &mut clcache,
                 &mut hunt.probed, &mut hunt.confirmed)
                 .await;
         }
@@ -2162,15 +2205,22 @@ async fn try_bootstrap(
                 continue;
             }
         };
-        let ssz_payload = match codec::decode_response(&raw, true) {
-            Ok(d) => d.ssz_payload,
+        let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientBootstrap::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(e) => {
                 fail(pool, &mut round_failures, peer);
                 tracing::debug!(peer = %peer, error = %e, "bootstrap frame invalid");
                 continue;
             }
         };
-        let bootstrap = match LightClientBootstrap::decode(&ssz_payload) {
+        let bootstrap = match LightClientBootstrap::decode_for(fork, &ssz_payload) {
             Ok(b) => b,
             Err(e) => {
                 fail(pool, &mut round_failures, peer);
@@ -2212,21 +2262,12 @@ async fn try_bootstrap(
                      slot (same period — fine)");
             }
         }
-        let depth = bootstrap.current_sync_committee_branch.len();
-        if !ssz::verify_merkle_branch(
-            &bootstrap.current_sync_committee.hash_tree_root(),
-            &bootstrap.current_sync_committee_branch,
-            depth,
-            spec::sync_committee_gindex(depth),
-            &bootstrap.header.beacon.state_root,
-        ) {
+        // Shape vs its slot's fork, the committee in the header's state, and the
+        // execution branch — each at the gindex of the header's fork.
+        if let Err(reason) = processor.verify_bootstrap(&bootstrap) {
             fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, depth, "bootstrap rejected: sync committee branch invalid");
-            continue;
-        }
-        if !LightClientProcessor::verify_execution_branch(&bootstrap.header) {
-            fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, "bootstrap rejected: execution branch invalid");
+            tracing::warn!(peer = %peer, %reason, slot = bootstrap.header.beacon.slot,
+                "bootstrap rejected");
             continue;
         }
 
@@ -2313,6 +2354,9 @@ impl ResumeGuard {
 /// round's responding peer (chunks linger across rounds and responses).
 struct StagedChunk {
     ssz: Vec<u8>,
+    /// The chunk's wire format, from its context bytes and size
+    /// (`ChainConfig::lc_fork_of_chunk`).
+    fork: LcFork,
     from: String,
     /// Other peers' chunks for the SAME period, kept as fallbacks.
     ///
@@ -2324,12 +2368,42 @@ struct StagedChunk {
     /// round raced the same way (mainnet period 1840, ~4.6k identical requests
     /// to one server; issue seen live 2026-09-01). Alternates make a
     /// verify-reject fall through to the next peer's copy instead.
-    alternates: Vec<(Vec<u8>, String)>,
+    alternates: Vec<(Vec<u8>, LcFork, String)>,
 }
 
 /// Cap on alternates per period — enough to route around a few bad or stale
 /// servers without holding a full fan-out's multi-MiB responses in memory.
 const MAX_STAGED_ALTERNATES: usize = 3;
+
+/// Stage `chunk` (wire format `fork`) for `period`, served by `from`. The first
+/// copy of a period takes the slot; another peer's copy becomes a FALLBACK
+/// rather than being dropped, so a verify-reject on the leader can try someone
+/// else's (see [`StagedChunk::alternates`]). Copies identical in bytes AND wire
+/// format are skipped — they would fail verification identically. The same
+/// bytes under another format are not a copy: a peer tagging an honest chunk
+/// with the wrong digest must not shadow the correctly tagged one.
+fn stage_chunk(
+    staged: &mut std::collections::BTreeMap<u64, StagedChunk>,
+    period: u64,
+    chunk: Vec<u8>,
+    fork: LcFork,
+    from: &str,
+) {
+    match staged.entry(period) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(StagedChunk { ssz: chunk, fork, from: from.to_string(), alternates: Vec::new() });
+        }
+        std::collections::btree_map::Entry::Occupied(mut o) => {
+            let slot = o.get_mut();
+            if slot.alternates.len() < MAX_STAGED_ALTERNATES
+                && (slot.ssz != chunk || slot.fork != fork)
+                && !slot.alternates.iter().any(|(ssz, f, _)| *ssz == chunk && *f == fork)
+            {
+                slot.alternates.push((chunk, fork, from.to_string()));
+            }
+        }
+    }
+}
 
 /// Periods requested per catch-up round — the full spec cap, matching the
 /// Java client's `min(periodsToFetch, 128)`. This is THE cold-sync lever:
@@ -2830,7 +2904,7 @@ async fn catch_up(
                     tokio::time::sleep(wait),
                     tokio::time::timeout(
                         probe_budget,
-                        hunt_round(client, pool, processor, clcache, &mut hunt.probed,
+                        hunt_round(config, client, pool, processor, clcache, &mut hunt.probed,
                             &mut hunt.confirmed),
                     ),
                 );
@@ -2916,7 +2990,7 @@ async fn catch_up(
             tracing::debug!(peer = %peer.id, raw_len = raw.len(), hex = %hex_str(&raw),
                 "small updates_by_range frame");
         }
-        let chunks = match codec::decode_multi_chunk_response(&raw, sub_count as usize) {
+        let chunks = match codec::decode_multi_chunk_response_with_digests(&raw, sub_count as usize) {
             Ok(c) => c,
             Err(e) => {
                 // Undecodable response — with the codec's read budget this is
@@ -2934,34 +3008,13 @@ async fn catch_up(
         };
         let staged_before = staged.len();
         let mut served = 0usize;
-        for (i, chunk) in chunks.into_iter().enumerate() {
+        for (i, (digest, chunk)) in chunks.into_iter().enumerate() {
             if chunk.is_empty() {
                 break; // truncated/empty chunk — nothing after it is trustworthy
             }
             served += 1;
-            match staged.entry(sub_from + i as u64) {
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(StagedChunk {
-                        ssz: chunk,
-                        from: peer_key.clone(),
-                        alternates: Vec::new(),
-                    });
-                }
-                std::collections::btree_map::Entry::Occupied(mut o) => {
-                    // Another peer already staged this period: keep this copy
-                    // as a FALLBACK rather than dropping it, so a verify-reject
-                    // on the leader can try someone else's (see
-                    // StagedChunk::alternates). Skip byte-identical copies —
-                    // they would fail verification identically.
-                    let slot = o.get_mut();
-                    if slot.alternates.len() < MAX_STAGED_ALTERNATES
-                        && slot.ssz != chunk
-                        && !slot.alternates.iter().any(|(ssz, _)| *ssz == chunk)
-                    {
-                        slot.alternates.push((chunk, peer_key.clone()));
-                    }
-                }
-            }
+            let fork = config.lc_fork_of_chunk(&digest, chunk.len(), LightClientUpdate::GLOAS_SIZE);
+            stage_chunk(staged, sub_from + i as u64, chunk, fork, &peer_key);
         }
         if served == 0 {
             // Unserving answer — NOW the cooldown applies, so the next top-up
@@ -3214,9 +3267,9 @@ fn apply_staged_step(
     let mut out = StepOutcome::default();
     // The leader first, then every alternate: one bad copy of a period must not
     // block the walk when another peer served a good one in the same round.
-    let candidates = std::iter::once((chunk.ssz, chunk.from)).chain(chunk.alternates.into_iter());
-    for (ssz, from) in candidates {
-        match LightClientUpdate::decode(&ssz) {
+    let candidates = std::iter::once((chunk.ssz, chunk.fork, chunk.from)).chain(chunk.alternates);
+    for (ssz, fork, from) in candidates {
+        match LightClientUpdate::decode_for(fork, &ssz) {
             Ok(update) => {
                 if processor.process_update(&update) {
                     processor.store.force_rotate_if_past_period(slot_estimate);
@@ -3287,6 +3340,7 @@ struct StepOutcome {
 /// Returns true when an update verified AND applied (the resume guard's
 /// confirmation signal).
 async fn poll_finality(
+    config: &ChainConfig,
     client: &ReqRespClient,
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
@@ -3349,8 +3403,15 @@ async fn poll_finality(
                 continue;
             }
         };
-        let ssz_payload = match codec::decode_response(&raw, true) {
-            Ok(d) => d.ssz_payload,
+        let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientFinalityUpdate::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(e) => {
                 // Garbage frames are failures too (bootstrap-round parity):
                 // strikable when the whole round fails, spared by a winner.
@@ -3360,7 +3421,7 @@ async fn poll_finality(
                 continue;
             }
         };
-        match LightClientFinalityUpdate::decode(&ssz_payload) {
+        match LightClientFinalityUpdate::decode_for(fork, &ssz_payload) {
             Ok(update) => {
                 if processor.process_finality_update(&update) {
                     // Success is a VERIFIED apply (Java notifies its cache
@@ -3411,6 +3472,7 @@ async fn poll_finality(
 ///
 /// Returns true when an update verified AND applied.
 async fn hunt_round(
+    config: &ChainConfig,
     client: &ReqRespClient,
     pool: &mut PeerPool,
     processor: &mut LightClientProcessor,
@@ -3468,14 +3530,21 @@ async fn hunt_round(
                 continue;
             }
         };
-        let ssz_payload = match codec::decode_response(&raw, true) {
-            Ok(d) => d.ssz_payload,
+        let (fork, ssz_payload) = match codec::decode_response(&raw, true) {
+            Ok(d) => (
+                config.lc_fork_of_chunk(
+                    &d.fork_digest,
+                    d.ssz_payload.len(),
+                    LightClientFinalityUpdate::GLOAS_SIZE,
+                ),
+                d.ssz_payload,
+            ),
             Err(_) => {
                 pool.note_failure(peer.id);
                 continue;
             }
         };
-        match LightClientFinalityUpdate::decode(&ssz_payload) {
+        match LightClientFinalityUpdate::decode_for(fork, &ssz_payload) {
             Ok(update) => {
                 let addr = format!("{}/p2p/{}", peer.addr, peer.id);
                 if confirmed.insert(peer.id) {
@@ -3565,26 +3634,40 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
     // the SIGNATURE slot (~beacon.slot + 1), whereas the optimistic execution
     // payload belongs to the attested block at `beacon.slot`. Using the block
     // slot keeps the stateRootMatch window's (slot, root) keys correct.
+    //
+    // A Gloas-shaped header proves only the block hash: the anchor holds it as
+    // pending until the EL fetches the header whose keccak it is
+    // (`ExecAnchor::resolve_header`) — the number and state root come from there.
     if let Some(finalized) = store.finalized_header() {
-        let e = &finalized.execution;
-        if e.block_hash != [0u8; 32] {
-            anchor.update_finalized(
-                finalized.beacon.slot,
-                e.state_root,
-                e.block_number,
-                e.block_hash,
-            );
+        match &finalized.execution {
+            HeaderExecution::Payload(e) if e.block_hash != [0u8; 32] => {
+                anchor.update_finalized(
+                    finalized.beacon.slot,
+                    e.state_root,
+                    e.block_number,
+                    e.block_hash,
+                );
+            }
+            HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {
+                anchor.note_finalized_hash(finalized.beacon.slot, *hash);
+            }
+            _ => {}
         }
     }
     if let Some(optimistic) = store.optimistic_header() {
-        let e = &optimistic.execution;
-        if e.block_hash != [0u8; 32] {
-            anchor.update_optimistic(
-                optimistic.beacon.slot,
-                e.block_number,
-                e.block_hash,
-                e.state_root,
-            );
+        match &optimistic.execution {
+            HeaderExecution::Payload(e) if e.block_hash != [0u8; 32] => {
+                anchor.update_optimistic(
+                    optimistic.beacon.slot,
+                    e.block_number,
+                    e.block_hash,
+                    e.state_root,
+                );
+            }
+            HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {
+                anchor.note_optimistic_hash(optimistic.beacon.slot, *hash);
+            }
+            _ => {}
         }
     }
 }
@@ -3631,7 +3714,16 @@ fn feed_exec_anchor(
     slots_per_period: u64,
 ) -> SyncState {
     update_exec_anchor(store, anchor);
-    let state = sync_state_at(store, wall_slot, slots_per_epoch, slots_per_period);
+    let mut state = sync_state_at(store, wall_slot, slots_per_epoch, slots_per_period);
+    // Gloas: a finality is usable only once its execution header is resolved.
+    // A resolver left behind (no EL peer serves the header) must not read as
+    // SYNCED — the same slack as the finality gate itself. Before Gloas the
+    // anchor's finality IS the store's, so this never fires.
+    if state == SyncState::Synced
+        && anchor.finalized_slot() + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch < wall_slot
+    {
+        state = SyncState::CatchingUp;
+    }
     anchor.set_finality_current(state == SyncState::Synced);
     state
 }
@@ -3728,13 +3820,22 @@ mod tests {
         };
         LightClientHeader {
             beacon: BeaconBlockHeader { slot, ..Default::default() },
-            execution: ExecutionPayloadHeader {
+            execution: HeaderExecution::Payload(Box::new(ExecutionPayloadHeader {
                 state_root,
                 block_number,
                 block_hash,
                 ..Default::default()
-            },
+            })),
             execution_branch: Vec::new(),
+        }
+    }
+
+    /// A Gloas-shaped store header: the block hash alone.
+    fn gloas_header(slot: u64, block_hash: [u8; 32]) -> myotis_consensus::types::LightClientHeader {
+        myotis_consensus::types::LightClientHeader {
+            beacon: myotis_consensus::types::BeaconBlockHeader { slot, ..Default::default() },
+            execution: HeaderExecution::BlockHash(block_hash),
+            execution_branch: vec![[0u8; 32]; 11],
         }
     }
 
@@ -3852,6 +3953,67 @@ mod tests {
         assert_eq!((parked.period, parked.ws_bound_periods), (1_220, 13));
     }
 
+    /// Gloas: the store's headers carry only block hashes, so the anchor holds
+    /// them pending and the published state is not SYNCED until the finality's
+    /// header is resolved — however current the light client itself is.
+    #[test]
+    fn a_gloas_finality_is_synced_only_once_its_header_resolves() {
+        use myotis_consensus::types::SyncCommittee;
+        let (epoch, period_slots) = (32u64, 8192u64);
+        let wall = 10_000_000u64;
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new_mainnet_preset();
+        let committee = SyncCommittee { pubkeys: Vec::new(), aggregate_pubkey: [0u8; 48] };
+
+        // The execution header the finality will name, built for real so its
+        // keccak is the hash the light client "proved".
+        let (_, genesis) = crate::el::served::mainnet_genesis().expect("embedded genesis");
+        let mut h = myotis_core::header::BlockHeader::decode(&genesis).expect("genesis decodes");
+        h.number = 21_004_000;
+        h.state_root = [3; 32];
+        let raw_rlp = h.encode();
+        let resolved = crate::el::eth::messages::VerifiedHeader {
+            hash: myotis_core::keccak::keccak256(&raw_rlp),
+            raw_rlp,
+            header: h,
+        };
+
+        store.initialize(gloas_header(wall - 64, resolved.hash), committee);
+        store.update_optimistic(&gloas_header(wall - 2, [9; 32]), wall - 1);
+        assert_eq!(feed_exec_anchor(&store, &anchor, wall, epoch, period_slots), SyncState::CatchingUp);
+        assert_eq!(anchor.pending_hashes(), vec![resolved.hash, [9; 32]]);
+        assert!(!anchor.is_synced(), "a proven hash alone anchors nothing");
+        assert!(!anchor.finality_is_current());
+
+        assert!(anchor.resolve_header(&resolved));
+        assert_eq!(feed_exec_anchor(&store, &anchor, wall, epoch, period_slots), SyncState::Synced);
+        let fin = anchor.finalized_execution().expect("resolved");
+        assert_eq!((fin.slot, fin.block_number, fin.state_root), (wall - 64, 21_004_000, [3; 32]));
+        assert!(anchor.finality_is_current());
+        assert_eq!(anchor.pending_hashes(), vec![[9; 32]], "the optimistic head still waits");
+    }
+
+    /// A resolver that stays behind — no EL peer serves the header — drops the
+    /// published state out of SYNCED within the finality gate's own slack,
+    /// instead of reading as verification-ready on a finality it cannot use.
+    #[test]
+    fn a_resolver_left_behind_is_not_synced() {
+        use myotis_consensus::types::SyncCommittee;
+        let (epoch, period_slots) = (32u64, 8192u64);
+        let wall = 10_000_000u64;
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new_mainnet_preset();
+        let committee = SyncCommittee { pubkeys: Vec::new(), aggregate_pubkey: [0u8; 48] };
+        // Resolved long ago (payload-shaped finality six epochs back)...
+        store.initialize(header_with_exec(wall - 6 * epoch, [1; 32], 21_000_000, [2; 32]), committee);
+        feed_exec_anchor(&store, &anchor, wall - 6 * epoch, epoch, period_slots);
+        // ...then the light client finalizes Gloas blocks the EL never resolves.
+        store.update_finalized(&gloas_header(wall - 64, [7; 32]), wall - 64);
+        assert_eq!(feed_exec_anchor(&store, &anchor, wall, epoch, period_slots), SyncState::CatchingUp);
+        // The previous finality still anchors reads — final, only older.
+        assert_eq!(anchor.finalized_execution().map(|f| f.block_number), Some(21_000_000));
+    }
+
     #[test]
     fn exec_anchor_skips_zero_block_hash() {
         // A pre-merge / absent execution header (zero block hash) must NOT
@@ -3865,6 +4027,10 @@ mod tests {
 
         assert!(!anchor.is_synced());
         assert!(anchor.finalized_execution().is_none());
+        // Nor a zero Gloas block hash.
+        store.update_finalized(&gloas_header(6, [0u8; 32]), 6);
+        update_exec_anchor(&store, &anchor);
+        assert!(anchor.pending_hashes().is_empty());
     }
 
     #[test]
@@ -3986,8 +4152,6 @@ mod tests {
     #[test]
     fn a_future_fork_pinned_ahead_does_not_change_todays_digest() {
         for c in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
-            assert_eq!(c.current_fork_version(), c.fork_schedule.newest(),
-                "{}: every pinned fork is active today", c.name);
             let mut forks = c.fork_schedule.forks().to_vec();
             forks.push((u64::MAX / 64, [0x7F, 0, 0, 0])); // never activates in this test's lifetime
             let ahead = ChainConfig {
@@ -4019,7 +4183,9 @@ mod tests {
     fn sepolia_config_matches_networkconfig_java() {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
-        assert_eq!(c.current_fork_version(), [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        // Gloas is pinned ahead of its activation (2026-10-06): keyed by epoch.
+        assert_eq!(c.fork_version_at_epoch(353_023), [0x90, 0x00, 0x00, 0x75]); // Fulu
+        assert_eq!(c.fork_version_at_epoch(353_024), [0x90, 0x00, 0x00, 0x76]); // Gloas
         assert_eq!(c.prior_fork_version(), None); // fallback digest off
         // eth-clients/sepolia metadata/config.yaml — Java twin pins the same.
         assert_eq!(c.fork_schedule.slots_per_epoch(), c.slots_per_epoch);
@@ -4033,8 +4199,13 @@ mod tests {
                 (132_608, [0x90, 0x00, 0x00, 0x73]),
                 (222_464, [0x90, 0x00, 0x00, 0x74]),
                 (272_640, [0x90, 0x00, 0x00, 0x75]),
+                (353_024, [0x90, 0x00, 0x00, 0x76]),
             ]
         );
+        // Gloas's first slot (353024 * 32) still verifies under Fulu.
+        let sig = |slot| c.fork_schedule.version_for_signature_slot(slot);
+        assert_eq!(sig(11_296_768), [0x90, 0x00, 0x00, 0x75]);
+        assert_eq!(sig(11_296_769), [0x90, 0x00, 0x00, 0x76]);
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 11_209_280);
         assert_eq!(
@@ -4055,10 +4226,41 @@ mod tests {
             spec::compute_sync_committee_period(c.checkpoint_slot),
             spec::compute_sync_committee_period_with(c.checkpoint_slot, c.slots_per_period())
         );
-        // The live digest the Java computes (verified by running
-        // NetworkConfig.SEPOLIA.currentForkDigest() — BPO2 folded in).
-        assert_eq!(c.current_fork_digest(), [0x74, 0xD0, 0x14, 0x59]);
-        assert_eq!(c.accepted_fork_digests(), vec![[0x74, 0xD0, 0x14, 0x59]]);
+        // The digests the Java computes (NetworkConfig.SEPOLIA.forkDigestAtEpoch, BPO2
+        // folded in), keyed by epoch because Gloas flips it. Fulu's is live-verified;
+        // Gloas's is the same formula over 0x90000076 with the unchanged BPO2 params —
+        // derived, to be confirmed against live peers after the fork.
+        assert_eq!(c.fork_digest_at_epoch(353_023), [0x74, 0xD0, 0x14, 0x59]);
+        assert_eq!(c.fork_digest_at_epoch(353_024), [0x66, 0x9E, 0x6C, 0x11]);
+        assert_eq!(c.accepted_fork_digests(), vec![c.current_fork_digest()]);
+        // Context bytes pick the wire format: Gloas' digest the Gloas decoders,
+        // everything else the (sniffing) pre-Gloas ones — unless the payload is
+        // exactly the Gloas size, which no pre-Gloas object is.
+        assert_eq!(c.fork_schedule.gloas_epoch(), Some(353_024));
+        const GLOAS: [u8; 4] = [0x66, 0x9E, 0x6C, 0x11];
+        const FULU: [u8; 4] = [0x74, 0xD0, 0x14, 0x59];
+        let (update, upd_len) = (LightClientUpdate::GLOAS_SIZE, 27_000);
+        assert_eq!(c.lc_fork_of_chunk(&GLOAS, upd_len, update), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&FULU, upd_len, update), LcFork::PreGloas);
+        assert_eq!(c.lc_fork_of_chunk(&[], upd_len, update), LcFork::PreGloas);
+        // A digest this config does not compute — a later blob-parameter fork —
+        // still reads a Gloas-sized object as Gloas, as does a mislabelled one.
+        assert_eq!(c.lc_fork_of_chunk(&[1, 2, 3, 4], update, update), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&FULU, update, update), LcFork::Gloas);
+        let fin = LightClientFinalityUpdate::GLOAS_SIZE;
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], fin, fin), LcFork::Gloas);
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], fin + 1, fin), LcFork::PreGloas);
+        let boot = LightClientBootstrap::GLOAS_SIZE;
+        assert_eq!(c.lc_fork_of_chunk(&[9, 9, 9, 9], boot, boot), LcFork::Gloas);
+        assert_eq!(c.fork_schedule.lc_fork_at_slot(11_296_767), LcFork::PreGloas);
+        assert_eq!(c.fork_schedule.lc_fork_at_slot(11_296_768), LcFork::Gloas);
+        // No Gloas date on mainnet or gnosis yet: nothing is Gloas there, by
+        // digest or by size.
+        for other in [ChainConfig::mainnet(), ChainConfig::gnosis()] {
+            assert_eq!(other.fork_schedule.gloas_epoch(), None);
+            assert_eq!(other.lc_fork_of_chunk(&GLOAS, upd_len, update), LcFork::PreGloas);
+            assert_eq!(other.lc_fork_of_chunk(&GLOAS, update, update), LcFork::PreGloas);
+        }
         // The full list, in order, addresses included — NOT a suffix match.
         //
         // This does NOT read the Java config: the two are hand-maintained copies
@@ -4537,7 +4739,12 @@ mod tests {
     fn next_single_target_spreads_lookahead_and_keeps_prefix_redundant() {
         let mut staged = std::collections::BTreeMap::new();
         let mut covered: HashMap<u64, usize> = HashMap::new();
-        let chunk = || StagedChunk { ssz: vec![1], from: String::new(), alternates: Vec::new() };
+        let chunk = || StagedChunk {
+            ssz: vec![1],
+            fork: LcFork::PreGloas,
+            from: String::new(),
+            alternates: Vec::new(),
+        };
         // Empty pipeline: the prefix first, PREFIX_REDUNDANCY times.
         assert_eq!(next_single_target(100, 5, &staged, &covered), Some(100));
         for _ in 0..PREFIX_REDUNDANCY {
@@ -4879,8 +5086,9 @@ mod tests {
             expected_period,
             StagedChunk {
                 ssz: good_ssz.iter().map(|b| b ^ 0xff).collect(), // same length, garbage
+                fork: LcFork::PreGloas,
                 from: "/ip4/10.0.0.1/tcp/9000/p2p/bad".into(),
-                alternates: vec![(good_ssz, "/ip4/10.0.0.2/tcp/9000/p2p/good".into())],
+                alternates: vec![(good_ssz, LcFork::PreGloas, "/ip4/10.0.0.2/tcp/9000/p2p/good".into())],
             },
         );
 
@@ -4896,6 +5104,86 @@ mod tests {
                 || out.decode_failures > 0,
             "the bad leader must be reported as rejected (or undecodable), never silently dropped"
         );
+    }
+
+    /// The fork recorded with a staged chunk — from ITS context bytes — is what
+    /// picks the decoder at apply time: a genuine pre-Gloas update staged as
+    /// Gloas is a decode failure (never a misread), and the same bytes staged
+    /// under their real fork apply.
+    #[test]
+    fn a_staged_chunk_decodes_in_the_fork_its_context_bytes_named() {
+        use myotis_consensus::types::LightClientBootstrap;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/lc/mainnet");
+        let Ok(bootstrap_ssz) = std::fs::read(dir.join("bootstrap.ssz")) else {
+            eprintln!("skipping: LC corpus not present");
+            return;
+        };
+        let bootstrap = LightClientBootstrap::decode(&bootstrap_ssz).expect("bootstrap decodes");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with("-update.ssz") && n.len() == "000-update.ssz".len())
+            .collect();
+        names.sort();
+        let good_ssz = std::fs::read(dir.join(&names[0])).expect("first update");
+        let processor = || {
+            let mut store = myotis_consensus::store::LightClientStore::new_mainnet_preset();
+            store.initialize(bootstrap.header.clone(), bootstrap.current_sync_committee.clone());
+            let mainnet = crate::sync::ChainConfig::mainnet();
+            LightClientProcessor::new(store, mainnet.fork_schedule, mainnet.genesis_validators_root)
+        };
+        let stage = |p: &LightClientProcessor, fork| {
+            let mut staged = std::collections::BTreeMap::new();
+            staged.insert(
+                p.store.current_period(),
+                StagedChunk { ssz: good_ssz.clone(), fork, from: "peer".into(), alternates: Vec::new() },
+            );
+            staged
+        };
+
+        let mut p = processor();
+        let mut staged = stage(&p, LcFork::Gloas);
+        let out = apply_staged_step(&mut p, &mut staged, u64::MAX);
+        assert_eq!((out.applied, out.verify_rejects), (0, 0));
+        assert!(out.decode_failures > 0, "wrong-fork bytes are a decode failure");
+
+        let mut p = processor();
+        let mut staged = stage(&p, LcFork::PreGloas);
+        let out = apply_staged_step(&mut p, &mut staged, u64::MAX);
+        assert_eq!(out.applied, 1);
+
+        // A peer that tags the honest bytes with the wrong digest stages them
+        // FIRST: the honest peer's byte-identical copy under the right format is
+        // not a duplicate — it stays as the alternate, and applies.
+        let mut p = processor();
+        let period = p.store.current_period();
+        let mut staged = std::collections::BTreeMap::new();
+        stage_chunk(&mut staged, period, good_ssz.clone(), LcFork::Gloas, "liar");
+        stage_chunk(&mut staged, period, good_ssz.clone(), LcFork::PreGloas, "honest");
+        let out = apply_staged_step(&mut p, &mut staged, u64::MAX);
+        assert_eq!(out.applied, 1, "the correctly tagged copy must not be deduplicated away");
+        assert_eq!(out.applied_from.as_deref(), Some("honest"));
+    }
+
+    /// Staging keeps one copy per (bytes, wire format): the first takes the
+    /// slot, a byte-and-format-identical copy is dropped, the same bytes under
+    /// another format or other bytes become alternates, up to the cap.
+    #[test]
+    fn stage_chunk_dedups_by_bytes_and_format() {
+        let mut staged = std::collections::BTreeMap::new();
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::Gloas, "a");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::Gloas, "b");
+        assert!(staged[&7].alternates.is_empty(), "an identical copy is not an alternate");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::PreGloas, "c");
+        stage_chunk(&mut staged, 7, vec![1, 2, 3], LcFork::PreGloas, "d");
+        stage_chunk(&mut staged, 7, vec![4, 5, 6], LcFork::Gloas, "e");
+        let from: Vec<&str> = staged[&7].alternates.iter().map(|(_, _, f)| f.as_str()).collect();
+        assert_eq!((staged[&7].from.as_str(), from), ("a", vec!["c", "e"]));
+        for i in 0..MAX_STAGED_ALTERNATES as u8 {
+            stage_chunk(&mut staged, 7, vec![9, i], LcFork::Gloas, "f");
+        }
+        assert_eq!(staged[&7].alternates.len(), MAX_STAGED_ALTERNATES, "capped");
     }
 
     #[test]

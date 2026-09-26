@@ -10,8 +10,8 @@ use myotis_consensus::spec;
 use myotis_consensus::ssz::{self, Root};
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
-    BeaconBlockHeader, ExecutionPayloadHeader, LightClientFinalityUpdate, LightClientHeader,
-    LightClientUpdate, SyncAggregate, SyncCommittee, SYNC_COMMITTEE_SIZE,
+    BeaconBlockHeader, ExecutionPayloadHeader, HeaderExecution, LightClientFinalityUpdate,
+    LightClientHeader, LightClientUpdate, SyncAggregate, SyncCommittee, SYNC_COMMITTEE_SIZE,
 };
 use myotis_consensus::verify;
 
@@ -85,7 +85,7 @@ fn header(slot: u64, state_root: Root) -> LightClientHeader {
             state_root,
             body_root: lv.last().unwrap()[0],
         },
-        execution,
+        execution: HeaderExecution::Payload(Box::new(execution)),
         execution_branch: branch(&lv, leaf),
     }
 }

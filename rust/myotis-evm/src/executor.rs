@@ -26,6 +26,7 @@ use std::sync::Arc;
 use revm::context::result::{ExecutionResult, HaltReason, Output};
 use revm::context::{CfgEnv, TxEnv};
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
+use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, TxKind, U256};
 use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
 use revm::interpreter::{Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
@@ -72,7 +73,8 @@ fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
 }
 
 /// The exact intrinsic cost of a plain value transfer — the empty-calldata
-/// no-code estimate short-circuit's answer (unbuffered; Java parity).
+/// no-code estimate short-circuit's answer (unbuffered; Java parity). Exact only
+/// before Amsterdam (EIP-2780), so the short-circuit stops at that fork.
 const PLAIN_TRANSFER_GAS: u64 = 21_000;
 
 /// Precompiles are CODELESS in state yet execute logic — an empty-calldata
@@ -222,7 +224,7 @@ impl EvmExecutor {
         // `Context::mainnet()` builder below is chain-neutral standard-Ethereum
         // rules — the chain id itself is set via cfg.chain_id, and every chain
         // spec_for knows (mainnet, sepolia) is rule-identical at a given SpecId.
-        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let spec = spec_for_context(ctx)?;
         let db = self.database_for(ctx);
         self.execute_with_db(&db, spec, caller, target, calldata, value, ctx)
     }
@@ -256,17 +258,7 @@ impl EvmExecutor {
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
         self.oracle.check_request()?;
-        let mut cfg = CfgEnv::new_with_spec(spec);
-        cfg.chain_id = ctx.chain_id;
-        // Not a real tx: relax the transaction-level checks (see the module docs).
-        // `tx_gas_limit_cap` is raised to VIEW_CALL_GAS so the spec's own per-tx cap
-        // doesn't clip the full-block gas budget (also the estimate ceiling).
-        cfg.disable_nonce_check = true;
-        cfg.disable_balance_check = true;
-        cfg.disable_base_fee = true;
-        cfg.disable_eip3607 = true;
-        cfg.disable_block_gas_limit = true;
-        cfg.tx_gas_limit_cap = Some(VIEW_CALL_GAS);
+        let cfg = view_cfg(spec, ctx.chain_id);
 
         let tx = TxEnv::builder()
             .caller(caller)
@@ -346,7 +338,7 @@ impl EvmExecutor {
         overrides: StateOverrides,
     ) -> Result<Vec<u8>, EvmError> {
         self.oracle.check_request()?;
-        let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+        let spec = spec_for_context(ctx)?;
         let db = self.database_for_with(ctx, overrides);
 
         // Prime the target's account + code synchronously (sentinel OFF, not
@@ -457,8 +449,17 @@ impl EvmExecutor {
         // runs FIRST — an unsupported chain or too-old fork fails closed here
         // exactly like the full path, never answering 21000 for a context the
         // executor wouldn't execute.
-        spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
-        if calldata.is_empty() && !in_precompile_range(&target) {
+        //
+        // The flat 21000 is exact only BEFORE Amsterdam: EIP-2780 decomposes it
+        // (sender base + recipient access + a value charge), and a value transfer
+        // to an EMPTY account also pays EIP-8037 account-creation state gas — an
+        // order of magnitude more than 21000. From AMSTERDAM the metered run below
+        // prices it instead (buffered, like every metered estimate).
+        let spec = spec_for_context(ctx)?;
+        if calldata.is_empty()
+            && !in_precompile_range(&target)
+            && !spec.is_enabled_in(SpecId::AMSTERDAM)
+        {
             let db = OracleDatabase::new(
                 Arc::clone(&self.oracle),
                 ctx.state_root,
@@ -489,6 +490,64 @@ impl EvmExecutor {
             ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
         }
     }
+}
+
+/// The spec `ctx` executes under ([`spec_for`]), refusing a context that
+/// cannot serve it: an AMSTERDAM block whose header carried no EIP-7843 slot
+/// number would run SLOTNUM against a made-up 0 — a well-formed wrong answer —
+/// so it fails with the permanent [`EvmError::MissingSlotNumber`] before any
+/// state is fetched. Before Amsterdam the slot is not needed (SLOTNUM is an
+/// invalid opcode there) — and a header that carries one anyway is an
+/// Amsterdam block this build's fork table does not know about, refused the
+/// same way ([`EvmError::UnexpectedSlotNumber`]) rather than run under the
+/// older fork's rules.
+fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
+    let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
+    let amsterdam = spec.is_enabled_in(SpecId::AMSTERDAM);
+    if amsterdam && ctx.slot_number.is_none() {
+        return Err(EvmError::MissingSlotNumber {
+            block_number: ctx.block_number,
+        });
+    }
+    if !amsterdam && ctx.slot_number.is_some() {
+        return Err(EvmError::UnexpectedSlotNumber {
+            block_number: ctx.block_number,
+        });
+    }
+    Ok(spec)
+}
+
+/// The [`CfgEnv`] a view call runs under at `spec`: revm's per-spec defaults
+/// with the transaction-level checks relaxed (see the module docs).
+///
+/// Amsterdam's gas model — EIP-8037 state gas and EIP-2780 decomposed intrinsic
+/// gas — is on for AMSTERDAM specs and off for every earlier one. That is exactly
+/// what reth runs Amsterdam blocks with: it builds its env with this same
+/// `CfgEnv::new_with_spec` (alloy-evm `EvmEnv::for_eth`), which derives both
+/// flags from the spec, and sets no Amsterdam flag of its own — revm's EIP-7708 /
+/// EIP-8246 opt-outs stay at their defaults (active from AMSTERDAM, gated inside
+/// revm). The explicit assignment restates that derivation so a revm bump that
+/// stopped making it can't silently price Amsterdam with Osaka's gas model;
+/// `amsterdam_gas_model_is_enabled_only_for_amsterdam` pins the result.
+fn view_cfg(spec: SpecId, chain_id: u64) -> CfgEnv {
+    let mut cfg = CfgEnv::new_with_spec(spec);
+    cfg.chain_id = chain_id;
+    let amsterdam = spec.is_enabled_in(SpecId::AMSTERDAM);
+    cfg.enable_amsterdam_eip8037 = amsterdam;
+    cfg.enable_amsterdam_eip2780 = amsterdam;
+    // Not a real tx: relax the transaction-level checks (see the module docs).
+    // `tx_gas_limit_cap` is raised to VIEW_CALL_GAS so the spec's own per-tx cap
+    // doesn't clip the full-block gas budget (also the estimate ceiling). Under
+    // EIP-8037 the cap also splits regular gas from the state-gas reservoir; at
+    // cap == gas limit the reservoir is empty and state gas draws on the same
+    // 30 M, so the budget means the same thing on every fork.
+    cfg.disable_nonce_check = true;
+    cfg.disable_balance_check = true;
+    cfg.disable_base_fee = true;
+    cfg.disable_eip3607 = true;
+    cfg.disable_block_gas_limit = true;
+    cfg.tx_gas_limit_cap = Some(VIEW_CALL_GAS);
+    cfg
 }
 
 fn output_bytes(output: Output) -> Vec<u8> {
@@ -586,6 +645,7 @@ mod tests {
             prev_randao: [0x33; 32],
             chain_id: 1,
             gas_limit: 30_000_000,
+            slot_number: None, // mainnet has no Amsterdam date: no slot in the header
         }
     }
 
@@ -1272,6 +1332,258 @@ mod tests {
         c.chain_id = 11_155_111;
         let out = exec.call_view(TARGET, &[], &c).expect("sepolia call must run");
         assert_eq!(U256::from_be_slice(&out), U256::from(11_155_111u64));
+    }
+
+    /// Sepolia's first Amsterdam slot (ethereum/pm#2205).
+    const SEPOLIA_AMSTERDAM_SLOT: u64 = 11_296_768;
+
+    /// A sepolia context at `ts` (the one chain with an Amsterdam date). Like a
+    /// real header, it carries a slot number only from Amsterdam on.
+    fn sepolia_ctx(ts: u64) -> BlockContext {
+        let mut c = ctx(10_000_000, ts);
+        c.chain_id = 11_155_111;
+        c.slot_number =
+            (ts >= crate::fork::SEPOLIA_AMSTERDAM_TIME).then_some(SEPOLIA_AMSTERDAM_SLOT);
+        c
+    }
+
+    /// Every fetch panics: proves a refusal happens before any state is read.
+    struct NoFetchOracle;
+    impl SnapStateOracle for NoFetchOracle {
+        fn fetch_account(
+            &self,
+            _: &[u8; 32],
+            _: [u8; 20],
+        ) -> Result<Option<OracleAccount>, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+        fn fetch_storage(&self, _: &[u8; 32], _: [u8; 20], _: U256) -> Result<U256, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+        fn fetch_bytecode(&self, _: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+            panic!("a refused context must not fetch")
+        }
+    }
+
+    /// SLOTNUM PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN — returns the slot.
+    const SLOTNUM_CODE: [u8; 9] = [0x4b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+    #[test]
+    fn slotnum_returns_the_headers_slot_on_amsterdam() {
+        let exec = executor_with(SLOTNUM_CODE.to_vec(), None);
+        let mut c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME);
+        let out = exec
+            .call_view(TARGET, &[], &c)
+            .expect("SLOTNUM runs on Amsterdam");
+        assert_eq!(
+            U256::from_be_slice(&out),
+            U256::from(SEPOLIA_AMSTERDAM_SLOT)
+        );
+        // It is the context's slot, not a constant: a later block reads its own.
+        c.slot_number = Some(SEPOLIA_AMSTERDAM_SLOT + 5);
+        let out = exec.call_view(TARGET, &[], &c).unwrap();
+        assert_eq!(
+            U256::from_be_slice(&out),
+            U256::from(SEPOLIA_AMSTERDAM_SLOT + 5)
+        );
+    }
+
+    #[test]
+    fn amsterdam_context_without_a_slot_is_refused_before_any_fetch() {
+        // Never SLOTNUM against a made-up 0: a verified Amsterdam header always
+        // carries the slot, so its absence means the block isn't what the fork
+        // table says — refused for good, and before the peers are asked anything.
+        let exec = EvmExecutor::new(
+            Arc::new(NoFetchOracle),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let mut c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME);
+        c.slot_number = None;
+        let refused = |r: Result<(), EvmError>| {
+            let e = r.unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    EvmError::MissingSlotNumber {
+                        block_number: 10_000_000
+                    }
+                ),
+                "{e:?}"
+            );
+            assert!(e.is_refusal(), "a missing slot is permanent: {e:?}");
+        };
+        refused(exec.call_view(TARGET, &[], &c).map(drop));
+        refused(
+            exec.create_view(
+                [0u8; 20],
+                &SLOTNUM_CODE,
+                U256::ZERO,
+                &c,
+                StateOverrides::new(),
+            )
+            .map(drop),
+        );
+        refused(
+            exec.estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &c)
+                .map(drop),
+        );
+    }
+
+    #[test]
+    fn a_slot_before_amsterdam_is_refused_before_any_fetch() {
+        // A slot number in the header means an Amsterdam block. If the fork
+        // table disagrees — no Amsterdam date (mainnet), or a later one — the
+        // network moved the fork after this build shipped: refused for good
+        // rather than answered under the older fork's opcodes and gas.
+        let exec = EvmExecutor::new(
+            Arc::new(NoFetchOracle),
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let mut before = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME - 1);
+        before.slot_number = Some(SEPOLIA_AMSTERDAM_SLOT - 1);
+        let mut mainnet = ctx(10_000_000, crate::fork::SEPOLIA_AMSTERDAM_TIME + 1);
+        mainnet.slot_number = Some(1);
+        for c in [before, mainnet] {
+            let refused = |r: Result<(), EvmError>| {
+                let e = r.unwrap_err();
+                assert!(
+                    matches!(
+                        e,
+                        EvmError::UnexpectedSlotNumber {
+                            block_number: 10_000_000
+                        }
+                    ),
+                    "{e:?}"
+                );
+                assert!(
+                    e.is_refusal(),
+                    "an unscheduled Amsterdam block is permanent: {e:?}"
+                );
+            };
+            refused(exec.call_view(TARGET, &[], &c).map(drop));
+            refused(
+                exec.create_view(
+                    [0u8; 20],
+                    &SLOTNUM_CODE,
+                    U256::ZERO,
+                    &c,
+                    StateOverrides::new(),
+                )
+                .map(drop),
+            );
+            refused(
+                exec.estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &c)
+                    .map(drop),
+            );
+        }
+    }
+
+    #[test]
+    fn slotnum_is_invalid_before_amsterdam_and_needs_no_slot() {
+        // One second before activation there is no slot in the header and
+        // nothing to refuse — the context runs, and SLOTNUM itself is simply an
+        // invalid opcode there (revm gates it on AMSTERDAM).
+        let c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME - 1);
+        assert_eq!(c.slot_number, None);
+        let chain_id = executor_with(
+            vec![0x46u8, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+            None,
+        )
+        .call_view(TARGET, &[], &c)
+        .expect("a pre-Amsterdam context needs no slot");
+        assert_eq!(U256::from_be_slice(&chain_id), U256::from(11_155_111u64));
+        let err = executor_with(SLOTNUM_CODE.to_vec(), None)
+            .call_view(TARGET, &[], &c)
+            .unwrap_err();
+        assert!(matches!(err, EvmError::Halted { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn amsterdam_gas_model_is_enabled_only_for_amsterdam() {
+        let sepolia = 11_155_111u64;
+        for spec in [
+            SpecId::LONDON,
+            SpecId::CANCUN,
+            SpecId::PRAGUE,
+            SpecId::OSAKA,
+        ] {
+            let cfg = view_cfg(spec, sepolia);
+            assert!(
+                !cfg.enable_amsterdam_eip8037,
+                "{spec:?} must not run EIP-8037 state gas"
+            );
+            assert!(
+                !cfg.enable_amsterdam_eip2780,
+                "{spec:?} must not run EIP-2780 intrinsic gas"
+            );
+        }
+        let cfg = view_cfg(SpecId::AMSTERDAM, sepolia);
+        assert!(
+            cfg.enable_amsterdam_eip8037,
+            "AMSTERDAM runs EIP-8037 state gas"
+        );
+        assert!(
+            cfg.enable_amsterdam_eip2780,
+            "AMSTERDAM runs EIP-2780 intrinsic gas"
+        );
+        // reth leaves revm's two Amsterdam opt-outs alone (EIP-7708 transfer logs
+        // and EIP-8246 self-destruct clearing stay active); so do we.
+        assert!(!cfg.amsterdam_eip7708_disabled);
+        assert!(!cfg.amsterdam_eip8246_delayed_clear_disabled);
+        // The view-call relaxations are fork-independent.
+        assert_eq!(cfg.tx_gas_limit_cap, Some(VIEW_CALL_GAS));
+        assert_eq!(cfg.chain_id, sepolia);
+    }
+
+    #[test]
+    fn amsterdam_call_runs_on_the_amsterdam_rung() {
+        // CHAINID PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN at the activation
+        // instant: the envelope passes EIP-2780/EIP-8037 validation with the
+        // view-call gas settings, and the answer comes from the right chain.
+        let code = vec![0x46u8, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let exec = executor_with(code, None);
+        let c = sepolia_ctx(crate::fork::SEPOLIA_AMSTERDAM_TIME);
+        let out = exec
+            .call_view(TARGET, &[], &c)
+            .expect("amsterdam call must run");
+        assert_eq!(U256::from_be_slice(&out), U256::from(11_155_111u64));
+    }
+
+    #[test]
+    fn amsterdam_value_transfer_to_an_empty_account_is_metered_not_21000() {
+        // EIP-2780 charges a value transfer to an EMPTY account EIP-8037
+        // account-creation state gas on top of its intrinsic, so the pre-Amsterdam
+        // 21000 short-circuit would under-estimate it ~10x and the tx would OOG.
+        let exec = EvmExecutor::new(
+            Arc::new(FixtureSnapStateOracle::new()), // TARGET is proven absent
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        let t = crate::fork::SEPOLIA_AMSTERDAM_TIME;
+        // One second before activation (Osaka) the exact answer is unchanged.
+        let osaka = exec
+            .estimate_gas(
+                [0x42; 20],
+                TARGET,
+                &[],
+                U256::from(1u64),
+                &sepolia_ctx(t - 1),
+            )
+            .unwrap();
+        assert_eq!(osaka, 21_000);
+        let amsterdam = exec
+            .estimate_gas([0x42; 20], TARGET, &[], U256::from(1u64), &sepolia_ctx(t))
+            .unwrap();
+        let state_gas = view_cfg(SpecId::AMSTERDAM, 11_155_111)
+            .gas_params
+            .new_account_state_gas();
+        assert!(state_gas > 0, "Amsterdam must price new-account state gas");
+        assert!(
+            amsterdam > 21_000 && amsterdam >= state_gas,
+            "estimate {amsterdam} must cover the {state_gas} new-account state gas"
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 32; // 32: the state reads take a block selector (`finalized` applied)
+    static final int EXPECTED_ABI_VERSION = 33; // 33: executor refusals are permanent (-32602); Gloas SYNCED waits for the resolved execution header
 
     private static final boolean AVAILABLE = load();
 

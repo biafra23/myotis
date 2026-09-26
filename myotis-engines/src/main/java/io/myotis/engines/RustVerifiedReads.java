@@ -238,6 +238,9 @@ final class RustVerifiedReads implements VerifiedReads {
         if (to != null && to.length != 20) return io.myotis.api.CallResult.unavailable("malformed to");
         if (from != null && from.length != 20) return io.myotis.api.CallResult.unavailable("malformed from");
         try {
+            // The engine's permanent refusal ({"error","code":-32602}: a block it
+            // will never serve, an executor refusal) comes back as REFUSED from
+            // the handle; only a transport / not-running failure lands in the catch.
             String fromHex = from == null ? "" : toHex(from);
             String toHex20 = to == null ? "" : toHex(to);
             String dataHex = data == null ? "" : toHex(data);
@@ -425,20 +428,22 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public io.myotis.api.EstimateResult estimateGasDetailed(byte[] from, byte[] to,
                                                             byte[] data, String valueWei) {
-        // Same guards + 21000 fast path as estimateGas(); all are "cannot answer",
-        // not reverts.
+        // Same guards as estimateGas(); both are "cannot answer", not reverts.
+        // No host-side 21000 shortcut for a plain transfer: the engine decides.
+        // Its executor answers 21000 itself only where that is the real cost
+        // (before Amsterdam, and not to a precompile); from Amsterdam a value
+        // transfer to an empty account costs more (EIP-2780/EIP-8037), so a
+        // host shortcut would under-estimate it.
         if (to == null || to.length != 20) {
             return io.myotis.api.EstimateResult.unavailable("contract creation not estimated");
         }
         if (from != null && from.length != 20) {
             return io.myotis.api.EstimateResult.unavailable("malformed from");
         }
-        if (data == null || data.length == 0) {
-            byte[] code = getCode(to, "latest");
-            if (code != null && code.length == 0) return io.myotis.api.EstimateResult.ok(21_000L);
-            if (code == null) return io.myotis.api.EstimateResult.unavailable("recipient unverifiable");
-        }
         try {
+            // An executor refusal (the permanent {"error","code":-32602}) comes
+            // back as REFUSED from the handle; only a transport / not-running
+            // failure lands in the catch.
             return handle.estimateGasVerifiedDetailed(
                     from == null ? "" : toHex(from),
                     toHex(to),
@@ -453,7 +458,7 @@ final class RustVerifiedReads implements VerifiedReads {
     @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Legacy two-state view of estimateGasDetailed (single source for the
-        // guards + 21000 fast path) — a revert reads as null here.
+        // guards) — a revert or refusal reads as null here.
         io.myotis.api.EstimateResult r = estimateGasDetailed(from, to, data, valueWei);
         return r.status() == io.myotis.api.EstimateResult.Status.OK ? r.gas() : null;
     }

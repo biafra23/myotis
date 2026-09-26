@@ -3,7 +3,14 @@
 //! fork sniffing (branch lengths / fixed sizes derived from the leading offsets,
 //! pre-Electra vs Electra+). Decoding never panics: every malformed input returns
 //! `Err(SszError)` with a message shaped like the Java exceptions.
+//!
+//! Gloas objects are NOT sniffed: their headers carry no variable part, so every
+//! container is fixed-size and the only honest way to tell the format is the
+//! fork of the object's slot — the req/resp context bytes. `decode_for(LcFork,
+//! ..)` dispatches on it; the pre-Gloas `decode` paths are unchanged.
 
+use crate::fork::LcFork;
+use crate::spec;
 use crate::ssz::{self, Root};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -291,19 +298,54 @@ impl ExecutionPayloadHeader {
 }
 
 // -------------------------------------------------------------------------
-// LightClientHeader — beacon(112) + execution offset(4) + executionBranch(128)
+// LightClientHeader — pre-Gloas: beacon(112) + execution offset(4) +
+// executionBranch(128) + payload header; Gloas: beacon(112) + block hash(32) +
+// executionBranch(352), 496 bytes fixed.
 // -------------------------------------------------------------------------
+
+/// What a light-client header proves about the execution layer. The shape is its
+/// fork's ([`LcFork`]), and so is the proof: see
+/// `LightClientProcessor::verify_execution_branch_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderExecution {
+    /// Capella..Fulu: the whole execution payload header, bound to the beacon
+    /// body at `EXECUTION_PAYLOAD_GINDEX` (25) by a 4-node branch. Boxed: it is
+    /// ~20× the other variant.
+    Payload(Box<ExecutionPayloadHeader>),
+    /// Gloas shape: the execution block hash alone, bound at
+    /// `EXECUTION_BLOCK_HASH_GINDEX_GLOAS` (2856) by an 11-node branch — or, for a
+    /// pre-Gloas header carried in the Gloas shape (a Gloas update's finalized
+    /// header in the first epochs after the fork), at
+    /// `EXECUTION_BLOCK_HASH_GINDEX_DENEB` (812) normalized to 11 nodes. At a
+    /// Gloas slot it is the PARENT payload's hash (`bid.parent_block_hash`): the
+    /// slot's own payload is revealed separately and may be withheld, the parent
+    /// is one the chain has imported. No state root, number or timestamp: those
+    /// come from the execution header this hash pins.
+    BlockHash(Root),
+}
+
+impl Default for HeaderExecution {
+    fn default() -> Self {
+        HeaderExecution::Payload(Box::default())
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LightClientHeader {
     pub beacon: BeaconBlockHeader,
-    pub execution: ExecutionPayloadHeader,
-    pub execution_branch: Vec<Root>, // 4 nodes
+    pub execution: HeaderExecution,
+    /// 4 nodes pre-Gloas, [`spec::GLOAS_EXECUTION_BRANCH_LEN`] (11) in the Gloas shape.
+    pub execution_branch: Vec<Root>,
 }
 
 impl LightClientHeader {
+    /// Fixed part of the pre-Gloas shape (the payload header follows).
     pub const FIXED_SIZE: usize = 244;
+    /// The whole Gloas shape: beacon 112 + block hash 32 + 11 × 32.
+    pub const GLOAS_SIZE: usize =
+        BeaconBlockHeader::ENCODED_SIZE + 32 + spec::GLOAS_EXECUTION_BRANCH_LEN * 32; // 496
 
+    /// Decode the pre-Gloas (payload-carrying) shape.
     pub fn decode(ssz_bytes: &[u8]) -> Result<Self, SszError> {
         if ssz_bytes.len() < Self::FIXED_SIZE {
             return err(format!(
@@ -323,8 +365,72 @@ impl LightClientHeader {
             ));
         }
         let execution = ExecutionPayloadHeader::decode(&ssz_bytes[execution_offset..])?;
-        Ok(Self { beacon, execution, execution_branch })
+        Ok(Self {
+            beacon,
+            execution: HeaderExecution::Payload(Box::new(execution)),
+            execution_branch,
+        })
     }
+
+    /// Decode the Gloas shape: exactly [`Self::GLOAS_SIZE`] bytes.
+    pub fn decode_gloas(ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        if ssz_bytes.len() != Self::GLOAS_SIZE {
+            return err(format!(
+                "Gloas LightClientHeader requires {} bytes, got {}",
+                Self::GLOAS_SIZE,
+                ssz_bytes.len()
+            ));
+        }
+        let beacon = BeaconBlockHeader::decode(&ssz_bytes[..112])?;
+        let block_hash = ssz::read_root(ssz_bytes, 112).unwrap();
+        let execution_branch = read_roots(ssz_bytes, 144, spec::GLOAS_EXECUTION_BRANCH_LEN)
+            .ok_or_else(|| SszError("Gloas LightClientHeader: truncated branch".into()))?;
+        Ok(Self {
+            beacon,
+            execution: HeaderExecution::BlockHash(block_hash),
+            execution_branch,
+        })
+    }
+
+    /// Decode in the wire format of `fork`.
+    pub fn decode_for(fork: LcFork, ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        match fork {
+            LcFork::PreGloas => Self::decode(ssz_bytes),
+            LcFork::Gloas => Self::decode_gloas(ssz_bytes),
+        }
+    }
+
+    /// The execution block hash this header proves, in either shape.
+    pub fn execution_block_hash(&self) -> Root {
+        match &self.execution {
+            HeaderExecution::Payload(p) => p.block_hash,
+            HeaderExecution::BlockHash(h) => *h,
+        }
+    }
+
+    /// The execution payload header, when this is the pre-Gloas shape.
+    pub fn execution_payload(&self) -> Option<&ExecutionPayloadHeader> {
+        match &self.execution {
+            HeaderExecution::Payload(p) => Some(p.as_ref()),
+            HeaderExecution::BlockHash(_) => None,
+        }
+    }
+
+    /// Which wire shape this header was decoded from — NOT the fork of its slot:
+    /// a Gloas update carries a pre-Gloas finalized header in the Gloas shape.
+    pub fn shape(&self) -> LcFork {
+        match self.execution {
+            HeaderExecution::Payload(_) => LcFork::PreGloas,
+            HeaderExecution::BlockHash(_) => LcFork::Gloas,
+        }
+    }
+}
+
+/// `n` consecutive 32-byte nodes from `offset`, or `None` past the end.
+fn read_roots(data: &[u8], offset: usize, n: usize) -> Option<Vec<Root>> {
+    (0..n)
+        .map(|i| ssz::read_root(data, offset + i * 32))
+        .collect()
 }
 
 // -------------------------------------------------------------------------
@@ -335,11 +441,46 @@ impl LightClientHeader {
 pub struct LightClientBootstrap {
     pub header: LightClientHeader,
     pub current_sync_committee: SyncCommittee,
-    pub current_sync_committee_branch: Vec<Root>, // 5 or 6, fork-sniffed
+    pub current_sync_committee_branch: Vec<Root>, // 5 or 6, fork-sniffed; 11 (Gloas)
 }
 
 impl LightClientBootstrap {
     pub const MIN_FIXED_SIZE: usize = 4 + SyncCommittee::ENCODED_SIZE + 5 * 32; // 24788
+    /// Gloas: header 496 + committee 24624 + 11 × 32, fixed.
+    pub const GLOAS_SIZE: usize = LightClientHeader::GLOAS_SIZE
+        + SyncCommittee::ENCODED_SIZE
+        + spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32; // 25472
+
+    /// Decode in the wire format of `fork` (the fork of the header's slot).
+    pub fn decode_for(fork: LcFork, ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        match fork {
+            LcFork::PreGloas => Self::decode(ssz_bytes),
+            LcFork::Gloas => Self::decode_gloas(ssz_bytes),
+        }
+    }
+
+    /// Decode the Gloas format: exactly [`Self::GLOAS_SIZE`] bytes.
+    pub fn decode_gloas(ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        if ssz_bytes.len() != Self::GLOAS_SIZE {
+            return err(format!(
+                "Gloas LightClientBootstrap requires {} bytes, got {}",
+                Self::GLOAS_SIZE,
+                ssz_bytes.len()
+            ));
+        }
+        const H: usize = LightClientHeader::GLOAS_SIZE;
+        const C: usize = H + SyncCommittee::ENCODED_SIZE;
+        let header = LightClientHeader::decode_gloas(&ssz_bytes[..H])?;
+        let current_sync_committee = SyncCommittee::decode(&ssz_bytes[H..C])?;
+        let current_sync_committee_branch =
+            read_roots(ssz_bytes, C, spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN)
+                .ok_or_else(|| SszError("Gloas LightClientBootstrap: truncated branch".into()))?;
+        Ok(Self {
+            header,
+            current_sync_committee,
+            current_sync_committee_branch,
+        })
+    }
 
     pub fn decode(ssz_bytes: &[u8]) -> Result<Self, SszError> {
         if ssz_bytes.len() < Self::MIN_FIXED_SIZE {
@@ -387,9 +528,9 @@ impl LightClientBootstrap {
 pub struct LightClientUpdate {
     pub attested_header: LightClientHeader,
     pub next_sync_committee: SyncCommittee,
-    pub next_sync_committee_branch: Vec<Root>, // 5 or 6
+    pub next_sync_committee_branch: Vec<Root>, // 5 or 6; 11 (Gloas)
     pub finalized_header: LightClientHeader,
-    pub finality_branch: Vec<Root>, // 6 or 7
+    pub finality_branch: Vec<Root>, // 6 or 7; 9 (Gloas)
     pub sync_aggregate: SyncAggregate,
     pub signature_slot: u64,
 }
@@ -397,6 +538,57 @@ pub struct LightClientUpdate {
 impl LightClientUpdate {
     pub const MIN_FIXED_SIZE: usize =
         4 + SyncCommittee::ENCODED_SIZE + 5 * 32 + 4 + 6 * 32 + 160 + 8;
+    /// Gloas: attested 496 + committee 24624 + 11 × 32 + finalized 496 +
+    /// 9 × 32 + aggregate 160 + slot 8, fixed.
+    pub const GLOAS_SIZE: usize = LightClientHeader::GLOAS_SIZE
+        + SyncCommittee::ENCODED_SIZE
+        + spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32
+        + LightClientHeader::GLOAS_SIZE
+        + spec::GLOAS_FINALITY_BRANCH_LEN * 32
+        + SyncAggregate::ENCODED_SIZE
+        + 8; // 26424
+
+    /// Decode in the wire format of `fork` (the fork of the attested slot).
+    pub fn decode_for(fork: LcFork, ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        match fork {
+            LcFork::PreGloas => Self::decode(ssz_bytes),
+            LcFork::Gloas => Self::decode_gloas(ssz_bytes),
+        }
+    }
+
+    /// Decode the Gloas format: exactly [`Self::GLOAS_SIZE`] bytes.
+    pub fn decode_gloas(ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        if ssz_bytes.len() != Self::GLOAS_SIZE {
+            return err(format!(
+                "Gloas LightClientUpdate requires {} bytes, got {}",
+                Self::GLOAS_SIZE,
+                ssz_bytes.len()
+            ));
+        }
+        const H: usize = LightClientHeader::GLOAS_SIZE;
+        const NSC: usize = H;
+        const NSC_BRANCH: usize = NSC + SyncCommittee::ENCODED_SIZE;
+        const FINALIZED: usize = NSC_BRANCH + spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN * 32;
+        const FIN_BRANCH: usize = FINALIZED + H;
+        const AGG: usize = FIN_BRANCH + spec::GLOAS_FINALITY_BRANCH_LEN * 32;
+        const SLOT: usize = AGG + SyncAggregate::ENCODED_SIZE;
+        let truncated = || SszError("Gloas LightClientUpdate: truncated".into());
+        Ok(Self {
+            attested_header: LightClientHeader::decode_gloas(&ssz_bytes[..H])?,
+            next_sync_committee: SyncCommittee::decode(&ssz_bytes[NSC..NSC_BRANCH])?,
+            next_sync_committee_branch: read_roots(
+                ssz_bytes,
+                NSC_BRANCH,
+                spec::GLOAS_SYNC_COMMITTEE_BRANCH_LEN,
+            )
+            .ok_or_else(truncated)?,
+            finalized_header: LightClientHeader::decode_gloas(&ssz_bytes[FINALIZED..FIN_BRANCH])?,
+            finality_branch: read_roots(ssz_bytes, FIN_BRANCH, spec::GLOAS_FINALITY_BRANCH_LEN)
+                .ok_or_else(truncated)?,
+            sync_aggregate: SyncAggregate::decode(&ssz_bytes[AGG..SLOT])?,
+            signature_slot: ssz::read_u64(ssz_bytes, SLOT).ok_or_else(truncated)?,
+        })
+    }
 
     pub fn decode(ssz_bytes: &[u8]) -> Result<Self, SszError> {
         if ssz_bytes.len() < Self::MIN_FIXED_SIZE {
@@ -476,13 +668,50 @@ impl LightClientUpdate {
 pub struct LightClientFinalityUpdate {
     pub attested_header: LightClientHeader,
     pub finalized_header: LightClientHeader,
-    pub finality_branch: Vec<Root>, // 6 or 7
+    pub finality_branch: Vec<Root>, // 6 or 7; 9 (Gloas)
     pub sync_aggregate: SyncAggregate,
     pub signature_slot: u64,
 }
 
 impl LightClientFinalityUpdate {
     pub const MIN_FIXED_SIZE: usize = 4 + 4 + 6 * 32 + 160 + 8; // 368
+    /// Gloas: attested 496 + finalized 496 + 9 × 32 + aggregate 160 + slot 8, fixed.
+    pub const GLOAS_SIZE: usize = 2 * LightClientHeader::GLOAS_SIZE
+        + spec::GLOAS_FINALITY_BRANCH_LEN * 32
+        + SyncAggregate::ENCODED_SIZE
+        + 8; // 1448
+
+    /// Decode in the wire format of `fork` (the fork of the attested slot).
+    pub fn decode_for(fork: LcFork, ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        match fork {
+            LcFork::PreGloas => Self::decode(ssz_bytes),
+            LcFork::Gloas => Self::decode_gloas(ssz_bytes),
+        }
+    }
+
+    /// Decode the Gloas format: exactly [`Self::GLOAS_SIZE`] bytes.
+    pub fn decode_gloas(ssz_bytes: &[u8]) -> Result<Self, SszError> {
+        if ssz_bytes.len() != Self::GLOAS_SIZE {
+            return err(format!(
+                "Gloas LightClientFinalityUpdate requires {} bytes, got {}",
+                Self::GLOAS_SIZE,
+                ssz_bytes.len()
+            ));
+        }
+        const H: usize = LightClientHeader::GLOAS_SIZE;
+        const FIN_BRANCH: usize = 2 * H;
+        const AGG: usize = FIN_BRANCH + spec::GLOAS_FINALITY_BRANCH_LEN * 32;
+        const SLOT: usize = AGG + SyncAggregate::ENCODED_SIZE;
+        let truncated = || SszError("Gloas LightClientFinalityUpdate: truncated".into());
+        Ok(Self {
+            attested_header: LightClientHeader::decode_gloas(&ssz_bytes[..H])?,
+            finalized_header: LightClientHeader::decode_gloas(&ssz_bytes[H..FIN_BRANCH])?,
+            finality_branch: read_roots(ssz_bytes, FIN_BRANCH, spec::GLOAS_FINALITY_BRANCH_LEN)
+                .ok_or_else(truncated)?,
+            sync_aggregate: SyncAggregate::decode(&ssz_bytes[AGG..SLOT])?,
+            signature_slot: ssz::read_u64(ssz_bytes, SLOT).ok_or_else(truncated)?,
+        })
+    }
 
     pub fn decode(ssz_bytes: &[u8]) -> Result<Self, SszError> {
         if ssz_bytes.len() < Self::MIN_FIXED_SIZE {
@@ -550,6 +779,35 @@ impl LightClientFinalityUpdate {
     }
 }
 
+// -------------------------------------------------------------------------
+// A Gloas object is never the size of a pre-Gloas one
+// -------------------------------------------------------------------------
+
+/// The smallest canonical pre-Gloas header of the forks these decoders serve:
+/// the fixed part plus a Capella payload header with empty `extra_data` (568
+/// bytes; Deneb's and Electra's are larger).
+const MIN_PRE_GLOAS_HEADER_SIZE: usize = LightClientHeader::FIXED_SIZE + 568; // 812
+
+// Every Gloas container is fixed-size and smaller than the smallest canonical
+// pre-Gloas encoding of the same type, so a payload of exactly the Gloas size
+// is a Gloas object whatever its context bytes say. That is what lets the sync
+// loop read a Gloas object under a fork digest it does not compute (a later
+// blob-parameter fork) without ever misreading a pre-Gloas one
+// (`ChainConfig::lc_fork_of_chunk` in myotis-net).
+const _: () = assert!(LightClientHeader::GLOAS_SIZE < MIN_PRE_GLOAS_HEADER_SIZE);
+const _: () = assert!(
+    LightClientBootstrap::GLOAS_SIZE
+        < LightClientBootstrap::MIN_FIXED_SIZE + MIN_PRE_GLOAS_HEADER_SIZE
+);
+const _: () = assert!(
+    LightClientUpdate::GLOAS_SIZE
+        < LightClientUpdate::MIN_FIXED_SIZE + 2 * MIN_PRE_GLOAS_HEADER_SIZE
+);
+const _: () = assert!(
+    LightClientFinalityUpdate::GLOAS_SIZE
+        < LightClientFinalityUpdate::MIN_FIXED_SIZE + 2 * MIN_PRE_GLOAS_HEADER_SIZE
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +866,66 @@ mod tests {
         let mut e = vec![0u8; DENEB_FIXED_SIZE];
         e[436..440].copy_from_slice(&(ELECTRA_FIXED_SIZE as u32).to_le_bytes());
         assert!(ExecutionPayloadHeader::decode(&e).is_err());
+    }
+
+    /// The Gloas sizes are the spec's (consensus-specs v1.7.0-beta.2, mainnet
+    /// preset), and a Gloas decoder takes exactly that many bytes — one short
+    /// or one long is a rejection, never a panic or a silently ignored tail.
+    #[test]
+    fn gloas_sizes_are_exact() {
+        assert_eq!(LightClientHeader::GLOAS_SIZE, 496);
+        assert_eq!(LightClientBootstrap::GLOAS_SIZE, 25472);
+        assert_eq!(LightClientUpdate::GLOAS_SIZE, 26424);
+        assert_eq!(LightClientFinalityUpdate::GLOAS_SIZE, 1448);
+        for n in [
+            LightClientHeader::GLOAS_SIZE - 1,
+            LightClientHeader::GLOAS_SIZE + 1,
+        ] {
+            assert!(LightClientHeader::decode_gloas(&vec![0u8; n]).is_err());
+        }
+        for n in [
+            LightClientBootstrap::GLOAS_SIZE - 1,
+            LightClientBootstrap::GLOAS_SIZE + 1,
+        ] {
+            assert!(LightClientBootstrap::decode_gloas(&vec![0u8; n]).is_err());
+        }
+        for n in [
+            LightClientUpdate::GLOAS_SIZE - 1,
+            LightClientUpdate::GLOAS_SIZE + 1,
+        ] {
+            assert!(LightClientUpdate::decode_gloas(&vec![0u8; n]).is_err());
+        }
+        for n in [
+            LightClientFinalityUpdate::GLOAS_SIZE - 1,
+            LightClientFinalityUpdate::GLOAS_SIZE + 1,
+        ] {
+            assert!(LightClientFinalityUpdate::decode_gloas(&vec![0u8; n]).is_err());
+        }
+        let h = LightClientHeader::decode_gloas(&[0u8; 496]).unwrap();
+        assert_eq!(h.shape(), LcFork::Gloas);
+        assert_eq!(h.execution_branch.len(), 11);
+        assert!(h.execution_payload().is_none());
+        let f = LightClientFinalityUpdate::decode_for(LcFork::Gloas, &[0u8; 1448]).unwrap();
+        assert_eq!(f.finality_branch.len(), 9);
+    }
+
+    /// Every Gloas container is SMALLER than the smallest canonical pre-Gloas
+    /// encoding of its type (the compile-time asserts beside
+    /// `MIN_PRE_GLOAS_HEADER_SIZE`), so a Gloas decoder — exactly one size —
+    /// refuses the smallest pre-Gloas object of each type: a wrong context
+    /// digest is a clean rejection, not a misparse (the fork-keyed dispatch is
+    /// the rule; this is the belt to its braces). Java twin:
+    /// `GloasLightClientTypesTest.gloasAndPreGloasSizesDoNotCollide`.
+    #[test]
+    fn gloas_and_pre_gloas_sizes_do_not_collide() {
+        let header = MIN_PRE_GLOAS_HEADER_SIZE;
+        assert!(LightClientHeader::decode_gloas(&vec![0u8; header]).is_err());
+        let bootstrap = LightClientBootstrap::MIN_FIXED_SIZE + header;
+        assert!(LightClientBootstrap::decode_gloas(&vec![0u8; bootstrap]).is_err());
+        let update = LightClientUpdate::MIN_FIXED_SIZE + 2 * header;
+        assert!(LightClientUpdate::decode_gloas(&vec![0u8; update]).is_err());
+        let finality = LightClientFinalityUpdate::MIN_FIXED_SIZE + 2 * header;
+        assert!(LightClientFinalityUpdate::decode_gloas(&vec![0u8; finality]).is_err());
     }
 
     /// Bootstrap with a header offset pointing past the buffer must be rejected.

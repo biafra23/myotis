@@ -525,9 +525,9 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
                 "  context     0x{} — INTERIM: copied from the newest update chunk.\n\
                  \x20             Correct except across a fork or BPO boundary, where the\n\
                  \x20             head object's digest differs from the newest period's.\n\
-                 \x20             myotis' own decoder ignores context bytes, so this is safe\n\
-                 \x20             for our clients; other CLs dispatch on it. Computing it via\n\
-                 \x20             fork_digest_bpo for the object's slot is the next task.",
+                 \x20             Only this self-check uses it: `serve` computes each\n\
+                 \x20             object's digest from the fork schedule, which every\n\
+                 \x20             client dispatches on (myotis too, since Gloas).",
                 hex::encode(digest)
             );
         }
@@ -565,8 +565,20 @@ async fn ingest(rest_base: &str, archive_path: &Path) -> Result<()> {
 /// Sync-aggregate participant count of an SSZ-encoded `LightClientUpdate`, or
 /// `None` when it does not decode with this build's (fork-polymorphic) decoder.
 /// Used by ingest to judge whether a stored update is provisional.
+///
+/// A Gloas update is fixed-size and no pre-Gloas update has that length, so
+/// the length alone picks its decoder here. (A wallet goes by the chunk's
+/// context bytes instead; roost only needs the participant count, and without
+/// this every Gloas period would read as undecodable — stored once and never
+/// replaced by a better copy.)
 pub(crate) fn participation_of(ssz: &[u8]) -> Option<usize> {
-    myotis_consensus::types::LightClientUpdate::decode(ssz)
+    use myotis_consensus::{fork::LcFork, types::LightClientUpdate};
+    let fork = if ssz.len() == LightClientUpdate::GLOAS_SIZE {
+        LcFork::Gloas
+    } else {
+        LcFork::PreGloas
+    };
+    LightClientUpdate::decode_for(fork, ssz)
         .ok()
         .map(|u| u.sync_aggregate.count_participants())
 }
@@ -884,6 +896,20 @@ mod ingest_decision_tests {
     fn an_undecodable_fresh_chunk_never_replaces_anything() {
         assert!(!should_replace(Some(113), None));
         assert!(!should_replace(None, None));
+    }
+
+    #[test]
+    fn participation_of_reads_gloas_updates() {
+        use myotis_consensus::types::LightClientUpdate;
+        // The Gloas layout is fixed: the sync committee bits sit at
+        // [26256, 26320). 400 of 512 set.
+        let mut u = vec![0u8; LightClientUpdate::GLOAS_SIZE];
+        for byte in &mut u[26256..26256 + 50] {
+            *byte = 0xff;
+        }
+        assert_eq!(participation_of(&u), Some(400));
+        // One byte off the Gloas size is neither shape.
+        assert_eq!(participation_of(&u[..u.len() - 1]), None);
     }
 
     #[test]

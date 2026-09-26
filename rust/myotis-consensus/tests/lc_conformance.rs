@@ -154,7 +154,7 @@ fn replay_reproduces_recorded_verdicts() {
     );
     actual.insert(
         "final.finalizedExecStateRoot".into(),
-        hex(&processor.store.finalized_header().unwrap().execution.state_root),
+        hex(&processor.store.finalized_header().unwrap().execution_payload().unwrap().state_root),
     );
 
     assert_eq!(

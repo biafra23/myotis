@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.networking;
 
 import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.core.enr.Enr;
+import com.jaeckel.ethp2p.networking.eth.ForkIds;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.rlp.RLP;
@@ -236,7 +237,10 @@ public record NetworkConfig(
             Bytes32.fromHexString("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"),
             Bytes32.fromHexString("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"), // genesis (testnets lenient)
             new byte[]{(byte) 0x26, (byte) 0x89, (byte) 0x56, (byte) 0xb6}, // post-BPO2 (Fusaka)
-            0L,
+            // forkNext: Amsterdam (Glamsterdam's EL half), 2026-10-06 13:53:36 UTC
+            // (ethereum/pm#2205). Announced until then; afterwards the fork id is
+            // successor(0x268956b6, it) = 0x6c1d9423 — see forkIdAt.
+            1_791_294_816L,
             List.of(
                     new InetSocketAddress("138.197.51.181", 30303),
                     new InetSocketAddress("146.190.1.103", 30303),
@@ -252,7 +256,9 @@ public record NetworkConfig(
             11209280L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
-            // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
+            // Gloas (Glamsterdam's CL half) activates at epoch 353024, 2026-10-06
+            // 13:53:36 UTC (ethereum/pm#2205), pinned ahead of activation.
             ForkSchedule.of(32,
                     ForkSchedule.fork(0, 0x90000069),      // phase0 (genesis)
                     ForkSchedule.fork(50, 0x90000070),     // altair
@@ -260,8 +266,9 @@ public record NetworkConfig(
                     ForkSchedule.fork(56832, 0x90000072),  // capella
                     ForkSchedule.fork(132608, 0x90000073), // deneb
                     ForkSchedule.fork(222464, 0x90000074), // electra
-                    ForkSchedule.fork(272640, 0x90000075)  // fulu
-            ),
+                    ForkSchedule.fork(272640, 0x90000075), // fulu
+                    ForkSchedule.fork(353024, 0x90000076)  // gloas
+            ).withGloasEpoch(353024),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia:
             // BPO2 at epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28). Folds into
             // the fork digest XOR — see activeBlobParams.
@@ -528,7 +535,16 @@ public record NetworkConfig(
      * still use. See consensus-specs/specs/fulu/beacon-chain.md.
      */
     public byte[] currentForkDigest() {
-        byte[] base = forkDigestFor32(currentForkVersion());
+        return forkDigestAtEpoch(wallClockEpoch());
+    }
+
+    /**
+     * {@link #currentForkDigest} as of {@code epoch}: the digest of the fork active then.
+     * Pure in the clock, so a digest on either side of a pinned fork can be checked.
+     * Rust twin: {@code ChainConfig::fork_digest_at_epoch}.
+     */
+    public byte[] forkDigestAtEpoch(long epoch) {
+        byte[] base = forkDigestFor32(forkVersionAtEpoch(epoch));
         if (activeBlobParamsEpoch == 0) {
             byte[] out = new byte[4];
             System.arraycopy(base, 0, out, 0, 4);
@@ -600,7 +616,28 @@ public record NetworkConfig(
      * ({@link ForkSchedule#versionForSignatureSlot}).
      */
     public byte[] currentForkVersion() {
-        return forkSchedule.versionAtEpoch(wallClockEpoch());
+        return forkVersionAtEpoch(wallClockEpoch());
+    }
+
+    /** The schedule's fork version at {@code epoch} (the digest input at that epoch). */
+    public byte[] forkVersionAtEpoch(long epoch) {
+        return forkSchedule.versionAtEpoch(epoch);
+    }
+
+    /**
+     * The EIP-2124 fork id this build announces at {@code nowSeconds}: the pinned
+     * {@link #forkIdHash} with {@link #forkNext} until that fork's timestamp, then its
+     * successor with no next fork. The pin and forkNext stay the conformance values;
+     * this is what goes on the wire, into the discovery filter and the fork watch's
+     * baseline. Rust twin: {@code ElConfig::fork_id_at}.
+     */
+    public ForkIds.ForkId forkIdAt(long nowSeconds) {
+        return ForkIds.effective(ForkIds.toInt(forkIdHash), forkNext, nowSeconds);
+    }
+
+    /** {@link #forkIdAt} on the wall clock. */
+    public ForkIds.ForkId currentForkId() {
+        return forkIdAt(System.currentTimeMillis() / 1000L);
     }
 
     /**
