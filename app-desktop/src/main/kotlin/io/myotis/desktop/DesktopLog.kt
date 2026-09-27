@@ -59,6 +59,10 @@ object DesktopLogSource : LogSource {
             LogLevel.ERROR -> Level.ERROR
         }
         CONTROLLED_LOGGERS.forEach { (LoggerFactory.getLogger(it) as? Logger)?.level = lb }
+        // The pinned RPC access logger doesn't inherit io.myotis: its bodies (DEBUG) follow the chip,
+        // while the per-call INFO summaries stay on at WARN/ERROR as the pin intends.
+        (LoggerFactory.getLogger("io.myotis.jsonrpc.access") as? Logger)?.level =
+            if (level == LogLevel.DEBUG) Level.DEBUG else Level.INFO
     }
 
     private fun fromLogback(lvl: Level?): LogLevel = when {
