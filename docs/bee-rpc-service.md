@@ -83,9 +83,12 @@ its deployment block:
 
 4. **Wait for readiness.** `beacon-status` must say `"state":"SYNCED"`, and
    `logindex-status` must show the coverage you need: for full Bee function,
-   `backfillCursor` at the target and a small `headGap`; for the demo seed,
-   `coveredLow` at or below Bee's resume block (47,061,408 for Bee v2.8.2 —
-   the seed's own low is 47,000,000) and `headGap` closed.
+   `blocksRemaining` at 0 (every watched entry's coverage has reached its own
+   `from_block` — `backfillCursor` itself can stop short of the target once
+   one entry finishes before another, e.g. when Bee's four contracts are
+   added one `build-logindex` at a time) and a small `headGap`; for the demo
+   seed, `coveredLow` at or below Bee's resume block (47,061,408 for Bee
+   v2.8.2 — the seed's own low is 47,000,000) and `headGap` closed.
 
 5. **Point Bee at it.** Myotis serves verified JSON-RPC on
    `http://127.0.0.1:8546` for Gnosis (per-network ports; mainnet is 8545).

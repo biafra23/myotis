@@ -3813,24 +3813,43 @@ fn build_log_index_status(
         s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
-        // All optional-by-context so the shape stays honest: no cursor yet →
-        // no remaining; no rate yet → no ETA (hosts then show x/y instead).
+        // All optional-by-context so the shape stays honest: nothing indexed
+        // and no cursor yet → no remaining; already fully covered → remaining
+        // is 0 even before a cursor exists (there is nothing left to walk,
+        // whether or not the head-follow appender has run yet); no rate yet →
+        // no ETA (hosts then show x/y instead).
         if let Some(target_low) = ix.config().watch.iter().map(|w| w.from_block).min() {
             s.push_str(",\"targetLow\":");
             s.push_str(&target_low.to_string());
-            if let Some((n, _)) = ix.cursor {
-                let remaining = n.saturating_sub(target_low);
-                s.push_str(",\"blocksRemaining\":");
-                s.push_str(&remaining.to_string());
-                if let Some(bps) = rate_bps {
-                    if bps > 0.05 {
-                        s.push_str(",\"blocksPerSec\":");
-                        s.push_str(&format!("{:.1}", bps));
-                        let eta = (remaining as f64 / bps).round() as u64;
-                        s.push_str(",\"etaSeconds\":");
-                        s.push_str(&eta.to_string());
+            // The distance to report is measured to `walk_target()` — the
+            // lowest `from_block` among entries NOT yet done — not to
+            // `target_low` above, which is the lowest `from_block` over EVERY
+            // entry including already-complete ones. Using `target_low` here
+            // would add a complete entry's own already-covered span back into
+            // the figure the moment any OTHER entry is incomplete (adding a
+            // second contract to an otherwise-finished index reintroduced the
+            // exact overcount `walk_target` exists to fix). `None` means every
+            // entry is done — nothing left to walk, whether or not a cursor
+            // exists yet (a bundled seed reaching every entry's deployment
+            // block, with backfill paused so nothing ever pulls a head-seeded
+            // `cursor` back down — see `walk_target`'s doc comment).
+            if let Some(t) = ix.walk_target() {
+                if let Some((n, _)) = ix.cursor {
+                    let remaining = n.saturating_sub(t);
+                    s.push_str(",\"blocksRemaining\":");
+                    s.push_str(&remaining.to_string());
+                    if let Some(bps) = rate_bps {
+                        if bps > 0.05 {
+                            s.push_str(",\"blocksPerSec\":");
+                            s.push_str(&format!("{:.1}", bps));
+                            let eta = (remaining as f64 / bps).round() as u64;
+                            s.push_str(",\"etaSeconds\":");
+                            s.push_str(&eta.to_string());
+                        }
                     }
                 }
+            } else {
+                s.push_str(",\"blocksRemaining\":0");
             }
         }
         // How far the TOP of coverage trails the head `latest` resolves to.
@@ -4266,6 +4285,101 @@ mod log_index_json_tests {
         let s2 = build_log_index_status(&ix, None, 0);
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
+    }
+
+    /// The RAILGUN PoC's exact shape: coverage already reaches `from_block`
+    /// but `cursor` sits far above it, as a bundled seed installs it (see
+    /// `LogIndex::walk_target`'s doc comment for why that is not a sign of
+    /// unfinished work). Pins the integration: `build_log_index_status` must
+    /// ask `walk_target()`, not compare `cursor` to `target_low` itself.
+    /// `logindex.rs`'s own tests cover `walk_target()`/`backfill_complete()`
+    /// in isolation, including the tied-`from_block` case a naive per-entry
+    /// filter would get wrong.
+    #[test]
+    fn blocks_remaining_is_zero_once_the_target_entry_is_already_complete() {
+        let w = myotis_net::el::logindex::WatchEntry {
+            address: [0x11; 20],
+            from_block: 100,
+            topic0s: vec![],
+            name: String::new(),
+        };
+        let cfg = myotis_net::el::logindex::LogIndexConfig {
+            enabled: true,
+            max_speed: true,
+            backfill_paused: true,
+            watch: vec![w],
+        };
+        let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
+        // Coverage already reaches from_block — the seed's own claim, exactly
+        // as `walk_resumable` treats a done entry (`low <= from_block`).
+        ix.backfill_block(100, [0u8; 32], vec![]).unwrap();
+        // …but the cursor sits far above it, as if the head-follow appender
+        // seeded it near the head sometime after the seed installed (the seed
+        // itself ships no cursor; see the doc comment above).
+        ix.cursor = Some((5000, [0u8; 32]));
+        let s = build_log_index_status(&ix, Some(9.44), 0);
+        assert!(s.contains("\"targetLow\":100"), "{s}");
+        assert!(s.contains("\"blocksRemaining\":0"), "{s}");
+        // Nothing left to estimate a rate or an ETA for.
+        assert!(!s.contains("etaSeconds"), "{s}");
+    }
+
+    /// Reproduces the follow-up the PR review found: `target_low` (the
+    /// minimum `from_block` over EVERY entry, complete or not) is the right
+    /// value for the displayed `targetLow`, but the WRONG one to measure
+    /// `blocksRemaining` from as soon as any second entry is incomplete —
+    /// `walk_target()` (the minimum `from_block` among entries NOT yet done)
+    /// is. Built the way this arises in production: `LogIndex::merge`
+    /// unioning an already-backfilled source with a config-only source for a
+    /// newly watched address (`ElReader::set_log_index_config`'s path when
+    /// `adopt_config` refuses a brand-new address), then one `append_block`
+    /// seeding the new entry's first — and, so far, only — span above its own
+    /// `from_block`.
+    #[test]
+    fn blocks_remaining_measures_from_the_incomplete_entry_not_the_global_minimum() {
+        use myotis_net::el::logindex::{ChainTag, LogIndex, LogIndexConfig, WatchEntry};
+
+        let tag = ChainTag { network_id: 1, genesis_hash: [0u8; 32] };
+        let addr_a = [0x11; 20];
+        let addr_b = [0x22; 20];
+
+        // Source A: already backfilled all the way to its own from_block=1.
+        let a = WatchEntry { address: addr_a, from_block: 1, topic0s: vec![], name: String::new() };
+        let cfg_a =
+            LogIndexConfig { enabled: true, max_speed: true, backfill_paused: true, watch: vec![a] };
+        let mut ix_a = LogIndex::new(cfg_a).unwrap();
+        ix_a.backfill_block(1, [1u8; 32], vec![]).unwrap();
+        for n in 2..=19u64 {
+            ix_a.append_block(n, [1u8; 32], vec![]).unwrap();
+        }
+
+        // Source B: config-only — the user just added contract B
+        // (from_block=15), nothing fetched for it yet.
+        let b = WatchEntry { address: addr_b, from_block: 15, topic0s: vec![], name: String::new() };
+        let cfg_b =
+            LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![b] };
+        let ix_b = LogIndex::new(cfg_b).unwrap();
+
+        let (_, mut ix) = LogIndex::merge(vec![(tag, ix_a), (tag, ix_b)]).unwrap();
+        // B has no span and its from_block sits at/below H — walk_resumable
+        // rejects the old cursor, exactly as it does in production.
+        assert_eq!(ix.cursor, None, "sanity: merge must drop the pre-merge cursor here");
+
+        // The next head-follow append reseeds the cursor and gives B its
+        // first-ever span, above its own from_block.
+        ix.append_block(20, [2u8; 32], vec![]).unwrap();
+        assert_eq!(ix.coverage_of(&addr_a).unwrap().span, Some((1, 20)), "sanity: A still complete");
+        assert_eq!(ix.coverage_of(&addr_b).unwrap().span, Some((20, 20)), "sanity: B seeded, not backfilled");
+
+        let s = build_log_index_status(&ix, None, 0);
+        // targetLow is unaffected — still the minimum from_block over every
+        // entry (its meaning is pinned in LogIndexStatus.kt).
+        assert!(s.contains("\"targetLow\":1"), "{s}");
+        // Correct distance is to B's from_block (15): 20 - 15 = 5. The old
+        // `cursor - target_low` formula would report 20 - 1 = 19 — the same
+        // kind of overcount this PR's fix closed for the single-entry case,
+        // reopened the moment a second, incomplete entry exists.
+        assert!(s.contains("\"blocksRemaining\":5"), "{s}");
     }
 }
 

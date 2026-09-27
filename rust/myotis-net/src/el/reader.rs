@@ -3900,18 +3900,26 @@ impl ElReader {
     /// One backfill round: try every pooled peer for one batch at the current
     /// cursor. Returns (progressed, max_speed_configured).
     async fn log_index_backfill_round(&self, ticks: u64, backfill_ok: &mut u64) -> (bool, bool) {
-        let Some((config, cursor)) = self.with_log_index(|ix| (ix.config().clone(), ix.cursor)) else {
+        let Some((config, cursor, walk_target)) =
+            self.with_log_index(|ix| (ix.config().clone(), ix.cursor, ix.walk_target()))
+        else {
             return (false, false);
         };
         let max_speed = config.max_speed;
-        let (Some(target_low), Some((cur_n, cur_hash))) =
-            (config.watch.iter().map(|w| w.from_block).min(), cursor)
+        // No watch entries, the edge isn't seeded yet, the config is
+        // disabled, the walker already reached the lowest point any entry is
+        // still short of, or every entry's coverage already reaches its OWN
+        // target regardless of where `cursor` sits (`LogIndex::walk_target` —
+        // a bundled or imported seed can leave `cursor` far above the walk
+        // target with nothing left to walk, and a newly added entry above the
+        // frontier stops the walk there rather than at the overall minimum
+        // `from_block`; see its doc comment) — either way, nothing to do this
+        // tick.
+        let Some((target_low, cur_n, cur_hash)) =
+            backfill_round_has_work(config.enabled, walk_target, cursor)
         else {
-            return (false, max_speed); // no watch entries, or the edge isn't seeded yet
-        };
-        if !config.enabled || cur_n <= target_low {
             return (false, max_speed);
-        }
+        };
         let fingerprint = config.fingerprint();
         // count+1 headers are requested (the top one is the cursor block), and
         // honest peers cap header serves at 1024 (our own served.rs agrees) —
@@ -9000,6 +9008,99 @@ impl From<String> for BackfillBatchError {
 impl From<&str> for BackfillBatchError {
     fn from(message: &str) -> Self {
         Self::peer(message)
+    }
+}
+
+/// Whether `log_index_backfill_round` has any work to do this tick, given
+/// state already read out of the index under one lock hold. Pure and
+/// separately tested — the round itself needs a live pool of peers to
+/// exercise, but this decision does not.
+///
+/// `cursor <= walk_target` (the walker already reached the lowest point any
+/// entry is still short of) is the obvious "nothing left" case, and was the
+/// ONLY one checked — against the overall minimum `from_block`, not the
+/// per-entry stopping point — before `LogIndex::walk_target` existed. Taking
+/// `walk_target` directly (rather than a separate `target_low` + a
+/// `backfill_complete` bool) folds two things `walk_target` already accounts
+/// for into this one comparison: `cursor` can sit far ABOVE it for a reason
+/// other than unfinished work (`LogIndex::append_block` seeds `cursor` at the
+/// first block it ever appends, which for an index built from a bundled or
+/// imported seed is wherever head-follow happens to be, not at any entry's
+/// `from_block`), and a newly added entry can sit above `cursor` entirely —
+/// see [`crate::el::logindex::LogIndex::walk_target`] for the full account
+/// (it closes the same gap in the hosts' `blocksRemaining` status figure).
+///
+/// Returns the `(walk_target, cursor_block, cursor_hash)` to walk from when
+/// there IS work, `None` otherwise.
+fn backfill_round_has_work(
+    enabled: bool,
+    walk_target: Option<u64>,
+    cursor: Option<(u64, [u8; 32])>,
+) -> Option<(u64, u64, [u8; 32])> {
+    if !enabled {
+        return None;
+    }
+    let walk_target = walk_target?;
+    let (cur_n, cur_hash) = cursor?;
+    if cur_n <= walk_target {
+        return None;
+    }
+    Some((walk_target, cur_n, cur_hash))
+}
+
+#[cfg(test)]
+mod backfill_round_has_work_tests {
+    use super::backfill_round_has_work;
+
+    const HASH: [u8; 32] = [7; 32];
+
+    #[test]
+    fn no_watch_entries_or_no_cursor_yet_means_no_work() {
+        assert_eq!(backfill_round_has_work(true, None, Some((500, HASH))), None);
+        assert_eq!(backfill_round_has_work(true, Some(100), None), None);
+    }
+
+    #[test]
+    fn disabled_means_no_work_even_with_a_real_gap() {
+        assert_eq!(backfill_round_has_work(false, Some(100), Some((500, HASH))), None);
+    }
+
+    #[test]
+    fn cursor_at_or_below_target_means_no_work() {
+        assert_eq!(backfill_round_has_work(true, Some(100), Some((100, HASH))), None);
+        assert_eq!(backfill_round_has_work(true, Some(100), Some((50, HASH))), None);
+    }
+
+    /// The bug this helper exists to fix: `cursor` far above the walk target
+    /// used to be read as "lots of backfill left" unconditionally. A seeded,
+    /// paused, already-complete index looks exactly like this — `cursor`
+    /// seeded near the head by the first head-follow append, with nothing
+    /// left for any entry to walk down to (`walk_target` is `None`) — and
+    /// must NOT spend a batch fetch on it.
+    #[test]
+    fn no_walk_target_skips_the_round_even_though_cursor_is_far_above_every_from_block() {
+        assert_eq!(backfill_round_has_work(true, None, Some((5000, HASH))), None);
+    }
+
+    #[test]
+    fn a_real_gap_with_incomplete_coverage_has_work() {
+        assert_eq!(
+            backfill_round_has_work(true, Some(100), Some((5000, HASH))),
+            Some((100, 5000, HASH))
+        );
+    }
+
+    /// Mirrors the host-status regression: a newly added entry's `from_block`
+    /// sits ABOVE the current cursor (nothing walked for it yet, and no span
+    /// at all). `walk_target` reports that entry's `from_block` rather than
+    /// the overall minimum, so the gate correctly finds work down to IT, not
+    /// down to some older, already-complete entry's much lower `from_block`.
+    #[test]
+    fn walk_target_above_an_older_entrys_from_block_is_still_the_stopping_point() {
+        assert_eq!(
+            backfill_round_has_work(true, Some(25_000_000), Some((26_064_265, HASH))),
+            Some((25_000_000, 26_064_265, HASH))
+        );
     }
 }
 

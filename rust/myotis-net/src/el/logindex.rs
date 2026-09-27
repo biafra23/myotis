@@ -611,6 +611,60 @@ impl LogIndex {
     pub fn coverage_entries(&self) -> Vec<(WatchEntry, Coverage)> {
         self.config.watch.iter().cloned().zip(self.coverage.iter().copied()).collect()
     }
+
+    /// Lowest `from_block` among entries whose coverage has NOT yet reached
+    /// it — where the descending walk actually stops. `None` = nothing left
+    /// to walk.
+    ///
+    /// This is deliberately not the same value as `target_low` (the lowest
+    /// `from_block` over EVERY entry, complete or not — the figure hosts
+    /// display as `targetLow`): two entries can legitimately share a
+    /// `from_block` (nothing but the address is checked for duplicates, see
+    /// [`LogIndexConfig::duplicate_address`]) while only one of them is
+    /// actually done, and a newly added entry can sit above the walker's
+    /// current frontier with no span at all yet. Filtering to "whichever
+    /// entry happens to own `target_low`" would get both wrong; this scans
+    /// every entry's own `low <= w.from_block` — the same per-entry "done"
+    /// check `walk_resumable` makes — and reports the lowest point among the
+    /// ones still short of it.
+    ///
+    /// This exists because `cursor` alone is not a reliable "how much
+    /// backfill is left" signal: [`Self::append_block`] seeds it at the FIRST
+    /// block it ever appends, not at any entry's `from_block`. For an index
+    /// built from a bundled or imported seed — which ships no cursor of its
+    /// own (`scripts/synth_logindex.py`'s own comment: "the appender re-seeds
+    /// the walker's trust edge itself") — that first append lands wherever
+    /// head-follow happens to be, far above every `from_block`, and nothing
+    /// ever pulls it back down while backfill stays paused (or simply hasn't
+    /// run yet). Two real consumers both need the true stopping point instead
+    /// of the naive `cursor - target_low` distance: the hosts' `blocksRemaining`
+    /// status figure (`myotis-engine::host::build_log_index_status`), which
+    /// reported the full historical span as still needing a walk for an index
+    /// that was serving every one of those blocks (and, before this method
+    /// existed, still overcounted as soon as any one entry was incomplete);
+    /// and this crate's own backfill scheduler (`el::reader`'s
+    /// `log_index_backfill_round`, via `backfill_round_has_work`), which would
+    /// otherwise spend a real batch fetch-and-verify round re-walking a range
+    /// it already fully covers.
+    pub fn walk_target(&self) -> Option<u64> {
+        self.config
+            .watch
+            .iter()
+            .zip(self.coverage.iter())
+            .filter(|(w, c)| !c.span.is_some_and(|(low, _)| low <= w.from_block))
+            .map(|(w, _)| w.from_block)
+            .min()
+    }
+
+    /// True once EVERY watch entry's coverage has reached its own
+    /// `from_block` — the descending backfill walk has nothing left to do for
+    /// any of them, independent of where [`Self::cursor`] happens to sit. An
+    /// empty watch list is vacuously NOT complete: there is nothing to report
+    /// on, and a caller asking "is there nothing left to do" about no entries
+    /// at all almost certainly has a bug of its own.
+    pub fn backfill_complete(&self) -> bool {
+        !self.config.watch.is_empty() && self.walk_target().is_none()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2512,6 +2566,45 @@ mod tests {
         assert!(!m.config().enabled);
         // Cursor: the deepest trust edge.
         assert_eq!(m.cursor, Some((100, [100; 32])));
+    }
+
+    #[test]
+    fn backfill_complete_is_false_until_coverage_reaches_from_block() {
+        let ix = LogIndex::new(config_ok(vec![watch_all(addr(1), 100)])).unwrap();
+        assert!(!ix.backfill_complete(), "nothing indexed yet");
+        let ix = span_ix(config(vec![watch_all(addr(1), 100)]), 150, 200, vec![]);
+        assert!(!ix.backfill_complete(), "covered down to 150, from_block is 100 — 50 blocks short");
+        let ix = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 200, vec![]);
+        assert!(ix.backfill_complete(), "covered all the way to from_block");
+    }
+
+    /// The bug a filtered `.any()` (checked only the entry that happens to
+    /// own the current `target_low`) would reintroduce: two entries can
+    /// legitimately share a `from_block` — nothing but the address is
+    /// checked for duplicates — and being tied for the minimum does not mean
+    /// they are equally done. Built the way this actually arises in
+    /// production, `LogIndex::merge` unioning two independently-backfilled
+    /// sources (`ElReader::set_log_index_config`'s path for a newly added
+    /// watch address), not by poking private state directly.
+    #[test]
+    fn backfill_complete_requires_every_entry_at_a_tied_from_block_not_just_one() {
+        // Both entries have from_block=100 and share the same high (150), so
+        // merge's H-clamping leaves both spans untouched: A was walked all
+        // the way down to 100 (complete); B only down to 120 — 20 blocks
+        // short of ITS OWN from_block=100, despite tying A for target_low.
+        let complete = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 150, vec![]);
+        let incomplete = span_ix(config(vec![watch_all(addr(2), 100)]), 120, 150, vec![]);
+        let (_, merged) = LogIndex::merge(vec![(tag(), complete), (tag(), incomplete)]).unwrap();
+        assert_eq!(merged.coverage_of(&addr(1)).unwrap().span, Some((100, 150)), "sanity: A complete");
+        assert_eq!(
+            merged.coverage_of(&addr(2)).unwrap().span,
+            Some((120, 150)),
+            "sanity: B still short of its own from_block"
+        );
+        assert!(
+            !merged.backfill_complete(),
+            "B has not reached its own from_block — reporting complete here is exactly what this method exists to prevent"
+        );
     }
 
     #[test]
