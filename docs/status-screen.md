@@ -15,6 +15,14 @@ Host coverage isn't uniform: iOS never fills the READY peers list or the
 Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), and the
 Tor row is desktop-only (see that row below).
 
+Every Status row carries an in-app "ⓘ" help badge next to its label, and the
+three action buttons carry the same kind of tooltip directly on the button
+itself (no separate icon) — both trigger on long-press (touch) or hover
+(desktop) and show a condensed version of this same explanation. See the
+`StatusHelp` object right above `StatusRow` in `NodeScreen.kt`. **The two are
+meant to stay in sync**: a behavior change that changes what a row or action
+means must update both `StatusHelp` and this doc.
+
 ## Readiness strip
 
 A thin colored bar above the tabs — the wallet's "safe to transact" signal for
