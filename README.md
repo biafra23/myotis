@@ -913,7 +913,10 @@ around the clock, then hand the file to the apps:
 # 3. Watch the backfill (cursor walks DOWN to the target; maxSpeed is on for build-logindex).
 ./gradlew :app:run -Pnetwork=gnosis -Pargs=logindex-status
 
-# 4. When backfillCursor has reached the target: export a portable snapshot.
+# 4. When blocksRemaining reads 0 (equivalently: every watched entry's
+#    coverage has reached its own from_block — backfillCursor itself can stop
+#    short of the target once one entry finishes before another): export a
+#    portable snapshot.
 ./gradlew :app:run -Pnetwork=gnosis -Pargs="export-logindex /tmp/my-index.db"
 ```
 

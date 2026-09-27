@@ -612,20 +612,21 @@ impl LogIndex {
         self.config.watch.iter().cloned().zip(self.coverage.iter().copied()).collect()
     }
 
-    /// True once EVERY watch entry's coverage has reached its own
-    /// `from_block` — the descending backfill walk has nothing left to do for
-    /// any of them, independent of where [`Self::cursor`] happens to sit. An
-    /// empty watch list is vacuously NOT complete: there is nothing to report
-    /// on, and a caller asking "is there nothing left to do" about no entries
-    /// at all almost certainly has a bug of its own.
+    /// Lowest `from_block` among entries whose coverage has NOT yet reached
+    /// it — where the descending walk actually stops. `None` = nothing left
+    /// to walk.
     ///
-    /// Mirrors the `low <= w.from_block` half of `walk_resumable`'s per-entry
-    /// "done" check, but over the WHOLE watch list rather than filtered to
-    /// whichever entry happens to own the current `target_low` — two entries
-    /// can legitimately share a `from_block` (nothing but the address is
-    /// checked for duplicates, see [`LogIndexConfig::duplicate_address`]), and
-    /// `cursor` alone cannot tell a caller which of them, if any, is not
-    /// actually done.
+    /// This is deliberately not the same value as `target_low` (the lowest
+    /// `from_block` over EVERY entry, complete or not — the figure hosts
+    /// display as `targetLow`): two entries can legitimately share a
+    /// `from_block` (nothing but the address is checked for duplicates, see
+    /// [`LogIndexConfig::duplicate_address`]) while only one of them is
+    /// actually done, and a newly added entry can sit above the walker's
+    /// current frontier with no span at all yet. Filtering to "whichever
+    /// entry happens to own `target_low`" would get both wrong; this scans
+    /// every entry's own `low <= w.from_block` — the same per-entry "done"
+    /// check `walk_resumable` makes — and reports the lowest point among the
+    /// ones still short of it.
     ///
     /// This exists because `cursor` alone is not a reliable "how much
     /// backfill is left" signal: [`Self::append_block`] seeds it at the FIRST
@@ -635,22 +636,34 @@ impl LogIndex {
     /// the walker's trust edge itself") — that first append lands wherever
     /// head-follow happens to be, far above every `from_block`, and nothing
     /// ever pulls it back down while backfill stays paused (or simply hasn't
-    /// run yet). Two real consumers both need the true answer instead of the
-    /// naive `cursor - target_low` distance: the hosts' `blocksRemaining`
+    /// run yet). Two real consumers both need the true stopping point instead
+    /// of the naive `cursor - target_low` distance: the hosts' `blocksRemaining`
     /// status figure (`myotis-engine::host::build_log_index_status`), which
     /// reported the full historical span as still needing a walk for an index
-    /// that was serving every one of those blocks; and this crate's own
-    /// backfill scheduler (`el::reader`'s `log_index_backfill_round`, via
-    /// `backfill_round_has_work`), which would otherwise spend a real batch
-    /// fetch-and-verify round re-walking a range it already fully covers.
+    /// that was serving every one of those blocks (and, before this method
+    /// existed, still overcounted as soon as any one entry was incomplete);
+    /// and this crate's own backfill scheduler (`el::reader`'s
+    /// `log_index_backfill_round`, via `backfill_round_has_work`), which would
+    /// otherwise spend a real batch fetch-and-verify round re-walking a range
+    /// it already fully covers.
+    pub fn walk_target(&self) -> Option<u64> {
+        self.config
+            .watch
+            .iter()
+            .zip(self.coverage.iter())
+            .filter(|(w, c)| !c.span.is_some_and(|(low, _)| low <= w.from_block))
+            .map(|(w, _)| w.from_block)
+            .min()
+    }
+
+    /// True once EVERY watch entry's coverage has reached its own
+    /// `from_block` — the descending backfill walk has nothing left to do for
+    /// any of them, independent of where [`Self::cursor`] happens to sit. An
+    /// empty watch list is vacuously NOT complete: there is nothing to report
+    /// on, and a caller asking "is there nothing left to do" about no entries
+    /// at all almost certainly has a bug of its own.
     pub fn backfill_complete(&self) -> bool {
-        !self.config.watch.is_empty()
-            && self
-                .config
-                .watch
-                .iter()
-                .zip(self.coverage.iter())
-                .all(|(w, c)| c.span.is_some_and(|(low, _)| low <= w.from_block))
+        !self.config.watch.is_empty() && self.walk_target().is_none()
     }
 }
 
