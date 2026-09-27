@@ -1,5 +1,3 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
-
 package io.myotis.ui
 
 import androidx.compose.foundation.background
@@ -28,23 +26,19 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TooltipAnchorPosition
-import androidx.compose.material3.TooltipBox
-import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -62,12 +56,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
@@ -743,32 +740,21 @@ private fun StatusTab(
         // (e.g. fresh install, nothing on) goes through enableNetwork so a cold host
         // has an enabled set to boot.
         val primaryActive = snap != null
-        Row {
-            TooltipBox(
-                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
-                tooltip = { PlainTooltip { Text(StatusHelp.START_STOP) } },
-                state = rememberTooltipState(),
-            ) {
-                Button(
-                    onClick = {
-                        if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
-                        else controller.enableNetwork(primary)
-                    },
-                    // Don't offer Start while offline — discovery can't reach any peer.
-                    enabled = !primaryActive && online,
-                ) { Text("Start $primary") }
-            }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(
+                onClick = {
+                    if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
+                    else controller.enableNetwork(primary)
+                },
+                // Don't offer Start while offline — discovery can't reach any peer.
+                enabled = !primaryActive && online,
+            ) { Text("Start $primary") }
             Spacer(Modifier.width(8.dp))
-            TooltipBox(
-                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
-                tooltip = { PlainTooltip { Text(StatusHelp.START_STOP) } },
-                state = rememberTooltipState(),
-            ) {
-                OutlinedButton(
-                    onClick = { controller.stopNetwork(primary) },
-                    enabled = primaryActive,
-                ) { Text("Stop") }
-            }
+            OutlinedButton(
+                onClick = { controller.stopNetwork(primary) },
+                enabled = primaryActive,
+            ) { Text("Stop") }
+            HelpButton("Start / Stop", StatusHelp.START_STOP)
         }
 
         Spacer(Modifier.height(16.dp))
@@ -810,28 +796,22 @@ private fun StatusTab(
         // engine under it keeps running — so just after a rebind these can render enabled
         // against a live node until the next tick, and a tap then executes for real (the
         // service handle is resolved at click time, by which point the bind has completed).
-        TooltipBox(
-            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
-            tooltip = { PlainTooltip { Text(StatusHelp.CLEAR_CACHES) } },
-            state = rememberTooltipState(),
-        ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(
                 onClick = { controller.clearCaches(primary) },
                 enabled = !primaryActive,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.weight(1f),
             ) { Text("Clear peer caches") }
+            HelpButton("Clear peer caches", StatusHelp.CLEAR_CACHES)
         }
         Spacer(Modifier.height(8.dp))
-        TooltipBox(
-            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
-            tooltip = { PlainTooltip { Text(StatusHelp.RESET_SYNC_STATE) } },
-            state = rememberTooltipState(),
-        ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(
                 onClick = { controller.resetSyncState(primary) },
                 enabled = !primaryActive,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.weight(1f),
             ) { Text("Reset sync state") }
+            HelpButton("Reset sync state", StatusHelp.RESET_SYNC_STATE)
         }
         if (primaryActive) {
             Spacer(Modifier.height(4.dp))
@@ -1753,16 +1733,22 @@ private fun EnsResultView(e: EnsResult) {
     }
 }
 
-/** A Status-tab row: label, value, and — when [help] is given — a tappable/hoverable info
- *  badge carrying the explanation from docs/status-screen.md (see [StatusHelp]). */
+/** A Status-tab row: label, value, and — when [help] is given — a "ⓘ" hint. Nothing else
+ *  in a row is interactive, so the whole row is the tap target for the explanation. */
 @Composable
 private fun StatusRow(key: String, value: String, help: String? = null, color: Color? = null) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+    var showHelp by remember { mutableStateOf(false) }
+    // The row's own text names it for screen readers; the click label names the action.
+    val tappable = if (help == null) Modifier else Modifier.clickable(
+        onClickLabel = "show explanation",
+        role = Role.Button,
+    ) { showHelp = true }
+    Row(Modifier.fillMaxWidth().then(tappable).padding(vertical = 2.dp)) {
         Row(Modifier.width(160.dp)) {
             // weight(1f) reserves the badge's own width first, so a long label truncates
             // instead of the two overflowing the 160dp column into the value's Text.
             Text(key, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (help != null) HelpBadge(help)
+            if (help != null) HelpGlyph(Modifier.padding(start = 4.dp))
         }
         Text(
             value,
@@ -1771,25 +1757,41 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
             overflow = TextOverflow.Ellipsis,
         )
     }
+    if (showHelp && help != null) HelpDialog(key, help) { showHelp = false }
 }
 
-/** Small "ⓘ" badge that shows [text] in a tooltip on long-press (touch) or hover (desktop
- *  mouse) — Material3's [TooltipBox] handles both triggers with no platform-specific code. */
+/** A standalone "ⓘ" for items whose own tap is already an action (the buttons). */
 @Composable
-private fun HelpBadge(text: String) {
-    TooltipBox(
-        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
-        tooltip = { PlainTooltip { Text(text) } },
-        state = rememberTooltipState(),
-    ) {
-        Text(
-            "ⓘ", // ⓘ — matches the row values' existing character-glyph style (✓ ✕ ?)
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 4.dp)
-                .semantics { contentDescription = text },
-        )
-    }
+private fun HelpButton(title: String, help: String) {
+    var showHelp by remember { mutableStateOf(false) }
+    IconButton(
+        onClick = { showHelp = true },
+        modifier = Modifier.semantics { contentDescription = "Help: $title" },
+    ) { HelpGlyph(fontSize = 16.sp) }
+    if (showHelp) HelpDialog(title, help) { showHelp = false }
+}
+
+@Composable
+private fun HelpGlyph(modifier: Modifier = Modifier, fontSize: TextUnit = 11.sp) {
+    Text(
+        "ⓘ",
+        fontSize = fontSize,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        // Decorative: the tap target carries the label for screen readers.
+        modifier = modifier.clearAndSetSemantics {},
+    )
+}
+
+/** The explanation stays up until dismissed (Close, tap outside, or back). */
+@Composable
+private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        // AlertDialog's text slot doesn't scroll; long entries at large font scales would clip.
+        text = { Text(help, Modifier.verticalScroll(rememberScrollState())) },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 /**
