@@ -25,6 +25,7 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
+- [Status Screen](docs/status-screen.md) — Field-by-field guide to the Status screen: the readiness strip, banners, sync bar, every status row, and the actions below them.
 - [Read Statistics](docs/read-stats.md) — The `read-stats` shadow cache: what a state-read cache (per-block, storage-root-keyed, or stale-serve) would have saved on a real session, measured without serving anything from it.
 - [Disk & Network Usage](docs/disk-and-network-usage.md) — Storage footprint of a fully synced client (peer caches, light-client snapshot — there is no on-disk block/header database) and bandwidth: initial sync, the daily cost of staying synced, and what sending a transaction costs.
 - [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.

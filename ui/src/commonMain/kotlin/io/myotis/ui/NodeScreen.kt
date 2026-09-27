@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package io.myotis.ui
 
 import androidx.compose.foundation.background
@@ -30,14 +32,19 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TooltipAnchorPosition
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -737,19 +744,31 @@ private fun StatusTab(
         // has an enabled set to boot.
         val primaryActive = snap != null
         Row {
-            Button(
-                onClick = {
-                    if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
-                    else controller.enableNetwork(primary)
-                },
-                // Don't offer Start while offline — discovery can't reach any peer.
-                enabled = !primaryActive && online,
-            ) { Text("Start $primary") }
+            TooltipBox(
+                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+                tooltip = { PlainTooltip { Text(StatusHelp.START_STOP) } },
+                state = rememberTooltipState(),
+            ) {
+                Button(
+                    onClick = {
+                        if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
+                        else controller.enableNetwork(primary)
+                    },
+                    // Don't offer Start while offline — discovery can't reach any peer.
+                    enabled = !primaryActive && online,
+                ) { Text("Start $primary") }
+            }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(
-                onClick = { controller.stopNetwork(primary) },
-                enabled = primaryActive,
-            ) { Text("Stop") }
+            TooltipBox(
+                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+                tooltip = { PlainTooltip { Text(StatusHelp.START_STOP) } },
+                state = rememberTooltipState(),
+            ) {
+                OutlinedButton(
+                    onClick = { controller.stopNetwork(primary) },
+                    enabled = primaryActive,
+                ) { Text("Stop") }
+            }
         }
 
         Spacer(Modifier.height(16.dp))
@@ -791,17 +810,29 @@ private fun StatusTab(
         // engine under it keeps running — so just after a rebind these can render enabled
         // against a live node until the next tick, and a tap then executes for real (the
         // service handle is resolved at click time, by which point the bind has completed).
-        OutlinedButton(
-            onClick = { controller.clearCaches(primary) },
-            enabled = !primaryActive,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Clear peer caches") }
+        TooltipBox(
+            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+            tooltip = { PlainTooltip { Text(StatusHelp.CLEAR_CACHES) } },
+            state = rememberTooltipState(),
+        ) {
+            OutlinedButton(
+                onClick = { controller.clearCaches(primary) },
+                enabled = !primaryActive,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Clear peer caches") }
+        }
         Spacer(Modifier.height(8.dp))
-        OutlinedButton(
-            onClick = { controller.resetSyncState(primary) },
-            enabled = !primaryActive,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Reset sync state") }
+        TooltipBox(
+            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+            tooltip = { PlainTooltip { Text(StatusHelp.RESET_SYNC_STATE) } },
+            state = rememberTooltipState(),
+        ) {
+            OutlinedButton(
+                onClick = { controller.resetSyncState(primary) },
+                enabled = !primaryActive,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Reset sync state") }
+        }
         if (primaryActive) {
             Spacer(Modifier.height(4.dp))
             Text(
@@ -999,17 +1030,21 @@ private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
 private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
     val tz = remember { TimeZone.currentSystemDefault() }
     Column {
-        StatusRow("Network", s.network)
-        StatusRow("State", when (s.lifecycle) {
-            "PAUSED" -> "Sleeping (wakes on request)"
-            "RUNNING" -> "Running"
-            else -> "Stopped"
-        })
-        StatusRow("Beacon", s.beaconState)
-        StatusRow("EL block", s.executionBlockNumber.toString())
+        StatusRow("Network", s.network, help = StatusHelp.NETWORK)
+        StatusRow(
+            "State",
+            when (s.lifecycle) {
+                "PAUSED" -> "Sleeping (wakes on request)"
+                "RUNNING" -> "Running"
+                else -> "Stopped"
+            },
+            help = StatusHelp.STATE,
+        )
+        StatusRow("Beacon", s.beaconState, help = StatusHelp.BEACON)
+        StatusRow("EL block", s.executionBlockNumber.toString(), help = StatusHelp.EL_BLOCK)
         // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
         // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
-        s.logIndex?.let { StatusRow("Log index", it) }
+        s.logIndex?.let { StatusRow("Log index", it, help = StatusHelp.LOG_INDEX) }
         s.tor?.let { mode ->
             StatusRow(
                 "Tor",
@@ -1019,13 +1054,22 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                     "off" -> "off"
                     else -> mode
                 },
+                help = StatusHelp.TOR,
                 color = if (mode == "active") MaterialTheme.colorScheme.primary else null,
             )
         }
-        StatusRow("CL peers", "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}")
+        StatusRow(
+            "CL peers",
+            "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}",
+            help = StatusHelp.CL_PEERS,
+        )
         // Same total-first shape as the cache rows (the pool holds only ready
         // peers, so the total IS the ready count).
-        StatusRow("EL peers", "${s.readyPeers} · snap ${s.snapPeers} · serving ${s.snapServingPeers}")
+        StatusRow(
+            "EL peers",
+            "${s.readyPeers} · snap ${s.snapPeers} · serving ${s.snapServingPeers}",
+            help = StatusHelp.EL_PEERS,
+        )
         // Cache rows: confirmed-server counts predict how fast the NEXT cold
         // start finds servers — the cache learning is visible live. One icon
         // vocabulary for both rows, sized for phone-width screens:
@@ -1039,16 +1083,26 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             "CL cache",
             "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
                 "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
+            help = StatusHelp.CL_CACHE,
         )
         StatusRow(
             "EL cache",
             "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
                 "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
+            help = StatusHelp.EL_CACHE,
         )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
-        StatusRow("Hdr asks", "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}")
-        StatusRow("Blk asks", "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}")
+        StatusRow(
+            "Hdr asks",
+            "${s.peerHeaderRequests} · served ${s.peerHeaderRequestsServed}",
+            help = StatusHelp.HDR_ASKS,
+        )
+        StatusRow(
+            "Blk asks",
+            "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}",
+            help = StatusHelp.BLK_ASKS,
+        )
         // The read-fetch shadow cache (docs/read-stats.md): verified state
         // fetches this run, the share a sound cache keying would have served
         // (storage-root keyed slots, per-block accounts, content-addressed
@@ -1057,28 +1111,43 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // once the engine has observed a fetch; hidden on hosts that don't
         // feed the JSON.
         s.readStatsJson?.let(ReadStatsStatus::parse)?.takeIf(ReadStatsStatus::hasReads)?.let { rs ->
-            StatusRow("Reads", ReadStatsStatus.fetchesLine(rs))
-            StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs))
-            ReadStatsStatus.staleLine(rs)?.let { StatusRow("Stale ≤60s ok", it) }
+            StatusRow("Reads", ReadStatsStatus.fetchesLine(rs), help = StatusHelp.READS)
+            StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs), help = StatusHelp.CACHEABLE)
+            ReadStatsStatus.staleLine(rs)?.let {
+                StatusRow("Stale ≤60s ok", it, help = StatusHelp.STALE_OK)
+            }
         }
-        StatusRow("Discovered", s.discoveredPeers.toString())
-        StatusRow("Discv5 peers", s.discv5Peers.toString())
-        StatusRow("In backoff", s.backedOffPeers.toString())
-        StatusRow("Blacklisted", s.blacklistedPeers.toString())
+        StatusRow("Discovered", s.discoveredPeers.toString(), help = StatusHelp.DISCOVERED)
+        StatusRow("Discv5 peers", s.discv5Peers.toString(), help = StatusHelp.DISCV5_PEERS)
+        StatusRow("In backoff", s.backedOffPeers.toString(), help = StatusHelp.IN_BACKOFF)
+        StatusRow("Blacklisted", s.blacklistedPeers.toString(), help = StatusHelp.BLACKLISTED)
         // JSON-RPC listener: where a same-device client reaches this network's
         // verified endpoint — or why it can't (port squatted / bind failed).
         if (s.rpcPort > 0) {
             if (s.rpcServing) {
-                StatusRow("RPC", "127.0.0.1:${s.rpcPort}")
+                StatusRow("RPC", "127.0.0.1:${s.rpcPort}", help = StatusHelp.RPC)
             } else {
-                StatusRow("RPC", "port ${s.rpcPort} unavailable", color = MaterialTheme.colorScheme.error)
+                StatusRow(
+                    "RPC",
+                    "port ${s.rpcPort} unavailable",
+                    help = StatusHelp.RPC,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         }
-        StatusRow("Sync period", "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}")
+        StatusRow(
+            "Sync period",
+            "${s.syncCurrentPeriod} / ${s.syncTargetPeriod}",
+            help = StatusHelp.SYNC_PERIOD,
+        )
         // verifiedHeadAgeMs == Long.MAX_VALUE is the "no verified head yet" sentinel — show a
         // dash instead of the raw ~9.2e18 ms, which would read as a nonsensical age.
-        StatusRow("Head age", if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms")
-        StatusRow("Uptime", "${s.uptimeSeconds}s")
+        StatusRow(
+            "Head age",
+            if (s.verifiedHeadAgeMs == Long.MAX_VALUE) "—" else "${s.verifiedHeadAgeMs} ms",
+            help = StatusHelp.HEAD_AGE,
+        )
+        StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
         // so this keeps showing the last real request/catch-up wake even as you view it.
@@ -1094,10 +1163,15 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                 else -> "${formatDuration(s.totalPausedMs)} over ${s.pauseCount} " +
                     "${if (s.pauseCount == 1) "pause" else "pauses"}"
             },
+            help = StatusHelp.SLEEP,
         )
         if (s.lastResumeEpochMs > 0) {
             val slept = if (s.lastPauseEpochMs > 0) " · slept ${formatLogTime(s.lastPauseEpochMs, tz)}" else ""
-            StatusRow("Last woke", "${formatLogTime(s.lastResumeEpochMs, tz)} (${s.lastWakeReason ?: "?"})$slept")
+            StatusRow(
+                "Last woke",
+                "${formatLogTime(s.lastResumeEpochMs, tz)} (${s.lastWakeReason ?: "?"})$slept",
+                help = StatusHelp.LAST_WOKE,
+            )
         }
     }
 }
@@ -1679,10 +1753,17 @@ private fun EnsResultView(e: EnsResult) {
     }
 }
 
+/** A Status-tab row: label, value, and — when [help] is given — a tappable/hoverable info
+ *  badge carrying the explanation from docs/status-screen.md (see [StatusHelp]). */
 @Composable
-private fun StatusRow(key: String, value: String, color: Color? = null) {
+private fun StatusRow(key: String, value: String, help: String? = null, color: Color? = null) {
     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-        Text(key, Modifier.width(160.dp))
+        Row(Modifier.width(160.dp)) {
+            // weight(1f) reserves the badge's own width first, so a long label truncates
+            // instead of the two overflowing the 160dp column into the value's Text.
+            Text(key, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (help != null) HelpBadge(help)
+        }
         Text(
             value,
             color = color ?: Color.Unspecified,
@@ -1690,6 +1771,106 @@ private fun StatusRow(key: String, value: String, color: Color? = null) {
             overflow = TextOverflow.Ellipsis,
         )
     }
+}
+
+/** Small "ⓘ" badge that shows [text] in a tooltip on long-press (touch) or hover (desktop
+ *  mouse) — Material3's [TooltipBox] handles both triggers with no platform-specific code. */
+@Composable
+private fun HelpBadge(text: String) {
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+        tooltip = { PlainTooltip { Text(text) } },
+        state = rememberTooltipState(),
+    ) {
+        Text(
+            "ⓘ", // ⓘ — matches the row values' existing character-glyph style (✓ ✕ ?)
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp)
+                .semantics { contentDescription = text },
+        )
+    }
+}
+
+/**
+ * Status-tab help text, one entry per on-screen item — the in-app twin of
+ * docs/status-screen.md. **Keep both in sync**: a behavior change to
+ * [StatusView]/[ReadinessStrip]/[StatusTab] that changes what a row means
+ * must update its string here AND the matching row in that doc.
+ */
+private object StatusHelp {
+    const val NETWORK = "The chain name (mainnet / sepolia / gnosis / …)."
+    const val STATE = "Stack lifecycle: sleeping (idle-paused — networking off, RPC still " +
+        "listening), running, or stopped."
+    const val BEACON = "Beacon light client sync state (STARTING/SYNCING/CATCHING_UP/SYNCED/" +
+        "STALE_ANCHOR). On Android, STARTING shows as STOPPED and the sync bar is then hidden. " +
+        "SYNCED alone doesn't guarantee reads succeed — see Head age."
+    const val EL_BLOCK = "Block number of the latest beacon-finalized execution payload — not " +
+        "the optimistic head eth_blockNumber uses. Trails the chain head by about two epochs " +
+        "(~64–96 blocks on mainnet) on a healthy node."
+    const val LOG_INDEX = "Log index backfill progress, e.g. \"12,041 logs · " +
+        "5,594,611–8,461,900\", or \"backfilling\". Shown only when the log index feature applies."
+    const val TOR = "Desktop only, and only with the Rust engine on a -PtorEngine build. " +
+        "Scope: only account (balance/nonce) reads route over Tor today — storage/token reads, " +
+        "eth_call/gas estimation, tx broadcast, the CL fetch, and discovery still leave from " +
+        "your real IP."
+    const val CL_PEERS = "\"served N/min\" = distinct peers that answered a light-client " +
+        "request in the last 60s. \"con N\" = currently-connected CL peers — usually near 0, " +
+        "since connections are short-lived."
+    const val EL_PEERS = "\"N\" ready peers total, \"snap M\" negotiated snap/1, \"serving K\" " +
+        "can answer a read right now. Reads gate on serving, not snap — a cold pool can show " +
+        "snap peers for hours before any of them can actually serve."
+    const val CL_CACHE = "Peers in the on-disk CL peer cache: total · ✓ proven light-client " +
+        "servers · ✕ confirmed non-servers · ? untried. Predicts how fast the next cold start " +
+        "finds servers."
+    const val EL_CACHE = "Peers in the on-disk EL (snap) peer cache: total · ✓ confirmed " +
+        "snap-serving · ✕ confirmed snap-denied · ? untried."
+    const val HDR_ASKS = "GetBlockHeaders requests other peers sent us: total received · " +
+        "served with a non-empty reply."
+    const val BLK_ASKS = "GetBlockBodies requests other peers sent us. Served is always 0 by " +
+        "design — this light client holds no bodies."
+    const val READS = "Verified account/storage/code fetches that crossed the network since " +
+        "start (the read-fetch shadow cache — docs/read-stats.md)."
+    const val CACHEABLE = "Share of each kind's fetches a SOUND cache keying would have served " +
+        "for free (storage-root for slots, per-block for accounts, content-addressing for " +
+        "code), with the time it would have saved."
+    const val STALE_OK = "Of repeats within a minute of the last fetch, how often the value " +
+        "was still correct — the ceiling for an UNSOUND \"serve a value up to a minute old\" " +
+        "strategy. Not a proposal to actually do this; nothing here is served unverified."
+    const val DISCOVERED = "EL peers currently in the discv4 (Kademlia) routing table — a live " +
+        "table size, not a running total. Shrinks as buckets evict, and is 0 while the stack " +
+        "sleeps."
+    const val DISCV5_PEERS = "Live nodes currently in the discv5 (CL-side) routing table."
+    const val IN_BACKOFF = "Peers currently in dial backoff after a recent failed connection " +
+        "attempt — won't be redialed until it expires."
+    const val BLACKLISTED = "Peers blacklisted as wrong-chain (network-id/genesis mismatch, or " +
+        "an undecodable Status from a foreign chain) — not re-dialed until the stack restarts " +
+        "(on the Rust engine, also cleared by a sleep/wake)."
+    const val RPC = "Local JSON-RPC listener for this network. Hidden if the host doesn't " +
+        "report a port. Shows the bind address, or \"unavailable\" if the port was already taken."
+    const val SYNC_PERIOD = "Sync-committee period progress: current / target. While parked in " +
+        "STALE_ANCHOR, current is the refused anchor's period and target is the wall clock's " +
+        "period."
+    const val HEAD_AGE = "Freshness, in ms, of the head context verified reads are served " +
+        "against. \"—\" = no verified head yet, so no read can be served. The UI turns amber " +
+        "past 45s."
+    const val UPTIME = "Seconds since this network's stack started running."
+    const val SLEEP = "Idle-sleep summary: \"always on\" if this host can't idle-sleep, " +
+        "\"never slept\", or the total time paused over N pauses."
+    const val LAST_WOKE = "When the node last woke on a real request, and why (foreground/" +
+        "app-open wakes don't count). \"slept\" is the most recent time it went to sleep — " +
+        "which can be AFTER this wake, if it's asleep again now."
+
+    const val START_STOP = "Runtime-only start/stop — independent of the network's enabled " +
+        "switch in Settings. Exception: starting a disabled network also enables it, so a " +
+        "cold host has something to boot next time."
+    const val CLEAR_CACHES = "Wipes the on-disk peer caches through the engine for a fresh " +
+        "discovery slate. Only enabled while stopped — a guard rail against clicking it on a " +
+        "live node, not a hard lock."
+    const val RESET_SYNC_STATE = "Deletes the persisted sync snapshot; the next start " +
+        "re-bootstraps from the embedded checkpoint alone. If this build is older than the " +
+        "network's weak-subjectivity bound, that parks the next start in STALE_ANCHOR — " +
+        "updating the app first avoids that."
 }
 
 /**
