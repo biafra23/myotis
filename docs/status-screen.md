@@ -16,8 +16,9 @@ Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), and the
 Tor row is desktop-only (see that row below).
 
 The app shows a condensed version of this explanation in place: rows marked
-"ⓘ" open it in a dialog on a single tap anywhere on the row, and each action
-button has its own "ⓘ" next to it (the button's own tap stays the action). The
+"ⓘ" open it in a dialog on a single tap anywhere on the row, and each of the
+three actions — Start / Stop (one "ⓘ" for the pair), Clear peer caches, Reset
+sync state — has an "ⓘ" beside it (the buttons' own tap stays the action). The
 dialog is titled with the row or action's name and stays open until dismissed
 (Close, tap outside, or back). The text lives in the `StatusHelp` object in
 `NodeScreen.kt`. **The two are meant to stay in sync**: a behavior change that

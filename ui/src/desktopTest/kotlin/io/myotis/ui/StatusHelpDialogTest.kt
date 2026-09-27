@@ -57,7 +57,7 @@ class StatusHelpDialogTest {
         val controller = Stopped()
         rule.setContent { NodeScreen(controller = controller, settings = FakeSettings(), logs = NoLogs) }
         pumpFrames()
-        rule.onNodeWithContentDescription("Explain Clear peer caches").performScrollTo().performClick()
+        rule.onNodeWithContentDescription("Help: Clear peer caches").performScrollTo().performClick()
         pumpFrames()
         rule.onNodeWithText("fresh discovery slate", substring = true).assertIsDisplayed()
         assertEquals(0, controller.cleared)

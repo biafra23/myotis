@@ -26,6 +26,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -63,6 +64,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
@@ -1736,8 +1738,9 @@ private fun EnsResultView(e: EnsResult) {
 @Composable
 private fun StatusRow(key: String, value: String, help: String? = null, color: Color? = null) {
     var showHelp by remember { mutableStateOf(false) }
+    // The row's own text names it for screen readers; the click label names the action.
     val tappable = if (help == null) Modifier else Modifier.clickable(
-        onClickLabel = "Explain $key",
+        onClickLabel = "show explanation",
         role = Role.Button,
     ) { showHelp = true }
     Row(Modifier.fillMaxWidth().then(tappable).padding(vertical = 2.dp)) {
@@ -1757,26 +1760,24 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
     if (showHelp && help != null) HelpDialog(key, help) { showHelp = false }
 }
 
-/** A 48dp "ⓘ" tap target for items whose own tap is already an action (the buttons). */
+/** A standalone "ⓘ" for items whose own tap is already an action (the buttons). */
 @Composable
 private fun HelpButton(title: String, help: String) {
     var showHelp by remember { mutableStateOf(false) }
-    Box(
-        Modifier.size(48.dp)
-            .clickable(onClickLabel = "Explain $title", role = Role.Button) { showHelp = true }
-            .semantics { contentDescription = "Explain $title" },
-        contentAlignment = Alignment.Center,
-    ) { HelpGlyph() }
+    IconButton(
+        onClick = { showHelp = true },
+        modifier = Modifier.semantics { contentDescription = "Help: $title" },
+    ) { HelpGlyph(fontSize = 16.sp) }
     if (showHelp) HelpDialog(title, help) { showHelp = false }
 }
 
 @Composable
-private fun HelpGlyph(modifier: Modifier = Modifier) {
+private fun HelpGlyph(modifier: Modifier = Modifier, fontSize: TextUnit = 11.sp) {
     Text(
         "ⓘ",
-        fontSize = 11.sp,
+        fontSize = fontSize,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        // Decorative: the tap target carries the "Explain …" label for screen readers.
+        // Decorative: the tap target carries the label for screen readers.
         modifier = modifier.clearAndSetSemantics {},
     )
 }
@@ -1787,7 +1788,8 @@ private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { Text(help) },
+        // AlertDialog's text slot doesn't scroll; long entries at large font scales would clip.
+        text = { Text(help, Modifier.verticalScroll(rememberScrollState())) },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
