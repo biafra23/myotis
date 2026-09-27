@@ -15,13 +15,13 @@ Host coverage isn't uniform: iOS never fills the READY peers list or the
 Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), and the
 Tor row is desktop-only (see that row below).
 
-Every Status row carries an in-app "ⓘ" help badge next to its label, and the
-three action buttons carry the same kind of tooltip directly on the button
-itself (no separate icon) — both trigger on long-press (touch) or hover
-(desktop) and show a condensed version of this same explanation. See the
-`StatusHelp` object right above `StatusRow` in `NodeScreen.kt`. **The two are
-meant to stay in sync**: a behavior change that changes what a row or action
-means must update both `StatusHelp` and this doc.
+The app shows a condensed version of this explanation in place: rows marked
+"ⓘ" open it in a dialog on a single tap anywhere on the row, and each action
+button has its own "ⓘ" next to it (the button's own tap stays the action). The
+dialog is titled with the row or action's name and stays open until dismissed
+(Close, tap outside, or back). The text lives in the `StatusHelp` object in
+`NodeScreen.kt`. **The two are meant to stay in sync**: a behavior change that
+changes what a row or action means must update both `StatusHelp` and this doc.
 
 ## Readiness strip
 
