@@ -87,55 +87,209 @@ public final class DefaultEvmExecutor implements EvmExecutor {
     private long estimateGasOnce(UnsignedTransaction tx, BlockContext blockContext) {
         CryptoProviders.ensureRegistered();
         long intrinsicGas = computeIntrinsicGas(tx.data());
-        // The ceiling (geth's `hi`, #509): the executor's budget — never above
-        // what a transaction may carry at all (EIP-7825 from Osaka) — lowered by
-        // the caller's gas limit (below 21000 geth reads it as no limit, and so
-        // do we) and, under a fee cap, by what the sender can pay for. The answer
-        // never exceeds it, and a transaction that does not succeed within it
-        // is geth's "gas required exceeds allowance".
-        long ceiling = Math.min(DEFAULT_GAS_LIMIT, EvmFactory.txGasLimitCap(blockContext));
-        if (tx.gasLimit() != null && tx.gasLimit() >= 21_000L) {
-            ceiling = Math.min(ceiling, tx.gasLimit());
-        }
-        java.math.BigInteger feeCap = tx.feeCapOrZero();
-        if (feeCap.signum() > 0) {
-            java.math.BigInteger balance = balanceOf(tx.from(), blockContext);
-            if (tx.value().compareTo(balance) >= 0) {
-                throw new EvmExecutionException(new EvmExecutionError.InsufficientFundsForTransfer());
-            }
-            java.math.BigInteger fundable = balance.subtract(tx.value()).divide(feeCap);
-            if (fundable.compareTo(java.math.BigInteger.valueOf(ceiling)) < 0) {
-                ceiling = fundable.longValue();
-            }
-        }
-        // geth checks the fee cap against the base fee when it first RUNS the
-        // transaction: after the affordability checks above, before the intrinsic
-        // cost is weighed against the ceiling (the Rust estimate's order) — and
-        // its estimator reports that run's refusal with the ceiling it ran at.
-        EvmExecutionError.FeeCapTooLow feeCapTooLow = feeCapBelowBaseFee(tx, blockContext);
-        if (feeCapTooLow != null) {
-            throw new EvmExecutionException(new EvmExecutionError.FailedWithGas(ceiling, feeCapTooLow));
-        }
+        long ceiling = estimateCeiling(tx, blockContext, () -> balanceOf(tx.from(), blockContext));
         // EIP-7623: from Prague on a transaction is charged at least this floor,
         // so the answer must cover it (the Rust estimate's `tx_gas_used` twin).
         long floor = EvmFactory.calldataFloorActive(blockContext) ? computeCalldataFloor(tx.data()) : 0L;
         if (intrinsicGas > ceiling || floor > ceiling) {
             // The limit does not even cover the intrinsic cost (or the floor).
-            // Note: a budget of exactly 0 is legal — a plain ETH transfer to an
-            // existing EOA at gasLimit=21000 has no EVM execution and
-            // runForEstimation correctly returns evmUsed=0.
+            // Note: a frame budget of exactly 0 is legal — a plain ETH transfer
+            // to an existing EOA at gasLimit=21000 has no EVM execution.
             throw new EvmExecutionException(new EvmExecutionError.GasAllowanceExceeded(ceiling));
         }
-        long evmUsed = runForEstimation(tx, blockContext, ceiling - intrinsicGas, ceiling);
-        long total = Math.max(intrinsicGas + evmUsed, floor);
-        // 15% safety buffer per the plan. A slightly-too-high estimate just
-        // costs the user some priority fee; a slightly-too-low one OOG's
-        // the broadcast transaction — so round *up* strictly. Math.round
-        // can round down (e.g. for totals where total * 1.15 lands just
-        // below x.5), defeating the safety property. Never above the ceiling:
-        // the run just succeeded within it, so the ceiling is itself a limit
-        // that works — geth's invariant.
-        return Math.min((long) Math.ceil(total * 1.15), ceiling);
+        // One EVM and one view for every run below: the search's probes reuse the
+        // EVM's code analysis and read the state the first run fetched.
+        EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
+        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, new AccessTracker());
+        MessageFrame first = runPlanned(bundle, estimatePlan(tx, blockContext, ceiling, intrinsicGas),
+                blockContext, view, OperationTracer.NO_TRACING);
+        if (first.getState() != MessageFrame.State.COMPLETED_SUCCESS) {
+            // Out of gas AT the ceiling: more than the caller allowed.
+            throw failureOf(first, new EvmExecutionError.GasAllowanceExceeded(ceiling));
+        }
+        // geth's search, from the most the run at the ceiling drew (at least the
+        // floor: its MaxUsedGas).
+        long drawn = Math.max(ceiling - first.getRemainingGas(), floor);
+        long lowest = lowestWorkingLimit(bundle, tx, blockContext, view, intrinsicGas, floor, drawn, ceiling);
+        // 15% safety buffer over the lowest limit that works. A slightly-too-high
+        // estimate just costs the user some priority fee; a slightly-too-low one
+        // OOG's the broadcast transaction — so round *up* strictly. Math.round
+        // can round down (e.g. for totals where total * 1.15 lands just below
+        // x.5), defeating the safety property. Never above the ceiling: the run
+        // just succeeded AT it, so the ceiling is itself a limit that works —
+        // geth's invariant.
+        return Math.min((long) Math.ceil(lowest * 1.15), ceiling);
+    }
+
+    /**
+     * An estimate's ceiling — geth's {@code hi} (#509) — or geth's refusal before
+     * any run: the executor's budget and EIP-7825's cap from Osaka, lowered by the
+     * caller's {@code gas} (from 21000; without one, by the block's gas limit,
+     * where geth's search starts) and, under a fee cap, by what the sender can pay
+     * for; then a fee cap below the base fee, and geth's buyGas at that ceiling —
+     * without a fee, the value the sender moves. The answer never exceeds it, and
+     * a transaction that does not succeed within it is geth's "gas required
+     * exceeds allowance". {@code balance} supplies the sender's verified balance,
+     * asked at most once and only when a rule needs it. ONE copy for the metered
+     * estimate and the JSON-RPC backend's plain-transfer short-circuit, so a rule
+     * cannot reach one and not the other.
+     *
+     * @throws EvmExecutionException carrying the refusal, an
+     *         {@link EvmExecutionError.Infeasible}
+     */
+    public static long estimateCeiling(UnsignedTransaction tx, BlockContext blockContext,
+                                       java.util.function.Supplier<java.math.BigInteger> balance) {
+        java.math.BigInteger[] known = new java.math.BigInteger[1];
+        java.util.function.Supplier<java.math.BigInteger> once =
+                () -> known[0] != null ? known[0] : (known[0] = balance.get());
+        long ceiling = Math.min(DEFAULT_GAS_LIMIT, EvmFactory.txGasLimitCap(blockContext));
+        if (tx.gasLimit() != null && tx.gasLimit() >= 21_000L) {
+            // Below 21000 geth reads a gas limit as none, and so do we.
+            ceiling = Math.min(ceiling, tx.gasLimit());
+        } else if (blockContext.gasLimit() > 0) {
+            // No block holds a larger transaction.
+            ceiling = Math.min(ceiling, blockContext.gasLimit());
+        }
+        java.math.BigInteger feeCap = tx.feeCapOrZero();
+        if (feeCap.signum() > 0) {
+            java.math.BigInteger have = once.get();
+            if (tx.value().compareTo(have) >= 0) {
+                throw new EvmExecutionException(new EvmExecutionError.InsufficientFundsForTransfer());
+            }
+            java.math.BigInteger fundable = have.subtract(tx.value()).divide(feeCap);
+            if (fundable.compareTo(java.math.BigInteger.valueOf(ceiling)) < 0) {
+                ceiling = fundable.longValue();
+            }
+        }
+        // geth checks the fee cap against the base fee when it first RUNS the
+        // transaction — after the affordability checks above, before the
+        // intrinsic cost is weighed against the ceiling (the Rust estimate's
+        // order) — then its buyGas; its estimator reports that run's refusal
+        // with the ceiling it ran at.
+        EvmExecutionError.FeeCapTooLow feeCapTooLow = feeCapBelowBaseFee(tx, blockContext);
+        if (feeCapTooLow != null) {
+            throw new EvmExecutionException(new EvmExecutionError.FailedWithGas(ceiling, feeCapTooLow));
+        }
+        EvmExecutionError.Infeasible shortfall = buyGasShortfall(tx, ceiling, once);
+        if (shortfall != null) {
+            throw new EvmExecutionException(new EvmExecutionError.FailedWithGas(ceiling, shortfall));
+        }
+        return ceiling;
+    }
+
+    /**
+     * geth's buyGas: the sender must hold {@code gasLimit × fee cap + value}, a
+     * sum that must fit 256 bits — the shortfall as geth's error, or null.
+     * {@code balance} is asked only when something is owed. ONE copy for a call
+     * and an estimate (the Rust {@code buy_gas_shortfall} twin).
+     */
+    static EvmExecutionError.Infeasible buyGasShortfall(UnsignedTransaction tx, long gasLimit,
+                                                        java.util.function.Supplier<java.math.BigInteger> balance) {
+        java.math.BigInteger want = java.math.BigInteger.valueOf(gasLimit).multiply(tx.feeCapOrZero()).add(tx.value());
+        if (want.bitLength() > 256) {
+            return new EvmExecutionError.RequiredBalanceOverflow(tx.from());
+        }
+        if (want.signum() == 0) {
+            return null;
+        }
+        java.math.BigInteger have = balance.get();
+        return have.compareTo(want) < 0 ? new EvmExecutionError.InsufficientFunds(tx.from(), have, want) : null;
+    }
+
+    /** The gas a value-bearing CALL hands its callee on top (geth's
+     *  {@code params.CallStipend}): geth's first probe adds it to the draw. */
+    private static final long CALL_STIPEND = 2_300;
+    /** How long the search may keep bisecting before the limit in hand — one
+     *  that works — is the answer. An abandoned JSON-RPC wait does not stop an
+     *  estimate on this engine, so this bounds how long one holds an EVM thread
+     *  (the Rust engine cancels instead). */
+    private static final long SEARCH_BUDGET_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+    /** geth's {@code estimateGasErrorRatio}: the search stops within 1.5% of the
+     *  lowest limit that works — the 1.15 buffer on top dwarfs it. */
+    private static final double ESTIMATE_ERROR_RATIO = 0.015;
+
+    /**
+     * geth's estimator search ({@code eth/gasestimator}) for the lowest gas
+     * limit at which {@code tx} succeeds, given a run at {@code hi} that
+     * succeeded having drawn {@code drawn}: a first probe tries what it drew plus
+     * the call stipend with the 63/64 a nested call withholds — usually the
+     * answer — and bisection, skewed low, stops within
+     * {@link #ESTIMATE_ERROR_RATIO} of it (or at {@link #SEARCH_BUDGET_NANOS},
+     * with the working limit in hand). A probe that fails for any reason (out of
+     * gas, a revert, a halt, a limit below the intrinsic cost or the floor)
+     * raises the limit; an error reading state ends the search with it. The Rust
+     * estimate's {@code lowest_working_limit} twin, down to the one deliberate
+     * difference from geth: geth searches down to what the run was charged
+     * (after refunds), this search stops at what it drew. Below that a limit can
+     * only "work" by running a different transaction — a failure caught deep
+     * inside (try/catch, a multicall that tolerates one), a {@code gasleft()}
+     * branch — which is not the one the caller simulated. A probe cannot tell a
+     * caught failure from success, though, so above the draw the search finds
+     * the lowest limit at which the OUTER transaction succeeds: a call whose
+     * failure is caught d levels down needs (64/63)^d of what it drew, which
+     * the 1.15 buffer covers through d = 8, not from d = 9 on.
+     */
+    private long lowestWorkingLimit(EvmFactory.EvmAndPrecompiles bundle, UnsignedTransaction tx,
+                                    BlockContext blockContext, SyncStateView view, long intrinsicGas, long floor,
+                                    long drawn, long hi) {
+        long deadline = System.nanoTime() + SEARCH_BUDGET_NANOS;
+        long lo = drawn - 1;
+        long optimistic = (drawn + CALL_STIPEND) * 64 / 63;
+        if (optimistic < hi) {
+            if (succeedsWith(bundle, tx, blockContext, view, intrinsicGas, floor, optimistic)) {
+                hi = optimistic;
+            } else {
+                lo = optimistic;
+            }
+        }
+        while (lo + 1 < hi && System.nanoTime() - deadline < 0) {
+            // Within the error ratio of the answer: a wallet bumps the limit
+            // anyway, and every probe is a full run.
+            if ((double) (hi - lo) / hi < ESTIMATE_ERROR_RATIO) {
+                break;
+            }
+            // Skewed low: most transactions need little more than they drew.
+            long mid = Math.min((hi + lo) / 2, lo * 2);
+            if (succeedsWith(bundle, tx, blockContext, view, intrinsicGas, floor, mid)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        return hi;
+    }
+
+    /** Whether {@code tx} succeeds with {@code gasLimit} — one probe of
+     *  {@link #lowestWorkingLimit}. Below the intrinsic cost or the floor it
+     *  cannot, and geth's estimator raises the limit on that. */
+    private boolean succeedsWith(EvmFactory.EvmAndPrecompiles bundle, UnsignedTransaction tx,
+                                 BlockContext blockContext, SyncStateView view, long intrinsicGas, long floor,
+                                 long gasLimit) {
+        if (gasLimit < intrinsicGas || gasLimit < floor) {
+            return false;
+        }
+        return runPlanned(bundle, estimatePlan(tx, blockContext, gasLimit, intrinsicGas), blockContext, view,
+                OperationTracer.NO_TRACING).getState() == MessageFrame.State.COMPLETED_SUCCESS;
+    }
+
+    /** What one run of {@code tx} at {@code gasLimit} draws, gross — the base a
+     *  single-run estimate buffered. Package-private as a test seam: tests show
+     *  where that base is not a limit that works and the search is. */
+    long drawnAt(UnsignedTransaction tx, BlockContext blockContext, long gasLimit) {
+        long intrinsicGas = computeIntrinsicGas(tx.data());
+        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, new AccessTracker());
+        MessageFrame frame = runPlanned(EvmFactory.buildForBlock(blockContext),
+                estimatePlan(tx, blockContext, gasLimit, intrinsicGas), blockContext, view, OperationTracer.NO_TRACING);
+        return gasLimit - frame.getRemainingGas();
+    }
+
+    /** The estimate's run of {@code tx} at {@code gasLimit}: priced and debited
+     *  as the transaction would be (geth runs its estimate through the same
+     *  state transition as a call). */
+    private static CallPlan estimatePlan(UnsignedTransaction tx, BlockContext blockContext, long gasLimit,
+                                         long intrinsicGas) {
+        return new CallPlan(tx.from(), tx.to(), tx.data(), tx.value(), gasLimit, gasLimit - intrinsicGas,
+                Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())), gasLimit);
     }
 
     /**
@@ -202,18 +356,11 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         if (feeCapTooLow != null) {
             throw callFailed(gasLimit, feeCapTooLow);
         }
-        // geth's buyGas, fee or no fee: the sender must hold gas × fee cap +
-        // value — a call moving more than the sender holds is refused as the
-        // chain would refuse it — and that sum must fit 256 bits.
-        java.math.BigInteger want = java.math.BigInteger.valueOf(gasLimit).multiply(tx.feeCapOrZero()).add(tx.value());
-        if (want.bitLength() > 256) {
-            throw callFailed(gasLimit, new EvmExecutionError.RequiredBalanceOverflow(tx.from()));
-        }
-        if (want.signum() > 0) {
-            java.math.BigInteger have = balanceOf(tx.from(), blockContext);
-            if (have.compareTo(want) < 0) {
-                throw callFailed(gasLimit, new EvmExecutionError.InsufficientFunds(tx.from(), have, want));
-            }
+        // geth's buyGas, fee or no fee: a call moving more than the sender holds
+        // is refused as the chain would refuse it.
+        EvmExecutionError.Infeasible shortfall = buyGasShortfall(tx, gasLimit, () -> balanceOf(tx.from(), blockContext));
+        if (shortfall != null) {
+            throw callFailed(gasLimit, shortfall);
         }
         long intrinsic = computeIntrinsicGas(tx.data());
         if (gasLimit < intrinsic) {
@@ -255,92 +402,6 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         var account = new SnapWorldUpdater(view).updater().get(
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(address.toByteArray())));
         return account == null ? java.math.BigInteger.ZERO : account.getBalance().toBigInteger();
-    }
-
-    /**
-     * Run the EVM with transaction-shaped frame parameters and return the
-     * EVM-side gas consumed. Throws {@link EvmExecutionException} on
-     * revert / exceptional halt — the plan mandates that estimation does
-     * NOT return a number for a reverting transaction (the caller must
-     * not broadcast it).
-     */
-    private long runForEstimation(UnsignedTransaction tx, BlockContext blockContext, long evmBudget,
-                                  long ceiling) {
-        EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
-        EVM evm = bundle.evm();
-
-        AccessTracker tracker = new AccessTracker();
-        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, tracker);
-        SnapWorldUpdater root = new SnapWorldUpdater(view);
-        org.hyperledger.besu.evm.worldstate.WorldUpdater scope = root.updater();
-
-        org.hyperledger.besu.datatypes.Address besuTarget =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(tx.to().toByteArray()));
-        org.hyperledger.besu.datatypes.Address besuSender =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(tx.from().toByteArray()));
-        org.hyperledger.besu.datatypes.Address besuCoinbase =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
-
-        var targetAccount = scope.get(besuTarget);
-        Code code = resolveCode(evm, scope, targetAccount);
-
-        Wei value = Wei.of(tx.value());
-
-        MessageFrame frame = MessageFrame.builder()
-                .type(MessageFrame.Type.MESSAGE_CALL)
-                .worldUpdater(scope)
-                .initialGas(evmBudget)
-                .address(besuTarget)
-                .originator(besuSender)
-                .contract(besuTarget)
-                // What GASPRICE reads: the request's effective price (zero
-                // when it names no fee field) — a relayer that pays itself
-                // gasleft() × tx.gasprice costs more when it is not zero.
-                .gasPrice(Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())))
-                .blobGasPrice(Wei.ZERO)
-                .inputData(Bytes.wrap(tx.data()))
-                .sender(besuSender)
-                .value(value)
-                .apparentValue(value)
-                .code(code)
-                .blockValues(new BlockContextValues(blockContext))
-                .completer(f -> {})
-                .miningBeneficiary(besuCoinbase)
-                .blockHashLookup((bhFrame, n) -> {
-                    throw new UnsupportedOperationException(
-                            "BLOCKHASH not implemented; needs a verified block-hash provider");
-                })
-                // Estimation runs as a real (non-static) call so SSTOREs
-                // inside the target's bytecode can be metered correctly,
-                // including refund accounting. The per-call journal is
-                // discarded after we read getRemainingGas; nothing
-                // mutates the chain.
-                .isStatic(false)
-                .build();
-
-        MessageCallProcessor processor = new MessageCallProcessor(evm, bundle.precompiles());
-        Deque<MessageFrame> stack = frame.getMessageFrameStack();
-        while (!stack.isEmpty()) {
-            processor.process(stack.peek(), OperationTracer.NO_TRACING);
-        }
-
-        if (frame.getState() == MessageFrame.State.COMPLETED_SUCCESS) {
-            return evmBudget - frame.getRemainingGas();
-        }
-        if (frame.getRevertReason().isPresent()) {
-            throw new EvmExecutionException(
-                    new EvmExecutionError.Reverted(frame.getRevertReason().get().toArrayUnsafe()));
-        }
-        var halt = frame.getExceptionalHaltReason();
-        if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
-            // Out of gas AT the ceiling: more than the caller allowed.
-            throw new EvmExecutionException(new EvmExecutionError.GasAllowanceExceeded(ceiling));
-        }
-        String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
-                + " state=" + frame.getState();
-        // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
-        // serve Reverted's bytes verbatim as JSON-RPC revert data.
-        throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
     }
 
     /** EIP-7702 delegation designator prefix: an EOA whose code is
@@ -427,8 +488,30 @@ public final class DefaultEvmExecutor implements EvmExecutor {
      *  plain and the transaction-object calls (and their prefetch loop) run on. */
     byte[] runPlannedOnTracedView(CallPlan plan, BlockContext blockContext,
                                   SyncStateView view, OperationTracer tracer) {
+        MessageFrame frame = runPlanned(plan, blockContext, view, tracer);
+        if (frame.getState() == MessageFrame.State.COMPLETED_SUCCESS) {
+            return frame.getOutputData().toArrayUnsafe();
+        }
+        throw failureOf(frame, outOfGas(plan));
+    }
+
+    /**
+     * Run {@code plan} on {@code view} and return the outer frame, finished:
+     * {@code COMPLETED_SUCCESS}, or failed with its revert payload or halt
+     * reason — the caller reads the outcome (and the gas) off it. The shared
+     * runner of calls and of the estimate's probes.
+     */
+    private MessageFrame runPlanned(CallPlan plan, BlockContext blockContext,
+                                    SyncStateView view, OperationTracer tracer) {
+        return runPlanned(EvmFactory.buildForBlock(blockContext), plan, blockContext, view, tracer);
+    }
+
+    /** {@link #runPlanned(CallPlan, BlockContext, SyncStateView, OperationTracer)}
+     *  on an EVM already built for {@code blockContext} — the estimate builds one
+     *  for all of its runs. */
+    private MessageFrame runPlanned(EvmFactory.EvmAndPrecompiles bundle, CallPlan plan, BlockContext blockContext,
+                                    SyncStateView view, OperationTracer tracer) {
         CryptoProviders.ensureRegistered();
-        EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
         EVM evm = bundle.evm();
 
         SnapWorldUpdater root = new SnapWorldUpdater(view);
@@ -506,30 +589,32 @@ public final class DefaultEvmExecutor implements EvmExecutor {
             processor.process(stack.peek(), tracer);
         }
 
-        // process() auto-transitions REVERT/EXCEPTIONAL_HALT to a COMPLETED_*
-        // terminal state before returning, so MessageFrame.State.REVERT is
-        // unobservable here. Derive the outcome from the surviving signals
-        // (revertReason / exceptionalHaltReason / output) on the original
-        // outer frame, not on whatever popped last.
-        if (frame.getState() == MessageFrame.State.COMPLETED_SUCCESS) {
-            return frame.getOutputData().toArrayUnsafe();
-        }
+        return frame;
+    }
+
+    /**
+     * The failure a finished, unsuccessful outer frame stands for.
+     * {@code process()} auto-transitions REVERT/EXCEPTIONAL_HALT to a
+     * COMPLETED_* terminal state before returning, so MessageFrame.State.REVERT
+     * is unobservable; the outcome comes from the surviving signals
+     * (revertReason / exceptionalHaltReason) on the original outer frame, not on
+     * whatever popped last. Running out of gas is {@code outOfGas} — which
+     * limit ran out is the caller's to say.
+     */
+    private static EvmExecutionException failureOf(MessageFrame frame, EvmExecutionError outOfGas) {
         if (frame.getRevertReason().isPresent()) {
-            throw new EvmExecutionException(
+            return new EvmExecutionException(
                     new EvmExecutionError.Reverted(frame.getRevertReason().get().toArrayUnsafe()));
         }
-        // Halt without an explicit revert payload: map the halt reason to
-        // OutOfGas where applicable, otherwise surface a Halted with a
-        // human-readable detail so the failure isn't opaque.
         var halt = frame.getExceptionalHaltReason();
         if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
-            throw new EvmExecutionException(outOfGas(plan));
+            return new EvmExecutionException(outOfGas);
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
         // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
         // serve Reverted's bytes verbatim as JSON-RPC revert data.
-        throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
+        return new EvmExecutionException(new EvmExecutionError.Halted(detail));
     }
 
     /** Running dry, as the plan's limit makes it: under a limit the caller set,

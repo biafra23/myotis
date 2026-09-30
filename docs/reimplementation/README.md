@@ -356,7 +356,7 @@ not-found) / `null`. Wei values are decimal strings; addresses/hashes/calldata a
 | `getCode(bytes, block)` | bytes? | bytecode vs proven `codeHash` |
 | `getStorageAt(bytes, slot32, block)` | bytes? | MPT storage proof vs proven `storageRoot` |
 | `call(from?, to, data, valueWei?, block)` | bytes? | local EVM over proof-served state |
-| `estimateGas(from?, to, data, valueWei?)` | Long? | local EVM, intrinsic + metered + 15% buffer |
+| `estimateGas(from?, to, data, valueWei?)` | Long? | local EVM, geth's search for the lowest working limit + 15% buffer |
 | `gasPrice()` / `maxPriorityFeePerGas()` | decimal-wei String? | verified headers/bodies |
 | `feeHistory(count, newest, percentiles)` | JSON String? | beacon-verified headers (+bodies) |
 | `getBlockByNumber/Hash(...)` | JSON String? | beacon-anchored header |

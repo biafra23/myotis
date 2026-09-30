@@ -89,8 +89,9 @@ class MainnetGasEstimationIT {
             "0xee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835";
 
     /**
-     * Plain ETH transfer to an EOA. Reference: ~21000 gas (intrinsic only),
-     * +15% buffer = ~24150.
+     * Plain ETH transfer to an EOA. Reference: ~21000 gas (intrinsic only) as
+     * the lowest limit that works; the search stops within 1.5% of it and the
+     * 15% buffer goes on top: ~24150–24520.
      */
     @Test
     void ethTransferToEoaIsAround21000() throws Exception {
@@ -106,7 +107,7 @@ class MainnetGasEstimationIT {
 
         long estimate = executor.estimateGas(tx, ctx).get(60, TimeUnit.SECONDS);
         System.out.printf("[gas-it] eth-transfer-to-eoa: %d%n", estimate);
-        // 21000 * 1.15 = 24150; allow generous slop because the recipient
+        // ~21000 searched, × 1.15 ≈ 24150–24520; allow generous slop because the recipient
         // might or might not be a brand-new account (EIP-2929 cold/warm
         // accounting differs by 100 gas).
         assertTrue(estimate >= 23_000 && estimate <= 26_000,
