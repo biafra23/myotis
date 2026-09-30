@@ -5442,39 +5442,40 @@ impl ElReader {
         Ok(Self::call_answer(anchor, block_number, joined))
     }
 
-    /// Verified `eth_estimateGas` for a call (`to` set): run the call against the
-    /// verified head and return the gas-limit estimate. A REVERT of the estimated
-    /// transaction yields [`GasOutcome::Revert`] with its payload (a verified
-    /// answer the host serves as the standard code-3 error); a halt /
-    /// unverifiable run yields [`GasOutcome::Unavailable`] (retryable null).
-    /// Same anchor + executor bridge as [`Self::eth_call_overridden`].
-    pub async fn estimate_gas(
+    /// Verified `eth_estimateGas` for a full transaction object (#509): every
+    /// field the request names is applied or the request is refused (see
+    /// `myotis_evm::tx`), with `overrides` layered over verified state for this
+    /// run only. `anchor` selects the block exactly as for
+    /// [`Self::eth_call_overridden`] — the head, or the beacon-finalized block
+    /// for `finalized`, never downgraded. A REVERT of the estimated transaction
+    /// yields [`GasOutcome::Revert`] with its payload (a verified answer the
+    /// host serves as the standard code-3 error); a transaction that does not
+    /// fit the caller's gas or funds yields [`GasOutcome::Infeasible`] (geth's
+    /// answer and message); a halt / unverifiable run yields
+    /// [`GasOutcome::Unavailable`] (retryable).
+    pub async fn estimate_gas_tx(
         &self,
-        from: Option<[u8; 20]>,
-        to: [u8; 20],
-        data: Vec<u8>,
-        value: U256,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
         chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<GasOutcome, String> {
-        self.request(self.estimate_gas_inner(from, to, data, value, chain_id)).await
+        self.request(self.estimate_gas_tx_inner(anchor, tx, chain_id, overrides)).await
     }
 
-    async fn estimate_gas_inner(
+    async fn estimate_gas_tx_inner(
         &self,
-        from: Option<[u8; 20]>,
-        to: [u8; 20],
-        data: Vec<u8>,
-        value: U256,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
         chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<GasOutcome, String> {
-        let (ctx, executor) = self.evm_setup(chain_id, "estimateGas").await?;
-        let joined = super::request::blocking(move || {
-            let sender = from.unwrap_or([0u8; 20]);
-            executor.estimate_gas(sender, to, &data, value, &ctx)
-        })
-        .await?;
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "estimateGas").await?;
+        let joined =
+            super::request::blocking(move || executor.estimate_tx(&tx, &ctx, overrides)).await?;
         // Revert payloads survive as the verified answer; executor refusals
-        // (e.g. an Amsterdam block without its slot number) become permanent.
+        // (a contradictory request, an Amsterdam block without its slot number)
+        // become permanent.
         Ok(GasOutcome::from_executor(joined))
     }
 

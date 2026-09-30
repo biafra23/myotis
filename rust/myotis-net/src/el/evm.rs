@@ -127,6 +127,12 @@ pub enum GasOutcome {
     Unavailable(String),
     /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
     Refused(String),
+    /// The estimate RAN and the transaction does not succeed within the
+    /// caller's own limits — its `gas`, or the funds its fee cap can pay for
+    /// (#509). An answer, served as geth serves it (JSON-RPC -32000 with this
+    /// message: "gas required exceeds allowance (N)", "insufficient funds for
+    /// transfer"), never as a number.
+    Infeasible(String),
 }
 
 impl GasOutcome {
@@ -138,6 +144,7 @@ impl GasOutcome {
             // payload away: it is the verified answer the host must serve.
             Err(EvmError::Reverted { data }) => GasOutcome::Revert(data),
             Err(e) if e.is_refusal() => GasOutcome::Refused(e.to_string()),
+            Err(e) if e.is_infeasible() => GasOutcome::Infeasible(e.to_string()),
             Err(e) => GasOutcome::Unavailable(e.to_string()),
         }
     }

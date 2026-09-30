@@ -36,7 +36,7 @@ use napi_derive::napi;
 use myotis_engine::capi::{
     myotis_accept_stale_anchor, myotis_available_networks_json, myotis_canonical_network_name,
     myotis_create, myotis_create_with_checkpoint, myotis_drain_logs, myotis_ens_record_json,
-    myotis_estimate_gas_json,
+    myotis_estimate_gas_json, myotis_estimate_gas_tx_json,
     myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
     myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_ws_bound_periods,
@@ -340,6 +340,33 @@ pub fn estimate_gas_json<'env>(env: &'env Env,
                 myotis_estimate_gas_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr())
             }),
             _ => r#"{"error":"argument contains NUL"}"#.to_string(),
+        }
+    })
+}
+
+/// Verified eth_estimateGas for the FULL JSON-RPC transaction object (ABI >= 34):
+/// `tx` is geth's TransactionArgs JSON — EIP-7702 `authorizationList`,
+/// `accessList`, `gas`, fees, `nonce` and `type` are applied, never dropped —
+/// `block` the block selector (checked as for ethCallJson), `stateOverrides` a
+/// state override object ('' = none). A malformed or contradictory object is
+/// the permanent `{"error","code":-32602}`; `{"status":"infeasible","reason"}`
+/// is geth's "gas required exceeds allowance" / "insufficient funds for
+/// transfer" answer (README "Notes").
+#[napi(ts_return_type = "Promise<string>")]
+pub fn estimate_gas_tx_json<'env>(env: &'env Env,
+    handle: i64,
+    tx: String,
+    block: String,
+    state_overrides: String,
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || {
+        match (c_arg(&tx), c_arg(&block), c_arg(&state_overrides)) {
+            (Ok(t), Ok(b), Ok(o)) => take(unsafe {
+                myotis_estimate_gas_tx_json(handle, t.as_ptr(), b.as_ptr(), o.as_ptr())
+            }),
+            // A malformed argument, refused here instead of in the engine:
+            // permanent, like the engine's own refusals for this call (README).
+            _ => NUL_INVALID_PARAMS.to_string(),
         }
     })
 }

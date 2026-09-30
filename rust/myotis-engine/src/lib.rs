@@ -142,7 +142,18 @@ uniffi::setup_scaffolding!();
 ///      is SYNCED only once the finalized execution header has been fetched
 ///      and verified by hash (a Gloas light-client header proves only the
 ///      block hash). Behavior changes, no signature change.
-pub const ABI_VERSION: i32 = 33;
+/// v34: added estimate_gas_tx_json (UniFFI, the C ABI and Node, #509):
+///      eth_estimateGas for the FULL JSON-RPC transaction object — EIP-7702
+///      authorizations, access list, gas, fees, nonce, type — with the block
+///      selector and a state override, every field applied or the request
+///      refused (-32602). The estimate JSON gained
+///      `{"status":"infeasible","reason"}` for a transaction that does not fit
+///      the caller's gas or funds (geth's -32000 answer, served verbatim),
+///      which estimate_gas_json can now return too, for an estimate that runs
+///      out of gas at its 30 M ceiling (it used to be `unavailable`). The JVM
+///      `RustEngineNative` wrappers, the Node addon and the iOS wrapper moved
+///      with it.
+pub const ABI_VERSION: i32 = 34;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

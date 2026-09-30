@@ -708,8 +708,12 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
 /// a verified answer; the host serves the standard code-3 error with the raw
 /// payload, same shape as `call_json`'s revert), or
 /// `{"status":"unavailable","reason":"…"}` (retryable — the Java side maps it
-/// to null / the host's -32000), or the permanent [`invalid_params_json`]
-/// envelope for a refusal (never answerable on this build).
+/// to null / the host's -32000), `{"status":"infeasible","reason":"…"}` (ABI ≥
+/// 34: the transaction does not fit the caller's gas or funds — an answer the
+/// host serves as geth does, -32000 carrying `reason` verbatim, e.g. "gas
+/// required exceeds allowance (50000)"), or the permanent
+/// [`invalid_params_json`] envelope for a refusal (never answerable on this
+/// build, including a request whose transaction object is contradictory).
 pub fn estimate_json(outcome: &GasOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
@@ -724,6 +728,10 @@ pub fn estimate_json(outcome: &GasOutcome) -> String {
         }
         GasOutcome::Unavailable(reason) => {
             obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+        GasOutcome::Infeasible(reason) => {
+            obj.insert("status".into(), "infeasible".into());
             obj.insert("reason".into(), reason.as_str().into());
         }
     }
@@ -1044,6 +1052,14 @@ mod tests {
         .unwrap();
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "no verified head");
+
+        // infeasible → status + geth's message, which the hosts serve verbatim.
+        let inf: serde_json::Value = serde_json::from_str(&estimate_json(
+            &GasOutcome::Infeasible("gas required exceeds allowance (50000)".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(inf["status"], "infeasible");
+        assert_eq!(inf["reason"], "gas required exceeds allowance (50000)");
     }
 
     #[test]

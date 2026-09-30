@@ -194,6 +194,18 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   Amsterdam (the fork was scheduled or moved after this build shipped). It ran
   nowhere, so it carries no `blockNumber`. Before ABI 33, `estimateGasJson`
   never carried a `code`.
+- **Full transaction objects** (ABI 34, #509): `estimateGasTxJson(h, tx,
+  block, stateOverrides)` takes the JSON-RPC transaction object as JSON — the
+  EIP-7702 `authorizationList`, `accessList`, `gas`, fee fields, `nonce` and
+  `type` are all applied (`estimateGasJson` carries only from/to/data/value, so
+  a type-4 estimate through it is too low). A malformed or contradictory
+  object (a type-4 request without authorizations, a tip above its fee cap, a
+  `chainId` for another chain, a blob transaction) is `{"error": "…", "code":
+  -32602}`, permanent. `{"status": "infeasible", "reason": "…"}` means the
+  transaction does not fit the caller's `gas` or funds — answer it as geth
+  does, JSON-RPC -32000 with `reason` verbatim ("gas required exceeds
+  allowance (N)", "insufficient funds for transfer"); `estimateGasJson` can
+  return it too, for an estimate that runs out of gas at its 30 M ceiling.
 - **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
   `{ phase, activationTime, forkId, observedPeers }` when peers announce
   (`"SCHEDULED"`, `activationTime` ahead) or have already activated
