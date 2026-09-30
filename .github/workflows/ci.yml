@@ -40,13 +40,21 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Current stable, like every other Rust lane. The Gradle gate skips any
+      # toolchain below the workspace rust-version (rust/Cargo.toml), and that
+      # floor moves with the dependency graph. Leaning on the image's preinstalled
+      # Rust would let a floor bump that outpaces the image turn cargoTest and
+      # verifyRustVersionFloor into a quiet skip here, with `build` still green.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       # -PskipRustEngine: this runner has no Android Rust toolchain (cargo-ndk,
       # NDK, Android rustup targets), and :android-app builds the Rust engine
       # from source by DEFAULT (a missing toolchain is a hard error naming this
       # switch). This job is a JVM compile/test check — it does not ship the APK
       # (android-apk.yml does, with the full toolchain), so build the app without
-      # the engine. The runner image DOES ship host Rust, so `check` still runs
-      # the host-side Rust tasks (cargoTest, verifyRustVersionFloor, …).
+      # the engine. Host Rust is set up above, so `check` still runs the
+      # host-side Rust tasks (cargoTest, verifyRustVersionFloor, …).
       #
       # Retry to ride out transient external-repo resolution blips (JitPack 403s,
       # google()/Hyperledger timeouts) for any artifact not already cached. NOT

@@ -74,6 +74,9 @@ jobs:
       # own code using a std API newer than the workspace rust-version
       # (rust/Cargo.toml), which the Gradle gate trusts. Gradle's
       # verifyRustVersionFloor covers the dependencies' side of that floor.
+      # Default-features code only: the `tor`-gated code in myotis-net and
+      # myotis-engine is unlinted by design (see the header on features), so a
+      # -PtorEngine build on an exactly-floor toolchain is the one path it misses.
       - name: Clippy (fails on deny-level lints and on code above the MSRV; other warnings are reported only)
         working-directory: rust
         run: cargo clippy --workspace --all-targets --keep-going -- -D clippy::incompatible_msrv
