@@ -64,6 +64,26 @@ class RevertDataOfTest {
         assertNull(VerifiedRpcBackend.infeasibleOf(new EvmExecutionException(new EvmExecutionError.OutOfGas())));
     }
 
+    /** A precompile is codeless yet charges on an empty call: the estimate's
+     *  21000 short-circuit must not answer for one (the Rust twin's range). */
+    @Test
+    void precompilesAreNotPlainTransfers() {
+        byte[] address = new byte[20];
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+        address[19] = 0x01;
+        org.junit.jupiter.api.Assertions.assertTrue(VerifiedRpcBackend.inPrecompileRange(address));
+        address[18] = 0x01;
+        address[19] = (byte) 0xff;
+        org.junit.jupiter.api.Assertions.assertTrue(VerifiedRpcBackend.inPrecompileRange(address));
+        address[18] = 0x02;
+        address[19] = 0x00;
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+        address[0] = 0x01;
+        address[18] = 0x00;
+        address[19] = 0x01;
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+    }
+
     /** #509 stage 2: a transaction-object eth_call's refusals are answers too, and
      *  the estimate names the ceiling its refused run was made at — geth's words. */
     @Test

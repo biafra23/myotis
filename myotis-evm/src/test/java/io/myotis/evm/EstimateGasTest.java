@@ -9,7 +9,9 @@ import java.math.BigInteger;
 import java.util.HexFormat;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -19,9 +21,11 @@ import static org.junit.jupiter.api.Assertions.fail;
  * <p>Each test sets up a fixture oracle with the contracts and balances
  * the transaction needs, asks the executor for an estimate, and verifies
  * the returned number sits in the expected range. Exact match isn't
- * useful — Besu's gas accounting is the source of truth, and the 15%
- * buffer means any specific number is approximate by design — so the
- * assertions are bounded ranges with rationale in comments.
+ * useful — Besu's gas accounting is the source of truth, and geth's search
+ * stops within 1.5% of the lowest limit that works, with the 15% buffer on
+ * top — so the assertions are bounded ranges with rationale in comments, or
+ * {@link #assertIsTheSearchedEstimate} against the lowest limit a call
+ * actually runs with.
  */
 class EstimateGasTest {
 
@@ -70,10 +74,10 @@ class EstimateGasTest {
                 new byte[0],
                 /* gasLimit */ null);
 
-        long estimate = executor.estimateGas(tx, ctx()).get();
-        // Intrinsic 21000 * 1.15 = 24150. Allow a 100-gas slop window.
-        assertTrue(estimate >= 24_000 && estimate <= 24_300,
-                "ETH transfer to EOA should estimate ≈24150 gas; got " + estimate);
+        // Intrinsic 21000 is the lowest limit that runs; the estimate is the
+        // search's answer over it (within 1.5%, then × 1.15).
+        assertEquals(21_000L, lowestLimitThatRuns(executor, tx, ctx()));
+        assertIsTheSearchedEstimate(executor, tx, ctx(), executor.estimateGas(tx, ctx()).get());
     }
 
     @Test
@@ -253,9 +257,11 @@ class EstimateGasTest {
         byte[] calldata = new byte[200];
         java.util.Arrays.fill(calldata, (byte) 0x11);
         var tx = new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.ZERO, calldata, null);
-        assertEquals((long) Math.ceil(29_000 * 1.15), executor.estimateGas(tx, pragueCtx()).get());
+        assertEquals(29_000L, lowestLimitThatRuns(executor, tx, pragueCtx()));
+        assertIsTheSearchedEstimate(executor, tx, pragueCtx(), executor.estimateGas(tx, pragueCtx()).get());
         // Before Prague the floor does not exist.
-        assertEquals((long) Math.ceil(24_200 * 1.15), executor.estimateGas(tx, ctx()).get());
+        assertEquals(24_200L, lowestLimitThatRuns(executor, tx, ctx()));
+        assertIsTheSearchedEstimate(executor, tx, ctx(), executor.estimateGas(tx, ctx()).get());
     }
 
     @Test
@@ -299,7 +305,244 @@ class EstimateGasTest {
                 "EOA call with 4 non-zero calldata bytes should estimate ≈24224; got " + estimate);
     }
 
+    // ---- geth's search (#509 stage 2) -------------------------------------
+
+    @Test
+    void theEstimateCoversTheGasNestedCallsWithhold() throws Exception {
+        // 20 levels, each CALLing the next with all its gas and reverting if the
+        // callee failed; the innermost stores 14 fresh slots. CALL withholds
+        // 1/64 at every level (EIP-150), so the limit that works grows as
+        // (64/63)^20 ≈ 1.37 over the innermost work — past the 1.15 one run's
+        // draw was buffered with.
+        int depth = 20;
+        var builder = FixtureSnapStateOracle.builder()
+                .account(new AccountState(SENDER, 0L, new BigInteger("1000000000000000000"), emptyCodeHash()));
+        for (int i = 0; i < depth; i++) {
+            contract(builder, level(i), forwarder(level(i + 1)));
+        }
+        contract(builder, level(depth), sstores(14));
+        var executor = new DefaultEvmExecutor(builder.build());
+        var tx = new UnsignedTransaction(SENDER, level(0), BigInteger.ZERO, new byte[0], null);
+
+        assertIsTheSearchedEstimate(executor, tx, ctx(), executor.estimateGas(tx, ctx()).get());
+        assertFalse(runs(executor, tx, ctx(), oneRunEstimate(executor, tx, ctx())),
+                "the one-run estimate should fail here");
+    }
+
+    @Test
+    void theEstimateCoversARefundHeavyTransaction() throws Exception {
+        // Ten SSTORE(slot i, 0) over slots holding 1, then STOP: clearing refunds
+        // up to a fifth of the gas, at the end — so the charge sits far below
+        // what the run needs, and the search must answer the need.
+        byte[] code = new byte[10 * 5 + 1];
+        for (int i = 0; i < 10; i++) {
+            code[i * 5] = 0x60;
+            code[i * 5 + 1] = 0x00;
+            code[i * 5 + 2] = 0x60;
+            code[i * 5 + 3] = (byte) i;
+            code[i * 5 + 4] = 0x55;
+        }
+        var builder = FixtureSnapStateOracle.builder()
+                .account(new AccountState(SENDER, 0L, new BigInteger("1000000000000000000"), emptyCodeHash()));
+        contract(builder, CONTRACT, code);
+        for (int i = 0; i < 10; i++) {
+            builder.storage(CONTRACT, BigInteger.valueOf(i), BigInteger.ONE);
+        }
+        var executor = new DefaultEvmExecutor(builder.build());
+        var tx = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null);
+
+        // 21000 + 10 × (2100 cold + 2900 reset + 6) = 71060 needed, ~57k charged.
+        assertEquals(71_060L, lowestLimitThatRuns(executor, tx, ctx()));
+        assertIsTheSearchedEstimate(executor, tx, ctx(), executor.estimateGas(tx, ctx()).get());
+    }
+
+    @Test
+    void theEstimateCoversAGasleftCheck() throws Exception {
+        // GAS PUSH3 100000 LT ISZERO PUSH1 11 JUMPI STOP JUMPDEST PUSH1 0 DUP1
+        // REVERT — revert unless gasleft() > 100000: little is drawn at the
+        // budget, yet any limit that leaves it short reverts.
+        byte[] code = HexFormat.of().parseHex("5a620186a01015600b57005b600080fd");
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, code));
+        var tx = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null);
+
+        long estimate = executor.estimateGas(tx, ctx()).get();
+        assertTrue(estimate > 100_000, "the estimate must leave the contract its 100000: " + estimate);
+        assertIsTheSearchedEstimate(executor, tx, ctx(), estimate);
+        assertFalse(runs(executor, tx, ctx(), oneRunEstimate(executor, tx, ctx())),
+                "the one-run estimate should revert here");
+    }
+
+    @Test
+    void aFeeLessEstimateMovingMoreThanTheSenderHoldsIsGethsAnswer() throws Exception {
+        // Without a fee geth still holds the sender to the value it moves.
+        var executor = new DefaultEvmExecutor(senderWithBalanceAnd(BigInteger.valueOf(5L), CONTRACT, new byte[]{0x00}));
+        var error = estimateError(executor,
+                new UnsignedTransaction(SENDER, CONTRACT, BigInteger.valueOf(6L), new byte[0], null), ctx());
+        assertEquals(new EvmExecutionError.FailedWithGas(30_000_000L, new EvmExecutionError.InsufficientFunds(
+                SENDER, BigInteger.valueOf(5L), BigInteger.valueOf(6L))), error);
+        assertEquals("failed with 30000000 gas: insufficient funds for gas * price + value: address "
+                        + "0x1111111111111111111111111111111111111111 have 5 want 6",
+                ((EvmExecutionError.FailedWithGas) error).message());
+        // All of it is fine.
+        assertTrue(executor.estimateGas(new UnsignedTransaction(SENDER, CONTRACT, BigInteger.valueOf(5L),
+                new byte[0], null), ctx()).get() >= 21_000L);
+    }
+
+    @Test
+    void theBlockGasLimitBoundsTheEstimate() throws Exception {
+        // No block holds a transaction above its gas limit: geth's search starts
+        // there, and so does the ceiling.
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, sstores(10)));
+        var tx = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null);
+        assertTrue(executor.estimateGas(tx, ctx()).get() > 200_000);
+        var small = new BlockContext(new byte[32], 19_500_000L, EvmFactory.CANCUN_TIME + 1,
+                BigInteger.valueOf(1_000_000_000L), Address.ZERO, new byte[32], BigInteger.ONE, 200_000L);
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(200_000L), estimateError(executor, tx, small));
+        // Only a default, as in geth: the caller's own gas replaces it.
+        assertEquals(250_000L, executor.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], 250_000L), small).get());
+    }
+
+    @Test
+    void theEstimateNeverAnswersALimitWhereASwallowedCallFails() throws Exception {
+        // Ten SSTORE(slot i, 0) over slots holding 1 (refunds), then CALL an inner
+        // contract with all gas and return the success flag, whatever it is. What
+        // the run is CHARGED — where geth's search starts — is a limit at which it
+        // still "runs" without its inner call; the estimate never goes below the
+        // draw, so the call the caller simulated happens.
+        Address inner = Address.fromHex("0x7777777777777777777777777777777777777777");
+        StringBuilder outer = new StringBuilder();
+        for (int i = 0; i < 10; i++) {
+            outer.append(String.format("600060%02x55", i));
+        }
+        outer.append("60006000600060006000").append("73").append(inner.toHex().substring(2))
+                .append("5af1").append("600052").append("60206000f3");
+        byte[] code = HexFormat.of().parseHex(outer.toString());
+        var builder = FixtureSnapStateOracle.builder()
+                .account(new AccountState(SENDER, 0L, new BigInteger("1000000000000000000"), emptyCodeHash()));
+        contract(builder, CONTRACT, code);
+        contract(builder, inner, sstores(5));
+        for (int i = 0; i < 10; i++) {
+            builder.storage(CONTRACT, BigInteger.valueOf(i), BigInteger.ONE);
+        }
+        var executor = new DefaultEvmExecutor(builder.build());
+        var tx = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null);
+
+        long drawn = executor.drawnAt(tx, ctx(), 30_000_000L);
+        // At four fifths of the draw — about what the run is charged after its
+        // refund — the transaction still runs, without its inner call.
+        assertEquals(BigInteger.ZERO, new BigInteger(1, callWithGas(executor, tx, ctx(), drawn * 4 / 5)));
+
+        long estimate = executor.estimateGas(tx, ctx()).get();
+        assertTrue(estimate >= (long) Math.ceil(drawn * 1.15), "estimate " + estimate + " below the draw " + drawn);
+        assertEquals(BigInteger.ONE, new BigInteger(1, callWithGas(executor, tx, ctx(), estimate)),
+                "at the estimate the inner call must succeed");
+    }
+
+    @Test
+    void theCeilingRuleIsSharedByTheEstimateAndThePlainTransferShortCircuit() {
+        // DefaultEvmExecutor.estimateCeiling is what the JSON-RPC backend's 21000
+        // short-circuit answers with, so its refusals are pinned here once.
+        java.util.function.Supplier<BigInteger> five = () -> BigInteger.valueOf(5L);
+        java.util.function.Supplier<BigInteger> unasked = () -> fail("the balance was not needed");
+        var transfer = new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[0], null);
+        // No fee, no value: the budget, bounded by the block's gas limit.
+        assertEquals(30_000_000L, DefaultEvmExecutor.estimateCeiling(transfer, ctx(), unasked));
+        // The caller's gas replaces the block's limit, from 21000.
+        assertEquals(40_000L, DefaultEvmExecutor.estimateCeiling(
+                new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[0], 40_000L), ctx(), unasked));
+        // Fee-less, the sender must cover the value it moves.
+        var tooMuch = new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.valueOf(6L), new byte[0], null);
+        var refused = assertThrows(EvmExecutionException.class,
+                () -> DefaultEvmExecutor.estimateCeiling(tooMuch, ctx(), five));
+        assertEquals(new EvmExecutionError.FailedWithGas(30_000_000L, new EvmExecutionError.InsufficientFunds(
+                SENDER, BigInteger.valueOf(5L), BigInteger.valueOf(6L))), refused.error());
+        // Under a fee cap: what the sender can pay for is the ceiling ...
+        var priced = new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[0], null,
+                BigInteger.TEN, BigInteger.ONE);
+        assertEquals(100_000L, DefaultEvmExecutor.estimateCeiling(priced, ctx(7), () -> BigInteger.valueOf(1_000_000L)));
+        // ... and a fee cap below the base fee is refused at that ceiling.
+        refused = assertThrows(EvmExecutionException.class,
+                () -> DefaultEvmExecutor.estimateCeiling(priced, ctx(), () -> BigInteger.valueOf(1_000_000L)));
+        assertEquals(new EvmExecutionError.FailedWithGas(100_000L,
+                new EvmExecutionError.FeeCapTooLow(SENDER, BigInteger.TEN, 1_000_000_000L)), refused.error());
+    }
+
     // ---- Helpers ----------------------------------------------------------
+
+    /** The lowest gas limit at which {@code tx} runs, found exactly by bisecting
+     *  over call outcomes (the transactions in these tests are monotone in it). */
+    private static long lowestLimitThatRuns(DefaultEvmExecutor executor, UnsignedTransaction tx, BlockContext ctx) {
+        long fails = 0;
+        long works = 30_000_000L;
+        assertTrue(runs(executor, tx, ctx, works), "the transaction must run at the budget");
+        while (fails + 1 < works) {
+            long mid = (fails + works) / 2;
+            if (runs(executor, tx, ctx, mid)) {
+                works = mid;
+            } else {
+                fails = mid;
+            }
+        }
+        return works;
+    }
+
+    /** {@code estimate} is the search's answer for {@code tx}: the lowest limit
+     *  that runs, within geth's 1.5%, plus the 1.15 buffer — and itself a limit
+     *  that runs. */
+    private static void assertIsTheSearchedEstimate(DefaultEvmExecutor executor, UnsignedTransaction tx,
+                                                    BlockContext ctx, long estimate) {
+        long lowest = lowestLimitThatRuns(executor, tx, ctx);
+        long lower = (long) Math.ceil(lowest * 1.15);
+        long upper = (long) Math.ceil((lowest * 10_153L / 10_000L + 1) * 1.15);
+        assertTrue(estimate >= lower && estimate <= upper, "estimate " + estimate
+                + " is not the searched answer over the lowest limit " + lowest + " (" + lower + ".." + upper + ")");
+        assertTrue(runs(executor, tx, ctx, estimate), "the estimate must be a limit that runs");
+    }
+
+    /** Whether {@code tx} runs as a call with {@code gas} as its limit. Only an
+     *  answer from the executor counts as "does not run"; anything else fails. */
+    private static boolean runs(DefaultEvmExecutor executor, UnsignedTransaction tx, BlockContext ctx, long gas) {
+        return callWithGas(executor, tx, ctx, gas) != null;
+    }
+
+    /** {@code tx}'s return data as a call with {@code gas} as its limit, or null
+     *  when the executor answers that it does not run at it. */
+    private static byte[] callWithGas(DefaultEvmExecutor executor, UnsignedTransaction tx, BlockContext ctx,
+                                      long gas) {
+        try {
+            return executor.callTx(new UnsignedTransaction(tx.from(), tx.to(), tx.value(), tx.data(), gas,
+                    tx.gasFeeCap(), tx.gasTipCap()), ctx).get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            if (e.getCause() instanceof EvmExecutionException) return null;
+            throw new AssertionError("not an answer at gas " + gas, e.getCause());
+        } catch (InterruptedException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** The one-run estimate this search replaced: what a run at the budget
+     *  drew, buffered by 1.15. */
+    private static long oneRunEstimate(DefaultEvmExecutor executor, UnsignedTransaction tx, BlockContext ctx) {
+        return (long) Math.ceil(executor.drawnAt(tx, ctx, 30_000_000L) * 1.15);
+    }
+
+    private static Address level(int i) {
+        return Address.fromHex(String.format("0x60606060606060606060606060606060606060%02x", i));
+    }
+
+    /** CALL {@code next} with all remaining gas, and revert if it failed:
+     *  PUSH1 0 ×5 (retSize, retOffset, argsSize, argsOffset, value), PUSH20 next,
+     *  GAS CALL ISZERO PUSH1 38 JUMPI STOP JUMPDEST PUSH1 0 DUP1 REVERT. */
+    private static byte[] forwarder(Address next) {
+        return HexFormat.of().parseHex("60006000600060006000" + "73" + next.toHex().substring(2)
+                + "5af11560265700" + "5b600080fd");
+    }
+
+    private static void contract(FixtureSnapStateOracle.Builder builder, Address address, byte[] code) {
+        builder.account(new AccountState(address, 1L, BigInteger.ZERO, FixtureSnapStateOracle.codeHashOf(code)))
+                .bytecode(code);
+    }
 
     /** The error an estimate fails with (unwrapping the future). */
     private static EvmExecutionError estimateError(DefaultEvmExecutor executor, UnsignedTransaction tx,

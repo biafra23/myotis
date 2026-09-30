@@ -2409,25 +2409,35 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return null;
     }
 
-    /** geth's answer when a 21000 plain transfer does not fit what a fee cap lets
-     *  the sender pay for ("insufficient funds for transfer" / "gas required
-     *  exceeds allowance (N)"), or null when it fits or no fee cap is set. */
-    private String plainTransferUnaffordable(RpcCallContext h, byte[] from, java.math.BigInteger value,
-                                             java.math.BigInteger feeCap) throws Exception {
-        if (feeCap == null || feeCap.signum() == 0) return null;
-        io.myotis.evm.world.AccountState sender = h.oracle()
-                .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(from != null ? from : new byte[20]))
-                .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-        java.math.BigInteger balance = sender == null ? java.math.BigInteger.ZERO : sender.balance();
-        java.math.BigInteger sent = value == null ? java.math.BigInteger.ZERO : value;
-        if (sent.compareTo(balance) >= 0) {
-            return new io.myotis.evm.EvmExecutionError.InsufficientFundsForTransfer().message();
+    /** The verified balance a {@link io.myotis.evm.DefaultEvmExecutor#estimateCeiling}
+     *  rule asks for, from the fetch the fast path started ({@code null} when no
+     *  rule could need it). */
+    private static java.math.BigInteger fetchedBalance(
+            java.util.concurrent.CompletableFuture<io.myotis.evm.world.AccountState> fetch) {
+        if (fetch == null) {
+            throw new IllegalStateException("a sender balance was asked for without a fee or a value");
         }
-        java.math.BigInteger fundable = balance.subtract(sent).divide(feeCap);
-        if (fundable.compareTo(java.math.BigInteger.valueOf(21_000L)) < 0) {
-            return new io.myotis.evm.EvmExecutionError.GasAllowanceExceeded(fundable.longValue()).message();
+        try {
+            io.myotis.evm.world.AccountState account = fetch.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+            return account == null ? java.math.BigInteger.ZERO : account.balance();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted fetching the sender's balance", e);
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            throw new java.util.concurrent.CompletionException(e);
         }
-        return null;
+    }
+
+    /** Codeless addresses that nevertheless run logic: 0x…0001 ..= 0x…01ff
+     *  (mainnet uses 0x01–0x11 through Prague and 0x100 since Osaka; the
+     *  headroom covers future ones) — the Rust estimate's
+     *  {@code in_precompile_range} twin. */
+    static boolean inPrecompileRange(byte[] address) {
+        for (int i = 0; i < 18; i++) {
+            if (address[i] != 0) return false;
+        }
+        int low = ((address[18] & 0xff) << 8) | (address[19] & 0xff);
+        return low >= 1 && low <= 0x01ff;
     }
 
     /** geth's message when the throwable chain holds an answer about the request —
@@ -4127,8 +4137,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /**
      * eth_estimateGas over the shared anchored head, three-way: runs the call in the
-     * local EVM against snap-verified state with full gas accounting (intrinsic +
-     * execution + 15% headroom — see {@code DefaultEvmExecutor.estimateGas}).
+     * local EVM against snap-verified state with full gas accounting (geth's search
+     * for the lowest limit that succeeds + 15% headroom — see
+     * {@code DefaultEvmExecutor.estimateGas}).
      * OK carries the gas; REVERTED carries the estimated transaction's revert
      * payload (a verified answer — the tx cannot succeed as composed; the router
      * serves code 3 and the wallet must not broadcast it); UNAVAILABLE is the
@@ -4181,30 +4192,6 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // it has no code (a contract receive()/fallback, or a 7702 delegation,
             // would execute and cost more) — but skip building+running the EVM, the
             // bulk of the per-estimate work on ART.
-            boolean noData = data == null || data.length == 0;
-            // A fee cap below the base fee is refused by the metered estimate, which
-            // names the ceiling its refused run was made at (geth's message) — so
-            // such a request skips the fast path.
-            java.math.BigInteger baseFee = h.blockCtx().baseFeePerGas() == null
-                    ? java.math.BigInteger.ZERO : h.blockCtx().baseFeePerGas();
-            boolean feeCapBelowBaseFee = feeCap != null && feeCap.signum() > 0 && feeCap.compareTo(baseFee) < 0;
-            if (noData && !feeCapBelowBaseFee) {
-                io.myotis.evm.world.AccountState acct = h.oracle()
-                        .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(to))
-                        .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
-                byte[] codeHash = acct == null ? null : acct.codeHash();
-                if (codeHash != null && java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) {
-                    // Exact 21000 — unless the caller's fee cap says the sender
-                    // cannot pay for it (geth's affordability rule, as the
-                    // executor applies it to a metered run). A gas limit cannot
-                    // bind here: below 21000 it is no limit at all.
-                    String unaffordable = plainTransferUnaffordable(h, from, value, feeCap);
-                    if (unaffordable != null) return io.myotis.api.EstimateResult.infeasible(unaffordable);
-                    estimateCache.put(estKey, 21_000L, clock.elapsedMillis());
-                    return io.myotis.api.EstimateResult.ok(21_000L);
-                }
-                // Has code (contract / 7702 EOA) → fall through to the full EVM estimate.
-            }
             io.myotis.evm.UnsignedTransaction tx = new io.myotis.evm.UnsignedTransaction(
                     io.myotis.evm.Address.of(from != null ? from : new byte[20]),
                     io.myotis.evm.Address.of(to),
@@ -4213,6 +4200,41 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                     gasLimit,
                     feeCap,
                     tip);
+            boolean noData = data == null || data.length == 0;
+            // A precompile is codeless yet runs — and charges — on an empty call.
+            if (noData && !inPrecompileRange(to)) {
+                // The recipient decides the short-circuit and the sender's balance
+                // its checks: fetched together.
+                java.util.concurrent.CompletableFuture<io.myotis.evm.world.AccountState> recipient =
+                        h.oracle().fetchAccount(h.blockCtx().stateRoot(), tx.to());
+                java.util.concurrent.CompletableFuture<io.myotis.evm.world.AccountState> sender =
+                        tx.feeCapOrZero().signum() > 0 || tx.value().signum() > 0
+                                ? h.oracle().fetchAccount(h.blockCtx().stateRoot(), tx.from()) : null;
+                io.myotis.evm.world.AccountState acct = recipient.get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);
+                byte[] codeHash = acct == null ? null : acct.codeHash();
+                if (codeHash != null && java.util.Arrays.equals(codeHash, EMPTY_CODE_HASH)) {
+                    // Exact 21000 — once the executor's own rules pass: its ceiling
+                    // and geth's refusals before any run (affordability, the fee cap
+                    // against the base fee, buyGas), from ONE shared copy.
+                    long ceiling;
+                    try {
+                        ceiling = io.myotis.evm.DefaultEvmExecutor.estimateCeiling(tx, h.blockCtx(),
+                                () -> fetchedBalance(sender));
+                    } catch (io.myotis.evm.EvmExecutionException refused) {
+                        if (refused.error() instanceof io.myotis.evm.EvmExecutionError.Infeasible answer) {
+                            return io.myotis.api.EstimateResult.infeasible(answer.message());
+                        }
+                        throw refused;
+                    }
+                    if (ceiling < 21_000L) {
+                        return io.myotis.api.EstimateResult.infeasible(
+                                new io.myotis.evm.EvmExecutionError.GasAllowanceExceeded(ceiling).message());
+                    }
+                    estimateCache.put(estKey, 21_000L, clock.elapsedMillis());
+                    return io.myotis.api.EstimateResult.ok(21_000L);
+                }
+                // Has code (contract / 7702 EOA) → fall through to the full EVM estimate.
+            }
             java.util.concurrent.CompletableFuture<Long> est =
                     h.offchainExecutor().estimateGas(tx, h.blockCtx());
             // Warm the replay cache from the async completion, not just the returning
