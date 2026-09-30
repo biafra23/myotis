@@ -377,7 +377,9 @@ Sepolia 30305 for both RLPx-TCP and discv4-UDP).
     Status, BlockRangeUpdate or inbound GetBlockHeaders over 16 KiB before decoding), and keep
     only the prefix of a gossip list you actually read. Responses to your own requests need the
     same care. Read them in place (the Rust engine's `rlp::View`), and keep transaction and
-    receipt lists as the bytes they arrived in, not a buffer per element. Keep no more bodies,
-    receipt blocks or codes than you asked for, and cap a snap proof's node count. Refuse a body
-    with more transactions than its header's gasUsed can pay for before building its trie.
-    Recompute eth/69 blooms only once the receipt count matches the verified body.
+    receipt lists as the bytes they arrived in, not a buffer per element. Keep at most one
+    header, body, receipt block or code more than you asked for, so an over-serving peer stays
+    visible, and check the rest as before without keeping it. Cap how many snap range entries
+    you keep and how many proof nodes you accept. Refuse a body with more transactions than its
+    header's gasUsed can pay for before building its trie. Recompute eth/69 blooms only once the
+    receipt count matches the verified body.

@@ -391,7 +391,7 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
                 body.as_list()?.count()
             )));
         };
-        let txs = txs.as_list()?;
+        let tx_items = txs.as_list()?;
         let uncle_count = uncles.as_list()?.count();
         let withdrawal_count = fields.next().map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
         if i >= kept(requested) {
@@ -400,8 +400,8 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
         // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
         // byte-string whose payload IS the consensus tx bytes. Both are kept
         // as they arrived, and read back as those bytes.
-        let mut transactions = RawList::with_capacity(body.raw().len());
-        for tx in txs {
+        let mut transactions = RawList::with_capacity(txs.raw().len());
+        for tx in tx_items {
             transactions.push_item(tx);
         }
         bodies.push(BlockBody {
