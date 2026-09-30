@@ -64,19 +64,32 @@ estimateGas(tx, ctx):
   intrinsic = 21000
             + 4*zero_bytes(tx.data)
             + 16*nonzero_bytes(tx.data)
-  ceiling = tx.gasLimit ?? 30_000_000
+  // The ceiling (geth's `hi`, #509): below 21000 a gasLimit is no limit.
+  ceiling = min(30_000_000, tx.gasLimit if tx.gasLimit >= 21000)
+  if tx.feeCap > 0:                           // geth's affordability cap
+    if tx.value >= balance(tx.from): fail InsufficientFundsForTransfer
+    ceiling = min(ceiling, (balance(tx.from) - tx.value) / tx.feeCap)
+  floor = 21000 + 10*(zero_bytes + 4*nonzero_bytes)   // EIP-7623, Prague+ only
+  if intrinsic > ceiling or floor > ceiling:
+    fail GasAllowanceExceeded(ceiling)
   evmBudget = ceiling - intrinsic
-  if evmBudget <= 0:
-    fail OutOfGas
   run EVM at tx.to with calldata=tx.data, value=tx.value,
-              sender=tx.from, initialGas=evmBudget, isStatic=false
+              sender=tx.from, initialGas=evmBudget, isStatic=false,
+              gasPrice=min(tx.feeCap, baseFee + tx.tip)
   case run.state of
     COMPLETED_SUCCESS:  used = evmBudget - run.remainingGas
-                        return ceil((intrinsic + used) * 1.15)
+                        return min(ceil(max(intrinsic + used, floor) * 1.15), ceiling)
     REVERT (any kind):  fail Reverted(reason)         // do NOT estimate
-    INSUFFICIENT_GAS:   fail OutOfGas
-    other halt:         fail Reverted(detail)
+    INSUFFICIENT_GAS:   fail GasAllowanceExceeded(ceiling)
+    other halt:         fail Halted(detail)
 ```
+
+`GasAllowanceExceeded` and `InsufficientFundsForTransfer` are answers, not
+failures to answer: hosts serve them as geth does (-32000, "gas required
+exceeds allowance (N)" / "insufficient funds for transfer"). The Rust engine
+(`myotis_evm::tx`, `EvmExecutor::estimate_tx`) runs the same algorithm and,
+unlike this one, also applies EIP-7702 authorization lists, access lists,
+the transaction nonce and contract creation (#509).
 
 The behaviour for reverting transactions matters: the plan says "do
 *not* return a gas estimate for a reverting transaction (the caller
