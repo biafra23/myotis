@@ -9,6 +9,7 @@
 pub mod anchor;
 pub mod discv4;
 pub mod eth;
+mod feecache;
 pub mod evm;
 pub mod fork_watch;
 pub mod peer;
