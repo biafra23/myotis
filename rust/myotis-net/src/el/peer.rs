@@ -580,7 +580,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_number(id, block_number, max_headers, skip, reverse)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         // Window-poisoning guard: only remember headers whose number lies in the
         // range WE requested — a hostile peer answering with fabricated far-future
@@ -616,7 +616,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_number(id, block_number, max_headers, 0, false)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         Ok(headers)
     }
@@ -632,7 +632,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_hash(id, block_hash, max_headers, 0, false)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         // Same poisoning guard as the by-number path: only the header whose hash
         // is the one WE asked for may enter the window.
@@ -1044,6 +1044,12 @@ fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Opt
             }
         }
     }
+}
+
+/// A request's header count as the decoder's `requested` (it keeps one more,
+/// so an over-serving peer stays visible).
+fn requested(max_headers: u64) -> usize {
+    usize::try_from(max_headers).unwrap_or(usize::MAX)
 }
 
 /// Fail every in-flight request with `reason`, draining the pending map. Marks

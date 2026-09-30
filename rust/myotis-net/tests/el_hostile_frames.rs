@@ -18,6 +18,9 @@ use myotis_net::el::snap::messages as snap;
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Bytes allocated and not yet freed on this thread, and their high mark.
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
 }
 
 /// Counts every allocation and reallocation made on the calling thread.
@@ -29,21 +32,31 @@ fn note(bytes: usize) {
     let _ = BYTES.try_with(|n| n.set(n.get() + bytes));
 }
 
+fn live(delta: isize) {
+    let _ = LIVE.try_with(|l| {
+        l.set(l.get() + delta);
+        let _ = PEAK.try_with(|p| p.set(p.get().max(l.get())));
+    });
+}
+
 // SAFETY: every call is forwarded unchanged to `System`, which upholds the
 // `GlobalAlloc` contract; the counters are const-initialised thread-locals
 // without destructors, so touching them never allocates or re-enters.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note(layout.size());
+        live(layout.size() as isize);
         System.alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        live(-(layout.size() as isize));
         System.dealloc(ptr, layout)
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note(new_size);
+        live(new_size as isize - layout.size() as isize);
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -56,6 +69,15 @@ fn counted<T>(f: impl FnOnce() -> T) -> (usize, usize, T) {
     let (a0, b0) = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
     let out = f();
     (ALLOCATIONS.with(Cell::get) - a0, BYTES.with(Cell::get) - b0, out)
+}
+
+/// The most memory `f` held at once on this thread, over what was live when it
+/// started, and its result. Memory a decoder frees as it goes doesn't count.
+fn peak<T>(f: impl FnOnce() -> T) -> (isize, T) {
+    let start = LIVE.with(Cell::get);
+    PEAK.with(|p| p.set(start));
+    let out = f();
+    (PEAK.with(Cell::get) - start, out)
 }
 
 /// Just under the 10 MiB decompressed-frame cap, as in the #454 report.
@@ -140,11 +162,9 @@ fn gossip_decoders_cost_their_cap_not_the_frame() {
     }
 }
 
-/// `payload` wrapped as a list.
+/// `payload` wrapped as a list, canonically.
 fn list(payload: &[u8]) -> Vec<u8> {
-    let mut out = list_header(payload.len());
-    out.extend_from_slice(payload);
-    out
+    myotis_core::rlp::encode_list_payload(payload)
 }
 
 /// `[1, payload]`: a response to request 1, the payload given as its encoding.
@@ -168,12 +188,12 @@ fn assert_one_buffer(what: &str, allocations: usize, bytes: usize) {
 fn header_responses_are_read_without_a_tree() {
     // `[1, [0x01; N]]`: one-byte "headers". The first fails, and none is built.
     let msg = nested();
-    let (a, b, r) = counted(|| messages::decode_block_headers(&msg));
+    let (a, b, r) = counted(|| messages::decode_block_headers(&msg, 1));
     assert!(r.is_err());
     assert_flat("BlockHeaders of one-byte elements", a, b);
     // `[1, [[0x01; N]]]`: one "header" of one-byte fields.
     let one = response(&list(&list(&vec![0x01; ELEMENTS])));
-    let (a, b, r) = counted(|| messages::decode_block_headers(&one));
+    let (a, b, r) = counted(|| messages::decode_block_headers(&one, 1));
     assert!(r.is_err());
     assert_flat("a header of one-byte fields", a, b);
 }
@@ -226,9 +246,48 @@ fn snap_responses_are_bounded_by_the_proof_cap_and_the_request() {
     let (a, b, r) = counted(|| snap::decode_storage_ranges(&storage));
     assert!(r.is_err());
     assert_flat("StorageRanges proof", a, b);
-    // `[1, [0x01; N]]` for one requested code hash: one code kept.
+    // `[1, [0x01; N]]` for one requested code hash: two codes kept (one
+    // over, so the over-serving shows), the rest checked.
     let msg = nested();
     let (a, b, codes) = counted(|| snap::decode_byte_codes(&msg, 1));
-    assert_eq!(codes.unwrap().1.len(), 1);
+    assert_eq!(codes.unwrap().1.len(), 2);
     assert_flat("ByteCodes", a, b);
+}
+
+/// Back to back, as many copies of `element` as fit a response frame.
+fn fill(element: &[u8]) -> Vec<u8> {
+    element.repeat(ELEMENTS / element.len())
+}
+
+#[test]
+fn a_flood_of_valid_headers_keeps_one_past_the_request() {
+    // The smallest header the decoder accepts: 15 fields, about 210 bytes and
+    // fifty thousand to a frame. We asked for three.
+    let header = myotis_core::header::BlockHeader::default().encode();
+    assert!(header.len() < 256);
+    let msg = response(&list(&fill(&header)));
+    let (held, headers) = peak(|| messages::decode_block_headers(&msg, 3));
+    assert_eq!(headers.unwrap().1.len(), 4);
+    assert!(held < 64 * 1024, "held {held} bytes at once");
+}
+
+#[test]
+fn range_entries_past_the_cap_are_not_kept() {
+    // Minimal accounts `[hash, [0x80, 0x01]]` (37 bytes) and storage slots
+    // `[hash, 0x01]` (35 bytes), a frame of each.
+    let hash = [&[0xa0][..], &[0x11; 32]].concat();
+    let account = list(&[&hash[..], &[0xc2, 0x80, 0x01]].concat());
+    let slot = list(&[&hash[..], &[0x01]].concat());
+    // The kept entries, a struct and a balance each: well under a megabyte.
+    let bound = 1 << 20;
+
+    let range = list(&[&[0x01][..], &list(&fill(&account)), &[0xc0]].concat());
+    let (held, r) = peak(|| snap::decode_account_range(&range));
+    assert_eq!(r.unwrap().accounts.len(), snap::MAX_RANGE_ENTRIES);
+    assert!(held < bound, "AccountRange held {held} bytes at once");
+
+    let storage = list(&[&[0x01][..], &list(&list(&fill(&slot))), &[0xc0]].concat());
+    let (held, r) = peak(|| snap::decode_storage_ranges(&storage));
+    assert_eq!(r.unwrap().slots.len(), snap::MAX_RANGE_ENTRIES);
+    assert!(held < bound, "StorageRanges held {held} bytes at once");
 }

@@ -42,7 +42,7 @@ fn replay_reproduces_recorded_verdicts() {
     // --- headerChain verification over Java's committed BlockHeaders messages,
     //     anchored on the finalized BLOCK HASH ---
     for (base, bytes) in chain_vectors(&corpus) {
-        let (_id, headers) = decode_block_headers(&bytes).unwrap();
+        let (_id, headers) = decode_block_headers(&bytes, usize::MAX).unwrap();
         let chain: Vec<ChainHeader> = headers
             .into_iter()
             .map(|vh| ChainHeader { hash: vh.hash, header: vh.header })

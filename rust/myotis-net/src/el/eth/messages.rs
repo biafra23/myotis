@@ -331,21 +331,26 @@ pub struct VerifiedHeader {
     pub header: BlockHeader,
 }
 
-/// Decode a BlockHeaders response `[reqId, [header, …]]`. Returns
-/// `(request_id, headers)`. Each header is read in place from the checked
-/// response, never built into a tree (#454). A header is hundreds of bytes,
-/// so what this keeps stays close to what the peer sent.
-pub fn decode_block_headers(rlp_bytes: &[u8]) -> Result<(u64, Vec<VerifiedHeader>), CoreError> {
+/// Decode a BlockHeaders response `[reqId, [header, …]]` to a request for
+/// `requested` headers. Returns `(request_id, headers)`, at most one more than
+/// `requested` (see [`kept`]). Each header is read in place from the checked
+/// response, never built into a tree (#454).
+pub fn decode_block_headers(
+    rlp_bytes: &[u8],
+    requested: usize,
+) -> Result<(u64, Vec<VerifiedHeader>), CoreError> {
     let (request_id, headers) = request_and_payload(rlp_bytes)?;
     // Each element's RAW sub-slice is the canonical header encoding → hash it.
     let mut out = Vec::new();
-    for raw in headers.as_list()? {
+    for (i, raw) in headers.as_list()?.enumerate() {
         let header = BlockHeader::decode_view(raw)?;
-        out.push(VerifiedHeader {
-            hash: header::hash(raw.raw()),
-            raw_rlp: raw.raw().to_vec(),
-            header,
-        });
+        if i < kept(requested) {
+            out.push(VerifiedHeader {
+                hash: header::hash(raw.raw()),
+                raw_rlp: raw.raw().to_vec(),
+                header,
+            });
+        }
     }
     Ok((request_id, out))
 }
@@ -368,16 +373,15 @@ pub struct BlockBody {
     pub withdrawal_count: usize,
 }
 
-/// Decode a BlockBodies response `[reqId, [body, …]]`, keeping at most
-/// `max_bodies`, the number we asked for. An over-serving peer's surplus is
-/// checked and walked but not kept; callers used only the served prefix up to
-/// their request anyway. The transactions go into a [`RawList`], so a body of
-/// millions of one-byte "transactions" costs about five bytes per input byte,
-/// not the fifty separate allocations would (#454).
-pub fn decode_block_bodies(rlp_bytes: &[u8], max_bodies: usize) -> Result<(u64, Vec<BlockBody>), CoreError> {
+/// Decode a BlockBodies response `[reqId, [body, …]]` to a request for
+/// `requested` bodies, keeping at most one more (see [`kept`]). The
+/// transactions go into a [`RawList`] as they arrived, so a body of millions
+/// of one-byte "transactions" costs about its own size, where a buffer per
+/// transaction cost some fifty times that (#454).
+pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockBody>), CoreError> {
     let (request_id, bodies_view) = request_and_payload(rlp_bytes)?;
     let mut bodies = Vec::new();
-    for body in bodies_view.as_list()?.take(max_bodies) {
+    for (i, body) in bodies_view.as_list()?.enumerate() {
         // body = [transactions, uncles, withdrawals?] — transactions AND uncles
         // are mandatory (withdrawals only post-Shanghai).
         let mut fields = body.as_list()?;
@@ -387,15 +391,19 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], max_bodies: usize) -> Result<(u64, 
                 body.as_list()?.count()
             )));
         };
+        let txs = txs.as_list()?;
+        let uncle_count = uncles.as_list()?.count();
+        let withdrawal_count = fields.next().map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
+        if i >= kept(requested) {
+            continue;
+        }
         // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
         // byte-string whose payload IS the consensus tx bytes. Both are kept
         // as they arrived, and read back as those bytes.
-        let mut transactions = RawList::with_capacity(txs.raw().len());
-        for tx in txs.as_list()? {
+        let mut transactions = RawList::with_capacity(body.raw().len());
+        for tx in txs {
             transactions.push_item(tx);
         }
-        let uncle_count = uncles.as_list()?.count();
-        let withdrawal_count = fields.next().map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
         bodies.push(BlockBody {
             transactions,
             uncle_count,
@@ -522,19 +530,25 @@ impl BlockReceipts {
         self.len() == 0
     }
 
-    /// The receipts-trie values, for a block of `tx_count` transactions (taken
-    /// from its transactionsRoot-verified body). Any other number of receipts
-    /// is an error, raised before an eth/69 bloom is recomputed.
-    pub fn canonical(&self, tx_count: usize) -> Result<Cow<'_, RawList>, CoreError> {
-        if self.len() != tx_count {
-            return Err(CoreError(format!("{} receipts for {tx_count} transactions", self.len())));
+    /// The receipts-trie values, for a block of `verified_tx_count`
+    /// transactions. Any other number of receipts is an error, raised before an
+    /// eth/69 bloom is recomputed. The count must come from the block's
+    /// transactionsRoot-verified body: that is what bounds the expansion, so
+    /// every caller verifies the body first.
+    pub fn canonical(&self, verified_tx_count: usize) -> Result<Cow<'_, RawList>, CoreError> {
+        if self.len() != verified_tx_count {
+            return Err(CoreError(format!(
+                "{} receipts for {verified_tx_count} transactions",
+                self.len()
+            )));
         }
         match self {
             BlockReceipts::Canonical(list) => Ok(Cow::Borrowed(list)),
             BlockReceipts::Eth69(wire) => {
+                // The stored receipts were checked on decode: walk them as views.
                 let mut out = RawList::new();
-                for receipt in wire {
-                    out.push(&canonicalize_eth69_receipt(rlp::View::new(receipt)?)?);
+                for receipt in wire.0.iter() {
+                    out.push(&canonicalize_eth69_receipt(receipt)?);
                 }
                 Ok(Cow::Owned(out))
             }
@@ -542,17 +556,21 @@ impl BlockReceipts {
     }
 }
 
-/// Decode a Receipts response (eth/66-68) into each block's receipts-trie
-/// values, keeping at most `max_blocks`, the number we asked for. Returns
-/// `(request_id, per_block_receipts)`.
-pub fn decode_receipts(rlp_bytes: &[u8], max_blocks: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
+/// Decode a Receipts response (eth/66-68) to a request for `requested`
+/// blocks into each block's receipts-trie values, keeping at most one block
+/// more (see [`kept`]). Returns `(request_id, per_block_receipts)`.
+pub fn decode_receipts(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
     let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;
     let mut blocks = Vec::new();
-    for block in blocks_view.as_list()?.take(max_blocks) {
+    for (i, block) in blocks_view.as_list()?.enumerate() {
+        let receipts_view = block.as_list()?;
+        if i >= kept(requested) {
+            continue;
+        }
         // Legacy = RLP list (canonical as-is); typed = byte-string whose
         // payload IS `type ‖ rlp(...)`, the trie value.
         let mut receipts = RawList::with_capacity(block.raw().len());
-        for receipt in block.as_list()? {
+        for receipt in receipts_view {
             receipts.push_item(receipt);
         }
         blocks.push(BlockReceipts::Canonical(receipts));
@@ -560,7 +578,8 @@ pub fn decode_receipts(rlp_bytes: &[u8], max_blocks: usize) -> Result<(u64, Vec<
     Ok((request_id, blocks))
 }
 
-/// Decode an eth/69 (EIP-7642) Receipts response, keeping at most `max_blocks`.
+/// Decode an eth/69 (EIP-7642) Receipts response to a request for `requested`
+/// blocks, keeping at most one block more (see [`kept`]).
 /// eth/69 strips the logsBloom and flattens the typed envelope: each receipt
 /// arrives as `[txType, statusOrState, cumGas, logs]`. The bloom is a pure
 /// function of the logs, so [`BlockReceipts::canonical`] recomputes it and
@@ -568,16 +587,20 @@ pub fn decode_receipts(rlp_bytes: &[u8], max_blocks: usize) -> Result<(u64, Vec<
 /// the receipts-trie check works exactly as for eth/66-68
 /// (docs/reimplementation/02 §6.6). Each receipt is checked here, so a
 /// malformed one fails the response as before; only the recomputation waits.
-pub fn decode_receipts69(rlp_bytes: &[u8], max_blocks: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
+pub fn decode_receipts69(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
     let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;
     let mut blocks = Vec::new();
-    for block in blocks_view.as_list()?.take(max_blocks) {
-        let mut receipts = RawList::with_capacity(block.raw().len());
+    for (i, block) in blocks_view.as_list()?.enumerate() {
         for wire in block.as_list()? {
             eth69_receipt_fields(wire)?;
-            receipts.push_item(wire);
         }
-        blocks.push(BlockReceipts::Eth69(receipts));
+        if i < kept(requested) {
+            let mut receipts = RawList::with_capacity(block.raw().len());
+            for wire in block.as_list()? {
+                receipts.push_item(wire);
+            }
+            blocks.push(BlockReceipts::Eth69(receipts));
+        }
     }
     Ok((request_id, blocks))
 }
@@ -780,15 +803,25 @@ fn check_control_size(what: &str, payload: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Check an eth/66-69 `[reqId, payload]` response once, then split it: the
-/// request id and a view of the payload to read in place (#454). Anything
-/// after the payload is checked but not read.
+/// Split an eth/66-69 `[reqId, payload]` response into the request id and a
+/// view of the payload to read in place (#454). The elements of the message
+/// are checked as they always were (each a whole item, anything after the
+/// payload checked but not read), so the nesting a response may use is
+/// unchanged.
 fn request_and_payload(rlp_bytes: &[u8]) -> Result<(u64, rlp::View<'_>), CoreError> {
-    let mut items = rlp::View::new(rlp_bytes)?.as_list()?;
-    let (Some(id), Some(payload)) = (items.next(), items.next()) else {
+    let items = rlp::raw_list_prefix(rlp_bytes, 2)?;
+    let (Some(id), Some(payload)) = (items.first(), items.get(1)) else {
         return Err(CoreError("eth message: missing [reqId, payload]".into()));
     };
-    Ok((request_id_at(id.raw())?, payload))
+    Ok((request_id_at(id)?, rlp::View::new(payload)?))
+}
+
+/// How many elements of a response to a request for `requested` to keep: one
+/// more than asked for, so a caller still sees a peer that over-serves. Any
+/// further element is checked exactly as a kept one would be, so the verdict
+/// on the response doesn't change, but it is not kept (#454).
+fn kept(requested: usize) -> usize {
+    requested.saturating_add(1)
 }
 
 fn fixed32(item: &Item) -> Result<[u8; 32], CoreError> {
@@ -1083,6 +1116,49 @@ mod tests {
     }
 
     #[test]
+    fn block_headers_keep_one_past_the_request_and_check_the_rest() {
+        let h = |n| raw(&minimal_header(n));
+        let msg = |headers: Vec<Item>| {
+            rlp::encode(&Item::List(vec![Item::Bytes(rlp::u64_to_minimal_be(7)), Item::List(headers)]))
+        };
+        let (_, headers) = decode_block_headers(&msg(vec![h(1), h(2), h(3), h(4)]), 2).unwrap();
+        assert_eq!(headers.iter().map(|v| v.header.number).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // A dropped header is still decoded, so a bad one fails the response.
+        assert!(decode_block_headers(&msg(vec![h(1), h(2), h(3), Item::List(vec![])]), 1).is_err());
+    }
+
+    #[test]
+    fn a_response_may_nest_as_deep_as_before() {
+        // One header with a trailing field of `depth` nested lists. The header
+        // sits two lists below the message; the deepest list then reaches
+        // depth `2 + depth - 1`, and MAX_DEPTH (32) allows 31 levels.
+        let with_trailing = |depth: usize| {
+            let mut field = Item::List(vec![]);
+            for _ in 1..depth {
+                field = Item::List(vec![field]);
+            }
+            let mut fields = rlp::decode(&minimal_header(9)).unwrap().as_list().unwrap().to_vec();
+            // withdrawalsRoot, blobGasUsed, excessBlobGas, parentBeaconBlockRoot,
+            // requestsHash, then the nested field where blockAccessListHash
+            // would be (tolerated when it isn't a hash).
+            fields.extend([
+                Item::Bytes(vec![0; 32]),
+                Item::Bytes(vec![]),
+                Item::Bytes(vec![]),
+                Item::Bytes(vec![0; 32]),
+                Item::Bytes(vec![0; 32]),
+                field,
+            ]);
+            rlp::encode(&Item::List(vec![
+                Item::Bytes(rlp::u64_to_minimal_be(7)),
+                Item::List(vec![Item::List(fields)]),
+            ]))
+        };
+        assert_eq!(decode_block_headers(&with_trailing(31), 1).unwrap().1[0].header.number, 9);
+        assert!(decode_block_headers(&with_trailing(32), 1).is_err());
+    }
+
+    #[test]
     fn block_headers_decode_and_hash() {
         // Two minimal but well-formed headers, wrapped `[reqId, [h0, h1]]`.
         let h0 = minimal_header(100);
@@ -1092,7 +1168,7 @@ mod tests {
             Item::Bytes(rlp::u64_to_minimal_be(7)),
             Item::List(vec![raw(&h0), raw(&h1)]),
         ]));
-        let (req_id, headers) = decode_block_headers(&msg).unwrap();
+        let (req_id, headers) = decode_block_headers(&msg, 2).unwrap();
         assert_eq!(req_id, 7);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].hash, hash0);
@@ -1172,19 +1248,22 @@ mod tests {
         };
         let msg = response(4, &[body(1, Some(3)), body(0, None), body(2, None)]);
 
-        let (id, bodies) = decode_block_bodies(&msg, 2).unwrap();
+        let (id, bodies) = decode_block_bodies(&msg, 1).unwrap();
         assert_eq!(id, 4);
-        // The third body was not asked for: checked, then dropped.
+        // One body asked for: it and one more are kept (so the over-serving
+        // shows), the third is checked, then dropped.
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0].transactions.iter().collect::<Vec<_>>(), vec![&legacy[..], &typed[..]]);
         assert_eq!((bodies[0].uncle_count, bodies[0].withdrawal_count), (1, 3));
         assert_eq!((bodies[1].uncle_count, bodies[1].withdrawal_count), (0, 0));
         assert_eq!(decode_block_bodies(&msg, 10).unwrap().1.len(), 3);
 
-        // Transactions and uncles are mandatory.
-        let short = response(4, &[rlp::encode(&Item::List(vec![Item::List(vec![])]))]);
-        let err = decode_block_bodies(&short, 1).unwrap_err();
+        // Transactions and uncles are mandatory, in a dropped body too.
+        let short = rlp::encode(&Item::List(vec![Item::List(vec![])]));
+        let err = decode_block_bodies(&response(4, std::slice::from_ref(&short)), 1).unwrap_err();
         assert_eq!(err.0, "BlockBody: expected >= 2 fields, got 1");
+        let surplus = response(4, &[body(0, None), body(0, None), short, vec![0x80]]);
+        assert!(decode_block_bodies(&surplus, 1).is_err());
     }
 
     #[test]
@@ -1196,10 +1275,13 @@ mod tests {
             Item::List(vec![]),
         ]));
         let block = |n: usize| rlp::encode_list_payload(&vec![receipt.clone(); n].concat());
-        let msg = response(6, &[block(2), block(1)]);
+        let msg = response(6, &[block(2), block(1), block(3)]);
 
+        // One block asked for: it and one more are kept.
         let (id, blocks) = decode_receipts(&msg, 1).unwrap();
-        assert_eq!((id, blocks.len(), blocks[0].len()), (6, 1, 2));
+        assert_eq!((id, blocks.len(), blocks[0].len(), blocks[1].len()), (6, 2, 2, 1));
+        // A dropped block is still checked: a byte string where a list must be.
+        assert!(decode_receipts(&response(6, &[block(1), block(1), vec![0x80]]), 1).is_err());
         let canonical = blocks[0].canonical(2).unwrap();
         assert!(matches!(canonical, Cow::Borrowed(_)), "eth/66-68 receipts are used as served");
         assert_eq!(canonical.iter().collect::<Vec<_>>(), vec![&receipt[..], &receipt[..]]);

@@ -63,7 +63,7 @@ fn replay_reproduces_recorded_verdicts() {
 
     // (2) BlockHeaders decode → per-header hashes (committed message bytes).
     let headers_msg = fs::read(corpus.join("001-blockheaders.rlp")).expect("headers vector");
-    let (req_id, headers) = messages::decode_block_headers(&headers_msg).unwrap();
+    let (req_id, headers) = messages::decode_block_headers(&headers_msg, usize::MAX).unwrap();
     actual.insert("headers.reqId".into(), req_id.to_string());
     actual.insert("headers.count".into(), headers.len().to_string());
     for (i, vh) in headers.iter().enumerate() {

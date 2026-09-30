@@ -102,8 +102,15 @@ pub struct AccountRange {
     pub proof: Vec<Vec<u8>>,
 }
 
+/// Most range entries (accounts, or one account's storage slots) a response
+/// keeps. We ask for a single key with a 4096-byte budget, and an entry is at
+/// least 35 bytes, so an honest answer holds a few dozen at most. Nothing reads
+/// the entries (the proof carries the verified value), so any past this are
+/// checked exactly as a kept one, and dropped (#454).
+pub const MAX_RANGE_ENTRIES: usize = 1024;
+
 /// Decode `AccountRange: [reqId, [[accountHash, slimBody], …], [proofNode, …]]`.
-/// Read in place (#454); an account is at least 35 bytes on the wire, and the
+/// Read in place (#454), keeping at most [`MAX_RANGE_ENTRIES`] accounts; the
 /// proof is capped at [`MAX_PROOF_NODES`].
 pub fn decode_account_range(rlp_bytes: &[u8]) -> Result<AccountRange, CoreError> {
     let mut items = rlp::View::new(rlp_bytes)?.as_list()?;
@@ -114,14 +121,23 @@ pub fn decode_account_range(rlp_bytes: &[u8]) -> Result<AccountRange, CoreError>
 
     let mut accounts = Vec::new();
     if let Some(pairs) = items.next().filter(rlp::View::is_list) {
-        for pair in pairs.as_list()? {
+        for (i, pair) in pairs.as_list()?.enumerate() {
             let mut fields = pair.as_list()?;
             let (Some(hash), Some(body)) = (fields.next(), fields.next()) else {
                 return Err(CoreError("AccountRange: malformed pair".into()));
             };
             let mut account_hash = [0u8; 32];
             account_hash.copy_from_slice(hash.as_fixed_bytes(32)?);
-            accounts.push(decode_slim_account(account_hash, body)?);
+            let slim = SlimFields::read(body)?;
+            if i < MAX_RANGE_ENTRIES {
+                accounts.push(SlimAccount {
+                    account_hash,
+                    nonce: slim.nonce,
+                    balance: slim.balance.to_vec(),
+                    storage_root: slim.storage_root,
+                    code_hash: slim.code_hash,
+                });
+            }
         }
     }
     let proof = decode_proof(items.next())?;
@@ -132,22 +148,27 @@ pub fn decode_account_range(rlp_bytes: &[u8]) -> Result<AccountRange, CoreError>
     })
 }
 
-/// The slim body is either a nested list `[nonce, balance, root?, codeHash?]`
-/// or a byte-string wrapping that list's RLP (go-ethereum's `[]byte` form).
-fn decode_slim_account(account_hash: [u8; 32], body: rlp::View<'_>) -> Result<SlimAccount, CoreError> {
-    let body = if body.is_list() { body } else { rlp::View::new(body.as_bytes()?)? };
-    let mut fields = body.as_list()?;
-    let nonce = fields.next().map_or(Ok(0), |n| n.as_u64())?;
-    let balance = fields.next().map_or(Ok(Vec::new()), |b| b.as_bytes().map(<[u8]>::to_vec))?;
-    let storage_root = slim_hash(fields.next(), &EMPTY_TRIE_ROOT)?;
-    let code_hash = slim_hash(fields.next(), &EMPTY_CODE_HASH)?;
-    Ok(SlimAccount {
-        account_hash,
-        nonce,
-        balance,
-        storage_root,
-        code_hash,
-    })
+/// The fields of a slim account body, read in place.
+struct SlimFields<'a> {
+    nonce: u64,
+    balance: &'a [u8],
+    storage_root: [u8; 32],
+    code_hash: [u8; 32],
+}
+
+impl<'a> SlimFields<'a> {
+    /// The slim body is either a nested list `[nonce, balance, root?, codeHash?]`
+    /// or a byte-string wrapping that list's RLP (go-ethereum's `[]byte` form).
+    fn read(body: rlp::View<'a>) -> Result<SlimFields<'a>, CoreError> {
+        let body = if body.is_list() { body } else { rlp::View::new(body.as_bytes()?)? };
+        let mut fields = body.as_list()?;
+        Ok(SlimFields {
+            nonce: fields.next().map_or(Ok(0), |n| n.as_u64())?,
+            balance: fields.next().map_or(Ok(&[][..]), |b| b.as_bytes())?,
+            storage_root: slim_hash(fields.next(), &EMPTY_TRIE_ROOT)?,
+            code_hash: slim_hash(fields.next(), &EMPTY_CODE_HASH)?,
+        })
+    }
 }
 
 /// A slim-encoded 32-byte hash: empty defaults to `default`.
@@ -229,7 +250,7 @@ pub struct StorageRanges {
 
 /// Decode `StorageRanges: [reqId, [[slots-for-account-0], …], [proofNode, …]]`,
 /// reading the FIRST account's slots (we always query one account). Read in
-/// place (#454); a slot is at least 35 bytes on the wire, and the proof is
+/// place (#454), keeping at most [`MAX_RANGE_ENTRIES`] slots; the proof is
 /// capped at [`MAX_PROOF_NODES`].
 pub fn decode_storage_ranges(rlp_bytes: &[u8]) -> Result<StorageRanges, CoreError> {
     let mut items = rlp::View::new(rlp_bytes)?.as_list()?;
@@ -241,7 +262,7 @@ pub fn decode_storage_ranges(rlp_bytes: &[u8]) -> Result<StorageRanges, CoreErro
     let mut slots = Vec::new();
     if let Some(per_account) = items.next().filter(rlp::View::is_list) {
         if let Some(account_slots) = per_account.as_list()?.next().filter(rlp::View::is_list) {
-            for pair in account_slots.as_list()? {
+            for (i, pair) in account_slots.as_list()?.enumerate() {
                 let mut fields = pair.as_list()?;
                 let (Some(hash), Some(value)) = (fields.next(), fields.next()) else {
                     return Err(CoreError("StorageRanges: malformed slot".into()));
@@ -250,10 +271,10 @@ pub fn decode_storage_ranges(rlp_bytes: &[u8]) -> Result<StorageRanges, CoreErro
                 slot_hash.copy_from_slice(hash.as_fixed_bytes(32)?);
                 // `value` is the trie value (already unwrapped by our read —
                 // the outer wrap is the RLP bytes item itself).
-                slots.push(StorageSlot {
-                    slot_hash,
-                    raw_trie_value: value.as_bytes()?.to_vec(),
-                });
+                let raw_trie_value = value.as_bytes()?;
+                if i < MAX_RANGE_ENTRIES {
+                    slots.push(StorageSlot { slot_hash, raw_trie_value: raw_trie_value.to_vec() });
+                }
             }
         }
     }
@@ -278,11 +299,12 @@ pub fn encode_get_byte_codes(request_id: u64, hashes: &[[u8; 32]], response_byte
     ]))
 }
 
-/// Decode `ByteCodes: [reqId, [bytecode, …]]` → `(reqId, codes)`, keeping at
-/// most `max_codes`, the number of hashes we asked for (a peer answers in
-/// request order and may send fewer; any surplus is checked, not kept, #454).
-/// The caller hashes each and matches it against the requested codeHash.
-pub fn decode_byte_codes(rlp_bytes: &[u8], max_codes: usize) -> Result<(u64, Vec<Vec<u8>>), CoreError> {
+/// Decode `ByteCodes: [reqId, [bytecode, …]]` → `(reqId, codes)` for a request
+/// of `requested` code hashes. A peer answers in request order and may send
+/// fewer; at most one code more than asked for is kept, and any further one is
+/// checked but not kept (#454). The caller hashes each and matches it against
+/// the requested codeHash.
+pub fn decode_byte_codes(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<Vec<u8>>), CoreError> {
     let mut items = rlp::View::new(rlp_bytes)?.as_list()?;
     let Some(request_id) = items.next() else {
         return Err(CoreError("ByteCodes: empty".into()));
@@ -290,8 +312,11 @@ pub fn decode_byte_codes(rlp_bytes: &[u8], max_codes: usize) -> Result<(u64, Vec
     let request_id = request_id.as_u64()?;
     let mut codes = Vec::new();
     if let Some(list) = items.next().filter(rlp::View::is_list) {
-        for c in list.as_list()?.take(max_codes) {
-            codes.push(c.as_bytes()?.to_vec());
+        for (i, c) in list.as_list()?.enumerate() {
+            let code = c.as_bytes()?;
+            if i <= requested {
+                codes.push(code.to_vec());
+            }
         }
     }
     Ok((request_id, codes))
@@ -438,18 +463,41 @@ mod tests {
     }
 
     #[test]
-    fn byte_codes_keep_what_was_asked_for() {
-        // Three codes served for two requested hashes: the surplus is dropped.
-        let resp = rlp::encode(&Item::List(vec![
-            Item::Bytes(rlp::u64_to_minimal_be(3)),
-            Item::List(vec![
-                Item::Bytes(vec![0x60, 0x00]),
-                Item::Bytes(vec![0x60, 0x01]),
-                Item::Bytes(vec![0x60, 0x02]),
-            ]),
-        ]));
-        let (_, codes) = decode_byte_codes(&resp, 2).unwrap();
+    fn byte_codes_keep_one_past_what_was_asked_for() {
+        let resp = |codes: Vec<Item>| {
+            rlp::encode(&Item::List(vec![Item::Bytes(rlp::u64_to_minimal_be(3)), Item::List(codes)]))
+        };
+        let code = |b: u8| Item::Bytes(vec![0x60, b]);
+        // Four codes for one requested hash: one over is kept (so the
+        // over-serving shows), the rest dropped.
+        let (_, codes) = decode_byte_codes(&resp(vec![code(0), code(1), code(2), code(3)]), 1).unwrap();
         assert_eq!(codes, vec![vec![0x60, 0x00], vec![0x60, 0x01]]);
+        // A dropped code is still checked: a list where a code must be fails.
+        let bad = resp(vec![code(0), code(1), Item::List(vec![])]);
+        assert!(decode_byte_codes(&bad, 1).is_err());
+    }
+
+    #[test]
+    fn range_entries_past_the_cap_are_checked_not_kept() {
+        let account = |nonce: u8| {
+            Item::List(vec![
+                Item::Bytes(vec![nonce; 32]),
+                Item::List(vec![Item::Bytes(vec![nonce]), Item::Bytes(vec![1])]),
+            ])
+        };
+        let range = |accounts: Vec<Item>| {
+            rlp::encode(&Item::List(vec![
+                Item::Bytes(rlp::u64_to_minimal_be(5)),
+                Item::List(accounts),
+                Item::List(vec![]),
+            ]))
+        };
+        let many: Vec<Item> = (0..MAX_RANGE_ENTRIES + 5).map(|i| account(1 + (i % 100) as u8)).collect();
+        assert_eq!(decode_account_range(&range(many.clone())).unwrap().accounts.len(), MAX_RANGE_ENTRIES);
+        // An entry past the cap with a bad hash still fails the response.
+        let mut bad = many;
+        bad.push(Item::List(vec![Item::Bytes(vec![1; 31]), Item::List(vec![])]));
+        assert!(decode_account_range(&range(bad)).is_err());
     }
 
     #[test]

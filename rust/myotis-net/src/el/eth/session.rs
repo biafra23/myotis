@@ -232,7 +232,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         );
         self.conn.send(messages::GET_BLOCK_HEADERS, &req).await?;
         let payload = self.await_response(messages::BLOCK_HEADERS, id).await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let requested = usize::try_from(max_headers).unwrap_or(usize::MAX);
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested)
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         Ok(headers)
     }
@@ -248,7 +249,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         let req = messages::encode_get_block_headers_by_hash(id, block_hash, max_headers, 0, false);
         self.conn.send(messages::GET_BLOCK_HEADERS, &req).await?;
         let payload = self.await_response(messages::BLOCK_HEADERS, id).await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let requested = usize::try_from(max_headers).unwrap_or(usize::MAX);
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested)
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         Ok(headers)
     }
