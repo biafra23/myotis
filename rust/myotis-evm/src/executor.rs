@@ -97,8 +97,8 @@ const ESTIMATE_ERROR_RATIO: (u128, u128) = (15, 1_000);
 /// not claim it. Conservatively covers 0x…0001 ..= 0x…01ff (mainnet uses
 /// 0x01..0x11 through Prague, 0x100 = P256VERIFY since Osaka; the headroom
 /// absorbs future assignments — a stray fall-through only costs a full
-/// estimate run). NOTE: the Java engine's rpcEstimateGas short-circuits these
-/// today (same under-estimate) — flagged for the same fix there.
+/// estimate run). The Java backend's short-circuit guards the same range
+/// (`VerifiedRpcBackend.inPrecompileRange`).
 fn in_precompile_range(addr: &[u8; 20]) -> bool {
     addr[..18].iter().all(|&b| b == 0) && {
         let low = u16::from_be_bytes([addr[18], addr[19]]);
@@ -380,6 +380,12 @@ impl EvmExecutor {
     /// that a limit can only "work" by running a different transaction — a
     /// failure caught deep inside (try/catch, a multicall that tolerates one),
     /// a `gasleft()` branch — which is not the one the caller simulated.
+    ///
+    /// What that bound buys, exactly: a probe cannot tell a caught failure
+    /// from success, so above the draw the search still finds the lowest limit
+    /// at which the OUTER transaction succeeds. A call whose failure is caught
+    /// d levels down needs (64/63)^d of what it drew; the 1.15 buffer covers
+    /// that through d = 8, not from d = 9 on.
     fn lowest_working_limit(
         &self,
         db: &OracleDatabase,
@@ -1955,9 +1961,11 @@ mod tests {
     /// the outer contract swallows it. Clearing storage first refunds a fifth
     /// of the draw, so what the run is CHARGED — where geth's search starts —
     /// is such a limit; this search never goes below the draw, so the call the
-    /// caller simulated happens at the estimate.
+    /// caller simulated happens at the estimate. One level deep, as
+    /// `lowest_working_limit` bounds it: the buffer covers a caught failure
+    /// through 8 levels.
     #[test]
-    fn estimate_never_answers_a_limit_where_a_swallowed_call_fails() {
+    fn estimate_covers_a_swallowed_call_one_level_deep() {
         let inner = [0x77; 20];
         // SSTORE(slot i, 0) over ten slots holding 1 (refunds), then CALL inner
         // with all gas and return the success flag, whatever it is.

@@ -151,7 +151,11 @@ search starts from what the run was charged (after refunds), ours from
 what it drew. Below the draw a limit can only "work" by running a
 different transaction — a failure caught deep inside (try/catch, a
 multicall that tolerates one) or a `gasleft()` branch — which is not the
-transaction the caller simulated, so the answer never goes below it. The
+transaction the caller simulated, so the answer never goes below it. A probe
+still cannot tell a caught failure from success, so above the draw the
+search finds where the outer transaction succeeds: a call whose failure is
+caught d levels down needs (64/63)^d of its draw, which the 1.15 buffer
+covers through d = 8, not beyond. The
 cost stays small: the probe usually lands, and the error ratio ends the
 bisection after a handful of runs on one EVM, reading state the first run
 already fetched. The Rust search stops when its request is abandoned; the

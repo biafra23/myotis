@@ -223,7 +223,11 @@ public final class DefaultEvmExecutor implements EvmExecutor {
      * (after refunds), this search stops at what it drew. Below that a limit can
      * only "work" by running a different transaction — a failure caught deep
      * inside (try/catch, a multicall that tolerates one), a {@code gasleft()}
-     * branch — which is not the one the caller simulated.
+     * branch — which is not the one the caller simulated. A probe cannot tell a
+     * caught failure from success, though, so above the draw the search finds
+     * the lowest limit at which the OUTER transaction succeeds: a call whose
+     * failure is caught d levels down needs (64/63)^d of what it drew, which
+     * the 1.15 buffer covers through d = 8, not from d = 9 on.
      */
     private long lowestWorkingLimit(EvmFactory.EvmAndPrecompiles bundle, UnsignedTransaction tx,
                                     BlockContext blockContext, SyncStateView view, long intrinsicGas, long floor,

@@ -404,12 +404,13 @@ class EstimateGasTest {
     }
 
     @Test
-    void theEstimateNeverAnswersALimitWhereASwallowedCallFails() throws Exception {
+    void theEstimateCoversASwallowedCallOneLevelDeep() throws Exception {
         // Ten SSTORE(slot i, 0) over slots holding 1 (refunds), then CALL an inner
         // contract with all gas and return the success flag, whatever it is. What
         // the run is CHARGED — where geth's search starts — is a limit at which it
         // still "runs" without its inner call; the estimate never goes below the
-        // draw, so the call the caller simulated happens.
+        // draw, so the call the caller simulated happens. One level deep: the
+        // buffer covers a caught failure through 8 levels (lowestWorkingLimit).
         Address inner = Address.fromHex("0x7777777777777777777777777777777777777777");
         StringBuilder outer = new StringBuilder();
         for (int i = 0; i < 10; i++) {
