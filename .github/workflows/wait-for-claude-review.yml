@@ -27,13 +27,17 @@
 # a fork and a draft PR pass in seconds. A run's conclusion does not matter: a
 # failed review says nothing about the code, and its own check reports it.
 #
-# FAIL-OPEN. It may only ever delay the builds, never block them. Three API
-# errors in a row, no run appearing within 3 minutes, a review still queued
-# after 5 minutes (gates like this one may be holding the runners it needs),
-# and a review still running after an hour all end in a warning and success.
-# `continue-on-error` covers the rest: a gate job that fails anyway (runner
-# lost, timed out) does not stop the jobs that need it. A cancelled gate still
-# cancels them, as a cancelled run should.
+# FAIL-OPEN. Once it runs, it may only delay the builds, never block them.
+# Three API errors in a row, no run appearing within 3 minutes, a review still
+# queued after 5 minutes (gates like this one may be holding the runners it
+# needs), and a review still running after an hour all end in a warning and
+# success. `continue-on-error` covers the rest: a gate job that fails anyway
+# (runner lost, timed out) does not stop the jobs that need it. A cancelled
+# gate still cancels them, as a cancelled run should. What it cannot cover is
+# this file failing to load (a YAML error, a rename without its callers): the
+# three callers then fail at startup, builds and tag release uploads included,
+# as with any broken workflow file. A PR that does that goes red on
+# android-apk and desktop-dmg, which run on every PR, before it can merge.
 #
 # NEVER GIVE THE CALLER'S JOB AN `if:`. When a job is skipped, GitHub skips
 # every job in the `needs:` chain after it, so a gate skipped on pushes would
@@ -45,7 +49,10 @@
 # superseded run per ref, so a fix pushed soon after the review cancels builds
 # that only just started. Runner time is saved when a push lands while the
 # review is still running. While it waits, each calling workflow holds one idle
-# Linux runner: free in this public repo, but it takes a concurrent-job slot.
+# Linux runner (free in this public repo, but it takes a concurrent-job slot)
+# and polls the API from the GITHUB_TOKEN budget every job in the repository
+# shares, 1,000 requests an hour: each minute until it sees the review, then
+# every 2 minutes.
 name: Wait for claude-review
 
 on:
@@ -158,5 +165,8 @@ jobs:
               echo "Waiting for claude-review ($((SECONDS / 60))m so far):"
               echo "$details"
             fi
-            sleep "$poll"
+            # A review already seen needs no minute-by-minute resolution, and
+            # each poll spends the budget the repository's other jobs share
+            # (claude-review's own API steps and the release uploads among them).
+            if [ "$waited" = true ]; then sleep "$((poll * 2))"; else sleep "$poll"; fi
           done
