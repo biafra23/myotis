@@ -14,9 +14,10 @@ the seam. Summary first; the original evaluation follows.
 - `rust/myotis-bls` — a `blst` + `jni` cdylib; `NativeBlsBackend` calls it with the whole
   committee flattened into one JNI crossing. One crate → desktop `.so` **and** Android ABIs.
 - Daemon: `./gradlew :app:run` puts the desktop `.so` on `java.library.path` and auto-selects
-  native; `-Pbls=compare` runs the head-to-head. (The packaged **desktop app** bundles the Rust
-  engine but no `libmyotis_bls`, so its Java engine runs Milagro and the "Native BLS
-  acceleration" setting is a no-op there.)
+  native; `-Pbls=compare` runs the head-to-head. (The **desktop app** — dev loop and packaged build alike — bundles the Rust
+  engine but no `libmyotis_bls`; `DesktopNode.applyBlsBackend()` is a hard no-op, so its
+  Java engine always runs Milagro and the "Native BLS acceleration" setting does nothing
+  there.)
 - Android: `rust/build-android.sh` (cargo-ndk) builds `arm64-v8a` + `x86_64`
   `libmyotis_bls.so` into `android-app/src/main/jniLibs` (confirmed packaged in the debug
   APK); compare mode is an explicit opt-in (-Dmyotis.bls.backend=compare) — it was briefly the debuggable default, but 10-16 s of Milagro per update froze on-device catch-up (Pixel 7, 2026-07-06).

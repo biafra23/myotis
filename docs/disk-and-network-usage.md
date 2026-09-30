@@ -106,7 +106,7 @@ Global (not per network):
 | `~/.myotis/logs/` (desktop only) | Rolling logs, size-capped (`logback-desktop.xml`) | bounded by the rolling policy |
 
 **Total per enabled network: well under 1 MB.** The only unbounded file is the EL peer
-cache (~150 B per distinct peer ever seen READY); `purge-cache` (IPC) or the apps'
+cache (~150 B per distinct peer ever seen READY); `purge-cache` (a client-side daemon command, run with the daemon stopped) or the apps'
 cache-purge action deletes the caches and the snapshot.
 
 ### 1.2 What is deliberately *not* on disk

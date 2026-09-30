@@ -4,10 +4,12 @@ Status: **implemented — the architecture recommended below is what was built.*
 `node-core`'s `NodeRegistry` owns a `Map<network, ChainStack>` behind the engine
 API (`MyotisEngine.create(...)` per network, `hostedNetworks()`); the daemon hosts
 every network named in `-Pnetwork=mainnet,gnosis` in one process
-(`app/.../Main.java`), and the Android, desktop and iOS apps host mainnet, Gnosis
-and Sepolia together — on either engine — each network on its own ports, lock
-file and IPC socket. The Rust engine hosts several networks in one process the
-same way (one handle per network). This document is kept as the record of *why*
+(`app/.../Main.java`), each network on its own ports, lock file and IPC socket; and the
+Android, desktop and iOS apps host mainnet, Gnosis and Sepolia together in one
+process, each network on its own ports (on either engine on Android 13+ and
+desktop; iOS runs the Rust engine only — and the apps create no lock files or
+sockets, those are the daemon's). The Rust engine hosts several networks in one
+process the same way (one handle per network). This document is kept as the record of *why*
 several chains share one process and of the trade-offs; the "What blocked it"
 section describes the code before the refactor. The long-term payoff in item 5
 (trustless cross-chain verification between two in-process light clients) is

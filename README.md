@@ -286,7 +286,8 @@ engine, and a few commands exist on one engine only:
 | `get-account`, `get-storage` | both | at least one snap-serving peer (`snapServingPeers > 0` in `status`) |
 | `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | — | `beacon-status` returns `"state":"SYNCED"` |
 | `resolve-ens`, `reverse-ens`, `resolve-ens-*` | both (mainnet and Sepolia — Gnosis has no ENS) | at least one snap-serving peer |
-| `build-logindex`, `logindex-status`, `logindex-backfill on\|off`, `import-logindex <file…>`, `export-logindex <file>` | Rust | daemon running (see [Log index](#log-index-verified-eth_getlogs)) |
+| `build-logindex`, `logindex-backfill on\|off`, `import-logindex <file…>`, `export-logindex <file>` | Rust (the Java engine answers an error) | daemon running (see [Log index](#log-index-verified-eth_getlogs)) |
+| `logindex-status` | both — on the Java engine a stable `{"enabled":false,"logCount":0,"entries":[]}` | daemon running |
 | `get-transactions <address>` | Java, mainnet only (debug) | at least one peer in `READY` state |
 | `purge-cache` | — | runs in the client with the daemon **stopped**: deletes the first network's peer caches and sync snapshot |
 
