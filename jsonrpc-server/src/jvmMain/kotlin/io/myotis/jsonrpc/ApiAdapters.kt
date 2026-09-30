@@ -66,13 +66,21 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         block: String,
         stateOverridesJson: String?,
     ): RpcCallResult {
-        val r = v.callDetailed(from, to, data, valueWei, block, stateOverridesJson)
-        return when (r.status()!!) {
-            io.myotis.api.CallResult.Status.OK -> RpcCallResult.ok(r.data() ?: ByteArray(0))
-            io.myotis.api.CallResult.Status.REVERTED -> RpcCallResult.reverted(r.data() ?: ByteArray(0))
-            io.myotis.api.CallResult.Status.UNAVAILABLE -> RpcCallResult.unavailable(r.detail())
-            io.myotis.api.CallResult.Status.REFUSED -> RpcCallResult.refused(r.detail() ?: "refused by the engine")
-        }
+        return v.callDetailed(from, to, data, valueWei, block, stateOverridesJson).toRpc()
+    }
+
+    override fun callTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult = v.callTx(tx.toApi(), block, stateOverridesJson).toRpc()
+
+    private fun io.myotis.api.CallResult.toRpc(): RpcCallResult = when (status()!!) {
+        io.myotis.api.CallResult.Status.OK -> RpcCallResult.ok(data() ?: ByteArray(0))
+        io.myotis.api.CallResult.Status.REVERTED -> RpcCallResult.reverted(data() ?: ByteArray(0))
+        io.myotis.api.CallResult.Status.UNAVAILABLE -> RpcCallResult.unavailable(detail())
+        io.myotis.api.CallResult.Status.REFUSED -> RpcCallResult.refused(detail() ?: "refused by the engine")
+        io.myotis.api.CallResult.Status.INFEASIBLE -> RpcCallResult.infeasible(detail() ?: "out of gas")
     }
     override fun getBalance(address: ByteArray, block: String): String? = v.getBalance(address, block)
     override fun getTransactionCount(address: ByteArray, block: String): Long? = v.getTransactionCount(address, block)
@@ -111,15 +119,13 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         tx: RpcTransactionArgs,
         block: String,
         stateOverridesJson: String?,
-    ): RpcEstimateResult = v.estimateGasTx(
-        io.myotis.api.TransactionArgs(
-            tx.from, tx.to, tx.data, tx.valueWei, tx.gas,
-            tx.gasPriceWei, tx.maxFeePerGasWei, tx.maxPriorityFeePerGasWei, tx.nonce,
-            tx.hasAccessList, tx.hasAuthorizationList, tx.json,
-        ),
-        block,
-        stateOverridesJson,
-    ).toRpc()
+    ): RpcEstimateResult = v.estimateGasTx(tx.toApi(), block, stateOverridesJson).toRpc()
+
+    private fun RpcTransactionArgs.toApi() = io.myotis.api.TransactionArgs(
+        from, to, data, valueWei, gas,
+        gasPriceWei, maxFeePerGasWei, maxPriorityFeePerGasWei, nonce,
+        hasAccessList, hasAuthorizationList, json,
+    )
 
     private fun io.myotis.api.EstimateResult.toRpc(): RpcEstimateResult = when (status()!!) {
         io.myotis.api.EstimateResult.Status.OK -> RpcEstimateResult.ok(gas())

@@ -108,6 +108,14 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 ceiling = fundable.longValue();
             }
         }
+        // geth checks the fee cap against the base fee when it first RUNS the
+        // transaction: after the affordability checks above, before the intrinsic
+        // cost is weighed against the ceiling (the Rust estimate's order) — and
+        // its estimator reports that run's refusal with the ceiling it ran at.
+        EvmExecutionError.FeeCapTooLow feeCapTooLow = feeCapBelowBaseFee(tx, blockContext);
+        if (feeCapTooLow != null) {
+            throw new EvmExecutionException(new EvmExecutionError.FailedWithGas(ceiling, feeCapTooLow));
+        }
         // EIP-7623: from Prague on a transaction is charged at least this floor,
         // so the answer must cover it (the Rust estimate's `tx_gas_used` twin).
         long floor = EvmFactory.calldataFloorActive(blockContext) ? computeCalldataFloor(tx.data()) : 0L;
@@ -128,6 +136,117 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // the run just succeeded within it, so the ceiling is itself a limit
         // that works — geth's invariant.
         return Math.min((long) Math.ceil(total * 1.15), ceiling);
+    }
+
+    /**
+     * {@code eth_call} for a transaction object (#509): {@code gas} is the call's
+     * limit (capped at the executor's budget, as geth caps it at its RPC gas cap),
+     * and a fee must reach the block's base fee, is affordable by the sender and
+     * is debited from it before the call runs, with GASPRICE reading the
+     * effective price — geth's {@code eth_call}. Contract creation is not served.
+     */
+    @Override
+    public CompletableFuture<byte[]> callTx(UnsignedTransaction tx, BlockContext blockContext) {
+        if (tx.to() == null) {
+            return Futures.failedFuture(new UnsupportedOperationException(
+                    "this engine does not run contract creation (to=null)"));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            CallPlan plan = planCall(tx, blockContext);
+            SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, new AccessTracker());
+            return runPlannedOnTracedView(plan, blockContext, view, OperationTracer.NO_TRACING);
+        }, executor);
+    }
+
+    /**
+     * What one call runs with, decided — and refused — before any EVM run: the
+     * sender and target, the transaction's gas limit and the frame's share of it
+     * after the intrinsic cost, the effective price GASPRICE reads and the sender
+     * is debited at, and the gas the caller set, if any — running out of it is
+     * the caller's answer, geth's "out of gas", unless it was above the budget
+     * and capped ({@link #outOfGas}).
+     */
+    record CallPlan(io.myotis.evm.Address sender, io.myotis.evm.Address target, byte[] data,
+                    java.math.BigInteger value, long gasLimit, long frameGas, Wei price,
+                    Long callerGas) {}
+
+    /** The plan a plain view call has always run with: the whole budget handed to
+     *  the frame, no price, no debit. */
+    static CallPlan viewPlan(io.myotis.evm.Address sender, io.myotis.evm.Address target, byte[] calldata,
+                             java.math.BigInteger value) {
+        return new CallPlan(sender != null ? sender : VIEW_CALLER, target, calldata,
+                value != null ? value : java.math.BigInteger.ZERO,
+                DEFAULT_GAS_LIMIT, DEFAULT_GAS_LIMIT, Wei.ZERO, null);
+    }
+
+    /**
+     * Decide a transaction-object call's plan, in geth's order: the fee cap
+     * against the base fee, the balance against {@code gas × fee cap + value}
+     * (fee or not — geth's {@code buyGas}), then the limit against the
+     * intrinsic cost and the EIP-7623 floor. Each failure is geth's answer
+     * ({@link EvmExecutionError.FeeCapTooLow},
+     * {@link EvmExecutionError.RequiredBalanceOverflow},
+     * {@link EvmExecutionError.InsufficientFunds},
+     * {@link EvmExecutionError.IntrinsicGasTooLow},
+     * {@link EvmExecutionError.FloorDataGasTooLow}) wrapped as geth's
+     * {@code eth_call} wraps it ({@link EvmExecutionError.CallFailed}), thrown
+     * as {@link EvmExecutionException}.
+     */
+    CallPlan planCall(UnsignedTransaction tx, BlockContext blockContext) {
+        // Fork validation first (the Rust call_tx's spec_for-before-checks twin):
+        // a block no run would serve must not cost the balance read below.
+        EvmFactory.requireSupported(blockContext);
+        CryptoProviders.ensureRegistered();
+        long gasLimit = tx.gasLimit() == null ? DEFAULT_GAS_LIMIT : Math.min(tx.gasLimit(), DEFAULT_GAS_LIMIT);
+        EvmExecutionError.FeeCapTooLow feeCapTooLow = feeCapBelowBaseFee(tx, blockContext);
+        if (feeCapTooLow != null) {
+            throw callFailed(gasLimit, feeCapTooLow);
+        }
+        // geth's buyGas, fee or no fee: the sender must hold gas × fee cap +
+        // value — a call moving more than the sender holds is refused as the
+        // chain would refuse it — and that sum must fit 256 bits.
+        java.math.BigInteger want = java.math.BigInteger.valueOf(gasLimit).multiply(tx.feeCapOrZero()).add(tx.value());
+        if (want.bitLength() > 256) {
+            throw callFailed(gasLimit, new EvmExecutionError.RequiredBalanceOverflow(tx.from()));
+        }
+        if (want.signum() > 0) {
+            java.math.BigInteger have = balanceOf(tx.from(), blockContext);
+            if (have.compareTo(want) < 0) {
+                throw callFailed(gasLimit, new EvmExecutionError.InsufficientFunds(tx.from(), have, want));
+            }
+        }
+        long intrinsic = computeIntrinsicGas(tx.data());
+        if (gasLimit < intrinsic) {
+            throw callFailed(gasLimit, new EvmExecutionError.IntrinsicGasTooLow(gasLimit, intrinsic));
+        }
+        if (EvmFactory.calldataFloorActive(blockContext)) {
+            long floor = computeCalldataFloor(tx.data());
+            if (gasLimit < floor) {
+                throw callFailed(gasLimit, new EvmExecutionError.FloorDataGasTooLow(gasLimit, floor));
+            }
+        }
+        return new CallPlan(tx.from(), tx.to(), tx.data(), tx.value(), gasLimit, gasLimit - intrinsic,
+                Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())), tx.gasLimit());
+    }
+
+    /** A check the call failed before running, as geth's {@code eth_call}
+     *  reports it: with the gas limit it supplied. */
+    private static EvmExecutionException callFailed(long suppliedGas, EvmExecutionError.Infeasible error) {
+        return new EvmExecutionException(new EvmExecutionError.CallFailed(suppliedGas, error));
+    }
+
+    /** A non-zero fee cap (a legacy gas price is its own cap) below the block's
+     *  base fee names a transaction no block at that base fee includes: geth's
+     *  answer for a call and an estimate alike, returned here (null when the cap
+     *  covers it). No fee is the exempt, fee-less simulation. */
+    private static EvmExecutionError.FeeCapTooLow feeCapBelowBaseFee(UnsignedTransaction tx,
+                                                                   BlockContext blockContext) {
+        java.math.BigInteger feeCap = tx.feeCapOrZero();
+        java.math.BigInteger baseFee = blockContext.baseFeePerGas() == null
+                ? java.math.BigInteger.ZERO : blockContext.baseFeePerGas();
+        return feeCap.signum() > 0 && feeCap.compareTo(baseFee) < 0
+                ? new EvmExecutionError.FeeCapTooLow(tx.from(), feeCap, baseFee.longValue())
+                : null;
     }
 
     /** The verified balance of {@code address} at {@code blockContext}'s state root. */
@@ -297,6 +416,17 @@ public final class DefaultEvmExecutor implements EvmExecutor {
     byte[] runOnTracedView(Address sender, Address target, byte[] calldata,
                            java.math.BigInteger value, BlockContext blockContext,
                            SyncStateView view, OperationTracer tracer) {
+        // A null sender means a from-less call → the anonymous VIEW_CALLER (Geth's
+        // default). When the caller DID supply a from (eth_call from a wallet), use
+        // it: contracts that gate on msg.sender (ERC-20 transfer/approve, …) must see
+        // the real caller, else they revert ("transfer from the zero address").
+        return runPlannedOnTracedView(viewPlan(sender, target, calldata, value), blockContext, view, tracer);
+    }
+
+    /** {@link #runOnTracedView} for a decided {@link CallPlan}: the seam both the
+     *  plain and the transaction-object calls (and their prefetch loop) run on. */
+    byte[] runPlannedOnTracedView(CallPlan plan, BlockContext blockContext,
+                                  SyncStateView view, OperationTracer tracer) {
         CryptoProviders.ensureRegistered();
         EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
         EVM evm = bundle.evm();
@@ -306,18 +436,23 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // outer call doesn't pollute the read-through cache.
         org.hyperledger.besu.evm.worldstate.WorldUpdater scope = root.updater();
 
-        // A null sender means a from-less call → the anonymous VIEW_CALLER (Geth's
-        // default). When the caller DID supply a from (eth_call from a wallet), use
-        // it: contracts that gate on msg.sender (ERC-20 transfer/approve, …) must see
-        // the real caller, else they revert ("transfer from the zero address").
-        io.myotis.evm.Address effectiveSender = sender != null ? sender : VIEW_CALLER;
-        Wei callValue = value != null ? Wei.of(value) : Wei.ZERO;
+        Wei callValue = Wei.of(plan.value());
         org.hyperledger.besu.datatypes.Address besuTarget =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(target.toByteArray()));
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(plan.target().toByteArray()));
         org.hyperledger.besu.datatypes.Address besuSender =
-                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(effectiveSender.toByteArray()));
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(plan.sender().toByteArray()));
         org.hyperledger.besu.datatypes.Address besuCoinbase =
                 org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(blockContext.coinbase().toByteArray()));
+
+        // geth's buyGas: the sender pays gas × price before the call runs, so the
+        // call sees it debited. planCall checked the sender can afford it and
+        // the prefetch loop primes the sender's real balance before its first
+        // pass, so the floor at zero is only a safety net.
+        if (!plan.price().isZero()) {
+            var payer = scope.getOrCreate(besuSender);
+            Wei cost = plan.price().multiply(plan.gasLimit());
+            payer.setBalance(payer.getBalance().greaterOrEqualThan(cost) ? payer.getBalance().subtract(cost) : Wei.ZERO);
+        }
 
         var targetAccount = scope.get(besuTarget);
         Code code = resolveCode(evm, scope, targetAccount);
@@ -325,13 +460,13 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         MessageFrame frame = MessageFrame.builder()
                 .type(MessageFrame.Type.MESSAGE_CALL)
                 .worldUpdater(scope)
-                .initialGas(DEFAULT_GAS_LIMIT)
+                .initialGas(plan.frameGas())
                 .address(besuTarget)
                 .originator(besuSender)
                 .contract(besuTarget)
-                .gasPrice(Wei.ZERO)
+                .gasPrice(plan.price())
                 .blobGasPrice(Wei.ZERO)
-                .inputData(Bytes.wrap(calldata))
+                .inputData(Bytes.wrap(plan.data()))
                 .sender(besuSender)
                 .value(callValue)
                 .apparentValue(callValue)
@@ -388,13 +523,26 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // human-readable detail so the failure isn't opaque.
         var halt = frame.getExceptionalHaltReason();
         if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
-            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+            throw new EvmExecutionException(outOfGas(plan));
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
         // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
         // serve Reverted's bytes verbatim as JSON-RPC revert data.
         throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
+    }
+
+    /** Running dry, as the plan's limit makes it: under a limit the caller set,
+     *  geth's "out of gas" — an answer; under a larger one, capped to the budget,
+     *  a refusal rather than an answer for a smaller limit; without one, the
+     *  ordinary out-of-gas at this executor's own budget. The Rust call_tx twin. */
+    private static EvmExecutionError outOfGas(CallPlan plan) {
+        if (plan.callerGas() == null) {
+            return new EvmExecutionError.OutOfGas();
+        }
+        return plan.callerGas() <= DEFAULT_GAS_LIMIT
+                ? new EvmExecutionError.CallOutOfGas()
+                : new EvmExecutionError.CallBudgetExceeded(DEFAULT_GAS_LIMIT, plan.callerGas());
     }
 
     /** Accessors used by {@code PrefetchingEvmExecutor} to share configuration. */

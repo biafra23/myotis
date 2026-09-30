@@ -694,6 +694,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_eth_call_overrides_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_eth_call_tx_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_export_log_index(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_fee_estimate_json(
@@ -786,6 +788,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_eth_call_json(`handle`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_eth_call_overrides_json(`handle`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_eth_call_tx_json(`handle`: Long,`tx`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_export_log_index(`handle`: Long,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -995,6 +999,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_eth_call_tx_json() != 32426) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_export_log_index() != 2966) {
@@ -1521,6 +1528,28 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterString.lower(`to`),
         FfiConverterString.lower(`data`),
         FfiConverterString.lower(`value`),
+        FfiConverterString.lower(`block`),
+        FfiConverterString.lower(`stateOverrides`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified `eth_call` for the FULL JSON-RPC transaction object (ABI ≥ 35,
+         * #509): the same `tx`, `block` and `state_overrides` as
+         * [`estimate_gas_tx_json`], every field applied as the estimate applies it —
+         * `gas` as the call's limit, a fee checked and charged to the sender, EIP-7702
+         * authorizations, access list, nonce — or the request refused with the
+         * permanent `{"error","code":-32602}` envelope.
+         */ fun `ethCallTxJson`(`handle`: kotlin.Long, `tx`: kotlin.String, `block`: kotlin.String, `stateOverrides`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_eth_call_tx_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`tx`),
         FfiConverterString.lower(`block`),
         FfiConverterString.lower(`stateOverrides`),_status)
 }

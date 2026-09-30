@@ -5471,6 +5471,37 @@ impl ElReader {
         Ok(Self::call_answer(anchor, block_number, joined))
     }
 
+    /// Verified `eth_call` for a full transaction object (#509): every field
+    /// the request names is applied as `eth_estimateGas` applies it (see
+    /// `myotis_evm::tx`) or the request is refused, with `overrides` layered
+    /// over verified state for this call only. `anchor` selects the block as
+    /// for [`Self::eth_call_overridden`]. A call that cannot succeed within
+    /// the caller's own gas, fee cap or funds yields
+    /// [`CallOutcome::Infeasible`] (geth's answer and message).
+    pub async fn eth_call_tx(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        self.request(self.eth_call_tx_inner(anchor, tx, chain_id, overrides)).await
+    }
+
+    async fn eth_call_tx_inner(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let block_number = ctx.block_number;
+        let joined =
+            super::request::blocking(move || executor.call_tx(&tx, &ctx, overrides)).await?;
+        Ok(Self::call_answer(anchor, block_number, joined))
+    }
+
     /// Verified `eth_estimateGas` for a full transaction object (#509): every
     /// field the request names is applied or the request is refused (see
     /// `myotis_evm::tx`), with `overrides` layered over verified state for this

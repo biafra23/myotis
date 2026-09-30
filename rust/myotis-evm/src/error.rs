@@ -6,6 +6,7 @@
 //! revert carries its raw data so the JSON-RPC layer can echo it.
 
 use crate::oracle::OracleError;
+use revm::primitives::{Address, U256};
 
 /// Everything a view call can return other than the success bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +67,47 @@ pub enum EvmError {
     /// transferred value (geth's `insufficient funds for transfer`). An answer
     /// like [`EvmError::GasAllowanceExceeded`] ([`EvmError::is_infeasible`]).
     InsufficientFundsForTransfer,
+    /// `eth_call` with a fee: the sender cannot pay `gas × fee cap + value`
+    /// (geth's `insufficient funds for gas * price + value`). An answer about
+    /// the request ([`EvmError::is_infeasible`]).
+    InsufficientFunds { address: [u8; 20], have: U256, want: U256 },
+    /// A fee cap (or legacy gas price) below the block's base fee: no block at
+    /// that base fee includes the transaction, so geth answers
+    /// `max fee per gas less than block base fee` for both a call and an
+    /// estimate ([`EvmError::is_infeasible`]).
+    FeeCapTooLow { address: [u8; 20], fee_cap: u128, base_fee: u64 },
+    /// `eth_call` with a `gas` below the transaction's intrinsic cost (geth's
+    /// `intrinsic gas too low`; an estimate reads it as
+    /// [`EvmError::GasAllowanceExceeded`] instead, as geth does).
+    IntrinsicGasTooLow { have: u64, want: u64 },
+    /// `eth_call` with a `gas` below the EIP-7623 calldata floor (geth's
+    /// `insufficient gas for floor data gas cost`; an estimate reads it as
+    /// [`EvmError::GasAllowanceExceeded`]).
+    FloorDataGasTooLow { have: u64, want: u64 },
+    /// `eth_call` ran out of the `gas` the caller gave it (geth's `out of
+    /// gas`). Without a caller limit a call that runs dry is
+    /// [`EvmError::OutOfGas`], as before.
+    CallOutOfGas,
+    /// An estimate whose run at its ceiling `gas` was refused outright (a fee
+    /// cap below the base fee): geth's estimator wraps the state transition's
+    /// error as `failed with {gas} gas: {error}`, and so do we
+    /// ([`EvmError::is_infeasible`]).
+    FailedWithGas { gas: u64, error: Box<EvmError> },
+    /// `eth_call` with `gas × fee cap + value` past 2^256 wei: geth's
+    /// `insufficient funds for gas * price + value: address … required
+    /// balance exceeds 256 bits` ([`EvmError::is_infeasible`]).
+    RequiredBalanceOverflow { address: [u8; 20] },
+    /// `eth_call` whose `gas` was above the call budget, capped to it, and
+    /// ran out there: the answer says nothing about the limit the caller set,
+    /// so it is refused ([`EvmError::is_refusal`]) — never answered for a
+    /// smaller limit, nor served as the retryable unavailable a client would
+    /// spin on.
+    CallBudgetExceeded { budget: u64, requested: u64 },
+    /// `eth_call` refused by one of the checks a transaction passes before it
+    /// runs (fee cap, balance, intrinsic cost, floor): geth's `eth_call` wraps
+    /// the state transition's error as `err: {error} (supplied gas {gas})`, and
+    /// so do we ([`EvmError::is_infeasible`]).
+    CallFailed { supplied_gas: u64, error: Box<EvmError> },
 }
 
 impl EvmError {
@@ -78,17 +120,28 @@ impl EvmError {
             EvmError::MissingSlotNumber { .. }
                 | EvmError::UnexpectedSlotNumber { .. }
                 | EvmError::InvalidRequest { .. }
+                | EvmError::CallBudgetExceeded { .. }
         )
     }
 
-    /// True when the estimate RAN and the answer is that the transaction cannot
-    /// succeed within the caller's own limits (gas, funds). Hosts serve it as
-    /// geth does — JSON-RPC -32000 carrying this error's message — and never as
-    /// a number: a wallet that broadcast one would lose the fee.
+    /// True when the request was understood and the answer is that the
+    /// transaction cannot succeed within the caller's own limits (gas, funds,
+    /// fee cap). Hosts serve it as geth does — JSON-RPC -32000 carrying this
+    /// error's message — and never as a number or return data: a wallet that
+    /// broadcast one would lose the fee.
     pub fn is_infeasible(&self) -> bool {
         matches!(
             self,
-            EvmError::GasAllowanceExceeded { .. } | EvmError::InsufficientFundsForTransfer
+            EvmError::GasAllowanceExceeded { .. }
+                | EvmError::InsufficientFundsForTransfer
+                | EvmError::InsufficientFunds { .. }
+                | EvmError::FeeCapTooLow { .. }
+                | EvmError::IntrinsicGasTooLow { .. }
+                | EvmError::FloorDataGasTooLow { .. }
+                | EvmError::CallOutOfGas
+                | EvmError::FailedWithGas { .. }
+                | EvmError::RequiredBalanceOverflow { .. }
+                | EvmError::CallFailed { .. }
         )
     }
 }
@@ -138,6 +191,38 @@ impl std::fmt::Display for EvmError {
                 write!(f, "gas required exceeds allowance ({allowance})")
             }
             EvmError::InsufficientFundsForTransfer => write!(f, "insufficient funds for transfer"),
+            // geth's core errors, formatted as its state transition formats them
+            // (the address EIP-55 checksummed, as `common.Address.Hex()` prints it).
+            EvmError::InsufficientFunds { address, have, want } => write!(
+                f,
+                "insufficient funds for gas * price + value: address {} have {have} want {want}",
+                Address::from(*address)
+            ),
+            EvmError::FeeCapTooLow { address, fee_cap, base_fee } => write!(
+                f,
+                "max fee per gas less than block base fee: address {}, maxFeePerGas: {fee_cap}, baseFee: {base_fee}",
+                Address::from(*address)
+            ),
+            EvmError::IntrinsicGasTooLow { have, want } => {
+                write!(f, "intrinsic gas too low: have {have}, want {want}")
+            }
+            EvmError::FloorDataGasTooLow { have, want } => {
+                write!(f, "insufficient gas for floor data gas cost: have {have}, want {want}")
+            }
+            EvmError::CallOutOfGas => write!(f, "out of gas"),
+            EvmError::FailedWithGas { gas, error } => write!(f, "failed with {gas} gas: {error}"),
+            EvmError::RequiredBalanceOverflow { address } => write!(
+                f,
+                "insufficient funds for gas * price + value: address {} required balance exceeds 256 bits",
+                Address::from(*address)
+            ),
+            EvmError::CallBudgetExceeded { budget, requested } => write!(
+                f,
+                "the call ran out of this node's {budget}-gas call budget, below the {requested} gas it allows"
+            ),
+            EvmError::CallFailed { supplied_gas, error } => {
+                write!(f, "err: {error} (supplied gas {supplied_gas})")
+            }
         }
     }
 }

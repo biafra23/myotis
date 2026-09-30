@@ -20,9 +20,11 @@ import java.util.Objects;
  * @param to         target address; null for contract creation
  * @param value      wei to transfer
  * @param data       calldata
- * @param gasLimit   optional cap; null lets the executor pick the ceiling. Below
- *                   21000 it is no cap at all — geth's reading, which a
- *                   {@code "gas": "0x0"} from a wallet relies on.
+ * @param gasLimit   optional cap; null lets the executor pick the ceiling. For
+ *                   an estimate, below 21000 it is no cap at all — geth's
+ *                   reading, which a {@code "gas": "0x0"} from a wallet relies
+ *                   on. For a call ({@link EvmExecutor#callTx}) it is the limit
+ *                   as given, as in geth: below the intrinsic cost it is refused.
  * @param gasFeeCap  {@code maxFeePerGas} (or a legacy {@code gasPrice}), or null
  * @param gasTipCap  {@code maxPriorityFeePerGas} (or a legacy {@code gasPrice}), or null
  */

@@ -570,12 +570,16 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// Serialize a broadcast transaction hash (`eth_sendRawTransaction`).
 /// `eth_call` result: `{"status":"ok","resultHex":"0x…"}` on success,
 /// `{"status":"revert","dataHex":"0x…"}` on a revert, or
-/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified
-/// — each also carrying `"blockNumber":N`, the block the call ran against, and
-/// `"verified":b`, true when the call RAN (`ok`/`revert`) against the
-/// beacon-FINALIZED block (the `finalized` tag; the vocabulary of
-/// `ens_record_json`). ABI ≥ 30, additive: the hosts read `status` and the
-/// data keys only.
+/// `{"status":"unavailable","reason":"…"}` when it couldn't be executed/verified,
+/// or (ABI ≥ 35) `{"status":"infeasible","reason":"…"}` when it cannot succeed
+/// within the caller's own gas, fee cap or funds — the reason is geth's
+/// message, served as geth serves it (JSON-RPC -32000); a plain call gets it
+/// only for calldata that alone costs more than the 30 M budget — each also
+/// carrying `"blockNumber":N`, the block the
+/// call ran against, and `"verified":b`, true when the call was ANSWERED
+/// (anything but `unavailable`) at the beacon-FINALIZED block (the `finalized` tag;
+/// the vocabulary of `ens_record_json`). ABI ≥ 30, additive: the hosts read
+/// `status` and the data keys only.
 /// The Java side returns the bytes for `ok` and a JSON-RPC null for the other two
 /// (matching the reference engine, which treats revert/unavailable as "no answer").
 /// A refusal (never answerable on this build) is the permanent
@@ -594,6 +598,12 @@ pub fn call_json(answer: &CallAnswer) -> String {
         }
         CallOutcome::Unavailable(reason) => {
             obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+        // ABI ≥ 35: the transaction-object call, and a plain call whose
+        // calldata alone costs more than the budget.
+        CallOutcome::Infeasible(reason) => {
+            obj.insert("status".into(), "infeasible".into());
             obj.insert("reason".into(), reason.as_str().into());
         }
     }
@@ -1011,6 +1021,16 @@ mod tests {
         assert_eq!(un["status"], "unavailable");
         assert_eq!(un["reason"], "out of gas");
         assert_eq!(un["verified"], false);
+
+        // infeasible (ABI 35) → status + geth's
+        // message, which the hosts serve verbatim as -32000
+        let inf: serde_json::Value = serde_json::from_str(&call_json(&at_head(CallOutcome::Infeasible(
+            "intrinsic gas too low: have 20000, want 21000".to_string(),
+        ))))
+        .unwrap();
+        assert_eq!(inf["status"], "infeasible");
+        assert_eq!(inf["reason"], "intrinsic gas too low: have 20000, want 21000");
+        assert_eq!(inf["blockNumber"], 21_000_000);
 
         // a `finalized` call names the finalized block and says so...
         let at_fin = |outcome: CallOutcome| CallAnswer {

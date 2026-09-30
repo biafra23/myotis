@@ -206,6 +206,26 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   does, JSON-RPC -32000 with `reason` verbatim ("gas required exceeds
   allowance (N)", "insufficient funds for transfer"); `estimateGasJson` can
   return it too, for an estimate that runs out of gas at its 30 M ceiling.
+- **Full transaction objects for calls** (ABI 35, #509): `ethCallTxJson(h, tx,
+  block, stateOverrides)` takes the same arguments and applies every field as
+  the estimate does: `gas` is the call's limit (capped at the 30 M call
+  budget, as geth caps at its RPC gas cap), a fee must reach the block's base
+  fee and is charged to the sender before the call runs, and both lists are
+  applied (`ethCallJson` carries only from/to/data/value). Refusals are the
+  same permanent `-32602`. `{"status": "infeasible", "reason": "…"}` means
+  the call cannot succeed within the caller's gas, fee cap or funds — answer
+  it as geth does, JSON-RPC -32000 with `reason` verbatim: "out of gas" for a
+  run that exhausted the caller's `gas`, and for a check failed before the
+  run geth's eth_call wording, "err: <why> (supplied gas N)" with <why> one of
+  "intrinsic gas too low: have N, want M", "insufficient gas for floor data
+  gas cost: …", "insufficient funds for gas * price + value: address … have N
+  want M" or "max fee per gas less than block base fee: …". Fee or not, the
+  sender must hold `gas × fee cap + value`, as geth requires. `ethCallJson`
+  can return `infeasible` too, but only for calldata that alone costs more
+  than the 30 M budget. From ABI 35 `estimateGasTxJson` answers a fee cap below the
+  base fee too, where it used to estimate — as geth's estimator words it,
+  "failed with N gas: max fee per gas less than block base fee: …", N being
+  the ceiling of the refused run.
 - **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
   `{ phase, activationTime, forkId, observedPeers }` when peers announce
   (`"SCHEDULED"`, `activationTime` ahead) or have already activated

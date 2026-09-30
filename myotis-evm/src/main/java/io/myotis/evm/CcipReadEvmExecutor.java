@@ -82,6 +82,13 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
         return tryWithCcipRead(sender, target, calldata, value, blockContext, 0);
     }
 
+    /** A transaction-object call gets the same CCIP-Read handling: the callback
+     *  re-enters with the original sender, value, gas limit and fees. */
+    @Override
+    public CompletableFuture<byte[]> callTx(UnsignedTransaction tx, BlockContext blockContext) {
+        return tryTxWithCcipRead(tx, blockContext, 0);
+    }
+
     /** Estimation passes straight through — CCIP-Read (ERC-3668) only applies to
      *  OffchainLookup reverts during view reads, not to gas metering of a
      *  to-be-broadcast transaction (a tx that reverts must NOT get an estimate). */
@@ -95,11 +102,24 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
             BlockContext ctx, int depth) {
         return Futures.exceptionallyCompose(
                 delegate.callView(sender, target, calldata, value, ctx),
-                t -> handleException(sender, value, t, ctx, depth));
+                t -> handleException(t, depth, (callbackTarget, callbackCalldata) ->
+                        tryWithCcipRead(sender, callbackTarget, callbackCalldata, value, ctx, depth + 1)));
     }
 
-    private CompletableFuture<byte[]> handleException(Address sender, java.math.BigInteger value,
-                                                      Throwable t, BlockContext ctx, int depth) {
+    private CompletableFuture<byte[]> tryTxWithCcipRead(UnsignedTransaction tx, BlockContext ctx, int depth) {
+        return Futures.exceptionallyCompose(
+                delegate.callTx(tx, ctx),
+                t -> handleException(t, depth, (callbackTarget, callbackCalldata) ->
+                        tryTxWithCcipRead(new UnsignedTransaction(tx.from(), callbackTarget, tx.value(),
+                                callbackCalldata, tx.gasLimit(), tx.gasFeeCap(), tx.gasTipCap()), ctx, depth + 1)));
+    }
+
+    /** Resolve an OffchainLookup revert through the gateways and hand the
+     *  callback's target and calldata to {@code reenter}; any other failure
+     *  passes through unchanged. */
+    private CompletableFuture<byte[]> handleException(
+            Throwable t, int depth,
+            java.util.function.BiFunction<Address, byte[], CompletableFuture<byte[]>> reenter) {
         Throwable cause = unwrap(t);
         Optional<OffchainLookupRevert> lookup = extractLookup(cause);
         if (lookup.isEmpty()) {
@@ -126,9 +146,10 @@ public final class CcipReadEvmExecutor implements EvmExecutor {
                     log.debug("[ccip] re-entering EVM (callbackTarget={}, depth={})",
                             lookup.get().sender(), depth + 1);
                     // The OffchainLookup's `sender` is the contract that raised it — the
-                    // callback TARGET. Keep the original msg.sender/value for the re-entry
-                    // so sender-gated callbacks still see the real caller.
-                    return tryWithCcipRead(sender, lookup.get().sender(), callbackCalldata, value, ctx, depth + 1);
+                    // callback TARGET. The re-entry keeps the original msg.sender/value
+                    // (and, for a transaction object, its gas and fees) so sender-gated
+                    // callbacks still see the real caller.
+                    return reenter.apply(lookup.get().sender(), callbackCalldata);
                 });
     }
 
