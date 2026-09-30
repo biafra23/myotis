@@ -11,6 +11,8 @@ use myotis_core::rlp::{self, Item};
 use myotis_core::trie::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 use myotis_core::CoreError;
 
+use crate::el::eth::messages::kept;
+
 /// The absolute wire codes for the snap messages, derived from the negotiated
 /// eth protocol length. Offsets from `base` are fixed by the snap/1 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,9 @@ pub struct SlimAccount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRange {
     pub request_id: u64,
+    /// The peer's entries, cut at [`MAX_RANGE_ENTRIES`] (any past that are
+    /// checked, then dropped). Nothing in production reads them: the proof
+    /// carries the verified account.
     pub accounts: Vec<SlimAccount>,
     pub proof: Vec<Vec<u8>>,
 }
@@ -244,6 +249,9 @@ pub struct StorageSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageRanges {
     pub request_id: u64,
+    /// The first account's slots, cut at [`MAX_RANGE_ENTRIES`] (any past that
+    /// are checked, then dropped). Nothing in production reads them: the proof
+    /// carries the verified value.
     pub slots: Vec<StorageSlot>,
     pub proof: Vec<Vec<u8>>,
 }
@@ -314,7 +322,7 @@ pub fn decode_byte_codes(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec
     if let Some(list) = items.next().filter(rlp::View::is_list) {
         for (i, c) in list.as_list()?.enumerate() {
             let code = c.as_bytes()?;
-            if i <= requested {
+            if i < kept(requested) {
                 codes.push(code.to_vec());
             }
         }

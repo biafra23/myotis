@@ -813,14 +813,20 @@ fn request_and_payload(rlp_bytes: &[u8]) -> Result<(u64, rlp::View<'_>), CoreErr
     let (Some(id), Some(payload)) = (items.first(), items.get(1)) else {
         return Err(CoreError("eth message: missing [reqId, payload]".into()));
     };
+    // `View::new` walks the payload a second time; `raw_list_prefix` has just
+    // checked it the same way, so this cannot fail. Both halves stay: the first
+    // keeps the nesting budget a response always had (a view over the whole
+    // message would count one more level), and checking is the only way to
+    // make a view.
     Ok((request_id_at(id)?, rlp::View::new(payload)?))
 }
 
 /// How many elements of a response to a request for `requested` to keep: one
 /// more than asked for, so a caller still sees a peer that over-serves. Any
 /// further element is checked exactly as a kept one would be, so the verdict
-/// on the response doesn't change, but it is not kept (#454).
-fn kept(requested: usize) -> usize {
+/// on the response doesn't change, but it is not kept (#454). The eth and
+/// snap decoders share it.
+pub(crate) fn kept(requested: usize) -> usize {
     requested.saturating_add(1)
 }
 
