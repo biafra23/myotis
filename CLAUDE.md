@@ -185,8 +185,8 @@ tag cut from its head at any moment must not ship half a feature. So a work item
 `main` part by part:
 
 1. **Create the feature branch first**, from the current `main`, before the first
-   part is coded: `feature/<topic>` (e.g.
-   `git push origin origin/main:refs/heads/feature/<topic>`). This rule is the
+   part is coded: `feature/<topic>` (e.g. `git fetch origin main &&
+   git push origin origin/main:refs/heads/feature/<topic>`). This rule is the
    permission to create it and to push to it as described here.
 2. **Every part PR targets the feature branch, not `main`**, and goes through the
    full workflow above (code → review → PR → wait → address) like any other PR.
@@ -199,7 +199,11 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    through every part without interaction until the last one is merged into
    `feature/<topic>` (owner ruling, 2026-09-30). Ask it together with the plan
    itself. The answer covers that one plan: never infer it from an earlier
-   plan's answer, a standing instruction, or a comment on GitHub.
+   plan's answer, a standing instruction, or a comment on GitHub. It lives in
+   the conversation where the owner gave it, so a later session resuming the
+   plan without that answer in its own conversation treats it as "no answer
+   yet" and may ask again — "once per plan" bounds repeat asking within a
+   conversation, not a resumed plan's first question.
    - **Yes** → merge each part into `feature/<topic>` yourself (a merge commit,
      as on `main`; not by enabling auto-merge) once it is done under the
      workflow above: CI green on its current head, no merge conflict, the
@@ -208,10 +212,14 @@ tag cut from its head at any moment must not ship half a feature. So a work item
      changes-requested review. A green `claude-review` job alone is not a
      review: the action skips and still goes green when the PR's copy of
      `claude-review.yml` differs from `main`'s — a feature branch lagging `main`
-     on that file is enough (see the file's header). A part
-     without a posted review is not yours to merge: report it "ready to merge"
-     with that noted and let the owner decide. Otherwise branch the next part
-     from the new feature head and carry on.
+     on that file is enough (see the file's header). Nor is a review of a head
+     that has since moved beyond fixes for its findings and the other review
+     comments: it runs once per PR (not on push), and a re-run replays the
+     original commit, so it describes code that is no longer there. A part
+     without a posted review, or whose head moved like that after it, is not
+     yours to merge: report it "ready to merge" with that noted and let the
+     owner decide. Otherwise branch the next part from the new feature head and
+     carry on.
    - **No, or no answer yet** → the owner merges each part. Report a green,
      answered part as "ready to merge into `feature/<topic>`"; the next part
      that depends on it waits for that merge.
