@@ -262,7 +262,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         let req = messages::encode_get_block_bodies(id, hashes);
         self.conn.send(messages::GET_BLOCK_BODIES, &req).await?;
         let payload = self.await_response(messages::BLOCK_BODIES, id).await?;
-        let (_rid, bodies) = messages::decode_block_bodies(&payload)
+        let (_rid, bodies) = messages::decode_block_bodies(&payload, hashes.len())
             .map_err(|e| format!("BlockBodies decode: {}", e.0))?;
         Ok(bodies)
     }
@@ -382,7 +382,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         self.conn.send(codes.get_byte_codes, &req).await?;
         let payload = self.await_snap_response(codes.byte_codes, id).await?;
         let (_id, codes_returned) =
-            snap::decode_byte_codes(&payload).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
+            snap::decode_byte_codes(&payload, 1).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
         fetch::verify_bytecode(code_hash, &codes_returned)
             .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
     }

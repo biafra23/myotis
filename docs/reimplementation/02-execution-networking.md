@@ -375,4 +375,9 @@ Sepolia 30305 for both RLPx-TCP and discv4-UDP).
     one-byte elements is ~500 KB of snappy and costs ~0.5 GB as a tree (#454). Read the request
     id by walking the list, cap control messages (the Rust engine refuses a Hello, Disconnect,
     Status, BlockRangeUpdate or inbound GetBlockHeaders over 16 KiB before decoding), and keep
-    only the prefix of a gossip list you actually read.
+    only the prefix of a gossip list you actually read. Responses to your own requests need the
+    same care. Read them in place (the Rust engine's `rlp::View`), and keep transaction and
+    receipt lists as the bytes they arrived in, not a buffer per element. Keep no more bodies,
+    receipt blocks or codes than you asked for, and cap a snap proof's node count. Refuse a body
+    with more transactions than its header's gasUsed can pay for before building its trie.
+    Recompute eth/69 blooms only once the receipt count matches the verified body.

@@ -756,6 +756,9 @@ struct TxLocation {
     block_hash: [u8; 32],
     index: usize,
     raw_tx: Vec<u8>,
+    /// Transactions in the verified body the tx was found in: the number of
+    /// receipts its block must have.
+    tx_count: usize,
 }
 
 /// Per-tx incremental scan cursor (the Java `TxScanState`): coverage grows
@@ -3674,8 +3677,11 @@ impl ElReader {
                     bodies[i].transactions.len()
                 ));
             }
-            verify_block_receipts(&vh.header, &receipt_blocks[i])?;
-            let built = build_block_receipts(&vh.header, vh.hash, &bodies[i], &receipt_blocks[i])?;
+            let receipts = receipt_blocks[i]
+                .canonical(bodies[i].transactions.len())
+                .map_err(|e| format!("block {}: {}", vh.header.number, e.0))?;
+            verify_block_receipts(&vh.header, &receipts)?;
+            let built = build_block_receipts(&vh.header, vh.hash, &bodies[i], &receipts)?;
             let stored =
                 stored_logs_for_block(&built).ok_or("malformed log field in verified receipts")?;
             let watched: Vec<crate::el::logindex::StoredLog> = self
@@ -4269,8 +4275,11 @@ impl ElReader {
                         body.transactions.len()
                     )));
                 }
-                verify_block_receipts(&vh.header, receipts)?;
-                let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+                let receipts = receipts
+                    .canonical(body.transactions.len())
+                    .map_err(|e| format!("block {}: {}", vh.header.number, e.0))?;
+                verify_block_receipts(&vh.header, &receipts)?;
+                let built = build_block_receipts(&vh.header, vh.hash, body, &receipts)?;
                 let stored = stored_logs_for_block(&built)
                     .ok_or("malformed log field in verified receipts")?;
                 // Pre-filter: buffer only logs the captured watch-list will
@@ -6612,6 +6621,9 @@ impl ElReader {
                 body.transactions.len()
             ));
         }
+        let receipts = receipts
+            .canonical(body.transactions.len())
+            .map_err(|e| format!("block {}: {}", vh.header.number, e.0))?;
         verify_block_receipts(&vh.header, &receipts)?;
         // Remember the fully verified hash↔number (feeds getBlockByHash and the
         // by-hash entry of this method).
@@ -6924,7 +6936,8 @@ impl ElReader {
                         header: vh.header.clone(),
                         block_hash: vh.hash,
                         index: i,
-                        raw_tx: raw.clone(),
+                        raw_tx: raw.to_vec(),
+                        tx_count: body.transactions.len(),
                     }));
                 }
             }
@@ -6945,6 +6958,9 @@ impl ElReader {
         if receipts.is_empty() {
             return Err("peer returned no receipts".to_string());
         }
+        let receipts = receipts
+            .canonical(loc.tx_count)
+            .map_err(|e| format!("block {}: {}", loc.header.number, e.0))?;
         verify_block_receipts(&loc.header, &receipts)?;
         if loc.index >= receipts.len() {
             return Err("tx index out of receipt range".to_string());
@@ -6990,12 +7006,13 @@ impl ElReader {
 /// future tx type yields a receipt without those fields, never an error.
 fn build_verified_receipt(
     loc: &TxLocation,
-    receipts: &[Vec<u8>],
+    receipts: &crate::el::eth::messages::RawList,
 ) -> Result<VerifiedReceipt, String> {
-    let decoded = crate::el::receipt::decode(&receipts[loc.index])?;
+    let target = receipts.get(loc.index).ok_or("tx index out of receipt range")?;
+    let decoded = crate::el::receipt::decode(target)?;
     let mut prev_cum = 0u64;
     let mut log_index_base = 0u64;
-    for prior in &receipts[..loc.index] {
+    for prior in receipts.iter().take(loc.index) {
         let prev = crate::el::receipt::decode(prior)?;
         log_index_base += prev.logs.len() as u64;
         // The last iteration leaves receipt[index-1]'s cumulative gas here.
@@ -7178,7 +7195,7 @@ fn build_block_receipts(
     header: &BlockHeader,
     block_hash: [u8; 32],
     body: &crate::el::eth::messages::BlockBody,
-    receipts: &[Vec<u8>],
+    receipts: &crate::el::eth::messages::RawList,
 ) -> Result<Vec<VerifiedReceipt>, String> {
     let mut out = Vec::with_capacity(receipts.len());
     let mut prev_cum = 0u64;
@@ -7202,15 +7219,33 @@ fn build_block_receipts(
     Ok(out)
 }
 
+/// Every transaction pays intrinsic gas: 21,000 today, and 12,000 at the least
+/// under EIP-2780's repricing (Amsterdam). Assuming a dozen times less still
+/// caps a block at `gasUsed / 1000` transactions, far above any real block,
+/// and lets [`verify_body_transactions`] refuse a peer's body of millions of
+/// junk transactions before hashing each one into the trie (#454).
+const MIN_GAS_PER_TX: u64 = 1_000;
+
 /// The body half of the per-block trust gate: the fetched transactions must
 /// rebuild the (already anchored) header's `transactionsRoot`. One
 /// implementation for every consumer (block serve, fee estimate, tx scan,
 /// fee history), so a hardening never has to be applied in four places.
+/// A body with more transactions than the header's gas can pay for fails
+/// before the trie is built, since building it costs memory per transaction.
 fn verify_body_transactions(
     header: &BlockHeader,
     body: &crate::el::eth::messages::BlockBody,
 ) -> Result<(), String> {
-    if !triehash::verify(&body.transactions, &header.transactions_root) {
+    let payable = header.gas_used / MIN_GAS_PER_TX;
+    if body.transactions.len() as u64 > payable {
+        return Err(format!(
+            "block {} body has {} transactions, more than its gasUsed {} can pay for",
+            header.number,
+            body.transactions.len(),
+            header.gas_used
+        ));
+    }
+    if !triehash::verify(body.transactions.iter(), &header.transactions_root) {
         return Err(format!(
             "block {} body does not match the header transactionsRoot",
             header.number
@@ -7220,9 +7255,14 @@ fn verify_body_transactions(
 }
 
 /// The receipts half of the per-block trust gate: the fetched receipt list
-/// must rebuild the (already anchored) header's `receiptsRoot`.
-fn verify_block_receipts(header: &BlockHeader, receipts: &[Vec<u8>]) -> Result<(), String> {
-    if !triehash::verify(receipts, &header.receipts_root) {
+/// must rebuild the (already anchored) header's `receiptsRoot`. Callers pass
+/// [`BlockReceipts::canonical`](crate::el::eth::messages::BlockReceipts::canonical)
+/// output, which has already matched the count to the verified body.
+fn verify_block_receipts(
+    header: &BlockHeader,
+    receipts: &crate::el::eth::messages::RawList,
+) -> Result<(), String> {
+    if !triehash::verify(receipts.iter(), &header.receipts_root) {
         return Err(format!(
             "block {} receipts do not match the header receiptsRoot",
             header.number
@@ -7239,7 +7279,7 @@ fn verify_block_receipts(header: &BlockHeader, receipts: &[Vec<u8>]) -> Result<(
 fn block_tx_tips(
     header: &BlockHeader,
     bodies: Vec<crate::el::eth::messages::BlockBody>,
-    receipt_blocks: Vec<Vec<Vec<u8>>>,
+    receipt_blocks: Vec<crate::el::eth::messages::BlockReceipts>,
 ) -> Result<Vec<(u128, u64)>, String> {
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
     verify_body_transactions(header, &body)?;
@@ -7267,11 +7307,14 @@ fn block_tx_tips(
             body.transactions.len()
         ));
     }
+    let receipts = receipts
+        .canonical(body.transactions.len())
+        .map_err(|e| format!("block {}: {}", header.number, e.0))?;
     verify_block_receipts(header, &receipts)?;
     let base_fee = header_base_fee(header);
     let mut out = Vec::with_capacity(body.transactions.len());
     let mut prev_cum = 0u64;
-    for (raw, receipt) in body.transactions.iter().zip(&receipts) {
+    for (raw, receipt) in body.transactions.iter().zip(receipts.iter()) {
         let tip = tx::effective_tip(raw, base_fee)
             .ok_or_else(|| format!("block {} has an undecodable tx", header.number))?;
         let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
@@ -8458,6 +8501,29 @@ mod tests {
     #[test]
     fn next_base_fee_pre_london_is_zero() {
         assert_eq!(next_base_fee_calc(0, 30_000_000, 15_000_000), 0);
+    }
+
+    #[test]
+    fn a_body_with_more_transactions_than_its_gas_pays_for_fails_before_the_trie() {
+        use crate::el::eth::messages::{BlockBody, RawList};
+        let body = |n: usize| {
+            let mut transactions = RawList::new();
+            for _ in 0..n {
+                transactions.push(&[0x01]);
+            }
+            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }
+        };
+        let mut header = BlockHeader { number: 7, gas_used: 3 * MIN_GAS_PER_TX, ..Default::default() };
+        header.transactions_root = triehash::ordered_trie_root(body(3).transactions.iter());
+        // As many transactions as the gas pays for: on to the root check.
+        assert!(verify_body_transactions(&header, &body(3)).is_ok());
+        assert!(verify_body_transactions(&header, &body(2)).unwrap_err().contains("transactionsRoot"));
+        // One more is refused on the count, before a trie is built.
+        let err = verify_body_transactions(&header, &body(4)).unwrap_err();
+        assert!(err.contains("more than its gasUsed"), "{err}");
+        // A block that used no gas holds no transactions.
+        header.gas_used = 0;
+        assert!(verify_body_transactions(&header, &body(1)).unwrap_err().contains("more than"));
     }
 
     #[test]

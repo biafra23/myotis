@@ -1,8 +1,9 @@
 //! Allocation regression test for #454 at the eth wire. Every decoder a peer
-//! reaches without being asked anything (the handshake, and the read loop's
-//! request-id, gossip and control paths) must stay flat on the frames from the
-//! report. Those are 10 MiB lists of one-byte elements, 492 KB as snappy on the
-//! wire, and decoding one into an owned tree cost 547 MB of heap.
+//! reaches must stay flat on the frames from the report: those reached without
+//! being asked anything (the handshake, and the read loop's request-id, gossip
+//! and control paths), and the responses to our own requests (headers, bodies,
+//! receipts, snap). The frames are 10 MiB lists of one-byte elements, 492 KB as
+//! snappy on the wire, and decoding one into an owned tree cost 547 MB of heap.
 //!
 //! Its own test binary, since a `#[global_allocator]` applies to the whole
 //! binary. Counts are per thread, so tests running in parallel don't mix.
@@ -12,6 +13,7 @@ use std::cell::Cell;
 
 use myotis_net::el::eth::messages;
 use myotis_net::el::rlpx::transport::decode_hello;
+use myotis_net::el::snap::messages as snap;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
@@ -136,4 +138,97 @@ fn gossip_decoders_cost_their_cap_not_the_frame() {
         let cap = messages::MAX_GOSSIP_HASHES_PER_MSG;
         assert!(a <= 4 * cap + 16 && b <= 1024 * 1024, "{shape} Transactions: {a} allocations, {b} bytes");
     }
+}
+
+/// `payload` wrapped as a list.
+fn list(payload: &[u8]) -> Vec<u8> {
+    let mut out = list_header(payload.len());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// `[1, payload]`: a response to request 1, the payload given as its encoding.
+fn response(payload: &[u8]) -> Vec<u8> {
+    list(&[&[0x01][..], payload].concat())
+}
+
+/// One-byte elements to fill a response frame, leaving room for its headers.
+const ELEMENTS: usize = N - 64;
+
+/// A decoder keeping a peer's elements as they arrived: one buffer the size
+/// of the input, not an allocation per element.
+fn assert_one_buffer(what: &str, allocations: usize, bytes: usize) {
+    assert!(
+        allocations <= 16 && bytes <= ELEMENTS + 64 * 1024,
+        "{what}: {allocations} allocations, {bytes} bytes for {ELEMENTS} elements"
+    );
+}
+
+#[test]
+fn header_responses_are_read_without_a_tree() {
+    // `[1, [0x01; N]]`: one-byte "headers". The first fails, and none is built.
+    let msg = nested();
+    let (a, b, r) = counted(|| messages::decode_block_headers(&msg));
+    assert!(r.is_err());
+    assert_flat("BlockHeaders of one-byte elements", a, b);
+    // `[1, [[0x01; N]]]`: one "header" of one-byte fields.
+    let one = response(&list(&list(&vec![0x01; ELEMENTS])));
+    let (a, b, r) = counted(|| messages::decode_block_headers(&one));
+    assert!(r.is_err());
+    assert_flat("a header of one-byte fields", a, b);
+}
+
+#[test]
+fn a_body_of_one_byte_transactions_is_one_buffer() {
+    // `[1, [[[0x01; N], []]]]`: one body of one-byte "typed transactions".
+    let body = list(&[list(&vec![0x01; ELEMENTS]), vec![0xc0]].concat());
+    let msg = response(&list(&body));
+    let (a, b, bodies) = counted(|| messages::decode_block_bodies(&msg, 1));
+    assert_eq!(bodies.unwrap().1[0].transactions.len(), ELEMENTS);
+    assert_one_buffer("BlockBodies", a, b);
+}
+
+#[test]
+fn receipt_blocks_of_one_byte_receipts_are_one_buffer() {
+    // eth/66-68 `[1, [[0x01; N]]]`: one block of one-byte "receipts".
+    let msg = response(&list(&list(&vec![0x01; ELEMENTS])));
+    let (a, b, blocks) = counted(|| messages::decode_receipts(&msg, 1));
+    assert_eq!(blocks.unwrap().1[0].len(), ELEMENTS);
+    assert_one_buffer("Receipts", a, b);
+}
+
+#[test]
+fn eth69_receipts_expand_only_for_the_verified_count() {
+    // The smallest well-formed eth/69 receipt, `[type, status, cumGas, []]`:
+    // five bytes, and 265 once its bloom is back.
+    let minimal = [0xc4, 0x80, 0x80, 0x80, 0xc0];
+    let count = ELEMENTS / minimal.len();
+    let msg = response(&list(&list(&minimal.repeat(count))));
+    let (a, b, blocks) = counted(|| messages::decode_receipts69(&msg, 1));
+    let blocks = blocks.unwrap().1;
+    assert_eq!(blocks[0].len(), count);
+    assert_one_buffer("eth/69 Receipts", a, b);
+    // Our block has one transaction: refused before a single bloom is built.
+    let (a, b, canonical) = counted(|| blocks[0].canonical(1).map(|c| c.len()));
+    assert!(canonical.is_err());
+    assert_flat("eth/69 receipts for the wrong count", a, b);
+}
+
+#[test]
+fn snap_responses_are_bounded_by_the_proof_cap_and_the_request() {
+    // `[1, [], [0x01; N]]`: a proof of one-byte nodes, refused on its count.
+    let proof = [vec![0xc0], list(&vec![0x01; ELEMENTS])].concat();
+    let range = list(&[&[0x01][..], &proof].concat());
+    let (a, b, r) = counted(|| snap::decode_account_range(&range));
+    assert!(r.is_err());
+    assert_flat("AccountRange proof", a, b);
+    let storage = list(&[&[0x01][..], &[0xc1, 0xc0], &list(&vec![0x01; ELEMENTS])].concat());
+    let (a, b, r) = counted(|| snap::decode_storage_ranges(&storage));
+    assert!(r.is_err());
+    assert_flat("StorageRanges proof", a, b);
+    // `[1, [0x01; N]]` for one requested code hash: one code kept.
+    let msg = nested();
+    let (a, b, codes) = counted(|| snap::decode_byte_codes(&msg, 1));
+    assert_eq!(codes.unwrap().1.len(), 1);
+    assert_flat("ByteCodes", a, b);
 }

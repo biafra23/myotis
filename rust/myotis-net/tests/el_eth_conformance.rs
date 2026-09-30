@@ -73,10 +73,12 @@ fn replay_reproduces_recorded_verdicts() {
 
     // (3) eth/69 bloomless receipts → recomputed-bloom canonical bytes.
     let receipts_msg = fs::read(corpus.join("002-receipts69.rlp")).expect("receipts vector");
-    let (_id, blocks) = messages::decode_receipts69(&receipts_msg).unwrap();
+    let (_id, blocks) = messages::decode_receipts69(&receipts_msg, usize::MAX).unwrap();
     actual.insert("receipts69.blocks".into(), blocks.len().to_string());
     for (b, block) in blocks.iter().enumerate() {
-        for (r, receipt) in block.iter().enumerate() {
+        // No body to take the count from here: the vector's own count.
+        let canonical = block.canonical(block.len()).unwrap();
+        for (r, receipt) in canonical.iter().enumerate() {
             actual.insert(format!("receipts69.{b}.{r}.canonical"), hex(receipt));
         }
     }

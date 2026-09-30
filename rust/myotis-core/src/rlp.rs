@@ -54,28 +54,13 @@ impl Item {
     /// Byte string of exactly `n` bytes (Tuweni `Bytes32.wrap` semantics:
     /// wrong size is an error, not a truncation).
     pub fn as_fixed_bytes(&self, n: usize) -> Result<&[u8], CoreError> {
-        let b = self.as_bytes()?;
-        if b.len() != n {
-            return err(format!("RLP: expected {n}-byte value, got {} bytes", b.len()));
-        }
-        Ok(b)
+        fixed_bytes(self.as_bytes()?, n)
     }
 
     /// Canonical unsigned integer ≤ 8 bytes, big-endian, no leading zeros
     /// (Tuweni `readLong` semantics).
     pub fn as_u64(&self) -> Result<u64, CoreError> {
-        let b = self.as_bytes()?;
-        if b.len() > 8 {
-            return err(format!("RLP: integer too large ({} bytes)", b.len()));
-        }
-        if !b.is_empty() && b[0] == 0 {
-            return err("RLP: integer has leading zero byte");
-        }
-        let mut v: u64 = 0;
-        for &x in b {
-            v = (v << 8) | u64::from(x);
-        }
-        Ok(v)
+        scalar_u64(self.as_bytes()?)
     }
 
     /// Like [`Item::as_u64`], additionally capped to `i64::MAX`. Java-parity
@@ -85,15 +70,200 @@ impl Item {
     /// sides now reject the signed-overflow range — no real chain value
     /// (block number, gas, timestamp, ENR seq) comes near 2^63.
     pub fn as_u64_fitting_long(&self) -> Result<u64, CoreError> {
-        let v = self.as_u64()?;
-        if v > i64::MAX as u64 {
-            return err(format!("RLP: integer {v} exceeds signed-64 range"));
-        }
-        Ok(v)
+        fitting_long(self.as_u64()?)
     }
 
     pub fn is_list(&self) -> bool {
         matches!(self, Item::List(_))
+    }
+}
+
+// Scalar reading shared by `Item` and `View`, so the two read a value alike.
+
+fn fixed_bytes(b: &[u8], n: usize) -> Result<&[u8], CoreError> {
+    if b.len() != n {
+        return err(format!("RLP: expected {n}-byte value, got {} bytes", b.len()));
+    }
+    Ok(b)
+}
+
+fn scalar_u64(b: &[u8]) -> Result<u64, CoreError> {
+    if b.len() > 8 {
+        return err(format!("RLP: integer too large ({} bytes)", b.len()));
+    }
+    if !b.is_empty() && b[0] == 0 {
+        return err("RLP: integer has leading zero byte");
+    }
+    let mut v: u64 = 0;
+    for &x in b {
+        v = (v << 8) | u64::from(x);
+    }
+    Ok(v)
+}
+
+fn fitting_long(v: u64) -> Result<u64, CoreError> {
+    if v > i64::MAX as u64 {
+        return err(format!("RLP: integer {v} exceeds signed-64 range"));
+    }
+    Ok(v)
+}
+
+/// A borrowed view of one RLP item, checked when it is made to be exactly one
+/// well-formed item (what [`decode`] accepts). Reading it builds nothing: the
+/// byte accessors return slices of the input, and [`View::as_list`] walks the
+/// elements in place. This is how peer messages are read (#454). [`decode`]
+/// spends about 50 heap bytes per input byte on its tree, and a peer can pack
+/// a 10 MiB frame with millions of one-byte elements. The accessors are
+/// [`Item`]'s, with the same errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View<'a> {
+    /// The item's whole encoding, header included.
+    raw: &'a [u8],
+}
+
+impl<'a> View<'a> {
+    /// A view of `data`, which must be exactly one well-formed item: the same
+    /// check, and the same errors, as [`decode`] (see [`validate`]).
+    pub fn new(data: &'a [u8]) -> Result<View<'a>, CoreError> {
+        validate(data)?;
+        Ok(View { raw: data })
+    }
+
+    /// The item's whole encoding, header included: the bytes to hash or to
+    /// copy into a re-encoding.
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    pub fn is_list(&self) -> bool {
+        is_list_prefix(self.raw)
+    }
+
+    /// Byte-string payload, or an error for a list.
+    pub fn as_bytes(&self) -> Result<&'a [u8], CoreError> {
+        if self.is_list() {
+            return err("RLP: expected bytes, found list");
+        }
+        let (start, len) = header(self.raw);
+        Ok(self.raw.get(start..).and_then(|p| p.get(..len)).unwrap_or_default())
+    }
+
+    /// The list's elements, walked in place, or an error for a byte string.
+    pub fn as_list(&self) -> Result<ViewIter<'a>, CoreError> {
+        if !self.is_list() {
+            return err("RLP: expected list, found bytes");
+        }
+        Ok(ViewIter { list: self.raw, pos: header(self.raw).0 })
+    }
+
+    /// See [`Item::as_fixed_bytes`].
+    pub fn as_fixed_bytes(&self, n: usize) -> Result<&'a [u8], CoreError> {
+        fixed_bytes(self.as_bytes()?, n)
+    }
+
+    /// See [`Item::as_u64`].
+    pub fn as_u64(&self) -> Result<u64, CoreError> {
+        scalar_u64(self.as_bytes()?)
+    }
+
+    /// See [`Item::as_u64_fitting_long`].
+    pub fn as_u64_fitting_long(&self) -> Result<u64, CoreError> {
+        fitting_long(self.as_u64()?)
+    }
+}
+
+/// The elements of a [`View`] list, walked in place. Each is a [`View`] of
+/// its own: a part of a checked item is itself one.
+#[derive(Debug, Clone)]
+pub struct ViewIter<'a> {
+    /// The whole list item; `pos` walks its payload.
+    list: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for ViewIter<'a> {
+    type Item = View<'a>;
+
+    fn next(&mut self) -> Option<View<'a>> {
+        let rest = self.list.get(self.pos..).filter(|r| !r.is_empty())?;
+        let (start, len) = header(rest);
+        let raw = rest.get(..start.checked_add(len)?)?;
+        self.pos += raw.len();
+        Some(View { raw })
+    }
+}
+
+impl core::iter::FusedIterator for ViewIter<'_> {}
+
+/// An owned list of RLP items, kept as their encodings back to back: what a
+/// [`View`] list holds, without the header, built one item at a time. Every
+/// item going in is whole and well-formed (a [`View`], or bytes this encodes),
+/// so [`ListBuf::iter`] walks them back without checking again. A peer's list
+/// kept this way costs what it weighed on the wire: no allocation and no offset
+/// per item, whatever their number (#454).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListBuf {
+    payload: Vec<u8>,
+    len: usize,
+}
+
+impl ListBuf {
+    pub fn new() -> ListBuf {
+        ListBuf::default()
+    }
+
+    /// An empty list with room for `bytes` of encoded items.
+    pub fn with_capacity(bytes: usize) -> ListBuf {
+        ListBuf { payload: Vec::with_capacity(bytes), len: 0 }
+    }
+
+    /// Append `item` as it is encoded.
+    pub fn push_view(&mut self, item: View<'_>) {
+        self.payload.extend_from_slice(item.raw);
+        self.len += 1;
+    }
+
+    /// Append `bytes` as a byte-string item.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        write_bytes(&mut self.payload, bytes);
+        self.len += 1;
+    }
+
+    /// How many items the list holds.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The items, in order.
+    pub fn iter(&self) -> ViewIter<'_> {
+        ViewIter { list: &self.payload, pos: 0 }
+    }
+}
+
+/// `(payload offset, payload length)` of the item heading `raw`, which a
+/// [`View`] has already checked: no validation here, and no panic should that
+/// ever not hold (a bad header reads as an empty payload).
+fn header(raw: &[u8]) -> (usize, usize) {
+    let Some(&first) = raw.first() else {
+        return (0, 0);
+    };
+    let long = |len_of_len: u8| {
+        let n = usize::from(len_of_len);
+        let len = raw
+            .get(1..1 + n)
+            .map_or(0, |b| b.iter().fold(0usize, |acc, &x| (acc << 8) | usize::from(x)));
+        (1 + n, len)
+    };
+    match first {
+        0x00..=0x7f => (0, 1),
+        0x80..=0xb7 => (1, usize::from(first - 0x80)),
+        0xb8..=0xbf => long(first - 0xb7),
+        0xc0..=0xf7 => (1, usize::from(first - 0xc0)),
+        0xf8..=0xff => long(first - 0xf7),
     }
 }
 
@@ -546,6 +716,65 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn a_view_reads_every_item_as_its_decoded_tree_does() {
+        let mut viewed = 0;
+        each_differential_input(|input| {
+            assert_eq!(View::new(input).map(|_| ()), decode(input).map(|_| ()), "input {input:02x?}");
+            if let (Ok(view), Ok(item)) = (View::new(input), decode(input)) {
+                assert_view_reads_as(&item, view);
+                viewed += 1;
+            }
+        });
+        assert!(viewed > 5_000, "only {viewed} inputs viewed");
+    }
+
+    /// `view` answers every accessor as `item` does, all the way down, and its
+    /// raw bytes are the item's encoding.
+    fn assert_view_reads_as(item: &Item, view: View) {
+        assert_eq!(view.raw(), &encode(item)[..]);
+        assert_eq!(view.is_list(), item.is_list());
+        assert_eq!(view.as_bytes(), item.as_bytes());
+        assert_eq!(view.as_u64(), item.as_u64());
+        assert_eq!(view.as_u64_fitting_long(), item.as_u64_fitting_long());
+        for n in [0, 1, 20, 32] {
+            assert_eq!(view.as_fixed_bytes(n), item.as_fixed_bytes(n));
+        }
+        match (item.as_list(), view.as_list()) {
+            (Ok(items), Ok(views)) => {
+                let views: Vec<View> = views.collect();
+                assert_eq!(views.len(), items.len());
+                for (item, view) in items.iter().zip(views) {
+                    assert_view_reads_as(item, view);
+                }
+            }
+            (Err(a), Err(b)) => assert_eq!(a, b),
+            (a, b) => panic!("as_list disagrees: {a:?} vs {:?}", b.map(Iterator::count)),
+        }
+    }
+
+    #[test]
+    fn a_list_buf_gives_back_what_went_in() {
+        let list_item = encode(&Item::List(vec![Item::Bytes(b"cat".to_vec())]));
+        let strings: [&[u8]; 4] = [b"", &[0x05], &[0x80], &[0xaa; 60]];
+        let mut buf = ListBuf::with_capacity(64);
+        buf.push_view(View::new(&list_item).unwrap());
+        for s in strings {
+            buf.push_bytes(s);
+        }
+        assert_eq!(buf.len(), 5);
+        let items: Vec<View> = buf.iter().collect();
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].raw(), &list_item[..]);
+        for (item, s) in items[1..].iter().zip(strings) {
+            assert_eq!(item.as_bytes().unwrap(), s);
+        }
+        // Back to back, the items are a list payload `decode` accepts.
+        let payload: Vec<u8> = items.iter().flat_map(|v| v.raw().to_vec()).collect();
+        assert_eq!(decode(&encode_list_payload(&payload)).unwrap().as_list().unwrap().len(), 5);
+        assert!(ListBuf::new().is_empty() && ListBuf::new().iter().next().is_none());
     }
 
     #[test]
