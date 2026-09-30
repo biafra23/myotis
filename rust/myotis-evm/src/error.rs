@@ -50,6 +50,22 @@ pub enum EvmError {
     /// be a well-formed wrong answer, and no retry can fix that. A refusal
     /// ([`EvmError::is_refusal`]).
     UnexpectedSlotNumber { block_number: u64 },
+    /// The request's transaction object is one no transaction could be (a
+    /// type-4 request without an authorization list, a tip above its fee cap,
+    /// a `chainId` for another chain, …): refused before any state is read,
+    /// never "repaired" into a different transaction ([`crate::tx::TxRequest::validate`]).
+    /// A refusal ([`EvmError::is_refusal`]) — no retry changes the request.
+    InvalidRequest { detail: String },
+    /// `eth_estimateGas`: the transaction does not succeed within the gas the
+    /// caller allowed — its `gas`, the funds its fee cap can pay for, or this
+    /// executor's own ceiling, whichever is lowest. A deterministic ANSWER, not
+    /// a failure to answer; the message is geth's, so a wallet reads it the
+    /// same way from this node as from a public one ([`EvmError::is_infeasible`]).
+    GasAllowanceExceeded { allowance: u64 },
+    /// `eth_estimateGas` with a fee cap: the sender cannot even cover the
+    /// transferred value (geth's `insufficient funds for transfer`). An answer
+    /// like [`EvmError::GasAllowanceExceeded`] ([`EvmError::is_infeasible`]).
+    InsufficientFundsForTransfer,
 }
 
 impl EvmError {
@@ -59,7 +75,20 @@ impl EvmError {
     pub fn is_refusal(&self) -> bool {
         matches!(
             self,
-            EvmError::MissingSlotNumber { .. } | EvmError::UnexpectedSlotNumber { .. }
+            EvmError::MissingSlotNumber { .. }
+                | EvmError::UnexpectedSlotNumber { .. }
+                | EvmError::InvalidRequest { .. }
+        )
+    }
+
+    /// True when the estimate RAN and the answer is that the transaction cannot
+    /// succeed within the caller's own limits (gas, funds). Hosts serve it as
+    /// geth does — JSON-RPC -32000 carrying this error's message — and never as
+    /// a number: a wallet that broadcast one would lose the fee.
+    pub fn is_infeasible(&self) -> bool {
+        matches!(
+            self,
+            EvmError::GasAllowanceExceeded { .. } | EvmError::InsufficientFundsForTransfer
         )
     }
 }
@@ -102,6 +131,13 @@ impl std::fmt::Display for EvmError {
                  block, but this build's fork table puts it before Amsterdam; refusing to run \
                  it under the older fork's rules"
             ),
+            EvmError::InvalidRequest { detail } => write!(f, "invalid transaction object: {detail}"),
+            // geth's exact messages (gasestimator / core.ErrInsufficientFundsForTransfer):
+            // wallets match on them.
+            EvmError::GasAllowanceExceeded { allowance } => {
+                write!(f, "gas required exceeds allowance ({allowance})")
+            }
+            EvmError::InsufficientFundsForTransfer => write!(f, "insufficient funds for transfer"),
         }
     }
 }
