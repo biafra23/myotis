@@ -93,9 +93,16 @@ impl<T: Clone> Slot<T> {
     /// is already there and `head` is no longer the `current` one (a slow
     /// compute finishing late must not regress it). A head that really moved
     /// backwards (re-anchor, reorg to a shorter chain) IS current and replaces
-    /// it; refusing it would leave the follower recomputing it every tick.
+    /// it; refusing it would leave the follower recomputing it every tick. Nor
+    /// may a late compute for a reorged-away sibling displace the value for the
+    /// top that IS current.
     pub(crate) fn store(&mut self, head: Head, value: T, now: Instant, current: Option<Head>) {
-        if current != Some(head) && self.cached.as_ref().is_some_and(|(h, _, _)| h.0 > head.0) {
+        if current != Some(head)
+            && self
+                .cached
+                .as_ref()
+                .is_some_and(|(h, _, _)| h.0 > head.0 || Some(*h) == current)
+        {
             return;
         }
         self.cached = Some((head, value, now));
@@ -210,13 +217,17 @@ impl FeeCache {
         now: Instant,
     ) -> (Lookup<FeeHistory>, Arc<tokio::sync::Mutex<()>>) {
         if !self.histories.contains_key(shape) && self.histories.len() >= HISTORY_SHAPES_MAX {
-            if let Some(oldest) = self
+            // Victim preference: a shape with no build in flight (evicting one
+            // drops its result and splits its single-flight), then a pinned
+            // shape over a followed `latest` one (whose demand only moves on
+            // wallet polls), then the least recently requested.
+            if let Some(victim) = self
                 .histories
                 .iter()
-                .min_by_key(|(_, e)| e.last_demand)
+                .min_by_key(|(s, e)| (e.lock.try_lock().is_err(), s.follows_head(), e.last_demand))
                 .map(|(k, _)| k.clone())
             {
-                self.histories.remove(&oldest);
+                self.histories.remove(&victim);
             }
         }
         let entry = self.histories.entry(shape.clone()).or_insert_with(|| HistoryEntry {
@@ -349,6 +360,16 @@ mod tests {
     }
 
     #[test]
+    fn a_late_compute_for_a_reorged_sibling_never_displaces_the_current_top() {
+        let t0 = Instant::now();
+        let mut s = Slot::default();
+        s.store(h(100, 0xb), est(9), t0, Some(h(100, 0xb)));
+        s.store(h(100, 0xa), est(7), t0, Some(h(100, 0xb)));
+        assert_eq!(tip_of(s.lookup(h(100, 0xb), t0, false)), Some((true, 9)));
+        assert!(!s.wants_refresh(h(100, 0xb), t0));
+    }
+
+    #[test]
     fn a_head_that_really_moved_backwards_is_stored_and_not_refreshed_again() {
         let t0 = Instant::now();
         let mut s = Slot::default();
@@ -427,6 +448,25 @@ mod tests {
         assert_eq!(c.histories.len(), HISTORY_SHAPES_MAX);
         // The least recently requested went first.
         assert!(!c.histories.contains_key(&HistoryShape::new(1, None, None)));
+    }
+
+    #[test]
+    fn eviction_spares_the_followed_shape_and_builds_in_flight() {
+        let t0 = Instant::now();
+        let mut c = FeeCache::default();
+        let latest = HistoryShape::new(5, None, None);
+        let _ = c.history_lookup(&latest, h(1, 1), t0);
+        // The oldest pinned shape has a build in flight.
+        let busy = HistoryShape::new(5, Some(1), None);
+        let (_, busy_lock) = c.history_lookup(&busy, h(1, 1), t0 + Duration::from_millis(1));
+        let _guard = busy_lock.try_lock().expect("uncontended");
+        for i in 0..(HISTORY_SHAPES_MAX as u64 + 4) {
+            let later = t0 + Duration::from_millis(10 + i);
+            let _ = c.history_lookup(&HistoryShape::new(5, Some(100 + i), None), h(1, 1), later);
+        }
+        assert_eq!(c.histories.len(), HISTORY_SHAPES_MAX);
+        assert!(c.histories.contains_key(&latest));
+        assert!(c.histories.contains_key(&busy));
     }
 
     #[test]
