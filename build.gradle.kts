@@ -404,14 +404,29 @@ fun probeTool(vararg cmd: String): String =
 val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
 val cargoNdkVersion = if (cargoVersion.isEmpty()) "" else probeTool("cargo", "ndk", "--version")
 
-// Minimum toolchain: headroom for the crates the engine phase pulls in
-// (alloy-primitives / ethereum_ssz MSRVs move quickly). Older toolchains skip
-// the Rust build exactly like a missing cargo — java stays fully functional.
-val minRustMinor = 85
-val rustAvailable = Regex("""cargo (\d+)\.(\d+)""").find(cargoVersion)?.let {
-    val (major, minor) = it.destructured
-    major.toInt() > 1 || (major.toInt() == 1 && minor.toInt() >= minRustMinor)
-} ?: false
+// Minimum toolchain: the workspace's `rust-version` (rust/Cargo.toml
+// [workspace.package]), read rather than restated so the gate and cargo can't
+// disagree. Older toolchains skip the Rust build exactly like a missing cargo —
+// java stays fully functional. A gate below the real floor admits toolchains
+// that then fail inside cargo on a dependency's rust-version instead of skipping.
+// Lazy: a cargo-less build never reads the manifest.
+val minRustVersion: String by lazy {
+    file("rust/Cargo.toml").readText()
+        .substringAfter("[workspace.package]", "")
+        .substringBefore("\n[")
+        .let { Regex("""^rust-version\s*=\s*"(\d+(\.\d+){0,2})"""", RegexOption.MULTILINE).find(it) }
+        ?.groupValues?.get(1)
+        ?: throw GradleException("rust/Cargo.toml: no [workspace.package] rust-version found — the Rust toolchain gate reads it")
+}
+// Cargo's own rule: missing components count as 0, and patch levels matter
+// (1.91.0 does not satisfy a crate declaring 1.91.1).
+fun rustVersionAtLeast(version: String, floor: String): Boolean {
+    fun parts(v: String) = v.split('.').map { it.toInt() }.let { it + List(3 - it.size) { 0 } }
+    val (have, need) = parts(version) to parts(floor)
+    return (0 until 3).firstOrNull { have[it] != need[it] }?.let { have[it] > need[it] } ?: true
+}
+val rustAvailable = Regex("""cargo (\d+\.\d+\.\d+)""").find(cargoVersion)
+    ?.let { rustVersionAtLeast(it.groupValues[1], minRustVersion) } ?: false
 
 // NDK for cargoNdkAndroid: $ANDROID_NDK_HOME, else the newest ndk/<version>
 // under the SDK from local.properties / $ANDROID_HOME / $ANDROID_SDK_ROOT.
@@ -556,6 +571,68 @@ val cargoTest = tasks.register<Exec>("cargoTest") {
 }
 tasks.named("check") { dependsOn(cargoTest) }
 
+// The declared floor only helps while it is true. Cargo never compares it with
+// the dependencies' own rust-version, so a lock update to a crate needing a
+// newer rustc goes unnoticed on an up-to-date toolchain, and the toolchains
+// between the two numbers stop skipping and start failing in cargo. That is how
+// the gate sat at 1.85 while revm needed 1.91. Every resolved package counts:
+// every target platform (Android and iOS build the same graph) and every
+// optional feature (-PtorEngine links the Arti tree).
+val verifyRustVersionFloor = tasks.register<Exec>("verifyRustVersionFloor") {
+    group = "verification"
+    description = "Fail when a Rust dependency or workspace member needs a newer rustc than rust/Cargo.toml's rust-version (self-skips without cargo)"
+    onlyIf { rustAvailable }
+    workingDir = file("rust")
+    rustToolchainPath?.let { environment("PATH", it) }
+    commandLine(rustTool("cargo"), "metadata", "--format-version", "1", "--locked", "--all-features")
+    val metadata = ByteArrayOutputStream()
+    standardOutput = metadata
+    // The verdict depends only on the manifests and the lock, so an unchanged
+    // tree is UP-TO-DATE instead of re-resolving every package on each `check`.
+    inputs.files(fileTree("rust") {
+        include("Cargo.toml", "Cargo.lock", "*/Cargo.toml")
+        exclude("roost/**", "tor-poc/**", "target/**")
+    }).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property("cargoVersion", cargoVersion)
+    val marker = layout.buildDirectory.file("verifyRustVersionFloor/ok")
+    outputs.file(marker)
+    doLast {
+        val floor = minRustVersion
+        @Suppress("UNCHECKED_CAST")
+        val root = groovy.json.JsonSlurper().parseText(metadata.toString(Charsets.UTF_8)) as Map<String, Any?>
+        val members = (root["workspace_members"] as List<*>).toSet()
+        val packages = root["packages"] as List<Map<String, Any?>>
+        val tooNew = mutableListOf<String>()
+        val memberDrift = mutableListOf<String>()
+        packages.forEach { pkg ->
+            val declared = pkg["rust_version"] as String?
+            val label = "${pkg["name"]} ${pkg["version"]}"
+            if (pkg["id"] in members) {
+                if (declared == null || !rustVersionAtLeast(declared, floor) || !rustVersionAtLeast(floor, declared)) {
+                    memberDrift += "$label: rust-version = ${declared ?: "(none)"}"
+                }
+            } else if (declared != null && !rustVersionAtLeast(floor, declared)) {
+                tooNew += "$label needs rustc $declared"
+            }
+        }
+        val problems = mutableListOf<String>()
+        if (tooNew.isNotEmpty()) {
+            problems += "These dependencies need a newer rustc than rust/Cargo.toml's rust-version ($floor):\n" +
+                tooNew.sorted().joinToString("\n") { "  $it" } +
+                "\nRaise [workspace.package] rust-version to the highest of them; the Gradle toolchain" +
+                "\ngate reads that line, so older toolchains then skip the Rust build instead of failing."
+        }
+        if (memberDrift.isNotEmpty()) {
+            problems += "These workspace members don't declare the workspace rust-version ($floor):\n" +
+                memberDrift.sorted().joinToString("\n") { "  $it" } +
+                "\nSet `rust-version.workspace = true` in each member's [package] table."
+        }
+        if (problems.isNotEmpty()) throw GradleException(problems.joinToString("\n\n"))
+        marker.get().asFile.apply { parentFile.mkdirs(); writeText("rust-version $floor\n") }
+    }
+}
+tasks.named("check") { dependsOn(verifyRustVersionFloor) }
+
 // wasm32 canary: `cargo check --target wasm32-unknown-unknown` for the sans-I/O
 // crates (myotis-consensus, and myotis-core since the EL phase). PROVES they
 // stayed sans-I/O — tokio/libp2p/discv5 (and any sockets/fs dependency someone
@@ -682,8 +759,8 @@ tasks.register("requireAndroidRustEngine") {
         }
         if (!androidRustToolchainReady) {
             val missing = buildList {
-                if (cargoVersion.isEmpty()) add("cargo/rustc (need 1.$minRustMinor or newer)")
-                else if (!rustAvailable) add("a newer rustc (need 1.$minRustMinor+; found \"$cargoVersion\")")
+                if (cargoVersion.isEmpty()) add("cargo/rustc (need $minRustVersion or newer)")
+                else if (!rustAvailable) add("a newer rustc (need $minRustVersion+; found \"$cargoVersion\")")
                 if (cargoNdkVersion.isEmpty()) add("cargo-ndk (`cargo install cargo-ndk`)")
                 if (androidNdkDir == null) add("the Android NDK r28+ (set ANDROID_NDK_HOME, or install it under <sdk>/ndk/)")
                 val tgts = androidRustTargets.filterNot { it in installedRustupTargets }
@@ -834,11 +911,11 @@ val rustSkipNote = when {
     cargoVersion.isEmpty() ->
         "[rust] cargo/rustc not found — skipping the Rust build; the pure-Java build is unaffected"
     !rustAvailable ->
-        "[rust] $cargoVersion is older than 1.$minRustMinor — skipping the Rust build; the pure-Java build is unaffected"
+        "[rust] $cargoVersion is older than $minRustVersion — skipping the Rust build; the pure-Java build is unaffected"
     else -> null
 }
 gradle.taskGraph.whenReady {
-    if (allTasks.none { it.name.startsWith("cargo") }) return@whenReady
+    if (allTasks.none { it.name.startsWith("cargo") || it.name == "verifyRustVersionFloor" }) return@whenReady
     if (rustSkipNote != null) {
         logger.lifecycle(rustSkipNote)
     } else if (allTasks.any { it.name == "cargoNdkAndroid" } && skipRustEngine) {

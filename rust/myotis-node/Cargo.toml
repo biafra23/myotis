@@ -2,6 +2,7 @@
 name = "myotis-node"
 version.workspace = true
 edition = "2021"
+rust-version.workspace = true
 description = "Node.js (napi-rs) binding over the myotis-engine C ABI — for Electron/Node hosts"
 license = "MIT OR Apache-2.0"
 

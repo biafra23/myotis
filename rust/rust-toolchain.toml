@@ -1,5 +1,5 @@
-# Track stable. The Gradle probe (root build.gradle.kts) enforces the minimum rustc
-# version; pinning an exact version here would force rustup downloads on machines that
+# Track stable. The minimum rustc is `rust-version` in Cargo.toml [workspace.package],
+# which the Gradle probe (root build.gradle.kts) enforces; pinning an exact version here would force rustup downloads on machines that
 # already have a new-enough stable, which fights the "Rust is optional" build design.
 [toolchain]
 channel = "stable"
