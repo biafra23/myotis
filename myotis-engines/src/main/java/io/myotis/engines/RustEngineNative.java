@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 33; // 33: executor refusals are permanent (-32602); Gloas SYNCED waits for the resolved execution header
+    static final int EXPECTED_ABI_VERSION = 34; // 34: estimate_gas_tx_json — the full eth_estimateGas transaction object (#509)
 
     private static final boolean AVAILABLE = load();
 
@@ -296,6 +296,16 @@ final class RustEngineNative {
     static String nativeEstimateGasJson(
             long handle, String from, String to, String data, String value) {
         return Myotis_engineKt.estimateGasJson(handle, nz(from), nz(to), nz(data), nz(value));
+    }
+
+    /**
+     * Verified {@code eth_estimateGas} for the FULL transaction object (ABI >= 34,
+     * #509) — {@code tx} is the canonical JSON the router built, {@code block} the
+     * RPC block selector, {@code stateOverrides} a state override object (empty ⇒
+     * none). Every field is applied or the request refused (-32602).
+     */
+    static String nativeEstimateGasTxJson(long handle, String tx, String block, String stateOverrides) {
+        return Myotis_engineKt.estimateGasTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
     }
 
     /** Verified ENS forward resolution (name → address record), as JSON. */

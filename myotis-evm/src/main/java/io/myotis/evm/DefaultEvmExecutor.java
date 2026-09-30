@@ -87,24 +87,55 @@ public final class DefaultEvmExecutor implements EvmExecutor {
     private long estimateGasOnce(UnsignedTransaction tx, BlockContext blockContext) {
         CryptoProviders.ensureRegistered();
         long intrinsicGas = computeIntrinsicGas(tx.data());
-        long ceiling = tx.gasLimit() != null ? tx.gasLimit() : DEFAULT_GAS_LIMIT;
-        long evmBudget = ceiling - intrinsicGas;
-        if (evmBudget < 0) {
-            // The intrinsic cost alone exceeds the ceiling — caller's
-            // gasLimit is too low even before the EVM gets a chance to run.
-            // Note: a budget of exactly 0 is legal — a plain ETH transfer
-            // to an existing EOA at gasLimit=21000 has no EVM execution
-            // and runForEstimation correctly returns evmUsed=0.
-            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+        // The ceiling (geth's `hi`, #509): the executor's budget — never above
+        // what a transaction may carry at all (EIP-7825 from Osaka) — lowered by
+        // the caller's gas limit (below 21000 geth reads it as no limit, and so
+        // do we) and, under a fee cap, by what the sender can pay for. The answer
+        // never exceeds it, and a transaction that does not succeed within it
+        // is geth's "gas required exceeds allowance".
+        long ceiling = Math.min(DEFAULT_GAS_LIMIT, EvmFactory.txGasLimitCap(blockContext));
+        if (tx.gasLimit() != null && tx.gasLimit() >= 21_000L) {
+            ceiling = Math.min(ceiling, tx.gasLimit());
         }
-        long evmUsed = runForEstimation(tx, blockContext, evmBudget);
-        long total = intrinsicGas + evmUsed;
+        java.math.BigInteger feeCap = tx.feeCapOrZero();
+        if (feeCap.signum() > 0) {
+            java.math.BigInteger balance = balanceOf(tx.from(), blockContext);
+            if (tx.value().compareTo(balance) >= 0) {
+                throw new EvmExecutionException(new EvmExecutionError.InsufficientFundsForTransfer());
+            }
+            java.math.BigInteger fundable = balance.subtract(tx.value()).divide(feeCap);
+            if (fundable.compareTo(java.math.BigInteger.valueOf(ceiling)) < 0) {
+                ceiling = fundable.longValue();
+            }
+        }
+        // EIP-7623: from Prague on a transaction is charged at least this floor,
+        // so the answer must cover it (the Rust estimate's `tx_gas_used` twin).
+        long floor = EvmFactory.calldataFloorActive(blockContext) ? computeCalldataFloor(tx.data()) : 0L;
+        if (intrinsicGas > ceiling || floor > ceiling) {
+            // The limit does not even cover the intrinsic cost (or the floor).
+            // Note: a budget of exactly 0 is legal — a plain ETH transfer to an
+            // existing EOA at gasLimit=21000 has no EVM execution and
+            // runForEstimation correctly returns evmUsed=0.
+            throw new EvmExecutionException(new EvmExecutionError.GasAllowanceExceeded(ceiling));
+        }
+        long evmUsed = runForEstimation(tx, blockContext, ceiling - intrinsicGas, ceiling);
+        long total = Math.max(intrinsicGas + evmUsed, floor);
         // 15% safety buffer per the plan. A slightly-too-high estimate just
         // costs the user some priority fee; a slightly-too-low one OOG's
         // the broadcast transaction — so round *up* strictly. Math.round
         // can round down (e.g. for totals where total * 1.15 lands just
-        // below x.5), defeating the safety property.
-        return (long) Math.ceil(total * 1.15);
+        // below x.5), defeating the safety property. Never above the ceiling:
+        // the run just succeeded within it, so the ceiling is itself a limit
+        // that works — geth's invariant.
+        return Math.min((long) Math.ceil(total * 1.15), ceiling);
+    }
+
+    /** The verified balance of {@code address} at {@code blockContext}'s state root. */
+    private java.math.BigInteger balanceOf(Address address, BlockContext blockContext) {
+        SyncStateView view = new SyncStateView(oracle, blockContext.stateRoot(), bytecodeCache, new AccessTracker());
+        var account = new SnapWorldUpdater(view).updater().get(
+                org.hyperledger.besu.datatypes.Address.wrap(Bytes.wrap(address.toByteArray())));
+        return account == null ? java.math.BigInteger.ZERO : account.getBalance().toBigInteger();
     }
 
     /**
@@ -114,7 +145,8 @@ public final class DefaultEvmExecutor implements EvmExecutor {
      * NOT return a number for a reverting transaction (the caller must
      * not broadcast it).
      */
-    private long runForEstimation(UnsignedTransaction tx, BlockContext blockContext, long evmBudget) {
+    private long runForEstimation(UnsignedTransaction tx, BlockContext blockContext, long evmBudget,
+                                  long ceiling) {
         EvmFactory.EvmAndPrecompiles bundle = EvmFactory.buildForBlock(blockContext);
         EVM evm = bundle.evm();
 
@@ -142,7 +174,10 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 .address(besuTarget)
                 .originator(besuSender)
                 .contract(besuTarget)
-                .gasPrice(Wei.ZERO)
+                // What GASPRICE reads: the request's effective price (zero
+                // when it names no fee field) — a relayer that pays itself
+                // gasleft() × tx.gasprice costs more when it is not zero.
+                .gasPrice(Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())))
                 .blobGasPrice(Wei.ZERO)
                 .inputData(Bytes.wrap(tx.data()))
                 .sender(besuSender)
@@ -179,7 +214,8 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         }
         var halt = frame.getExceptionalHaltReason();
         if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
-            throw new EvmExecutionException(new EvmExecutionError.OutOfGas());
+            // Out of gas AT the ceiling: more than the caller allowed.
+            throw new EvmExecutionException(new EvmExecutionError.GasAllowanceExceeded(ceiling));
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
@@ -227,6 +263,19 @@ public final class DefaultEvmExecutor implements EvmExecutor {
             gas += (b == 0) ? 4L : 16L;
         }
         return gas;
+    }
+
+    /**
+     * EIP-7623's calldata floor: {@code 21000 + 10 × tokens}, where a zero byte
+     * is one token and a non-zero byte four. Active from Prague
+     * ({@link EvmFactory#calldataFloorActive}).
+     */
+    static long computeCalldataFloor(byte[] calldata) {
+        long tokens = 0;
+        for (byte b : calldata) {
+            tokens += (b == 0) ? 1L : 4L;
+        }
+        return 21_000L + 10L * tokens;
     }
 
     private byte[] runOnce(Address sender, Address target, byte[] calldata,

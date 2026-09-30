@@ -364,6 +364,23 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void detailedEstimate_infeasibleCarriesGethsMessage() {
+        // ABI 34 (#509): the transaction does not fit the caller's gas or funds —
+        // an answer the router serves as geth does (-32000, this message verbatim).
+        var inf = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"gas required exceeds allowance (50000)\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.INFEASIBLE, inf.status());
+        org.junit.jupiter.api.Assertions.assertEquals("gas required exceeds allowance (50000)", inf.detail());
+        // The legacy two-state view has no number for it.
+        assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"insufficient funds for transfer\"}"));
+        // A reasonless one is native shape drift: fail closed.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasDetailedFromJson("{\"status\":\"infeasible\"}"));
+    }
+
+    @Test
     void detailedEstimate_legacyViewStaysNullOnRevert() {
         org.junit.jupiter.api.Assertions.assertNull(RustChainHandle.estimateGasFromJson(
                 "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}"));

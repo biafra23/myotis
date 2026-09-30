@@ -1028,6 +1028,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 handle, fromHex, toHex, dataHex, valueDecimal)));
     }
 
+    /**
+     * One verified {@code eth_estimateGas} for the full transaction object (ABI 34,
+     * #509): {@code txJson} is the canonical JSON the router built, {@code block}
+     * the RPC block selector, {@code stateOverridesJson} a state override (empty ⇒
+     * none). Throws {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.EstimateResult estimateGasTxVerifiedDetailed(
+            String txJson, String block, String stateOverridesJson) {
+        return estimateGasDetailedFromJson(gated(() -> RustEngineNative.nativeEstimateGasTxJson(
+                handle, txJson, block, stateOverridesJson)));
+    }
+
     /** Package-private test seam: estimateGas JSON → the engine's three-way outcome.
      *  The Rust side emits {@code {"status":"ok","gas":N}} /
      *  {@code {"status":"revert","dataHex"}} (ABI v23) / {@code {"status":
@@ -1035,7 +1047,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  host serves as the standard code-3 error. An executor refusal (ABI 33)
      *  arrives as the permanent {@code {"error","code":-32602}} envelope and is
      *  {@link io.myotis.api.EstimateResult.Status#REFUSED}, as for
-     *  {@link #callDetailedFromJson}. */
+     *  {@link #callDetailedFromJson}. {@code {"status":"infeasible","reason"}}
+     *  (ABI 34) is {@link io.myotis.api.EstimateResult.Status#INFEASIBLE}: the
+     *  transaction does not fit the caller's gas or funds, and {@code reason} is
+     *  geth's message. */
     static io.myotis.api.EstimateResult estimateGasDetailedFromJson(String json) {
         JsonObject o = parseJsonObject(json, "estimateGas");
         String refusal = permanentRefusalOrNull(o);
@@ -1049,6 +1064,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 throw new EngineException(
                         "malformed estimateGas JSON from the Rust engine: " + e.getMessage(), e);
             }
+        }
+        if ("infeasible".equals(status)) {
+            String reason = stringOrNull(o, "reason");
+            if (reason == null || reason.isBlank()) {
+                throw new EngineException("estimateGas JSON: status=infeasible without a reason");
+            }
+            return io.myotis.api.EstimateResult.infeasible(reason);
         }
         if (!"ok".equals(status)) {
             return io.myotis.api.EstimateResult.unavailable(stringOrNull(o, "reason"));

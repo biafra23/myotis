@@ -15,8 +15,15 @@ package io.myotis.api;
  *   <li>{@link Status#UNAVAILABLE} — no verified answer right now (retryable);
  *       {@code detail} may carry a diagnostic reason.</li>
  *   <li>{@link Status#REFUSED} — permanently unanswerable on this build (e.g.
- *       an EVM fork this engine cannot price); {@code detail} says why. Hosts
- *       serve the permanent -32602, as for {@link CallResult.Status#REFUSED}.</li>
+ *       an EVM fork this engine cannot price, or a transaction object whose
+ *       fields contradict each other); {@code detail} says why. Hosts serve the
+ *       permanent -32602, as for {@link CallResult.Status#REFUSED}.</li>
+ *   <li>{@link Status#INFEASIBLE} — the estimate RAN and the transaction does
+ *       not succeed within the caller's own limits: its {@code gas}, or what
+ *       its fee cap lets the sender pay for (#509). An answer, not a failure to
+ *       answer; {@code detail} carries geth's message ("gas required exceeds
+ *       allowance (N)", "insufficient funds for transfer"), which hosts serve
+ *       verbatim as geth does (JSON-RPC -32000) — never as a number.</li>
  * </ul>
  *
  * <p>Flat record over FFI-portable types per the engine-contract rules;
@@ -29,7 +36,7 @@ public record EstimateResult(Status status, long gas, byte[] revertData, String 
         java.util.Objects.requireNonNull(status, "status");
     }
 
-    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED }
+    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 
     public static EstimateResult ok(long gas) {
         return new EstimateResult(Status.OK, gas, null, null);
@@ -46,5 +53,10 @@ public record EstimateResult(Status status, long gas, byte[] revertData, String 
 
     public static EstimateResult refused(String detail) {
         return new EstimateResult(Status.REFUSED, 0L, null, detail);
+    }
+
+    public static EstimateResult infeasible(String detail) {
+        return new EstimateResult(Status.INFEASIBLE, 0L, null,
+                java.util.Objects.requireNonNull(detail, "detail"));
     }
 }
