@@ -140,6 +140,15 @@ class RpcTransactionArgs private constructor(
             if (nonce != null && RpcQuantities.decimalToHex(nonce) == "f".repeat(16)) {
                 refuse("nonce 0xffffffffffffffff is not a valid transaction nonce (EIP-2681)")
             }
+            // The typed view holds a Long. No account can reach 2^63
+            // transactions, so the rest of the u64 range is refused here, not
+            // wrapped negative or thrown past parse() as a NumberFormatException
+            // (which failed the whole HTTP request, and every call batched
+            // with it). The Rust engine takes all of u64 over its own FFI.
+            val typedNonce = nonce?.let {
+                it.toLongOrNull() ?: refuse("'nonce' ${quantityHex(it)} is above 0x7fffffffffffffff, " +
+                    "the largest nonce this node simulates")
+            }
 
             val accessList = field("accessList")?.let { accessList(it) }
             val authorizations = field("authorizationList")?.let { authorizationList(it) }
@@ -207,7 +216,7 @@ class RpcTransactionArgs private constructor(
                 gasPriceWei = gasPrice,
                 maxFeePerGasWei = maxFee,
                 maxPriorityFeePerGasWei = maxPriority,
-                nonce = nonce?.toLong(),
+                nonce = typedNonce,
                 chainId = chainId,
                 type = type,
                 hasAccessList = hasAccessList,

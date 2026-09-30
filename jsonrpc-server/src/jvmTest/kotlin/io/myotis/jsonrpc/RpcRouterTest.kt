@@ -1248,6 +1248,24 @@ class RpcRouterTest {
         assertEquals("0xcf08", result(served))
     }
 
+    /** A nonce past the typed Long is a -32602 with its reason, answered per
+     *  element: it once threw out of the parser and failed the whole HTTP
+     *  request, batch included (#514 review). */
+    @Test fun estimateGas_nonceAboveTheTypedRange_isRefusedPerElement() {
+        val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+        val resp = route(b,
+            """[{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+                "params":[{"to":"0x2222222222222222222222222222222222222222","nonce":"0x8000000000000000"}]},
+               {"jsonrpc":"2.0","id":2,"method":"eth_estimateGas",
+                "params":[{"to":"0x2222222222222222222222222222222222222222","nonce":"0x7fffffffffffffff"}]}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        val error = arr[0].jsonObject["error"]!!.jsonObject
+        assertEquals(-32602, error["code"]!!.jsonPrimitive.content.toInt())
+        assertTrue(error["message"]!!.jsonPrimitive.content.contains("above 0x7fffffffffffffff"), resp)
+        assertEquals("0x5208", arr[1].jsonObject["result"]!!.jsonPrimitive.content)
+        assertEquals(Long.MAX_VALUE, b.lastTx!!.nonce())
+    }
+
     /** `"data": null` is absent on its own — it must not hide `input`. */
     @Test fun ethCall_nullDataWithInput_runsTheInput() {
         val b = FakeBackend(callResult = byteArrayOf(1))
@@ -1276,6 +1294,22 @@ class RpcRouterTest {
             """{"jsonrpc":"2.0","id":1,"method":"eth_call",
                "params":[{$to,"authorizationList":[],"data":"0x01","input":"0x01"},"latest"]}""")
         assertEquals("0x01", result(resp))
+    }
+
+    /** Two identical malformed strings are refused as malformed, not as a
+     *  data/input disagreement (#514 review). */
+    @Test fun ethCall_malformedDataAndInput_nameTheMalformedField() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        mapOf(
+            """{$to,"data":"0xzz","input":"0xzz"}""" to "'data' is not hex data",
+            """{$to,"data":"0x01","input":"0x0"}""" to "'input' is not hex data",
+        ).forEach { (obj, reason) ->
+            val resp = route(FakeBackend(callResult = byteArrayOf(1)),
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$obj,"latest"]}""")
+            assertEquals(-32602, errorCode(resp), resp)
+            val message = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content
+            assertEquals(reason, message, obj)
+        }
     }
 
     @Test fun estimateGas_revertingTx_errors() {

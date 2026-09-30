@@ -289,8 +289,11 @@ class RpcRouter(
             ?.let { return "eth_call with blob fields ('$it') is not supported by this node" }
         val data = callObj["data"]?.takeUnless { it is JsonNull }
         val input = callObj["input"]?.takeUnless { it is JsonNull }
-        if (data != null && input != null && data.asHexBytes()?.let { d -> input.asHexBytes()?.contentEquals(d) } != true) {
-            return "both 'data' and 'input' are set and not equal; use 'input'"
+        if (data != null && input != null) {
+            // Malformed first: two identical bad strings are not "not equal".
+            val d = data.asHexBytes() ?: return "'data' is not hex data"
+            val i = input.asHexBytes() ?: return "'input' is not hex data"
+            if (!d.contentEquals(i)) return "both 'data' and 'input' are set and not equal; use 'input'"
         }
         return null
     }

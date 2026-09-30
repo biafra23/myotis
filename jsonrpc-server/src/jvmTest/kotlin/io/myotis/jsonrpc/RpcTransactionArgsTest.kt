@@ -84,6 +84,9 @@ class RpcTransactionArgsTest {
             """{$to,"blobVersionedHashes":["0x01"]}""" to "blob transactions",
             """{$to,"type":"0x7e"}""" to "unsupported transaction type",
             """{$to,"nonce":"0xffffffffffffffff"}""" to "EIP-2681",
+            // Past the typed Long: refused with a reason, never thrown (#514 review).
+            """{$to,"nonce":"0x8000000000000000"}""" to "above 0x7fffffffffffffff",
+            """{$to,"nonce":"0xfffffffffffffffe"}""" to "above 0x7fffffffffffffff",
             """{"to":"0x1234"}""" to "'to' is not a 20-byte",
             """{$to,"gas":"0x10000000000000000"}""" to "exceeds 64 bits",
             """{$to,"authorizationList":[{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963","nonce":"0x0","chainId":"0x1","r":"0x1","s":"0x1"}]}""" to "yParity",
@@ -104,6 +107,12 @@ class RpcTransactionArgsTest {
         assertTrue(valid(auth(""","v":"0x1c"""")).json.contains(""""yParity":"0x1""""))
         assertTrue(valid(auth(""","v":"0x1c","yParity":"0x1"""")).json.contains(""""yParity":"0x1""""))
         assertTrue(refusal(auth(""","v":"0x1b","yParity":"0x1"""")).contains("disagree"))
+    }
+
+    @Test fun theLargestTypedNonceIsServed() {
+        val tx = valid("""{"to":"0x2222222222222222222222222222222222222222","nonce":"0x7fffffffffffffff"}""")
+        assertEquals(Long.MAX_VALUE, tx.nonce)
+        assertTrue(tx.json.contains(""""nonce":"0x7fffffffffffffff""""), tx.json)
     }
 
     @Test fun aCreationNamingItsNonceHasExtendedFields() {
