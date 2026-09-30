@@ -42,17 +42,17 @@ It is worth noting that Bitcoin has had an answer to this problem since 2008. Sa
 
 SPV allows a Bitcoin wallet to verify its own transactions cryptographically, using only a small amount of data downloaded directly from the Bitcoin peer-to-peer network. The wallet does not need to trust any server. It checks the mathematics itself. Wallets like Electrum have used this approach for over a decade, running comfortably on ordinary laptops and mobile phones.
 
-Bitcoin users who care about self-sovereignty have had access to trustless light clients for the entire history of the ecosystem. Ethereum users, despite operating a far more sophisticated network, have not. Until soon.
+Bitcoin users who care about self-sovereignty have had access to trustless light clients for the entire history of the ecosystem. Ethereum users, despite operating a far more sophisticated network, have not. Until now.
 
 ---
 
 ## What This Library Is
 
-This library aims to be an Android foundation for a trustless Ethereum wallet. It gives wallet developers everything they need to show users their past transactions, current balances, and token holdings, and to create and broadcast new transactions — all without connecting to a centralised server at any point. The library handles the peer-to-peer networking, cryptographic verification, and consensus tracking directly, so the wallet built on top of it inherits all of those properties without having to implement them itself.
+Myotis is a wallet engine for a trustless Ethereum wallet — it runs as an Android app, an iOS app and a desktop app, and embeds as a library (a Node.js addon for Electron hosts, an iOS framework). It gives wallet developers everything they need to show users their current balances and token holdings, resolve names, and create and broadcast new transactions — all without connecting to a centralised server at any point — and exposes it as a standard JSON-RPC endpoint an unmodified wallet can use (see the [README](../README.md) for what is built and [Implementation Status](implementation-status.md) for what remains). The library handles the peer-to-peer networking, cryptographic verification, and consensus tracking directly, so the wallet built on top of it inherits all of those properties without having to implement them itself.
 
-## What This Library Will Do Differently
+## What This Library Does Differently
 
-Rather than querying a centralised server, this library will connect directly to the Ethereum peer-to-peer network and retrieve and **verify** all data cryptographically.
+Rather than querying a centralised server, this library connects directly to the Ethereum peer-to-peer network and retrieves and **verifies** all data cryptographically. (The rest of this section is written as the design intent; the parts still ahead of the implementation are the transaction-history index and its balance reconciliation, and Tor routing beyond account reads.)
 
 **Balances will be proven, not reported.** The library will fetch ETH balances and ERC-20 token holdings with cryptographic proofs that link the data back to a trusted chain state. If the data does not match the proof, it will be rejected. No server will be able to fabricate a balance that passes verification.
 

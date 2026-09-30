@@ -1,5 +1,12 @@
 # SOLID Review
 
+> **Historical snapshot.** Written against the original four Gradle modules of
+> the Java engine (`core`, `networking`, `consensus`, `app`), before the engine
+> contract (`:myotis-api`), the `node-core`/`rpc-backend` split, the Compose hosts
+> and the Rust engine (`rust/`, today's default engine) existed. Line references
+> and the module map are as of that review. Kept as a record, not as a
+> description of today's layout.
+
 Read-only review of the four Gradle modules. No code was changed.
 
 Principle key: **S** Single Responsibility · **O** Open/Closed · **L** Liskov Substitution · **I** Interface Segregation · **D** Dependency Inversion.

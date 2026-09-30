@@ -17,12 +17,17 @@ figures are arithmetic on top of those constants plus a few **chain-level assump
 (marked below) — average mainnet transaction rate, block body size, etc. Treat the
 byte totals as sizing estimates, not measurements.
 
-**Scope: only what a synced, wallet-serving client actually uses today.** Two features
+**Scope: only what a synced, wallet-serving client actually uses today.** Three features
 are deliberately **not** counted in the budget below: the **historical accumulators**
-(pre-Merge historical hashes, Bellatrix historical roots — today only roadmap items),
-and the **TrueBlocks Unchained Index** transaction-history scan (the daemon's
-`get-transactions` stream and the desktop Query tab) — an opt-in, per-request debug
-feature, not part of steady-state operation. Its profile, for sizing: an on-demand
+(pre-Merge historical hashes, Bellatrix historical roots — today only roadmap items);
+the opt-in **log index** behind `eth_getLogs` (Rust engine only — the one place Myotis
+does persist chain data: every verified log of the contracts you chose, in
+`logindex[-<network>].db` under the data dir, plus the bandwidth of the backfill walk
+to each contract's deployment block, which is bounded by the peers' body/receipt
+serving rate and the "Max download speed" setting — see
+[eth-getlogs-design.md](eth-getlogs-design.md)); and the **TrueBlocks Unchained Index**
+transaction-history scan (the daemon's `get-transactions` stream and the desktop Query
+tab) — an opt-in, per-request debug feature, not part of steady-state operation. Its profile, for sizing: an on-demand
 content-addressed cache under `trueblocks/` (daemon: working-dir-relative; desktop:
 `<dataDir>/trueblocks/`; Android: `filesDir/trueblocks/` — mind that a deep scan can
 grow it to multi-GB on a phone; delete the directory to reclaim) holding the manifest
@@ -62,9 +67,9 @@ Chain-level assumptions used throughout (2025/26 ballparks):
 
 ## 1. Disk footprint
 
-Myotis is a light client in the strictest sense: **no chain data is persisted**. There
-is no header database, no block store, no state database — no LevelDB/RocksDB/SQLite
-anywhere in the tree. Headers live in a small in-memory window (§1.3); state is fetched
+Myotis is a light client in the strictest sense: **no chain data is persisted** (the
+opt-in log index excluded, see the scope note above). There is no header database, no
+block store, no state database — no LevelDB/RocksDB/SQLite anywhere in the tree. Headers live in a small in-memory window (§1.3); state is fetched
 as snap/1 proofs on demand and cached only in bounded in-memory LRUs
 (`myotis-evm/.../StateProofCache.java`, `rpc-backend/.../VerifiedResultCache.java`).
 

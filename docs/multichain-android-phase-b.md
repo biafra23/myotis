@@ -1,7 +1,15 @@
 # Multichain Phase B — Android (`NodeService` registry + per-network UI)
 
-Status: **plan.** The shared core (Phase A) is merged (PR #83), and the Phase B
-*foundation* is on this branch (`feat/multichain-android`) and compiles:
+Status: **implemented, kept as the design record.** The shared core (Phase A)
+merged in PR #83 and the Android side of this plan has landed: the app hosts
+every enabled network (mainnet, Gnosis, Sepolia) in one foreground service with
+a per-network UI — today through the engine API (`MyotisEngine.create(...)` per
+network, `hostedNetworks()`, on either engine) rather than the
+`Map<String,ChainStack>` this document sketches, which is what the Java engine
+does internally. Class and line references below are as of the plan. The text
+that follows is the original plan, unchanged.
+
+The Phase B *foundation* was on the `feat/multichain-android` branch and compiled:
 
 - `android-app` depends on `:node-core`.
 - `AndroidPeerCacheAdapter` / `AndroidClPeerCacheAdapter` wrap the existing Android

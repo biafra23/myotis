@@ -5,10 +5,16 @@ JDK/runtime features that Android's ART runtime lacks. Running the EVM on
 Android (for on-device ENS resolution / view calls in `:android-app`) needs
 **two source patches**. This directory documents them.
 
-**Status: DONE — fork published and consumed.** The patches live in
-**[biafra23/besu](https://github.com/biafra23/besu)** (branch `24.12.2-android`,
-tag **`24.12.2-android.2`**), published via JitPack, and `:android-app` consumes
-them. `vitalik.eth` resolves end-to-end on an API-35 emulator against the fork
+**Status: DONE — fork published and consumed; rebased on every Besu bump.** The
+patches live in **[biafra23/besu](https://github.com/biafra23/besu)**, published
+via JitPack as `com.github.biafra23.besu:{besu-evm,…}:<besu>-android.N`, and
+`:android-app` substitutes them in (`besuForkVersion` in
+`android-app/build.gradle.kts` — **`26.4.0-android.1`** today, tracking the
+`besu` pin in `gradle/libs.versions.toml`). The walkthrough below is the
+original one against Besu **24.12.2** (branch `24.12.2-android`, tag
+`24.12.2-android.2`); the mechanics are unchanged, only the version moves.
+Note that the Java engine's Besu is only used on Android 13+ (API 33) — below
+that the app runs the Rust engine only. `vitalik.eth` resolves end-to-end on an API-35 emulator against the fork
 artifacts (→ `0xd8dA…96045`, 5.68 ETH, account read over SNAP). The earlier
 in-tree class-replacement + strip-transform mechanism has been removed.
 

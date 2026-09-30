@@ -1,11 +1,17 @@
 # Multi-chain in one process — evaluation & design
 
-Status: **design only.** Gnosis Chain is implemented as a first-class network
-today, but it runs as one daemon per network (separate ports, separate IPC
-socket) exactly like mainnet. This document records *why* we would eventually
-want several chains in one process, what blocks it today, and the recommended
-architecture — so the refactor can be picked up deliberately rather than
-bolted on.
+Status: **implemented — the architecture recommended below is what was built.**
+`node-core`'s `NodeRegistry` owns a `Map<network, ChainStack>` behind the engine
+API (`MyotisEngine.create(...)` per network, `hostedNetworks()`); the daemon hosts
+every network named in `-Pnetwork=mainnet,gnosis` in one process
+(`app/.../Main.java`), and the Android, desktop and iOS apps host mainnet, Gnosis
+and Sepolia together — on either engine — each network on its own ports, lock
+file and IPC socket. The Rust engine hosts several networks in one process the
+same way (one handle per network). This document is kept as the record of *why*
+several chains share one process and of the trade-offs; the "What blocked it"
+section describes the code before the refactor. The long-term payoff in item 5
+(trustless cross-chain verification between two in-process light clients) is
+still not built.
 
 ## Scope decision
 
@@ -64,10 +70,11 @@ bolted on.
   the per-network stacks must be made robust and resource-bounded *within* the
   process before this is safe.
 
-## What blocks it today
+## What blocked it (before the refactor — historical)
 
-The codebase is "one daemon = one network" by construction: a single
-`NetworkConfig` is threaded through every service.
+The codebase was "one daemon = one network" by construction: a single
+`NetworkConfig` was threaded through every service. Every item below has since
+been resolved by the `NodeRegistry`/`ChainStack` refactor.
 
 - **Node identity is per-network (resolved).** `Main.nodeKeyFile` gives mainnet
   `nodekey.hex` and every other network `nodekey-<net>.hex`, so each advertises
@@ -105,13 +112,17 @@ solid on its own.
 
 ## Today's supported model
 
-Run a second chain as its own daemon in its own process:
+Host several chains in one daemon process, or run them as separate daemons —
+both work, and the per-network files (`nodekey-<net>.hex`, `peers-<net>.cache`,
+`cl-peers-<net>.cache`, `sync-state-<net>.snapshot`, `ethp2p-<net>.lock`,
+`/tmp/ethp2p-<net>.sock`) never collide:
 
 ```
-./gradlew :app:run                       # mainnet  (UDP/TCP 30303, /tmp/ethp2p.sock)
-./gradlew :app:run -Pnetwork=gnosis -Pport=30304   # gnosis (/tmp/ethp2p-gnosis.sock)
+./gradlew :app:run -Pnetwork=mainnet,gnosis          # one process, both chains
+./gradlew :app:run                                    # mainnet only  (UDP/TCP 30303, /tmp/ethp2p.sock)
+./gradlew :app:run -Pnetwork=gnosis -Pport=30304      # gnosis as its own daemon (/tmp/ethp2p-gnosis.sock)
 ```
 
-Each is independent: separate node identity file would still be shared via
-`nodekey.hex` in the same working dir, so run them from different working
-directories (or different `ETHP2P_SOCKET`/cwd) if both must be active at once.
+The apps do the same in-process: every network enabled in Settings runs in the
+one foreground service / desktop process, and the Status screen's chips switch
+between them.

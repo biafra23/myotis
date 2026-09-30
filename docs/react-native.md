@@ -1,11 +1,18 @@
 # React Native (Android + iOS) integration — design & roadmap
 
-Status: **design only.** Nothing in this document is implemented yet; it
-records what is necessary to consume myotis from a React Native app on
-Android and iOS, what already exists (much more than one would expect,
-especially for iOS), the decisions taken, and a phased plan. Facts marked
-*(feat/ios-target)* live on that unmerged branch; everything else is on
-`main`.
+Status: **design only** for the React Native bridge itself — no RN module
+exists. The document records what is necessary to consume myotis from a
+React Native app on Android and iOS, what already exists, the decisions
+taken, and a phased plan. **Since it was written, the iOS groundwork it
+depends on has landed on `main`:** facts marked *(feat/ios-target)* below
+now live in `:app-ios` (the `MyotisKit` Kotlin/Native framework), `ios-app/`
+(the Xcode shell) and the engine's plain C ABI (`rust/myotis-engine/src/capi.rs`,
+`rust/include/myotis_engine.h`, whose ABI version has moved well past the
+13/14 quoted in the drift table — gate on the header's current
+`MYOTIS_ABI_VERSION`), and releases ship `MyotisEngine.xcframework` for
+Swift hosts. Read the "P0 — land `feat/ios-target`" items as done and the
+iOS effort estimates as reduced accordingly; the Android side of the plan is
+unchanged.
 
 ## Goal & constraints
 

@@ -1,9 +1,12 @@
 # BLS acceleration: native blst behind a `BlsBackend` seam
 
-## Status: IMPLEMENTED on `prototype/bls-blst-acceleration` (desktop + Android)
+## Status: IMPLEMENTED and merged (desktop + Android)
 
 The seam, the native Rust crate, the timing/compare mechanism, and the Android build are
-all done and verified. Summary first; the original evaluation follows.
+all done, verified and on `main` (the apps expose the backend choice as a Settings
+toggle, `BlsBackends`). Note that this is the **Java engine's** BLS path: the Rust
+engine — the default engine today — verifies with `blst` natively and needs none of
+the seam. Summary first; the original evaluation follows.
 
 **What's wired**
 - `BlsBackend` seam + `BlsBackends.active()` (selects via `-Dmyotis.bls.backend=auto|milagro|native|compare`),
@@ -11,7 +14,9 @@ all done and verified. Summary first; the original evaluation follows.
 - `rust/myotis-bls` — a `blst` + `jni` cdylib; `NativeBlsBackend` calls it with the whole
   committee flattened into one JNI crossing. One crate → desktop `.so` **and** Android ABIs.
 - Daemon: `./gradlew :app:run` puts the desktop `.so` on `java.library.path` and auto-selects
-  native; `-Pbls=compare` runs the head-to-head.
+  native; `-Pbls=compare` runs the head-to-head. (The packaged **desktop app** bundles the Rust
+  engine but no `libmyotis_bls`, so its Java engine runs Milagro and the "Native BLS
+  acceleration" setting is a no-op there.)
 - Android: `rust/build-android.sh` (cargo-ndk) builds `arm64-v8a` + `x86_64`
   `libmyotis_bls.so` into `android-app/src/main/jniLibs` (confirmed packaged in the debug
   APK); compare mode is an explicit opt-in (-Dmyotis.bls.backend=compare) — it was briefly the debuggable default, but 10-16 s of Milagro per update froze on-device catch-up (Pixel 7, 2026-07-06).
@@ -37,9 +42,10 @@ Native is **4–15× faster and agrees on every real verify.** On Android/ART (M
 30–55 s per the in-code comments) the win is far larger — measure it on-device via the
 `[bls-compare]` logcat lines.
 
-**To compare on your phone:** build `:android-app:assembleDebug` (the `.so` is already in
-jniLibs / committed), install, and `adb logcat -s ComparingBlsBackend` while it syncs.
-Rebuild the libs with `rust/build-android.sh` (needs `cargo-ndk` + `ANDROID_NDK_HOME`).
+**To compare on your phone:** build `:android-app:assembleDebug` (its `preBuild` runs
+`cargoNdkAndroid`, which builds `libmyotis_bls.so` and `libmyotis_engine.so` from source —
+no `.so` is committed any more; `-PskipRustEngine` builds without either), install, and
+`adb logcat -s ComparingBlsBackend` while it syncs.
 
 ---
 
