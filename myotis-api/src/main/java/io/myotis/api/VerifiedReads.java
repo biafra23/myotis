@@ -222,4 +222,50 @@ public interface VerifiedReads {
         Long gas = estimateGas(from, to, data, valueWei);
         return gas == null ? EstimateResult.unavailable(null) : EstimateResult.ok(gas);
     }
+
+    /**
+     * Whether this engine APPLIES a transaction object's {@code accessList} and
+     * EIP-7702 {@code authorizationList} in {@link #estimateGasTx} (#509).
+     *
+     * <p>Hosts consult it BEFORE dispatch and refuse (-32602) a request carrying
+     * either list when it is false: an engine that estimated without them would
+     * answer for a different transaction — a type-4 estimate without its
+     * authorizations misses the whole delegated execution — and waking a paused
+     * stack only to refuse would turn a free refusal into an expensive one.
+     *
+     * @return false by default
+     */
+    default boolean supportsTransactionLists() {
+        return false;
+    }
+
+    /**
+     * {@code eth_estimateGas} for the full transaction object (#509) at
+     * {@code block} (a JSON-RPC block selector, applied or refused as for
+     * {@link #callDetailed}), with a state override when {@code
+     * stateOverridesJson} is non-empty (engines that report
+     * {@link #supportsStateOverrides()} apply it here too; the answer is then a
+     * simulation, not a chain fact). Every field of {@code tx} is applied or the
+     * request is {@link EstimateResult.Status#REFUSED}.
+     *
+     * <p>Default: an engine that has not implemented the transaction object
+     * answers exactly the subset it always could — {@code from}/{@code to}/
+     * {@code data}/{@code value} at the head, via {@link #estimateGasDetailed} —
+     * and REFUSES anything else rather than estimate a transaction the caller
+     * did not describe.
+     */
+    default EstimateResult estimateGasTx(TransactionArgs tx, String block, String stateOverridesJson) {
+        if (tx.hasExtendedFields()) {
+            return EstimateResult.refused(
+                    "this engine does not apply the transaction object's gas, fee or list fields");
+        }
+        if (stateOverridesJson != null && !stateOverridesJson.isEmpty()) {
+            return EstimateResult.refused("this engine does not apply state overrides to eth_estimateGas");
+        }
+        String tag = block == null ? "" : block.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!tag.isEmpty() && !java.util.Set.of("latest", "pending", "safe").contains(tag)) {
+            return EstimateResult.refused("this engine estimates only against the head block");
+        }
+        return estimateGasDetailed(tx.from(), tx.to(), tx.data(), tx.valueWei());
+    }
 }

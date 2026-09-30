@@ -133,30 +133,122 @@ class EstimateGasTest {
     }
 
     @Test
-    void gasLimitTooLowForIntrinsicThrowsOutOfGas() {
-        // Caller passed a gasLimit that's lower than the intrinsic 21000.
-        var oracle = FixtureSnapStateOracle.builder()
-                .account(new AccountState(SENDER, 0L,
-                        new BigInteger("1000000000000000000"),
-                        emptyCodeHash()))
-                .account(new AccountState(EOA_RECIPIENT, 0L, BigInteger.ZERO,
-                        emptyCodeHash()))
-                .build();
-        var executor = new DefaultEvmExecutor(oracle);
-
+    void gasLimitBelowTheIntrinsicCostIsGasAllowanceExceeded() {
+        // 21000 is a real cap, but 4 non-zero calldata bytes make the intrinsic
+        // cost 21064: the transaction cannot fit — geth's answer (#509).
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(EOA_RECIPIENT, null));
         var tx = new UnsignedTransaction(
-                SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[0],
-                /* gasLimit */ 20_000L);
+                SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[]{1, 2, 3, 4},
+                /* gasLimit */ 21_000L);
+        var error = estimateError(executor, tx, ctx());
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(21_000L), error);
+        assertEquals("gas required exceeds allowance (21000)",
+                ((EvmExecutionError.GasAllowanceExceeded) error).message());
+    }
 
-        try {
-            executor.estimateGas(tx, ctx()).get();
-            fail("expected OutOfGas — caller's gasLimit < intrinsic 21000");
-        } catch (Exception e) {
-            Throwable cause = e instanceof java.util.concurrent.ExecutionException
-                    ? e.getCause() : e;
-            var eee = assertInstanceOf(EvmExecutionException.class, cause);
-            assertInstanceOf(EvmExecutionError.OutOfGas.class, eee.error());
-        }
+    @Test
+    void gasLimitBelow21000IsNoLimitAsInGeth() throws Exception {
+        // geth reads a gas below 21000 as unset (a wallet's "gas": "0x0" means
+        // "no opinion"), so it must not turn a valid estimate into an error.
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(EOA_RECIPIENT, null));
+        long uncapped = executor.estimateGas(new UnsignedTransaction(
+                SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[]{1}, null), ctx()).get();
+        long zeroGas = executor.estimateGas(new UnsignedTransaction(
+                SENDER, EOA_RECIPIENT, BigInteger.ZERO, new byte[]{1}, 0L), ctx()).get();
+        assertEquals(uncapped, zeroGas);
+    }
+
+    @Test
+    void estimateNeverExceedsTheCallersGas() throws Exception {
+        // Ten fresh SSTOREs: 21000 + 10 × 22106 = 242060 gross, ~278k buffered.
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, sstores(10)));
+        long uncapped = executor.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null), ctx()).get();
+        assertTrue(uncapped > 250_000, "buffered estimate above the cap; got " + uncapped);
+        // A cap between the gross draw and the buffered answer IS the answer.
+        assertEquals(250_000L, executor.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], 250_000L), ctx()).get());
+        // A cap below the gross draw cannot fit.
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(200_000L), estimateError(executor,
+                new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], 200_000L), ctx()));
+    }
+
+    @Test
+    void outOfGasAtTheDefaultCeilingIsGasAllowanceExceeded() {
+        // JUMPDEST; PUSH1 0; JUMP — forever.
+        byte[] loop = HexFormat.of().parseHex("5b600056");
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, loop));
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(30_000_000L), estimateError(executor,
+                new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null), ctx()));
+    }
+
+    @Test
+    void feeCapBoundsTheCeilingByWhatTheSenderCanPay() throws Exception {
+        // geth's affordability cap: (balance − value) / feeCap. 1_000_000 wei at
+        // 10 wei/gas funds 100_000 gas; the ten SSTOREs need ~242k.
+        byte[] code = sstores(10);
+        var poor = new DefaultEvmExecutor(senderWithBalanceAnd(BigInteger.valueOf(1_000_000L), CONTRACT, code));
+        var priced = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null,
+                BigInteger.TEN, BigInteger.TEN);
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(100_000L), estimateError(poor, priced, ctx()));
+
+        var funded = new DefaultEvmExecutor(senderWithBalanceAnd(BigInteger.valueOf(100_000_000L), CONTRACT, code));
+        assertTrue(funded.estimateGas(priced, ctx()).get() > 242_060L);
+
+        // A value the sender cannot cover is refused outright.
+        var allIn = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.valueOf(100_000_000L), new byte[0], null,
+                BigInteger.TEN, BigInteger.TEN);
+        assertEquals(new EvmExecutionError.InsufficientFundsForTransfer(), estimateError(funded, allIn, ctx()));
+    }
+
+    @Test
+    void gaspriceReadsTheRequestsEffectivePrice() throws Exception {
+        // GASPRICE; PUSH1 0; SSTORE; STOP — a zero price writes nothing new, a
+        // non-zero one stores a fresh slot (22100).
+        byte[] code = HexFormat.of().parseHex("3a60005500");
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, code));
+        long free = executor.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null), ctx()).get();
+        long priced = executor.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null,
+                BigInteger.valueOf(2_000_000_000L), BigInteger.ONE), ctx()).get();
+        assertTrue(priced > free + 15_000, "non-zero GASPRICE must store: " + free + " -> " + priced);
+        // min(feeCap, baseFee + tip): the context's base fee is 1 gwei.
+        assertEquals(BigInteger.valueOf(1_000_000_001L), new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null,
+                BigInteger.valueOf(2_000_000_000L), BigInteger.ONE)
+                .effectiveGasPrice(BigInteger.valueOf(1_000_000_000L)));
+        assertEquals(BigInteger.ZERO, new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null).effectiveGasPrice(BigInteger.TEN));
+    }
+
+    @Test
+    void estimateNeverExceedsTheOsakaTransactionCap() throws Exception {
+        // EIP-7825: from Osaka no transaction may carry more than 2^24 gas. 680
+        // fresh SSTOREs (~15.05M gross, ~17.3M buffered) fit under it, so the cap
+        // IS the answer; 800 (~17.7M) cannot fit at all.
+        long cap = 1L << 24;
+        var fits = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, sstoresWide(680)));
+        assertEquals(cap, fits.estimateGas(new UnsignedTransaction(
+                SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null), osakaCtx()).get());
+        var tooBig = new DefaultEvmExecutor(fundedSenderAnd(CONTRACT, sstoresWide(800)));
+        var tx = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null);
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(cap), estimateError(tooBig, tx, osakaCtx()));
+        // Before Osaka the same work is simply estimated.
+        assertTrue(tooBig.estimateGas(tx, pragueCtx()).get() > cap);
+    }
+
+    @Test
+    void calldataFloorAppliesFromPrague() throws Exception {
+        // 200 non-zero bytes to an EOA: the standard intrinsic is 21000 + 3200,
+        // EIP-7623's floor 21000 + 10 × 800 = 29000 — which Prague charges.
+        var executor = new DefaultEvmExecutor(fundedSenderAnd(EOA_RECIPIENT, null));
+        byte[] calldata = new byte[200];
+        java.util.Arrays.fill(calldata, (byte) 0x11);
+        var tx = new UnsignedTransaction(SENDER, EOA_RECIPIENT, BigInteger.ZERO, calldata, null);
+        assertEquals((long) Math.ceil(29_000 * 1.15), executor.estimateGas(tx, pragueCtx()).get());
+        // Before Prague the floor does not exist.
+        assertEquals((long) Math.ceil(24_200 * 1.15), executor.estimateGas(tx, ctx()).get());
     }
 
     @Test
@@ -201,6 +293,88 @@ class EstimateGasTest {
     }
 
     // ---- Helpers ----------------------------------------------------------
+
+    /** The error an estimate fails with (unwrapping the future). */
+    private static EvmExecutionError estimateError(DefaultEvmExecutor executor, UnsignedTransaction tx,
+                                                   BlockContext ctx) {
+        try {
+            long gas = executor.estimateGas(tx, ctx).get();
+            return fail("expected the estimate to fail; got " + gas);
+        } catch (Exception e) {
+            Throwable cause = e instanceof java.util.concurrent.ExecutionException ? e.getCause() : e;
+            return assertInstanceOf(EvmExecutionException.class, cause).error();
+        }
+    }
+
+    /** SENDER with 1 ETH, plus {@code address} holding {@code code} (an EOA when null). */
+    private static FixtureSnapStateOracle fundedSenderAnd(Address address, byte[] code) {
+        return senderWithBalanceAnd(new BigInteger("1000000000000000000"), address, code);
+    }
+
+    private static FixtureSnapStateOracle senderWithBalanceAnd(BigInteger balance, Address address, byte[] code) {
+        var builder = FixtureSnapStateOracle.builder()
+                .account(new AccountState(SENDER, 0L, balance, emptyCodeHash()));
+        if (code == null) {
+            builder.account(new AccountState(address, 0L, BigInteger.ZERO, emptyCodeHash()));
+        } else {
+            builder.account(new AccountState(address, 1L, BigInteger.ZERO,
+                    FixtureSnapStateOracle.codeHashOf(code))).bytecode(code);
+        }
+        return builder.build();
+    }
+
+    /** {@code n} fresh-slot SSTOREs (slot i := 1), then STOP — 22106 gas each. */
+    private static byte[] sstores(int n) {
+        byte[] code = new byte[n * 5 + 1];
+        for (int i = 0; i < n; i++) {
+            code[i * 5] = 0x60;
+            code[i * 5 + 1] = 0x01;
+            code[i * 5 + 2] = 0x60;
+            code[i * 5 + 3] = (byte) i;
+            code[i * 5 + 4] = 0x55;
+        }
+        code[n * 5] = 0x00;
+        return code;
+    }
+
+    /** {@code n} fresh-slot SSTOREs with 2-byte slot numbers (slot i := 1), then STOP. */
+    private static byte[] sstoresWide(int n) {
+        byte[] code = new byte[n * 6 + 1];
+        for (int i = 0; i < n; i++) {
+            code[i * 6] = 0x60;
+            code[i * 6 + 1] = 0x01;
+            code[i * 6 + 2] = 0x61;
+            code[i * 6 + 3] = (byte) (i >> 8);
+            code[i * 6 + 4] = (byte) i;
+            code[i * 6 + 5] = 0x55;
+        }
+        code[n * 6] = 0x00;
+        return code;
+    }
+
+    private static BlockContext osakaCtx() {
+        return new BlockContext(
+                new byte[32],
+                23_900_000L,
+                EvmFactory.OSAKA_TIME + 1,
+                BigInteger.valueOf(1_000_000_000L),
+                Address.ZERO,
+                new byte[32],
+                BigInteger.ONE,
+                60_000_000L);
+    }
+
+    private static BlockContext pragueCtx() {
+        return new BlockContext(
+                new byte[32],
+                22_500_000L,
+                EvmFactory.PRAGUE_TIME + 1,
+                BigInteger.valueOf(1_000_000_000L),
+                Address.ZERO,
+                new byte[32],
+                BigInteger.ONE,
+                30_000_000L);
+    }
 
     private static byte[] emptyCodeHash() {
         // keccak256("") — the codeHash for an EOA / no-code account.

@@ -31,7 +31,9 @@ class RpcCallResult private constructor(
     val data: ByteArray?,
     val detail: String?,
 ) {
-    enum class Kind { OK, REVERTED, UNAVAILABLE, REFUSED }
+    /** [INFEASIBLE] is `eth_estimateGas`-only (see [RpcEstimateResult]); no
+     *  call result carries it. */
+    enum class Kind { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 
     companion object {
         fun ok(data: ByteArray): RpcCallResult = RpcCallResult(Kind.OK, data, null)
@@ -42,11 +44,14 @@ class RpcCallResult private constructor(
 }
 
 /**
- * `io.myotis.api.EstimateResult`'s pure-Kotlin mirror: the three-way outcome of
- * a detailed `eth_estimateGas`. REVERTED means the ESTIMATED TRANSACTION cannot
+ * `io.myotis.api.EstimateResult`'s pure-Kotlin mirror: the outcome of a
+ * detailed `eth_estimateGas`. REVERTED means the ESTIMATED TRANSACTION cannot
  * succeed — a verified answer carrying the raw revert payload, served as the
  * standard code-3 error; UNAVAILABLE keeps the retryable -32000 path; REFUSED
- * is permanent (-32602), as for [RpcCallResult].
+ * is permanent (-32602), as for [RpcCallResult]. INFEASIBLE (#509) is also an
+ * answer: the transaction does not fit the caller's gas or funds, and [detail]
+ * is geth's message ("gas required exceeds allowance (N)", "insufficient funds
+ * for transfer"), served verbatim under geth's -32000.
  */
 class RpcEstimateResult private constructor(
     val kind: RpcCallResult.Kind,
@@ -62,6 +67,8 @@ class RpcEstimateResult private constructor(
             RpcEstimateResult(RpcCallResult.Kind.UNAVAILABLE, null, null, detail)
         fun refused(detail: String): RpcEstimateResult =
             RpcEstimateResult(RpcCallResult.Kind.REFUSED, null, null, detail)
+        fun infeasible(detail: String): RpcEstimateResult =
+            RpcEstimateResult(RpcCallResult.Kind.INFEASIBLE, null, null, detail)
     }
 }
 
@@ -173,6 +180,45 @@ interface RpcBackend {
     ): RpcEstimateResult {
         val gas = estimateGas(from, to, data, valueWei)
         return if (gas == null) RpcEstimateResult.unavailable() else RpcEstimateResult.ok(gas)
+    }
+
+    /**
+     * Whether this backend APPLIES a transaction object's `accessList` and
+     * EIP-7702 `authorizationList` in [estimateGasTx] (#509). Consulted BEFORE
+     * dispatch: a request carrying either list is refused (-32602) on a backend
+     * that would otherwise estimate a different transaction — a type-4 estimate
+     * without its authorizations misses the whole delegated execution.
+     */
+    fun supportsTransactionLists(): Boolean = false
+
+    /**
+     * `eth_estimateGas` for the full transaction object at [block], with a
+     * state override when [stateOverridesJson] is non-null (only asked of a
+     * backend whose [supportsStateOverrides] is true). Every field is applied
+     * or the outcome is REFUSED.
+     *
+     * Default: a backend that has not implemented the transaction object
+     * answers exactly the subset it always could — from/to/data/value at the
+     * head — and REFUSES anything else rather than estimate a transaction the
+     * caller did not describe.
+     */
+    fun estimateGasTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcEstimateResult {
+        if (tx.hasExtendedFields) {
+            return RpcEstimateResult.refused(
+                "this engine does not apply the transaction object's gas, fee or list fields",
+            )
+        }
+        if (!stateOverridesJson.isNullOrEmpty()) {
+            return RpcEstimateResult.refused("this engine does not apply state overrides to eth_estimateGas")
+        }
+        if (block.trim().lowercase() !in setOf("", "latest", "pending", "safe")) {
+            return RpcEstimateResult.refused("this engine estimates only against the head block")
+        }
+        return estimateGasDetailed(tx.from, tx.to, tx.data, tx.valueWei)
     }
 }
 

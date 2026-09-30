@@ -7,6 +7,7 @@ import io.myotis.engine.capi.myotis_create
 import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
+import io.myotis.engine.capi.myotis_estimate_gas_tx_json
 import io.myotis.engine.capi.myotis_eth_call_json
 import io.myotis.engine.capi.myotis_eth_call_overrides_json
 import io.myotis.engine.capi.myotis_fee_estimate_json
@@ -234,6 +235,13 @@ object RustEngine {
 
     fun estimateGasJson(handle: Long, from: String, to: String, data: String, valueDecimal: String): String =
         jsonCall { myotis_estimate_gas_json(handle, from, to, data, valueDecimal) }
+
+    /** `eth_estimateGas` for the FULL transaction object (ABI >= 34, #509): [txJson]
+     *  is the router's canonical object, [block] the RPC selector, [stateOverrides]
+     *  a state override object (empty ⇒ none). Every field is applied or the
+     *  request refused with the permanent -32602 envelope. */
+    fun estimateGasTxJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
+        jsonCall { myotis_estimate_gas_tx_json(handle, txJson, block, stateOverrides) }
 
     fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }

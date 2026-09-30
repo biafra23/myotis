@@ -473,6 +473,21 @@ class RpcRouterTest {
         var lastEstData: ByteArray? = null
         var lastEstValue: BigInteger? = null
         var estimateResult: Long? = null
+
+        /** The transaction object the router forwarded (#509), and with what. */
+        var lastTx: io.myotis.api.TransactionArgs? = null
+        var lastTxBlock: String? = null
+        var lastTxOverrides: String? = null
+        /** When set, estimateGasTx answers this (else the interface default). */
+        var txEstimate: io.myotis.api.EstimateResult? = null
+        /** Whether this fake applies accessList/authorizationList (the Rust engine does). */
+        var applyLists: Boolean = false
+        override fun supportsTransactionLists(): Boolean = applyLists
+        override fun estimateGasTx(tx: io.myotis.api.TransactionArgs, block: String,
+                                   stateOverridesJson: String?): io.myotis.api.EstimateResult {
+            lastTx = tx; lastTxBlock = block; lastTxOverrides = stateOverridesJson
+            return txEstimate ?: super.estimateGasTx(tx, block, stateOverridesJson)
+        }
         override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
                                  valueWei: String?): Long? {
             lastEstFrom = from; lastEstTo = to; lastEstData = data
@@ -1093,8 +1108,208 @@ class RpcRouterTest {
                "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa"}]}""")
         assertEquals("0xcf08", result(resp))
         assertNull(b.lastEstFrom)
-        assertNull(b.lastEstData)
+        // Absent calldata crosses as empty — the same execution (#509 builds one
+        // canonical object for every engine).
+        assertEquals(0, b.lastEstData!!.size)
         assertNull(b.lastEstValue)
+    }
+
+    // ---- the full transaction object (#509) --------------------------------
+
+    private val setCodeRequest = """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+        "params":[{"from":"0x1111111111111111111111111111111111111111",
+                   "to":"0x2222222222222222222222222222222222222222",
+                   "data":"0x3e12cc2e","value":"0x1","gas":"0x7a120","nonce":"0x3","chainId":"0x1",
+                   "type":"0x4","maxFeePerGas":"0x3b9aca00","maxPriorityFeePerGas":"0x1",
+                   "authorizationList":[{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963",
+                     "nonce":"0x0","chainId":"0x1","yParity":"0x1","r":"0x9a3b","s":"0x0c5d"}]},
+                  "0x100"]}"""
+
+    @Test fun estimateGas_forwardsTheWholeTransactionObjectAndTheBlock() {
+        val b = FakeBackend().apply {
+            applyLists = true
+            txEstimate = io.myotis.api.EstimateResult.ok(300_000L)
+        }
+        assertEquals("0x493e0", result(route(b, setCodeRequest)))
+        val tx = b.lastTx!!
+        assertEquals(500_000L, tx.gas())
+        assertEquals("1000000000", tx.maxFeePerGasWei())
+        assertEquals("1", tx.maxPriorityFeePerGasWei())
+        assertTrue(tx.hasAuthorizationList())
+        assertEquals("0x100", b.lastTxBlock)
+        assertNull(b.lastTxOverrides)
+        // The engine gets the canonical object, the authorization intact.
+        val auth = json.parseToJsonElement(tx.json()).jsonObject["authorizationList"]!!.jsonArray[0].jsonObject
+        assertEquals("0x05ae73c5925d843864ae6f261f3175de2ebcd963", auth["address"]!!.jsonPrimitive.content)
+        assertEquals("0x1", auth["yParity"]!!.jsonPrimitive.content)
+        assertEquals("0xc5d", auth["s"]!!.jsonPrimitive.content)
+    }
+
+    /** THE #509 failure, closed: an engine that cannot apply the authorization
+     *  list must not be asked at all — estimating without it answered for an
+     *  empty EOA, and the wallet's transaction ran out of gas on chain. */
+    @Test fun estimateGas_authorizationListTheEngineCannotApply_isRefusedNotDropped() {
+        val b = FakeBackend().apply { estimateResult = 59_000L }   // applyLists = false
+        val resp = route(b, setCodeRequest)
+        assertEquals(-32602, errorCode(resp))
+        val msg = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content
+        assertTrue(msg.contains("authorizationList"), msg)
+        assertNull(b.lastTx)
+        assertNull(b.lastEstTo)
+    }
+
+    @Test fun estimateGas_contradictoryObjects_areRefusedBeforeTheEngine() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        listOf(
+            """{$to,"type":"0x4"}""",
+            """{$to,"authorizationList":[]}""",
+            """{$to,"data":"0x01","input":"0x02"}""",
+            """{$to,"gasPrice":"0x1","maxFeePerGas":"0x2"}""",
+            """{$to,"maxFeePerGas":"0x1","maxPriorityFeePerGas":"0x2"}""",
+            """{$to,"blobVersionedHashes":["0x01"]}""",
+            """{$to,"chainId":"0x5"}""",   // the node is on chain 1
+        ).forEach { obj ->
+            val b = FakeBackend().apply { applyLists = true; estimateResult = 21_000L }
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[$obj]}""")
+            assertEquals(-32602, errorCode(resp), "not refused: $obj -> $resp")
+            assertNull(b.lastTx, "the engine was asked: $obj")
+            assertNull(b.lastEstTo, "the engine was asked: $obj")
+        }
+    }
+
+    @Test fun estimateGas_contractCreationTheEngineCannotServe_isRefused() {
+        val b = FakeBackend(serveCreation = false).apply { estimateResult = 53_000L }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"data":"0x6000"}]}""")
+        assertEquals(-32602, errorCode(resp))
+        assertNull(b.lastTx)
+    }
+
+    /** A transaction that does not fit the caller's gas or funds is geth's
+     *  -32000 with geth's own words — wallets match on them. */
+    @Test fun estimateGas_infeasible_isGethsAnswerVerbatim() {
+        val b = FakeBackend().apply {
+            applyLists = true
+            txEstimate = io.myotis.api.EstimateResult.infeasible("gas required exceeds allowance (500000)")
+        }
+        val resp = route(b, setCodeRequest)
+        assertEquals(-32000, errorCode(resp))
+        assertEquals("gas required exceeds allowance (500000)",
+            json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun estimateGas_stateOverride_isAppliedByAnEngineThatCan() {
+        val b = FakeBackend(applyOverrides = true).apply {
+            txEstimate = io.myotis.api.EstimateResult.ok(21_000L)
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"0x00000000219ab540356cBB839Cbe05303d7705Fa"},"latest",
+                         {"0x00000000219ab540356cBB839Cbe05303d7705Fa":{"balance":"0x1"}}]}""")
+        assertEquals("0x5208", result(resp))
+        assertTrue(b.lastTxOverrides!!.contains("0x00000000219ab540356cBB839Cbe05303d7705Fa"))
+    }
+
+    /** The estimate's block selector is applied or refused, never read as the
+     *  head behind the caller's back (review of #509). */
+    @Test fun estimateGas_blockSelector_isAppliedOrRefused() {
+        val tx = """{"to":"0x2222222222222222222222222222222222222222"}"""
+        listOf(
+            "\"earliest\"",
+            "\"0x" + "ab".repeat(32) + "\"",
+            """{"blockHash":"0x${"ab".repeat(32)}"}""",
+            "5",
+            "\"latest-ish\"",
+        ).forEach { selector ->
+            val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[$tx,$selector]}""")
+            assertEquals(-32602, errorCode(resp), "not refused: $selector -> $resp")
+            assertNull(b.lastTx, "the engine was asked: $selector")
+        }
+        // EIP-1898's {"blockNumber": …} IS that number; null is latest.
+        mapOf("""{"blockNumber":"0x100"}""" to "0x100", "null" to "latest", "\"pending\"" to "pending")
+            .forEach { (selector, expected) ->
+                val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+                val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[$tx,$selector]}""")
+                assertEquals("0x5208", result(resp), "$selector -> $resp")
+                assertEquals(expected, b.lastTxBlock)
+            }
+    }
+
+    /** An engine that has not implemented the transaction object answers only
+     *  the four legacy fields — so a creation that names its nonce (which
+     *  decides the new address) is refused, not estimated at the state nonce. */
+    @Test fun estimateGas_creationNonceOnADefaultEngine_isRefused() {
+        val b = FakeBackend().apply { estimateResult = 53_000L }   // serves creation; no txEstimate
+        val refused = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"data":"0x6000","nonce":"0x5"}]}""")
+        assertEquals(-32602, errorCode(refused))
+        val served = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"data":"0x6000"}]}""")
+        assertEquals("0xcf08", result(served))
+    }
+
+    /** A nonce past the typed Long is a -32602 with its reason, answered per
+     *  element: it once threw out of the parser and failed the whole HTTP
+     *  request, batch included (#514 review). */
+    @Test fun estimateGas_nonceAboveTheTypedRange_isRefusedPerElement() {
+        val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+        val resp = route(b,
+            """[{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+                "params":[{"to":"0x2222222222222222222222222222222222222222","nonce":"0x8000000000000000"}]},
+               {"jsonrpc":"2.0","id":2,"method":"eth_estimateGas",
+                "params":[{"to":"0x2222222222222222222222222222222222222222","nonce":"0x7fffffffffffffff"}]}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        val error = arr[0].jsonObject["error"]!!.jsonObject
+        assertEquals(-32602, error["code"]!!.jsonPrimitive.content.toInt())
+        assertTrue(error["message"]!!.jsonPrimitive.content.contains("above 0x7fffffffffffffff"), resp)
+        assertEquals("0x5208", arr[1].jsonObject["result"]!!.jsonPrimitive.content)
+        assertEquals(Long.MAX_VALUE, b.lastTx!!.nonce())
+    }
+
+    /** `"data": null` is absent on its own — it must not hide `input`. */
+    @Test fun ethCall_nullDataWithInput_runsTheInput() {
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x2222222222222222222222222222222222222222","data":null,"input":"0x70a08231"},"latest"]}""")
+        assertEquals("0x01", result(resp))
+        assertEquals("0x70a08231", b.lastData!!.toHex())
+    }
+
+    @Test fun ethCall_fieldsItDoesNotApply_areRefusedNotDropped() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        listOf(
+            """{$to,"authorizationList":[{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963","nonce":"0x0","chainId":"0x1","yParity":"0x1","r":"0x1","s":"0x1"}]}""",
+            """{$to,"blobVersionedHashes":["0x01"]}""",
+            """{$to,"data":"0x01","input":"0x02"}""",
+        ).forEach { obj ->
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$obj,"latest"]}""")
+            assertEquals(-32602, errorCode(resp), "not refused: $obj -> $resp")
+            assertNull(b.lastTo, "the engine was asked: $obj")
+        }
+        // An empty list and an agreeing data/input pair change nothing.
+        val b = FakeBackend(callResult = byteArrayOf(1))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{$to,"authorizationList":[],"data":"0x01","input":"0x01"},"latest"]}""")
+        assertEquals("0x01", result(resp))
+    }
+
+    /** Two identical malformed strings are refused as malformed, not as a
+     *  data/input disagreement (#514 review). */
+    @Test fun ethCall_malformedDataAndInput_nameTheMalformedField() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        mapOf(
+            """{$to,"data":"0xzz","input":"0xzz"}""" to "'data' is not hex data",
+            """{$to,"data":"0x01","input":"0x0"}""" to "'input' is not hex data",
+        ).forEach { (obj, reason) ->
+            val resp = route(FakeBackend(callResult = byteArrayOf(1)),
+                """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$obj,"latest"]}""")
+            assertEquals(-32602, errorCode(resp), resp)
+            val message = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content
+            assertEquals(reason, message, obj)
+        }
     }
 
     @Test fun estimateGas_revertingTx_errors() {

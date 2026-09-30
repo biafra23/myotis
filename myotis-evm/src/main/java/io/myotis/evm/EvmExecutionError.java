@@ -58,6 +58,30 @@ public sealed interface EvmExecutionError {
     record OutOfGas() implements EvmExecutionError {}
 
     /**
+     * Estimation: the transaction does not succeed within the gas the caller
+     * allowed — its gas limit, what its fee cap lets the sender pay for, or the
+     * executor's own ceiling, whichever is lowest (#509). An ANSWER, not a
+     * failure to answer; {@link #message()} is geth's, which hosts serve
+     * verbatim as geth does.
+     */
+    record GasAllowanceExceeded(long allowance) implements EvmExecutionError {
+        public String message() {
+            return "gas required exceeds allowance (" + allowance + ")";
+        }
+    }
+
+    /**
+     * Estimation under a fee cap: the sender cannot even cover the transferred
+     * value (#509) — geth's {@code insufficient funds for transfer}, an answer
+     * like {@link GasAllowanceExceeded}.
+     */
+    record InsufficientFundsForTransfer() implements EvmExecutionError {
+        public String message() {
+            return "insufficient funds for transfer";
+        }
+    }
+
+    /**
      * EVM halted exceptionally WITHOUT a revert payload (invalid opcode, stack
      * violation, the deliberate BLOCKHASH gap, …). Distinct from
      * {@link Reverted} on purpose: a revert is a verified chain answer whose

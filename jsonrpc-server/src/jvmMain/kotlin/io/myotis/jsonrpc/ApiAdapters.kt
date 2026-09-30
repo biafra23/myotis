@@ -102,15 +102,34 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         data: ByteArray?,
         valueWei: String?,
     ): RpcEstimateResult {
-        val r = v.estimateGasDetailed(from, to, data, valueWei)
-        return when (r.status()!!) {
-            io.myotis.api.EstimateResult.Status.OK -> RpcEstimateResult.ok(r.gas())
-            io.myotis.api.EstimateResult.Status.REVERTED ->
-                RpcEstimateResult.reverted(r.revertData() ?: ByteArray(0))
-            io.myotis.api.EstimateResult.Status.UNAVAILABLE -> RpcEstimateResult.unavailable(r.detail())
-            io.myotis.api.EstimateResult.Status.REFUSED ->
-                RpcEstimateResult.refused(r.detail() ?: "refused by the engine")
-        }
+        return v.estimateGasDetailed(from, to, data, valueWei).toRpc()
+    }
+
+    override fun supportsTransactionLists(): Boolean = v.supportsTransactionLists()
+
+    override fun estimateGasTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcEstimateResult = v.estimateGasTx(
+        io.myotis.api.TransactionArgs(
+            tx.from, tx.to, tx.data, tx.valueWei, tx.gas,
+            tx.gasPriceWei, tx.maxFeePerGasWei, tx.maxPriorityFeePerGasWei, tx.nonce,
+            tx.hasAccessList, tx.hasAuthorizationList, tx.json,
+        ),
+        block,
+        stateOverridesJson,
+    ).toRpc()
+
+    private fun io.myotis.api.EstimateResult.toRpc(): RpcEstimateResult = when (status()!!) {
+        io.myotis.api.EstimateResult.Status.OK -> RpcEstimateResult.ok(gas())
+        io.myotis.api.EstimateResult.Status.REVERTED ->
+            RpcEstimateResult.reverted(revertData() ?: ByteArray(0))
+        io.myotis.api.EstimateResult.Status.UNAVAILABLE -> RpcEstimateResult.unavailable(detail())
+        io.myotis.api.EstimateResult.Status.REFUSED ->
+            RpcEstimateResult.refused(detail() ?: "refused by the engine")
+        io.myotis.api.EstimateResult.Status.INFEASIBLE ->
+            RpcEstimateResult.infeasible(detail() ?: "gas required exceeds allowance")
     }
 }
 

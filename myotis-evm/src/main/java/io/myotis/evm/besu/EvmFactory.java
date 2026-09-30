@@ -122,6 +122,35 @@ public final class EvmFactory {
     }
 
     /**
+     * The largest gas limit a transaction may carry at {@code ctx}: EIP-7825's
+     * 2^24 from Osaka, else unbounded. An estimate above it is a limit the
+     * network rejects, so the estimate's ceiling never exceeds it (geth caps its
+     * estimate the same way). Written as "not one of the forks before Osaka" so a
+     * fork added to {@link #specFor} later is capped by default. Refuses exactly
+     * what {@link #specFor} refuses.
+     */
+    public static long txGasLimitCap(BlockContext ctx) {
+        return switch (specFor(ctx)) {
+            case LONDON, PARIS, SHANGHAI, CANCUN, PRAGUE -> Long.MAX_VALUE;
+            default -> 1L << 24;
+        };
+    }
+
+    /**
+     * Whether EIP-7623's calldata floor applies at {@code ctx}: from Prague on,
+     * a transaction is charged at least {@code 21000 + 10 × tokens}, so an
+     * estimate below that is a limit the network rejects. Written as "not one
+     * of the forks before Prague" so a fork added to {@link #specFor} later is
+     * floored by default. Refuses exactly what {@link #specFor} refuses.
+     */
+    public static boolean calldataFloorActive(BlockContext ctx) {
+        return switch (specFor(ctx)) {
+            case LONDON, PARIS, SHANGHAI, CANCUN -> false;
+            default -> true;
+        };
+    }
+
+    /**
      * The fork {@code ctx} executes under — the selection half of
      * {@link #buildForBlock}. Throws {@link IllegalArgumentException} for an
      * unknown chain or a pre-floor block, and {@link EvmExecutionException}

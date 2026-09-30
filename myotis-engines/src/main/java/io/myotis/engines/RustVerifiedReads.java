@@ -456,6 +456,28 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsTransactionLists() {
+        return true;   // the revm executor applies both (myotis_evm::tx, ABI >= 34)
+    }
+
+    @Override
+    public io.myotis.api.EstimateResult estimateGasTx(io.myotis.api.TransactionArgs tx, String block,
+                                                      String stateOverridesJson) {
+        // No host-side block guard (unlike callDetailed): the engine applies the
+        // selector itself and refuses what it can never serve PERMANENTLY — a
+        // host check here would turn that into a retryable "unavailable". It
+        // applies — or refuses, as the permanent {"error","code":-32602} the
+        // handle returns as REFUSED — every field of the canonical object too.
+        try {
+            return handle.estimateGasTxVerifiedDetailed(
+                    tx.json(), block, stateOverridesJson == null ? "" : stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified estimateGas (transaction object) unavailable: {}", e.getMessage());
+            return io.myotis.api.EstimateResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Legacy two-state view of estimateGasDetailed (single source for the
         // guards) — a revert or refusal reads as null here.

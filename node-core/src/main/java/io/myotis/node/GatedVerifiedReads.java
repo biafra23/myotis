@@ -86,6 +86,17 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public io.myotis.api.EstimateResult estimateGasTx(io.myotis.api.TransactionArgs tx, String block,
+                                                      String stateOverridesJson) {
+        // Forwarded, not inherited: the interface default would answer from the
+        // four legacy fields and refuse the rest, while the engine behind this
+        // gate applies gas, fees and the block itself (#509).
+        io.myotis.api.EstimateResult r = guarded(d -> d.estimateGasTx(tx, block, stateOverridesJson));
+        // guarded() returns null when no backend is available — retryable, not a revert.
+        return r != null ? r : io.myotis.api.EstimateResult.unavailable("stack not ready");
+    }
+
+    @Override
     public io.myotis.api.CallResult callDetailed(byte[] from, byte[] to, byte[] data,
                                                  String valueWei, String block,
                                                  String stateOverridesJson) {

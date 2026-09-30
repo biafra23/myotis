@@ -1,6 +1,7 @@
 package io.myotis.rpc;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import io.myotis.evm.EvmExecutionError;
@@ -44,5 +45,20 @@ class RevertDataOfTest {
         assertNull(VerifiedRpcBackend.revertDataOf(new java.util.concurrent.ExecutionException(
                 new EvmExecutionException(
                         new EvmExecutionError.StateUnavailable(new byte[32], null, null)))));
+    }
+
+    /** #509: an estimate that does not fit the caller's gas or funds is an ANSWER in
+     *  geth's words (INFEASIBLE → -32000 with the message), found through the same
+     *  wrapped causes — and nothing else reads as one. */
+    @Test
+    void infeasibleEstimatesCarryGethsMessage() {
+        assertEquals("gas required exceeds allowance (50000)", VerifiedRpcBackend.infeasibleOf(
+                new java.util.concurrent.ExecutionException(new RuntimeException(new EvmExecutionException(
+                        new EvmExecutionError.GasAllowanceExceeded(50_000L))))));
+        assertEquals("insufficient funds for transfer", VerifiedRpcBackend.infeasibleOf(
+                new EvmExecutionException(new EvmExecutionError.InsufficientFundsForTransfer())));
+        assertNull(VerifiedRpcBackend.infeasibleOf(
+                new EvmExecutionException(new EvmExecutionError.Reverted(new byte[0]))));
+        assertNull(VerifiedRpcBackend.infeasibleOf(new RuntimeException("timeout")));
     }
 }

@@ -4,6 +4,7 @@ import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
 import io.myotis.jsonrpc.RpcBlockWindow
+import io.myotis.jsonrpc.RpcTransactionArgs
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -217,13 +218,35 @@ class IosRpcBackend(
         if (to == null || to.size != 20) return RpcEstimateResult.unavailable("contract creation not estimated")
         if (from != null && from.size != 20) return RpcEstimateResult.unavailable("malformed from")
         val handle = handleProvider() ?: return RpcEstimateResult.unavailable("engine not running")
-        val json = RustEngine.estimateGasJson(
+        return estimateFromJson(RustEngine.estimateGasJson(
             handle,
             from?.let(::hex) ?: "",
             hex(to),
             data?.let { if (it.isEmpty()) "" else hex(it) } ?: "",
             valueWei ?: "",
-        )
+        ))
+    }
+
+    override fun supportsTransactionLists(): Boolean = true // the revm executor applies both (ABI >= 34)
+
+    override fun estimateGasTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcEstimateResult {
+        // No host-side block guard (unlike callDetailed): the engine applies the
+        // selector itself and refuses what it can never serve PERMANENTLY — a
+        // host check would turn that into a retryable "unavailable". It applies
+        // — or refuses, as the permanent -32602 envelope — every field of the
+        // canonical object the router built too (#509; JVM-adapter parity).
+        val handle = handleProvider() ?: return RpcEstimateResult.unavailable("engine not running")
+        return estimateFromJson(RustEngine.estimateGasTxJson(handle, tx.json, block, stateOverridesJson ?: ""))
+    }
+
+    /** The engine's estimate JSON as an [RpcEstimateResult] — one reading for
+     *  both estimate entry points (RustChainHandle.estimateGasDetailedFromJson's
+     *  twin). */
+    private fun estimateFromJson(json: String): RpcEstimateResult {
         // An executor refusal is the permanent -32602 envelope: REFUSED, as in callDetailed.
         permanentRefusalOrNull(json)?.let { return RpcEstimateResult.refused(it) }
         val o = resultOrNull(json) ?: return RpcEstimateResult.unavailable("engine error")
@@ -239,6 +262,13 @@ class IosRpcBackend(
             // shape drift → retryable, never a definitive revert.
             "revert" -> RpcEstimateResult.reverted(hexToBytes(o.engineString("dataHex"))
                 ?: return RpcEstimateResult.unavailable("malformed dataHex from engine"))
+            // The transaction does not fit the caller's gas or funds (ABI 34): an
+            // answer in geth's words, which the router serves verbatim. A
+            // reasonless one is shape drift → retryable, as above.
+            "infeasible" -> RpcEstimateResult.infeasible(
+                o.engineString("reason")?.takeIf { it.isNotBlank() }
+                    ?: return RpcEstimateResult.unavailable("infeasible without a reason from engine"),
+            )
             else -> RpcEstimateResult.unavailable(o.engineString("reason"))
         }
     }

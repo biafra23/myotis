@@ -43,6 +43,7 @@ pub mod executor;
 pub mod fork;
 pub mod oracle;
 pub mod overrides;
+pub mod tx;
 
 // Re-exported so downstream crates implementing [`SnapStateOracle`] / building a
 // [`BlockContext`] can name revm's `U256` without depending on revm directly.
@@ -63,6 +64,7 @@ pub use ens::{
 pub use error::EvmError;
 pub use executor::EvmExecutor;
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle};
+pub use tx::TxRequest;
 
 #[cfg(any(test, feature = "fixture"))]
 pub use oracle::FixtureSnapStateOracle;

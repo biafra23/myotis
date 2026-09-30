@@ -1940,9 +1940,10 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
 }
 
 /// `nativeEstimateGasJson`: verified `eth_estimateGas` for a call (`to` set) over the
-/// revm executor. Args as for [`eth_call_json`] minus the block (estimate always runs
-/// against the verified head). Returns the estimate JSON (`ok`/`revert`/`unavailable`, see
-/// [`eljson::estimate_json`]) or `{"error": "..."}`.
+/// revm executor, from the four pre-#509 fields only — the full transaction
+/// object goes through [`estimate_gas_tx_json`]. Args as for [`eth_call_json`]
+/// minus the block (this entry point always runs against the verified head).
+/// Returns the estimate JSON ([`eljson::estimate_json`]) or `{"error": "..."}`.
 pub fn estimate_gas_json(
     handle: i64,
     from_hex: &str,
@@ -1954,10 +1955,10 @@ pub fn estimate_gas_json(
         return eljson::error_json("invalid 'to' address (expected 20-byte hex)");
     };
     let from = if from_hex.trim().is_empty() {
-        None
+        myotis_evm::tx::ANONYMOUS_SENDER
     } else {
         match parse_address(from_hex) {
-            Some(a) => Some(a),
+            Some(a) => a,
             None => return eljson::error_json("invalid 'from' address (expected 20-byte hex)"),
         }
     };
@@ -1977,6 +1978,51 @@ pub fn estimate_gas_json(
             Err(_) => return eljson::error_json("invalid value (expected decimal wei)"),
         }
     };
+    let tx = myotis_evm::TxRequest::call(from, Some(to), data.into(), value);
+    run_estimate(handle, tx, BlockSelector::Head, myotis_evm::overrides::StateOverrides::new())
+}
+
+/// `nativeEstimateGasTxJson` (ABI ≥ 34, #509): verified `eth_estimateGas` for
+/// the FULL JSON-RPC transaction object — `tx_json` is geth's
+/// `TransactionArgs` shape ([`parse_tx_request`]), `block` the RPC block
+/// selector (applied or refused exactly as `eth_call`'s), `overrides_json` an
+/// `eth_estimateGas` state override (empty = none; the answer is then
+/// SIMULATED, as for `eth_call`). Every field is applied or the request is
+/// refused with the permanent `{"error","code":-32602}` envelope — a malformed
+/// or contradictory object, a `chainId` for another chain, a blob transaction.
+/// Otherwise the estimate JSON ([`eljson::estimate_json`], including the
+/// `infeasible` status for a transaction that does not fit the caller's gas or
+/// funds) or a retryable `{"error": "..."}`.
+pub fn estimate_gas_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
+    // Every refusal of the request's own arguments is permanent (-32602), and
+    // decided before the handle is consulted: no retry, and no sync progress,
+    // changes a contradictory request.
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
+    };
+    let overrides = match parse_state_overrides(overrides_json) {
+        Ok(o) => o,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
+    let tx = match parse_tx_request(tx_json) {
+        Ok(tx) => tx,
+        Err(msg) => return eljson::invalid_params_json(&format!("invalid transaction object: {msg}")),
+    };
+    if let Err(msg) = tx.validate() {
+        return eljson::invalid_params_json(&format!("invalid transaction object: {msg}"));
+    }
+    run_estimate(handle, tx, selector, overrides)
+}
+
+/// The shared tail of the estimate entry points: resolve the handle and the
+/// anchor, refuse a `chainId` for another chain, run.
+fn run_estimate(
+    handle: i64,
+    tx: myotis_evm::TxRequest,
+    selector: BlockSelector,
+    overrides: myotis_evm::overrides::StateOverrides,
+) -> String {
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
@@ -1984,13 +2030,202 @@ pub fn estimate_gas_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
+    if let Some(requested) = tx.chain_id {
+        if requested != U256::from(chain_id) {
+            return eljson::invalid_params_json(&format!(
+                "invalid transaction object: chainId {requested} does not match this node's chain ({chain_id})"
+            ));
+        }
+    }
+    // Against the head as of dispatch, like the host adapters' own check.
+    let anchor = match read_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
     match engine
         .rt
-        .block_on(async { reader.estimate_gas(from, to, data, value, chain_id).await })
+        .block_on(async { reader.estimate_gas_tx(anchor, tx, chain_id, overrides).await })
     {
         Ok(outcome) => eljson::estimate_json(&outcome),
         Err(e) => eljson::error_json(&e),
     }
+}
+
+/// Parse a JSON-RPC transaction object (geth's `TransactionArgs`) into the
+/// executor's [`myotis_evm::TxRequest`]. Pure and unit-tested: this decides
+/// which transaction is simulated, so a silently mis-read field answers a
+/// different question than the caller asked (#509). Shape only — the
+/// cross-field rules live in [`myotis_evm::TxRequest::validate`].
+///
+/// - `from` / `to`: 20-byte hex; absent or null `to` is contract creation.
+/// - `input` / `data`: hex; both present must agree (geth refuses otherwise).
+/// - quantities (`value`, `gas`, `gasPrice`, `maxFeePerGas`,
+///   `maxPriorityFeePerGas`, `nonce`, `chainId`, `type`): `0x`-hex strings.
+/// - `gasPrice` together with an EIP-1559 fee field is refused (geth does).
+/// - `accessList`: `[{address, storageKeys: [32-byte hex]}]`.
+/// - `authorizationList`: `[{chainId, address, nonce, yParity (or v), r, s}]`.
+/// - blob fields are refused: nothing here models blob gas or BLOBHASH.
+///
+/// JSON `null` reads as absent. Unknown keys are ignored, as geth ignores them.
+fn parse_tx_request(json: &str) -> Result<myotis_evm::TxRequest, String> {
+    use myotis_evm::tx::{AccessListItem, Authorization, Fees, ANONYMOUS_SENDER};
+    let v: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|_| "not a JSON object".to_string())?;
+    let obj = v.as_object().ok_or("not a JSON object")?;
+    // A present, non-null field.
+    let field = |k: &str| obj.get(k).filter(|v| !v.is_null());
+
+    for blob in ["blobVersionedHashes", "maxFeePerBlobGas", "blobs", "commitments", "proofs", "sidecar"] {
+        if let Some(val) = field(blob) {
+            if val.as_array().is_none_or(|a| !a.is_empty()) {
+                return Err(format!(
+                    "blob transactions (type 0x3) are not supported by this node ('{blob}')"
+                ));
+            }
+        }
+    }
+    let address = |k: &str, val: &serde_json::Value| -> Result<[u8; 20], String> {
+        val.as_str().and_then(parse_address).ok_or(format!("'{k}' is not a 20-byte hex address"))
+    };
+    let from = match field("from") {
+        Some(val) => address("from", val)?,
+        None => ANONYMOUS_SENDER,
+    };
+    let to = field("to").map(|val| address("to", val)).transpose()?;
+    let bytes = |k: &str| -> Result<Option<Vec<u8>>, String> {
+        field(k)
+            .map(|val| val.as_str().and_then(parse_hex_bytes).ok_or(format!("'{k}' is not hex data")))
+            .transpose()
+    };
+    let data = match (bytes("input")?, bytes("data")?) {
+        (Some(input), Some(data)) if input != data => {
+            return Err("both 'data' and 'input' are set and not equal; use 'input'".into())
+        }
+        (Some(d), _) | (None, Some(d)) => d,
+        (None, None) => Vec::new(),
+    };
+    let quantity = |k: &str| -> Result<Option<U256>, String> {
+        field(k).map(|val| parse_quantity(k, val)).transpose()
+    };
+    let narrow_u64 = |k: &str, q: Option<U256>| -> Result<Option<u64>, String> {
+        q.map(|n| u64::try_from(n).map_err(|_| format!("'{k}' exceeds 64 bits"))).transpose()
+    };
+    let narrow_u128 = |k: &str, q: Option<U256>| -> Result<Option<u128>, String> {
+        q.map(|n| u128::try_from(n).map_err(|_| format!("'{k}' exceeds 128 bits"))).transpose()
+    };
+    let gas_price = narrow_u128("gasPrice", quantity("gasPrice")?)?;
+    let max_fee = narrow_u128("maxFeePerGas", quantity("maxFeePerGas")?)?;
+    let max_priority = narrow_u128("maxPriorityFeePerGas", quantity("maxPriorityFeePerGas")?)?;
+    let fees = match (gas_price, max_fee, max_priority) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified".into())
+        }
+        (Some(gas_price), None, None) => Fees::Legacy { gas_price },
+        (None, None, None) => Fees::None,
+        (None, max_fee, max_priority) => Fees::DynamicFee {
+            max_fee_per_gas: max_fee.unwrap_or(0),
+            max_priority_fee_per_gas: max_priority.unwrap_or(0),
+        },
+    };
+    let tx_type = quantity("type")?
+        .map(|t| u8::try_from(t).map_err(|_| format!("unsupported transaction type {t:#x}")))
+        .transpose()?;
+    let access_list = match field("accessList") {
+        None => None,
+        Some(val) => {
+            let items = val.as_array().ok_or("'accessList' must be an array")?;
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                let entry = item.as_object().ok_or("'accessList' entries must be objects")?;
+                let address = address(
+                    "accessList.address",
+                    entry.get("address").ok_or("'accessList' entry without 'address'")?,
+                )?;
+                let mut storage_keys = Vec::new();
+                if let Some(keys) = entry.get("storageKeys").filter(|v| !v.is_null()) {
+                    for key in keys.as_array().ok_or("'storageKeys' must be an array")? {
+                        storage_keys.push(
+                            key.as_str()
+                                .and_then(parse_word32)
+                                .ok_or("'storageKeys' entries must be 32-byte hex")?,
+                        );
+                    }
+                }
+                list.push(AccessListItem { address, storage_keys });
+            }
+            Some(list)
+        }
+    };
+    let authorization_list = match field("authorizationList") {
+        None => None,
+        Some(val) => {
+            let items = val.as_array().ok_or("'authorizationList' must be an array")?;
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                let auth = item.as_object().ok_or("'authorizationList' entries must be objects")?;
+                let get = |k: &str| {
+                    auth.get(k)
+                        .filter(|v| !v.is_null())
+                        .ok_or(format!("authorization without '{k}'"))
+                };
+                // geth names it yParity; alloy also accepts v, and a legacy v of
+                // 27/28 is the same parity. Left as 27, recovery would fail and
+                // the tuple be SKIPPED — an estimate without the delegation the
+                // signed transaction (whose yParity is 0/1) carries, #509's own
+                // failure. Normalized, then both must agree.
+                let parity = |k: &str, v: &serde_json::Value| -> Result<U256, String> {
+                    let p = parse_quantity(k, v)?;
+                    Ok(if p == U256::from(27) || p == U256::from(28) { p - U256::from(27) } else { p })
+                };
+                let y_parity = match (auth.get("yParity").filter(|v| !v.is_null()), auth.get("v").filter(|v| !v.is_null())) {
+                    (Some(y), Some(v)) if parity("yParity", y)? != parity("v", v)? => {
+                        return Err("authorization 'yParity' and 'v' disagree".into())
+                    }
+                    (Some(y), _) => parity("yParity", y)?,
+                    (None, Some(v)) => parity("v", v)?,
+                    (None, None) => return Err("authorization without 'yParity'".into()),
+                };
+                list.push(Authorization {
+                    chain_id: parse_quantity("chainId", get("chainId")?)?,
+                    address: address("authorization address", get("address")?)?,
+                    nonce: u64::try_from(parse_quantity("nonce", get("nonce")?)?)
+                        .map_err(|_| "authorization 'nonce' exceeds 64 bits")?,
+                    // Anything but 0/1 fails recovery, which makes the TUPLE
+                    // invalid (skipped) — the spec's outcome, not ours to refuse.
+                    y_parity: u8::try_from(y_parity).map_err(|_| "authorization 'yParity' exceeds 8 bits")?,
+                    r: parse_quantity("r", get("r")?)?,
+                    s: parse_quantity("s", get("s")?)?,
+                });
+            }
+            Some(list)
+        }
+    };
+    Ok(myotis_evm::TxRequest {
+        from,
+        to,
+        data: data.into(),
+        value: quantity("value")?.unwrap_or(U256::ZERO),
+        gas: narrow_u64("gas", quantity("gas")?)?,
+        fees,
+        nonce: narrow_u64("nonce", quantity("nonce")?)?,
+        chain_id: quantity("chainId")?,
+        tx_type,
+        access_list,
+        authorization_list,
+    })
+}
+
+/// A JSON-RPC QUANTITY: a `0x`-hex string of at most 256 bits. Leading zeros
+/// are tolerated (ethers serializes a signature's `s` with `toBeHex`, which
+/// pads), a bare decimal or a JSON number is not — geth refuses those too.
+fn parse_quantity(k: &str, val: &serde_json::Value) -> Result<U256, String> {
+    let bad = || format!("'{k}' is not a 0x-hex quantity");
+    let s = val.as_str().ok_or_else(bad)?;
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).ok_or_else(bad)?;
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    U256::from_str_radix(hex, 16).map_err(|_| bad())
 }
 
 /// `nativeGetBlockByNumberJson`: verified `eth_getBlockByNumber` for a running
@@ -2745,6 +2980,184 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the eth_estimateGas transaction object (#509) --------------------
+
+    fn assert_invalid_params(json: &str, needle: &str) {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["code"], eljson::INVALID_PARAMS, "{json}");
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains(needle), "expected '{needle}' in '{msg}'");
+    }
+
+    /// The #509 request as ethers v6 serializes it (`getRpcTransaction`): type
+    /// 4, the sender's nonce, and an authorization whose `s` is `toBeHex`-padded.
+    #[test]
+    fn parse_tx_request_reads_an_ethers_set_code_request() {
+        let json = r#"{
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "data": "0x3e12cc2e",
+            "value": "0x2386f26fc10000",
+            "nonce": "0x7",
+            "chainId": "0x1",
+            "type": "0x4",
+            "authorizationList": [{
+                "address": "0x05ae73c5925d843864ae6f261f3175de2ebcd963",
+                "nonce": "0x0",
+                "chainId": "0x1",
+                "yParity": "0x1",
+                "r": "0x9a3b",
+                "s": "0x0c5d"
+            }]
+        }"#;
+        let tx = parse_tx_request(json).unwrap();
+        assert_eq!(tx.from, [0x11; 20]);
+        assert_eq!(tx.to, Some([0x22; 20]));
+        assert_eq!(tx.data.as_ref(), &[0x3e, 0x12, 0xcc, 0x2e]);
+        assert_eq!(tx.value, U256::from(10_000_000_000_000_000u64));
+        assert_eq!(tx.nonce, Some(7));
+        assert_eq!(tx.chain_id, Some(U256::from(1)));
+        assert_eq!(tx.tx_type, Some(myotis_evm::tx::TYPE_SET_CODE));
+        let auths = tx.authorization_list.as_ref().unwrap();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].address[..2], [0x05, 0xae]);
+        assert_eq!((auths[0].y_parity, auths[0].r, auths[0].s), (1, U256::from(0x9a3b), U256::from(0x0c5d)));
+        assert_eq!(tx.validate(), Ok(()));
+    }
+
+    /// The cross-language golden: the router's canonical object for the #509
+    /// request, VERBATIM from `RpcTransactionArgsTest.CANONICAL` (jsonrpc-server)
+    /// — what every JVM and iOS host hands this parser. Change both together.
+    #[test]
+    fn parse_tx_request_reads_the_routers_canonical_form() {
+        const CANONICAL: &str = concat!(
+            r#"{"from":"0x1111111111111111111111111111111111111111","#,
+            r#""to":"0x2222222222222222222222222222222222222222","input":"0x3e12cc2e","#,
+            r#""value":"0x2386f26fc10000","maxFeePerGas":"0x3b9aca00","maxPriorityFeePerGas":"0x1","#,
+            r#""nonce":"0x7","chainId":"0x1","type":"0x4","#,
+            r#""accessList":[{"address":"0x3333333333333333333333333333333333333333","#,
+            r#""storageKeys":["0x0000000000000000000000000000000000000000000000000000000000000001"]}],"#,
+            r#""authorizationList":[{"chainId":"0x1","address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963","#,
+            r#""nonce":"0x0","yParity":"0x1","r":"0x9a3b","s":"0xc5d"}]}"#,
+        );
+        let tx = parse_tx_request(CANONICAL).unwrap();
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!((tx.from, tx.to), ([0x11; 20], Some([0x22; 20])));
+        assert_eq!(tx.data.as_ref(), &[0x3e, 0x12, 0xcc, 0x2e]);
+        assert_eq!(tx.value, U256::from(10_000_000_000_000_000u64));
+        assert_eq!(
+            tx.fees,
+            myotis_evm::tx::Fees::DynamicFee { max_fee_per_gas: 1_000_000_000, max_priority_fee_per_gas: 1 }
+        );
+        assert_eq!((tx.nonce, tx.chain_id, tx.tx_type), (Some(7), Some(U256::from(1)), Some(4)));
+        let list = tx.access_list.as_ref().unwrap();
+        assert_eq!((list.len(), list[0].address, list[0].storage_keys[0][31]), (1, [0x33; 20], 1));
+        let auth = &tx.authorization_list.as_ref().unwrap()[0];
+        assert_eq!((auth.chain_id, auth.nonce, auth.y_parity), (U256::from(1), 0, 1));
+        assert_eq!((auth.r, auth.s), (U256::from(0x9a3b), U256::from(0xc5d)));
+    }
+
+    #[test]
+    fn parse_tx_request_reads_access_lists_and_fees() {
+        let tx = parse_tx_request(
+            r#"{"to":"0x2222222222222222222222222222222222222222","gas":"0x5208",
+                "maxFeePerGas":"0x3b9aca00","maxPriorityFeePerGas":"0x1",
+                "accessList":[{"address":"0x3333333333333333333333333333333333333333",
+                  "storageKeys":["0x0000000000000000000000000000000000000000000000000000000000000001"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(tx.gas, Some(21_000));
+        assert_eq!(
+            tx.fees,
+            myotis_evm::tx::Fees::DynamicFee { max_fee_per_gas: 1_000_000_000, max_priority_fee_per_gas: 1 }
+        );
+        let list = tx.access_list.unwrap();
+        assert_eq!(list[0].address, [0x33; 20]);
+        assert_eq!(list[0].storage_keys[0][31], 1);
+        // Legacy pricing.
+        let legacy = parse_tx_request(r#"{"gasPrice":"0x10"}"#).unwrap();
+        assert_eq!(legacy.fees, myotis_evm::tx::Fees::Legacy { gas_price: 16 });
+    }
+
+    #[test]
+    fn parse_tx_request_reads_null_as_absent_and_ignores_unknown_keys() {
+        let tx = parse_tx_request(
+            r#"{"from":null,"to":null,"input":null,"gas":null,"accessList":null,
+                "authorizationList":null,"someWalletField":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(tx, myotis_evm::TxRequest::call(myotis_evm::tx::ANONYMOUS_SENDER, None, Default::default(), U256::ZERO));
+    }
+
+    /// Fields that disagree are refused, never resolved by picking one.
+    #[test]
+    fn parse_tx_request_refuses_conflicting_fields() {
+        assert!(parse_tx_request(r#"{"data":"0x01","input":"0x02"}"#).unwrap_err().contains("not equal"));
+        assert_eq!(parse_tx_request(r#"{"data":"0x01","input":"0x01"}"#).unwrap().data.as_ref(), &[1]);
+        assert!(parse_tx_request(r#"{"gasPrice":"0x1","maxFeePerGas":"0x2"}"#)
+            .unwrap_err()
+            .contains("both gasPrice"));
+        let auth = |extra: &str| {
+            format!(
+                r#"{{"authorizationList":[{{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963",
+                    "nonce":"0x0","chainId":"0x1","r":"0x1","s":"0x1"{extra}}}]}}"#
+            )
+        };
+        assert_eq!(parse_tx_request(&auth(r#","v":"0x1""#)).unwrap().authorization_list.unwrap()[0].y_parity, 1);
+        assert!(parse_tx_request(&auth(r#","v":"0x1","yParity":"0x0""#)).unwrap_err().contains("disagree"));
+        // A legacy v of 27/28 is parity 0/1 — left as is, recovery would fail
+        // and the delegation silently vanish from the estimate.
+        assert_eq!(parse_tx_request(&auth(r#","v":"0x1b""#)).unwrap().authorization_list.unwrap()[0].y_parity, 0);
+        assert_eq!(parse_tx_request(&auth(r#","v":"0x1c""#)).unwrap().authorization_list.unwrap()[0].y_parity, 1);
+        assert!(parse_tx_request(&auth(r#","v":"0x1c","yParity":"0x1""#)).is_ok());
+        assert!(parse_tx_request(&auth("")).unwrap_err().contains("yParity"));
+    }
+
+    #[test]
+    fn parse_tx_request_refuses_blobs_and_malformed_values() {
+        assert!(parse_tx_request(r#"{"blobVersionedHashes":["0x01"]}"#).unwrap_err().contains("blob"));
+        assert!(parse_tx_request(r#"{"maxFeePerBlobGas":"0x1"}"#).unwrap_err().contains("blob"));
+        // An empty list is no blob at all.
+        assert!(parse_tx_request(r#"{"blobVersionedHashes":[]}"#).is_ok());
+        for bad in [
+            r#"{"value":"100"}"#,
+            r#"{"value":100}"#,
+            r#"{"gas":"0x"}"#,
+            r#"{"gas":"0x10000000000000000"}"#,
+            r#"{"type":"0x100"}"#,
+            r#"{"to":"0x1234"}"#,
+            r#"{"data":"0xabc"}"#,
+            r#"{"accessList":[{"address":"0x3333333333333333333333333333333333333333","storageKeys":["0x01"]}]}"#,
+            r#"[]"#,
+            "",
+        ] {
+            assert!(parse_tx_request(bad).is_err(), "must refuse {bad}");
+        }
+        // Leading zeros are tolerated (ethers pads a signature's `s`).
+        assert_eq!(parse_tx_request(r#"{"gas":"0x05208"}"#).unwrap().gas, Some(21_000));
+    }
+
+    /// A contradictory or malformed request is refused permanently BEFORE the
+    /// handle is consulted — no handle exists here, so reaching it would answer
+    /// the retryable "engine unavailable"/"unknown handle" instead.
+    #[test]
+    fn estimate_gas_tx_json_refuses_bad_requests_before_the_handle() {
+        let to = r#""to":"0x2222222222222222222222222222222222222222""#;
+        assert_invalid_params(
+            &estimate_gas_tx_json(i64::MIN, &format!(r#"{{{to},"type":"0x4"}}"#), "", ""),
+            "requires an authorizationList",
+        );
+        assert_invalid_params(
+            &estimate_gas_tx_json(i64::MIN, &format!(r#"{{{to},"authorizationList":[]}}"#), "latest", ""),
+            "must not be empty",
+        );
+        assert_invalid_params(&estimate_gas_tx_json(i64::MIN, "not json", "", ""), "invalid transaction object");
+        assert_invalid_params(&estimate_gas_tx_json(i64::MIN, &format!("{{{to}}}"), "", "[]"), "state override");
+        let earliest: serde_json::Value =
+            serde_json::from_str(&estimate_gas_tx_json(i64::MIN, &format!("{{{to}}}"), "earliest", "")).unwrap();
+        assert_eq!(earliest["code"], eljson::INVALID_PARAMS);
+    }
 
     #[test]
     fn fee_history_outer_failure_preserves_stale_cache_policy() {
