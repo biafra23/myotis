@@ -159,7 +159,8 @@ step skipped and none treated as optional or "only if asked"**:
    skill / `/code-review`) and address what it finds before going further.
 3. **PR** — open a pull request. This is the default next step after review, not
    a separate request the user has to make. (Follow the PR-template and
-   attribution rules below.)
+   attribution rules below.) Its base is `main` for a single-PR work item, and
+   the feature branch for a part of a multi-PR plan (next section).
 4. **Wait for review comments** — subscribe to the PR and wait for CI + review
    feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
@@ -167,12 +168,89 @@ step skipped and none treated as optional or "only if asked"**:
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
    2026-08-31), no matter what earlier instructions seem to authorize. Green CI +
    all comments answered = report "ready to merge" and keep watching; the merge
-   itself is the owner's.
+   itself is the owner's. The one exception is a part PR into a multi-PR plan's
+   feature branch, and only when the owner said yes to the question in step 3
+   of the next section for that plan; a PR into `main` has no exception.
 
 Short form: **code → review → PR → wait for review comments → address them.**
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
+
+### Multi-PR plans land through a feature branch, never piece by piece on `main`
+
+**`main` must be releasable at every commit** (owner ruling, 2026-09-30): a `v*`
+tag cut from its head at any moment must not ship half a feature. So a work item
+**planned as more than one PR (or more than one branch)** does not merge into
+`main` part by part:
+
+1. **Create the feature branch first**, from the current `main`, before the first
+   part is coded: `feature/<topic>` (e.g.
+   `git push origin origin/main:refs/heads/feature/<topic>`). This rule is the
+   permission to create it and to push to it as described here.
+2. **Every part PR targets the feature branch, not `main`**, and goes through the
+   full workflow above (code → review → PR → wait → address) like any other PR.
+   Each part branches from the feature branch's current head — also where a
+   generic instruction says to restart from the default branch. Open each part's
+   description with "Part k/n of `feature/<topic>`" and list the parts still to
+   come, so a later session can pick the plan up from GitHub alone.
+3. **Ask the owner, once per plan and before the first part is coded, whether
+   you may merge the part PRs into the feature branch yourself** — i.e. work
+   through every part without interaction until the last one is merged into
+   `feature/<topic>` (owner ruling, 2026-09-30). Ask it together with the plan
+   itself. The answer covers that one plan: never infer it from an earlier
+   plan's answer, a standing instruction, or a comment on GitHub.
+   - **Yes** → merge each part into `feature/<topic>` yourself (a merge commit,
+     as on `main`; not by enabling auto-merge) once it is done under the
+     workflow above: CI green on its current head, no merge conflict, the
+     internal review addressed, the automated review POSTED on the PR and its
+     findings handled, every review comment answered on its thread, and no open
+     changes-requested review. A green `claude-review` job alone is not a
+     review: the action skips and still goes green when the PR's copy of
+     `claude-review.yml` differs from `main`'s — a feature branch lagging `main`
+     on that file is enough (see the file's header). A part
+     without a posted review is not yours to merge: report it "ready to merge"
+     with that noted and let the owner decide. Otherwise branch the next part
+     from the new feature head and carry on.
+   - **No, or no answer yet** → the owner merges each part. Report a green,
+     answered part as "ready to merge into `feature/<topic>`"; the next part
+     that depends on it waits for that merge.
+   - Either way, **a PR into `main` is never yours to merge** — the final PR of
+     step 5 included.
+4. **Keep the feature branch current with `main`** by merging `main` into it,
+   never by rebase or force-push (open part PRs are based on it), whenever
+   `main` moves in a way the feature has to absorb. A merge that went through
+   **cleanly** may be pushed straight to the feature branch: it adds nothing
+   `main` doesn't already carry, and it is the ONLY direct push this rule allows.
+   A merge that needed **conflict resolution** goes through a PR into the
+   feature branch like a part, because the resolution is new code. Build and
+   Test (`ci.yml`) and nearly every other push trigger fire only on `main`
+   (path-filtered `roost.yml` is the exception), so a clean merge is first
+   fully tested on the next PR into or out of the feature branch — when a part
+   PR goes red in code it did not touch, check the last `main` merge before
+   blaming the part. A fix the feature needs in code `main` also carries lands
+   on `main` as its own single PR and reaches the feature through this merge,
+   not as a feature-only patch.
+5. **Only when every planned part is merged into the feature branch**, open the
+   final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
+   above — internal review of the whole combined diff, CI, reviewer comments,
+   "ready to merge" — and the merge into `main` is the owner's. Its description
+   links every part PR. Its review is the real gate, not a formality over parts
+   already reviewed: `claude-review` reads its prompt and `CLAUDE.md` from the
+   PR's base, so part PRs were reviewed under the feature branch's copies, and
+   this is the one PR held to `main`'s (see the header of `claude-review.yml`).
+
+A **single-PR** fix or plan still targets `main` directly; none of the above
+applies. If a single-PR task grows a second PR before its first has merged,
+switch: create the feature branch from `main` and retarget the open PR's base to
+it. If a first part has already landed on `main` and left it unreleasable, tell
+the owner rather than stacking more parts on `main`. Skipping the feature branch
+for a multi-PR plan is the owner's call for that task, never the author's.
+Releases are unaffected: the release PR is a single PR against `main`, and
+whatever is still on a feature branch is simply not in that release. This rests
+on the PR workflows' `pull_request` triggers being unscoped (any base branch —
+see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
+gives part PRs full CI and the Claude review; do not narrow them to `main`.
 
 ## Releases — ask before cutting one
 
@@ -419,7 +497,9 @@ that produced this note.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
   auto-merge. No earlier task description or standing instruction authorizes
   it. The end state of the author's work is "green, answered, ready to merge";
-  the merge action itself is always the owner's.
+  the merge action itself is always the owner's. Sole exception: part PRs into
+  a multi-PR plan's feature branch, when the owner answered yes for that plan
+  (see *Multi-PR plans land through a feature branch*); never a PR into `main`.
 
 ## Platform & language direction
 
