@@ -11,23 +11,25 @@ use crate::rlp;
 use crate::trie::{hex_prefix_encode, to_nibbles, EMPTY_TRIE_ROOT};
 
 /// True iff the ordered trie over `items` roots to `expected_root`.
-pub fn verify(items: &[Vec<u8>], expected_root: &[u8; 32]) -> bool {
+pub fn verify<'a>(items: impl IntoIterator<Item = &'a [u8]>, expected_root: &[u8; 32]) -> bool {
     ordered_trie_root(items) == *expected_root
 }
 
-/// Root of the ordered trie mapping `RLP(i) -> items[i]`.
-pub fn ordered_trie_root(items: &[Vec<u8>]) -> [u8; 32] {
-    if items.is_empty() {
-        return EMPTY_TRIE_ROOT;
-    }
+/// Root of the ordered trie mapping `RLP(i)` to the `i`-th item. It builds a
+/// key and an entry per item, so callers bound how many items a peer can
+/// hand it before asking (#454).
+pub fn ordered_trie_root<'a>(items: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
     let mut entries: Vec<(Vec<u8>, &[u8])> = items
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(i, v)| {
             let key = rlp::encode_bytes(&rlp::u64_to_minimal_be(i as u64));
-            (to_nibbles(&key), v.as_slice())
+            (to_nibbles(&key), v)
         })
         .collect();
+    if entries.is_empty() {
+        return EMPTY_TRIE_ROOT;
+    }
     // Trie shape follows key-nibble order, not insertion order.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     keccak256(&build_node(&entries, 0))
@@ -98,19 +100,19 @@ fn common_prefix_end(entries: &[(Vec<u8>, &[u8])], depth: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{format, vec};
+    use alloc::format;
 
     #[test]
     fn empty_list_is_empty_root() {
-        assert_eq!(ordered_trie_root(&[]), EMPTY_TRIE_ROOT);
-        assert!(verify(&[], &EMPTY_TRIE_ROOT));
+        assert_eq!(ordered_trie_root([]), EMPTY_TRIE_ROOT);
+        assert!(verify([], &EMPTY_TRIE_ROOT));
     }
 
     #[test]
     fn single_item_root_is_hash_of_leaf() {
         // One item: trie is a single leaf [HP(nibbles(0x80), leaf), value].
         let value = b"first".to_vec();
-        let root = ordered_trie_root(core::slice::from_ref(&value));
+        let root = ordered_trie_root([value.as_slice()]);
         let key = rlp::encode_bytes(&[]); // RLP(0) = 0x80
         let leaf = {
             let mut payload = rlp::encode_bytes(&hex_prefix_encode(&to_nibbles(&key), true));
@@ -122,9 +124,9 @@ mod tests {
 
     #[test]
     fn order_matters() {
-        let a = vec![b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(), b"b".to_vec()];
-        let b = vec![b"b".to_vec(), b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec()];
-        assert_ne!(ordered_trie_root(&a), ordered_trie_root(&b));
+        let a: [&[u8]; 2] = [b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", b"b"];
+        let b: [&[u8]; 2] = [b"b", b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"];
+        assert_ne!(ordered_trie_root(a), ordered_trie_root(b));
     }
 
     #[test]
@@ -134,9 +136,9 @@ mod tests {
         let items: Vec<Vec<u8>> = (0..200u32)
             .map(|i| keccak256(format!("item-{i}").as_bytes()).to_vec())
             .collect();
-        let root = ordered_trie_root(&items);
+        let root = ordered_trie_root(items.iter().map(Vec::as_slice));
         assert_ne!(root, EMPTY_TRIE_ROOT);
         // Deterministic: same input, same root.
-        assert_eq!(root, ordered_trie_root(&items));
+        assert_eq!(root, ordered_trie_root(items.iter().map(Vec::as_slice)));
     }
 }

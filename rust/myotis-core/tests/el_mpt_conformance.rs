@@ -78,23 +78,23 @@ fn replay_reproduces_recorded_verdicts() {
     }
 
     // --- ordered-trie-root pins (lists derived from strings shared with Java) ---
-    actual.insert("triehash.empty".into(), hex(&ordered_trie_root(&[])));
+    actual.insert("triehash.empty".into(), hex(&ordered_trie_root([])));
     actual.insert(
         "triehash.single".into(),
-        hex(&ordered_trie_root(&[b"myotis-tx-0".to_vec()])),
+        hex(&ordered_trie_root([&b"myotis-tx-0"[..]])),
     );
     actual.insert(
         "triehash.three".into(),
-        hex(&ordered_trie_root(&[
-            keccak256(b"mpt:item:0").to_vec(),
-            keccak256(b"mpt:item:1")[..8].to_vec(),
-            Vec::new(),
-        ])),
+        hex(&ordered_trie_root(
+            [keccak256(b"mpt:item:0").to_vec(), keccak256(b"mpt:item:1")[..8].to_vec(), Vec::new()]
+                .iter()
+                .map(Vec::as_slice),
+        )),
     );
     let spanning: Vec<Vec<u8>> = (0..200)
         .map(|i| keccak256(format!("mpt:span:{i}").as_bytes()).to_vec())
         .collect();
-    actual.insert("triehash.spanning".into(), hex(&ordered_trie_root(&spanning)));
+    actual.insert("triehash.spanning".into(), hex(&ordered_trie_root(spanning.iter().map(Vec::as_slice))));
 
     // --- logs-bloom pins (M3:2048) ---
     let mut bloom = EMPTY_BLOOM;

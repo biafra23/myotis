@@ -12,7 +12,7 @@
 //! Pure decoder over bytes the caller has ALREADY verified against a trusted
 //! `receiptsRoot` (see `myotis_core::triehash`) — it does no verification itself.
 
-use myotis_core::rlp::{self, Item};
+use myotis_core::rlp;
 
 /// A decoded receipt (typed or legacy).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,19 +40,23 @@ pub struct ReceiptLog {
 }
 
 /// Decode one receipt from its raw consensus bytes (as returned per block by
-/// `ManagedPeer::get_receipts`). `Err` carries a diagnostic message.
+/// `ManagedPeer::get_receipts`). `Err` carries a diagnostic message. The
+/// receipt is read in place and only its logs are copied out (#454).
 pub fn decode(raw: &[u8]) -> Result<DecodedReceipt, String> {
     let Some(&first) = raw.first() else {
         return Err("receipt bytes are empty".to_string());
     };
     // RLP list → legacy receipt; else EIP-2718 envelope: type byte + payload.
     let (ty, payload) = if first >= 0xc0 { (0, raw) } else { (first, &raw[1..]) };
-    let top = rlp::decode(payload).map_err(|e| format!("receipt RLP: {}", e.0))?;
-    let fields = top.as_list().map_err(|e| format!("receipt RLP: {}", e.0))?;
-    if fields.len() < 4 {
-        return Err(format!("receipt: expected 4 fields, got {}", fields.len()));
-    }
-    let status_or_root = fields[0].as_bytes().map_err(|e| format!("receipt status: {}", e.0))?;
+    let top = rlp::View::new(payload).map_err(|e| format!("receipt RLP: {}", e.0))?;
+    let mut fields = top.as_list().map_err(|e| format!("receipt RLP: {}", e.0))?;
+    let (Some(status_or_root), Some(cumulative_gas_used), Some(logs_bloom), Some(log_items)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        let count = top.as_list().map_or(0, Iterator::count);
+        return Err(format!("receipt: expected 4 fields, got {count}"));
+    };
+    let status_or_root = status_or_root.as_bytes().map_err(|e| format!("receipt status: {}", e.0))?;
     // A <= 1-byte first field is the status; a longer one (32 bytes) is the
     // pre-Byzantium intermediate stateRoot — no status bit.
     let (has_status, success) = if status_or_root.len() <= 1 {
@@ -60,30 +64,33 @@ pub fn decode(raw: &[u8]) -> Result<DecodedReceipt, String> {
     } else {
         (false, false)
     };
-    let cumulative_gas_used =
-        fields[1].as_u64().map_err(|e| format!("receipt cumulativeGasUsed: {}", e.0))?;
+    let cumulative_gas_used = cumulative_gas_used
+        .as_u64()
+        .map_err(|e| format!("receipt cumulativeGasUsed: {}", e.0))?;
     let logs_bloom =
-        fields[2].as_bytes().map_err(|e| format!("receipt logsBloom: {}", e.0))?.to_vec();
-    let log_items = fields[3].as_list().map_err(|e| format!("receipt logs: {}", e.0))?;
-    let mut logs = Vec::with_capacity(log_items.len());
+        logs_bloom.as_bytes().map_err(|e| format!("receipt logsBloom: {}", e.0))?.to_vec();
+    let log_items = log_items.as_list().map_err(|e| format!("receipt logs: {}", e.0))?;
+    let mut logs = Vec::new();
     for item in log_items {
         logs.push(decode_log(item)?);
     }
     Ok(DecodedReceipt { ty, has_status, success, cumulative_gas_used, logs_bloom, logs })
 }
 
-fn decode_log(item: &Item) -> Result<ReceiptLog, String> {
-    let parts = item.as_list().map_err(|e| format!("receipt log: {}", e.0))?;
-    if parts.len() < 3 {
-        return Err(format!("receipt log: expected 3 fields, got {}", parts.len()));
-    }
-    let address = parts[0].as_bytes().map_err(|e| format!("log address: {}", e.0))?.to_vec();
-    let topic_items = parts[1].as_list().map_err(|e| format!("log topics: {}", e.0))?;
-    let mut topics = Vec::with_capacity(topic_items.len());
+fn decode_log(item: rlp::View<'_>) -> Result<ReceiptLog, String> {
+    let mut parts = item.as_list().map_err(|e| format!("receipt log: {}", e.0))?;
+    let (Some(address), Some(topic_items), Some(data)) = (parts.next(), parts.next(), parts.next())
+    else {
+        let count = item.as_list().map_or(0, Iterator::count);
+        return Err(format!("receipt log: expected 3 fields, got {count}"));
+    };
+    let address = address.as_bytes().map_err(|e| format!("log address: {}", e.0))?.to_vec();
+    let topic_items = topic_items.as_list().map_err(|e| format!("log topics: {}", e.0))?;
+    let mut topics = Vec::new();
     for t in topic_items {
         topics.push(t.as_bytes().map_err(|e| format!("log topic: {}", e.0))?.to_vec());
     }
-    let data = parts[2].as_bytes().map_err(|e| format!("log data: {}", e.0))?.to_vec();
+    let data = data.as_bytes().map_err(|e| format!("log data: {}", e.0))?.to_vec();
     Ok(ReceiptLog { address, topics, data })
 }
 

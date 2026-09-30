@@ -580,7 +580,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_number(id, block_number, max_headers, skip, reverse)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         // Window-poisoning guard: only remember headers whose number lies in the
         // range WE requested — a hostile peer answering with fabricated far-future
@@ -616,7 +616,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_number(id, block_number, max_headers, 0, false)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         Ok(headers)
     }
@@ -632,7 +632,7 @@ impl ManagedPeer {
                 messages::encode_get_block_headers_by_hash(id, block_hash, max_headers, 0, false)
             })
             .await?;
-        let (_rid, headers) = messages::decode_block_headers(&payload)
+        let (_rid, headers) = messages::decode_block_headers(&payload, requested(max_headers))
             .map_err(|e| format!("BlockHeaders decode: {}", e.0))?;
         // Same poisoning guard as the by-number path: only the header whose hash
         // is the one WE asked for may enter the window.
@@ -663,27 +663,29 @@ impl ManagedPeer {
                 messages::encode_get_block_bodies(id, hashes)
             })
             .await?;
-        let (_rid, bodies) = messages::decode_block_bodies(&payload)
+        let (_rid, bodies) = messages::decode_block_bodies(&payload, hashes.len())
             .map_err(|e| format!("BlockBodies decode: {}", e.0))?;
         Ok(bodies)
     }
 
-    /// Request transaction receipts by block hash, returning the RAW canonical
-    /// consensus receipt bytes per block — the receipts-trie values, ready for
-    /// `triehash::verify` against a header's `receiptsRoot`. An eth/69 peer's
-    /// bloomless response is re-canonicalized (bloom recomputed) by the decoder,
-    /// so callers see one shape across versions.
-    pub async fn get_receipts(&self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    /// Request transaction receipts by block hash, returning each block's
+    /// receipts as the peer served them. [`messages::BlockReceipts::canonical`]
+    /// turns them into the receipts-trie values, ready for `triehash::verify`
+    /// against a header's `receiptsRoot`, once the count matches the block's
+    /// verified body. An eth/69 peer's bloomless receipts get their blooms
+    /// recomputed there, so callers see one shape across versions.
+    pub async fn get_receipts(&self, hashes: &[[u8; 32]]) -> Result<Vec<messages::BlockReceipts>, String> {
         let payload = self
             .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
                 messages::encode_get_receipts(id, hashes)
             })
             .await?;
         let (_rid, blocks) = if self.eth_version >= 69 {
-            messages::decode_receipts69(&payload)
+            messages::decode_receipts69(&payload, hashes.len())
                 .map_err(|e| format!("Receipts (eth/69) decode: {}", e.0))?
         } else {
-            messages::decode_receipts(&payload).map_err(|e| format!("Receipts decode: {}", e.0))?
+            messages::decode_receipts(&payload, hashes.len())
+                .map_err(|e| format!("Receipts decode: {}", e.0))?
         };
         Ok(blocks)
     }
@@ -755,7 +757,7 @@ impl ManagedPeer {
             })
             .await?;
         let (_id, codes_returned) =
-            snap::decode_byte_codes(&payload).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
+            snap::decode_byte_codes(&payload, 1).map_err(|e| format!("ByteCodes decode: {}", e.0))?;
         fetch::verify_bytecode(code_hash, &codes_returned)
             .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
     }
@@ -1042,6 +1044,12 @@ fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Opt
             }
         }
     }
+}
+
+/// A request's header count as the decoder's `requested` (it keeps one more,
+/// so an over-serving peer stays visible).
+fn requested(max_headers: u64) -> usize {
+    usize::try_from(max_headers).unwrap_or(usize::MAX)
 }
 
 /// Fail every in-flight request with `reason`, draining the pending map. Marks

@@ -71,15 +71,18 @@ pub fn hash(rlp_bytes: &[u8]) -> [u8; 32] {
 impl BlockHeader {
     /// Decode a header from its RLP encoding.
     pub fn decode(rlp_bytes: &[u8]) -> Result<BlockHeader, CoreError> {
-        let top = rlp::decode(rlp_bytes)?;
-        let items = top.as_list()?;
-        if items.len() < 15 {
-            return err(format!(
-                "header: expected >= 15 RLP fields, got {}",
-                items.len()
-            ));
+        Self::decode_view(rlp::View::new(rlp_bytes)?)
+    }
+
+    /// [`BlockHeader::decode`] of an already-checked item, such as one header
+    /// of a peer's BlockHeaders response. The fields are read in place, and
+    /// fields past the ones understood are walked, never built (#454).
+    pub fn decode_view(top: rlp::View<'_>) -> Result<BlockHeader, CoreError> {
+        let mut f = top.as_list()?;
+        let count = f.clone().take(15).count();
+        if count < 15 {
+            return err(format!("header: expected >= 15 RLP fields, got {count}"));
         }
-        let mut f = items.iter();
         // The 15 always-present fields.
         let parent_hash = fixed32(f.next(), "parentHash")?;
         let ommers_hash = fixed32(f.next(), "ommersHash")?;
@@ -213,7 +216,7 @@ impl BlockHeader {
     }
 }
 
-fn fixed32(item: Option<&Item>, name: &str) -> Result<[u8; 32], CoreError> {
+fn fixed32(item: Option<rlp::View<'_>>, name: &str) -> Result<[u8; 32], CoreError> {
     let it = item.ok_or_else(|| CoreError(format!("header: missing field {name}")))?;
     let b = it
         .as_fixed_bytes(32)
@@ -223,7 +226,7 @@ fn fixed32(item: Option<&Item>, name: &str) -> Result<[u8; 32], CoreError> {
     Ok(out)
 }
 
-fn any_bytes(item: Option<&Item>, name: &str) -> Result<Vec<u8>, CoreError> {
+fn any_bytes(item: Option<rlp::View<'_>>, name: &str) -> Result<Vec<u8>, CoreError> {
     let it = item.ok_or_else(|| CoreError(format!("header: missing field {name}")))?;
     Ok(it
         .as_bytes()
@@ -233,7 +236,7 @@ fn any_bytes(item: Option<&Item>, name: &str) -> Result<Vec<u8>, CoreError> {
 
 /// Unbounded unsigned scalar (difficulty, baseFee): minimal big-endian bytes,
 /// leading zeros rejected (canonical RLP integers).
-fn scalar_bytes(item: Option<&Item>, name: &str) -> Result<Vec<u8>, CoreError> {
+fn scalar_bytes(item: Option<rlp::View<'_>>, name: &str) -> Result<Vec<u8>, CoreError> {
     let b = any_bytes(item, name)?;
     if !b.is_empty() && b[0] == 0 {
         return err(format!("header: {name}: integer has leading zero byte"));
@@ -241,7 +244,7 @@ fn scalar_bytes(item: Option<&Item>, name: &str) -> Result<Vec<u8>, CoreError> {
     Ok(b)
 }
 
-fn u64_field(item: Option<&Item>, name: &str) -> Result<u64, CoreError> {
+fn u64_field(item: Option<rlp::View<'_>>, name: &str) -> Result<u64, CoreError> {
     let it = item.ok_or_else(|| CoreError(format!("header: missing field {name}")))?;
     it.as_u64_fitting_long()
         .map_err(|e| CoreError(format!("header: {name}: {}", e.0)))

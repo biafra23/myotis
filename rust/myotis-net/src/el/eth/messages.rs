@@ -5,6 +5,8 @@
 //! live in [`super::session`]. Message codes are the ABSOLUTE eth codes (p2p
 //! base 0x10); the session maps the p2p Hello/Ping/Pong below 0x10.
 
+use std::borrow::Cow;
+
 use myotis_core::bloom::{accrue, EMPTY_BLOOM};
 use myotis_core::header::{self, BlockHeader};
 use myotis_core::keccak::keccak256;
@@ -329,19 +331,26 @@ pub struct VerifiedHeader {
     pub header: BlockHeader,
 }
 
-/// Decode a BlockHeaders response `[reqId, [header, …]]`. Returns
-/// `(request_id, headers)`.
-pub fn decode_block_headers(rlp_bytes: &[u8]) -> Result<(u64, Vec<VerifiedHeader>), CoreError> {
-    let (request_id, headers_rlp) = strip_request_id(rlp_bytes)?;
+/// Decode a BlockHeaders response `[reqId, [header, …]]` to a request for
+/// `requested` headers. Returns `(request_id, headers)`, at most one more than
+/// `requested` (see [`kept`]). Each header is read in place from the checked
+/// response, never built into a tree (#454).
+pub fn decode_block_headers(
+    rlp_bytes: &[u8],
+    requested: usize,
+) -> Result<(u64, Vec<VerifiedHeader>), CoreError> {
+    let (request_id, headers) = request_and_payload(rlp_bytes)?;
     // Each element's RAW sub-slice is the canonical header encoding → hash it.
     let mut out = Vec::new();
-    for raw in rlp::raw_list_items(headers_rlp)? {
-        let header = BlockHeader::decode(raw)?;
-        out.push(VerifiedHeader {
-            hash: header::hash(raw),
-            raw_rlp: raw.to_vec(),
-            header,
-        });
+    for (i, raw) in headers.as_list()?.enumerate() {
+        let header = BlockHeader::decode_view(raw)?;
+        if i < kept(requested) {
+            out.push(VerifiedHeader {
+                hash: header::hash(raw.raw()),
+                raw_rlp: raw.raw().to_vec(),
+                header,
+            });
+        }
     }
     Ok((request_id, out))
 }
@@ -359,42 +368,42 @@ pub fn encode_get_block_bodies(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> 
 /// as the envelope) plus uncle/withdrawal counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBody {
-    pub transactions: Vec<Vec<u8>>,
+    pub transactions: RawList,
     pub uncle_count: usize,
     pub withdrawal_count: usize,
 }
 
-/// Decode a BlockBodies response `[reqId, [body, …]]`.
-pub fn decode_block_bodies(rlp_bytes: &[u8]) -> Result<(u64, Vec<BlockBody>), CoreError> {
-    let (request_id, bodies_rlp) = strip_request_id(rlp_bytes)?;
+/// Decode a BlockBodies response `[reqId, [body, …]]` to a request for
+/// `requested` bodies, keeping at most one more (see [`kept`]). The
+/// transactions go into a [`RawList`] as they arrived, so a body of millions
+/// of one-byte "transactions" costs about its own size, where a buffer per
+/// transaction cost some fifty times that (#454).
+pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockBody>), CoreError> {
+    let (request_id, bodies_view) = request_and_payload(rlp_bytes)?;
     let mut bodies = Vec::new();
-    for body_raw in rlp::raw_list_items(bodies_rlp)? {
+    for (i, body) in bodies_view.as_list()?.enumerate() {
         // body = [transactions, uncles, withdrawals?] — transactions AND uncles
         // are mandatory (withdrawals only post-Shanghai).
-        let fields = rlp::raw_list_items(body_raw)?;
-        if fields.len() < 2 {
+        let mut fields = body.as_list()?;
+        let (Some(txs), Some(uncles)) = (fields.next(), fields.next()) else {
             return Err(CoreError(format!(
                 "BlockBody: expected >= 2 fields, got {}",
-                fields.len()
+                body.as_list()?.count()
             )));
+        };
+        let tx_items = txs.as_list()?;
+        let uncle_count = uncles.as_list()?.count();
+        let withdrawal_count = fields.next().map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
+        if i >= kept(requested) {
+            continue;
         }
-        let txs_raw = fields[0];
-        let mut transactions = Vec::new();
-        for tx in rlp::raw_list_items(txs_raw)? {
-            // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
-            // byte-string whose payload IS the consensus tx bytes.
-            if rlp::is_list_prefix(tx) {
-                transactions.push(tx.to_vec());
-            } else {
-                transactions.push(rlp::strip_bytes_header(tx)?.to_vec());
-            }
+        // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
+        // byte-string whose payload IS the consensus tx bytes. Both are kept
+        // as they arrived, and read back as those bytes.
+        let mut transactions = RawList::with_capacity(txs.raw().len());
+        for tx in tx_items {
+            transactions.push_item(tx);
         }
-        let uncle_count = fields
-            .get(1)
-            .map_or(Ok(0), |u| rlp::raw_list_items(u).map(|v| v.len()))?;
-        let withdrawal_count = fields
-            .get(2)
-            .map_or(Ok(0), |w| rlp::raw_list_items(w).map(|v| v.len()))?;
         bodies.push(BlockBody {
             transactions,
             uncle_count,
@@ -494,99 +503,263 @@ fn collect_hashes(items: Vec<&[u8]>) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// Decode a Receipts response into RAW consensus receipt bytes per block (the
-/// trie values). eth/66-68 form. Returns `(request_id, per_block_receipts)`.
-pub fn decode_receipts(rlp_bytes: &[u8]) -> Result<(u64, Vec<Vec<Vec<u8>>>), CoreError> {
-    let (request_id, blocks_rlp) = strip_request_id(rlp_bytes)?;
-    let mut blocks = Vec::new();
-    for block_raw in rlp::raw_list_items(blocks_rlp)? {
-        let mut receipts = Vec::new();
-        for receipt in rlp::raw_list_items(block_raw)? {
-            // Legacy = RLP list (canonical as-is); typed = byte-string whose
-            // payload IS `type ‖ rlp(...)`, the trie value.
-            if rlp::is_list_prefix(receipt) {
-                receipts.push(receipt.to_vec());
-            } else {
-                receipts.push(rlp::strip_bytes_header(receipt)?.to_vec());
+/// One block's receipts from a Receipts response, as the peer served them:
+/// canonical receipts-trie values (eth/66-68), or eth/69's bloomless form
+/// (EIP-7642). Recomputing an eth/69 bloom adds 256 bytes to every receipt,
+/// however small, so it waits for [`BlockReceipts::canonical`]. That takes the
+/// block's transaction count from its verified body, and refuses any other
+/// count before recomputing anything: a peer cannot make us expand more
+/// receipts than the block holds (#454).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockReceipts {
+    /// eth/66-68: each element is already the receipts-trie value.
+    Canonical(RawList),
+    /// eth/69: each element is a checked `[txType, statusOrState, cumGas, logs]`.
+    Eth69(RawList),
+}
+
+impl BlockReceipts {
+    /// How many receipts the peer served for the block.
+    pub fn len(&self) -> usize {
+        match self {
+            BlockReceipts::Canonical(list) | BlockReceipts::Eth69(list) => list.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The receipts-trie values, for a block of `verified_tx_count`
+    /// transactions. Any other number of receipts is an error, raised before an
+    /// eth/69 bloom is recomputed. The count must come from the block's
+    /// transactionsRoot-verified body: that is what bounds the expansion, so
+    /// every caller verifies the body first.
+    pub fn canonical(&self, verified_tx_count: usize) -> Result<Cow<'_, RawList>, CoreError> {
+        if self.len() != verified_tx_count {
+            return Err(CoreError(format!(
+                "{} receipts for {verified_tx_count} transactions",
+                self.len()
+            )));
+        }
+        match self {
+            BlockReceipts::Canonical(list) => Ok(Cow::Borrowed(list)),
+            BlockReceipts::Eth69(wire) => {
+                // The stored receipts were checked on decode: walk them as views.
+                let mut out = RawList::new();
+                for receipt in wire.0.iter() {
+                    out.push(&canonicalize_eth69_receipt(receipt)?);
+                }
+                Ok(Cow::Owned(out))
             }
         }
-        blocks.push(receipts);
     }
-    Ok((request_id, blocks))
 }
 
-/// Decode an eth/69 (EIP-7642) Receipts response into CANONICAL consensus
-/// receipt bytes. eth/69 strips the logsBloom and flattens the typed envelope:
-/// each receipt arrives as `[txType, statusOrState, cumGas, logs]`. The bloom
-/// is a pure function of the logs, so recompute it and re-canonicalize
-/// (`type ‖ rlp([status, cumGas, bloom, logs])`) — the receipts-trie check then
-/// works exactly as for eth/66-68 (docs/reimplementation/02 §6.6).
-pub fn decode_receipts69(rlp_bytes: &[u8]) -> Result<(u64, Vec<Vec<Vec<u8>>>), CoreError> {
-    let (request_id, blocks_rlp) = strip_request_id(rlp_bytes)?;
+/// Decode a Receipts response (eth/66-68) to a request for `requested`
+/// blocks into each block's receipts-trie values, keeping at most one block
+/// more (see [`kept`]). Returns `(request_id, per_block_receipts)`.
+pub fn decode_receipts(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
+    let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;
     let mut blocks = Vec::new();
-    for block_raw in rlp::raw_list_items(blocks_rlp)? {
-        let mut receipts = Vec::new();
-        for wire in rlp::raw_list_items(block_raw)? {
-            receipts.push(canonicalize_eth69_receipt(wire)?);
+    for (i, block) in blocks_view.as_list()?.enumerate() {
+        let receipts_view = block.as_list()?;
+        if i >= kept(requested) {
+            continue;
         }
-        blocks.push(receipts);
+        // Legacy = RLP list (canonical as-is); typed = byte-string whose
+        // payload IS `type ‖ rlp(...)`, the trie value.
+        let mut receipts = RawList::with_capacity(block.raw().len());
+        for receipt in receipts_view {
+            receipts.push_item(receipt);
+        }
+        blocks.push(BlockReceipts::Canonical(receipts));
     }
     Ok((request_id, blocks))
 }
 
-/// One eth/69 wire receipt `[txType, statusOrState, cumGas, logs]` → its
-/// canonical consensus encoding with the recomputed bloom.
-fn canonicalize_eth69_receipt(wire: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let top = rlp::decode(wire)?;
-    let fields = top.as_list()?;
-    if fields.len() < 4 {
-        return Err(CoreError("eth/69 receipt: too few fields".into()));
+/// Decode an eth/69 (EIP-7642) Receipts response to a request for `requested`
+/// blocks, keeping at most one block more (see [`kept`]).
+/// eth/69 strips the logsBloom and flattens the typed envelope: each receipt
+/// arrives as `[txType, statusOrState, cumGas, logs]`. The bloom is a pure
+/// function of the logs, so [`BlockReceipts::canonical`] recomputes it and
+/// re-canonicalizes (`type ‖ rlp([status, cumGas, bloom, logs])`), after which
+/// the receipts-trie check works exactly as for eth/66-68
+/// (docs/reimplementation/02 §6.6). Each receipt is checked here, so a
+/// malformed one fails the response as before; only the recomputation waits.
+pub fn decode_receipts69(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
+    let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;
+    let mut blocks = Vec::new();
+    for (i, block) in blocks_view.as_list()?.enumerate() {
+        for wire in block.as_list()? {
+            eth69_receipt_fields(wire)?;
+        }
+        if i < kept(requested) {
+            let mut receipts = RawList::with_capacity(block.raw().len());
+            for wire in block.as_list()? {
+                receipts.push_item(wire);
+            }
+            blocks.push(BlockReceipts::Eth69(receipts));
+        }
     }
+    Ok((request_id, blocks))
+}
+
+/// The fields of an eth/69 wire receipt `[txType, statusOrState, cumGas, logs]`
+/// (extra trailing fields are ignored), with everything the canonical form
+/// relies on checked: the tx type, byte-string status and gas, and every log a
+/// list with a 20-byte address and 32-byte topics.
+fn eth69_receipt_fields(wire: rlp::View<'_>) -> Result<(u8, [rlp::View<'_>; 3]), CoreError> {
+    let mut fields = wire.as_list()?;
+    let (Some(ty), Some(status_or_state), Some(cum_gas), Some(logs)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(CoreError("eth/69 receipt: too few fields".into()));
+    };
     // The receipt tx-type is a single byte in `0x00..=0x7f` (0 = legacy). Keep
     // the Java last-byte extraction for the valid single-byte case, but reject
     // multi-byte / out-of-range encodings rather than silently truncating.
-    let ty = match fields[0].as_bytes()? {
+    let ty = match ty.as_bytes()? {
         [] => 0u8,
         &[b] if b <= 0x7f => b,
         _ => return Err(CoreError("eth/69 receipt: invalid tx type".into())),
     };
-    let status_or_state = fields[1].as_bytes()?;
-    let cum_gas = fields[2].as_bytes()?;
-    let logs = fields[3].as_list()?;
+    status_or_state.as_bytes()?;
+    cum_gas.as_bytes()?;
+    for log in logs.as_list()? {
+        let mut lf = log.as_list()?;
+        let (Some(address), Some(topics), Some(_data)) = (lf.next(), lf.next(), lf.next()) else {
+            return Err(CoreError("eth/69 receipt: malformed log".into()));
+        };
+        // Consensus rules: a log address is exactly 20 bytes, each topic 32.
+        address.as_fixed_bytes(20)?;
+        for t in topics.as_list()? {
+            t.as_fixed_bytes(32)?;
+        }
+    }
+    Ok((ty, [status_or_state, cum_gas, logs]))
+}
 
+/// One checked eth/69 wire receipt → its canonical consensus encoding with the
+/// recomputed bloom. The status, gas and logs are copied as they arrived: the
+/// view checked them canonical, so the bytes are what re-encoding them gives.
+fn canonicalize_eth69_receipt(wire: rlp::View<'_>) -> Result<Vec<u8>, CoreError> {
+    let (ty, [status_or_state, cum_gas, logs]) = eth69_receipt_fields(wire)?;
     // Recompute the M3:2048 bloom over every log's address + topics.
     let mut bloom = EMPTY_BLOOM;
-    let mut log_items = Vec::with_capacity(logs.len());
-    for log in logs {
-        let lf = log.as_list()?;
-        if lf.len() < 3 {
-            return Err(CoreError("eth/69 receipt: malformed log".into()));
+    for log in logs.as_list()? {
+        let mut lf = log.as_list()?;
+        if let (Some(address), Some(topics)) = (lf.next(), lf.next()) {
+            accrue(&mut bloom, address.as_bytes()?);
+            for t in topics.as_list()? {
+                accrue(&mut bloom, t.as_bytes()?);
+            }
         }
-        // Consensus rules: a log address is exactly 20 bytes, each topic 32.
-        let address = lf[0].as_fixed_bytes(20)?;
-        accrue(&mut bloom, address);
-        let topics = lf[1].as_list()?;
-        for t in topics {
-            accrue(&mut bloom, t.as_fixed_bytes(32)?);
-        }
-        log_items.push(log.clone());
     }
-
-    let payload = rlp::encode(&Item::List(vec![
-        Item::Bytes(status_or_state.to_vec()),
-        Item::Bytes(cum_gas.to_vec()),
-        Item::Bytes(bloom.to_vec()),
-        Item::List(log_items),
-    ]));
+    let mut payload = Vec::with_capacity(
+        status_or_state.raw().len() + cum_gas.raw().len() + 3 + bloom.len() + logs.raw().len(),
+    );
+    payload.extend_from_slice(status_or_state.raw());
+    payload.extend_from_slice(cum_gas.raw());
+    payload.extend_from_slice(&rlp::encode_bytes(&bloom));
+    payload.extend_from_slice(logs.raw());
+    let receipt = rlp::encode_list_payload(&payload);
     if ty == 0 {
-        Ok(payload)
+        Ok(receipt)
     } else {
-        let mut out = Vec::with_capacity(1 + payload.len());
+        let mut out = Vec::with_capacity(1 + receipt.len());
         out.push(ty);
-        out.extend_from_slice(&payload);
+        out.extend_from_slice(&receipt);
         Ok(out)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Transaction and receipt lists (#454).
+// ---------------------------------------------------------------------------
+
+/// Transactions or receipts in the eth wire's form, in one [`rlp::ListBuf`]:
+/// a legacy one (an RLP list) as itself, a typed one (`type ‖ rlp(…)`) as the
+/// byte string around it. A peer's list is kept exactly as it arrived, so a
+/// body of millions of one-byte transactions costs what it weighed on the
+/// wire, with no allocation per element. A `Vec<Vec<u8>>` spent about 50 bytes
+/// on each. Reading an element gives back the list's encoding or the string's
+/// content, the bytes the trie and the hashes are built over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawList(rlp::ListBuf);
+
+impl RawList {
+    pub fn new() -> RawList {
+        RawList::default()
+    }
+
+    fn with_capacity(bytes: usize) -> RawList {
+        RawList(rlp::ListBuf::with_capacity(bytes))
+    }
+
+    /// Append an element of a checked peer message as it arrived.
+    fn push_item(&mut self, item: rlp::View<'_>) {
+        self.0.push_view(item);
+    }
+
+    /// Append `bytes`, which [`RawList::get`] gives back unchanged: kept as
+    /// itself when it is an RLP list, as a byte string around it otherwise.
+    pub fn push(&mut self, bytes: &[u8]) {
+        match rlp::View::new(bytes) {
+            Ok(list) if list.is_list() => self.0.push_view(list),
+            _ => self.0.push_bytes(bytes),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Element `i`, found by walking the list up to it.
+    pub fn get(&self, i: usize) -> Option<&[u8]> {
+        self.iter().nth(i)
+    }
+
+    pub fn iter(&self) -> RawListIter<'_> {
+        RawListIter { items: self.0.iter(), left: self.0.len() }
+    }
+}
+
+impl<'a> IntoIterator for &'a RawList {
+    type Item = &'a [u8];
+    type IntoIter = RawListIter<'a>;
+
+    fn into_iter(self) -> RawListIter<'a> {
+        self.iter()
+    }
+}
+
+/// The elements of a [`RawList`], in order.
+#[derive(Debug, Clone)]
+pub struct RawListIter<'a> {
+    items: rlp::ViewIter<'a>,
+    left: usize,
+}
+
+impl<'a> Iterator for RawListIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let item = self.items.next()?;
+        self.left = self.left.saturating_sub(1);
+        Some(if item.is_list() { item.raw() } else { item.as_bytes().unwrap_or_default() })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for RawListIter<'_> {}
 
 // ---------------------------------------------------------------------------
 // Shared helpers.
@@ -630,15 +803,31 @@ fn check_control_size(what: &str, payload: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Strip the `[reqId, payload]` wrapper (present in every eth/66-69 request/
-/// response message), returning `(reqId, payload_raw)`. Anything after the
-/// payload is validated but not collected (#454).
-fn strip_request_id(rlp_bytes: &[u8]) -> Result<(u64, &[u8]), CoreError> {
+/// Split an eth/66-69 `[reqId, payload]` response into the request id and a
+/// view of the payload to read in place (#454). The elements of the message
+/// are checked as they always were (each a whole item, anything after the
+/// payload checked but not read), so the nesting a response may use is
+/// unchanged.
+fn request_and_payload(rlp_bytes: &[u8]) -> Result<(u64, rlp::View<'_>), CoreError> {
     let items = rlp::raw_list_prefix(rlp_bytes, 2)?;
-    if items.len() < 2 {
+    let (Some(id), Some(payload)) = (items.first(), items.get(1)) else {
         return Err(CoreError("eth message: missing [reqId, payload]".into()));
-    }
-    Ok((request_id_at(items[0])?, items[1]))
+    };
+    // `View::new` walks the payload a second time; `raw_list_prefix` has just
+    // checked it the same way, so this cannot fail. Both halves stay: the first
+    // keeps the nesting budget a response always had (a view over the whole
+    // message would count one more level), and checking is the only way to
+    // make a view.
+    Ok((request_id_at(id)?, rlp::View::new(payload)?))
+}
+
+/// How many elements of a response to a request for `requested` to keep: one
+/// more than asked for, so a caller still sees a peer that over-serves. Any
+/// further element is checked exactly as a kept one would be, so the verdict
+/// on the response doesn't change, but it is not kept (#454). The eth and
+/// snap decoders share it.
+pub(crate) fn kept(requested: usize) -> usize {
+    requested.saturating_add(1)
 }
 
 fn fixed32(item: &Item) -> Result<[u8; 32], CoreError> {
@@ -933,6 +1122,49 @@ mod tests {
     }
 
     #[test]
+    fn block_headers_keep_one_past_the_request_and_check_the_rest() {
+        let h = |n| raw(&minimal_header(n));
+        let msg = |headers: Vec<Item>| {
+            rlp::encode(&Item::List(vec![Item::Bytes(rlp::u64_to_minimal_be(7)), Item::List(headers)]))
+        };
+        let (_, headers) = decode_block_headers(&msg(vec![h(1), h(2), h(3), h(4)]), 2).unwrap();
+        assert_eq!(headers.iter().map(|v| v.header.number).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // A dropped header is still decoded, so a bad one fails the response.
+        assert!(decode_block_headers(&msg(vec![h(1), h(2), h(3), Item::List(vec![])]), 1).is_err());
+    }
+
+    #[test]
+    fn a_response_may_nest_as_deep_as_before() {
+        // One header with a trailing field of `depth` nested lists. The header
+        // sits two lists below the message; the deepest list then reaches
+        // depth `2 + depth - 1`, and MAX_DEPTH (32) allows 31 levels.
+        let with_trailing = |depth: usize| {
+            let mut field = Item::List(vec![]);
+            for _ in 1..depth {
+                field = Item::List(vec![field]);
+            }
+            let mut fields = rlp::decode(&minimal_header(9)).unwrap().as_list().unwrap().to_vec();
+            // withdrawalsRoot, blobGasUsed, excessBlobGas, parentBeaconBlockRoot,
+            // requestsHash, then the nested field where blockAccessListHash
+            // would be (tolerated when it isn't a hash).
+            fields.extend([
+                Item::Bytes(vec![0; 32]),
+                Item::Bytes(vec![]),
+                Item::Bytes(vec![]),
+                Item::Bytes(vec![0; 32]),
+                Item::Bytes(vec![0; 32]),
+                field,
+            ]);
+            rlp::encode(&Item::List(vec![
+                Item::Bytes(rlp::u64_to_minimal_be(7)),
+                Item::List(vec![Item::List(fields)]),
+            ]))
+        };
+        assert_eq!(decode_block_headers(&with_trailing(31), 1).unwrap().1[0].header.number, 9);
+        assert!(decode_block_headers(&with_trailing(32), 1).is_err());
+    }
+
+    #[test]
     fn block_headers_decode_and_hash() {
         // Two minimal but well-formed headers, wrapped `[reqId, [h0, h1]]`.
         let h0 = minimal_header(100);
@@ -942,7 +1174,7 @@ mod tests {
             Item::Bytes(rlp::u64_to_minimal_be(7)),
             Item::List(vec![raw(&h0), raw(&h1)]),
         ]));
-        let (req_id, headers) = decode_block_headers(&msg).unwrap();
+        let (req_id, headers) = decode_block_headers(&msg, 2).unwrap();
         assert_eq!(req_id, 7);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].hash, hash0);
@@ -982,6 +1214,134 @@ mod tests {
     }
 
     #[test]
+    fn raw_list_holds_its_elements_in_order() {
+        let legacy = rlp::encode(&Item::List(vec![Item::Bytes(vec![1])]));
+        let not_rlp = [0xc5, 0x01];
+        let items: [&[u8]; 6] = [b"ab", b"", &[0x02, 0xc0], &legacy, &not_rlp, &[0x81, 0x7f]];
+        let mut list = RawList::new();
+        assert!(list.is_empty());
+        for item in items {
+            list.push(item);
+        }
+        // Whatever went in comes back unchanged, list or not.
+        assert_eq!(list.len(), items.len());
+        assert_eq!(list.iter().collect::<Vec<_>>(), items.to_vec());
+        assert_eq!(list.get(3), Some(&legacy[..]));
+        assert_eq!(list.get(6), None);
+        assert_eq!(list.iter().len(), 6);
+    }
+
+    /// `[reqId, [element, …]]`, with each element given as its encoding.
+    fn response(id: u64, elements: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = rlp::encode(&Item::Bytes(rlp::u64_to_minimal_be(id)));
+        out.extend_from_slice(&rlp::encode_list_payload(&elements.concat()));
+        rlp::encode_list_payload(&out)
+    }
+
+    #[test]
+    fn block_bodies_keep_the_requested_bodies_and_each_tx_as_served() {
+        let legacy = rlp::encode(&Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]));
+        let typed = [&[0x02][..], &rlp::encode(&Item::List(vec![Item::Bytes(vec![9])]))].concat();
+        let body = |uncles: usize, withdrawals: Option<usize>| {
+            let mut fields = vec![
+                Item::List(vec![raw(&legacy), Item::Bytes(typed.clone())]),
+                Item::List((0..uncles).map(|_| Item::List(vec![])).collect()),
+            ];
+            if let Some(w) = withdrawals {
+                fields.push(Item::List((0..w).map(|_| Item::List(vec![])).collect()));
+            }
+            rlp::encode(&Item::List(fields))
+        };
+        let msg = response(4, &[body(1, Some(3)), body(0, None), body(2, None)]);
+
+        let (id, bodies) = decode_block_bodies(&msg, 1).unwrap();
+        assert_eq!(id, 4);
+        // One body asked for: it and one more are kept (so the over-serving
+        // shows), the third is checked, then dropped.
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].transactions.iter().collect::<Vec<_>>(), vec![&legacy[..], &typed[..]]);
+        assert_eq!((bodies[0].uncle_count, bodies[0].withdrawal_count), (1, 3));
+        assert_eq!((bodies[1].uncle_count, bodies[1].withdrawal_count), (0, 0));
+        assert_eq!(decode_block_bodies(&msg, 10).unwrap().1.len(), 3);
+
+        // Transactions and uncles are mandatory, in a dropped body too.
+        let short = rlp::encode(&Item::List(vec![Item::List(vec![])]));
+        let err = decode_block_bodies(&response(4, std::slice::from_ref(&short)), 1).unwrap_err();
+        assert_eq!(err.0, "BlockBody: expected >= 2 fields, got 1");
+        let surplus = response(4, &[body(0, None), body(0, None), short, vec![0x80]]);
+        assert!(decode_block_bodies(&surplus, 1).is_err());
+    }
+
+    #[test]
+    fn receipts_keep_the_requested_blocks_and_check_the_count_before_use() {
+        let receipt = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![1]),
+            Item::Bytes(rlp::u64_to_minimal_be(21_000)),
+            Item::Bytes(vec![0; 256]),
+            Item::List(vec![]),
+        ]));
+        let block = |n: usize| rlp::encode_list_payload(&vec![receipt.clone(); n].concat());
+        let msg = response(6, &[block(2), block(1), block(3)]);
+
+        // One block asked for: it and one more are kept.
+        let (id, blocks) = decode_receipts(&msg, 1).unwrap();
+        assert_eq!((id, blocks.len(), blocks[0].len(), blocks[1].len()), (6, 2, 2, 1));
+        // A dropped block is still checked: a byte string where a list must be.
+        assert!(decode_receipts(&response(6, &[block(1), block(1), vec![0x80]]), 1).is_err());
+        let canonical = blocks[0].canonical(2).unwrap();
+        assert!(matches!(canonical, Cow::Borrowed(_)), "eth/66-68 receipts are used as served");
+        assert_eq!(canonical.iter().collect::<Vec<_>>(), vec![&receipt[..], &receipt[..]]);
+        // Any other count than the verified body's is refused.
+        assert_eq!(blocks[0].canonical(3).unwrap_err().0, "2 receipts for 3 transactions");
+    }
+
+    #[test]
+    fn eth69_receipts_are_checked_on_decode_and_expanded_only_for_the_right_count() {
+        let wire = |fields: Vec<Item>| rlp::encode(&Item::List(fields));
+        let good = wire(vec![
+            Item::Bytes(vec![]),
+            Item::Bytes(vec![1]),
+            Item::Bytes(rlp::u64_to_minimal_be(21_000)),
+            Item::List(vec![]),
+        ]);
+        let msg = response(8, &[rlp::encode_list_payload(&[good.clone(), good.clone()].concat())]);
+        let (_, blocks) = decode_receipts69(&msg, 1).unwrap();
+        assert!(matches!(blocks[0], BlockReceipts::Eth69(_)));
+        // Refused before any bloom is recomputed...
+        assert_eq!(blocks[0].canonical(1).unwrap_err().0, "2 receipts for 1 transactions");
+        // ...and expanded for the right count: a legacy receipt with a bloom.
+        let canonical = blocks[0].canonical(2).unwrap();
+        let fields = rlp::decode(canonical.get(0).unwrap()).unwrap();
+        assert_eq!(fields.as_list().unwrap()[2].as_bytes().unwrap(), &EMPTY_BLOOM[..]);
+
+        // A malformed receipt still fails the response on decode, as before.
+        for (bad, error) in [
+            (wire(vec![Item::Bytes(vec![])]), "eth/69 receipt: too few fields"),
+            (
+                wire(vec![
+                    Item::Bytes(vec![0x80]),
+                    Item::Bytes(vec![1]),
+                    Item::Bytes(vec![]),
+                    Item::List(vec![]),
+                ]),
+                "eth/69 receipt: invalid tx type",
+            ),
+            (
+                wire(vec![
+                    Item::Bytes(vec![]),
+                    Item::Bytes(vec![1]),
+                    Item::Bytes(vec![]),
+                    Item::List(vec![Item::List(vec![Item::Bytes(vec![0; 20])])]),
+                ]),
+                "eth/69 receipt: malformed log",
+            ),
+        ] {
+            let msg = response(8, &[rlp::encode_list_payload(&bad)]);
+            assert_eq!(decode_receipts69(&msg, 1).unwrap_err().0, error);
+        }
+    }
+
+    #[test]
     fn eth69_receipt_recomputes_bloom() {
         // wire receipt: [txType=2, status=1, cumGas=21000, [ [addr,[topic],data] ]]
         let addr = vec![0x11u8; 20];
@@ -1006,11 +1366,12 @@ mod tests {
             Item::Bytes(rlp::u64_to_minimal_be(9)),
             Item::List(vec![block]),
         ]));
-        let (id, blocks) = decode_receipts69(&msg).unwrap();
+        let (id, blocks) = decode_receipts69(&msg, 1).unwrap();
         assert_eq!(id, 9);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].len(), 1);
-        let canonical = &blocks[0][0];
+        let canonical = blocks[0].canonical(1).unwrap();
+        let canonical = canonical.get(0).unwrap();
         assert_eq!(canonical[0], 2); // typed envelope preserved
         // The recomputed bloom must have the addr + topic bits set.
         let mut expect = EMPTY_BLOOM;
