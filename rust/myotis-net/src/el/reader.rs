@@ -6198,9 +6198,15 @@ impl ElReader {
             && self.with_fee_cache(|c| c.estimate.wants_refresh(head, now)).unwrap_or(false)
         {
             // Registered like a host request, so a stop cancels and drains it.
-            let _ = self
+            // A budget timeout drops the refresh before it can record its own
+            // failure, so record it here: the RETRY_AFTER back-off covers it too.
+            if self
                 .request_with_budget(FEE_REFRESH_BUDGET, self.fee_estimate_refresh(head))
-                .await;
+                .await
+                .is_err()
+            {
+                let _ = self.with_fee_cache(|c| c.estimate.record_failure(head, Instant::now()));
+            }
         }
         for (shape, lock) in shapes {
             let Ok(plan) = self.fee_history_plan(shape.block_count, None, head) else {
@@ -6210,9 +6216,13 @@ impl ElReader {
             if !self.with_fee_cache(|c| c.history_wants_refresh(&shape, top, now)).unwrap_or(false) {
                 continue;
             }
-            let _ = self
+            if self
                 .request_with_budget(FEE_REFRESH_BUDGET, self.fee_history_refresh(&shape, &lock, plan))
-                .await;
+                .await
+                .is_err()
+            {
+                let _ = self.with_fee_cache(|c| c.record_history_failure(&shape, top, Instant::now()));
+            }
         }
         true
     }
@@ -6259,7 +6269,13 @@ impl ElReader {
         // The per-head memo (#510): identical shape + identical anchored top ⇒
         // identical verified result. A `latest` shape is also served stale just
         // after a head advance while the follower refreshes it.
-        let shape = HistoryShape::new(block_count, newest_block, reward_percentiles);
+        // Keyed by the CLAMPED count: every count past the clamp serves the
+        // same blocks, so they share one memo entry and one follow.
+        let shape = HistoryShape::new(
+            block_count.min(FEE_HISTORY_MAX_BLOCKS),
+            newest_block,
+            reward_percentiles,
+        );
         let top = (plan.top.number(), *plan.top.hash());
         let (hit, lock) = self
             .with_fee_cache(|c| c.history_lookup(&shape, top, Instant::now()))
