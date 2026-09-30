@@ -59,6 +59,12 @@ pub enum CallOutcome {
     /// e.g. an Amsterdam block whose header has no slot number): the host
     /// serves a permanent error (-32602), never the retryable `Unavailable`.
     Refused(String),
+    /// The call RAN, or was checked, and cannot succeed within the caller's
+    /// own limits — its `gas`, its fee cap against the base fee, the funds
+    /// its fee needs (#509). An answer, served as geth serves it (JSON-RPC
+    /// -32000 with this message: "out of gas", "intrinsic gas too low: …",
+    /// "insufficient funds for gas * price + value: …"), never as return data.
+    Infeasible(String),
 }
 
 impl CallOutcome {
@@ -70,6 +76,7 @@ impl CallOutcome {
             Ok(bytes) => CallOutcome::Success(bytes),
             Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
             Err(e) if e.is_refusal() => CallOutcome::Refused(e.to_string()),
+            Err(e) if e.is_infeasible() => CallOutcome::Infeasible(e.to_string()),
             Err(e) => CallOutcome::Unavailable(e.to_string()),
         }
     }

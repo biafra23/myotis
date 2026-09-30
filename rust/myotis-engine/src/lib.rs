@@ -153,7 +153,24 @@ uniffi::setup_scaffolding!();
 ///      out of gas at its 30 M ceiling (it used to be `unavailable`). The JVM
 ///      `RustEngineNative` wrappers, the Node addon and the iOS wrapper moved
 ///      with it.
-pub const ABI_VERSION: i32 = 34;
+/// v35: added eth_call_tx_json (UniFFI, the C ABI and Node, #509): eth_call
+///      for the FULL JSON-RPC transaction object, every field applied as
+///      estimate_gas_tx_json applies it — `gas` as the call's limit (capped at
+///      the 30 M call budget, as geth caps at its RPC gas cap), a fee checked
+///      against the base fee and charged to the sender, EIP-7702
+///      authorizations, access list, nonce — or the request refused (-32602).
+///      The call JSON gained `{"status":"infeasible","reason"}` for a call
+///      that cannot succeed within the caller's gas, fee cap or funds (geth's
+///      -32000 answer in geth's words — a check failed before the run as
+///      "err: … (supplied gas N)"). eth_call_tx_json returns it; the plain
+///      eth_call_json / eth_call_overrides_json only for calldata that alone
+///      costs more than the 30 M budget (it used to be `unavailable`).
+///      estimate_gas_tx_json now also answers a fee cap below the block's
+///      base fee as `infeasible` ("failed with N gas: max fee per gas less
+///      than block base fee: …"), where it used to estimate. The JVM
+///      `RustEngineNative` wrappers, the Node addon and the iOS wrapper moved
+///      with it.
+pub const ABI_VERSION: i32 = 35;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

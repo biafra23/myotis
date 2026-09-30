@@ -1,6 +1,7 @@
 // Addon-level API tests for createWithCheckpoint (ABI 26, #441), for
-// ethCallJson's block check (ABI 27, #452) and for estimateGasTxJson's
-// transaction-object refusals (ABI 34, #509). Run against a
+// ethCallJson's block check (ABI 27, #452) and for the transaction-object
+// refusals of estimateGasTxJson (ABI 34) and ethCallTxJson (ABI 35, #509).
+// Run against a
 // BUILT addon: node --test addon-api.test.mjs, with MYOTIS_NODE_ADDON pointing at
 // the .node (or a cargo output: libmyotis_node.so/.dylib, myotis_node.dll);
 // without one the tests skip rather than fail, so a cargo-less checkout still
@@ -184,6 +185,40 @@ test('estimateGasTxJson refuses a contradictory transaction object as permanent 
     // A well-formed object passes the parse. This handle was never started,
     // so the estimate fails as a plain, retryable error, not with a number.
     const r = JSON.parse(await m.estimateGasTxJson(h, JSON.stringify({ to }), 'latest', ''));
+    assert.equal(typeof r.error, 'string', JSON.stringify(r));
+    assert.equal(r.code, undefined, JSON.stringify(r));
+  } finally {
+    if (h >= 1) m.stop(h);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// #509: ethCallJson carries only from/to/data/value, so a wallet's simulation of
+// its 7702 transaction had no way to hand the engine the authorizations.
+// ethCallTxJson takes the whole object and refuses the same contradictions as
+// estimateGasTxJson, permanently and before the handle is consulted.
+test('ethCallTxJson refuses a contradictory transaction object as permanent invalid params (ABI 35)', { skip }, async () => {
+  assert.equal(typeof m.ethCallTxJson, 'function');
+  assert.ok(m.init() >= 35, `init()=${m.init()}`);
+  const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
+  let h = -1;
+  try {
+    h = m.create('mainnet', join(base, 'call'));
+    assert.ok(h >= 1, `create failed: ${h}`);
+    const to = '0x' + '22'.repeat(20);
+    for (const tx of [
+      { to, type: '0x4' },                                // type 4 without authorizations
+      { to, authorizationList: [] },                      // EIP-7702 forbids an empty list
+      { to, gasPrice: '0x1', maxFeePerGas: '0x2' },       // two fee models at once
+      { to, maxFeePerGas: '0x1', maxPriorityFeePerGas: '0x2' }, // a tip above its cap
+    ]) {
+      const r = JSON.parse(await m.ethCallTxJson(h, JSON.stringify(tx), 'latest', ''));
+      assert.equal(r.code, -32602, `${JSON.stringify(tx)}: ${JSON.stringify(r)}`);
+      assert.match(r.error, /invalid transaction object/, JSON.stringify(r));
+    }
+    // A well-formed object passes the parse. This handle was never started,
+    // so the call fails as a plain, retryable error, not with a result.
+    const r = JSON.parse(await m.ethCallTxJson(h, JSON.stringify({ to, gas: '0x5208' }), 'latest', ''));
     assert.equal(typeof r.error, 'string', JSON.stringify(r));
     assert.equal(r.code, undefined, JSON.stringify(r));
   } finally {

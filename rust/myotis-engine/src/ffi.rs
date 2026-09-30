@@ -247,6 +247,17 @@ pub fn estimate_gas_tx_json(
     crate::host::estimate_gas_tx_json(handle, &tx, &block, &state_overrides)
 }
 
+/// Verified `eth_call` for the FULL JSON-RPC transaction object (ABI ≥ 35,
+/// #509): the same `tx`, `block` and `state_overrides` as
+/// [`estimate_gas_tx_json`], every field applied as the estimate applies it —
+/// `gas` as the call's limit, a fee checked and charged to the sender, EIP-7702
+/// authorizations, access list, nonce — or the request refused with the
+/// permanent `{"error","code":-32602}` envelope.
+#[uniffi::export]
+pub fn eth_call_tx_json(handle: i64, tx: String, block: String, state_overrides: String) -> String {
+    crate::host::eth_call_tx_json(handle, &tx, &block, &state_overrides)
+}
+
 /// Verified ENS forward resolution (name → address record).
 #[uniffi::export]
 pub fn resolve_ens_json(handle: i64, name: String) -> String {
