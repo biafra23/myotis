@@ -34,8 +34,9 @@ class RpcCallResult private constructor(
     /** [INFEASIBLE] is an answer, not a failure (#509): the transaction cannot
      *  succeed within the caller's own gas, fee cap or funds, and [detail] is
      *  geth's message, served verbatim under geth's -32000. A call carries it
-     *  from [RpcBackend.callTx], and from a plain call only when its calldata
-     *  alone costs more than the engine's budget; an estimate from any path
+     *  from [RpcBackend.callTx], and from a plain call only on the Rust engine,
+     *  when its calldata alone costs more than the call budget (the Java
+     *  engine's plain call charges no intrinsic gas); an estimate from any path
      *  (see [RpcEstimateResult]). */
     enum class Kind { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 

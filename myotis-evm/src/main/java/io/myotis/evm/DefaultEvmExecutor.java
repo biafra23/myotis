@@ -162,12 +162,13 @@ public final class DefaultEvmExecutor implements EvmExecutor {
      * What one call runs with, decided — and refused — before any EVM run: the
      * sender and target, the transaction's gas limit and the frame's share of it
      * after the intrinsic cost, the effective price GASPRICE reads and the sender
-     * is debited at, and whether the limit is the caller's own (running out of it
-     * is then the caller's answer, geth's "out of gas").
+     * is debited at, and the gas the caller set, if any — running out of it is
+     * the caller's answer, geth's "out of gas", unless it was above the budget
+     * and capped ({@link #outOfGas}).
      */
     record CallPlan(io.myotis.evm.Address sender, io.myotis.evm.Address target, byte[] data,
                     java.math.BigInteger value, long gasLimit, long frameGas, Wei price,
-                    boolean callerLimited) {}
+                    Long callerGas) {}
 
     /** The plan a plain view call has always run with: the whole budget handed to
      *  the frame, no price, no debit. */
@@ -175,7 +176,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                              java.math.BigInteger value) {
         return new CallPlan(sender != null ? sender : VIEW_CALLER, target, calldata,
                 value != null ? value : java.math.BigInteger.ZERO,
-                DEFAULT_GAS_LIMIT, DEFAULT_GAS_LIMIT, Wei.ZERO, false);
+                DEFAULT_GAS_LIMIT, DEFAULT_GAS_LIMIT, Wei.ZERO, null);
     }
 
     /**
@@ -225,8 +226,7 @@ public final class DefaultEvmExecutor implements EvmExecutor {
             }
         }
         return new CallPlan(tx.from(), tx.to(), tx.data(), tx.value(), gasLimit, gasLimit - intrinsic,
-                Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())),
-                tx.gasLimit() != null && tx.gasLimit() <= DEFAULT_GAS_LIMIT);
+                Wei.of(tx.effectiveGasPrice(blockContext.baseFeePerGas())), tx.gasLimit());
     }
 
     /** A check the call failed before running, as geth's {@code eth_call}
@@ -523,16 +523,26 @@ public final class DefaultEvmExecutor implements EvmExecutor {
         // human-readable detail so the failure isn't opaque.
         var halt = frame.getExceptionalHaltReason();
         if (halt.isPresent() && halt.get() == ExceptionalHaltReason.INSUFFICIENT_GAS) {
-            // Out of a limit the CALLER set: geth's "out of gas", an answer. At
-            // this executor's own budget it stays the ordinary out-of-gas.
-            throw new EvmExecutionException(plan.callerLimited()
-                    ? new EvmExecutionError.CallOutOfGas() : new EvmExecutionError.OutOfGas());
+            throw new EvmExecutionException(outOfGas(plan));
         }
         String detail = "halt=" + halt.map(ExceptionalHaltReason::name).orElse("UNKNOWN")
                 + " state=" + frame.getState();
         // Halted, NOT Reverted: there is no chain-produced payload here, and hosts
         // serve Reverted's bytes verbatim as JSON-RPC revert data.
         throw new EvmExecutionException(new EvmExecutionError.Halted(detail));
+    }
+
+    /** Running dry, as the plan's limit makes it: under a limit the caller set,
+     *  geth's "out of gas" — an answer; under a larger one, capped to the budget,
+     *  a refusal rather than an answer for a smaller limit; without one, the
+     *  ordinary out-of-gas at this executor's own budget. The Rust call_tx twin. */
+    private static EvmExecutionError outOfGas(CallPlan plan) {
+        if (plan.callerGas() == null) {
+            return new EvmExecutionError.OutOfGas();
+        }
+        return plan.callerGas() <= DEFAULT_GAS_LIMIT
+                ? new EvmExecutionError.CallOutOfGas()
+                : new EvmExecutionError.CallBudgetExceeded(DEFAULT_GAS_LIMIT, plan.callerGas());
     }
 
     /** Accessors used by {@code PrefetchingEvmExecutor} to share configuration. */

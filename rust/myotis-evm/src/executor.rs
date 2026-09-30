@@ -415,11 +415,16 @@ impl EvmExecutor {
                 detail: format!("gas × fee cap ({gas_limit} × {fee_cap}) exceeds the 2^128 wei this engine can price"),
             });
         }
-        // Running dry is the caller's answer only under a limit the caller set;
-        // at this executor's own budget it stays the ordinary out-of-gas.
-        let caller_limited = tx.gas.is_some_and(|gas| gas <= VIEW_CALL_GAS);
         match self.run_converged(&db, spec, tx, gas_limit, ctx, cap) {
-            Err(EvmError::OutOfGas) if caller_limited => Err(EvmError::CallOutOfGas),
+            // Running dry is the caller's answer under a limit the caller set. A
+            // larger one was capped to the budget, so running dry there is
+            // refused rather than answered for a smaller limit. Without one it
+            // stays the ordinary out-of-gas at this executor's own budget.
+            Err(EvmError::OutOfGas) => Err(match tx.gas {
+                Some(gas) if gas <= VIEW_CALL_GAS => EvmError::CallOutOfGas,
+                Some(gas) => EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: gas },
+                None => EvmError::OutOfGas,
+            }),
             // The intrinsic cost or the floor above the limit: checks before the
             // run too, which revm makes.
             Err(error @ (EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. })) => {
@@ -2093,7 +2098,8 @@ mod tests {
 
     /// A limit above the executor's budget is capped there, as geth caps one at
     /// its RPC gas cap. Running dry at that cap is the executor's limit, not the
-    /// caller's, so it stays the ordinary out-of-gas.
+    /// caller's: refused (permanent), neither the caller's out-of-gas nor a
+    /// retryable unavailable. Without a limit it stays the ordinary out-of-gas.
     #[test]
     fn call_tx_caps_the_callers_gas_at_the_budget() {
         let c = ctx(19_500_000, CANCUN_TIME + 1);
@@ -2105,9 +2111,20 @@ mod tests {
 
         // JUMPDEST; PUSH1 0; JUMP — spins until the gas is gone.
         let spin = executor_with_accounts(&[(TARGET, vec![0x5b, 0x60, 0x00, 0x56], U256::ZERO, 1)]);
-        assert_eq!(spin.call_tx(&tx, &c, StateOverrides::new()).unwrap_err(), EvmError::OutOfGas);
-        tx.gas = Some(1_000_000);
+        let capped = spin.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+        assert_eq!(capped, EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: 50_000_000 });
+        assert!(capped.is_refusal());
+        assert_eq!(
+            capped.to_string(),
+            "the call ran out of this node's 30000000-gas call budget, below the 50000000 gas it allows"
+        );
+        tx.gas = Some(VIEW_CALL_GAS);
         assert_eq!(spin.call_tx(&tx, &c, StateOverrides::new()).unwrap_err(), EvmError::CallOutOfGas);
+        tx.gas = None;
+        tx.fees = Fees::Legacy { gas_price: 7 };
+        let mut funded = StateOverrides::new();
+        funded.insert(SENDER, crate::overrides::AccountOverride { balance: Some(U256::MAX), ..Default::default() });
+        assert_eq!(spin.call_tx(&tx, &c, funded).unwrap_err(), EvmError::OutOfGas);
     }
 
     /// A limit below the intrinsic cost, or below the EIP-7623 floor, is geth's

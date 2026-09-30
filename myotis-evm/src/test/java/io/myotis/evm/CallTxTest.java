@@ -56,10 +56,17 @@ class CallTxTest {
         assertTrue(left.compareTo(BigInteger.valueOf(BUDGET - 21_000)) < 0, "ran with at most the budget: " + left);
 
         // JUMPDEST; PUSH1 0; JUMP — spins until the gas is gone. Dry at the
-        // budget is the executor's limit (OutOfGas), dry at the caller's the answer.
+        // caller's limit is the answer; dry at the budget the caller's larger
+        // limit was capped to is refused; without a limit it stays OutOfGas.
         var spin = new DefaultEvmExecutor(senderAnd(ONE_ETH, HexFormat.of().parseHex("5b600056")));
-        assertEquals(new EvmExecutionError.OutOfGas(), callError(spin, tx(50_000_000L), ctx(7)));
+        var capped = callError(spin, tx(50_000_000L), ctx(7));
+        assertEquals(new EvmExecutionError.CallBudgetExceeded(BUDGET, 50_000_000L), capped);
+        assertEquals("the call ran out of this node's 30000000-gas call budget, below the 50000000 gas it allows",
+                ((EvmExecutionError.CallBudgetExceeded) capped).detail());
+        assertEquals(new EvmExecutionError.CallOutOfGas(), callError(spin, tx(BUDGET), ctx(7)));
         assertEquals(new EvmExecutionError.CallOutOfGas(), callError(spin, tx(1_000_000L), ctx(7)));
+        assertEquals(new EvmExecutionError.OutOfGas(),
+                callError(spin, priced(BigInteger.ZERO, null, BigInteger.TEN, BigInteger.ONE), ctx(7)));
     }
 
     @Test

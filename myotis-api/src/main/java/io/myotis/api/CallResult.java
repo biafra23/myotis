@@ -28,7 +28,8 @@ package io.myotis.api;
  *       gave it, that limit is below the intrinsic cost, the fee cap is below
  *       the block's base fee, or the sender cannot afford {@code gas × fee cap
  *       + value}. {@link VerifiedReads#callTx} answers it; a plain call only
- *       when its calldata alone costs more than the engine's call budget. An
+ *       on the Rust engine, when its calldata alone costs more than the call
+ *       budget (the Java engine's plain call charges no intrinsic gas). An
  *       answer, not a failure to answer; {@code detail} carries geth's message
  *       ("out of gas", "err: intrinsic gas too low: have N, want M (supplied
  *       gas N)", …), which hosts serve verbatim as geth does (JSON-RPC -32000)

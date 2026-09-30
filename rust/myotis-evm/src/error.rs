@@ -97,6 +97,12 @@ pub enum EvmError {
     /// `insufficient funds for gas * price + value: address … required
     /// balance exceeds 256 bits` ([`EvmError::is_infeasible`]).
     RequiredBalanceOverflow { address: [u8; 20] },
+    /// `eth_call` whose `gas` was above the call budget, capped to it, and
+    /// ran out there: the answer says nothing about the limit the caller set,
+    /// so it is refused ([`EvmError::is_refusal`]) — never answered for a
+    /// smaller limit, nor served as the retryable unavailable a client would
+    /// spin on.
+    CallBudgetExceeded { budget: u64, requested: u64 },
     /// `eth_call` refused by one of the checks a transaction passes before it
     /// runs (fee cap, balance, intrinsic cost, floor): geth's `eth_call` wraps
     /// the state transition's error as `err: {error} (supplied gas {gas})`, and
@@ -114,6 +120,7 @@ impl EvmError {
             EvmError::MissingSlotNumber { .. }
                 | EvmError::UnexpectedSlotNumber { .. }
                 | EvmError::InvalidRequest { .. }
+                | EvmError::CallBudgetExceeded { .. }
         )
     }
 
@@ -208,6 +215,10 @@ impl std::fmt::Display for EvmError {
                 f,
                 "insufficient funds for gas * price + value: address {} required balance exceeds 256 bits",
                 Address::from(*address)
+            ),
+            EvmError::CallBudgetExceeded { budget, requested } => write!(
+                f,
+                "the call ran out of this node's {budget}-gas call budget, below the {requested} gas it allows"
             ),
             EvmError::CallFailed { supplied_gas, error } => {
                 write!(f, "err: {error} (supplied gas {supplied_gas})")

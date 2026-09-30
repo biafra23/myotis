@@ -1,5 +1,6 @@
 package io.myotis.rpc;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -34,7 +35,7 @@ class UnsupportedForkOfTest {
         EvmExecutionException refusal = assertThrows(EvmExecutionException.class,
                 () -> EvmFactory.requireSupported(sepolia(EvmFactory.SEPOLIA_AMSTERDAM_TIME)));
         Exception chain = new java.util.concurrent.ExecutionException(new RuntimeException(refusal));
-        String reason = VerifiedRpcBackend.unsupportedForkOf(chain);
+        String reason = VerifiedRpcBackend.refusalOf(chain);
         assertNotNull(reason);
         assertTrue(reason.contains("Amsterdam"), reason);
     }
@@ -57,14 +58,26 @@ class UnsupportedForkOfTest {
 
     @Test
     void otherFailuresAreNotRefusals() {
-        assertNull(VerifiedRpcBackend.unsupportedForkOf(new RuntimeException("timeout")));
-        assertNull(VerifiedRpcBackend.unsupportedForkOf(
+        assertNull(VerifiedRpcBackend.refusalOf(new RuntimeException("timeout")));
+        assertNull(VerifiedRpcBackend.refusalOf(
                 new EvmExecutionException(new EvmExecutionError.Reverted(new byte[0]))));
-        assertNull(VerifiedRpcBackend.unsupportedForkOf(new java.util.concurrent.ExecutionException(
+        assertNull(VerifiedRpcBackend.refusalOf(new java.util.concurrent.ExecutionException(
                 new EvmExecutionException(
                         new EvmExecutionError.StateUnavailable(new byte[32], null, null)))));
         // The pre-existing fork-floor refusal keeps its old (unavailable) mapping.
-        assertNull(VerifiedRpcBackend.unsupportedForkOf(assertThrows(IllegalArgumentException.class,
+        assertNull(VerifiedRpcBackend.refusalOf(assertThrows(IllegalArgumentException.class,
                 () -> EvmFactory.requireSupported(sepolia(EvmFactory.SEPOLIA_SHANGHAI_TIME - 1)))));
+    }
+
+    /** #509 stage 2: a transaction-object call whose gas was capped to the budget
+     *  and ran out there is refused as permanently as an unsupported fork. */
+    @Test
+    void aCappedCallThatRanOutOfTheBudgetIsARefusal() {
+        assertEquals("the call ran out of this node's 30000000-gas call budget, below the 50000000 gas it allows",
+                VerifiedRpcBackend.refusalOf(new java.util.concurrent.ExecutionException(
+                        new io.myotis.evm.EvmExecutionException(
+                                new io.myotis.evm.EvmExecutionError.CallBudgetExceeded(30_000_000L, 50_000_000L)))));
+        assertNull(VerifiedRpcBackend.refusalOf(
+                new io.myotis.evm.EvmExecutionException(new io.myotis.evm.EvmExecutionError.CallOutOfGas())));
     }
 }

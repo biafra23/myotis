@@ -193,7 +193,29 @@ public sealed interface EvmExecutionError {
      * different question (CLAUDE.md apply-or-refuse), and no retry can help, so
      * hosts serve it as a permanent JSON-RPC error, never the retryable -32000.
      */
-    record UnsupportedFork(String detail) implements EvmExecutionError {}
+    record UnsupportedFork(String detail) implements Refusal {}
+
+    /**
+     * A request this engine will not answer on this build, and no retry changes
+     * that: hosts serve {@link #detail()} as the PERMANENT JSON-RPC -32602, never
+     * the retryable -32000 a client would spin on (CLAUDE.md apply-or-refuse).
+     */
+    sealed interface Refusal extends EvmExecutionError {
+        String detail();
+    }
+
+    /**
+     * A transaction-object call whose {@code gas} was above the call budget,
+     * capped to it, and ran out there (#509): the answer says nothing about the
+     * limit the caller set, so it is refused — never answered for a smaller
+     * limit, nor served as the retryable unavailable a client would spin on.
+     */
+    record CallBudgetExceeded(long budget, long requested) implements Refusal {
+        public String detail() {
+            return "the call ran out of this node's " + budget + "-gas call budget, below the "
+                    + requested + " gas it allows";
+        }
+    }
 
     /** Prefetch loop did not converge within the iteration cap. */
     record IterationLimitExceeded(int cap) implements EvmExecutionError {}

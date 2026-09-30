@@ -2357,7 +2357,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // is not "no verified answer right now": no retry can change it, so it
             // is REFUSED — served as the permanent -32602, not the -32000 a wallet
             // would spin on.
-            String refusal = unsupportedForkOf(e);
+            String refusal = refusalOf(e);
             if (refusal != null) {
                 log.info("[rpc] eth_call " + desc + " -> refused: " + refusal);
                 return io.myotis.api.CallResult.refused(refusal);
@@ -2395,14 +2395,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** The refusal reason when the throwable chain holds an
-     *  {@link io.myotis.evm.EvmExecutionError.UnsupportedFork} (a fork this engine
-     *  cannot price — permanent for this build), else null. Same cause-walk as
-     *  {@link #revertDataOf}; package-private as a test seam. */
-    static String unsupportedForkOf(Throwable t) {
+     *  {@link io.myotis.evm.EvmExecutionError.Refusal} — a fork this engine cannot
+     *  price, a capped call that ran out of the budget: permanent for this build —
+     *  else null. Same cause-walk as {@link #revertDataOf}; package-private as a
+     *  test seam. */
+    static String refusalOf(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             if (c instanceof io.myotis.evm.EvmExecutionException ee
-                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.UnsupportedFork u) {
-                return u.detail();
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.Refusal r) {
+                return r.detail();
             }
         }
         return null;
@@ -4239,7 +4240,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 return io.myotis.api.EstimateResult.reverted(revert);
             }
             // Permanent for this build (see rpcCallDetailed): REFUSED, not retryable.
-            String refusal = unsupportedForkOf(e);
+            String refusal = refusalOf(e);
             if (refusal != null) {
                 log.info("[rpc] eth_estimateGas -> refused: " + refusal);
                 return io.myotis.api.EstimateResult.refused(refusal);

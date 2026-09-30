@@ -932,7 +932,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  ABI 33) is {@link io.myotis.api.CallResult.Status#REFUSED}; a plain
      *  {@code {"error"}} still throws. {@code {"status":"infeasible","reason"}}
      *  (ABI 35: a transaction-object call, or a plain one whose calldata alone
-     *  costs more than the budget) is
+     *  costs more than the budget — which only this engine charges) is
      *  {@link io.myotis.api.CallResult.Status#INFEASIBLE}: the call cannot
      *  succeed within the caller's gas, fee cap or funds, and {@code reason} is
      *  geth's message. */
