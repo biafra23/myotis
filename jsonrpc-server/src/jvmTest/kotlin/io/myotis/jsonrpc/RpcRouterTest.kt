@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -487,6 +488,13 @@ class RpcRouterTest {
                                    stateOverridesJson: String?): io.myotis.api.EstimateResult {
             lastTx = tx; lastTxBlock = block; lastTxOverrides = stateOverridesJson
             return txEstimate ?: super.estimateGasTx(tx, block, stateOverridesJson)
+        }
+        /** When set, callTx answers this (else the interface default). */
+        var txCall: io.myotis.api.CallResult? = null
+        override fun callTx(tx: io.myotis.api.TransactionArgs, block: String,
+                            stateOverridesJson: String?): io.myotis.api.CallResult {
+            lastTx = tx; lastTxBlock = block; lastTxOverrides = stateOverridesJson
+            return txCall ?: super.callTx(tx, block, stateOverridesJson)
         }
         override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
                                  valueWei: String?): Long? {
@@ -1266,6 +1274,112 @@ class RpcRouterTest {
         assertEquals(Long.MAX_VALUE, b.lastTx!!.nonce())
     }
 
+    // ---- eth_call over the full transaction object (#509) ------------------
+
+    private val setCodeCall = """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+        "params":[{"from":"0x1111111111111111111111111111111111111111",
+                   "to":"0x2222222222222222222222222222222222222222",
+                   "data":"0x3e12cc2e","gas":"0x7a120","type":"0x4",
+                   "maxFeePerGas":"0x3b9aca00","maxPriorityFeePerGas":"0x1",
+                   "authorizationList":[{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963",
+                     "nonce":"0x0","chainId":"0x1","yParity":"0x1","r":"0x9a3b","s":"0x0c5d"}]},
+                  "latest"]}"""
+
+    /** Wallets simulate the 7702 transaction they then estimate: an engine that
+     *  applies the lists gets the whole object, authorization included. */
+    @Test fun ethCall_forwardsTheWholeTransactionObject() {
+        val b = FakeBackend(callResult = byteArrayOf(9)).apply {
+            applyLists = true
+            txCall = io.myotis.api.CallResult.ok(byteArrayOf(0x2a))
+        }
+        assertEquals("0x2a", result(route(b, setCodeCall)))
+        val tx = b.lastTx!!
+        assertEquals(500_000L, tx.gas())
+        assertEquals("1000000000", tx.maxFeePerGasWei())
+        assertTrue(tx.hasAuthorizationList())
+        assertEquals("latest", b.lastTxBlock)
+        assertNull(b.lastTo, "the plain call must not run")
+        val auth = json.parseToJsonElement(tx.json()).jsonObject["authorizationList"]!!.jsonArray[0].jsonObject
+        assertEquals("0x05ae73c5925d843864ae6f261f3175de2ebcd963", auth["address"]!!.jsonPrimitive.content)
+    }
+
+    /** `gas` or a fee alone takes the transaction-object call; a call without
+     *  them stays the plain one, exactly as before. */
+    @Test fun ethCall_gasOrFees_takeTheTransactionObjectCall() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        for (extra in listOf(""","gas":"0x5208"""", ""","gasPrice":"0x7"""", ""","maxFeePerGas":"0x9"""")) {
+            val b = FakeBackend(callResult = byteArrayOf(9)).apply { txCall = io.myotis.api.CallResult.ok(byteArrayOf(1)) }
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{$to$extra},"latest"]}""")
+            assertEquals("0x01", result(resp), extra)
+            assertNotNull(b.lastTx, extra)
+            assertNull(b.lastTo, extra)
+        }
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        assertEquals("0x09", result(route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{$to},"latest"]}""")))
+        assertNull(b.lastTx)
+    }
+
+    /** An engine that has not implemented the transaction-object call refuses
+     *  its fields rather than run the call without them. */
+    @Test fun ethCall_gasOnADefaultEngine_isRefusedNotDropped() {
+        val b = FakeBackend(callResult = byteArrayOf(9))
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x2222222222222222222222222222222222222222","gas":"0x5208"},"latest"]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertNull(b.lastTo)
+    }
+
+    /** A call that cannot succeed within the caller's gas, fee cap or funds is
+     *  geth's answer: -32000 with geth's message, never return data. */
+    @Test fun ethCall_infeasible_isGethsMinus32000() {
+        val b = FakeBackend().apply {
+            txCall = io.myotis.api.CallResult.infeasible("intrinsic gas too low: have 20000, want 21000")
+        }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x2222222222222222222222222222222222222222","gas":"0x4e20"},"latest"]}""")
+        assertEquals(-32000, errorCode(resp), resp)
+        val message = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content
+        assertEquals("intrinsic gas too low: have 20000, want 21000", message)
+    }
+
+    /** EIP-1898's object selector is applied or refused as for eth_estimateGas —
+     *  never read as the head; a string selector passes on to the engine as it
+     *  always has (the engine applies or refuses it, bare digits as decimal). */
+    @Test fun ethCall_objectBlockSelector_isAppliedOrRefused() {
+        val tx = """{"to":"0x2222222222222222222222222222222222222222"}"""
+        listOf(
+            """{"blockHash":"0x${"ab".repeat(32)}"}""",
+            """{"blockNumber":"earliest"}""",
+            """{"blockNumber":5}""",
+            "[]",
+        ).forEach { selector ->
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$tx,$selector]}""")
+            assertEquals(-32602, errorCode(resp), "not refused: $selector -> $resp")
+            assertNull(b.lastTo, "the engine was asked: $selector")
+        }
+        mapOf(
+            """{"blockNumber":"0x100"}""" to "0x100",
+            "null" to "latest",
+            "\"finalized\"" to "finalized",
+            "\"21000000\"" to "21000000",
+        ).forEach { (selector, expected) ->
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$tx,$selector]}""")
+            assertEquals("0x01", result(resp), "$selector -> $resp")
+            assertEquals(expected, b.lastBlock, selector)
+        }
+        // The transaction-object call reads the selector the same way.
+        val b = FakeBackend().apply { txCall = io.myotis.api.CallResult.ok(byteArrayOf(1)) }
+        val resp = route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call",
+               "params":[{"to":"0x2222222222222222222222222222222222222222","gas":"0x5208"},{"blockNumber":"0x100"}]}""")
+        assertEquals("0x01", result(resp), resp)
+        assertEquals("0x100", b.lastTxBlock)
+    }
+
     /** `"data": null` is absent on its own — it must not hide `input`. */
     @Test fun ethCall_nullDataWithInput_runsTheInput() {
         val b = FakeBackend(callResult = byteArrayOf(1))
@@ -1279,20 +1393,25 @@ class RpcRouterTest {
     @Test fun ethCall_fieldsItDoesNotApply_areRefusedNotDropped() {
         val to = """"to":"0x2222222222222222222222222222222222222222""""
         listOf(
+            // An engine that does not apply authorizations (the fake's default).
             """{$to,"authorizationList":[{"address":"0x05ae73c5925d843864ae6f261f3175de2ebcd963","nonce":"0x0","chainId":"0x1","yParity":"0x1","r":"0x1","s":"0x1"}]}""",
+            // geth refuses an empty list too (ErrEmptyAuthList), as the estimate does.
+            """{$to,"authorizationList":[]}""",
             """{$to,"blobVersionedHashes":["0x01"]}""",
             """{$to,"data":"0x01","input":"0x02"}""",
+            """{$to,"chainId":"0x5"}""",
         ).forEach { obj ->
             val b = FakeBackend(callResult = byteArrayOf(1))
             val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$obj,"latest"]}""")
             assertEquals(-32602, errorCode(resp), "not refused: $obj -> $resp")
             assertNull(b.lastTo, "the engine was asked: $obj")
+            assertNull(b.lastTx, "the engine was asked: $obj")
         }
-        // An empty list and an agreeing data/input pair change nothing.
+        // An agreeing data/input pair is one call.
         val b = FakeBackend(callResult = byteArrayOf(1))
         val resp = route(b,
             """{"jsonrpc":"2.0","id":1,"method":"eth_call",
-               "params":[{$to,"authorizationList":[],"data":"0x01","input":"0x01"},"latest"]}""")
+               "params":[{$to,"data":"0x01","input":"0x01"},"latest"]}""")
         assertEquals("0x01", result(resp))
     }
 
@@ -1301,8 +1420,9 @@ class RpcRouterTest {
     @Test fun ethCall_malformedDataAndInput_nameTheMalformedField() {
         val to = """"to":"0x2222222222222222222222222222222222222222""""
         mapOf(
-            """{$to,"data":"0xzz","input":"0xzz"}""" to "'data' is not hex data",
-            """{$to,"data":"0x01","input":"0x0"}""" to "'input' is not hex data",
+            """{$to,"data":"0xzz","input":"0xzz"}""" to "invalid transaction object: 'input' is not hex data",
+            """{$to,"data":"0x01","input":"0x0"}""" to "invalid transaction object: 'input' is not hex data",
+            """{$to,"data":"0x0","input":"0x01"}""" to "invalid transaction object: 'data' is not hex data",
         ).forEach { (obj, reason) ->
             val resp = route(FakeBackend(callResult = byteArrayOf(1)),
                 """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$obj,"latest"]}""")

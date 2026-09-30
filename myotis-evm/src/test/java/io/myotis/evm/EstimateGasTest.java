@@ -185,20 +185,27 @@ class EstimateGasTest {
     @Test
     void feeCapBoundsTheCeilingByWhatTheSenderCanPay() throws Exception {
         // geth's affordability cap: (balance − value) / feeCap. 1_000_000 wei at
-        // 10 wei/gas funds 100_000 gas; the ten SSTOREs need ~242k.
+        // 10 wei/gas funds 100_000 gas; the ten SSTOREs need ~242k. (A block at
+        // a 7 wei base fee, so the 10 wei cap is one a block would include.)
         byte[] code = sstores(10);
         var poor = new DefaultEvmExecutor(senderWithBalanceAnd(BigInteger.valueOf(1_000_000L), CONTRACT, code));
         var priced = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.ZERO, new byte[0], null,
                 BigInteger.TEN, BigInteger.TEN);
-        assertEquals(new EvmExecutionError.GasAllowanceExceeded(100_000L), estimateError(poor, priced, ctx()));
+        assertEquals(new EvmExecutionError.GasAllowanceExceeded(100_000L), estimateError(poor, priced, ctx(7)));
 
         var funded = new DefaultEvmExecutor(senderWithBalanceAnd(BigInteger.valueOf(100_000_000L), CONTRACT, code));
-        assertTrue(funded.estimateGas(priced, ctx()).get() > 242_060L);
+        assertTrue(funded.estimateGas(priced, ctx(7)).get() > 242_060L);
 
-        // A value the sender cannot cover is refused outright.
+        // A value the sender cannot cover is refused outright — even before the
+        // fee cap is weighed against the base fee (geth's order).
         var allIn = new UnsignedTransaction(SENDER, CONTRACT, BigInteger.valueOf(100_000_000L), new byte[0], null,
                 BigInteger.TEN, BigInteger.TEN);
+        assertEquals(new EvmExecutionError.InsufficientFundsForTransfer(), estimateError(funded, allIn, ctx(7)));
         assertEquals(new EvmExecutionError.InsufficientFundsForTransfer(), estimateError(funded, allIn, ctx()));
+        // Affordable, but under a 1 gwei base fee: refused at the funded ceiling.
+        assertEquals(new EvmExecutionError.FailedWithGas(100_000L,
+                        new EvmExecutionError.FeeCapTooLow(SENDER, BigInteger.TEN, 1_000_000_000L)),
+                estimateError(poor, priced, ctx()));
     }
 
     @Test
@@ -383,11 +390,16 @@ class EstimateGasTest {
     }
 
     private static BlockContext ctx() {
+        return ctx(1_000_000_000L);
+    }
+
+    /** A Cancun block at {@code baseFee} wei. */
+    private static BlockContext ctx(long baseFee) {
         return new BlockContext(
                 new byte[32],
                 19_500_000L,
                 EvmFactory.CANCUN_TIME + 1,
-                BigInteger.valueOf(1_000_000_000L),
+                BigInteger.valueOf(baseFee),
                 Address.ZERO,
                 new byte[32],
                 BigInteger.ONE,

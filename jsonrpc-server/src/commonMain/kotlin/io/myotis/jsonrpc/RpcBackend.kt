@@ -31,8 +31,12 @@ class RpcCallResult private constructor(
     val data: ByteArray?,
     val detail: String?,
 ) {
-    /** [INFEASIBLE] is `eth_estimateGas`-only (see [RpcEstimateResult]); no
-     *  call result carries it. */
+    /** [INFEASIBLE] is an answer, not a failure (#509): the transaction cannot
+     *  succeed within the caller's own gas, fee cap or funds, and [detail] is
+     *  geth's message, served verbatim under geth's -32000. A call carries it
+     *  from [RpcBackend.callTx], and from a plain call only when its calldata
+     *  alone costs more than the engine's budget; an estimate from any path
+     *  (see [RpcEstimateResult]). */
     enum class Kind { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 
     companion object {
@@ -40,6 +44,7 @@ class RpcCallResult private constructor(
         fun reverted(data: ByteArray): RpcCallResult = RpcCallResult(Kind.REVERTED, data, null)
         fun unavailable(detail: String? = null): RpcCallResult = RpcCallResult(Kind.UNAVAILABLE, null, detail)
         fun refused(detail: String): RpcCallResult = RpcCallResult(Kind.REFUSED, null, detail)
+        fun infeasible(detail: String): RpcCallResult = RpcCallResult(Kind.INFEASIBLE, null, detail)
     }
 }
 
@@ -220,6 +225,23 @@ interface RpcBackend {
         }
         return estimateGasDetailed(tx.from, tx.to, tx.data, tx.valueWei)
     }
+
+    /**
+     * `eth_call` for a transaction object that carries more than
+     * from/to/data/value (#509) — `gas`, a fee, a list — at [block], with a state
+     * override when [stateOverridesJson] is non-null. Every field is applied as
+     * [estimateGasTx] applies it or the outcome is REFUSED; a call that cannot
+     * succeed within the caller's gas, fee cap or funds is INFEASIBLE.
+     *
+     * Default: REFUSED, rather than run a call without the fields the caller set.
+     */
+    fun callTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult = RpcCallResult.refused(
+        "this engine does not apply the transaction object's gas, fee or list fields to eth_call",
+    )
 }
 
 /**

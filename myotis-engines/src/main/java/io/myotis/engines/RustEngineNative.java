@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 34; // 34: estimate_gas_tx_json — the full eth_estimateGas transaction object (#509)
+    static final int EXPECTED_ABI_VERSION = 35; // 35: eth_call_tx_json — the full eth_call transaction object (#509)
 
     private static final boolean AVAILABLE = load();
 
@@ -306,6 +306,15 @@ final class RustEngineNative {
      */
     static String nativeEstimateGasTxJson(long handle, String tx, String block, String stateOverrides) {
         return Myotis_engineKt.estimateGasTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
+    }
+
+    /**
+     * Verified {@code eth_call} for the FULL transaction object (ABI >= 35,
+     * #509) — the arguments of {@link #nativeEstimateGasTxJson}. Every field is
+     * applied or the request refused (-32602).
+     */
+    static String nativeEthCallTxJson(long handle, String tx, String block, String stateOverrides) {
+        return Myotis_engineKt.ethCallTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
     }
 
     /** Verified ENS forward resolution (name → address record), as JSON. */

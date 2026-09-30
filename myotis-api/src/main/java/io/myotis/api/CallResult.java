@@ -1,7 +1,7 @@
 package io.myotis.api;
 
 /**
- * The detailed outcome of a verified {@code eth_call} — distinguishes the three
+ * The detailed outcome of a verified {@code eth_call} — distinguishes the
  * cases the single nullable {@code byte[]} of {@link VerifiedReads#call} cannot:
  *
  * <ul>
@@ -23,6 +23,16 @@ package io.myotis.api;
  *       fork its Besu cannot price). {@code detail} says why. Hosts serve the
  *       PERMANENT JSON-RPC -32602, never the retryable -32000 a client would
  *       spin on (CLAUDE.md: a refusal is permanent).</li>
+ *   <li>{@link Status#INFEASIBLE} — the call cannot succeed within the
+ *       caller's own limits (#509): it ran out of the {@code gas} the caller
+ *       gave it, that limit is below the intrinsic cost, the fee cap is below
+ *       the block's base fee, or the sender cannot afford {@code gas × fee cap
+ *       + value}. {@link VerifiedReads#callTx} answers it; a plain call only
+ *       when its calldata alone costs more than the engine's call budget. An
+ *       answer, not a failure to answer; {@code detail} carries geth's message
+ *       ("out of gas", "err: intrinsic gas too low: have N, want M (supplied
+ *       gas N)", …), which hosts serve verbatim as geth does (JSON-RPC -32000)
+ *       — never as return data.</li>
  * </ul>
  *
  * <p>Flat record over FFI-portable types (enum, {@code byte[]}, {@code String})
@@ -35,7 +45,7 @@ public record CallResult(Status status, byte[] data, String detail) {
         java.util.Objects.requireNonNull(status, "status");
     }
 
-    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED }
+    public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 
     public static CallResult ok(byte[] data) {
         return new CallResult(Status.OK, data == null ? new byte[0] : data, null);
@@ -51,5 +61,9 @@ public record CallResult(Status status, byte[] data, String detail) {
 
     public static CallResult refused(String detail) {
         return new CallResult(Status.REFUSED, null, detail);
+    }
+
+    public static CallResult infeasible(String detail) {
+        return new CallResult(Status.INFEASIBLE, null, java.util.Objects.requireNonNull(detail, "detail"));
     }
 }

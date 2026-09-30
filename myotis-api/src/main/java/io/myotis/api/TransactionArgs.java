@@ -1,8 +1,9 @@
 package io.myotis.api;
 
 /**
- * The JSON-RPC transaction object of an {@code eth_estimateGas} request (geth's
- * {@code TransactionArgs}), as the host validated it (#509).
+ * The JSON-RPC transaction object of an {@code eth_estimateGas} or
+ * {@code eth_call} request (geth's {@code TransactionArgs}), as the host
+ * validated it (#509).
  *
  * <p>Every field changes the answer, so an engine APPLIES each one or the
  * request is REFUSED — never answered with a field dropped. The failure this

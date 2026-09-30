@@ -478,6 +478,21 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public io.myotis.api.CallResult callTx(io.myotis.api.TransactionArgs tx, String block,
+                                           String stateOverridesJson) {
+        // As estimateGasTx: no host-side block guard — the engine applies the
+        // selector and refuses what it can never serve PERMANENTLY, which a host
+        // check would turn into a retryable "unavailable".
+        try {
+            return handle.callTxVerifiedDetailed(
+                    tx.json(), block, stateOverridesJson == null ? "" : stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified eth_call (transaction object) unavailable: {}", e.getMessage());
+            return io.myotis.api.CallResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Legacy two-state view of estimateGasDetailed (single source for the
         // guards) — a revert or refusal reads as null here.

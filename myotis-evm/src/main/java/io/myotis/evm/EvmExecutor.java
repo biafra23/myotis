@@ -64,6 +64,26 @@ public interface EvmExecutor {
     }
 
     /**
+     * {@code eth_call} for a transaction object (#509): the sender-aware
+     * {@link #callView(Address, Address, byte[], java.math.BigInteger, BlockContext)}
+     * plus {@code tx}'s gas limit and fees, applied as geth's {@code eth_call}
+     * applies them — the limit bounds the call, a fee is checked against the base
+     * fee and the sender's balance and charged before the call runs. A call that
+     * cannot succeed within them fails with geth's answer
+     * ({@link EvmExecutionError.CallOutOfGas}, {@link EvmExecutionError.InsufficientFunds}, …).
+     *
+     * <p>The default serves only a transaction without them and fails anything
+     * else rather than run a call the caller did not describe.
+     */
+    default CompletableFuture<byte[]> callTx(UnsignedTransaction tx, BlockContext blockContext) {
+        if (tx.gasLimit() != null || tx.gasFeeCap() != null || tx.gasTipCap() != null) {
+            return Futures.failedFuture(new UnsupportedOperationException(
+                    "this executor does not apply a transaction's gas limit or fees"));
+        }
+        return callView(tx.from(), tx.to(), tx.data(), tx.value(), blockContext);
+    }
+
+    /**
      * Estimate the gas required to execute {@code tx} against the state at
      * {@code blockContext.stateRoot()}.
      *

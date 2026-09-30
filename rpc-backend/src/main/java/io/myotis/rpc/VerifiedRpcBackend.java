@@ -843,6 +843,69 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     @Override
+    public io.myotis.api.CallResult callTx(io.myotis.api.TransactionArgs tx, String block,
+                                           String stateOverridesJson) {
+        // Nothing beyond from/to/data/value: exactly the plain call, with its
+        // dedup, replay cache and warm shapes.
+        if (!tx.hasExtendedFields()) {
+            return callDetailed(tx.from(), tx.to(), tx.data(), tx.valueWei(), block, stateOverridesJson);
+        }
+        String refusal = javaEngineRefusal(tx, block, stateOverridesJson, "eth_call");
+        if (refusal != null) return io.myotis.api.CallResult.refused(refusal);
+        TxFees fees = txFees(tx);
+        return rpcCallDetailed(tx.from(), tx.to(), tx.data(), parseWei(tx.valueWei()),
+                tx.gas(), fees.feeCap(), fees.tip(), block);
+    }
+
+    /** A transaction object's fee fields as geth prices them (#509): a legacy
+     *  gasPrice is both the fee cap and the tip; with a dynamic fee a missing
+     *  field is zero; both null without any fee field. */
+    private record TxFees(java.math.BigInteger feeCap, java.math.BigInteger tip) {}
+
+    private static TxFees txFees(io.myotis.api.TransactionArgs tx) {
+        java.math.BigInteger gasPrice = parseWei(tx.gasPriceWei());
+        if (gasPrice != null) return new TxFees(gasPrice, gasPrice);
+        java.math.BigInteger maxFee = parseWei(tx.maxFeePerGasWei());
+        java.math.BigInteger maxPriority = parseWei(tx.maxPriorityFeePerGasWei());
+        if (maxFee == null && maxPriority == null) return new TxFees(null, null);
+        return new TxFees(maxFee != null ? maxFee : java.math.BigInteger.ZERO,
+                maxPriority != null ? maxPriority : java.math.BigInteger.ZERO);
+    }
+
+    /** What the Java engine cannot apply to {@code tx} for {@code method}
+     *  ({@code eth_call}, {@code eth_estimateGas}) — the refusal reason, or null
+     *  when it can serve it. ONE copy for both methods, so neither can serve
+     *  what the other refuses. */
+    private static String javaEngineRefusal(io.myotis.api.TransactionArgs tx, String block,
+                                            String stateOverridesJson, String method) {
+        if (tx.hasAccessList() || tx.hasAuthorizationList()) {
+            return "the Java engine does not apply accessList or authorizationList (EIP-7702) to " + method
+                    + "; answering without them would answer for a different transaction — select the "
+                    + "Rust engine";
+        }
+        if (stateOverridesJson != null && !stateOverridesJson.isEmpty()) {
+            return "the Java engine does not apply state overrides to " + method;
+        }
+        if (tx.to() == null) {
+            return "the Java engine does not run " + method + " for contract creation (a transaction "
+                    + "without 'to')";
+        }
+        // This engine answers `finalized` from the head (#366) — a different
+        // block than the caller asked for, so here it is refused instead.
+        if (block != null && "finalized".equalsIgnoreCase(block.trim())) {
+            return "the Java engine does not run " + method + " against the finalized block";
+        }
+        if (tx.gasPriceWei() != null && (tx.maxFeePerGasWei() != null || tx.maxPriorityFeePerGasWei() != null)) {
+            return "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified";
+        }
+        TxFees fees = txFees(tx);
+        if (fees.tip() != null && fees.tip().compareTo(fees.feeCap()) > 0) {
+            return "maxPriorityFeePerGas (" + fees.tip() + ") is greater than maxFeePerGas (" + fees.feeCap() + ")";
+        }
+        return null;
+    }
+
+    @Override
     public String getBalance(byte[] address, String block) {
         io.myotis.evm.world.AccountState a = rpcAccountState(address, block);
         return a == null ? null : a.balance().toString();
@@ -985,46 +1048,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     @Override
     public io.myotis.api.EstimateResult estimateGasTx(io.myotis.api.TransactionArgs tx, String block,
                                                       String stateOverridesJson) {
-        if (tx.hasAccessList() || tx.hasAuthorizationList()) {
-            return io.myotis.api.EstimateResult.refused("the Java engine does not apply accessList or "
-                    + "authorizationList (EIP-7702); estimating without them would answer for a "
-                    + "different transaction — select the Rust engine");
-        }
-        if (stateOverridesJson != null && !stateOverridesJson.isEmpty()) {
-            return io.myotis.api.EstimateResult.refused(
-                    "the Java engine does not apply state overrides to eth_estimateGas");
-        }
-        if (tx.to() == null) {
-            return io.myotis.api.EstimateResult.refused(
-                    "the Java engine does not estimate contract creation (a transaction without 'to')");
-        }
-        // This engine answers `finalized` from the head (#366) — a different
-        // block than the caller asked for, so here it is refused instead.
-        if (block != null && "finalized".equalsIgnoreCase(block.trim())) {
-            return io.myotis.api.EstimateResult.refused(
-                    "the Java engine does not run eth_estimateGas against the finalized block");
-        }
-        java.math.BigInteger gasPrice = parseWei(tx.gasPriceWei());
-        java.math.BigInteger maxFee = parseWei(tx.maxFeePerGasWei());
-        java.math.BigInteger maxPriority = parseWei(tx.maxPriorityFeePerGasWei());
-        if (gasPrice != null && (maxFee != null || maxPriority != null)) {
-            return io.myotis.api.EstimateResult.refused(
-                    "both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified");
-        }
-        // geth's pricing: a legacy gasPrice is both the fee cap and the tip; a
-        // missing dynamic-fee field is zero.
-        java.math.BigInteger feeCap = gasPrice != null ? gasPrice : maxFee;
-        java.math.BigInteger tip = gasPrice != null ? gasPrice : maxPriority;
-        if (gasPrice == null && (maxFee != null || maxPriority != null)) {
-            if (feeCap == null) feeCap = java.math.BigInteger.ZERO;
-            if (tip == null) tip = java.math.BigInteger.ZERO;
-            if (tip.compareTo(feeCap) > 0) {
-                return io.myotis.api.EstimateResult.refused("maxPriorityFeePerGas (" + tip
-                        + ") is greater than maxFeePerGas (" + feeCap + ")");
-            }
-        }
+        String refusal = javaEngineRefusal(tx, block, stateOverridesJson, "eth_estimateGas");
+        if (refusal != null) return io.myotis.api.EstimateResult.refused(refusal);
+        TxFees fees = txFees(tx);
         return rpcEstimateGasDetailed(tx.from(), tx.to(), tx.data(), parseWei(tx.valueWei()),
-                tx.gas(), feeCap, tip, block);
+                tx.gas(), fees.feeCap(), fees.tip(), block);
     }
 
     /** Decode a decimal wei string from the {@link io.myotis.api.VerifiedReads} boundary to the
@@ -2134,6 +2162,17 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  REFUSED for a head whose fork this engine cannot price (permanent). */
     private io.myotis.api.CallResult rpcCallDetailed(byte[] from, byte[] to, byte[] data,
                                                      java.math.BigInteger value, String block) {
+        return rpcCallDetailed(from, to, data, value, null, null, null, block);
+    }
+
+    /** {@link #rpcCallDetailed(byte[], byte[], byte[], java.math.BigInteger, String)} with a
+     *  transaction object's gas limit and fee fields (null = unset, #509): the call then
+     *  runs through {@link io.myotis.evm.EvmExecutor#callTx}. */
+    private io.myotis.api.CallResult rpcCallDetailed(byte[] from, byte[] to, byte[] data,
+                                                     java.math.BigInteger value, Long gasLimit,
+                                                     java.math.BigInteger feeCap,
+                                                     java.math.BigInteger tip, String block) {
+        boolean txObject = gasLimit != null || feeCap != null || tip != null;
         // Keep the early-rejection logs correlatable with the wallet call that triggered
         // them: include target + 4-byte selector, matching the richer `desc` logging below.
         String callCtx = " to=" + (to != null && to.length == 20 ? Bytes.wrap(to).toHexString() : "?")
@@ -2160,6 +2199,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 + " sel=" + (data != null && data.length >= 4
                         ? Bytes.wrap(data, 0, 4).toHexString() : "0x")
                 + " dataLen=" + (data == null ? 0 : data.length)
+                + (txObject ? " gas=" + gasLimit + " feeCap=" + feeCap + " tip=" + tip : "")
                 + " block=" + block;
         // Track the shape for the replay-warm BEFORE head resolution AND before the
         // single-flight dedup: the calls most worth warming are exactly the ones
@@ -2173,7 +2213,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // untracked it would have been leader on the small lane. Only head-intent
         // block tags: a shape pinned to a genuinely historical block would warm
         // against every fresh head yet never be asked at that head's root.
-        if (replayWarmEnabled && to != null && to.length == 20
+        if (replayWarmEnabled && !txObject && to != null && to.length == 20
                 && (from == null || from.length == 20)
                 && data != null && data.length > EVM_SMALL_CALLDATA_MAX
                 && isHeadIntentTag(block)) {
@@ -2209,7 +2249,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // Key by (stateRoot, from, to, value, calldata): the sender and value are now
         // part of the input — a transfer simulated by vitalik vs by the zero address
         // computes a DIFFERENT verified result, so they must not share an execution.
-        String flightKey = callFlightKey(h, from, to, value, data);
+        // A transaction object's gas and fees are part of the input too: a call with
+        // a 100k limit must never share (or replay) the answer of one run with 30 M.
+        String flightKey = callFlightKey(h, from, to, value, data)
+                + (txObject ? ":" + (gasLimit == null ? "-" : Long.toHexString(gasLimit))
+                        + ":" + (feeCap == null ? "-" : feeCap.toString(16))
+                        + ":" + (tip == null ? "-" : tip.toString(16)) : "");
         // Warm-result replay: a prior execution for this exact (root, target, calldata)
         // already produced a verified answer — possibly one whose original waiter timed
         // out but whose background leader finished and populated the cache. Replay it; the
@@ -2244,12 +2289,19 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 // identical call into a guaranteed timeout. On a sync throw, deregister
                 // and complete exceptionally so waiters fail fast and a retry re-executes.
                 try {
-                    h.offchainExecutor()
-                            .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                    CompletableFuture<byte[]> run = txObject
+                            ? h.offchainExecutor().callTx(new io.myotis.evm.UnsignedTransaction(
+                                    io.myotis.evm.Address.of(from != null ? from : new byte[20]),
                                     io.myotis.evm.Address.of(to),
+                                    value != null ? value : java.math.BigInteger.ZERO,
                                     data == null ? new byte[0] : data,
-                                    value, h.blockCtx())
-                            .whenComplete((out, ex) -> {
+                                    gasLimit, feeCap, tip), h.blockCtx())
+                            : h.offchainExecutor()
+                                    .callView(from == null ? null : io.myotis.evm.Address.of(from),
+                                            io.myotis.evm.Address.of(to),
+                                            data == null ? new byte[0] : data,
+                                            value, h.blockCtx());
+                    run.whenComplete((out, ex) -> {
                                 try {
                                     if (ex != null) {
                                         mine.completeExceptionally(ex);
@@ -2310,6 +2362,14 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 log.info("[rpc] eth_call " + desc + " -> refused: " + refusal);
                 return io.myotis.api.CallResult.refused(refusal);
             }
+            // The call cannot succeed within the caller's gas, fee cap or funds: an
+            // ANSWER in geth's words (#509), never return data and never the
+            // retryable null. Only a transaction object's call produces it here.
+            String infeasible = infeasibleOf(e);
+            if (infeasible != null) {
+                log.info("[rpc] eth_call " + desc + " -> " + infeasible);
+                return io.myotis.api.CallResult.infeasible(infeasible);
+            }
             log.info("[rpc] eth_call " + desc + " -> error after "
                     + (clock.elapsedMillis() - t0) + "ms"
                     + (leader ? "" : " (deduped)") + ": " + describeEvmError(e));
@@ -2369,19 +2429,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return null;
     }
 
-    /** geth's message when the throwable chain holds an estimate that does not fit
-     *  the caller's gas or funds ({@link io.myotis.evm.EvmExecutionError.GasAllowanceExceeded},
-     *  {@link io.myotis.evm.EvmExecutionError.InsufficientFundsForTransfer}), else null.
-     *  Same cause-walk as {@link #revertDataOf}; package-private as a test seam. */
+    /** geth's message when the throwable chain holds an answer about the request —
+     *  a transaction that cannot succeed within the caller's gas, fee cap or funds
+     *  ({@link io.myotis.evm.EvmExecutionError.Infeasible}) — else null. Same
+     *  cause-walk as {@link #revertDataOf}; package-private as a test seam. */
     static String infeasibleOf(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
-            if (c instanceof io.myotis.evm.EvmExecutionException ee) {
-                if (ee.error() instanceof io.myotis.evm.EvmExecutionError.GasAllowanceExceeded g) {
-                    return g.message();
-                }
-                if (ee.error() instanceof io.myotis.evm.EvmExecutionError.InsufficientFundsForTransfer f) {
-                    return f.message();
-                }
+            if (c instanceof io.myotis.evm.EvmExecutionException ee
+                    && ee.error() instanceof io.myotis.evm.EvmExecutionError.Infeasible answer) {
+                return answer.message();
             }
         }
         return null;
@@ -4125,7 +4181,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // would execute and cost more) — but skip building+running the EVM, the
             // bulk of the per-estimate work on ART.
             boolean noData = data == null || data.length == 0;
-            if (noData) {
+            // A fee cap below the base fee is refused by the metered estimate, which
+            // names the ceiling its refused run was made at (geth's message) — so
+            // such a request skips the fast path.
+            java.math.BigInteger baseFee = h.blockCtx().baseFeePerGas() == null
+                    ? java.math.BigInteger.ZERO : h.blockCtx().baseFeePerGas();
+            boolean feeCapBelowBaseFee = feeCap != null && feeCap.signum() > 0 && feeCap.compareTo(baseFee) < 0;
+            if (noData && !feeCapBelowBaseFee) {
                 io.myotis.evm.world.AccountState acct = h.oracle()
                         .fetchAccount(h.blockCtx().stateRoot(), io.myotis.evm.Address.of(to))
                         .get(RPC_CALL_TIMEOUT_SEC, TimeUnit.SECONDS);

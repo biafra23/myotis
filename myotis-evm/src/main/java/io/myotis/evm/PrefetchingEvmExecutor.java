@@ -104,6 +104,18 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
                 () -> runConvergent(sender, target, calldata, value, blockContext), executor);
     }
 
+    /** A transaction-object call converges like a plain one: its plan — gas limit,
+     *  price, and the checks that refuse it — is decided once, before the loop. */
+    @Override
+    public CompletableFuture<byte[]> callTx(UnsignedTransaction tx, BlockContext blockContext) {
+        if (tx.to() == null) {
+            return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(new UnsupportedOperationException(
+                    "this engine does not run contract creation (to=null)"));
+        }
+        return CompletableFuture.supplyAsync(
+                () -> runConvergent(delegate.planCall(tx, blockContext), blockContext), delegate.executor());
+    }
+
     /** Estimation delegates directly: the prefetch/convergence loop exists to batch
      *  oracle round-trips for reads; the estimator already runs against the same
      *  snap-backed view and its gas accounting must not be re-run to convergence. */
@@ -114,6 +126,10 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
 
     private byte[] runConvergent(Address sender, Address target, byte[] calldata,
                                  java.math.BigInteger value, BlockContext blockContext) {
+        return runConvergent(DefaultEvmExecutor.viewPlan(sender, target, calldata, value), blockContext);
+    }
+
+    private byte[] runConvergent(DefaultEvmExecutor.CallPlan plan, BlockContext blockContext) {
         // Fork validation FIRST (the Rust call path's spec_for-before-prime twin):
         // a block every iteration would refuse (Sepolia past Amsterdam) must not
         // spend snap round-trips on the prime below before failing.
@@ -133,7 +149,14 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         // so iteration 0's sentinel run actually executes meaningful bytecode.
         // Without this, the very-first lookup would get a sentinel empty
         // account, find no code, and return immediately.
-        primeTarget(view, target);
+        primeTarget(view, plan.target());
+        // And the sender, when the call moves value or pays for gas: its balance
+        // is debited before the first opcode runs, and a sentinel placeholder
+        // (zero) cannot cover it — Besu fails the top-level transfer outright,
+        // with no revert for a discovery pass to absorb.
+        if (plan.value().signum() > 0 || !plan.price().isZero()) {
+            primeAccount(view, plan.sender());
+        }
 
         // Track every (address, slot) we've ever seen so we can recognise the
         // "no new misses" stable state across iterations.
@@ -172,7 +195,7 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
             long missesBefore = view.sentinelMissCount();
             byte[] result;
             try {
-                result = delegate.runOnTracedView(sender, target, calldata, value, blockContext, view, tracer);
+                result = delegate.runPlannedOnTracedView(plan, blockContext, view, tracer);
             } catch (EvmExecutionException e) {
                 if (!sentinelMode) {
                     // Real iteration produced an actual revert / halt — propagate.
@@ -257,6 +280,12 @@ public final class PrefetchingEvmExecutor implements EvmExecutor {
         AccountState targetAccount = view.account(target);
         // Force bytecode fetch into the BytecodeCache (also blocks).
         view.bytecode(targetAccount.codeHash());
+    }
+
+    /** Fetch {@code address}'s verified account into the view (blocking;
+     *  sentinel mode is OFF at this point). */
+    private void primeAccount(SyncStateView view, Address address) {
+        if (!view.hasAccount(address)) view.account(address);
     }
 
     /**

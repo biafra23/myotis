@@ -225,7 +225,8 @@ public interface VerifiedReads {
 
     /**
      * Whether this engine APPLIES a transaction object's {@code accessList} and
-     * EIP-7702 {@code authorizationList} in {@link #estimateGasTx} (#509).
+     * EIP-7702 {@code authorizationList} in {@link #estimateGasTx} and
+     * {@link #callTx} (#509).
      *
      * <p>Hosts consult it BEFORE dispatch and refuse (-32602) a request carrying
      * either list when it is false: an engine that estimated without them would
@@ -267,5 +268,28 @@ public interface VerifiedReads {
             return EstimateResult.refused("this engine estimates only against the head block");
         }
         return estimateGasDetailed(tx.from(), tx.to(), tx.data(), tx.valueWei());
+    }
+
+    /**
+     * {@code eth_call} for the full transaction object (#509) at {@code block},
+     * with a state override when {@code stateOverridesJson} is non-empty — as
+     * {@link #callDetailed}, plus every other field of {@code tx} applied as
+     * {@link #estimateGasTx} applies it: {@code gas} is the call's limit, a fee
+     * is checked against the block's base fee and charged to the sender, the
+     * lists are applied — or the request is {@link CallResult.Status#REFUSED}.
+     * A call that cannot succeed within the caller's gas, fee cap or funds is
+     * {@link CallResult.Status#INFEASIBLE}.
+     *
+     * <p>Default: an engine that has not implemented the transaction object
+     * answers exactly the subset it always could — {@code from}/{@code to}/
+     * {@code data}/{@code value}, via {@link #callDetailed} — and REFUSES
+     * anything else rather than run a call the caller did not describe.
+     */
+    default CallResult callTx(TransactionArgs tx, String block, String stateOverridesJson) {
+        if (tx.hasExtendedFields()) {
+            return CallResult.refused(
+                    "this engine does not apply the transaction object's gas, fee or list fields to eth_call");
+        }
+        return callDetailed(tx.from(), tx.to(), tx.data(), tx.valueWei(), block, stateOverridesJson);
     }
 }
