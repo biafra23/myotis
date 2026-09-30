@@ -483,6 +483,25 @@ const RECEIPT_SCAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// next peer is tried.
 const RECEIPT_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Body requests one receipt scan attempt keeps in flight on its peer
+/// ([`verified_bodies_newest_first`]). Until it is verified, a body's response
+/// can be any frame of up to
+/// [`MAX_FRAME_BODY_SIZE`](crate::el::rlpx::frame::MAX_FRAME_BODY_SIZE)
+/// (10 MiB), so this bounds the frames a peer can make one attempt hold, where
+/// a request per block of a [`RECEIPT_MAX_SCAN_BLOCKS_PER_POLL`] window let it
+/// pin about 1.25 GiB (and the hedged race runs up to [`MAX_HEDGED_ATTEMPTS`]
+/// attempts at once). It also bounds how many of our requests wait at the
+/// peer, their timeouts running, ahead of background sync's on the shared
+/// connection. A steady-state poll and the first poll's lookback still go out
+/// in one round; only a catch-up scan pipelines, one response time per this
+/// many blocks. A tuning choice rather than a derived bound, like
+/// [`BULK_HEDGE_DELAY`].
+const RECEIPT_SCAN_BODIES_IN_FLIGHT: usize = 16;
+const _: () = assert!(
+    RECEIPT_SCAN_BODIES_IN_FLIGHT as u64 >= RECEIPT_INITIAL_LOOKBACK_BLOCKS,
+    "a first poll's lookback must still go out in one round"
+);
+
 /// A verified `eth_getTransactionReceipt` result. The containing block header is
 /// anchored to the beacon optimistic head via a hash-linked header window, the
 /// body verified against `transactionsRoot` (locating the tx + its index), and
@@ -7146,11 +7165,12 @@ impl ElReader {
     /// window, anchor it to the beacon head + hash-link it, then check the
     /// blocks NEWEST-first (a just-mined tx is found on the first body
     /// checked), each body verified against its header's `transactionsRoot`
-    /// before its tx hashes are trusted. Bodies are requested concurrently (the
-    /// Java twin's bodyFutures — one pipelined round instead of up-to-128
-    /// serial RTTs). Any fetch/verify failure fails the WHOLE scan for this
-    /// peer (→ next peer) — a skipped block could otherwise read as a verified
-    /// "not seen".
+    /// before its tx hashes are trusted. Bodies are requested concurrently, as
+    /// the Java twin's bodyFutures are, but at most
+    /// [`RECEIPT_SCAN_BODIES_IN_FLIGHT`] at a time and each verified as it
+    /// arrives ([`verified_bodies_newest_first`]). Any fetch/verify failure
+    /// fails the WHOLE scan for this peer (→ next peer) — a skipped block could
+    /// otherwise read as a verified "not seen".
     async fn scan_blocks_from(
         &self,
         peer: &ManagedPeer,
@@ -7159,16 +7179,19 @@ impl ElReader {
         want: &[u8; 32],
     ) -> Result<Option<TxLocation>, String> {
         let window = fetch_anchored_window(peer, from, top).await?;
-        // One single-hash request per block (bounded per-response size), all in
-        // flight at once on this peer's multiplexed connection.
-        let all_bodies = futures::future::join_all(window.iter().map(|vh| {
+        // One single-hash request per block (bounded per-response size) on this
+        // peer's multiplexed connection.
+        let bodies = verified_bodies_newest_first(&window, |vh| {
             let hash = [vh.hash]; // owned by the future (the request outlives this closure)
             async move { peer.get_block_bodies(&hash).await }
-        }))
-        .await;
-        for (vh, bodies) in window.iter().zip(all_bodies).rev() {
-            let body = bodies?.into_iter().next().ok_or("peer returned no block body")?;
-            verify_body_transactions(&vh.header, &body)?;
+        });
+        tokio::pin!(bodies);
+        // The first block in that order that failed or holds the tx decides.
+        // Returning drops the stream and the requests still in flight: their
+        // late answers are ignored, and one cut mid-write costs the connection,
+        // as in the backfill pipeline.
+        while let Some(verified) = futures::StreamExt::next(&mut bodies).await {
+            let (vh, body) = verified?;
             for (i, raw) in body.transactions.iter().enumerate() {
                 if &keccak256(raw) == want {
                     // Pre-populate for the eth_getBlockByHash the wallet issues
@@ -7421,6 +7444,45 @@ async fn fetch_anchored_window(
         peer.note_head_served(top.number());
     }
     Ok(window)
+}
+
+/// The body half of one receipt scan attempt: the body of every block in the
+/// anchored `window`, fetched with `fetch` NEWEST first and verified against
+/// its header's `transactionsRoot` inside its own fetch. A body that fails the
+/// check is dropped there and then; only its error waits for its turn. Items
+/// come out in that order however the responses arrive, and at most
+/// [`RECEIPT_SCAN_BODIES_IN_FLIGHT`] fetches run at once, counting a verified
+/// body not yet taken. Generic over the fetch so both are unit-testable
+/// without a peer.
+fn verified_bodies_newest_first<'w, Fut>(
+    window: &'w [crate::el::eth::messages::VerifiedHeader],
+    fetch: impl Fn(&'w crate::el::eth::messages::VerifiedHeader) -> Fut,
+) -> impl futures::Stream<
+    Item = Result<
+        (&'w crate::el::eth::messages::VerifiedHeader, crate::el::eth::messages::BlockBody),
+        String,
+    >,
+> + 'w
+where
+    Fut: std::future::Future<Output = Result<Vec<crate::el::eth::messages::BlockBody>, String>> + 'w,
+{
+    // Built up front, as join_all built them, so no closure over a borrowed
+    // header lives in the stream across an await: that trips rustc's Send
+    // inference (see the backfill's chunk fetches). Nothing is sent before
+    // `buffered` first polls a fetch.
+    let fetches: Vec<_> = window
+        .iter()
+        .rev()
+        .map(|vh| {
+            let fetched = fetch(vh);
+            async move {
+                let body = fetched.await?.into_iter().next().ok_or("peer returned no block body")?;
+                verify_body_transactions(&vh.header, &body)?;
+                Ok::<_, String>((vh, body))
+            }
+        })
+        .collect();
+    futures::StreamExt::buffered(futures::stream::iter(fetches), RECEIPT_SCAN_BODIES_IN_FLIGHT)
 }
 
 /// Build EVERY receipt of a ROOT-VERIFIED block in one pass — the batch form of
@@ -8560,6 +8622,187 @@ mod tests {
             // …and never exceeded, and every attempt that started also finished
             // (all six are misses — nothing is cancelled, so `live` returns to 0).
             assert_eq!(live.load(Ordering::SeqCst), 0, "an attempt leaked");
+        }
+    }
+
+    /// The receipt scan's body fetch ([`verified_bodies_newest_first`]): the
+    /// in-flight bound that caps what a peer can make one scan attempt hold
+    /// (#454), and the newest-first order the scan reads its verdict in,
+    /// whatever order the answers arrive in. On tokio's paused clock.
+    mod receipt_scan_bodies {
+        use super::*;
+        use crate::el::eth::messages::{BlockBody, VerifiedHeader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        const ANSWER: Duration = Duration::from_millis(100);
+
+        /// How the scripted peer answers one block's body request.
+        #[derive(Clone, Copy)]
+        enum Serve {
+            /// The empty body, after the delay.
+            After(Duration),
+            /// A response without a body.
+            NoBody,
+            /// A failed request.
+            Fails,
+        }
+
+        /// Answers as scripted, counting the requests it has in hand.
+        #[derive(Default)]
+        struct Peer {
+            live: AtomicUsize,
+            peak: AtomicUsize,
+            asked: Mutex<Vec<u64>>,
+        }
+
+        impl Peer {
+            async fn answer(&self, number: u64, serve: Serve) -> Result<Vec<BlockBody>, String> {
+                self.asked.lock().unwrap().push(number);
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                let out = match serve {
+                    Serve::After(delay) => {
+                        tokio::time::sleep(delay).await;
+                        // `Default` builds the empty list whatever type holds it.
+                        let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
+                        Ok(vec![empty])
+                    }
+                    Serve::NoBody => Ok(Vec::new()),
+                    Serve::Fails => Err("request failed".to_string()),
+                };
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                out
+            }
+
+            fn asked(&self) -> Vec<u64> {
+                self.asked.lock().unwrap().clone()
+            }
+        }
+
+        /// Headers `0..n` committing to an empty body, except the `bad` ones.
+        fn window(n: u64, bad: &[u64]) -> Vec<VerifiedHeader> {
+            (0..n)
+                .map(|number| {
+                    let transactions_root = if bad.contains(&number) { [0xAA; 32] } else { EMPTY_TRIE_ROOT };
+                    let header = BlockHeader { number, transactions_root, ..Default::default() };
+                    VerifiedHeader { hash: keccak256(&number.to_be_bytes()), raw_rlp: Vec::new(), header }
+                })
+                .collect()
+        }
+
+        fn newest_first(below: u64) -> Vec<u64> {
+            (0..below).rev().collect()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_full_window_keeps_the_bound_in_flight_newest_first() {
+            // A catch-up scan's whole window, each body answered after one
+            // response time. Never more than the bound out at once, where every
+            // block used to be — a peer could pin 128 frames — but always the
+            // bound, so the window costs one response time per bound's worth of
+            // blocks rather than one per block.
+            let peer = Peer::default();
+            let window = window(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL, &[]);
+            let started = tokio::time::Instant::now();
+            let bodies = verified_bodies_newest_first(&window, |vh| {
+                peer.answer(vh.header.number, Serve::After(ANSWER))
+            });
+            tokio::pin!(bodies);
+            let mut read = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut bodies).await {
+                read.push(item.expect("every body matches its root").0.header.number);
+            }
+            assert_eq!(read, newest_first(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL), "read newest first");
+            assert_eq!(peer.asked(), read, "and asked for in that order");
+            assert_eq!(peer.peak.load(Ordering::SeqCst), RECEIPT_SCAN_BODIES_IN_FLIGHT);
+            let rounds = RECEIPT_MAX_SCAN_BLOCKS_PER_POLL.div_ceil(RECEIPT_SCAN_BODIES_IN_FLIGHT as u64);
+            assert_eq!(started.elapsed(), ANSWER * rounds as u32);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_body_failing_its_root_ends_the_reading_in_its_place() {
+            // Block 100 is the 28th newest of 128. The 27 newer verdicts come
+            // first, so a tx found in one of them still wins, as it did; then the
+            // failure, which the scan returns on. By then at most the bound's
+            // worth of requests past the verdicts read has gone out, where
+            // join_all fetched the whole window first.
+            let peer = Peer::default();
+            let window = window(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL, &[100]);
+            let bodies = verified_bodies_newest_first(&window, |vh| {
+                peer.answer(vh.header.number, Serve::After(ANSWER))
+            });
+            tokio::pin!(bodies);
+            let mut verified = Vec::new();
+            let err = loop {
+                match futures::StreamExt::next(&mut bodies).await {
+                    Some(Ok((vh, _))) => verified.push(vh.header.number),
+                    Some(Err(e)) => break e,
+                    None => panic!("block 100's body matched a root it does not commit to"),
+                }
+            };
+            assert!(err.contains("block 100") && err.contains("transactionsRoot"), "{err}");
+            let newer: Vec<u64> = (101..RECEIPT_MAX_SCAN_BLOCKS_PER_POLL).rev().collect();
+            assert_eq!(verified, newer);
+            let asked = peer.asked().len();
+            assert!(asked <= verified.len() + RECEIPT_SCAN_BODIES_IN_FLIGHT, "{asked} requests went out");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_older_failure_waits_for_the_newer_bodies() {
+            // Block 1's request fails at once and block 0's answer carries no
+            // body, while blocks 3 and 2 take a response time. The failures
+            // arrive first but are read in their place: the two newer bodies
+            // still decide first.
+            let peer = Peer::default();
+            let window = window(4, &[]);
+            let bodies = verified_bodies_newest_first(&window, |vh| {
+                let serve = match vh.header.number {
+                    1 => Serve::Fails,
+                    0 => Serve::NoBody,
+                    _ => Serve::After(ANSWER),
+                };
+                peer.answer(vh.header.number, serve)
+            });
+            tokio::pin!(bodies);
+            let mut read = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut bodies).await {
+                read.push(item.map(|(vh, _)| vh.header.number));
+            }
+            assert_eq!(
+                read,
+                vec![
+                    Ok(3),
+                    Ok(2),
+                    Err("request failed".to_string()),
+                    Err("peer returned no block body".to_string()),
+                ]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_withheld_newest_body_holds_back_further_requests() {
+            // The peer sits on the newest body and answers the rest at once.
+            // Those wait behind it, verified, and count against the bound, so
+            // nothing more goes out until the newest is answered: reordering its
+            // answers cannot make the scan hold more.
+            let peer = Peer::default();
+            let window = window(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL, &[]);
+            let newest = RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1;
+            let bodies = verified_bodies_newest_first(&window, |vh| {
+                let delay = if vh.header.number == newest { Duration::from_secs(10) } else { ANSWER };
+                peer.answer(vh.header.number, Serve::After(delay))
+            });
+            tokio::pin!(bodies);
+            let held = tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut bodies)).await;
+            assert!(held.is_err(), "nothing is read before the newest body");
+            assert_eq!(peer.asked().len(), RECEIPT_SCAN_BODIES_IN_FLIGHT);
+            let mut read = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut bodies).await {
+                read.push(item.expect("every body matches its root").0.header.number);
+            }
+            assert_eq!(read, newest_first(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL));
         }
     }
 
