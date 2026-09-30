@@ -1,0 +1,172 @@
+# Hold a workflow's expensive jobs until this PR's Claude review has finished.
+#
+# Every workflow a `pull_request` event triggers starts at the same moment, and
+# GitHub has no ordering between workflows, so the macOS and Android builds ran
+# alongside claude-review.yml and built a commit the review might still ask to
+# change. A caller adds this as a job and makes its build job `needs:` it:
+#
+#     review-gate:
+#       name: Review gate
+#       uses: ./.github/workflows/wait-for-claude-review.yml
+#       permissions:
+#         actions: read
+#     build:
+#       needs: review-gate
+#
+# Callers: android-apk, desktop-dmg, ios-framework. Build and Test (ci.yml) and
+# the other Linux checks stay ungated on purpose: they are the test signal, and
+# holding them for the review would only delay it.
+#
+# WHEN IT WAITS. For a same-repo, non-draft PR (the ones claude-review.yml's job
+# `if:` reviews), while a claude-review run of the PR's branch that started in
+# the hour before this event has not completed. `opened` and `reopened` start a
+# review (that file's `types:`; its third, `ready_for_review`, never reaches the
+# callers), so on those it first waits for that run to appear. The first builds
+# of a PR therefore wait for its review, and so does a push that lands while
+# the review is still running. A push after the review, a push to main, a tag,
+# a fork and a draft PR pass in seconds. A run's conclusion does not matter: a
+# failed review says nothing about the code, and its own check reports it.
+#
+# FAIL-OPEN. Once it runs, it may only delay the builds, never block them.
+# Three API errors in a row, no run appearing within 3 minutes, a review still
+# queued after 5 minutes (gates like this one may be holding the runners it
+# needs), and a review still running after an hour all end in a warning and
+# success. `continue-on-error` covers the rest: a gate job that fails anyway
+# (runner lost, timed out) does not stop the jobs that need it. A cancelled
+# gate still cancels them, as a cancelled run should. What it cannot cover is
+# this file failing to load (a YAML error, a rename without its callers): the
+# three callers then fail at startup, builds and tag release uploads included,
+# as with any broken workflow file. A PR that does that goes red on
+# android-apk and desktop-dmg, which run on every PR, before it can merge.
+#
+# NEVER GIVE THE CALLER'S JOB AN `if:`. When a job is skipped, GitHub skips
+# every job in the `needs:` chain after it, so a gate skipped on pushes would
+# silently skip the builds, the emulator smoke and, on a tag, the release
+# uploads. It runs on every event and decides here, in the script.
+#
+# THE TRADE-OFF. A PR's first builds report one review later (the 40 reviews
+# before this file took 4 to 40 minutes, median 11), and the callers cancel a
+# superseded run per ref, so a fix pushed soon after the review cancels builds
+# that only just started. Runner time is saved when a push lands while the
+# review is still running. While it waits, each calling workflow holds one idle
+# Linux runner (free in this public repo, but it takes a concurrent-job slot)
+# and polls the API from the GITHUB_TOKEN budget every job in the repository
+# shares, 1,000 requests an hour: each minute until it sees the review, then
+# every 2 minutes.
+name: Wait for claude-review
+
+on:
+  workflow_call:
+
+jobs:
+  wait:
+    name: Wait for claude-review
+    runs-on: ubuntu-latest
+    # See FAIL-OPEN above: a failure here must not stop the jobs behind it.
+    continue-on-error: true
+    # A backstop above the script's own bound (MAX_WAIT_SECONDS plus a few slow
+    # polls). The script always ends the wait itself first.
+    timeout-minutes: 75
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for this PR's claude-review run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          # The payload is the PR as of this event, so updated_at is when it
+          # was opened, reopened or pushed to.
+          EVENT_AT: ${{ github.event.pull_request.updated_at }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -uo pipefail
+          # Every way out of this script is exit 0 (see FAIL-OPEN in the header).
+          proceed() {
+            echo "::warning title=Review gate::$1 Starting without waiting for claude-review."
+            exit 0
+          }
+
+          case "$EVENT_NAME/$EVENT_ACTION" in
+            # These start a review, so its run has to appear before the gate passes.
+            pull_request/opened | pull_request/reopened) expect_run=true ;;
+            # A push starts none, but it can land while one is still running.
+            pull_request/synchronize) expect_run=false ;;
+            *)
+              echo "No claude-review to wait for on $EVENT_NAME${EVENT_ACTION:+ ($EVENT_ACTION)}."
+              exit 0
+              ;;
+          esac
+          # The two skips in claude-review.yml's job `if:`.
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "PR from a fork: claude-review skips those; nothing to wait for."
+            exit 0
+          fi
+          if [ "$IS_DRAFT" = true ]; then
+            echo "Draft PR: claude-review runs once it is marked ready; nothing to wait for."
+            exit 0
+          fi
+          [ -n "$PR_BRANCH" ] || proceed "The PR has no head branch name."
+          # Checked before `date` sees it: `date -d ''` is today's midnight, not an error.
+          [[ "$EVENT_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || proceed "Unexpected event time '$EVENT_AT'."
+          event_s=$(date -u -d "$EVENT_AT" +%s) || proceed "Unreadable event time '$EVENT_AT'."
+          # Git allows '#', '&' and '+' in a branch name; the query must not read them.
+          branch=$(jq -rn --arg b "$PR_BRANCH" '$b | @uri') || proceed "Could not encode the branch name."
+
+          poll=${POLL_SECONDS:-60}
+          appear=${APPEAR_SECONDS:-180}
+          queued_limit=${QUEUED_SECONDS:-300}
+          max_wait=${MAX_WAIT_SECONDS:-3600}
+          window=${WINDOW_SECONDS:-3600}
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/claude-review.yml/runs?event=pull_request&branch=$branch&per_page=20"
+          failures=0
+          waited=false
+          while :; do
+            [ "$SECONDS" -lt "$max_wait" ] \
+              || proceed "claude-review has not finished after $((max_wait / 60)) minutes."
+            # The branch's runs from the hour before this event (older ones
+            # belong to earlier PRs of the branch). First line: "<runs this
+            # event started> <unfinished> <running> <youngest unfinished's
+            # age in s>"; then one line per run: "<status> <conclusion> <url>".
+            if ! out=$(timeout 60 gh api "$runs" | jq -r \
+                --argjson event "$event_s" --argjson now "$(date +%s)" --argjson window "$window" '
+                [.workflow_runs[] | .t = (.created_at | fromdateiso8601) | select(.t >= $event - $window)] as $runs
+                | [$runs[] | select(.status != "completed")] as $open
+                | "\([$runs[] | select(.t >= $event - 60)] | length) \($open | length) \([$open[] | select(.status == "in_progress")] | length) \([$open[] | $now - .t] | min // 0)",
+                  ($runs[] | "\(.status) \(.conclusion // "-") \(.html_url)")'); then
+              failures=$((failures + 1))
+              [ "$failures" -lt 3 ] || proceed "Listing the claude-review runs failed 3 times in a row."
+              echo "Listing the claude-review runs failed (attempt $failures of 3); retrying in ${poll}s."
+              sleep "$poll"
+              continue
+            fi
+            failures=0
+            read -r started open running age <<<"$(head -n 1 <<<"$out")"
+            details=$(tail -n +2 <<<"$out")
+            if [ "$expect_run" = true ] && [ "$started" -eq 0 ]; then
+              [ "$SECONDS" -lt "$appear" ] \
+                || proceed "No claude-review run for this event appeared within ${appear}s."
+              echo "No claude-review run for this event yet; checking again in ${poll}s."
+            elif [ "$open" -eq 0 ]; then
+              if [ "$expect_run" = true ] || [ "$waited" = true ]; then
+                echo "claude-review finished after $((SECONDS / 60))m; starting the builds:"
+                echo "$details"
+              else
+                echo "No claude-review of this branch is running; nothing to wait for."
+              fi
+              exit 0
+            elif [ "$running" -eq 0 ] && [ "$age" -ge "$queued_limit" ]; then
+              proceed "claude-review has waited $((age / 60)) minutes for a runner (gates like this one may be holding them)."
+            else
+              waited=true
+              echo "Waiting for claude-review ($((SECONDS / 60))m so far):"
+              echo "$details"
+            fi
+            # A review already seen needs no minute-by-minute resolution, and
+            # each poll spends the budget the repository's other jobs share
+            # (claude-review's own API steps and the release uploads among them).
+            if [ "$waited" = true ]; then sleep "$((poll * 2))"; else sleep "$poll"; fi
+          done
