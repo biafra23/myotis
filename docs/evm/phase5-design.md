@@ -69,6 +69,8 @@ estimateGas(tx, ctx):
   if tx.feeCap > 0:                           // geth's affordability cap
     if tx.value >= balance(tx.from): fail InsufficientFundsForTransfer
     ceiling = min(ceiling, (balance(tx.from) - tx.value) / tx.feeCap)
+  if 0 < tx.feeCap < baseFee:                 // geth's first run refuses it
+    fail FailedWithGas(ceiling, FeeCapTooLow)
   floor = 21000 + 10*(zero_bytes + 4*nonzero_bytes)   // EIP-7623, Prague+ only
   if intrinsic > ceiling or floor > ceiling:
     fail GasAllowanceExceeded(ceiling)
@@ -84,12 +86,32 @@ estimateGas(tx, ctx):
     other halt:         fail Halted(detail)
 ```
 
-`GasAllowanceExceeded` and `InsufficientFundsForTransfer` are answers, not
-failures to answer: hosts serve them as geth does (-32000, "gas required
-exceeds allowance (N)" / "insufficient funds for transfer"). The Rust engine
-(`myotis_evm::tx`, `EvmExecutor::estimate_tx`) runs the same algorithm and,
-unlike this one, also applies EIP-7702 authorization lists, access lists,
-the transaction nonce and contract creation (#509).
+`GasAllowanceExceeded`, `InsufficientFundsForTransfer` and `FailedWithGas`
+are answers, not failures to answer (`EvmExecutionError.Infeasible`): hosts
+serve them as geth does (-32000, "gas required exceeds allowance (N)" /
+"insufficient funds for transfer" / "failed with N gas: max fee per gas less
+than block base fee: …"). The Rust engine (`myotis_evm::tx`,
+`EvmExecutor::estimate_tx`) runs the same algorithm and, unlike this one,
+also applies EIP-7702 authorization lists, access lists, the transaction
+nonce and contract creation (#509).
+
+`eth_call` for a transaction object (`EvmExecutor.callTx`, #509 stage 2)
+shares the pricing but not the ceiling: `gas` is the call's own limit
+(capped at the 30 M budget, as geth caps it at its RPC gas cap; taken
+literally — below 21000 it is not "unset" as in an estimate), checked in
+geth's order before anything runs — the fee cap against the base fee
+(`FeeCapTooLow`), the balance against `gas × feeCap + value`, fee or not
+(`InsufficientFunds`, or `RequiredBalanceOverflow` past 2^256), the limit
+against the intrinsic cost and the Prague floor (`IntrinsicGasTooLow`,
+`FloorDataGasTooLow`) — each wrapped as geth's `eth_call` wraps it
+(`CallFailed`: "err: <reason> (supplied gas N)"). The sender is then
+debited `gas × effectivePrice` (geth's `buyGas`), the frame gets
+`gas − intrinsic` with GASPRICE at the effective price, and running out of
+a limit the caller set is `CallOutOfGas` ("out of gas") — all answers, like
+the estimate's. The prefetching and CCIP-Read layers run the same plan; the
+prefetch loop primes the sender's real balance before its first discovery
+pass whenever the call moves value or pays for gas, since a placeholder
+balance cannot cover the transfer Besu makes before the first opcode.
 
 The behaviour for reverting transactions matters: the plan says "do
 *not* return a gas estimate for a reverting transaction (the caller
