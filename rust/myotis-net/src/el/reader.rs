@@ -38,6 +38,7 @@ use myotis_evm::{
 use crate::el::anchor::{ExecAnchor, FinalizedExecution};
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
+use crate::el::feecache::{FeeCache, Head, HistoryShape, Lookup};
 use crate::el::evm::{
     block_context, ReadAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
     EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
@@ -1115,6 +1116,23 @@ const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90
 /// each block with reward percentiles costs a verified body + receipts fetch.
 const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
 
+/// How often the fee follower checks for a new anchored head (#510). A head
+/// arrives every 12 s on mainnet and 5 s on gnosis; 1 s keeps the refresh
+/// within a second of the head for the price of a lock read.
+const FEE_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Budget for one background fee refresh (estimate or one feeHistory shape).
+const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A resolved `eth_feeHistory` request: the anchored window top, the served
+/// block count and the oldest block.
+#[derive(Debug, Clone, Copy)]
+struct FeeHistoryPlan {
+    top: WindowTop,
+    count: u64,
+    oldest: u64,
+}
+
 /// Per-peer deadline for one `eth_feeHistory` build (header window + the
 /// pipelined per-block body/receipt fetches) — the Java stage timeout.
 const FEE_HISTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1351,6 +1369,16 @@ pub struct ElReader {
     /// concurrently would race that bookkeeping. Async mutex: held across the
     /// tick's network awaits.
     log_index_drive: tokio::sync::Mutex<()>,
+    /// The per-head fee memo (`el::feecache`, #510): the last verified fee
+    /// estimate and feeHistory results plus the rolling per-block tips window.
+    /// Brief-hold lock; never held across an await.
+    fee_cache: std::sync::Mutex<crate::el::feecache::FeeCache>,
+    /// Single-flight for the fee estimate compute: concurrent misses (and the
+    /// follower) run ONE peer ladder per head. Held across the network build.
+    fee_estimate_compute: tokio::sync::Mutex<()>,
+    /// The fee follower (see [`Self::ensure_fee_follower`]): refreshes the fee
+    /// reads a wallet is polling on every new head, off the request path.
+    fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -1528,6 +1556,9 @@ impl ElReader {
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
+            fee_cache: std::sync::Mutex::new(crate::el::feecache::FeeCache::default()),
+            fee_estimate_compute: tokio::sync::Mutex::new(()),
+            fee_follow_task: std::sync::Mutex::new(None),
         })
     }
 
@@ -5970,8 +6001,57 @@ impl ElReader {
     /// the last `TIP_SUGGEST_BLOCKS` beacon-anchored blocks: median per-tx effective
     /// tip (floored at the network's `min_suggested_tip_wei`) as the priority fee, and next-block
     /// base fee + that tip as the legacy gas price. `Err` when it can't verify.
-    pub async fn fee_estimate(&self) -> Result<FeeEstimate, String> {
-        let (head_num, head_hash) = self.anchored_head()?;
+    ///
+    /// Served from the per-head memo (#510): exact for as long as the anchored
+    /// head is unchanged, and STALE (within `feecache`'s block/age bounds) just
+    /// after a head advance while the fee follower refreshes it in the
+    /// background. Only a miss with no recent value computes on the request
+    /// path — single-flight, so concurrent misses share one peer ladder.
+    pub async fn fee_estimate(self: &Arc<Self>) -> Result<FeeEstimate, String> {
+        let head = self.anchored_head()?;
+        let now = Instant::now();
+        let hit = self.with_fee_cache(|c| {
+            c.note_estimate_demand(now);
+            c.estimate.lookup(head, now, true)
+        })?;
+        self.ensure_fee_follower();
+        match hit {
+            Lookup::Fresh(est) => Ok(est),
+            Lookup::Stale(est) => {
+                tracing::debug!(head = head.0, "fee estimate: serving the previous head's value while refreshing");
+                Ok(est)
+            }
+            Lookup::Miss => self.fee_estimate_refresh(head).await,
+        }
+    }
+
+    /// Run `f` on the fee memo under its brief-hold lock.
+    fn with_fee_cache<T>(&self, f: impl FnOnce(&mut FeeCache) -> T) -> Result<T, String> {
+        let mut cache = self.fee_cache.lock().map_err(|_| "fee cache unavailable".to_string())?;
+        Ok(f(&mut cache))
+    }
+
+    /// Compute (single-flight) and memoize the estimate for `head`.
+    async fn fee_estimate_refresh(&self, head: Head) -> Result<FeeEstimate, String> {
+        let _flight = self.fee_estimate_compute.lock().await;
+        // Another caller (or the follower) may have finished it while we waited.
+        if let Lookup::Fresh(est) =
+            self.with_fee_cache(|c| c.estimate.lookup(head, Instant::now(), false))?
+        {
+            return Ok(est);
+        }
+        let result = self.fee_estimate_at(head).await;
+        let current = self.anchored_head().ok();
+        self.with_fee_cache(|c| match &result {
+            Ok(est) => c.estimate.store(head, *est, Instant::now(), current),
+            Err(_) => c.estimate.record_failure(head, Instant::now()),
+        })?;
+        result
+    }
+
+    /// The peer ladder for the estimate at `head` (uncached).
+    async fn fee_estimate_at(&self, head: Head) -> Result<FeeEstimate, String> {
+        let (head_num, head_hash) = head;
         // Sample [start..head]; never below genesis.
         let count = TIP_SUGGEST_BLOCKS.min(head_num + 1);
         let start = head_num + 1 - count;
@@ -6005,9 +6085,11 @@ impl ElReader {
     }
 
     /// Compute the fee estimate against a single peer: fetch the header window
-    /// [start..head] (anchored + hash-linked to the beacon head), fetch all bodies
-    /// in one request, verify each against its header's `transactions_root`, then
-    /// take the median per-tx effective tip and the next-block base fee.
+    /// [start..head] (anchored + hash-linked to the beacon head), fetch the
+    /// bodies of the blocks whose tips are not already in the rolling window
+    /// (usually just the new head's) in one request, verify each against its
+    /// header's `transactions_root`, then take the median per-tx effective tip
+    /// over the whole window and the next-block base fee.
     async fn fee_estimate_from(
         &self,
         peer: &ManagedPeer,
@@ -6015,30 +6097,39 @@ impl ElReader {
         top: WindowTop,
     ) -> Result<FeeEstimate, String> {
         let window = fetch_anchored_window(peer, start, top).await?;
-        let hashes: Vec<[u8; 32]> = window.iter().map(|vh| vh.hash).collect();
-        let bodies = peer.get_block_bodies(&hashes).await?;
-        if bodies.len() != window.len() {
-            return Err(format!("peer returned {} bodies, expected {}", bodies.len(), window.len()));
-        }
-        let mut tips: Vec<u128> = Vec::new();
-        for (vh, body) in window.iter().zip(bodies.iter()) {
-            // Verify each body against its (chain-verified) header, then decode tips
-            // at THAT block's base fee. A body that fails its transactionsRoot fails
-            // the WHOLE estimate (→ next peer): stricter than the Java cold path,
-            // which would median over the remaining good blocks — safer here, at a
-            // small availability cost. (A wrong header/body pairing from an out-of-
-            // order peer response is caught the same way.)
-            verify_body_transactions(&vh.header, body)?;
-            let base = header_base_fee(&vh.header);
-            for raw in &body.transactions {
+        // Tips are keyed by the window's own (chain-verified) (number, hash),
+        // so a remembered list is exactly what this block's verified body gives.
+        let mut per_block: Vec<Option<Arc<Vec<u128>>>> = self.with_fee_cache(|c| {
+            window.iter().map(|vh| c.tips((vh.header.number, vh.hash))).collect()
+        })?;
+        let missing: Vec<usize> = (0..window.len()).filter(|&i| per_block[i].is_none()).collect();
+        if !missing.is_empty() {
+            let hashes: Vec<[u8; 32]> = missing.iter().map(|&i| window[i].hash).collect();
+            let bodies = peer.get_block_bodies(&hashes).await?;
+            if bodies.len() != hashes.len() {
+                return Err(format!("peer returned {} bodies, expected {}", bodies.len(), hashes.len()));
+            }
+            for (&i, body) in missing.iter().zip(bodies.iter()) {
+                let vh = &window[i];
+                // Verify each body against its (chain-verified) header, then decode tips
+                // at THAT block's base fee. A body that fails its transactionsRoot fails
+                // the WHOLE estimate (→ next peer): stricter than the Java cold path,
+                // which would median over the remaining good blocks — safer here, at a
+                // small availability cost. (A wrong header/body pairing from an out-of-
+                // order peer response is caught the same way.)
+                verify_body_transactions(&vh.header, body)?;
+                let base = header_base_fee(&vh.header);
                 // A tx the minimal fee decoder can't read is skipped (not dropped
                 // with its whole block, as Java does) — no real-world divergence
                 // since every current mainnet tx type decodes.
-                if let Some(t) = tx::effective_tip(raw, base) {
-                    tips.push(t);
-                }
+                let tips: Arc<Vec<u128>> = Arc::new(
+                    body.transactions.iter().filter_map(|raw| tx::effective_tip(raw, base)).collect(),
+                );
+                self.with_fee_cache(|c| c.put_tips((vh.header.number, vh.hash), Arc::clone(&tips)))?;
+                per_block[i] = Some(tips);
             }
         }
+        let mut tips: Vec<u128> = per_block.iter().flatten().flat_map(|t| t.iter().copied()).collect();
         let tip = if tips.is_empty() {
             self.min_suggested_tip_wei
         } else {
@@ -6049,6 +6140,93 @@ impl ElReader {
         let head_header = &window[window.len() - 1].header;
         let gas_price = next_base_fee(head_header).saturating_add(tip);
         Ok(FeeEstimate { max_priority_fee_wei: tip, gas_price_wei: gas_price })
+    }
+
+    /// Spawn (or keep) the fee follower: while a fee read was requested within
+    /// `feecache::FOLLOW_IDLE`, it refreshes the estimate and every
+    /// head-relative feeHistory shape once per new anchored head, so the
+    /// wallet's next poll is a memory hit. Idempotent; a no-op outside a tokio
+    /// runtime (a bare spawn there would abort the process under
+    /// panic="abort"). Holds only a WEAK reference, like the log-index appender,
+    /// so it never blocks the host's teardown; `stop` aborts it.
+    fn ensure_fee_follower(self: &Arc<Self>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // A fee read racing `stop` must not restart the follower behind it.
+        if *self.request_shutdown.borrow() {
+            return;
+        }
+        let Ok(mut slot) = self.fee_follow_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            let mut tick = tokio::time::interval(FEE_FOLLOW_TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return;
+                };
+                if !reader.fee_follow_tick().await {
+                    // Demand went idle; the next fee read respawns the task.
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// One follower pass. `false` = nothing is being polled any more.
+    async fn fee_follow_tick(&self) -> bool {
+        let now = Instant::now();
+        let Ok((active, estimate_followed, shapes)) = self.with_fee_cache(|c| {
+            (c.any_followed(now), c.estimate_followed(now), c.followed_histories(now))
+        }) else {
+            return false;
+        };
+        if !active || *self.request_shutdown.borrow() {
+            return false;
+        }
+        let Ok(head) = self.anchored_head() else {
+            return true;
+        };
+        if estimate_followed
+            && self.with_fee_cache(|c| c.estimate.wants_refresh(head, now)).unwrap_or(false)
+        {
+            // Registered like a host request, so a stop cancels and drains it.
+            let _ = self
+                .request_with_budget(FEE_REFRESH_BUDGET, self.fee_estimate_refresh(head))
+                .await;
+        }
+        for (shape, lock) in shapes {
+            let Ok(plan) = self.fee_history_plan(shape.block_count, None, head) else {
+                continue;
+            };
+            let top = (plan.top.number(), *plan.top.hash());
+            if !self.with_fee_cache(|c| c.history_wants_refresh(&shape, top, now)).unwrap_or(false) {
+                continue;
+            }
+            let _ = self
+                .request_with_budget(FEE_REFRESH_BUDGET, self.fee_history_refresh(&shape, &lock, plan))
+                .await;
+        }
+        true
+    }
+
+    /// Abort and await the fee follower (teardown; see [`Self::stop`]).
+    async fn stop_fee_follower(&self) {
+        let handle = match self.fee_follow_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await;
+        }
     }
 
     /// Verified `eth_feeHistory` (the Java `rpcFeeHistory` twin). `newest_block`
@@ -6066,7 +6244,7 @@ impl ElReader {
     /// is a transport/verify failure the host may answer from its last-good
     /// same-signature snapshot.
     pub async fn fee_history(
-        &self,
+        self: &Arc<Self>,
         block_count: u64,
         newest_block: Option<u64>,
         reward_percentiles: Option<&[f64]>,
@@ -6076,7 +6254,39 @@ impl ElReader {
         }
         // No anchor yet is a BUILD failure (Java's `anchor == null` path also
         // falls to the stale-serve), unlike the request rejects below.
-        let (head_num, head_hash) = self.anchored_head().map_err(FeeHistoryError::Build)?;
+        let head = self.anchored_head().map_err(FeeHistoryError::Build)?;
+        let plan = self.fee_history_plan(block_count, newest_block, head)?;
+        // The per-head memo (#510): identical shape + identical anchored top ⇒
+        // identical verified result. A `latest` shape is also served stale just
+        // after a head advance while the follower refreshes it.
+        let shape = HistoryShape::new(block_count, newest_block, reward_percentiles);
+        let top = (plan.top.number(), *plan.top.hash());
+        let (hit, lock) = self
+            .with_fee_cache(|c| c.history_lookup(&shape, top, Instant::now()))
+            .map_err(FeeHistoryError::Build)?;
+        if shape.follows_head() {
+            self.ensure_fee_follower();
+        }
+        match hit {
+            Lookup::Fresh(history) => Ok(history),
+            Lookup::Stale(history) => {
+                tracing::debug!(head = head.0, "eth_feeHistory: serving the previous head's result while refreshing");
+                Ok(history)
+            }
+            Lookup::Miss => {
+                self.fee_history_refresh(&shape, &lock, plan).await.map_err(FeeHistoryError::Build)
+            }
+        }
+    }
+
+    /// Resolve a feeHistory request against `head`: the window top, the
+    /// served count and the oldest block — or the request [`FeeHistoryError::Reject`]s.
+    fn fee_history_plan(
+        &self,
+        block_count: u64,
+        newest_block: Option<u64>,
+        (head_num, head_hash): Head,
+    ) -> Result<FeeHistoryPlan, FeeHistoryError> {
         let newest = newest_block.unwrap_or(head_num);
         // The window's top, as for the other by-number reads: the finalized
         // block when `newest` is at or below it (#465) — also while finality
@@ -6094,8 +6304,36 @@ impl ElReader {
                 "oldest block {oldest} is beyond the {BLOCK_LOOKBACK_MAX}-block verify window"
             )));
         }
-        self.fee_history_build(oldest, count, top, reward_percentiles).await
-            .map_err(FeeHistoryError::Build)
+        Ok(FeeHistoryPlan { top, count, oldest })
+    }
+
+    /// Build (single-flight per shape) and memoize a feeHistory result.
+    async fn fee_history_refresh(
+        &self,
+        shape: &HistoryShape,
+        lock: &tokio::sync::Mutex<()>,
+        plan: FeeHistoryPlan,
+    ) -> Result<FeeHistory, String> {
+        let _flight = lock.lock().await;
+        let top = (plan.top.number(), *plan.top.hash());
+        if let Some(history) = self.with_fee_cache(|c| c.history_fresh(shape, top, Instant::now()))? {
+            return Ok(history);
+        }
+        let percentiles = shape.percentiles();
+        let result =
+            self.fee_history_build(plan.oldest, plan.count, plan.top, percentiles.as_deref()).await;
+        // The top a `latest` request resolves to NOW (for a pinned shape a
+        // backwards head changes nothing it would be compared against).
+        let current = self
+            .anchored_head()
+            .ok()
+            .and_then(|head| self.fee_history_plan(shape.block_count, shape.newest, head).ok())
+            .map(|p| (p.top.number(), *p.top.hash()));
+        self.with_fee_cache(|c| match &result {
+            Ok(history) => c.store_history(shape, top, history.clone(), Instant::now(), current),
+            Err(_) => c.record_history_failure(shape, top, Instant::now()),
+        })?;
+        result
     }
 
     /// The peer-failover build stage of [`Self::fee_history`] (every error here
@@ -6963,6 +7201,7 @@ impl ElReader {
         self.cancel_requests();
         // Stop producers before collecting/draining registered work.
         self.stop_log_index_appender().await;
+        self.stop_fee_follower().await;
         let requests: Vec<_> = self.requests.lock().map(|requests| requests.iter().filter_map(std::sync::Weak::upgrade).collect()).unwrap_or_default();
         for request in requests { request.settled().await; }
         if let Ok(mut t) = self.log_index_task.lock() {

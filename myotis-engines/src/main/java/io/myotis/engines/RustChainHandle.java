@@ -1305,7 +1305,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     record FeeEstimate(String gasPriceWei, String maxPriorityFeePerGasWei) {}
 
     /** How long a fee estimate is reused so a paired gasPrice+maxPriorityFee poll
-     *  shares one native compute (each is a 3-block verified fetch). */
+     *  shares one native call. The engine itself memoizes the estimate per
+     *  anchored head and refreshes it in the background (#510), so a miss here is
+     *  normally a memory hit there, not a verified fetch. */
     private static final long FEE_CACHE_TTL_NANOS = 3_000_000_000L; // 3s
     /** Value+timestamp in one volatile so a reader can't pair a fresh estimate with
      *  a stale stamp (or vice versa). Monotonic nanoTime — immune to wall-clock/NTP
