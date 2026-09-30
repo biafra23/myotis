@@ -17,8 +17,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Holds the build, and the emulator smoke behind it, until this PR's Claude
+  # review has finished, so neither runs on a commit the review might still
+  # ask to change. It passes straight through on every other event — see
+  # wait-for-claude-review.yml, which also says why this job must never get
+  # an `if:`.
+  review-gate:
+    name: Review gate
+    uses: ./.github/workflows/wait-for-claude-review.yml
+    permissions:
+      actions: read
+
   build:
     name: Build debug APK
+    needs: review-gate
     runs-on: ubuntu-latest
     permissions:
       contents: read

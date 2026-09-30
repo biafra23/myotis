@@ -18,7 +18,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Holds the builds until this PR's Claude review has finished, so the macOS
+  # jpackage legs do not build a commit the review might still ask to change. It
+  # passes straight through on every other event — see
+  # wait-for-claude-review.yml, which also says why this job must never get
+  # an `if:`.
+  review-gate:
+    name: Review gate
+    uses: ./.github/workflows/wait-for-claude-review.yml
+    permissions:
+      actions: read
+
   build:
+    needs: review-gate
     # The regular legs keep their historical check name; the PoC leg is suffixed.
     name: Build macOS .dmg (${{ matrix.arch }}${{ matrix.flavor == 'bee-poc' && ', bee-poc' || '' }})
     # jpackage bundles a single-architecture JRE and can't emit a universal binary, so we build

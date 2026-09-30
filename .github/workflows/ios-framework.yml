@@ -45,7 +45,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Holds the build until this PR's Claude review has finished, so the macOS
+  # runner does not build a commit the review might still ask to change. It
+  # passes straight through on every other event — see
+  # wait-for-claude-review.yml, which also says why this job must never get
+  # an `if:`.
+  review-gate:
+    name: Review gate
+    uses: ./.github/workflows/wait-for-claude-review.yml
+    permissions:
+      actions: read
+
   build:
+    needs: review-gate
     # macos-15 for a recent Xcode toolchain (the Kotlin/Native iOS link needs
     # Xcode's clang/ld for the target). macos-14's Xcode also links a static
     # framework, but 15 tracks closer to the dev fleet's Xcode 26.
