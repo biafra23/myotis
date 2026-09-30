@@ -489,13 +489,14 @@ const RECEIPT_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// [`MAX_FRAME_BODY_SIZE`](crate::el::rlpx::frame::MAX_FRAME_BODY_SIZE)
 /// (10 MiB), so this bounds the frames a peer can make one attempt hold, where
 /// a request per block of a [`RECEIPT_MAX_SCAN_BLOCKS_PER_POLL`] window let it
-/// pin about 1.25 GiB (and the hedged race runs up to [`MAX_HEDGED_ATTEMPTS`]
-/// attempts at once). It also bounds how many of our requests wait at the
-/// peer, their timeouts running, ahead of background sync's on the shared
-/// connection. A steady-state poll and the first poll's lookback still go out
-/// in one round; only a catch-up scan pipelines, one response time per this
-/// many blocks. A tuning choice rather than a derived bound, like
-/// [`BULK_HEDGE_DELAY`].
+/// pin about 1.25 GiB. The bound is per attempt: the hedged race runs up to
+/// [`MAX_HEDGED_ATTEMPTS`] of them, and scans for other txs run their own. It
+/// also bounds how many of the attempt's requests wait at the peer, their
+/// timeouts running, ahead of background sync's on the shared connection. A
+/// steady-state poll and the first poll's lookback still go out in one round;
+/// only a catch-up scan pipelines, about one response time per this many
+/// blocks, and a slow answer to the newest request holds the next ones back. A
+/// tuning choice rather than a derived bound, like [`BULK_HEDGE_DELAY`].
 const RECEIPT_SCAN_BODIES_IN_FLIGHT: usize = 16;
 const _: () = assert!(
     RECEIPT_SCAN_BODIES_IN_FLIGHT as u64 >= RECEIPT_INITIAL_LOOKBACK_BLOCKS,
@@ -7450,13 +7451,13 @@ async fn fetch_anchored_window(
 /// anchored `window`, fetched with `fetch` NEWEST first and verified against
 /// its header's `transactionsRoot` inside its own fetch. A body that fails the
 /// check is dropped there and then; only its error waits for its turn. Items
-/// come out in that order however the responses arrive, and at most
-/// [`RECEIPT_SCAN_BODIES_IN_FLIGHT`] fetches run at once, counting a verified
-/// body not yet taken. Generic over the fetch so both are unit-testable
-/// without a peer.
+/// come out in that order however the responses arrive, and `fetch` is only
+/// called once one of the [`RECEIPT_SCAN_BODIES_IN_FLIGHT`] places is free (a
+/// verified body not yet taken keeps its place). Generic over the fetch so
+/// both are unit-testable without a peer.
 fn verified_bodies_newest_first<'w, Fut>(
     window: &'w [crate::el::eth::messages::VerifiedHeader],
-    fetch: impl Fn(&'w crate::el::eth::messages::VerifiedHeader) -> Fut,
+    fetch: impl Fn(&'w crate::el::eth::messages::VerifiedHeader) -> Fut + 'w,
 ) -> impl futures::Stream<
     Item = Result<
         (&'w crate::el::eth::messages::VerifiedHeader, crate::el::eth::messages::BlockBody),
@@ -7466,22 +7467,14 @@ fn verified_bodies_newest_first<'w, Fut>(
 where
     Fut: std::future::Future<Output = Result<Vec<crate::el::eth::messages::BlockBody>, String>> + 'w,
 {
-    // Built up front, as join_all built them, so no closure over a borrowed
-    // header lives in the stream across an await: that trips rustc's Send
-    // inference (see the backfill's chunk fetches). Nothing is sent before
-    // `buffered` first polls a fetch.
-    let fetches: Vec<_> = window
-        .iter()
-        .rev()
-        .map(|vh| {
-            let fetched = fetch(vh);
-            async move {
-                let body = fetched.await?.into_iter().next().ok_or("peer returned no block body")?;
-                verify_body_transactions(&vh.header, &body)?;
-                Ok::<_, String>((vh, body))
-            }
-        })
-        .collect();
+    let fetches = window.iter().rev().map(move |vh| {
+        let fetched = fetch(vh);
+        async move {
+            let body = fetched.await?.into_iter().next().ok_or("peer returned no block body")?;
+            verify_body_transactions(&vh.header, &body)?;
+            Ok::<_, String>((vh, body))
+        }
+    });
     futures::StreamExt::buffered(futures::stream::iter(fetches), RECEIPT_SCAN_BODIES_IN_FLIGHT)
 }
 
@@ -8658,22 +8651,31 @@ mod tests {
         }
 
         impl Peer {
-            async fn answer(&self, number: u64, serve: Serve) -> Result<Vec<BlockBody>, String> {
+            /// Counts the request as asked when the fetch is MADE, not when it
+            /// is first polled: a fetch that sent on creation must not slip
+            /// past the bound either.
+            fn answer(
+                &self,
+                number: u64,
+                serve: Serve,
+            ) -> impl std::future::Future<Output = Result<Vec<BlockBody>, String>> + '_ {
                 self.asked.lock().unwrap().push(number);
-                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
-                self.peak.fetch_max(now, Ordering::SeqCst);
-                let out = match serve {
-                    Serve::After(delay) => {
-                        tokio::time::sleep(delay).await;
-                        // `Default` builds the empty list whatever type holds it.
-                        let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
-                        Ok(vec![empty])
-                    }
-                    Serve::NoBody => Ok(Vec::new()),
-                    Serve::Fails => Err("request failed".to_string()),
-                };
-                self.live.fetch_sub(1, Ordering::SeqCst);
-                out
+                async move {
+                    let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.peak.fetch_max(now, Ordering::SeqCst);
+                    let out = match serve {
+                        Serve::After(delay) => {
+                            tokio::time::sleep(delay).await;
+                            // `Default` builds the empty list whatever type holds it.
+                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
+                            Ok(vec![empty])
+                        }
+                        Serve::NoBody => Ok(Vec::new()),
+                        Serve::Fails => Err("request failed".to_string()),
+                    };
+                    self.live.fetch_sub(1, Ordering::SeqCst);
+                    out
+                }
             }
 
             fn asked(&self) -> Vec<u64> {
@@ -8783,10 +8785,10 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn a_withheld_newest_body_holds_back_further_requests() {
-            // The peer sits on the newest body and answers the rest at once.
+            // The peer sits on the newest body and answers the rest promptly.
             // Those wait behind it, verified, and count against the bound, so
-            // nothing more goes out until the newest is answered: reordering its
-            // answers cannot make the scan hold more.
+            // no further fetch is even made until the newest is answered:
+            // reordering its answers cannot make the scan hold more.
             let peer = Peer::default();
             let window = window(RECEIPT_MAX_SCAN_BLOCKS_PER_POLL, &[]);
             let newest = RECEIPT_MAX_SCAN_BLOCKS_PER_POLL - 1;
