@@ -712,8 +712,9 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
-/// `estimateGas` result: `{"status":"ok","gas":N}` (the buffered gas-limit estimate
-/// as a JSON number — the 1.15 buffer can put it slightly above the 30 M base),
+/// `estimateGas` result: `{"status":"ok","gas":N}` (the gas-limit estimate as a
+/// JSON number: the lowest limit that works, searched as geth searches it, with
+/// the 1.15 buffer on top and never above the caller's ceiling),
 /// `{"status":"revert","dataHex":"0x…"}` (the estimated transaction reverted —
 /// a verified answer; the host serves the standard code-3 error with the raw
 /// payload, same shape as `call_json`'s revert), or
