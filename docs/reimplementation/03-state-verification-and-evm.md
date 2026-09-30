@@ -160,10 +160,19 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 
 - Intrinsic gas (Yellow Paper App. G): `21000 + 4·zeroBytes + 16·nonzeroBytes` (EIP-2028).
   **EIP-2930 access lists and EIP-3860 init-code are not modeled; contract creation is unsupported.**
-- `evmBudget = ceiling - intrinsic`; run with `isStatic = false` (so SSTORE meters/refunds), real
-  `value`, real `from`.
-- On success: `total = intrinsic + (evmBudget - remainingGas)`; return **`ceil(total · 1.15)`** (a
-  15% safety buffer, rounded **up** so a too-low estimate can't OOG the broadcast tx).
+- Run at the ceiling with `initialGas = ceiling - intrinsic`, `isStatic = false` (so SSTORE
+  meters/refunds), real `value`, real `from` (debited `gasLimit × effective price`, as geth's
+  `buyGas`).
+- On success, **geth's search** (`eth/gasestimator`, #509 stage 2) for the lowest gas limit at
+  which the transaction succeeds: `drawn = max(ceiling - remainingGas, floor)`; `lo = drawn - 1`;
+  probe `(drawn + 2300) × 64/63` first; then bisect, skewed low (`mid = min((hi+lo)/2, 2·lo)`),
+  until `(hi - lo)/hi < 1.5%`; any failed probe raises the limit. Return **`ceil(hi · 1.15)`**,
+  capped at the ceiling (a 15% safety buffer, rounded **up** so a too-low estimate can't OOG the
+  broadcast tx). One run's draw is NOT enough: a call chain withholds 1/64 of the gas at every
+  level (EIP-150) and a contract may check `gasleft()`. One deliberate difference from geth: the
+  search never goes below `drawn` (geth starts from the post-refund charge), since a lower limit
+  can only "work" by running a different transaction (a failure caught inside, a `gasleft()`
+  branch).
 - A reverting/OOG tx **does not get a number** — it throws, so callers never broadcast a doomed tx.
 - The JSON-RPC `eth_estimateGas` short-circuits a plain value transfer to a code-less account to
   exactly `21000` (no EVM run, no buffer).

@@ -470,8 +470,9 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
    from a fully cache-hit run, fail closed); batch coalescing (64 path-sets/request,
    independent per-item verification, whole-chunk rotation); semaphore-bounded waves; lanes +
    snap fan-out gate (half the live snap peers for the heavy lane).
-4. **estimateGas** (intrinsic + metered, `ceil(total·1.15)`, no number for reverts, plain
-   transfer short-circuit to 21000) + the ABI subset (hand-rolled, doc 03 §5 hardening).
+4. **estimateGas** (geth's search for the lowest working limit, `ceil(hi·1.15)` — doc 03 §4.4;
+   no number for reverts, plain transfer short-circuit to 21000) + the ABI subset (hand-rolled,
+   doc 03 §5 hardening).
 5. **CCIP-Read + ENS.** `OffchainLookup` parse/serial gateway iteration/HttpError detection
    via the `HttpGateway` port (blocking, wrapped `spawn_blocking`); callback re-entry capped
    at 1; ENS namehash/DNS-encode/ENSIP-10 discovery + record calls + reverse with mandatory
