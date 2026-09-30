@@ -2,6 +2,7 @@
 name = "myotis-consensus"
 version.workspace = true
 edition = "2021"
+rust-version.workspace = true
 description = "Myotis sync-committee light client (pure Rust; grows through the Rust-engine PRs)"
 license = "MIT OR Apache-2.0"
 

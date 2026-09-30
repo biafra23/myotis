@@ -2,6 +2,7 @@
 name = "myotis-engine"
 version.workspace = true
 edition = "2021"
+rust-version.workspace = true
 description = "Rust implementation of the io.myotis.api engine contract (JNI cdylib)"
 license = "MIT OR Apache-2.0"
 

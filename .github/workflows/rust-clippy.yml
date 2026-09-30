@@ -69,6 +69,11 @@ jobs:
           workspaces: rust
       # --keep-going: a red run lists every independent target's deny-level
       # hits at once instead of stopping at the first failing crate.
-      - name: Clippy (fails on deny-level lints; warnings are reported only)
+      #
+      # incompatible_msrv is the one warn-level lint denied here: it flags our
+      # own code using a std API newer than the workspace rust-version
+      # (rust/Cargo.toml), which the Gradle gate trusts. Gradle's
+      # verifyRustVersionFloor covers the dependencies' side of that floor.
+      - name: Clippy (fails on deny-level lints and on code above the MSRV; other warnings are reported only)
         working-directory: rust
-        run: cargo clippy --workspace --all-targets --keep-going
+        run: cargo clippy --workspace --all-targets --keep-going -- -D clippy::incompatible_msrv

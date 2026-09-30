@@ -40,11 +40,13 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # -PskipRustEngine: this runner has no Rust/Android toolchain, and
-      # :android-app now builds the Rust engine from source by DEFAULT (a missing
-      # toolchain is a hard error naming this switch). This job is a JVM
-      # compile/test check — it does not ship the APK (android-apk.yml does, with
-      # the full toolchain), so build the app without the engine.
+      # -PskipRustEngine: this runner has no Android Rust toolchain (cargo-ndk,
+      # NDK, Android rustup targets), and :android-app builds the Rust engine
+      # from source by DEFAULT (a missing toolchain is a hard error naming this
+      # switch). This job is a JVM compile/test check — it does not ship the APK
+      # (android-apk.yml does, with the full toolchain), so build the app without
+      # the engine. The runner image DOES ship host Rust, so `check` still runs
+      # the host-side Rust tasks (cargoTest, verifyRustVersionFloor, …).
       #
       # Retry to ride out transient external-repo resolution blips (JitPack 403s,
       # google()/Hyperledger timeouts) for any artifact not already cached. NOT

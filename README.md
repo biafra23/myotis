@@ -868,7 +868,7 @@ To actually build the Rust engine and bundle it, per target:
 
 | Target | Requirements |
 |---|---|
-| Desktop dev loop + packaged installers (`packageDmg`/`packageDeb`) | rustc/cargo **stable ≥ 1.85** (`rust-toolchain.toml` tracks stable; the Gradle probe skips anything older). Builds the host triple; the x64 dmg CI leg additionally passes `-PrustTarget=x86_64-apple-darwin` under Rosetta. |
+| Desktop dev loop + packaged installers (`packageDmg`/`packageDeb`) | rustc/cargo **stable**, at least the workspace `rust-version` in `rust/Cargo.toml` (the dependency graph sets it; `rust-toolchain.toml` tracks stable, and the Gradle probe reads that line and skips anything older). Builds the host triple; the x64 dmg CI leg additionally passes `-PrustTarget=x86_64-apple-darwin` under Rosetta. |
 | Android jniLibs (`cargoNdkAndroid`) | The same rustc/cargo, plus `rustup target add aarch64-linux-android x86_64-linux-android`, `cargo install cargo-ndk`, and an Android **NDK r28+** (16 KB-aligned LOAD segments for Android 15+; older NDKs work because `.cargo/config.toml` forces the alignment, and the build fails loudly if it slips). Found via `$ANDROID_NDK_HOME` or the newest `<sdk>/ndk/<version>`. |
 | iOS framework (`:app-ios`) | macOS with **Xcode 26+** and `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`. Without them the framework tasks disable themselves with a warning (a previously built `libmyotis_engine.a` also satisfies them). |
 | Regenerating the committed Kotlin bindings (`uniffiGenerateKotlin`) | Just rustc/cargo — the pinned `rust/uniffi-bindgen` CLI builds from the workspace. Re-run after any `ffi.rs` shape change. |
