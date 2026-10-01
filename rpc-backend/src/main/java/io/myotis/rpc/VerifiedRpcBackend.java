@@ -244,8 +244,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     private static final int STATE_PROOF_CACHE_MAX = 65_536;
 
     /** How long a verified eth_call / estimateGas RESULT stays replayable (see
-     *  {@link #callResultCache}). The result is keyed by stateRoot, so its value is
-     *  ALWAYS correct for that state — this bound is staleness + memory, not safety.
+     *  {@link #callResultCache}). The result is keyed by its block ({@link #blockKey}: the
+     *  state root and every block input the EVM reads), so its value is ALWAYS correct for
+     *  that block — this bound is staleness + memory, not safety.
      *  Mirrors {@link #RPC_HEAD_SERVE_STALE_MAX_MS}, the same horizon a pinned head
      *  itself stays servable, so a retry that still resolves to that head finds its
      *  result warm. Where StateProofCache (above) saves the per-slot snap proofs so a
@@ -461,9 +462,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 }
             });
 
-    /** Replayable eth_call results, keyed by the SAME {@code stateRoot:from:to:value:keccak(calldata)}
-     *  string as {@link #inflightCalls}. An eth_call is deterministic given its anchored
-     *  stateRoot, so once a (root, from, target, value, calldata) tuple has executed-and-verified
+    /** Replayable eth_call results, keyed by the SAME {@code block:from:to:value:keccak(calldata)}
+     *  string as {@link #inflightCalls}, where the block is {@link #blockKey}: the state root
+     *  and every block input the EVM reads. An eth_call is deterministic given its anchored
+     *  block, so once a (block, from, target, value, calldata) tuple has executed-and-verified
      *  the answer is reusable for as long as that root stays servable. The dominant real-world
      *  pattern is a user retrying a hung confirm screen — tap Confirm, it spins past the
      *  wallet's timeout, tap again — which re-issues the IDENTICAL call against the same
@@ -472,8 +474,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  cancelled when its waiter times out (see {@link #rpcCall}); it finishes in the
      *  background and populates this cache, so even a call the wallet GAVE UP on lands here
      *  and the retry finds it warm. Reuse is never a trust relaxation: the key pins the
-     *  exact stateRoot and every value was proof-verified against it before insertion — the
-     *  served bytes are bit-identical to re-executing. */
+     *  exact block and every value was proof-verified against its stateRoot before insertion
+     *  — the served bytes are bit-identical to re-executing. */
     private final VerifiedResultCache<byte[]> callResultCache =
             new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
 
@@ -486,9 +488,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /** {@link #REPLAY_WARM_PROP}, read once at construction. */
     private final boolean replayWarmEnabled;
 
-    /** Replayable eth_estimateGas results, keyed by {@code stateRoot:from:to:keccak(data):value}.
-     *  Same rationale as {@link #callResultCache}: an estimate is deterministic given the
-     *  anchored state, and estimateGas is a gating call on the confirm screen, so a retry
+    /** Replayable eth_estimateGas results, keyed by {@code block:from:to:keccak(data):value}
+     *  plus gas and fees, the block being {@link #blockKey}. Same rationale as
+     *  {@link #callResultCache}: an estimate is deterministic given the anchored block, and
+     *  estimateGas is a gating call on the confirm screen, so a retry
      *  against the same pinned head replays instead of re-running the binary-search EVM. */
     private final VerifiedResultCache<Long> estimateCache =
             new VerifiedResultCache<>(CALL_RESULT_CACHE_MAX, CALL_RESULT_CACHE_TTL_MS);
@@ -2241,24 +2244,24 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // against the few mobile peers. On a phone that multiplies hundreds of
         // account/storage round-trips by N for ONE answer, starving the gating calls
         // (fee simulation, estimateGas) into 30s timeouts. Key the in-flight execution
-        // by (stateRoot, to, calldata): identical inputs against the same verified
+        // by (block, to, calldata): identical inputs against the same verified
         // context compute the identical verified result, so duplicates can safely
         // share one execution — this changes scheduling, never verification. Each
         // waiter keeps its own 30s deadline; the entry is removed when the execution
         // completes so a later retry re-executes fresh.
-        // Key by (stateRoot, from, to, value, calldata): the sender and value are now
+        // Key by (block, from, to, value, calldata): the sender and value are now
         // part of the input — a transfer simulated by vitalik vs by the zero address
         // computes a DIFFERENT verified result, so they must not share an execution.
         // A transaction object's gas and fees are part of the input too: a call with
         // a 100k limit must never share (or replay) the answer of one run with 30 M.
-        String flightKey = callFlightKey(h, from, to, value, data)
+        String flightKey = callFlightKey(h.blockCtx(), from, to, value, data)
                 + (txObject ? ":" + (gasLimit == null ? "-" : Long.toHexString(gasLimit))
                         + ":" + (feeCap == null ? "-" : feeCap.toString(16))
                         + ":" + (tip == null ? "-" : tip.toString(16)) : "");
-        // Warm-result replay: a prior execution for this exact (root, target, calldata)
+        // Warm-result replay: a prior execution for this exact (block, target, calldata)
         // already produced a verified answer — possibly one whose original waiter timed
         // out but whose background leader finished and populated the cache. Replay it; the
-        // result is deterministic given the anchored stateRoot, so this skips the whole
+        // result is deterministic given the anchored block, so this skips the whole
         // EVM + snap-fetch round entirely (the retried-confirm-screen fast path).
         byte[] cached = callResultCache.get(flightKey, clock.elapsedMillis());
         if (cached != null) {
@@ -2454,21 +2457,58 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         return null;
     }
 
-    /** In-flight eth_call executions keyed by (stateRoot, to, keccak(calldata)) so
-     *  concurrent identical calls share ONE EVM execution + snap fetch wave. Entries
+    /** In-flight eth_call executions keyed by {@link #callFlightKey} (the block, sender,
+     *  target, value and calldata, plus a transaction object's gas and fees) so concurrent
+     *  identical calls share ONE EVM execution + snap fetch wave. Entries
      *  remove themselves on completion (see rpcCall); bounded by the number of
      *  distinct concurrent calls a wallet makes (~tens). */
     private final Map<String, CompletableFuture<byte[]>> inflightCalls =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** The eth_call dedup/replay key: (stateRoot, from, to, value, keccak(calldata)).
-     *  Shared by the wallet path ({@code rpcCall}) and the replay-warm
-     *  ({@link #replayHotCalls}) so a warmed result is found by the wallet's
+    /** The block an execution ran in, as the leading part of a call or estimate cache
+     *  key: the state root and every block input the EVM reads. The state root alone does
+     *  not name a block: an answer also depends on the base fee (a fee cap is checked
+     *  against it, and {@code GASPRICE} reads the price it sets), the gas limit (the
+     *  estimate's ceiling), and {@code NUMBER}, {@code TIMESTAMP}, {@code COINBASE},
+     *  {@code PREVRANDAO} and {@code CHAINID}. Two blocks of a post-Cancun chain never share
+     *  a root, since every block writes its beacon root (EIP-4788), but the key does not
+     *  rest on that. Package-private for its test. */
+    static String blockKey(io.myotis.evm.BlockContext c) {
+        return Bytes.wrap(c.stateRoot()).toHexString()
+                + ":" + Long.toHexString(c.blockNumber())
+                + ":" + Long.toHexString(c.timestamp())
+                + ":" + (c.baseFeePerGas() == null ? "-" : c.baseFeePerGas().toString(16))
+                + ":" + Long.toHexString(c.gasLimit())
+                + ":" + Bytes.wrap(c.coinbase().toByteArray()).toHexString()
+                + ":" + Bytes.wrap(c.prevRandao()).toHexString()
+                + ":" + c.chainId().toString(16);
+    }
+
+    /** The eth_estimateGas replay key: the block ({@link #blockKey}) and every field that
+     *  shapes an estimate. Package-private for its test. */
+    static String estimateKey(io.myotis.evm.BlockContext block, byte[] from, byte[] to, byte[] data,
+                              java.math.BigInteger value, Long gasLimit,
+                              java.math.BigInteger feeCap, java.math.BigInteger tip) {
+        return blockKey(block)
+                + ":" + (from == null ? "0x" : Bytes.wrap(from).toHexString())
+                + ":" + Bytes.wrap(to).toHexString()
+                + ":" + (data == null || data.length == 0
+                        ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString())
+                + ":" + (value == null ? "0" : value.toString(16))
+                + ":" + (gasLimit == null ? "-" : Long.toHexString(gasLimit))
+                + ":" + (feeCap == null ? "-" : feeCap.toString(16))
+                + ":" + (tip == null ? "-" : tip.toString(16));
+    }
+
+    /** The eth_call dedup/replay key: (block, from, to, value, keccak(calldata)), the block
+     *  being {@link #blockKey}. Shared by the wallet path ({@code rpcCall}) and the
+     *  replay-warm ({@link #replayHotCalls}) so a warmed result is found by the wallet's
      *  identical call. Null and empty calldata key identically — they are the same
-     *  execution (callView substitutes an empty array for null). */
-    private String callFlightKey(RpcCallContext h, byte[] from, byte[] to,
-                                 java.math.BigInteger value, byte[] data) {
-        return Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
+     *  execution (callView substitutes an empty array for null). Package-private for its
+     *  test. */
+    static String callFlightKey(io.myotis.evm.BlockContext block, byte[] from, byte[] to,
+                                java.math.BigInteger value, byte[] data) {
+        return blockKey(block)
                 + ":" + (from == null ? "0x0" : Bytes.wrap(from).toHexString())
                 + ":" + Bytes.wrap(to).toHexString()
                 + ":" + (value == null ? "0" : value.toString())
@@ -2507,7 +2547,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 byte[] from = c.from();
                 byte[] to = c.to();
                 byte[] data = c.data();
-                flightKey = callFlightKey(ctx, from, to, c.value(), data);
+                flightKey = callFlightKey(ctx.blockCtx(), from, to, c.value(), data);
                 if (callResultCache.get(flightKey, clock.elapsedMillis()) != null) {
                     continue;   // already warm at this root
                 }
@@ -4163,20 +4203,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (from != null && from.length != 20) return io.myotis.api.EstimateResult.unavailable("malformed from");
         RpcCallContext h = verifiedHeadFor(block);
         if (h == null) return io.myotis.api.EstimateResult.unavailable("no verified head for block " + block);
-        // Replay a verified estimate for this exact (root, from, to, data, value, gas,
-        // fees): an estimate is deterministic given the anchored state and every field
+        // Replay a verified estimate for this exact (block, from, to, data, value, gas,
+        // fees): an estimate is deterministic given the anchored block and every field
         // that shapes it, so a retried confirm screen hitting the same pinned head skips
         // the EVM run entirely. A field left out of the key would replay one request's
         // answer for another.
-        String estKey = Bytes.wrap(h.blockCtx().stateRoot()).toHexString()
-                + ":" + (from == null ? "0x" : Bytes.wrap(from).toHexString())
-                + ":" + Bytes.wrap(to).toHexString()
-                + ":" + (data == null || data.length == 0
-                        ? "0x" : Hash.keccak256(Bytes.wrap(data)).toHexString())
-                + ":" + (value == null ? "0" : value.toString(16))
-                + ":" + (gasLimit == null ? "-" : Long.toHexString(gasLimit))
-                + ":" + (feeCap == null ? "-" : feeCap.toString(16))
-                + ":" + (tip == null ? "-" : tip.toString(16));
+        String estKey = estimateKey(h.blockCtx(), from, to, data, value, gasLimit, feeCap, tip);
         Long cachedGas = estimateCache.get(estKey, clock.elapsedMillis());
         if (cachedGas != null) return io.myotis.api.EstimateResult.ok(cachedGas);
         try {

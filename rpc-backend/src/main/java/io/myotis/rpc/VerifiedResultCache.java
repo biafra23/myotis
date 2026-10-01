@@ -5,20 +5,24 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * A bounded, TTL'd cache of verified RPC results keyed by a string that PINS the anchored
- * state — e.g. {@code stateRoot:to:keccak(calldata)} for eth_call, or
- * {@code stateRoot:from:to:keccak(data):value} for estimateGas.
+ * A bounded, TTL'd cache of verified RPC results keyed by a string that PINS the block the
+ * result was computed in — e.g. {@code block:from:to:value:keccak(calldata)} for eth_call
+ * (plus gas and fees for a transaction object), or {@code block:from:to:keccak(data):value:gas:fees}
+ * for estimateGas, where {@code block} is the state root and every block input the EVM reads
+ * ({@code VerifiedRpcBackend.blockKey}).
  *
  * <p>Why this is safe to cache at all: the keyed result is a pure function of the anchored
- * {@code stateRoot}. Once a tuple has been executed-and-verified against that root the
- * answer is bit-identical on every replay, so reuse is a scheduling optimization, never a
- * trust relaxation — the caller only inserts values it has already proof-verified against
- * the root named in the key. A SNAP-proven value does not "expire"; it stays a valid
- * statement about that block forever. The {@code ttlMs} here therefore bounds STALENESS and
- * memory, not correctness: it mirrors how long the underlying head context itself stays
- * servable, so a retried confirm screen that still resolves to the same pinned head finds
- * its answer warm while a "latest" read that has since rolled to a new root simply computes
- * a new key and misses (then recomputes against fresh state).
+ * block — its {@code stateRoot} and its EVM inputs (number, timestamp, base fee, gas limit,
+ * coinbase, prevRandao, chain id). The root alone is not enough: a fee cap is checked against
+ * the base fee, and the block opcodes read the rest. Once a tuple has been
+ * executed-and-verified in that block the answer is bit-identical on every replay, so reuse
+ * is a scheduling optimization, never a trust relaxation — the caller only inserts values it
+ * has already proof-verified against the root named in the key. A SNAP-proven value does not
+ * "expire"; it stays a valid statement about that block forever. The {@code ttlMs} here
+ * therefore bounds STALENESS and memory, not correctness: it mirrors how long the underlying
+ * head context itself stays servable, so a retried confirm screen that still resolves to the
+ * same pinned head finds its answer warm while a "latest" read that has since rolled to a new
+ * block simply computes a new key and misses (then recomputes against fresh state).
  *
  * <p>Eviction is twofold: an LRU bound ({@code maxEntries}) caps memory under a confirm
  * screen's hundreds of distinct calls, and a per-entry TTL drops stale answers — expired
