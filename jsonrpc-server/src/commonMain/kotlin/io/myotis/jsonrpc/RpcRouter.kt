@@ -206,25 +206,13 @@ class RpcRouter(
                 return EstimateTx.Refuse("invalid transaction object: ${parsed.why}")
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
-        val block = when (val selector = estimateBlock(root.params()?.getOrNull(1))) {
-            is EstimateBlock.Refuse -> return EstimateTx.Refuse(selector.why)
-            is EstimateBlock.At -> selector.block
+        val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_estimateGas")) {
+            is TxBlock.Refuse -> return EstimateTx.Refuse(selector.why)
+            is TxBlock.At -> selector.block
         }
+        unservableTx(tx, "eth_estimateGas", "an estimate without it would be for a different transaction")
+            ?.let { return EstimateTx.Refuse(it) }
         val be = backend ?: return EstimateTx.Serve(tx, block)
-        tx.chainId?.let { requested ->
-            if (requested != be.chainId().toString()) {
-                return EstimateTx.Refuse(
-                    "invalid transaction object: chainId $requested does not match this node's chain (${be.chainId()})",
-                )
-            }
-        }
-        if ((tx.hasAuthorizationList || tx.hasAccessList) && !be.supportsTransactionLists()) {
-            val field = if (tx.hasAuthorizationList) "an authorizationList (EIP-7702)" else "an accessList"
-            return EstimateTx.Refuse(
-                "eth_estimateGas with $field is not supported by this node's engine (the field was " +
-                    "rejected, not ignored — an estimate without it would be for a different transaction)",
-            )
-        }
         if (tx.to == null && !be.supportsContractCreation()) {
             return EstimateTx.Refuse(
                 "eth_estimateGas without a 'to' (contract creation) is not supported by this node's engine",
@@ -233,69 +221,97 @@ class RpcRouter(
         return EstimateTx.Serve(tx, block)
     }
 
-    /** eth_estimateGas's block selector: one to pass on, or why not. */
-    private sealed interface EstimateBlock {
-        class At(val block: String) : EstimateBlock
-        class Refuse(val why: String) : EstimateBlock
+    /** What an `eth_call` request asks of this node (#509), as [EstimateTx] for
+     *  `eth_estimateGas`: the transaction object to [CallTx.Serve] — through the
+     *  engine's transaction-object call when it carries anything beyond
+     *  from/to/data/value, the plain call otherwise — or why it can never be
+     *  served here ([CallTx.Refuse], answered -32602). ONE derivation for the
+     *  handler and the strict branch. */
+    private sealed interface CallTx {
+        class Serve(val tx: RpcTransactionArgs, val block: String) : CallTx
+        class Refuse(val why: String) : CallTx
     }
 
-    /** eth_estimateGas's block selector (`params[1]`), applied or refused —
-     *  never silently read as the head: absent/null is `latest`; a tag or a
-     *  0x-hex number passes on to the engine, which applies it; EIP-1898's
+    private fun callTx(root: JsonObject): CallTx {
+        val callObj = root.params()?.getOrNull(0) as? JsonObject
+            ?: return CallTx.Refuse("eth_call expects a transaction object as its first parameter")
+        val tx = when (val parsed = RpcTransactionArgs.parse(callObj)) {
+            is RpcTransactionArgs.Parsed.Invalid -> return CallTx.Refuse("invalid transaction object: ${parsed.why}")
+            is RpcTransactionArgs.Parsed.Valid -> parsed.tx
+        }
+        val block = when (val param = root.params()?.getOrNull(1)) {
+            // A string selector passes on as it always has — the engine applies
+            // it or refuses it, bare digits read as decimal (#366).
+            null, is JsonPrimitive -> (param as? JsonPrimitive)?.contentOrNull ?: "latest"
+            // EIP-1898's object form is applied or refused as for
+            // eth_estimateGas — never read as the head.
+            else -> when (val selector = txBlock(param, "eth_call")) {
+                is TxBlock.Refuse -> return CallTx.Refuse(selector.why)
+                is TxBlock.At -> selector.block
+            }
+        }
+        unservableTx(tx, "eth_call", "the call would run without it")?.let { return CallTx.Refuse(it) }
+        return CallTx.Serve(tx, block)
+    }
+
+    /** What this node's engine cannot apply of [tx] for [method] — a `chainId`
+     *  for another chain, a list the engine does not apply — as the -32602
+     *  reason, or null. [without] says what answering anyway would mean. ONE
+     *  copy for eth_call and eth_estimateGas, so neither can drop what the
+     *  other refuses. */
+    private fun unservableTx(tx: RpcTransactionArgs, method: String, without: String): String? {
+        val be = backend ?: return null
+        tx.chainId?.let { requested ->
+            if (requested != be.chainId().toString()) {
+                return "invalid transaction object: chainId $requested does not match this node's chain (${be.chainId()})"
+            }
+        }
+        if ((tx.hasAuthorizationList || tx.hasAccessList) && !be.supportsTransactionLists()) {
+            val field = if (tx.hasAuthorizationList) "an authorizationList (EIP-7702)" else "an accessList"
+            return "$method with $field is not supported by this node's engine (the field was rejected, not " +
+                "ignored — $without)"
+        }
+        return null
+    }
+
+    /** A transaction method's block selector: one to pass on, or why not. */
+    private sealed interface TxBlock {
+        class At(val block: String) : TxBlock
+        class Refuse(val why: String) : TxBlock
+    }
+
+    /** [method]'s block selector (`params[1]`), applied or refused — never
+     *  silently read as the head: absent/null is `latest`; a tag or a 0x-hex
+     *  number passes on to the engine, which applies it; EIP-1898's
      *  `{"blockNumber": …}` is that number; `earliest`, a block hash (bare or
      *  `{"blockHash": …}`) and anything else are refused — this node holds no
-     *  historical state to run against. */
-    private fun estimateBlock(param: JsonElement?): EstimateBlock {
+     *  historical state to run against. eth_estimateGas reads every selector
+     *  through it, eth_call its object form. */
+    private fun txBlock(param: JsonElement?, method: String): TxBlock {
         val noHistory = "(this node holds no historical state)"
         val selector = when (param) {
-            null, is JsonNull -> return EstimateBlock.At("latest")
+            null, is JsonNull -> return TxBlock.At("latest")
             is JsonObject -> {
                 if (param["blockHash"] != null) {
-                    return EstimateBlock.Refuse("eth_estimateGas at a block hash is not supported $noHistory")
+                    return TxBlock.Refuse("$method at a block hash is not supported $noHistory")
                 }
                 (param["blockNumber"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
-                    ?: return EstimateBlock.Refuse(
+                    ?: return TxBlock.Refuse(
                         "invalid block selector: expected a tag, a 0x-hex number or {\"blockNumber\": …}",
                     )
             }
             is JsonPrimitive -> param.takeIf { it.isString }?.contentOrNull
-                ?: return EstimateBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
-            else -> return EstimateBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
+                ?: return TxBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
+            else -> return TxBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
         }.trim().ifEmpty { "latest" }
         return when {
-            selector == "earliest" -> EstimateBlock.Refuse("eth_estimateGas at 'earliest' is not supported $noHistory")
-            !specShapedSelector(selector) -> EstimateBlock.Refuse("invalid block selector '$selector'")
+            selector == "earliest" -> TxBlock.Refuse("$method at 'earliest' is not supported $noHistory")
+            !specShapedSelector(selector) -> TxBlock.Refuse("invalid block selector '$selector'")
             // Past 16 hex digits it is a hash, not a number.
             selector.length > 18 && selector.startsWith("0x", ignoreCase = true) ->
-                EstimateBlock.Refuse("eth_estimateGas at a block hash is not supported $noHistory")
-            else -> EstimateBlock.At(selector)
+                TxBlock.Refuse("$method at a block hash is not supported $noHistory")
+            else -> TxBlock.At(selector)
         }
-    }
-
-    /** A field of an `eth_call` transaction object that this node does not
-     *  apply to calls yet, as the -32602 reason — or null (#509). An
-     *  `authorizationList` rewrites the code the call runs; blob hashes are what
-     *  BLOBHASH reads; a `data` and an `input` that differ name two different
-     *  calls. Answering without them would answer a different question. (The
-     *  rest of the object — gas, fees, access list — is eth_estimateGas's today.) */
-    private fun ethCallUnappliedField(callObj: JsonObject): String? {
-        fun present(k: String) = callObj[k]?.let { it !is JsonNull && !(it is JsonArray && it.isEmpty()) } == true
-        if (present("authorizationList")) {
-            return "eth_call with an authorizationList (EIP-7702) is not supported by this node (the " +
-                "field was rejected, not ignored — the call would run without the delegations)"
-        }
-        listOf("blobVersionedHashes", "maxFeePerBlobGas", "blobs", "commitments", "proofs", "sidecar")
-            .firstOrNull { present(it) }
-            ?.let { return "eth_call with blob fields ('$it') is not supported by this node" }
-        val data = callObj["data"]?.takeUnless { it is JsonNull }
-        val input = callObj["input"]?.takeUnless { it is JsonNull }
-        if (data != null && input != null) {
-            // Malformed first: two identical bad strings are not "not equal".
-            val d = data.asHexBytes() ?: return "'data' is not hex data"
-            val i = input.asHexBytes() ?: return "'input' is not hex data"
-            if (!d.contentEquals(i)) return "both 'data' and 'input' are set and not equal; use 'input'"
-        }
-        return null
     }
 
     /** The methods that take override parameters. `eth_call` and
@@ -505,10 +521,9 @@ class RpcRouter(
                 }
             }
             if (m == "eth_call") {
-                val callObj = root.params()?.getOrNull(0) as? JsonObject
-                callObj?.let { ethCallUnappliedField(it) }?.let { why ->
+                (callTx(root) as? CallTx.Refuse)?.let { refusal ->
                     logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
-                    return errorEnvelope(id, -32602, why)
+                    return errorEnvelope(id, -32602, refusal.why)
                 }
             }
             // Contract creation this build cannot serve is permanent, not retryable.
@@ -675,7 +690,6 @@ class RpcRouter(
                 ?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 
             "eth_call" -> {
-                val p = root.params()
                 // An override the ENGINE can apply is served (and labelled
                 // SIMULATED below); one it cannot is `null` here — the file's
                 // existing "can't serve this verified" signal — so a dev proxy
@@ -690,44 +704,38 @@ class RpcRouter(
                 if (blockOverridePresent(root)) return null
                 if (stateOverrideParam(root) is OverrideParam.Malformed) return null
                 val overrideJson = stateOverrideJson(root)
-                val callObj = p?.getOrNull(0) as? JsonObject ?: return null
-                // A field eth_call does not apply is refused, not dropped (#509).
-                if (ethCallUnappliedField(callObj) != null) return null
+                // The whole transaction object (#509): every field is applied or
+                // the request is refused, and a refusal is `null` here so a dev
+                // proxy still gets its chance and strict mode names it ([callTx],
+                // the one source of truth for both).
+                val serve = callTx(root) as? CallTx.Serve ?: return null
+                val tx = serve.tx
                 // `to` absent or null is CONTRACT CREATION — the calldata is init
                 // code and its return data is the answer (the deployless Deploy
-                // form). Present-but-malformed is still a refusal.
-                val toElement = callObj["to"]?.takeUnless { it is JsonNull }
-                val to = if (toElement != null) (toElement.asHexBytes() ?: return null) else null
+                // form).
+                val to = tx.to
                 // Ask BEFORE dispatching. On an engine that can't serve creation
                 // (the Java engine is still the default) the call would wake a
                 // paused stack, wait for a verified head, and refuse anyway —
                 // an expensive refusal where there used to be a free one, and
                 // reported as retryable though it is permanent for that build.
                 if (to == null && backend?.supportsContractCreation() != true) return null
-                // The caller (msg.sender). Absent/null -> anonymous (backend uses the
-                // zero-address default); present-but-malformed -> proxy. Threading this
-                // is what lets a wallet's confirm-screen simulation of a sender-gated
-                // call (ERC-20 transfer/approve, …) run as the real `from` instead of
-                // reverting "transfer from the zero address".
-                val from = (callObj["from"]?.takeUnless { it is JsonNull })?.let { it.asHexBytes() ?: return null }
-                // Absent/null calldata -> empty; present-but-malformed -> proxy
-                // (don't silently run the call with empty calldata). Each key's
-                // JSON null is absent on its own — `"data": null` must not hide the
-                // calldata in `input` (a differing pair is refused above).
-                val dataElement = callObj["input"]?.takeUnless { it is JsonNull }
-                    ?: callObj["data"]?.takeUnless { it is JsonNull }
-                val data = if (dataElement != null) (dataElement.asHexBytes() ?: return null) else ByteArray(0)
-                // Optional call value (wei) — QUANTITY, unsigned <=256-bit; malformed /
-                // negative / out-of-range -> proxy (a negative would throw in Wei.of).
-                val valueElement = callObj["value"]?.takeUnless { it is JsonNull }
-                val value = if (valueElement != null) {
-                    val s = (valueElement as? JsonPrimitive)?.contentOrNull ?: return null
-                    parseWeiQuantity(s) ?: return null
-                } else null
-                val block = p.blockTag(1)
-                // VerifiedReads takes wei as a decimal string (FFI-neutral boundary).
+                // The caller (msg.sender): absent/null is anonymous (the backend uses
+                // the zero-address default). Threading it is what lets a wallet's
+                // confirm-screen simulation of a sender-gated call (ERC-20
+                // transfer/approve, …) run as the real `from` instead of reverting
+                // "transfer from the zero address". The calldata is `input`, else
+                // `data` (the parser refused a differing pair), and the value is
+                // decimal wei — the FFI-neutral boundary.
                 val outcome = withContext(rpcIoDispatcher) {
-                    b.callDetailed(from, to, data, value, block, overrideJson)
+                    if (tx.hasExtendedFields) {
+                        // Gas, fees or lists: only the transaction-object call
+                        // applies them.
+                        b.callTx(tx, serve.block, overrideJson)
+                    } else {
+                        // Nothing beyond from/to/data/value: the plain call, as always.
+                        b.callDetailed(tx.from, to, tx.data, tx.valueWei, serve.block, overrideJson)
+                    }
                 }
                 when (outcome.kind) {
                     RpcCallResult.Kind.OK ->
@@ -746,8 +754,10 @@ class RpcRouter(
                     RpcCallResult.Kind.UNAVAILABLE -> return null
                     // Never answerable on this build: permanent -32602 (handleOne).
                     RpcCallResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
-                    // An estimate-only outcome; no call result carries it.
-                    RpcCallResult.Kind.INFEASIBLE -> return null
+                    // An answer (#509): the call cannot succeed within the caller's
+                    // gas, fee cap or funds. Served exactly as geth serves it —
+                    // -32000 with geth's message — never as return data.
+                    RpcCallResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
                 }
             }
             "eth_getBalance" -> {
@@ -1148,12 +1158,6 @@ class RpcRouter(
     /** QUANTITY encode a decimal wei string (the FFI-neutral form the backend returns for
      *  balances/fees). */
     private fun hexQuantityDecimal(decimal: String): String = RpcQuantities.hexQuantityDecimal(decimal)
-
-    /** Parse a JSON-RPC QUANTITY (hex `0x…` or decimal) as a wei value, enforcing EVM
-     *  semantics: unsigned and <= 256 bits. Returns the normalized DECIMAL string (the
-     *  backend seam's wei form), or null for malformed / negative / out-of-range input.
-     *  Shared by eth_call and eth_estimateGas so both apply identical value validation. */
-    private fun parseWeiQuantity(s: String): String? = RpcQuantities.parseWeiQuantity(s)
 
     /** Ethereum JSON-RPC DATA encoding: 0x-prefixed, every byte rendered (leading
      *  zeros kept). Allocation-free — eth_getCode returns up to ~24KB of bytecode,

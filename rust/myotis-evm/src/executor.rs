@@ -83,13 +83,22 @@ fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
 /// before Amsterdam (EIP-2780), so the short-circuit stops at that fork.
 const PLAIN_TRANSFER_GAS: u64 = 21_000;
 
+/// The gas a value-bearing CALL hands its callee on top (`params.CallStipend`):
+/// geth's first probe adds it to what the run drew.
+const CALL_STIPEND: u64 = 2_300;
+
+/// How close to the lowest working limit the estimate's search stops, as
+/// `(numerator, denominator)`: geth's `estimateGasErrorRatio`, 1.5%. The 1.15
+/// buffer on top dwarfs it.
+const ESTIMATE_ERROR_RATIO: (u128, u128) = (15, 1_000);
+
 /// Precompiles are CODELESS in state yet execute logic — an empty-calldata
 /// call to one still charges its base gas, so the 21000 short-circuit must
 /// not claim it. Conservatively covers 0x…0001 ..= 0x…01ff (mainnet uses
 /// 0x01..0x11 through Prague, 0x100 = P256VERIFY since Osaka; the headroom
 /// absorbs future assignments — a stray fall-through only costs a full
-/// estimate run). NOTE: the Java engine's rpcEstimateGas short-circuits these
-/// today (same under-estimate) — flagged for the same fix there.
+/// estimate run). The Java backend's short-circuit guards the same range
+/// (`VerifiedRpcBackend.inPrecompileRange`).
 fn in_precompile_range(addr: &[u8; 20]) -> bool {
     addr[..18].iter().all(|&b| b == 0) && {
         let low = u16::from_be_bytes([addr[18], addr[19]]);
@@ -218,15 +227,18 @@ impl EvmExecutor {
     /// [`crate::tx`] — or the request is refused ([`EvmError::InvalidRequest`]),
     /// and `overrides` are layered over verified state for this run only.
     ///
-    /// The answer never exceeds the ceiling the caller allowed (its `gas`, what
-    /// its fee cap can pay for, and [`VIEW_CALL_GAS`]); a transaction that does
-    /// not succeed within it is [`EvmError::GasAllowanceExceeded`], geth's answer.
-    /// A revert yields no number either: its typed payload survives to the
-    /// host, which serves it as the standard JSON-RPC code-3 error.
+    /// The answer never exceeds the ceiling the caller allowed (its `gas` —
+    /// without one, the block's gas limit — what its fee cap can pay for, and
+    /// [`VIEW_CALL_GAS`]); a transaction that does not succeed within it is
+    /// [`EvmError::GasAllowanceExceeded`], geth's answer. A revert yields no
+    /// number either: its typed payload survives to the host, which serves it
+    /// as the standard JSON-RPC code-3 error.
     ///
-    /// ONE metered run at the ceiling, answered with the 1.15 buffer over the
-    /// larger of the gross gas drawn and the EIP-7623 floor — not geth's binary
-    /// search for the lowest limit that succeeds.
+    /// The number is geth's search for the lowest gas limit at which the
+    /// transaction succeeds ([`Self::lowest_working_limit`]) with the 1.15
+    /// buffer on top: a single run's gas draw is not a limit that works when
+    /// a nested call withholds 1/64 of its gas at every level or a contract
+    /// checks `gasleft()`.
     pub fn estimate_tx(
         &self,
         tx: &TxRequest,
@@ -239,37 +251,31 @@ impl EvmExecutor {
         // including the 21000 short-circuit below, which must never answer for
         // a context the executor wouldn't execute.
         let spec = spec_for_context(ctx)?;
-        tx.validate().map_err(|detail| EvmError::InvalidRequest { detail })?;
-        if let Some(chain_id) = tx.chain_id {
-            if chain_id != U256::from(ctx.chain_id) {
-                return Err(EvmError::InvalidRequest {
-                    detail: format!(
-                        "chainId {chain_id} does not match this node's chain ({})",
-                        ctx.chain_id
-                    ),
-                });
-            }
-        }
-        if tx.tx_type() == TYPE_SET_CODE && !spec.is_enabled_in(SpecId::PRAGUE) {
-            return Err(EvmError::InvalidRequest {
-                detail: "EIP-7702 transactions are not valid before Prague".into(),
-            });
-        }
+        check_tx(tx, ctx, spec)?;
         let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
+        // The checks and the short-circuit below read the sender's balance and
+        // the target's code, and the run reads both: one parallel wave.
+        self.prefetch_wave(
+            ctx,
+            &AccessSet { accounts: std::iter::once(tx.from).chain(tx.to).collect(), ..Default::default() },
+        );
 
         // The ceiling (geth's `hi`): the executor's budget, lowered by the
-        // caller's `gas` — below 21000 geth reads it as no limit, and so do we
-        // — and, under a fee cap, by what the sender can pay for.
+        // caller's `gas` — below 21000 geth reads it as no limit, and so do we;
+        // without one, geth starts from the block's gas limit, since no block
+        // holds more — and, under a fee cap, by what the sender can pay for.
         let mut hi = VIEW_CALL_GAS;
+        match tx.gas.filter(|g| *g >= PLAIN_TRANSFER_GAS) {
+            Some(gas) => hi = hi.min(gas),
+            None if ctx.gas_limit > 0 => hi = hi.min(ctx.gas_limit),
+            None => {}
+        }
         // EIP-7825 (Osaka): no transaction may carry more than 2^24 gas, so an
         // answer above it is a limit the network rejects; geth caps `hi` the
         // same way. (Amsterdam's EIP-8037 state-gas reservoir lifts the cap on
         // the total limit — revm skips the check there too.)
         if spec.is_enabled_in(SpecId::OSAKA) && !spec.is_enabled_in(SpecId::AMSTERDAM) {
             hi = hi.min(TX_GAS_LIMIT_CAP);
-        }
-        if let Some(gas) = tx.gas.filter(|g| *g >= PLAIN_TRANSFER_GAS) {
-            hi = hi.min(gas);
         }
         let fee_cap = tx.fees.fee_cap();
         if fee_cap > 0 {
@@ -289,6 +295,17 @@ impl EvmExecutor {
             // this bound, and there it reads as the caller's allowance anyway.
             hi = hi.min(u64::try_from(u128::MAX / fee_cap).unwrap_or(u64::MAX));
         }
+        // geth checks the fee cap against the base fee when it first RUNS the
+        // transaction, so after the affordability checks above and before the
+        // 21000 short-circuit below (which geth answers by running it too) —
+        // and its estimator reports that run's refusal with the ceiling it ran at.
+        check_fee_cap(tx, ctx).map_err(|error| EvmError::FailedWithGas { gas: hi, error: Box::new(error) })?;
+        // Then its buyGas at the ceiling. Under a fee cap the ceiling already
+        // fits the balance; without one geth still holds the sender to the value
+        // it moves, and reports that run's refusal the same way.
+        if let Some(short) = buy_gas_shortfall(&db, tx, hi)? {
+            return Err(EvmError::FailedWithGas { gas: hi, error: Box::new(short) });
+        }
 
         // Java `rpcEstimateGas` parity: a plain transfer (empty calldata) to a
         // CODELESS account costs exactly 21000 — no EVM run and NO 1.15 buffer
@@ -301,8 +318,8 @@ impl EvmExecutor {
         // The flat 21000 is exact only BEFORE Amsterdam: EIP-2780 decomposes it
         // (sender base + recipient access + a value charge), and a value transfer
         // to an EMPTY account also pays EIP-8037 account-creation state gas — an
-        // order of magnitude more than 21000. From AMSTERDAM the metered run below
-        // prices it instead (buffered, like every metered estimate).
+        // order of magnitude more than 21000. From AMSTERDAM the search below
+        // prices it instead (buffered, like every estimate).
         if let Some(target) = tx.to {
             if tx.data.is_empty()
                 && !tx.has_lists()
@@ -319,17 +336,24 @@ impl EvmExecutor {
                 }
             }
         }
-        match self.execute_with_db(&db, spec, tx, hi, ctx)? {
+        let run = self.execute_with_db(&db, spec, tx, hi, ctx).map_err(|e| match e {
+            // The intrinsic cost or the EIP-7623 floor above the ceiling: for an
+            // estimate that is the caller's allowance talking, exactly like
+            // running out of gas during execution — geth answers the same.
+            EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. } => {
+                EvmError::GasAllowanceExceeded { allowance: hi }
+            }
+            other => other,
+        })?;
+        match run {
             ExecutionResult::Success { gas, .. } => {
-                // The gas-limit base must cover BOTH the gross execution draw
-                // (`total_gas_spent`, before the EIP-3529 refund — so the run never
-                // OOGs mid-execution) AND the EIP-7623 calldata floor (`tx_gas_used`
-                // = max(spent−refund, floor_gas) — the minimum a Prague+ tx is
-                // charged). `max(total_gas_spent, tx_gas_used)` == `max(gross, floor)`.
-                // Never above the ceiling: the run just succeeded AT it, so the
-                // ceiling is itself a limit that works — geth's invariant.
-                let base = gas.total_gas_spent().max(gas.tx_gas_used());
-                Ok(with_estimate_buffer(base).min(hi))
+                // geth's search, from the most the run at the ceiling drew
+                // (max(gross, floor), its `MaxUsedGas`). Never above the ceiling:
+                // the run just succeeded AT it, so the ceiling is itself a limit
+                // that works — geth's invariant.
+                let drawn = gas.total_gas_spent().max(gas.tx_gas_used());
+                let lowest = self.lowest_working_limit(&db, spec, tx, ctx, drawn, hi)?;
+                Ok(with_estimate_buffer(lowest).min(hi))
             }
             ExecutionResult::Revert { output, .. } => {
                 Err(EvmError::Reverted { data: output.to_vec() })
@@ -339,6 +363,181 @@ impl EvmExecutor {
                 Err(EvmError::GasAllowanceExceeded { allowance: hi })
             }
             ExecutionResult::Halt { reason, .. } => Err(map_halt(reason)),
+        }
+    }
+
+    /// geth's estimator search (`eth/gasestimator`) for the lowest gas limit
+    /// at which `tx` succeeds, given a run at `hi` that succeeded having drawn
+    /// `drawn`: a first probe tries what it drew plus the call stipend with
+    /// the 63/64 a nested call withholds — usually the answer — and bisection,
+    /// skewed low, stops within [`ESTIMATE_ERROR_RATIO`] of it. A probe that
+    /// fails for any reason (out of gas, a revert, a halt, a limit below the
+    /// intrinsic cost or the floor) raises the limit; an error reading state
+    /// ends the search with it.
+    ///
+    /// One deliberate difference: geth searches down to what the run was
+    /// charged (after refunds), where this search stops at what it drew. Below
+    /// that a limit can only "work" by running a different transaction — a
+    /// failure caught deep inside (try/catch, a multicall that tolerates one),
+    /// a `gasleft()` branch — which is not the one the caller simulated.
+    ///
+    /// What that bound buys, exactly: a probe cannot tell a caught failure
+    /// from success, so above the draw the search still finds the lowest limit
+    /// at which the OUTER transaction succeeds. A call whose failure is caught
+    /// d levels down needs (64/63)^d of what it drew; the 1.15 buffer covers
+    /// that through d = 8, not from d = 9 on.
+    fn lowest_working_limit(
+        &self,
+        db: &OracleDatabase,
+        spec: SpecId,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        drawn: u64,
+        mut hi: u64,
+    ) -> Result<u64, EvmError> {
+        let mut lo = drawn.saturating_sub(1);
+        let optimistic = (drawn + CALL_STIPEND) * 64 / 63;
+        if optimistic < hi {
+            if self.succeeds_with(db, spec, tx, ctx, optimistic)? {
+                hi = optimistic;
+            } else {
+                lo = optimistic;
+            }
+        }
+        while lo + 1 < hi {
+            // Within the error ratio of the answer: a wallet bumps the limit
+            // anyway, and every probe is a full run.
+            let (num, den) = ESTIMATE_ERROR_RATIO;
+            if u128::from(hi - lo) * den < u128::from(hi) * num {
+                break;
+            }
+            // Skewed low: most transactions need little more than they drew.
+            let mid = ((hi + lo) / 2).min(lo.saturating_mul(2));
+            if self.succeeds_with(db, spec, tx, ctx, mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(hi)
+    }
+
+    /// Whether `tx` succeeds with `gas_limit` — one probe of
+    /// [`Self::lowest_working_limit`].
+    fn succeeds_with(
+        &self,
+        db: &OracleDatabase,
+        spec: SpecId,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        gas_limit: u64,
+    ) -> Result<bool, EvmError> {
+        match self.execute_with_db(db, spec, tx, gas_limit, ctx) {
+            Ok(ExecutionResult::Success { .. }) => Ok(true),
+            Ok(_) => Ok(false),
+            // geth's estimator raises the limit on these, it does not bail out.
+            Err(EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `eth_call` for a full transaction object (#509): every field the request
+    /// names is applied, as [`Self::estimate_tx`] applies it — authorization
+    /// list, access list, gas, fees, nonce, type — or the request is refused
+    /// ([`EvmError::InvalidRequest`]); `overrides` are layered over verified
+    /// state for this call only. Semantics are geth's `eth_call`:
+    ///
+    /// - `gas` is the call's gas limit, capped at [`VIEW_CALL_GAS`] as geth caps
+    ///   it at its RPC gas cap; absent, the call gets the whole budget. A limit
+    ///   below the intrinsic cost or the EIP-7623 floor is geth's
+    ///   `intrinsic gas too low` / `insufficient gas for floor data gas cost`,
+    ///   and running out of a limit the caller set is its `out of gas`.
+    /// - A non-zero fee (a legacy `gasPrice`, or `maxFeePerGas`) must reach the
+    ///   block's base fee, and the run sees the sender debited `gas × effective
+    ///   price` and GASPRICE reading that price.
+    /// - Fee or not, the sender must hold `gas × fee cap + value` (geth's
+    ///   `buyGas`): a call moving more than the sender holds is refused as the
+    ///   chain would refuse it, never run against a balance it does not have.
+    ///
+    /// Those answers are [`EvmError::is_infeasible`]: geth's message, never
+    /// return data — a check failed before the run wrapped as geth's `eth_call`
+    /// wraps it ([`EvmError::CallFailed`]).
+    pub fn call_tx(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<Vec<u8>, EvmError> {
+        self.call_tx_capped(tx, ctx, overrides, PREFETCH_ITERATION_CAP)
+    }
+
+    /// Run `tx` once at `gas_limit` as a block would include it and return
+    /// revm's whole result, logs included. Test tooling for recorded-world
+    /// replays (the `fixture` feature): it skips the call path's checks, and
+    /// nothing a wallet sees answers from it.
+    #[cfg(any(test, feature = "fixture"))]
+    pub fn run_tx(
+        &self,
+        tx: &TxRequest,
+        gas_limit: u64,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<ExecutionResult, EvmError> {
+        let spec = spec_for_context(ctx)?;
+        let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
+        self.execute_with_db(&db, spec, tx, gas_limit, ctx)
+    }
+
+    fn call_tx_capped(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+        cap: usize,
+    ) -> Result<Vec<u8>, EvmError> {
+        self.oracle.check_request()?;
+        let spec = spec_for_context(ctx)?;
+        check_tx(tx, ctx, spec)?;
+        // Refusals of the request itself first — a nonce contradicting the
+        // override included — exactly as for an estimate.
+        let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
+        let gas_limit = tx.gas.map_or(VIEW_CALL_GAS, |gas| gas.min(VIEW_CALL_GAS));
+        // Then geth's checks before the run, in its order, each reported with
+        // the limit it was made against — geth's `err: … (supplied gas N)`.
+        let supplied = |error: EvmError| EvmError::CallFailed { supplied_gas: gas_limit, error: Box::new(error) };
+        check_fee_cap(tx, ctx).map_err(supplied)?;
+        // geth's buyGas, fee or no fee. Checked here, not by revm: its own
+        // balance check would read a prefetch placeholder on a discovery pass,
+        // and here the read also primes the sender before the first pass.
+        if let Some(short) = buy_gas_shortfall(&db, tx, gas_limit)? {
+            return Err(supplied(short));
+        }
+        let fee_cap = tx.fees.fee_cap();
+        // revm prices the run as `gas × price` in u128 and `expect`s it not to
+        // overflow — with its own balance check off nothing else stops it, and
+        // a panic aborts the host. Only a balance overridden past 2^128 wei
+        // gets here with such a price: nothing on chain can pay it.
+        if u128::from(gas_limit).checked_mul(fee_cap).is_none() {
+            return Err(EvmError::InvalidRequest {
+                detail: format!("gas × fee cap ({gas_limit} × {fee_cap}) exceeds the 2^128 wei this engine can price"),
+            });
+        }
+        match self.run_converged(&db, spec, tx, gas_limit, ctx, cap) {
+            // Running dry is the caller's answer under a limit the caller set. A
+            // larger one was capped to the budget, so running dry there is
+            // refused rather than answered for a smaller limit. Without one it
+            // stays the ordinary out-of-gas at this executor's own budget.
+            Err(EvmError::OutOfGas) => Err(match tx.gas {
+                Some(gas) if gas <= VIEW_CALL_GAS => EvmError::CallOutOfGas,
+                Some(gas) => EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: gas },
+                None => EvmError::OutOfGas,
+            }),
+            // The intrinsic cost or the floor above the limit: checks before the
+            // run too, which revm makes.
+            Err(error @ (EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. })) => {
+                Err(supplied(error))
+            }
+            other => other,
         }
     }
 
@@ -435,12 +634,34 @@ impl EvmExecutor {
         // to run a helper contract they never deploy (Ambire's deployless Deploy
         // mode), which is the same job as a state override by another route.
         let tx = TxRequest::call(caller.into_array(), target, Bytes::copy_from_slice(calldata), value);
+        self.run_converged(&db, spec, &tx, VIEW_CALL_GAS, ctx, cap).map_err(|e| match e {
+            // Calldata that alone costs more than the budget: geth's answer for
+            // a call at its gas cap, worded as its eth_call words it.
+            error @ (EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. }) => {
+                EvmError::CallFailed { supplied_gas: VIEW_CALL_GAS, error: Box::new(error) }
+            }
+            other => other,
+        })
+    }
 
+    /// Run `tx` at `gas_limit` to convergence and return its output bytes
+    /// (revert/halt → `Err`): the loop behind every call entry point, over a
+    /// caller-built database (overrides and the sender's nonce already
+    /// layered in).
+    fn run_converged(
+        &self,
+        db: &OracleDatabase,
+        spec: SpecId,
+        tx: &TxRequest,
+        gas_limit: u64,
+        ctx: &BlockContext,
+        cap: usize,
+    ) -> Result<Vec<u8>, EvmError> {
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
         // code instead of a sentinel empty account.
         // A create has no target account to prime; its code is the calldata.
-        if let Some(to) = target {
+        if let Some(to) = tx.to {
             if let Some(acc) = db.basic_ref(Address::from(to))? {
                 db.code_by_hash_ref(acc.code_hash)?;
             }
@@ -456,7 +677,7 @@ impl EvmExecutor {
             let sentinel = discovering && iter + 2 < cap;
             db.set_sentinel(sentinel);
             let misses_before = db.sentinel_misses();
-            let outcome = self.execute_with_db(&db, spec, &tx, VIEW_CALL_GAS, ctx);
+            let outcome = self.execute_with_db(db, spec, tx, gas_limit, ctx);
             db.set_sentinel(false);
             let fresh = db.take_access_set().minus(&seen);
 
@@ -654,6 +875,62 @@ fn tx_env(tx: &TxRequest, gas_limit: u64, chain_id: u64) -> Result<TxEnv, EvmErr
         .map_err(|e| EvmError::InvalidRequest { detail: e.to_string() })
 }
 
+/// The request-level checks every transaction-object entry point shares, run
+/// before any state is read: the object must describe a transaction that could
+/// exist ([`TxRequest::validate`]), for this node's chain, of a type the
+/// block's fork knows.
+fn check_tx(tx: &TxRequest, ctx: &BlockContext, spec: SpecId) -> Result<(), EvmError> {
+    tx.validate().map_err(|detail| EvmError::InvalidRequest { detail })?;
+    if let Some(chain_id) = tx.chain_id {
+        if chain_id != U256::from(ctx.chain_id) {
+            return Err(EvmError::InvalidRequest {
+                detail: format!("chainId {chain_id} does not match this node's chain ({})", ctx.chain_id),
+            });
+        }
+    }
+    if tx.tx_type() == TYPE_SET_CODE && !spec.is_enabled_in(SpecId::PRAGUE) {
+        return Err(EvmError::InvalidRequest {
+            detail: "EIP-7702 transactions are not valid before Prague".into(),
+        });
+    }
+    Ok(())
+}
+
+/// A non-zero fee cap (a legacy gas price is its own cap) below the block's
+/// base fee names a transaction no block at that base fee includes: geth
+/// answers `max fee per gas less than block base fee` for a call and an
+/// estimate alike. No fee at all is the fee-less simulation geth exempts, and
+/// so do we (revm's own base-fee check stays off for it: `view_cfg`).
+fn check_fee_cap(tx: &TxRequest, ctx: &BlockContext) -> Result<(), EvmError> {
+    let fee_cap = tx.fees.fee_cap();
+    if fee_cap > 0 && fee_cap < u128::from(ctx.base_fee_per_gas) {
+        return Err(EvmError::FeeCapTooLow {
+            address: tx.from,
+            fee_cap,
+            base_fee: ctx.base_fee_per_gas,
+        });
+    }
+    Ok(())
+}
+
+/// geth's buyGas: the sender must hold `gas_limit × fee cap + value`, a sum
+/// that must fit 256 bits — the shortfall as geth's error, or `None`. The
+/// balance is the one the run will see (overrides included), and is not read
+/// when nothing is owed. ONE copy for a call and an estimate.
+fn buy_gas_shortfall(db: &OracleDatabase, tx: &TxRequest, gas_limit: u64) -> Result<Option<EvmError>, EvmError> {
+    let Some(want) = U256::from(gas_limit)
+        .checked_mul(U256::from(tx.fees.fee_cap()))
+        .and_then(|cost| cost.checked_add(tx.value))
+    else {
+        return Ok(Some(EvmError::RequiredBalanceOverflow { address: tx.from }));
+    };
+    if want.is_zero() {
+        return Ok(None);
+    }
+    let have = db.basic_ref(Address::from(tx.from))?.map_or(U256::ZERO, |a| a.balance);
+    Ok((have < want).then_some(EvmError::InsufficientFunds { address: tx.from, have, want }))
+}
+
 /// Layer the request's `nonce` over the sender's account, so the run sees the
 /// nonce the transaction will execute at: a self-sponsored EIP-7702
 /// authorization is checked against it + 1 (the sender's nonce is bumped
@@ -709,12 +986,14 @@ fn map_evm_error<E: DBErrorMarker + Into<EvmError> + std::fmt::Display>(
     match err {
         EVMError::Database(e) => e.into(),
         // The gas limit does not even cover the intrinsic cost (or the EIP-7623
-        // floor): for an estimate that is the caller's ceiling talking, exactly
-        // like running out of gas during execution — geth answers the same.
-        EVMError::Transaction(
-            InvalidTransaction::CallGasCostMoreThanGasLimit { gas_limit, .. }
-            | InvalidTransaction::GasFloorMoreThanGasLimit { gas_limit, .. },
-        ) => EvmError::GasAllowanceExceeded { allowance: gas_limit },
+        // floor): geth's call-side answers. An estimate reads both as its
+        // caller's allowance instead (`estimate_tx`), as geth does.
+        EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit { initial_gas, gas_limit }) => {
+            EvmError::IntrinsicGasTooLow { have: gas_limit, want: initial_gas }
+        }
+        EVMError::Transaction(InvalidTransaction::GasFloorMoreThanGasLimit { gas_floor, gas_limit }) => {
+            EvmError::FloorDataGasTooLow { have: gas_limit, want: gas_floor }
+        }
         // A creation whose init code exceeds EIP-3860's limit can never run:
         // the request's own fault, so a permanent refusal (geth: "max initcode
         // size exceeded"), never the retryable "unavailable".
@@ -741,6 +1020,9 @@ mod tests {
     use crate::fork::{CANCUN_TIME, LONDON_BLOCK};
     use crate::oracle::{FixtureSnapStateOracle, OracleAccount};
     use myotis_core::keccak::keccak256;
+
+    /// The mainnet RelayAdapt7702 shield, replayed from its recorded world (#509).
+    mod relay_adapt_7702_shield;
 
     struct CancelledOracle;
     impl SnapStateOracle for CancelledOracle {
@@ -1029,16 +1311,16 @@ mod tests {
     fn plain_transfer_to_codeless_account_is_exactly_21000() {
         // Empty calldata + no code → the short-circuit answers 21000 EXACTLY
         // (no 1.15 buffer, no EVM run — Java rpcEstimateGas parity).
-        let fx = FixtureSnapStateOracle::new().with_account(
-            ROOT,
-            TARGET,
-            OracleAccount {
-                nonce: 1,
-                balance: U256::from(1_000_000u64),
-                code_hash: myotis_core::trie::EMPTY_CODE_HASH,
-                storage_root: [0x9; 32],
-            },
-        );
+        let eoa = |balance: u64| OracleAccount {
+            nonce: 1,
+            balance: U256::from(balance),
+            code_hash: myotis_core::trie::EMPTY_CODE_HASH,
+            storage_root: [0x9; 32],
+        };
+        // The sender can cover the value it moves (geth's buyGas holds at fee 0).
+        let fx = FixtureSnapStateOracle::new()
+            .with_account(ROOT, TARGET, eoa(1_000_000))
+            .with_account(ROOT, [0x42; 20], eoa(1));
         let exec = EvmExecutor::new(
             Arc::new(fx),
             Arc::new(NoopStateProofCache),
@@ -1518,6 +1800,212 @@ mod tests {
         tx
     }
 
+    /// The lowest gas limit at which `tx` runs, found exactly by bisecting
+    /// over call outcomes (the transactions in these tests are monotone in it).
+    /// Only an ANSWER counts as "does not run" — anything else fails the test.
+    fn lowest_limit_that_runs(exec: &EvmExecutor, tx: &TxRequest, c: &BlockContext) -> u64 {
+        crate::fixture::lowest_limit_that_runs(exec, tx, c, &StateOverrides::new()).unwrap()
+    }
+
+    /// `estimate` is the search's answer for `tx`: the lowest limit that runs,
+    /// within geth's 1.5%, plus the 1.15 buffer — and itself a limit that runs.
+    fn assert_is_the_searched_estimate(exec: &EvmExecutor, tx: &TxRequest, c: &BlockContext, estimate: u64) {
+        let lowest = lowest_limit_that_runs(exec, tx, c);
+        let (lower, upper) = (with_estimate_buffer(lowest), with_estimate_buffer(lowest * 10_153 / 10_000 + 1));
+        assert!(
+            (lower..=upper).contains(&estimate),
+            "estimate {estimate} is not the searched answer over the lowest limit {lowest} ({lower}..={upper})"
+        );
+        let mut at_estimate = tx.clone();
+        at_estimate.gas = Some(estimate);
+        exec.call_tx(&at_estimate, c, StateOverrides::new()).expect("the estimate must be a limit that runs");
+    }
+
+    /// What one run at the budget drew, gross — the old one-run estimate's base.
+    fn drawn_at_the_budget(exec: &EvmExecutor, tx: &TxRequest, c: &BlockContext) -> u64 {
+        let spec = spec_for_context(c).unwrap();
+        let db = exec.database_for_with(c, StateOverrides::new());
+        match exec.execute_with_db(&db, spec, tx, VIEW_CALL_GAS, c).unwrap() {
+            ExecutionResult::Success { gas, .. } => gas.total_gas_spent().max(gas.tx_gas_used()),
+            other => panic!("the transaction must run at the budget, got {other:?}"),
+        }
+    }
+
+    /// CALL `next` with all remaining gas, and revert if it failed.
+    fn forwarder(next: [u8; 20]) -> Vec<u8> {
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(&next);
+        // GAS CALL ISZERO PUSH1 38 JUMPI STOP JUMPDEST PUSH1 0 DUP1 REVERT
+        code.extend_from_slice(&[0x5a, 0xf1, 0x15, 0x60, 0x26, 0x57, 0x00, 0x5b, 0x60, 0x00, 0x80, 0xfd]);
+        code
+    }
+
+    /// #509 stage 2: a call chain withholds 1/64 of the gas at every level
+    /// (EIP-150), so the limit that works grows as (64/63)^depth over the
+    /// innermost work — past the 1.15 a single run's draw was buffered with.
+    /// The search finds the limit that works.
+    #[test]
+    fn estimate_covers_the_gas_nested_calls_withhold() {
+        const DEPTH: u8 = 20;
+        let level = |i: u8| {
+            let mut address = [0x60; 20];
+            address[19] = i;
+            address
+        };
+        let mut accounts: Vec<([u8; 20], Vec<u8>, U256, u64)> =
+            (0..DEPTH).map(|i| (level(i), forwarder(level(i + 1)), U256::ZERO, 1)).collect();
+        accounts.push((level(DEPTH), sstores(14), U256::ZERO, 1));
+        let exec = executor_with_accounts(&accounts);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(level(0)), Bytes::new(), U256::ZERO);
+
+        let estimate = exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap();
+        assert_is_the_searched_estimate(&exec, &tx, &c, estimate);
+        // The one-run answer is a limit the transaction fails at.
+        let mut one_run = tx.clone();
+        one_run.gas = Some(with_estimate_buffer(drawn_at_the_budget(&exec, &tx, &c)));
+        assert!(exec.call_tx(&one_run, &c, StateOverrides::new()).is_err(), "the one-run estimate should fail here");
+    }
+
+    /// A refund-heavy transaction is charged far less than it needs to run:
+    /// clearing slots refunds up to a fifth of the gas, at the end. The
+    /// search starts from the charge but answers what the run needs.
+    #[test]
+    fn estimate_covers_a_refund_heavy_transaction() {
+        // Ten `SSTORE(slot i, 0)` over slots holding 1, then STOP.
+        let mut code = Vec::new();
+        for slot in 0..10u8 {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, slot, 0x55]);
+        }
+        code.push(0x00);
+        let mut fx = FixtureSnapStateOracle::new();
+        let code_hash = fx.with_bytecode(code);
+        fx = fx.with_account(ROOT, TARGET, OracleAccount { nonce: 1, balance: U256::ZERO, code_hash, storage_root: [0x9; 32] });
+        for slot in 0..10u8 {
+            let mut key = [0u8; 32];
+            key[31] = slot;
+            fx = fx.with_storage(ROOT, TARGET, key, U256::from(1u64));
+        }
+        let exec = EvmExecutor::new(Arc::new(fx), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+
+        let charged = mined_gas_used(&exec, &tx, VIEW_CALL_GAS, &c);
+        let lowest = lowest_limit_that_runs(&exec, &tx, &c);
+        assert!(charged + 10_000 < lowest, "refunds should put the charge ({charged}) well below the need ({lowest})");
+        assert_is_the_searched_estimate(&exec, &tx, &c, exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap());
+    }
+
+    /// A contract that checks `gasleft()` draws little at the budget yet
+    /// reverts at any limit that leaves it short: only a search sees that.
+    #[test]
+    fn estimate_covers_a_gasleft_check() {
+        // GAS PUSH3 100000 LT ISZERO PUSH1 11 JUMPI STOP JUMPDEST PUSH1 0 DUP1 REVERT
+        // — revert unless gasleft() > 100000.
+        let code = vec![0x5a, 0x62, 0x01, 0x86, 0xa0, 0x10, 0x15, 0x60, 0x0b, 0x57, 0x00, 0x5b, 0x60, 0x00, 0x80, 0xfd];
+        let exec = executor_with_accounts(&[(TARGET, code, U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+
+        let estimate = exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap();
+        assert!(estimate > 100_000, "the estimate must leave the contract its 100000: {estimate}");
+        assert_is_the_searched_estimate(&exec, &tx, &c, estimate);
+        let mut one_run = tx.clone();
+        one_run.gas = Some(with_estimate_buffer(drawn_at_the_budget(&exec, &tx, &c)));
+        assert!(exec.call_tx(&one_run, &c, StateOverrides::new()).is_err(), "the one-run estimate should revert here");
+    }
+
+    /// Without a fee geth still holds the sender to the value it moves.
+    #[test]
+    fn a_fee_less_estimate_moving_more_than_the_sender_holds_is_geths_answer() {
+        let exec = executor_with_accounts(&[(SENDER, vec![], U256::from(5u64), 0), (TARGET, vec![0x00], U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        for to in [TARGET, DELEGATE] {
+            // A contract, and a codeless account (the 21000 short-circuit).
+            let tx = TxRequest::call(SENDER, Some(to), Bytes::new(), U256::from(6u64));
+            let err = exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+            let short = EvmError::InsufficientFunds { address: SENDER, have: U256::from(5u64), want: U256::from(6u64) };
+            assert_eq!(err, EvmError::FailedWithGas { gas: VIEW_CALL_GAS, error: Box::new(short) });
+            assert!(err.is_infeasible());
+            assert_eq!(
+                err.to_string(),
+                "failed with 30000000 gas: insufficient funds for gas * price + value: address \
+                 0x4242424242424242424242424242424242424242 have 5 want 6"
+            );
+        }
+        // All of it is fine.
+        let tx = TxRequest::call(SENDER, Some(DELEGATE), Bytes::new(), U256::from(5u64));
+        assert_eq!(exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap(), PLAIN_TRANSFER_GAS);
+    }
+
+    /// No block holds a transaction above its gas limit: geth's search starts
+    /// there, and so does the ceiling.
+    #[test]
+    fn the_block_gas_limit_bounds_the_estimate() {
+        let exec = executor_with_accounts(&[(TARGET, sstores(10), U256::ZERO, 1)]);
+        let mut c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        assert!(exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap() > 200_000);
+        c.gas_limit = 200_000;
+        assert_eq!(
+            exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap_err(),
+            EvmError::GasAllowanceExceeded { allowance: 200_000 }
+        );
+        // Only a default, as in geth: the caller's own `gas` replaces it.
+        let mut limited = tx.clone();
+        limited.gas = Some(250_000);
+        assert_eq!(exec.estimate_tx(&limited, &c, StateOverrides::new()).unwrap(), 250_000);
+    }
+
+    /// Below what the run at the ceiling drew, a limit can only "work" by
+    /// running a different transaction: here one whose inner call fails and
+    /// the outer contract swallows it. Clearing storage first refunds a fifth
+    /// of the draw, so what the run is CHARGED — where geth's search starts —
+    /// is such a limit; this search never goes below the draw, so the call the
+    /// caller simulated happens at the estimate. One level deep, as
+    /// `lowest_working_limit` bounds it: the buffer covers a caught failure
+    /// through 8 levels.
+    #[test]
+    fn estimate_covers_a_swallowed_call_one_level_deep() {
+        let inner = [0x77; 20];
+        // SSTORE(slot i, 0) over ten slots holding 1 (refunds), then CALL inner
+        // with all gas and return the success flag, whatever it is.
+        let mut outer = Vec::new();
+        for slot in 0..10u8 {
+            outer.extend_from_slice(&[0x60, 0x00, 0x60, slot, 0x55]);
+        }
+        outer.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73]);
+        outer.extend_from_slice(&inner);
+        outer.extend_from_slice(&[0x5a, 0xf1, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let mut fx = FixtureSnapStateOracle::new();
+        let outer_hash = fx.with_bytecode(outer);
+        let inner_hash = fx.with_bytecode(sstores(5));
+        let account = |code_hash| OracleAccount { nonce: 1, balance: U256::ZERO, code_hash, storage_root: [0x9; 32] };
+        fx = fx.with_account(ROOT, TARGET, account(outer_hash)).with_account(ROOT, inner, account(inner_hash));
+        for slot in 0..10u8 {
+            let mut key = [0u8; 32];
+            key[31] = slot;
+            fx = fx.with_storage(ROOT, TARGET, key, U256::from(1u64));
+        }
+        let exec = EvmExecutor::new(Arc::new(fx), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        let flag = |gas: u64| {
+            let mut limited = tx.clone();
+            limited.gas = Some(gas);
+            word(&exec.call_tx(&limited, &c, StateOverrides::new()).unwrap())
+        };
+        // At what the run is charged, the transaction still "runs" — without
+        // its inner call.
+        let charged = mined_gas_used(&exec, &tx, VIEW_CALL_GAS, &c);
+        assert!(charged < drawn_at_the_budget(&exec, &tx, &c));
+        assert_eq!(flag(charged), U256::ZERO);
+
+        let estimate = exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap();
+        assert!(estimate >= with_estimate_buffer(drawn_at_the_budget(&exec, &tx, &c)));
+        assert_eq!(flag(estimate), U256::from(1u64), "at the estimate the inner call must succeed");
+    }
+
     /// Run `tx` at `gas_limit` as a mined transaction would, returning the gas it
     /// uses — or panic if it does not succeed.
     fn mined_gas_used(exec: &EvmExecutor, tx: &TxRequest, gas_limit: u64, c: &BlockContext) -> u64 {
@@ -1558,6 +2046,31 @@ mod tests {
         dropped.authorization_list = None;
         let blind = exec.estimate_tx(&dropped, &c, StateOverrides::new()).unwrap();
         assert!(blind < 30_000, "without the list the call hits an empty account: {blind}");
+    }
+
+    /// A call into a delegated account starts with the delegate warm (the
+    /// execution specs' `process_message_call`; geth's convenience warming).
+    /// The Java `DelegatedTargetTest` pins the same number: its engine charged
+    /// a cold access here, 2500 gas above this one on the RAILGUN shield.
+    #[test]
+    fn a_delegated_targets_delegate_starts_warm() {
+        let (target, delegate, other) = ([0x22; 20], [0x33; 20], [0x44; 20]);
+        // BALANCE of the delegate itself (warm: 100), then of an untouched
+        // account (cold: 2600), then STOP.
+        let mut code = vec![0x73];
+        code.extend_from_slice(&delegate);
+        code.extend_from_slice(&[0x31, 0x50, 0x73]);
+        code.extend_from_slice(&other);
+        code.extend_from_slice(&[0x31, 0x50, 0x00]);
+        let mut designator = vec![0xef, 0x01, 0x00];
+        designator.extend_from_slice(&delegate);
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18)), 0),
+            (target, designator, U256::ZERO, 1),
+            (delegate, code, U256::ZERO, 1),
+        ]);
+        let tx = TxRequest::call(SENDER, Some(target), Bytes::new(), U256::ZERO);
+        assert_eq!(drawn_at_the_budget(&exec, &tx, &prague()), 21_000 + 3 + 100 + 2 + 3 + 2_600 + 2);
     }
 
     /// A chain id of 0 authorizes on every chain (EIP-7702).
@@ -1622,32 +2135,36 @@ mod tests {
     }
 
     /// EIP-2930: each address costs 2400 and each key 1900 up front, and the
-    /// listed slot is then warm (100) instead of cold (2100). Pinned exactly.
+    /// listed slot is then warm (100) instead of cold (2100). Pinned exactly
+    /// through the lowest limit that runs.
     #[test]
     fn estimate_tx_charges_and_prewarms_the_access_list() {
         // PUSH1 0; SLOAD; POP; STOP
         let exec = executor_with_accounts(&[(TARGET, vec![0x60, 0x00, 0x54, 0x50, 0x00], U256::ZERO, 1)]);
         let c = ctx(19_500_000, CANCUN_TIME + 1);
         let bare = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
-        // 21000 + PUSH1 3 + cold SLOAD 2100 + POP 2 = 23105 → ceil(× 1.15)
-        assert_eq!(exec.estimate_tx(&bare, &c, StateOverrides::new()).unwrap(), 26_571);
+        // 21000 + PUSH1 3 + cold SLOAD 2100 + POP 2
+        assert_eq!(lowest_limit_that_runs(&exec, &bare, &c), 23_105);
+        assert_is_the_searched_estimate(&exec, &bare, &c, exec.estimate_tx(&bare, &c, StateOverrides::new()).unwrap());
         let mut listed = bare.clone();
         listed.access_list = Some(vec![AccessListItem { address: TARGET, storage_keys: vec![[0u8; 32]] }]);
-        // 21000 + 2400 + 1900 + 3 + warm SLOAD 100 + 2 = 25405 → ceil(× 1.15)
-        assert_eq!(exec.estimate_tx(&listed, &c, StateOverrides::new()).unwrap(), 29_216);
+        // 21000 + 2400 + 1900 + 3 + warm SLOAD 100 + 2
+        assert_eq!(lowest_limit_that_runs(&exec, &listed, &c), 25_405);
+        assert_is_the_searched_estimate(&exec, &listed, &c, exec.estimate_tx(&listed, &c, StateOverrides::new()).unwrap());
     }
 
     /// A list changes a plain transfer's price, so the exact-21000 shortcut must
     /// not answer for it.
     #[test]
     fn estimate_tx_does_not_short_circuit_a_transfer_with_an_access_list() {
-        let exec = executor_with_accounts(&[]);
+        let exec = executor_with_accounts(&[(SENDER, vec![], U256::from(1u64), 0)]);
         let c = ctx(19_500_000, CANCUN_TIME + 1);
         let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::from(1u64));
         assert_eq!(exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap(), PLAIN_TRANSFER_GAS);
         tx.access_list = Some(vec![AccessListItem { address: DELEGATE, storage_keys: vec![] }]);
-        // (21000 + 2400) × 1.15
-        assert_eq!(exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap(), 26_910);
+        // 21000 + 2400, searched and buffered like any metered estimate.
+        assert_eq!(lowest_limit_that_runs(&exec, &tx, &c), 23_400);
+        assert_is_the_searched_estimate(&exec, &tx, &c, exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap());
     }
 
     /// `gas` is the ceiling: the answer never exceeds it, a transaction that
@@ -1775,9 +2292,11 @@ mod tests {
         // PUSH1 0; PUSH1 0; RETURN — deploys empty code.
         let init = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xf3]);
         let tx = TxRequest::call(SENDER, None, init, U256::ZERO);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
         // 21000 + 32000 + calldata (2 zero × 4 + 3 nonzero × 16 = 56) + 1 word × 2
-        // + 6 executed = 53064 → ceil(× 1.15)
-        assert_eq!(exec.estimate_tx(&tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap(), 61_024);
+        // + 6 executed
+        assert_eq!(lowest_limit_that_runs(&exec, &tx, &c), 53_064);
+        assert_is_the_searched_estimate(&exec, &tx, &c, exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap());
     }
 
     /// Review regression (#509): a state-overridden balance above 2^128 with an
@@ -1841,10 +2360,10 @@ mod tests {
         assert!(err.is_refusal() && err.to_string().contains("max initcode size"), "{err:?}");
     }
 
-    /// A refusal is decided from the request alone: no state is read first
-    /// (the oracle below panics on any fetch).
+    /// A refusal is decided from the request alone, by a call as by an
+    /// estimate: no state is read first (the oracle below panics on any fetch).
     #[test]
-    fn estimate_tx_refuses_contradictions_before_reading_state() {
+    fn transaction_objects_are_refused_before_reading_state() {
         struct NoFetch;
         impl SnapStateOracle for NoFetch {
             fn fetch_account(&self, _: &[u8; 32], _: [u8; 20]) -> Result<Option<OracleAccount>, OracleError> {
@@ -1858,20 +2377,346 @@ mod tests {
             }
         }
         let exec = EvmExecutor::new(Arc::new(NoFetch), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        let refusal = |tx: &TxRequest, c: &BlockContext| {
+            let estimated = exec.estimate_tx(tx, c, StateOverrides::new()).unwrap_err();
+            let called = exec.call_tx(tx, c, StateOverrides::new()).unwrap_err();
+            assert_eq!(estimated, called, "one refusal for both entry points");
+            assert!(called.is_refusal(), "{called}");
+            called.to_string()
+        };
         let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
         tx.chain_id = Some(U256::from(5));
-        let err = exec.estimate_tx(&tx, &prague(), StateOverrides::new()).unwrap_err();
-        assert!(err.is_refusal() && err.to_string().contains("does not match this node's chain"), "{err}");
+        assert!(refusal(&tx, &prague()).contains("does not match this node's chain"));
 
         let mut no_list = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
         no_list.tx_type = Some(TYPE_SET_CODE);
-        let err = exec.estimate_tx(&no_list, &prague(), StateOverrides::new()).unwrap_err();
-        assert!(err.is_refusal() && err.to_string().contains("requires an authorizationList"), "{err}");
+        assert!(refusal(&no_list, &prague()).contains("requires an authorizationList"));
 
         let ephemeral = key(0x0b);
         let early = set_code_call(SENDER, address_of(&ephemeral), vec![sign_authorization(&ephemeral, 1, DELEGATE, 0)]);
-        let err = exec.estimate_tx(&early, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap_err();
-        assert!(err.is_refusal() && err.to_string().contains("before Prague"), "{err}");
+        assert!(refusal(&early, &ctx(19_500_000, CANCUN_TIME + 1)).contains("before Prague"));
+    }
+
+    // ---- eth_call over the full transaction object (#509) -----------------
+
+    /// Code that pushes one word with `op` and returns it.
+    fn returning(op: &[u8]) -> Vec<u8> {
+        let mut code = op.to_vec();
+        code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        code
+    }
+
+    fn word(out: &[u8]) -> U256 {
+        U256::from_be_slice(out)
+    }
+
+    /// Wallets simulate the same 7702 transaction they then estimate: the
+    /// authorization must be installed for the call too, or the call runs
+    /// against an empty account and returns nothing — a well-formed answer to
+    /// a different question.
+    #[test]
+    fn call_tx_applies_an_authorization_that_delegates_a_fresh_eoa() {
+        let ephemeral = key(0x0c);
+        // The delegate returns 42.
+        let exec = executor_with_accounts(&[(DELEGATE, returning(&[0x60, 0x2a]), U256::ZERO, 1)]);
+        let c = prague();
+        let tx = set_code_call(SENDER, address_of(&ephemeral), vec![sign_authorization(&ephemeral, 1, DELEGATE, 0)]);
+        assert_eq!(word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap()), U256::from(42));
+
+        let mut dropped = tx.clone();
+        dropped.tx_type = None;
+        dropped.authorization_list = None;
+        assert!(exec.call_tx(&dropped, &c, StateOverrides::new()).unwrap().is_empty());
+    }
+
+    /// A fee-less, limit-less transaction object is the plain call it always
+    /// was, overrides included.
+    #[test]
+    fn call_tx_without_extended_fields_is_the_plain_call() {
+        use crate::overrides::AccountOverride;
+        let exec = executor_with_accounts(&[(TARGET, returning(&[0x60, 0x07]), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        let plain = exec.call_view_from(SENDER, TARGET, &[], U256::ZERO, &c).unwrap();
+        assert_eq!(exec.call_tx(&tx, &c, StateOverrides::new()).unwrap(), plain);
+
+        let mut ov = StateOverrides::new();
+        ov.insert(TARGET, AccountOverride { code: Some(returning(&[0x60, 0x09])), ..Default::default() });
+        assert_eq!(word(&exec.call_tx(&tx, &c, ov).unwrap()), U256::from(9));
+    }
+
+    /// `gas` is the call's limit: running out of it is geth's "out of gas", an
+    /// answer, while the same call without a limit runs.
+    #[test]
+    fn call_tx_runs_out_of_the_callers_gas() {
+        let exec = executor_with_accounts(&[(TARGET, sstores(10), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        assert!(exec.call_tx(&tx, &c, StateOverrides::new()).is_ok());
+
+        tx.gas = Some(100_000);
+        let err = exec.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+        assert_eq!(err, EvmError::CallOutOfGas);
+        assert!(err.is_infeasible());
+        assert_eq!(err.to_string(), "out of gas");
+    }
+
+    /// A limit above the executor's budget is capped there, as geth caps one at
+    /// its RPC gas cap. Running dry at that cap is the executor's limit, not the
+    /// caller's: refused (permanent), neither the caller's out-of-gas nor a
+    /// retryable unavailable. Without a limit it stays the ordinary out-of-gas.
+    #[test]
+    fn call_tx_caps_the_callers_gas_at_the_budget() {
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let gas_left = executor_with_accounts(&[(TARGET, returning(&[0x5a]), U256::ZERO, 1)]);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(50_000_000);
+        let left = word(&gas_left.call_tx(&tx, &c, StateOverrides::new()).unwrap());
+        assert!(left < U256::from(VIEW_CALL_GAS - 21_000), "ran with at most the budget: {left}");
+
+        // JUMPDEST; PUSH1 0; JUMP — spins until the gas is gone.
+        let spin = executor_with_accounts(&[(TARGET, vec![0x5b, 0x60, 0x00, 0x56], U256::ZERO, 1)]);
+        let capped = spin.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+        assert_eq!(capped, EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: 50_000_000 });
+        assert!(capped.is_refusal());
+        assert_eq!(
+            capped.to_string(),
+            "the call ran out of this node's 30000000-gas call budget, below the 50000000 gas it allows"
+        );
+        tx.gas = Some(VIEW_CALL_GAS);
+        assert_eq!(spin.call_tx(&tx, &c, StateOverrides::new()).unwrap_err(), EvmError::CallOutOfGas);
+        tx.gas = None;
+        tx.fees = Fees::Legacy { gas_price: 7 };
+        let mut funded = StateOverrides::new();
+        funded.insert(SENDER, crate::overrides::AccountOverride { balance: Some(U256::MAX), ..Default::default() });
+        assert_eq!(spin.call_tx(&tx, &c, funded).unwrap_err(), EvmError::OutOfGas);
+    }
+
+    /// A limit below the intrinsic cost, or below the EIP-7623 floor, is geth's
+    /// answer for a call — never a run with less gas than the transaction pays.
+    #[test]
+    fn call_tx_refuses_a_limit_below_the_intrinsic_cost_or_the_floor() {
+        let exec = executor_with_accounts(&[(TARGET, vec![0x00], U256::ZERO, 1)]);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(20_000);
+        let err = exec.call_tx(&tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap_err();
+        let intrinsic = EvmError::IntrinsicGasTooLow { have: 20_000, want: 21_000 };
+        assert_eq!(err, EvmError::CallFailed { supplied_gas: 20_000, error: Box::new(intrinsic) });
+        assert_eq!(err.to_string(), "err: intrinsic gas too low: have 20000, want 21000 (supplied gas 20000)");
+        assert!(err.is_infeasible());
+
+        // Prague: 1000 non-zero bytes cost 37000 intrinsic, but floor at 61000.
+        tx.data = Bytes::from(vec![0xff; 1000]);
+        tx.gas = Some(50_000);
+        let err = exec.call_tx(&tx, &prague(), StateOverrides::new()).unwrap_err();
+        let floor = EvmError::FloorDataGasTooLow { have: 50_000, want: 61_000 };
+        assert_eq!(err, EvmError::CallFailed { supplied_gas: 50_000, error: Box::new(floor) });
+        assert_eq!(
+            err.to_string(),
+            "err: insufficient gas for floor data gas cost: have 50000, want 61000 (supplied gas 50000)"
+        );
+        assert!(err.is_infeasible());
+    }
+
+    /// With a fee the sender must afford `gas × fee cap + value`, and the run
+    /// sees it debited `gas × effective price` — geth's buyGas. Fee-less, the
+    /// balance is untouched, as a call without a transaction object always was.
+    #[test]
+    fn call_tx_charges_the_sender_for_its_fee() {
+        // BALANCE(CALLER), returned.
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10_000_000u64), 0),
+            (TARGET, returning(&[0x33, 0x31]), U256::ZERO, 1),
+        ]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1); // base fee 7
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        assert_eq!(word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap()), U256::from(10_000_000u64));
+
+        // Effective price min(10, 7 + 1) = 8 on a 100k limit.
+        tx.gas = Some(100_000);
+        tx.fees = Fees::DynamicFee { max_fee_per_gas: 10, max_priority_fee_per_gas: 1 };
+        assert_eq!(
+            word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap()),
+            U256::from(10_000_000u64 - 800_000)
+        );
+
+        // 100k × 10 + 9.1M = 10.1M > 10M.
+        tx.value = U256::from(9_100_000u64);
+        let err = exec.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+        let short = EvmError::InsufficientFunds {
+            address: SENDER,
+            have: U256::from(10_000_000u64),
+            want: U256::from(10_100_000u64),
+        };
+        assert_eq!(err, EvmError::CallFailed { supplied_gas: 100_000, error: Box::new(short) });
+        assert_eq!(
+            err.to_string(),
+            "err: insufficient funds for gas * price + value: address \
+             0x4242424242424242424242424242424242424242 have 10000000 want 10100000 (supplied gas 100000)"
+        );
+        assert!(err.is_infeasible());
+    }
+
+    /// geth's buyGas holds for a fee-less call too: moving more than the
+    /// sender holds is refused as the chain would refuse it — never run
+    /// against a balance the sender does not have — while a call that moves
+    /// nothing needs no balance at all.
+    #[test]
+    fn call_tx_refuses_a_value_the_sender_cannot_cover_even_without_a_fee() {
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(1_000u64), 0),
+            (TARGET, vec![0x00], U256::ZERO, 1),
+        ]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::from(1_001u64));
+        tx.gas = Some(100_000);
+        let err = exec.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+        let short = EvmError::InsufficientFunds { address: SENDER, have: U256::from(1_000u64), want: U256::from(1_001u64) };
+        assert_eq!(err, EvmError::CallFailed { supplied_gas: 100_000, error: Box::new(short) });
+
+        tx.value = U256::from(1_000u64);
+        assert!(exec.call_tx(&tx, &c, StateOverrides::new()).unwrap().is_empty());
+        // An empty account can still make a call that moves nothing.
+        let mut broke = TxRequest::call([0x77; 20], Some(TARGET), Bytes::new(), U256::ZERO);
+        broke.gas = Some(100_000);
+        assert!(exec.call_tx(&broke, &c, StateOverrides::new()).unwrap().is_empty());
+    }
+
+    /// A price revm cannot represent is answered, never run: revm `expect`s
+    /// `gas × price + value` to fit, and with its balance check off a panic
+    /// there aborts the host process.
+    #[test]
+    fn call_tx_answers_a_price_revm_cannot_represent() {
+        use crate::overrides::AccountOverride;
+        let exec = executor_with_accounts(&[(TARGET, vec![0x00], U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let rich = || {
+            let mut ov = StateOverrides::new();
+            ov.insert(SENDER, AccountOverride { balance: Some(U256::MAX), ..Default::default() });
+            ov
+        };
+        // gas × fee + value past 2^256: geth's own refusal.
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::MAX);
+        tx.gas = Some(21_000);
+        tx.fees = Fees::Legacy { gas_price: 7 };
+        let err = exec.call_tx(&tx, &c, rich()).unwrap_err();
+        assert_eq!(
+            err,
+            EvmError::CallFailed { supplied_gas: 21_000, error: Box::new(EvmError::RequiredBalanceOverflow { address: SENDER }) }
+        );
+        assert_eq!(
+            err.to_string(),
+            "err: insufficient funds for gas * price + value: address \
+             0x4242424242424242424242424242424242424242 required balance exceeds 256 bits (supplied gas 21000)"
+        );
+        // gas × fee past 2^128 against an overridden fortune: refused as a
+        // price this engine cannot run.
+        tx.value = U256::ZERO;
+        tx.fees = Fees::Legacy { gas_price: u128::MAX };
+        assert!(matches!(exec.call_tx(&tx, &c, rich()).unwrap_err(), EvmError::InvalidRequest { .. }));
+    }
+
+    /// A request that contradicts itself is refused before any check of what
+    /// it could afford — for a call exactly as for an estimate.
+    #[test]
+    fn call_tx_refuses_a_contradictory_nonce_before_the_fee_checks() {
+        use crate::overrides::AccountOverride;
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18)), 0),
+            (TARGET, vec![0x00], U256::ZERO, 1),
+        ]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1); // base fee 7
+        let overrides = || {
+            let mut ov = StateOverrides::new();
+            ov.insert(SENDER, AccountOverride { nonce: Some(5), ..Default::default() });
+            ov
+        };
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.nonce = Some(6);
+        tx.fees = Fees::Legacy { gas_price: 1 }; // below the base fee
+        let call = exec.call_tx(&tx, &c, overrides()).unwrap_err();
+        assert!(matches!(call, EvmError::InvalidRequest { .. }), "{call:?}");
+        assert_eq!(call, exec.estimate_tx(&tx, &c, overrides()).unwrap_err());
+    }
+
+    /// A plain call whose calldata alone costs more than the budget is geth's
+    /// answer for a call at its gas cap — infeasible, worded as geth's eth_call
+    /// words it — not a call this node cannot serve right now.
+    #[test]
+    fn a_plain_call_whose_calldata_outweighs_the_budget_is_geths_answer() {
+        let exec = executor_with_accounts(&[(TARGET, vec![0x00], U256::ZERO, 1)]);
+        // Prague: 800k non-zero bytes floor at 21000 + 40 × 800000 = 32.021 M.
+        let data = vec![0xff; 800_000];
+        let err = exec.call_view_from(SENDER, TARGET, &data, U256::ZERO, &prague()).unwrap_err();
+        let floor = EvmError::FloorDataGasTooLow { have: VIEW_CALL_GAS, want: 32_021_000 };
+        assert_eq!(err, EvmError::CallFailed { supplied_gas: VIEW_CALL_GAS, error: Box::new(floor) });
+        assert!(err.is_infeasible());
+    }
+
+    /// GASPRICE reads the effective price in a call, as in an estimate.
+    #[test]
+    fn call_tx_runs_with_the_requests_gas_price() {
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18)), 0),
+            (TARGET, returning(&[0x3a]), U256::ZERO, 1),
+        ]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        assert_eq!(word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap()), U256::ZERO);
+        tx.fees = Fees::DynamicFee { max_fee_per_gas: 10, max_priority_fee_per_gas: 1 };
+        assert_eq!(word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap()), U256::from(8));
+    }
+
+    /// The access list is charged (2400 + 1900 intrinsic) and pre-warms its
+    /// slot: GAS after reading that slot shows both.
+    #[test]
+    fn call_tx_charges_and_prewarms_the_access_list() {
+        // PUSH1 0; SLOAD; POP; GAS — returned.
+        let exec = executor_with_accounts(&[(TARGET, returning(&[0x60, 0x00, 0x54, 0x50, 0x5a]), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(100_000);
+        let cold = word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap());
+        tx.access_list = Some(vec![AccessListItem { address: TARGET, storage_keys: vec![[0u8; 32]] }]);
+        let warm = word(&exec.call_tx(&tx, &c, StateOverrides::new()).unwrap());
+        // 4300 more up front, 2000 less for the warm read.
+        assert_eq!(cold - warm, U256::from(2_300u64));
+    }
+
+    /// A fee cap below the block's base fee names a transaction no block at
+    /// this base fee includes: geth answers so for a call and for an estimate.
+    #[test]
+    fn a_fee_cap_below_the_base_fee_is_refused_for_calls_and_estimates() {
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18)), 0),
+            (TARGET, vec![0x00], U256::ZERO, 1),
+        ]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1); // base fee 7
+        for (fees, fee_cap) in [
+            (Fees::Legacy { gas_price: 5 }, 5u128),
+            (Fees::DynamicFee { max_fee_per_gas: 6, max_priority_fee_per_gas: 1 }, 6),
+        ] {
+            let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+            tx.fees = fees;
+            let want = EvmError::FeeCapTooLow { address: SENDER, fee_cap, base_fee: 7 };
+            let call = exec.call_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+            assert_eq!(call, EvmError::CallFailed { supplied_gas: VIEW_CALL_GAS, error: Box::new(want.clone()) });
+            assert_eq!(call.to_string(), format!("err: {want} (supplied gas {VIEW_CALL_GAS})"));
+            assert!(want.is_infeasible());
+            assert_eq!(
+                want.to_string(),
+                format!(
+                    "max fee per gas less than block base fee: address \
+                     0x4242424242424242424242424242424242424242, maxFeePerGas: {fee_cap}, baseFee: 7"
+                )
+            );
+            // The estimate reports it as geth's estimator does: with the ceiling
+            // the refused run was made at.
+            let estimate = exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap_err();
+            assert_eq!(estimate, EvmError::FailedWithGas { gas: VIEW_CALL_GAS, error: Box::new(want.clone()) });
+            assert!(estimate.is_infeasible());
+            assert_eq!(estimate.to_string(), format!("failed with {VIEW_CALL_GAS} gas: {want}"));
+        }
     }
 
     #[test]
@@ -2125,11 +2970,18 @@ mod tests {
         // EIP-2780 charges a value transfer to an EMPTY account EIP-8037
         // account-creation state gas on top of its intrinsic, so the pre-Amsterdam
         // 21000 short-circuit would under-estimate it ~10x and the tx would OOG.
-        let exec = EvmExecutor::new(
-            Arc::new(FixtureSnapStateOracle::new()), // TARGET is proven absent
-            Arc::new(NoopStateProofCache),
-            Arc::new(NoopBytecodeCache),
+        // TARGET is proven absent; the sender covers the value it moves.
+        let fx = FixtureSnapStateOracle::new().with_account(
+            ROOT,
+            [0x42; 20],
+            OracleAccount {
+                nonce: 1,
+                balance: U256::from(1u64),
+                code_hash: myotis_core::trie::EMPTY_CODE_HASH,
+                storage_root: [0x9; 32],
+            },
         );
+        let exec = EvmExecutor::new(Arc::new(fx), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
         let t = crate::fork::SEPOLIA_AMSTERDAM_TIME;
         // One second before activation (Osaka) the exact answer is unchanged.
         let osaka = exec

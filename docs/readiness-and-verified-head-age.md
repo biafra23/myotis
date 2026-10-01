@@ -215,7 +215,9 @@ since the node started. So keep honoring the SYNCED gate for `finalized`
 reads too; staleness does not always surface as `-32000`. On the JVM host the
 start/resume warm-up hold applies to `finalized` reads too (it waits for a
 head-serving peer that a finalized read does not need — at most 90 s).
-The Java engine still resolves `finalized` to the head (#366).
+The Java engine still resolves `finalized` to the head (#366), except where it
+refuses the tag instead (`-32602`): `eth_estimateGas`, and an `eth_call`
+carrying gas, fees or lists.
 
 ## Code pointers
 

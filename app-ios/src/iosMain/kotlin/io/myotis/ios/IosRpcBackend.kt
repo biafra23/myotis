@@ -151,6 +151,24 @@ class IosRpcBackend(
                     stateOverridesJson,
                 )
             }
+        return callFromJson(json)
+    }
+
+    override fun callTx(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcCallResult {
+        // No host-side block guard, as for estimateGasTx: the engine applies the
+        // selector and every field of the canonical object — or refuses it, as
+        // the permanent -32602 envelope (ABI >= 35, #509; JVM-adapter parity).
+        val handle = handleProvider() ?: return RpcCallResult.unavailable("engine not running")
+        return callFromJson(RustEngine.ethCallTxJson(handle, tx.json, block, stateOverridesJson ?: ""))
+    }
+
+    /** The engine's call JSON as an [RpcCallResult] — one reading for both call
+     *  entry points (RustChainHandle.callDetailedFromJson's twin). */
+    private fun callFromJson(json: String): RpcCallResult {
         // The permanent -32602 envelope (a block the engine will never serve, an
         // executor refusal): REFUSED, which the router serves as -32602 — never
         // the retryable -32000 a client would spin on (JVM-adapter parity).
@@ -165,6 +183,14 @@ class IosRpcBackend(
             // (JVM-adapter parity: EngineException → unavailable).
             "revert" -> RpcCallResult.reverted(hexToBytes(o.engineString("dataHex"))
                 ?: return RpcCallResult.unavailable("malformed dataHex from engine"))
+            // A transaction-object call that cannot succeed within the caller's
+            // gas, fee cap or funds (ABI 35): an answer in geth's words, which
+            // the router serves verbatim. A reasonless one is shape drift →
+            // retryable, as above.
+            "infeasible" -> RpcCallResult.infeasible(
+                o.engineString("reason")?.takeIf { it.isNotBlank() }
+                    ?: return RpcCallResult.unavailable("infeasible without a reason from engine"),
+            )
             else -> RpcCallResult.unavailable(o.engineString("reason"))
         }
     }

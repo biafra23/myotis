@@ -60,5 +60,50 @@ class RevertDataOfTest {
         assertNull(VerifiedRpcBackend.infeasibleOf(
                 new EvmExecutionException(new EvmExecutionError.Reverted(new byte[0]))));
         assertNull(VerifiedRpcBackend.infeasibleOf(new RuntimeException("timeout")));
+        // Running out of gas is an answer only when the caller set the limit.
+        assertNull(VerifiedRpcBackend.infeasibleOf(new EvmExecutionException(new EvmExecutionError.OutOfGas())));
+    }
+
+    /** A precompile is codeless yet charges on an empty call: the estimate's
+     *  21000 short-circuit must not answer for one (the Rust twin's range). */
+    @Test
+    void precompilesAreNotPlainTransfers() {
+        byte[] address = new byte[20];
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+        address[19] = 0x01;
+        org.junit.jupiter.api.Assertions.assertTrue(VerifiedRpcBackend.inPrecompileRange(address));
+        address[18] = 0x01;
+        address[19] = (byte) 0xff;
+        org.junit.jupiter.api.Assertions.assertTrue(VerifiedRpcBackend.inPrecompileRange(address));
+        address[18] = 0x02;
+        address[19] = 0x00;
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+        address[0] = 0x01;
+        address[18] = 0x00;
+        address[19] = 0x01;
+        org.junit.jupiter.api.Assertions.assertFalse(VerifiedRpcBackend.inPrecompileRange(address));
+    }
+
+    /** #509 stage 2: a transaction-object eth_call's refusals are answers too, and
+     *  the estimate names the ceiling its refused run was made at — geth's words. */
+    @Test
+    void infeasibleCallsCarryGethsMessage() {
+        var sender = io.myotis.evm.Address.fromHex("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed");
+        assertEquals("out of gas", VerifiedRpcBackend.infeasibleOf(new java.util.concurrent.ExecutionException(
+                new EvmExecutionException(new EvmExecutionError.CallOutOfGas()))));
+        assertEquals("intrinsic gas too low: have 20000, want 21000", VerifiedRpcBackend.infeasibleOf(
+                new EvmExecutionException(new EvmExecutionError.IntrinsicGasTooLow(20_000L, 21_000L))));
+        assertEquals("insufficient funds for gas * price + value: address "
+                        + "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed have 1 want 2",
+                VerifiedRpcBackend.infeasibleOf(new EvmExecutionException(new EvmExecutionError.InsufficientFunds(
+                        sender, java.math.BigInteger.ONE, java.math.BigInteger.TWO))));
+        var feeCapTooLow = new EvmExecutionError.FeeCapTooLow(sender, java.math.BigInteger.valueOf(5), 7L);
+        assertEquals("max fee per gas less than block base fee: address "
+                        + "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed, maxFeePerGas: 5, baseFee: 7",
+                VerifiedRpcBackend.infeasibleOf(new EvmExecutionException(feeCapTooLow)));
+        assertEquals("failed with 30000000 gas: max fee per gas less than block base fee: address "
+                        + "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed, maxFeePerGas: 5, baseFee: 7",
+                VerifiedRpcBackend.infeasibleOf(new EvmExecutionException(
+                        new EvmExecutionError.FailedWithGas(30_000_000L, feeCapTooLow))));
     }
 }

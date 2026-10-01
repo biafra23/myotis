@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 34
+#define MYOTIS_ABI_VERSION 35
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -201,6 +201,17 @@ char *myotis_estimate_gas_json(int64_t handle, const char *from,
 char *myotis_estimate_gas_tx_json(int64_t handle, const char *tx,
                                   const char *block,
                                   const char *state_overrides);
+/* eth_call for the FULL JSON-RPC transaction object (ABI >= 35): the arguments
+ * of myotis_estimate_gas_tx_json, every field applied as the estimate applies
+ * it (`gas` is the call's limit, a fee is checked against the base fee and
+ * charged to the sender, both lists are applied) or the request refused.
+ * Returns the shapes of myotis_eth_call_json plus {"status":"infeasible",
+ * "reason"} — the call cannot succeed within the caller's gas, fee cap or
+ * funds; serve JSON-RPC -32000 with `reason` verbatim, as geth does — and
+ * {"error","code":-32602} for a malformed or contradictory object
+ * (PERMANENT, do not retry). */
+char *myotis_eth_call_tx_json(int64_t handle, const char *tx,
+                              const char *block, const char *state_overrides);
 /* {"status":"ok","addressHex","blockNumber"} | {"status":"noRecord",...} |
  * {"status":"offchain",...} | {"error"}. */
 char *myotis_resolve_ens_json(int64_t handle, const char *name);

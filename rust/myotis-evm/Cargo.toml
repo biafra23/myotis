@@ -36,8 +36,18 @@ revm = { version = "=43.0.3", default-features = false, features = [
     "optional_no_base_fee",
 ] }
 
+# Only for the `fixture` feature's recorded-world files (`fixture::EvmFixture`);
+# never in a default build. A dev-dependency too, for the crate's own tests.
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
 [features]
-# In-memory FixtureSnapStateOracle for downstream tests (the engine crate's
-# EVM tests). Off by default so it never ships in the engine .so; the crate's
-# own tests see it through `cfg(test)`.
-fixture = []
+# Test tooling, off by default so it never ships in the engine .so; the crate's
+# own tests see it through `cfg(test)`. The in-memory FixtureSnapStateOracle
+# for downstream tests (the engine crate's EVM tests), and `fixture::` — the
+# recorded-world files the mainnet fixture recorder
+# (rust/myotis-net/examples/record_shield_fixture) writes and the replay tests
+# read.
+fixture = ["dep:serde_json"]

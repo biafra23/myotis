@@ -288,6 +288,25 @@ class RustVerifiedReadJsonTest {
     }
 
     @Test
+    void detailedCall_infeasibleCarriesGethsMessage() {
+        // ABI 35 (#509): a transaction-object call that cannot succeed within the
+        // caller's gas, fee cap or funds is an ANSWER in geth's words, which the
+        // router serves verbatim as -32000 — shape pinned by eljson's call_json test.
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"intrinsic gas too low: have 20000, want 21000\","
+                + "\"blockNumber\":21000000,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.INFEASIBLE, r.status());
+        assertEquals("intrinsic gas too low: have 20000, want 21000", r.detail());
+        assertNull(r.data());
+        // The legacy two-state view reads it as no answer.
+        assertNull(RustChainHandle.callResultFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"out of gas\"}"));
+        // A reasonless one is shape drift: it must not become an answer.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.callDetailedFromJson("{\"status\":\"infeasible\"}"));
+    }
+
+    @Test
     void callErrorObjectBecomesEngineException() {
         assertThrows(EngineException.class,
                 () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));

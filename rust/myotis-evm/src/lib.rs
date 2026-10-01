@@ -40,6 +40,8 @@ pub mod database;
 pub mod ens;
 pub mod error;
 pub mod executor;
+#[cfg(any(test, feature = "fixture"))]
+pub mod fixture;
 pub mod fork;
 pub mod oracle;
 pub mod overrides;

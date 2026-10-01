@@ -51,8 +51,13 @@ class RpcTransactionArgs private constructor(
     val hasAccessList: Boolean,
     /** An `authorizationList` is present (never empty: that is refused). */
     val hasAuthorizationList: Boolean,
-    val json: String,
+    canonicalJson: () -> String,
 ) {
+    /** The canonical JSON object (see the class doc), built on first use: a
+     *  plain `eth_call` — every call without [hasExtendedFields] — never reads
+     *  it, and its calldata can run to tens of KB. */
+    val json: String by lazy(canonicalJson)
+
     /** Whether anything beyond from/to/data/value is present that an engine
      *  could APPLY: `gas`, a fee field, either list — or a `nonce` on a
      *  contract creation, whose address it decides. */
@@ -192,20 +197,22 @@ class RpcTransactionArgs private constructor(
                 refuse("an EIP-7702 transaction cannot create a contract: authorizationList needs a 'to'")
             }
 
-            val canonical = buildJsonObject {
-                from?.let { put("from", JsonPrimitive(hex(it))) }
-                to?.let { put("to", JsonPrimitive(hex(it))) }
-                put("input", JsonPrimitive(hex(data)))
-                value?.let { put("value", JsonPrimitive(quantityHex(it))) }
-                gas?.let { put("gas", JsonPrimitive(quantityHex(it))) }
-                gasPrice?.let { put("gasPrice", JsonPrimitive(quantityHex(it))) }
-                maxFee?.let { put("maxFeePerGas", JsonPrimitive(quantityHex(it))) }
-                maxPriority?.let { put("maxPriorityFeePerGas", JsonPrimitive(quantityHex(it))) }
-                nonce?.let { put("nonce", JsonPrimitive(quantityHex(it))) }
-                chainId?.let { put("chainId", JsonPrimitive(quantityHex(it))) }
-                type?.let { put("type", JsonPrimitive("0x" + it.toString(16))) }
-                accessList?.let { put("accessList", it) }
-                authorizations?.let { put("authorizationList", it) }
+            val canonical = {
+                buildJsonObject {
+                    from?.let { put("from", JsonPrimitive(hex(it))) }
+                    to?.let { put("to", JsonPrimitive(hex(it))) }
+                    put("input", JsonPrimitive(hex(data)))
+                    value?.let { put("value", JsonPrimitive(quantityHex(it))) }
+                    gas?.let { put("gas", JsonPrimitive(quantityHex(it))) }
+                    gasPrice?.let { put("gasPrice", JsonPrimitive(quantityHex(it))) }
+                    maxFee?.let { put("maxFeePerGas", JsonPrimitive(quantityHex(it))) }
+                    maxPriority?.let { put("maxPriorityFeePerGas", JsonPrimitive(quantityHex(it))) }
+                    nonce?.let { put("nonce", JsonPrimitive(quantityHex(it))) }
+                    chainId?.let { put("chainId", JsonPrimitive(quantityHex(it))) }
+                    type?.let { put("type", JsonPrimitive("0x" + it.toString(16))) }
+                    accessList?.let { put("accessList", it) }
+                    authorizations?.let { put("authorizationList", it) }
+                }.toString()
             }
             return RpcTransactionArgs(
                 from = from,
@@ -221,7 +228,7 @@ class RpcTransactionArgs private constructor(
                 type = type,
                 hasAccessList = hasAccessList,
                 hasAuthorizationList = authorizations != null,
-                json = canonical.toString(),
+                canonicalJson = canonical,
             )
         }
 
@@ -308,8 +315,20 @@ class RpcTransactionArgs private constructor(
             }
         }
 
-        private fun hex(b: ByteArray): String =
-            "0x" + b.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+        private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+        /** 0x-prefixed lowercase hex, allocation-free per byte (the router's
+         *  `hexData`): calldata can run to tens of KB. */
+        private fun hex(b: ByteArray): String {
+            val out = CharArray(b.size * 2 + 2)
+            out[0] = '0'; out[1] = 'x'
+            for (i in b.indices) {
+                val v = b[i].toInt() and 0xff
+                out[i * 2 + 2] = HEX_DIGITS[v ushr 4]
+                out[i * 2 + 3] = HEX_DIGITS[v and 0x0f]
+            }
+            return out.concatToString()
+        }
 
         /** A normalized decimal as a minimal 0x-hex QUANTITY. */
         private fun quantityHex(decimal: String): String = "0x" + RpcQuantities.decimalToHex(decimal)

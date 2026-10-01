@@ -64,32 +64,64 @@ estimateGas(tx, ctx):
   intrinsic = 21000
             + 4*zero_bytes(tx.data)
             + 16*nonzero_bytes(tx.data)
-  // The ceiling (geth's `hi`, #509): below 21000 a gasLimit is no limit.
-  ceiling = min(30_000_000, tx.gasLimit if tx.gasLimit >= 21000)
+  // The ceiling (geth's `hi`, #509): below 21000 a gasLimit is no limit;
+  // without one, geth starts from the block's gas limit.
+  ceiling = min(30_000_000, 2^24 from Osaka,
+                tx.gasLimit if tx.gasLimit >= 21000 else block gas limit)
   if tx.feeCap > 0:                           // geth's affordability cap
     if tx.value >= balance(tx.from): fail InsufficientFundsForTransfer
     ceiling = min(ceiling, (balance(tx.from) - tx.value) / tx.feeCap)
+  if 0 < tx.feeCap < baseFee:                 // geth's first run refuses it
+    fail FailedWithGas(ceiling, FeeCapTooLow)
+  if balance(tx.from) < ceiling * tx.feeCap + tx.value: // geth's buyGas (bites
+    fail FailedWithGas(ceiling, InsufficientFunds)    // only fee-less here)
   floor = 21000 + 10*(zero_bytes + 4*nonzero_bytes)   // EIP-7623, Prague+ only
   if intrinsic > ceiling or floor > ceiling:
     fail GasAllowanceExceeded(ceiling)
-  evmBudget = ceiling - intrinsic
-  run EVM at tx.to with calldata=tx.data, value=tx.value,
-              sender=tx.from, initialGas=evmBudget, isStatic=false,
-              gasPrice=min(tx.feeCap, baseFee + tx.tip)
-  case run.state of
-    COMPLETED_SUCCESS:  used = evmBudget - run.remainingGas
-                        return min(ceil(max(intrinsic + used, floor) * 1.15), ceiling)
+  run(L) = EVM at tx.to with calldata=tx.data, value=tx.value,
+           sender=tx.from debited L × price, initialGas=L - intrinsic,
+           isStatic=false, gasPrice=price = min(tx.feeCap, baseFee + tx.tip)
+  case run(ceiling).state of
     REVERT (any kind):  fail Reverted(reason)         // do NOT estimate
     INSUFFICIENT_GAS:   fail GasAllowanceExceeded(ceiling)
     other halt:         fail Halted(detail)
+    COMPLETED_SUCCESS:
+      drawn = max(ceiling - run.remainingGas, floor)       // geth's MaxUsedGas
+      lo = drawn - 1; hi = ceiling                         // geth's search, but
+      optimistic = (drawn + 2300) * 64 / 63                // never below the draw
+      if optimistic < hi: (run(optimistic) succeeds ? hi : lo) = optimistic
+      while lo + 1 < hi and (hi - lo) / hi >= 1.5%:
+        mid = min((hi + lo) / 2, 2 * lo)
+        (run(mid) succeeds ? hi : lo) = mid   // any failure raises the limit
+      return min(ceil(hi * 1.15), ceiling)
 ```
 
-`GasAllowanceExceeded` and `InsufficientFundsForTransfer` are answers, not
-failures to answer: hosts serve them as geth does (-32000, "gas required
-exceeds allowance (N)" / "insufficient funds for transfer"). The Rust engine
-(`myotis_evm::tx`, `EvmExecutor::estimate_tx`) runs the same algorithm and,
-unlike this one, also applies EIP-7702 authorization lists, access lists,
-the transaction nonce and contract creation (#509).
+`GasAllowanceExceeded`, `InsufficientFundsForTransfer` and `FailedWithGas`
+are answers, not failures to answer (`EvmExecutionError.Infeasible`): hosts
+serve them as geth does (-32000, "gas required exceeds allowance (N)" /
+"insufficient funds for transfer" / "failed with N gas: max fee per gas less
+than block base fee: …"). The Rust engine (`myotis_evm::tx`,
+`EvmExecutor::estimate_tx`) runs the same algorithm and, unlike this one,
+also applies EIP-7702 authorization lists, access lists, the transaction
+nonce and contract creation (#509).
+
+`eth_call` for a transaction object (`EvmExecutor.callTx`, #509 stage 2)
+shares the pricing but not the ceiling: `gas` is the call's own limit
+(capped at the 30 M budget, as geth caps it at its RPC gas cap; taken
+literally — below 21000 it is not "unset" as in an estimate), checked in
+geth's order before anything runs — the fee cap against the base fee
+(`FeeCapTooLow`), the balance against `gas × feeCap + value`, fee or not
+(`InsufficientFunds`, or `RequiredBalanceOverflow` past 2^256), the limit
+against the intrinsic cost and the Prague floor (`IntrinsicGasTooLow`,
+`FloorDataGasTooLow`) — each wrapped as geth's `eth_call` wraps it
+(`CallFailed`: "err: <reason> (supplied gas N)"). The sender is then
+debited `gas × effectivePrice` (geth's `buyGas`), the frame gets
+`gas − intrinsic` with GASPRICE at the effective price, and running out of
+a limit the caller set is `CallOutOfGas` ("out of gas") — all answers, like
+the estimate's. The prefetching and CCIP-Read layers run the same plan; the
+prefetch loop primes the sender's real balance before its first discovery
+pass whenever the call moves value or pays for gas, since a placeholder
+balance cannot cover the transfer Besu makes before the first opcode.
 
 The behaviour for reverting transactions matters: the plan says "do
 *not* return a gas estimate for a reverting transaction (the caller
@@ -97,21 +129,53 @@ should not broadcast it)." Returning the gas-up-to-revert would let a
 broadcasted transaction silently consume gas to revert; failing
 explicitly forces the caller to handle it.
 
-### Why not a binary search
+### Why a search (#509 stage 2)
 
-`eth_estimateGas` on most node implementations binary-searches the gas
-limit between the actual usage and the ceiling, looking for the minimum
-that still succeeds. We don't, because:
+v1 answered one run's high-water mark plus 15%, on the reasoning that the
+buffer captures the slack a search would find at the cost of one EVM run
+instead of many. It does not, in two cases a wallet meets:
 
-- It costs N × execution time (typically ~30 iterations).
-- The 15% buffer above the high-water mark of one execution captures
-  the same slack at one EVM run instead of many.
-- For the corpus (transfers, swaps, NFT mints) the gas usage is mostly
-  data-independent — one run gives a tight number.
+- **Nested calls.** EIP-150 makes every CALL withhold 1/64 of the gas it
+  could forward, so the limit a call chain needs grows as (64/63)^depth
+  over the innermost work — past 1.15 at depth 9. A single run at the
+  ceiling never feels this: it has gas to spare at every level.
+- **`gasleft()` checks.** A contract that requires some gas to remain (a
+  relayer's reserve, a `try` that must be able to catch) draws little at
+  the ceiling yet reverts at any limit that leaves it short.
 
-If the corpus reveals cases where a binary search would noticeably
-beat the buffer, we can add it as a config flag later. Out of scope
-for v1.
+So both engines run geth's search (`eth/gasestimator`): a first probe at
+`(drawn + 2300) × 64/63` is usually the answer, and bisection, skewed low,
+stops within 1.5% of the lowest limit that works — then the 15% buffer on
+top, the owner's choice (#509). One deliberate difference from geth: its
+search starts from what the run was charged (after refunds), ours from
+what it drew. Below the draw a limit can only "work" by running a
+different transaction — a failure caught deep inside (try/catch, a
+multicall that tolerates one) or a `gasleft()` branch — which is not the
+transaction the caller simulated, so the answer never goes below it. A probe
+still cannot tell a caught failure from success, so above the draw the
+search finds where the outer transaction succeeds: a call whose failure is
+caught d levels down needs (64/63)^d of its draw, which the 1.15 buffer
+covers through d = 8, not beyond. The
+cost stays small: the probe usually lands, and the error ratio ends the
+bisection after a handful of runs on one EVM, reading state the first run
+already fetched. The Rust search stops when its request is abandoned; the
+Java one, which an abandoned JSON-RPC wait does not stop, answers the
+working limit in hand after 10 s of bisecting. `EstimateGasTest` (Java) and the
+`myotis-evm` executor tests (Rust) pin the nested-call, refund-heavy and
+`gasleft()` cases against the lowest limit a call actually runs with.
+
+The real case is pinned too: `rust/testdata/evm/relayadapt7702-shield.json`
+is the world a RAILGUN "shield ETH" through a fresh EIP-7702 account reads
+(#509's transaction, with throwaway keys), recorded from the Rust engine's
+verified mainnet state by `rust/myotis-net/examples/record_shield_fixture.rs`
+(how and why: `rust/testdata/evm/README.md`). Its replay shows the estimate
+completes the shield where the request without its authorization list
+answered #509's ~49k, and with a broadcaster's `requireSuccess = false`
+multicall it shows the swallowed-call case on real code: the lowest limit at
+which that transaction succeeds swallows the shield, and the estimate, kept
+above the draw, does not. The Java engine, which refuses authorization lists,
+replays the retry from the already-delegated account and must answer the
+Rust engine's number exactly.
 
 ### Public surface
 
@@ -121,7 +185,7 @@ overrides it in `DefaultEvmExecutor` with the real implementation.
 `PrefetchingEvmExecutor` and `CcipReadEvmExecutor` inherit the default
 unless they want to wrap (Phase 5.1: have the prefetcher run estimation
 inside the convergence loop too, so the access list is warmed before
-the high-water-mark run; defer until benchmark numbers say it matters).
+the run at the ceiling; defer until benchmark numbers say it matters).
 
 ### Wallet integration
 
@@ -157,9 +221,14 @@ Phase 5 completion (this branch):
 
 ## Out of scope
 
-- Contract-creation transactions (`to == null`). Phase 5.1.
-- EIP-2930 access lists. Phase 5.1.
-- EIP-3860 init-code length cost. Phase 5.1.
-- Binary-search refinement. Likely never; the buffer is fine.
+- Contract-creation transactions (`to == null`). Phase 5.1 — shipped on
+  the Rust engine (#509); the Java engine refuses them (`-32602`).
+- EIP-2930 access lists. Phase 5.1 — shipped on the Rust engine (#509);
+  the Java engine refuses them (`-32602`).
+- EIP-3860 init-code length cost. Phase 5.1 — shipped on the Rust engine
+  with contract creation (#509).
+- Binary-search refinement — shipped in both engines (#509 stage 2): one
+  run plus the buffer was not a limit that works for every transaction;
+  see *Why a search* above.
 - Cross-state-root estimation (using a state different from the one
   the tx will execute against). Out of scope.

@@ -5471,6 +5471,37 @@ impl ElReader {
         Ok(Self::call_answer(anchor, block_number, joined))
     }
 
+    /// Verified `eth_call` for a full transaction object (#509): every field
+    /// the request names is applied as `eth_estimateGas` applies it (see
+    /// `myotis_evm::tx`) or the request is refused, with `overrides` layered
+    /// over verified state for this call only. `anchor` selects the block as
+    /// for [`Self::eth_call_overridden`]. A call that cannot succeed within
+    /// the caller's own gas, fee cap or funds yields
+    /// [`CallOutcome::Infeasible`] (geth's answer and message).
+    pub async fn eth_call_tx(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        self.request(self.eth_call_tx_inner(anchor, tx, chain_id, overrides)).await
+    }
+
+    async fn eth_call_tx_inner(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallAnswer, String> {
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let block_number = ctx.block_number;
+        let joined =
+            super::request::blocking(move || executor.call_tx(&tx, &ctx, overrides)).await?;
+        Ok(Self::call_answer(anchor, block_number, joined))
+    }
+
     /// Verified `eth_estimateGas` for a full transaction object (#509): every
     /// field the request names is applied or the request is refused (see
     /// `myotis_evm::tx`), with `overrides` layered over verified state for this
@@ -5769,18 +5800,7 @@ impl ElReader {
         what: &str,
         finalized: bool,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        // Snapshot the snap peers once: one consistent set for the whole call.
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(format!("no snap peer available for {what}"));
-        }
-        let oracle = Arc::new(PoolOracle::new(
-            peers,
-            tokio::runtime::Handle::current(),
-            Some(self.pool.quality_sink()),
-            Arc::clone(&self.read_stats),
-            finalized,
-        ));
+        let oracle = self.snap_oracle(what, finalized).await?;
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
         // `Arc::clone` would instead infer `Arc<dyn Trait>` and fail to type-check).
@@ -5788,6 +5808,44 @@ impl ElReader {
         let bytecode_cache = Arc::clone(&self.evm_bytecode_cache);
         let executor = EvmExecutor::new(oracle, proof_cache, bytecode_cache);
         Ok((ctx, executor))
+    }
+
+    /// A verified-state oracle over a fresh snap-peer snapshot: one consistent
+    /// peer set for the whole call. `finalized` as for [`PoolOracle::new`].
+    async fn snap_oracle(&self, what: &str, finalized: bool) -> Result<Arc<PoolOracle>, String> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(format!("no snap peer available for {what}"));
+        }
+        Ok(Arc::new(PoolOracle::new(
+            peers,
+            tokio::runtime::Handle::current(),
+            Some(self.pool.quality_sink()),
+            Arc::clone(&self.read_stats),
+            finalized,
+        )))
+    }
+
+    /// The EVM fixture recorder's seam (`examples/record_shield_fixture.rs`,
+    /// #509): the verified head's hash and [`BlockContext`](myotis_evm::BlockContext),
+    /// and a snap-peer oracle over a fresh peer snapshot: what
+    /// [`Self::estimate_gas_tx`] runs against, at the context's `state_root`
+    /// (the oracle itself takes the root on every read). Every value it returns
+    /// has passed its proof checks; a caller that wraps it only observes. Its
+    /// reads block on this runtime, so call them from a blocking thread, and
+    /// they run outside any request scope (no deadline, no cancellation), which
+    /// is why this is test tooling behind `fixture-recorder`, never a read path.
+    #[cfg(feature = "fixture-recorder")]
+    pub async fn head_evm_oracle(
+        &self,
+        chain_id: u64,
+    ) -> Result<([u8; 32], myotis_evm::BlockContext, Arc<dyn myotis_evm::SnapStateOracle>), String> {
+        let Some((hash, header)) = self.verified_header_by_number(None).await? else {
+            return Err("no verified head to record against".to_string());
+        };
+        let ctx = block_context(&header, chain_id)?;
+        let oracle = self.snap_oracle("the fixture recorder", false).await?;
+        Ok((hash, ctx, oracle))
     }
 
     /// Verified `eth_getBlockByNumber`. `target` is the block number, or `None`

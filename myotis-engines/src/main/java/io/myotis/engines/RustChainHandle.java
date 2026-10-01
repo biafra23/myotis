@@ -930,7 +930,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  code-3 error. The permanent {@code {"error","code":-32602}} envelope (a
      *  block the node will never serve since ABI 27, an executor refusal since
      *  ABI 33) is {@link io.myotis.api.CallResult.Status#REFUSED}; a plain
-     *  {@code {"error"}} still throws. */
+     *  {@code {"error"}} still throws. {@code {"status":"infeasible","reason"}}
+     *  (ABI 35: a transaction-object call, or a plain one whose calldata alone
+     *  costs more than the budget — which only this engine charges) is
+     *  {@link io.myotis.api.CallResult.Status#INFEASIBLE}: the call cannot
+     *  succeed within the caller's gas, fee cap or funds, and {@code reason} is
+     *  geth's message. */
     static io.myotis.api.CallResult callDetailedFromJson(String json) {
         JsonObject o = parseJsonObject(json, "call");
         String refusal = permanentRefusalOrNull(o);
@@ -944,6 +949,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             }
             if ("revert".equals(status)) {
                 return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex")));
+            }
+            if ("infeasible".equals(status)) {
+                String reason = stringOrNull(o, "reason");
+                if (reason == null || reason.isBlank()) {
+                    throw new EngineException("call JSON: status=infeasible without a reason");
+                }
+                return io.myotis.api.CallResult.infeasible(reason);
             }
             return io.myotis.api.CallResult.unavailable(stringOrNull(o, "reason"));
         } catch (RuntimeException e) {
@@ -1026,6 +1038,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             String fromHex, String toHex, String dataHex, String valueDecimal) {
         return estimateGasDetailedFromJson(gated(() -> RustEngineNative.nativeEstimateGasJson(
                 handle, fromHex, toHex, dataHex, valueDecimal)));
+    }
+
+    /**
+     * One verified {@code eth_call} for the full transaction object (ABI 35,
+     * #509): the arguments of {@link #estimateGasTxVerifiedDetailed}. Throws
+     * {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.CallResult callTxVerifiedDetailed(String txJson, String block, String stateOverridesJson) {
+        return callDetailedFromJson(gated(() -> RustEngineNative.nativeEthCallTxJson(
+                handle, txJson, block, stateOverridesJson)));
     }
 
     /**

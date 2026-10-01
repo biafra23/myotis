@@ -10,6 +10,7 @@ import io.myotis.engine.capi.myotis_estimate_gas_json
 import io.myotis.engine.capi.myotis_estimate_gas_tx_json
 import io.myotis.engine.capi.myotis_eth_call_json
 import io.myotis.engine.capi.myotis_eth_call_overrides_json
+import io.myotis.engine.capi.myotis_eth_call_tx_json
 import io.myotis.engine.capi.myotis_fee_estimate_json
 import io.myotis.engine.capi.myotis_fee_history_json
 import io.myotis.engine.capi.myotis_get_block_by_hash_json
@@ -242,6 +243,13 @@ object RustEngine {
      *  request refused with the permanent -32602 envelope. */
     fun estimateGasTxJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
         jsonCall { myotis_estimate_gas_tx_json(handle, txJson, block, stateOverrides) }
+
+    /** `eth_call` for the FULL transaction object (ABI >= 35, #509): the arguments
+     *  of [estimateGasTxJson]. Every field is applied or the request refused with
+     *  the permanent -32602 envelope; a call that cannot succeed within the
+     *  caller's gas, fee cap or funds is `{"status":"infeasible","reason"}`. */
+    fun ethCallTxJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
+        jsonCall { myotis_eth_call_tx_json(handle, txJson, block, stateOverrides) }
 
     fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }

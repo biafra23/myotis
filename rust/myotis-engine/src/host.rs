@@ -1994,25 +1994,74 @@ pub fn estimate_gas_json(
 /// `infeasible` status for a transaction that does not fit the caller's gas or
 /// funds) or a retryable `{"error": "..."}`.
 pub fn estimate_gas_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
-    // Every refusal of the request's own arguments is permanent (-32602), and
-    // decided before the handle is consulted: no retry, and no sync progress,
-    // changes a contradictory request.
-    let selector = match parse_read_block(block) {
-        Ok(selector) => selector,
+    match parse_tx_args(tx_json, block, overrides_json) {
+        Ok((tx, selector, overrides)) => run_estimate(handle, tx, selector, overrides),
+        Err(json) => json,
+    }
+}
+
+/// `nativeEthCallTxJson` (ABI ≥ 35, #509): verified `eth_call` for the FULL
+/// JSON-RPC transaction object — the same `tx_json`, `block` and
+/// `overrides_json` as [`estimate_gas_tx_json`], every field applied as the
+/// estimate applies it (see [`myotis_evm::EvmExecutor::call_tx`]: `gas` is
+/// the call's limit, a fee is checked against the base fee and charged to the
+/// sender, both lists are applied) or the request refused with the permanent
+/// `{"error","code":-32602}` envelope. Otherwise the call JSON
+/// ([`eljson::call_json`], including the `infeasible` status for a call that
+/// cannot succeed within the caller's gas, fee cap or funds) or a retryable
+/// `{"error": "..."}`.
+pub fn eth_call_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
+    let (tx, selector, overrides) = match parse_tx_args(tx_json, block, overrides_json) {
+        Ok(parsed) => parsed,
         Err(json) => return json,
     };
-    let overrides = match parse_state_overrides(overrides_json) {
-        Ok(o) => o,
-        Err(msg) => return eljson::invalid_params_json(&msg),
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
+        Err(json) => return json,
     };
-    let tx = match parse_tx_request(tx_json) {
-        Ok(tx) => tx,
-        Err(msg) => return eljson::invalid_params_json(&format!("invalid transaction object: {msg}")),
-    };
-    if let Err(msg) = tx.validate() {
-        return eljson::invalid_params_json(&format!("invalid transaction object: {msg}"));
+    match engine.rt.block_on(async { reader.eth_call_tx(anchor, tx, chain_id, overrides).await }) {
+        Ok(answer) => eljson::call_json(&answer),
+        Err(e) => eljson::error_json(&e),
     }
-    run_estimate(handle, tx, selector, overrides)
+}
+
+/// The request half of the transaction-object entry points. Every refusal of
+/// the request's own arguments is permanent (-32602), and decided before the
+/// handle is consulted: no retry, and no sync progress, changes a
+/// contradictory request. `Err` is the ready JSON.
+fn parse_tx_args(
+    tx_json: &str,
+    block: &str,
+    overrides_json: &str,
+) -> Result<(myotis_evm::TxRequest, BlockSelector, myotis_evm::overrides::StateOverrides), String> {
+    let selector = parse_read_block(block)?;
+    let overrides = parse_state_overrides(overrides_json).map_err(|msg| eljson::invalid_params_json(&msg))?;
+    let tx = parse_tx_request(tx_json)
+        .map_err(|msg| eljson::invalid_params_json(&format!("invalid transaction object: {msg}")))?;
+    tx.validate()
+        .map_err(|msg| eljson::invalid_params_json(&format!("invalid transaction object: {msg}")))?;
+    Ok((tx, selector, overrides))
+}
+
+/// The node half: resolve the handle, refuse a `chainId` for another chain,
+/// and anchor the selector against the head as of dispatch (like the host
+/// adapters' own check). `Err` is the ready JSON.
+fn tx_target(
+    handle: i64,
+    tx: &myotis_evm::TxRequest,
+    selector: BlockSelector,
+) -> Result<(&'static EngineState, Arc<ElReader>, u64, ReadAnchor), String> {
+    let engine = engine().ok_or_else(|| eljson::error_json("engine unavailable"))?;
+    let (reader, chain_id) = snapshot_reader_evm(engine, handle).map_err(eljson::error_json)?;
+    if let Some(requested) = tx.chain_id {
+        if requested != U256::from(chain_id) {
+            return Err(eljson::invalid_params_json(&format!(
+                "invalid transaction object: chainId {requested} does not match this node's chain ({chain_id})"
+            )));
+        }
+    }
+    let anchor = read_anchor(selector, &reader)?;
+    Ok((engine, reader, chain_id, anchor))
 }
 
 /// The shared tail of the estimate entry points: resolve the handle and the
@@ -2023,23 +2072,8 @@ fn run_estimate(
     selector: BlockSelector,
     overrides: myotis_evm::overrides::StateOverrides,
 ) -> String {
-    let Some(engine) = engine() else {
-        return eljson::error_json("engine unavailable");
-    };
-    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
-        Ok(snap) => snap,
-        Err(msg) => return eljson::error_json(msg),
-    };
-    if let Some(requested) = tx.chain_id {
-        if requested != U256::from(chain_id) {
-            return eljson::invalid_params_json(&format!(
-                "invalid transaction object: chainId {requested} does not match this node's chain ({chain_id})"
-            ));
-        }
-    }
-    // Against the head as of dispatch, like the host adapters' own check.
-    let anchor = match read_anchor(selector, &reader) {
-        Ok(anchor) => anchor,
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
         Err(json) => return json,
     };
     match engine
@@ -3029,6 +3063,28 @@ mod tests {
     /// The cross-language golden: the router's canonical object for the #509
     /// request, VERBATIM from `RpcTransactionArgsTest.CANONICAL` (jsonrpc-server)
     /// — what every JVM and iOS host hands this parser. Change both together.
+    /// This parser and the fixture's read the recorded RelayAdapt7702 shield
+    /// (`rust/testdata/evm/relayadapt7702-shield.json`, #509) and its variants
+    /// as the same transactions: what the replay runs is what a wallet's
+    /// request makes this engine run. `MYOTIS_SHIELD_FIXTURE` as for the replay.
+    #[test]
+    fn parse_tx_request_reads_the_recorded_shield_as_the_replay_does() {
+        let path = std::env::var("MYOTIS_SHIELD_FIXTURE").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/evm/relayadapt7702-shield.json").to_string()
+        });
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let fixture = myotis_evm::fixture::EvmFixture::from_json(&text).unwrap();
+        assert_eq!(parse_tx_request(&fixture.request.to_string()).unwrap(), fixture.tx_request().unwrap());
+        for variant in ["requireSuccessFalse", "retryFromDelegated"] {
+            let request = &fixture.meta["variants"][variant];
+            assert_eq!(
+                parse_tx_request(&request.to_string()).unwrap(),
+                myotis_evm::fixture::request_from_json(request).unwrap(),
+                "{variant}"
+            );
+        }
+    }
+
     #[test]
     fn parse_tx_request_reads_the_routers_canonical_form() {
         const CANONICAL: &str = concat!(
