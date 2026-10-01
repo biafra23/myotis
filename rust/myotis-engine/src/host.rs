@@ -1580,13 +1580,21 @@ const CALL_BLOCK_LAG_TOLERANCE: u64 = 64;
 /// against head state. Mirrors `RpcBlockWindow.BLOCK_NUM_TOLERANCE`.
 const CALL_BLOCK_AHEAD_TOLERANCE: u64 = 16;
 
+/// Why `safe` is refused by every selector parser here (#366): the light client
+/// tracks the verified head and the beacon-finalized block, not the safe
+/// (justified) head, and answering it from the head would answer for a
+/// different block.
+const SAFE_TAG_REFUSAL: &str = "the 'safe' tag is not served: this node tracks the verified head \
+    and the beacon-finalized block, not the safe (justified) head; ask for 'latest' or 'finalized'";
+
 /// A parsed eth block selector — for `eth_call` ([`parse_call_block`]) and the
 /// block reads ([`parse_block_target`]), whose accepted syntax differs but
 /// whose meaning is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockSelector {
-    /// A head tag (`latest`/`pending`/`safe`), or empty — the JSON-RPC
-    /// default. `safe` and `pending` still mean the head (#366).
+    /// A head tag (`latest`/`pending`), or empty — the JSON-RPC default.
+    /// `pending` means the head (this node has no view of the mempool); `safe`
+    /// is refused by every parser here (#366).
     Head,
     /// The `finalized` tag: the beacon-FINALIZED block (ABI ≥ 30, #465) —
     /// applied, not silently mapped to the head; for a block read resolved
@@ -1605,16 +1613,21 @@ enum BlockSelector {
 /// where Kotlin's `toLongOrNull` also takes a sign and non-ASCII digits. No
 /// JSON-RPC quantity carries either.
 ///
-/// `Err` is a selector no retry can make servable (`earliest`, a block hash,
-/// garbage), so the caller refuses it as invalid params.
+/// `Err` is a selector no retry can make servable (`safe`, `earliest`, a block
+/// hash, garbage), so the caller refuses it as invalid params. `safe` is
+/// refused rather than read as the head (#366): nothing here tracks the safe
+/// (justified) head, and the head is a different block.
 fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
     let b = block.trim();
     let is_tag = |t: &str| b.eq_ignore_ascii_case(t);
-    if b.is_empty() || ["latest", "pending", "safe"].into_iter().any(is_tag) {
+    if b.is_empty() || ["latest", "pending"].into_iter().any(is_tag) {
         return Ok(BlockSelector::Head);
     }
     if is_tag("finalized") {
         return Ok(BlockSelector::Finalized);
+    }
+    if is_tag("safe") {
+        return Err(SAFE_TAG_REFUSAL.to_string());
     }
     if is_tag("earliest") {
         return Err("earliest (genesis) is not served: verified reads run against the \
@@ -1639,8 +1652,8 @@ fn parse_call_block(block: &str) -> Result<BlockSelector, String> {
     let shown: String = b.chars().take(66).collect();
     let more = if shown.len() < b.len() { "…" } else { "" };
     Err(format!(
-        "invalid block selector {shown:?}{more} (expected latest, pending, safe, finalized or a \
-         block number)"
+        "invalid block selector {shown:?}{more} (expected latest, pending, finalized or a block \
+         number)"
     ))
 }
 
@@ -2612,7 +2625,8 @@ fn parse_percentiles(json: &str) -> Result<Option<Vec<f64>>, &'static str> {
 /// -32000).
 fn parse_block_target(tag: &str) -> Result<BlockSelector, &'static str> {
     match tag {
-        "latest" | "pending" | "safe" => Ok(BlockSelector::Head),
+        "latest" | "pending" => Ok(BlockSelector::Head),
+        "safe" => Err(SAFE_TAG_REFUSAL),
         "finalized" => Ok(BlockSelector::Finalized),
         "earliest" => Err("earliest (genesis) is not served verified"),
         hex => {
@@ -3810,12 +3824,12 @@ mod tests {
             .map(|j| serde_json::from_str(j).unwrap())
             .collect()
         };
-        for servable in ["", "latest", "pending", "safe", "finalized", "0x10"] {
+        for servable in ["", "latest", "pending", "finalized", "0x10"] {
             for v in read(servable) {
                 assert_eq!(v["error"], "unknown handle", "{servable}: {v}");
             }
         }
-        for refused in ["earliest", "0xzz", &format!("0x{}", "ab".repeat(32))] {
+        for refused in ["safe", "earliest", "0xzz", &format!("0x{}", "ab".repeat(32))] {
             for v in read(refused) {
                 assert_eq!(v["code"], -32602, "{refused}: {v}");
             }
@@ -3980,7 +3994,8 @@ mod tests {
     fn parse_block_target_cases() {
         assert_eq!(parse_block_target("latest"), Ok(BlockSelector::Head));
         assert_eq!(parse_block_target("pending"), Ok(BlockSelector::Head));
-        assert_eq!(parse_block_target("safe"), Ok(BlockSelector::Head));
+        // `safe` names a block nothing here tracks: refused, not read as the head.
+        assert_eq!(parse_block_target("safe"), Err(SAFE_TAG_REFUSAL));
         assert_eq!(parse_block_target("finalized"), Ok(BlockSelector::Finalized));
         assert_eq!(parse_block_target("0x1406f40"), Ok(BlockSelector::Number(21_000_000)));
         // `finalized` resolves to the anchor's finalized block — applied — and
@@ -4381,7 +4396,8 @@ fn parse_get_logs_filter(
         match v {
             None | Some(serde_json::Value::Null) => Ok(head),
             Some(serde_json::Value::String(s)) => match s.as_str() {
-                "latest" | "pending" | "safe" => Ok(head),
+                "latest" | "pending" => Ok(head),
+                "safe" => Err(SAFE_TAG_REFUSAL.to_string()),
                 "finalized" => Ok(finalized),
                 "earliest" => Ok(0),
                 hex => hex
@@ -4436,7 +4452,10 @@ fn parse_get_logs_filter(
 /// The eth_getLogs query. Returns the log array ONLY when the requested
 /// range is inside indexed coverage; every other case is `{"error": ...}`
 /// (the router maps it to strict -32000) — never an empty array for an
-/// unindexed range.
+/// unindexed range. A filter that fails to parse — malformed, a `safe` or hash
+/// selector, no address — is the permanent `{"error","code":-32602}` (#366);
+/// every refusal that depends on the index (coverage, the watch-list, a range
+/// inverted by `latest` resolving to the covered top) stays retryable.
 pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     let out = get_logs_json_impl(handle, filter_json);
     // Observability for wallet integration (requested during the Kohaku
@@ -4447,13 +4466,13 @@ pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     // line per minute. (Filter content is addresses/topics/ranges — the
     // watched contract set — no secrets, but it IS the wallet's query
     // surface, hence info not warn.)
-    if let Some(reason) = out.strip_prefix("{\"error\":") {
-        // Strip the JSON wrapping (trailing brace and the value's quotes) so
-        // the log line reads as prose, not nested JSON.
-        let reason = reason
-            .strip_suffix('}')
-            .unwrap_or(reason)
-            .trim_matches('"');
+    if out.starts_with("{\"error\":") {
+        // The message alone, so the log line reads as prose rather than nested
+        // JSON — from either envelope, `{"error"}` or `{"error","code"}`.
+        let reason = serde_json::from_str::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| out.clone());
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         handle.hash(&mut h); // distinct networks debounce independently
@@ -4505,8 +4524,11 @@ const LOG_INDEX_LATEST_SLACK: u64 = 4;
 
 fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     use myotis_net::el::logindex::QueryError;
+    // A filter that does not parse, or names something this node never serves,
+    // is refused for good — the -32602 envelope, never the retryable error a
+    // client would spin on (#366). Coverage refusals below stay retryable.
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
-        return eljson::error_json("malformed filter");
+        return eljson::invalid_params_json("malformed filter");
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -4531,7 +4553,7 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         .map_or(head, |top| top.min(head));
     let filter = match parse_get_logs_filter(&v, servable, reader.finalized_block_number()) {
         Ok(f) => f,
-        Err(msg) => return eljson::error_json(&msg),
+        Err(msg) => return eljson::invalid_params_json(&msg),
     };
     let mut result = reader.with_log_index(|ix| ix.query(&filter));
     // On-demand tail fill. An explicit `toBlock` at the very head can land one
@@ -4631,6 +4653,10 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
             ),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
+        // Retryable, unlike the parse refusals above: `latest` resolves to the
+        // index's covered top, which trails the head by up to a tick, so a poll
+        // from the head to `latest` can be inverted now and answerable moments
+        // later — a permanent code here would stop a polling wallet for good.
         Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
     }
 }
@@ -4884,7 +4910,7 @@ mod call_target_tests {
 mod call_block_tests {
     use super::{
         check_call_block, eth_call_json, eth_call_overrides_json, parse_call_block, BlockSelector,
-        CallBlockRefusal, CALL_BLOCK_AHEAD_TOLERANCE, CALL_BLOCK_LAG_TOLERANCE,
+        CallBlockRefusal, CALL_BLOCK_AHEAD_TOLERANCE, CALL_BLOCK_LAG_TOLERANCE, SAFE_TAG_REFUSAL,
     };
 
     /// The JVM twin's head (`RustBlockWindowTest`), so the two tables line up.
@@ -4901,8 +4927,12 @@ mod call_block_tests {
 
     #[test]
     fn head_tags_and_default_are_servable() {
-        for tag in ["latest", "pending", "safe", "", "  ", "LATEST", "Pending"] {
+        for tag in ["latest", "pending", "", "  ", "LATEST", "Pending"] {
             assert_eq!(parse_call_block(tag), Ok(BlockSelector::Head), "{tag:?}");
+        }
+        // The safe (justified) head is not tracked: refused, never the head (#366).
+        for tag in ["safe", "SAFE", " safe "] {
+            assert_eq!(parse_call_block(tag), Err(SAFE_TAG_REFUSAL.to_string()), "{tag:?}");
         }
         // A tag needs no head to be checked against; without one, the executor
         // fails with its own not-synced error.
@@ -5039,8 +5069,9 @@ mod get_logs_filter_tests {
         assert_eq!((ok.from_block, ok.to_block), (0, 900));
         let ok = f(&format!("{{{addr},\"fromBlock\":\"0x64\"}}")).unwrap();
         assert_eq!(ok.from_block, 100);
-        for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}"] {
+        for bad in ["\"0x\"", "\"0x+5\"", "\"nope\"", "5", "{}", "\"safe\""] {
             assert!(f(&format!("{{{addr},\"fromBlock\":{bad}}}")).is_err(), "{bad}");
+            assert!(f(&format!("{{{addr},\"toBlock\":{bad}}}")).is_err(), "{bad}");
         }
     }
 

@@ -3,8 +3,10 @@ package io.myotis.jsonrpc
 /**
  * The block-selector serving window shared by every RpcBackend adapter (the
  * JVM RustVerifiedReads delegates here; the iOS backend calls it directly), so
- * the policy can never drift between hosts: head tags are always servable,
- * `earliest` never is, and a number pin is served from head state only within
+ * the policy can never drift between hosts: head tags (`latest`, `pending`)
+ * and `finalized` are always servable, `safe` and `earliest` never are (no
+ * engine tracks the safe head or holds genesis — #366), and a number pin is
+ * served from head state only within
  * [BLOCK_NUM_LAG_TOLERANCE] below to [BLOCK_NUM_TOLERANCE] above the anchored
  * head. Sub-second head lag plus a small reorg/announcement margin — outside
  * that, honest data would need historical state we don't hold.
@@ -26,8 +28,8 @@ object RpcBlockWindow {
         if (block.isNullOrBlank()) return true
         val b = block.trim()
         when (b.lowercase()) {
-            "latest", "pending", "safe", "finalized" -> return true
-            "earliest" -> return false
+            "latest", "pending", "finalized" -> return true
+            "safe", "earliest" -> return false
         }
         val n = if (b.startsWith("0x") || b.startsWith("0X")) {
             b.substring(2).toLongOrNull(16)

@@ -248,8 +248,8 @@ class RpcRouter(
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
         val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_estimateGas")) {
-            is TxBlock.Refuse -> return EstimateTx.Refuse(selector.why)
-            is TxBlock.At -> selector.selector
+            is SelectorParse.Refuse -> return EstimateTx.Refuse(selector.why)
+            is SelectorParse.Ok -> selector.selector
         }
         unservableTx(tx, "eth_estimateGas", "an estimate without it would be for a different transaction")
             ?.let { return EstimateTx.Refuse(it) }
@@ -285,8 +285,8 @@ class RpcRouter(
         // Every selector form — tag, number, EIP-1898's object — is applied or
         // refused exactly as for eth_estimateGas ([txBlock], #366).
         val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_call")) {
-            is TxBlock.Refuse -> return CallTx.Refuse(selector.why)
-            is TxBlock.At -> selector.selector
+            is SelectorParse.Refuse -> return CallTx.Refuse(selector.why)
+            is SelectorParse.Ok -> selector.selector
         }
         unservableTx(tx, "eth_call", "the call would run without it")?.let { return CallTx.Refuse(it) }
         return CallTx.Serve(tx, block)
@@ -312,28 +312,20 @@ class RpcRouter(
         return null
     }
 
-    /** A transaction method's block selector: one to pass on, or why not. */
-    private sealed interface TxBlock {
-        class At(val selector: Selector) : TxBlock
-        class Refuse(val why: String) : TxBlock
-    }
-
     /** [method]'s block selector (`params[1]`), applied or refused — never
      *  silently read as the head: [parseSelector]'s reading of a
      *  `BlockNumberOrHash`, less a block hash (bare or `{"blockHash": …}`),
      *  which names historical state this node does not hold. eth_call and
      *  eth_estimateGas read every selector through it, so a refusal here is
      *  the same in the handler and in the strict branch. */
-    private fun txBlock(param: JsonElement?, method: String): TxBlock =
-        when (val parsed = parseSelector(param, 1, Takes.NUMBER_OR_HASH)) {
-            is SelectorParse.Refuse -> TxBlock.Refuse(parsed.why)
-            is SelectorParse.Ok ->
-                if (parsed.selector.hash) {
-                    TxBlock.Refuse("$method at a block hash is not supported (this node holds no historical state)")
-                } else {
-                    TxBlock.At(parsed.selector)
-                }
+    private fun txBlock(param: JsonElement?, method: String): SelectorParse {
+        val parsed = parseSelector(param, 1, Takes.NUMBER_OR_HASH)
+        return if (parsed is SelectorParse.Ok && parsed.selector.hash) {
+            SelectorParse.Refuse("$method at a block hash is not supported (this node holds no historical state)")
+        } else {
+            parsed
         }
+    }
 
     /** The methods that take override parameters. `eth_call` and
      *  `eth_estimateGas` state overrides are APPLIED when the backend supports
@@ -734,7 +726,8 @@ class RpcRouter(
     private class Selector(val value: String, val number: Long?, val hash: Boolean)
 
     /** A selector, or why it is refused — for the transaction methods, whose
-     *  strict branch re-derives the refusal ([txBlock]). */
+     *  strict branch re-derives the refusal ([txBlock]), and for
+     *  [selectorAt], which raises it. */
     private sealed interface SelectorParse {
         class Ok(val selector: Selector) : SelectorParse
         class Refuse(val why: String) : SelectorParse
@@ -758,16 +751,24 @@ class RpcRouter(
      */
     private fun parseSelector(param: JsonElement?, argIndex: Int, takes: Takes): SelectorParse {
         fun refuse(why: String) = SelectorParse.Refuse("invalid argument $argIndex: $why")
+        // A bare string may name a hash where the method takes one; EIP-1898's
+        // `blockNumber` field never does — 64 hex digits there are a number out
+        // of range, not a hash to look the block up by.
+        var hashAllowed = takes == Takes.NUMBER_OR_HASH
         val raw: String = when (param) {
             null, is JsonNull -> "latest"
             is JsonPrimitive -> param.takeIf { it.isString }?.contentOrNull?.trim()
-                ?: return refuse("expected a block tag or a 0x-prefixed hex block number, not a JSON number")
+                ?: return refuse("expected a block tag or a 0x-prefixed hex block number as a JSON string")
             is JsonObject -> {
                 if (takes != Takes.NUMBER_OR_HASH) {
                     return refuse("expected a block tag or number; this method takes no EIP-1898 block object")
                 }
                 val byHash = param["blockHash"]?.takeUnless { it is JsonNull }
                 val byNumber = param["blockNumber"]?.takeUnless { it is JsonNull }
+                // `requireCanonical` is type-checked but needs nothing applied:
+                // both engines resolve a hash only among the canonical blocks
+                // they verified, so a non-canonical hash is unknown either way
+                // (eth's null), as the flag asks.
                 param["requireCanonical"]?.takeUnless { it is JsonNull }?.let {
                     if ((it as? JsonPrimitive)?.takeUnless { p -> p.isString }?.booleanOrNull == null) {
                         return refuse("'requireCanonical' must be a boolean")
@@ -783,8 +784,11 @@ class RpcRouter(
                         }
                         return SelectorParse.Ok(Selector(h.lowercase(), number = null, hash = true))
                     }
-                    byNumber != null -> (byNumber as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.trim()
-                        ?: return refuse("'blockNumber' must be a block tag or a 0x-prefixed hex number")
+                    byNumber != null -> {
+                        hashAllowed = false
+                        (byNumber as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.trim()
+                            ?: return refuse("'blockNumber' must be a block tag or a 0x-prefixed hex number")
+                    }
                     else -> return refuse("a block object needs 'blockHash' or 'blockNumber'")
                 }
             }
@@ -809,12 +813,11 @@ class RpcRouter(
             return refuse("invalid block selector '$shown': expected latest, pending, finalized or a " +
                 "0x-prefixed hex block number" + if (takes == Takes.NUMBER_OR_HASH) " or block hash" else "")
         }
-        if (s.length == 66) {
-            return if (takes == Takes.NUMBER_OR_HASH) {
-                SelectorParse.Ok(Selector(s.lowercase(), number = null, hash = true))
-            } else {
-                refuse("a block hash is not a block number; this method takes a number or a tag")
-            }
+        if (s.length == 66 && hashAllowed) {
+            return SelectorParse.Ok(Selector(s.lowercase(), number = null, hash = true))
+        }
+        if (s.length == 66 && takes == Takes.NUMBER) {
+            return refuse("a block hash is not a block number; this method takes a number or a tag")
         }
         val digits = s.substring(2).trimStart('0')
         // Leading zeros are tolerated (the value is unambiguous); past 63 bits
@@ -866,19 +869,13 @@ class RpcRouter(
      *  [MAX_FEE_HISTORY_BLOCKS] (see there). */
     private fun JsonArray?.feeHistoryBlockCountAt(i: Int): Long {
         val prim = required(i, "block count") as? JsonPrimitive
+        val decimal = prim?.takeIf { it.isString || it.booleanOrNull == null }
+            ?.let { RpcQuantities.parseWeiQuantity(it.content.trim()) }
             ?: invalid("invalid argument $i: expected the block count as a quantity")
-        val s = prim.content.trim()
-        val digits = if (prim.isString && (s.startsWith("0x") || s.startsWith("0X"))) s.substring(2) else s
-        val radix = if (digits.length != s.length) 16 else 10
-        if (digits.isEmpty() || !digits.all { it.digitToIntOrNull(radix) != null }) {
-            invalid("invalid argument $i: expected the block count as a quantity")
-        }
-        val significant = digits.trimStart('0')
-        if (significant.isEmpty()) invalid("invalid argument $i: the block count must be at least 1")
+        if (decimal == "0") invalid("invalid argument $i: the block count must be at least 1")
         // Past MAX_FEE_HISTORY_BLOCKS the exact value no longer matters: any
         // count that does not fit a Long is far beyond it.
-        val count = significant.toLongOrNull(radix) ?: Long.MAX_VALUE
-        return minOf(count, MAX_FEE_HISTORY_BLOCKS)
+        return minOf(decimal.toLongOrNull() ?: Long.MAX_VALUE, MAX_FEE_HISTORY_BLOCKS)
     }
 
     /** `eth_feeHistory`'s reward percentiles at params[[i]]: absent, null or an

@@ -32,8 +32,10 @@ class RustBlockWindowTest {
     void headTagsAndDefaultAreServable() {
         assertTrue(at("latest"));
         assertTrue(at("pending"));
-        assertTrue(at("safe"));
         assertTrue(at("finalized"));
+        // No engine tracks the safe (justified) head: served from the head it
+        // would answer for a different block, so it is not servable (#366).
+        assertFalse(at("safe"));
         assertTrue(at(null));
         assertTrue(at(""));
     }

@@ -1783,6 +1783,45 @@ class RpcRouterTest {
             """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x10"]}""")))
     }
 
+    @Test fun estimateGas_pinBehindTheWindow_isPermanent_beforeTheEngineIsAsked() {
+        val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"$vitalik"},"0x10"]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertNull(b.lastTx)
+        // In the window it is the engine's to apply.
+        assertEquals("0x5208", result(route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"$vitalik"},"0xff"]}""")))
+        assertEquals("0xff", b.lastTxBlock)
+    }
+
+    @Test fun ethCall_refusedSelector_namesWhy_inStrictMode() {
+        // The strict branch re-derives the refusal ([callTx]); it must carry the
+        // selector's reason, not a generic "cannot be served".
+        val safe = route(FakeBackend(callResult = byteArrayOf(1)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"safe"]}""")
+        assertEquals(-32602, errorCode(safe))
+        assertTrue(safe.contains("'safe' tag is not served"), safe)
+        val java = FakeBackend(callResult = byteArrayOf(1)).apply { finalizedTag = false }
+        val fin = route(java, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"to":"$vitalik"},"finalized"]}""")
+        assertEquals(-32602, errorCode(fin))
+        assertTrue(fin.contains("'finalized' tag is not served"), fin)
+    }
+
+    @Test fun eip1898BlockNumber_withSixtyFourHexDigits_isANumberOutOfRange_neverAHash() {
+        // A `blockNumber` field is a number: 64 hex digits there are out of
+        // range, not a hash to look the block up by.
+        val b = FakeBackend().apply { blockReceiptsJson = "[]" }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts",
+               "params":[{"blockNumber":"$someHash"}]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertNull(b.lastReceiptsSelector)
+        // ...while the same digits left-padded to a small number are that number.
+        val padded = "0x" + "0".repeat(62) + "10"
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":[{"blockNumber":"$padded"}]}""")
+        assertEquals("0x10", b.lastReceiptsSelector)
+    }
+
     @Test fun blockNumberMethods_takeNoBlockObjectOrHash() {
         // geth's BlockNumber, not BlockNumberOrHash: an EIP-1898 object or a hash
         // was read as "latest" by these methods (#366 items 1 and 7).
@@ -1897,7 +1936,7 @@ class RpcRouterTest {
     @Test fun getLogs_engineEnvelopeWithPermanentCode_isInvalidParams() {
         val reads = object : VerifiedReads by FakeBackend() {
             override fun getLogs(filterJson: String): String =
-                """{"error":"address is not on this node's log watch-list","code":-32602}"""
+                """{"error":"unanswerable filter (fromBlock > toBlock)","code":-32602}"""
         }
         val resp = route(reads, """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"address":"$vitalik"}]}""")
         assertEquals(-32602, errorCode(resp), resp)

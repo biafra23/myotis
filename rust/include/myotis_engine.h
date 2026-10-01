@@ -145,15 +145,16 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
  * and "verified" (true = an ok/revert that ran against the beacon-FINALIZED
  * block; always false on unavailable), ABI >= 30.
  * `from` empty = anonymous; `value` is wei as a decimal string.
- * The engine checks `block` itself (ABI >= 27): latest/pending/safe or
+ * The engine checks `block` itself (ABI >= 27): latest/pending or
  * empty/NULL run against the VERIFIED HEAD's state; "finalized" (ABI >= 30)
  * runs against the beacon-finalized block — older and never reorged, but a
  * state peers may already have pruned, so it can fail retryably while latest
- * serves (before ABI 30 it ran against the head); safe and pending still mean
- * the head (#366). A block number (0x-hex, or bare decimal digits) runs only
+ * serves (before ABI 30 it ran against the head); pending means the head
+ * (#366). A block number (0x-hex, or bare decimal digits) runs only
  * within [head-64, head+16], and still against head state. Anything else is
  * refused, never answered from the head:
- *   - behind that window, earliest, a block hash, or a malformed selector:
+ *   - behind that window, safe (no engine tracks the safe head; served from
+ *     the head before #366), earliest, a block hash, or a malformed selector:
  *     {"error","code":-32602}, PERMANENT (JSON-RPC invalid params) — do
  *     not retry. A malformed from/to/data/value is refused the same way;
  *   - ahead of the window, or no verified head yet: a plain {"error"},
@@ -256,7 +257,10 @@ void myotis_string_free(char *s);
 
 /* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
  * get_logs answers only inside indexed coverage; anything else is an
- * {"error": ...} JSON — never an empty array for unindexed ranges. */
+ * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
+ * that fails to parse (malformed, a `safe` or hash selector, no address)
+ * carries "code": -32602 as well, like eth_call's refusals; a refusal that
+ * depends on the index (coverage, the watch-list) stays plain and retryable. */
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);
