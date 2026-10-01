@@ -258,11 +258,15 @@ jumbo multicall from starving the small interactive calls a wallet blocks on (no
   `STATE_PROOF_CACHE_MAX = 65536`) caches proof-verified `(stateRoot, addr, slot) → value` —
   a *cryptographic fact*, so reuse is safe. (2) The forever-valid **`BytecodeCache`** (keyed by
   `codeHash`). (3) A **`VerifiedResultCache`** caches whole *verified results* — `eth_call` return
-  bytes and `estimateGas` values — keyed by the anchored state (`stateRoot:to:keccak(calldata)` for
-  calls, `stateRoot:from:to:keccak(data):value` for estimates), TTL'd to mirror how long the head
-  context stays servable. Safe for the same reason: a result is a pure function of the pinned
-  `stateRoot`, so a retried confirm screen replays bit-identically while a "latest" read that rolled
-  to a new root simply misses and recomputes. Together these let MetaMask's repeated/retried sweeps
+  bytes and `estimateGas` values — keyed by the anchored block (`block:from:to:value:keccak(calldata)`
+  for calls, plus gas and fees for a transaction object; `block:from:to:keccak(data):value:gas:fees`
+  for estimates), where `block` is the state root and every block input the EVM reads: number,
+  timestamp, base fee, gas limit, coinbase, prevRandao and chain id (`VerifiedRpcBackend.blockKey`).
+  TTL'd to mirror how long the head context stays servable. Safe for the same reason: a result is a
+  pure function of the pinned block. Not of its `stateRoot` alone: a fee cap is checked against the
+  base fee and the block opcodes read the rest, so a key on the root alone would replay an answer
+  in a block that shares the root but not the rest. A retried confirm screen replays
+  bit-identically, while a "latest" read that rolled to a new block simply misses and recomputes. Together these let MetaMask's repeated/retried sweeps
   converge instead of re-proving. The anchored **head context is built once and reused for
   `RPC_HEAD_TTL_MS = 12 s`**, so a burst shares one beacon-anchoring instead of re-walking the header
   chain per call.
