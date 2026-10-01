@@ -336,11 +336,13 @@ const WAVE_SILENCE_RECHECK: std::time::Duration = std::time::Duration::from_mill
 #[derive(Debug, PartialEq, Eq)]
 enum WaveFailure {
     /// The peer stayed silent for [`WAVE_SILENCE_DEADLINE`]: the item moves to
-    /// the next peer, and the peer is never struck for it — silence there may
-    /// as well be our own link. It is judged as the hedged race judges a
-    /// silent attempt instead: OUTPACED once another peer serves the item
-    /// ([`ChunkLedger`]).
-    Silent,
+    /// the next peer, and the silence never counts as a failure. It is judged
+    /// as the hedged race judges a silent attempt — OUTPACED ([`silence_verdict`];
+    /// the first outpace since a serve is free, a repeat is a strike) — and
+    /// only on the race's evidence: `link_proven`, another of the call's peers
+    /// delivered a response while this one was silent, so the silence was not
+    /// our own link.
+    Silent { link_proven: bool },
     /// The peer answered with an error, or the request failed outright.
     Failed(String),
 }
@@ -349,7 +351,9 @@ enum WaveFailure {
 /// peer has delivered NO response to any of our requests for
 /// [`WAVE_SILENCE_DEADLINE`], counted from the later of this request's actual
 /// send (`peer::scope_send_marker`) and the peer's last delivered response
-/// (`last_response`, `ManagedPeer::last_response`). Dropping the request then
+/// (`last_response`, `ManagedPeer::last_response`). `link_heard_after(since)`
+/// says whether another peer delivered after `since`; asked at the cut, it
+/// covers exactly this silence (`PoolOracle::link_heard_after`). Dropping the request then
 /// is safe — it is waiting for its response; the peer's pending-request guard
 /// removes it and a late answer is discarded. A request not yet sent (still
 /// queued for, or inside, the connection's shared writer) is never cut:
@@ -357,6 +361,7 @@ enum WaveFailure {
 /// connection (`send_frame`), so it waits as before, bounded by the wave.
 async fn wave_request<T>(
     last_response: impl Fn() -> Option<tokio::time::Instant>,
+    link_heard_after: impl Fn(tokio::time::Instant) -> bool,
     request: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, WaveFailure> {
     let (sent, request) = crate::el::peer::scope_send_marker(request);
@@ -370,7 +375,7 @@ async fn wave_request<T>(
             Some(since) => {
                 let quiet = since.elapsed();
                 if quiet >= WAVE_SILENCE_DEADLINE {
-                    return Err(WaveFailure::Silent);
+                    return Err(WaveFailure::Silent { link_proven: link_heard_after(since) });
                 }
                 WAVE_SILENCE_DEADLINE - quiet
             }
@@ -392,6 +397,26 @@ struct AttemptTally {
     failed: bool,
     /// An item was given up for the peer's silence ([`WaveFailure::Silent`]).
     cut: bool,
+    /// A cut came while the call's other peers were delivering (its
+    /// `link_proven`).
+    silence_proven: bool,
+}
+
+/// Whether a wave attempt's silence is reported OUTPACED: only a peer that
+/// served nothing, failed nothing, and stayed silent while the call's other
+/// peers delivered — the hedged race's own evidence for that verdict, where a
+/// peer asked no earlier answers first. Silence with no such proof may be our
+/// own link (a handover, a stalled radio) and is not held against the peer;
+/// a peer that also failed items is judged by those failures ([`ChunkLedger`]).
+/// Pure; [`PoolOracle::first_silence_report`] makes it once per call.
+fn silence_verdict(tally: AttemptTally) -> bool {
+    tally.silence_proven && !tally.served && !tally.failed
+}
+
+/// Set `flags[id]`, saying whether it was unset — a once-per-call gate.
+/// `false` for an id outside `flags`. Pure.
+fn first_time(flags: &mut [bool], id: usize) -> bool {
+    flags.get_mut(id).is_some_and(|flag| !std::mem::replace(flag, true))
 }
 
 /// A reputation report a wave chunk owes the pool (`SnapQualitySink`).
@@ -399,45 +424,28 @@ struct AttemptTally {
 enum WaveReport {
     Served(std::net::SocketAddr),
     Failed { addr: std::net::SocketAddr, witnessed: bool },
-    Outpaced(std::net::SocketAddr),
 }
 
-/// One wave chunk's reputation bookkeeping across its attempts — pure, so its
+/// One wave chunk's failure bookkeeping across its attempts — pure, so its
 /// rules are unit-tested. A peer that serves is credited, and settles the
-/// peers asked before it that held the same items:
-/// - one that FAILED every item it was asked is struck, witnessed. With no
-///   later serve it is struck unwitnessed at the end — a root every peer
-///   pruned is about our ask (#465). Neither applies at the finalized root,
-///   where an item failure is almost always "does not hold that root" and the
-///   wave keeps no reason to tell it from transport (the serial reads that
-///   follow still strike a silent peer).
-/// - one that only went SILENT is reported outpaced: the hedged race's rule
-///   for silence (the first outpace since a serve is free, a repeat is a
-///   strike), never a failure, as silence alone may be our own link. Once per
-///   stall: a peer this call already found silent or beaten is not reported
-///   again, however many chunks it held. With no later serve, nothing.
+/// peers asked before it that FAILED every item they were asked: they are
+/// struck, witnessed. With no later serve they are struck unwitnessed at the
+/// end — a root every peer pruned is about our ask (#465). Neither applies at
+/// the finalized root, where an item failure is almost always "does not hold
+/// that root" and the wave keeps no reason to tell it from transport (the
+/// serial reads that follow still strike a silent peer). Silence is judged
+/// apart ([`silence_verdict`]).
 #[derive(Debug, Default)]
 struct ChunkLedger {
     /// Peers that failed every item they were asked, held for a witness.
     unwitnessed: Vec<std::net::SocketAddr>,
-    /// Peers that went silent and failed nothing, held for a later serve.
-    silent: Vec<std::net::SocketAddr>,
 }
 
 impl ChunkLedger {
     /// Book one attempt against `peer`, returning the reports it settles.
-    /// `first_silence`: the call had not yet found `peer` silent or beaten
-    /// ([`PoolOracle::mark_lost`]).
-    fn book(
-        &mut self,
-        peer: std::net::SocketAddr,
-        tally: AttemptTally,
-        first_silence: bool,
-        finalized: bool,
-    ) -> Vec<WaveReport> {
+    fn book(&mut self, peer: std::net::SocketAddr, tally: AttemptTally, finalized: bool) -> Vec<WaveReport> {
         let mut reports = Vec::new();
         if tally.served {
-            reports.extend(self.silent.drain(..).map(WaveReport::Outpaced));
             let held = std::mem::take(&mut self.unwitnessed);
             if !finalized {
                 reports.extend(held.into_iter().map(|addr| WaveReport::Failed { addr, witnessed: true }));
@@ -445,8 +453,6 @@ impl ChunkLedger {
             reports.push(WaveReport::Served(peer));
         } else if tally.failed {
             self.unwitnessed.push(peer);
-        } else if tally.cut && first_silence {
-            self.silent.push(peer);
         }
         reports
     }
@@ -466,17 +472,18 @@ async fn file_reports(quality: &crate::el::pool::SnapQualitySink, reports: Vec<W
         match report {
             WaveReport::Served(addr) => quality.served(addr).await,
             WaveReport::Failed { addr, witnessed } => quality.failed(addr, witnessed).await,
-            WaveReport::Outpaced(addr) => quality.outpaced(addr).await,
         }
     }
 }
 
-/// The peer, as a position in this call's wave order ([`PoolOracle::wave_ladder`]:
-/// the learned order with the peers that lost a race in this call moved
-/// behind the rest), that a wave chunk asks on one attempt. Chunks start on
-/// different `healthy` peers and each retry moves on through the healthy ones
-/// first: a known loser is never a first ask, and is retried only once every
-/// healthy peer has been. With none healthy, or none lost, all rotate alike.
+/// Position `attempt` of the rotation a wave chunk asks its peers in, over
+/// this call's wave order ([`PoolOracle::wave_ladder`]: the learned order with
+/// the peers that lost a race or went silent in this call moved behind the
+/// rest). Chunks start on different `healthy` peers, and the rotation runs
+/// through every healthy peer before any loser: a known loser is never a
+/// first ask. With none healthy, or none lost, all rotate alike. Each attempt
+/// asks the first peer of the rotation the chunk has not asked yet, over the
+/// ladder as it stands then.
 fn wave_peer(peers: usize, healthy: usize, chunk: usize, attempt: usize) -> usize {
     if healthy == 0 || healthy >= peers {
         return (chunk + attempt) % peers;
@@ -486,6 +493,14 @@ fn wave_peer(peers: usize, healthy: usize, chunk: usize, attempt: usize) -> usiz
     } else {
         healthy + (attempt - healthy) % (peers - healthy)
     }
+}
+
+/// The position, in a wave ladder of peer `ids` whose first `healthy` are
+/// unscathed, of the peer a chunk asks next: the first of its rotation
+/// ([`wave_peer`]) it has not `asked` yet, so no attempt repeats a peer and a
+/// retry follows the ladder as it stands now. `None` once it asked them all.
+fn next_wave_ask(ids: &[usize], healthy: usize, chunk: usize, asked: &[usize]) -> Option<usize> {
+    (0..ids.len()).map(|a| wave_peer(ids.len(), healthy, chunk, a)).find(|&p| !asked.contains(&ids[p]))
 }
 
 /// A [`SnapStateOracle`] over a fixed snapshot of snap peers, bridging the sync
@@ -519,6 +534,10 @@ pub struct PoolOracle {
     /// silent ([`Self::mark_lost`]), and have not won a race since — what the
     /// wave keeps off a chunk's first ask ([`Self::wave_ladder`]).
     lost: Mutex<Vec<bool>>,
+    /// The peers (indices into `peers`) whose silence the prefetch wave has
+    /// reported in this call: one stall is held against a peer once, however
+    /// many chunks or waves it held ([`Self::first_silence_report`]).
+    silence_reported: Mutex<Vec<bool>>,
     /// The call runs against the beacon-FINALIZED state root (the `finalized`
     /// tag; #465, #366). Two things follow, both as for the reader's own
     /// finalized state reads: a peer answering a fetch with an empty proof
@@ -588,6 +607,7 @@ impl PoolOracle {
     ) -> PoolOracle {
         let order = Mutex::new((0..peers.len()).collect());
         let lost = Mutex::new(vec![false; peers.len()]);
+        let silence_reported = Mutex::new(vec![false; peers.len()]);
         PoolOracle {
             operation: super::request::Operation::current(),
             peers,
@@ -597,6 +617,7 @@ impl PoolOracle {
             stats,
             order,
             lost,
+            silence_reported,
             finalized,
         }
     }
@@ -711,9 +732,9 @@ impl PoolOracle {
     }
 
     /// The prefetch wave's peers, with their ids (indices into `peers`): this
-    /// call's learned order with every peer that lost a race in it moved
-    /// behind the rest, and how many lead it unscathed ([`wave_peer`] keeps a
-    /// chunk's first ask among those).
+    /// call's learned order with every peer that lost a race in it, or went
+    /// silent in its wave, moved behind the rest, and how many lead it
+    /// unscathed ([`wave_peer`] keeps a chunk's first ask among those).
     fn wave_ladder(&self) -> (Vec<usize>, Vec<Arc<ManagedPeer>>, usize) {
         let order = self.order.lock().unwrap().clone();
         let (positions, healthy) = wave_positions(&order, &self.lost.lock().unwrap());
@@ -723,15 +744,28 @@ impl PoolOracle {
 
     /// Note that peer `id` went silent on the wave: for the rest of this call
     /// it is asked only after the others, by the wave ([`Self::wave_ladder`])
-    /// and the serial reads alike. `false` when the call had already found it
-    /// silent or beaten (a race's loser already trails the order).
-    fn mark_lost(&self, id: usize) -> bool {
-        let first = self.lost.lock().unwrap().get_mut(id).is_some_and(|lost| !std::mem::replace(lost, true));
-        if first {
+    /// and the serial reads alike. A peer already lost stays where it is (a
+    /// race's loser already trails the order).
+    fn mark_lost(&self, id: usize) {
+        if first_time(&mut self.lost.lock().unwrap(), id) {
             let mut order = self.order.lock().unwrap();
             *order = demoted(&order, id);
         }
-        first
+    }
+
+    /// Whether the wave may report peer `id`'s silence now: the first time in
+    /// this call ([`Self::silence_reported`]).
+    fn first_silence_report(&self, id: usize) -> bool {
+        first_time(&mut self.silence_reported.lock().unwrap(), id)
+    }
+
+    /// Whether a peer of this call other than `silent` delivered a response
+    /// after `since` — that our own link was working while `silent` said
+    /// nothing ([`WaveFailure::Silent`]).
+    fn link_heard_after(&self, silent: &Arc<ManagedPeer>, since: tokio::time::Instant) -> bool {
+        self.peers
+            .iter()
+            .any(|p| !Arc::ptr_eq(p, silent) && p.last_response().is_some_and(|heard| heard > since))
     }
 
     /// The proof-verified account leaf at `address`, or `None` when proven absent.
@@ -848,10 +882,6 @@ impl SnapStateOracle for PoolOracle {
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let quality = self.quality.clone();
-        // The call's learned order, not the snapshot's, with this call's
-        // losers behind the rest (#320).
-        let (ids, ordered, healthy) = self.wave_ladder();
-        let (ids, ordered) = (&ids, &ordered);
 
         /// One item's outcome for retry + reputation bookkeeping.
         enum ItemOutcome {
@@ -860,8 +890,8 @@ impl SnapStateOracle for PoolOracle {
             Failed,
             /// The peer went silent ([`WaveFailure::Silent`]): retried on the
             /// next peer like a failure, but judged as silence (#320; see
-            /// [`ChunkLedger`]).
-            Cut,
+            /// [`silence_verdict`]).
+            Cut { link_proven: bool },
         }
 
         // One (account, slots) item against one peer: account leaf first (its
@@ -902,8 +932,12 @@ impl SnapStateOracle for PoolOracle {
                             return ItemOutcome::Failed;
                         };
                         let started = std::time::Instant::now();
-                        let outcome =
-                            wave_request(|| peer.last_response(), peer.snap_get_account(state_root, &addr)).await;
+                        let outcome = wave_request(
+                            || peer.last_response(),
+                            |since| self.link_heard_after(&peer, since),
+                            peer.snap_get_account(state_root, &addr),
+                        )
+                        .await;
                         if let Ok(o) = &outcome {
                             let leaf = match o {
                                 AccountOutcome::Present(l) => Some(l),
@@ -921,7 +955,7 @@ impl SnapStateOracle for PoolOracle {
                                 self.leaf_memo.lock().unwrap().insert(addr, None);
                                 return ItemOutcome::Served;
                             }
-                            Err(WaveFailure::Silent) => return ItemOutcome::Cut,
+                            Err(WaveFailure::Silent { link_proven }) => return ItemOutcome::Cut { link_proven },
                             Err(WaveFailure::Failed(_)) => return ItemOutcome::Failed,
                         }
                     }
@@ -950,6 +984,7 @@ impl SnapStateOracle for PoolOracle {
                         let started = std::time::Instant::now();
                         let value = wave_request(
                             || peer.last_response(),
+                            |since| self.link_heard_after(&peer, since),
                             peer.snap_get_storage(state_root, &addr, &leaf, &position),
                         )
                         .await
@@ -965,21 +1000,25 @@ impl SnapStateOracle for PoolOracle {
                 .await;
                 let mut any_slot_failed = false;
                 let mut any_slot_cut = false;
+                let mut any_cut_proven = false;
                 for (slot, value) in missing.iter().zip(values) {
                     match value {
                         Ok(v) => proof_sink.put_storage(state_root, &addr, slot, v),
-                        Err(WaveFailure::Silent) => any_slot_cut = true,
+                        Err(WaveFailure::Silent { link_proven }) => {
+                            any_slot_cut = true;
+                            any_cut_proven |= link_proven;
+                        }
                         Err(WaveFailure::Failed(_)) => any_slot_failed = true,
                     }
                 }
                 // A partial slot failure fails the ITEM so the rotation retries
                 // it on the next peer — the retry only re-fetches the gaps
                 // (cached slots are filtered out above). Successful puts keep.
-                // Silence alone retries it too, judged as silence (`ChunkLedger`).
+                // Silence alone retries it too, judged as silence (`silence_verdict`).
                 if any_slot_failed {
                     ItemOutcome::Failed
                 } else if any_slot_cut {
-                    ItemOutcome::Cut
+                    ItemOutcome::Cut { link_proven: any_cut_proven }
                 } else {
                     ItemOutcome::Served
                 }
@@ -996,14 +1035,23 @@ impl SnapStateOracle for PoolOracle {
                         // Items still needing a fetch; failed ones retry on the
                         // next peer (Java tryWithRetries chunk rotation).
                         let mut pending: Vec<&([u8; 20], Vec<U256>)> = chunk.iter().collect();
-                        let attempts = MAX_ATTEMPTS.min(ordered.len()).max(1);
+                        let attempts = MAX_ATTEMPTS.min(self.peers.len()).max(1);
                         let mut ledger = ChunkLedger::default();
-                        for attempt in 0..attempts {
+                        // The peers (ids) this chunk asked: every attempt asks a new one.
+                        let mut asked: Vec<usize> = Vec::with_capacity(attempts);
+                        for _ in 0..attempts {
                             if pending.is_empty() {
                                 break;
                             }
-                            let pos = wave_peer(ordered.len(), healthy, chunk_idx, attempt);
-                            let peer = &ordered[pos];
+                            // The ladder as it stands NOW, not as the wave
+                            // began: a peer another chunk has just found
+                            // silent is no retry's ask either (#320 review).
+                            let (ids, ladder, healthy) = self.wave_ladder();
+                            let Some(pos) = next_wave_ask(&ids, healthy, chunk_idx, &asked) else {
+                                break;
+                            };
+                            asked.push(ids[pos]);
+                            let peer = &ladder[pos];
                             let outcomes = futures::future::join_all(pending.iter().map(
                                 |(addr, slots)| {
                                     fetch_item(Arc::clone(peer), *addr, slots.clone())
@@ -1019,8 +1067,9 @@ impl SnapStateOracle for PoolOracle {
                                         tally.failed = true;
                                         still_failed.push(item);
                                     }
-                                    ItemOutcome::Cut => {
+                                    ItemOutcome::Cut { link_proven } => {
                                         tally.cut = true;
+                                        tally.silence_proven |= link_proven;
                                         still_failed.push(item);
                                     }
                                     // Cache-skips carry NO reputation signal —
@@ -1028,12 +1077,18 @@ impl SnapStateOracle for PoolOracle {
                                     ItemOutcome::Skipped => {}
                                 }
                             }
-                            // Silent and nothing served: kept off first asks
-                            // for the rest of the call, this wave's bytecode
-                            // phase included.
-                            let first_silence = tally.cut && !tally.served && self.mark_lost(ids[pos]);
-                            let reports = ledger.book(peer.addr(), tally, first_silence, self.finalized);
+                            // Silent and nothing served: asked last for the
+                            // rest of the call, by every chunk's next attempt,
+                            // the bytecode phase and the serial reads.
+                            if tally.cut && !tally.served {
+                                self.mark_lost(ids[pos]);
+                            }
+                            let outpaced = silence_verdict(tally) && self.first_silence_report(ids[pos]);
+                            let reports = ledger.book(peer.addr(), tally, self.finalized);
                             if let Some(q) = &quality {
+                                if outpaced {
+                                    q.outpaced(peer.addr()).await;
+                                }
                                 file_reports(q, reports).await;
                             }
                             pending = still_failed;
@@ -1062,7 +1117,8 @@ impl SnapStateOracle for PoolOracle {
                         return; // closed semaphore — never bypass the bound
                     };
                     let started = std::time::Instant::now();
-                    if let Ok(code) = wave_request(|| peer.last_response(), peer.snap_get_bytecode(hash)).await {
+                    // No reputation from these: a cut is simply no code.
+                    if let Ok(code) = wave_request(|| peer.last_response(), |_| false, peer.snap_get_bytecode(hash)).await {
                         self.stats.observe_code(*hash, started.elapsed());
                         code_sink.put(hash, code.into());
                     }
@@ -1392,8 +1448,8 @@ mod tests {
             // #320: a silent peer held its chunk for the 15 s request timeout,
             // and the eth_call with it.
             let started = tokio::time::Instant::now();
-            let out = wave_request(never_heard, sent_then_silent(Duration::ZERO)).await;
-            assert_eq!(out, Err(WaveFailure::Silent));
+            let out = wave_request(never_heard, |_| false, sent_then_silent(Duration::ZERO)).await;
+            assert_eq!(out, Err(WaveFailure::Silent { link_proven: false }));
             assert_eq!(started.elapsed(), WAVE_SILENCE_DEADLINE);
             assert!(WAVE_SILENCE_DEADLINE < Duration::from_secs(15), "must beat the peer request timeout");
         }
@@ -1414,7 +1470,7 @@ mod tests {
                 })
             };
             let started = tokio::time::Instant::now();
-            let out = wave_request(|| *heard.lock().unwrap(), sent_then_answered(Duration::from_secs(20))).await;
+            let out = wave_request(|| *heard.lock().unwrap(), |_| false, sent_then_answered(Duration::from_secs(20))).await;
             assert_eq!(out, Ok(7));
             assert_eq!(started.elapsed(), Duration::from_secs(20));
             feeder.abort();
@@ -1424,8 +1480,8 @@ mod tests {
         async fn silence_counts_from_the_send_not_from_the_queue() {
             // 4 s waiting for the shared writer is not the peer's silence.
             let started = tokio::time::Instant::now();
-            let out = wave_request(never_heard, sent_then_silent(Duration::from_secs(4))).await;
-            assert_eq!(out, Err(WaveFailure::Silent));
+            let out = wave_request(never_heard, |_| false, sent_then_silent(Duration::from_secs(4))).await;
+            assert_eq!(out, Err(WaveFailure::Silent { link_proven: false }));
             let elapsed = started.elapsed();
             assert!(
                 elapsed >= Duration::from_secs(4) + WAVE_SILENCE_DEADLINE
@@ -1438,7 +1494,7 @@ mod tests {
         async fn a_request_that_never_went_out_is_never_cut() {
             // Dropping one still inside the writer would tear its connection:
             // it is left to finish, however long the writer took.
-            let out = wave_request(never_heard, async {
+            let out = wave_request(never_heard, |_| false, async {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 Ok::<_, String>(9u8)
             })
@@ -1448,8 +1504,30 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn an_answer_inside_the_deadline_is_kept() {
-            let out = wave_request(never_heard, sent_then_answered(WAVE_SILENCE_DEADLINE - Duration::from_millis(1))).await;
+            let out = wave_request(never_heard, |_| false, sent_then_answered(WAVE_SILENCE_DEADLINE - Duration::from_millis(1))).await;
             assert_eq!(out, Ok(7));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_cut_says_whether_another_peer_delivered_during_the_silence() {
+            // #320 third review: the hedged race calls a silent peer outpaced
+            // only when a peer asked no earlier answered meanwhile — proof that
+            // our own link worked. A wave cut carries that proof, or says none.
+            let other = std::sync::Arc::new(StdMutex::new(None::<tokio::time::Instant>));
+            let heard_after = |since: tokio::time::Instant| other.lock().unwrap().is_some_and(|at| at > since);
+            {
+                let other = std::sync::Arc::clone(&other);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    *other.lock().unwrap() = Some(tokio::time::Instant::now());
+                });
+            }
+            // Another peer delivered 3 s into the silence: the link was working.
+            let out = wave_request(never_heard, heard_after, sent_then_silent(Duration::ZERO)).await;
+            assert_eq!(out, Err(WaveFailure::Silent { link_proven: true }));
+            // Nothing from anyone during this one (a handover, say): no proof.
+            let out = wave_request(never_heard, heard_after, sent_then_silent(Duration::ZERO)).await;
+            assert_eq!(out, Err(WaveFailure::Silent { link_proven: false }));
         }
 
         #[test]
@@ -1464,6 +1542,23 @@ mod tests {
             assert_eq!((0..3).map(|a| wave_peer(3, 3, 2, a)).collect::<Vec<_>>(), vec![2, 0, 1]);
             // Nobody unscathed: rotate over all, as before.
             assert_eq!((0..3).map(|c| wave_peer(3, 0, c, 0)).collect::<Vec<_>>(), vec![0, 1, 2]);
+        }
+
+        #[test]
+        fn a_retry_follows_the_ladder_as_it_stands_and_never_repeats_a_peer() {
+            let peer_at = |ids: &[usize], pos: Option<usize>| pos.map(|p| ids[p]);
+            // Chunk 0's first ask, all three peers unscathed: peer 0.
+            assert_eq!(peer_at(&[0, 1, 2], next_wave_ask(&[0, 1, 2], 3, 0, &[])), Some(0));
+            // Peer 0 went silent, and another chunk found peer 1 silent too:
+            // the retry goes to peer 2 — the ladder at the wave's start would
+            // have sent it to peer 1, six more seconds (#320 third review).
+            let ids = [2, 0, 1];
+            assert_eq!(peer_at(&ids, next_wave_ask(&ids, 1, 0, &[0])), Some(2));
+            // Peer 1 FAILED (still unscathed): it is not asked again either.
+            let ids = [1, 2, 0];
+            assert_eq!(peer_at(&ids, next_wave_ask(&ids, 2, 0, &[0, 1])), Some(2));
+            // Every peer asked: no further attempt.
+            assert_eq!(next_wave_ask(&ids, 2, 0, &[0, 1, 2]), None);
         }
 
         fn race(accepted: Option<usize>, missed: Vec<usize>, outpaced: Vec<usize>) -> RaceOutcome<()> {
@@ -1493,57 +1588,52 @@ mod tests {
             std::net::SocketAddr::from(([10, 0, 0, n], 30303))
         }
 
-        const SERVED: AttemptTally = AttemptTally { served: true, failed: false, cut: false };
-        const FAILED: AttemptTally = AttemptTally { served: false, failed: true, cut: false };
-        const SILENT: AttemptTally = AttemptTally { served: false, failed: false, cut: true };
+        const SERVED: AttemptTally = AttemptTally { served: true, failed: false, cut: false, silence_proven: false };
+        const FAILED: AttemptTally = AttemptTally { served: false, failed: true, cut: false, silence_proven: false };
+        const SILENT: AttemptTally = AttemptTally { served: false, failed: false, cut: true, silence_proven: true };
 
         #[test]
-        fn silence_is_outpaced_once_a_later_peer_serves_never_failed() {
-            // #320 re-review: a cut peer was simply retried past, so a dead
-            // connection kept leading the next calls' ladders. It is reported
-            // as the hedged race reports a silent attempt: outpaced, not a
-            // failure — and only once another peer has served the items.
-            let mut ledger = ChunkLedger::default();
-            assert!(ledger.book(addr(1), SILENT, true, false).is_empty());
-            assert_eq!(
-                ledger.book(addr(2), SERVED, false, false),
-                vec![WaveReport::Outpaced(addr(1)), WaveReport::Served(addr(2))]
-            );
-            assert!(ledger.finish(false).is_empty());
-            // Nobody served: the silence goes unreported.
-            let mut ledger = ChunkLedger::default();
-            assert!(ledger.book(addr(1), SILENT, true, false).is_empty());
-            assert!(ledger.book(addr(2), SILENT, true, false).is_empty());
-            assert!(ledger.finish(false).is_empty());
-            // At the finalized root too: silence is not "does not hold that root".
-            let mut ledger = ChunkLedger::default();
-            ledger.book(addr(1), SILENT, true, true);
-            assert_eq!(
-                ledger.book(addr(2), SERVED, false, true),
-                vec![WaveReport::Outpaced(addr(1)), WaveReport::Served(addr(2))]
-            );
+        fn silence_is_reported_only_on_the_races_evidence() {
+            // #320 reviews: a dead connection, retried past and never reported,
+            // kept leading the next calls' ladders — but a silence while our own
+            // link was down (a handover) is not the peer's. Outpaced, never a
+            // failure, and only when the call's other peers delivered meanwhile.
+            assert!(silence_verdict(SILENT));
+            assert!(!silence_verdict(AttemptTally { silence_proven: false, ..SILENT }));
+            // Anything served or failed decides instead: credit, or the failure rules.
+            assert!(!silence_verdict(AttemptTally { served: true, ..SILENT }));
+            assert!(!silence_verdict(AttemptTally { failed: true, ..SILENT }));
+            // Silence is never booked as a failure, at either root.
+            for finalized in [false, true] {
+                let mut ledger = ChunkLedger::default();
+                assert!(ledger.book(addr(1), SILENT, finalized).is_empty());
+                assert_eq!(ledger.book(addr(2), SERVED, finalized), vec![WaveReport::Served(addr(2))]);
+                assert!(ledger.finish(finalized).is_empty());
+            }
         }
 
         #[test]
-        fn one_stall_is_reported_once_per_call() {
-            // Every chunk the peer held saw the same stall; the first one to
-            // find it silent reports it, the rest do not (`mark_lost`).
-            let mut ledger = ChunkLedger::default();
-            assert!(ledger.book(addr(1), SILENT, false, false).is_empty());
-            assert_eq!(ledger.book(addr(2), SERVED, false, false), vec![WaveReport::Served(addr(2))]);
+        fn a_peer_is_reported_once_per_call() {
+            // However many chunks or waves one stall held, it is one report
+            // (`PoolOracle::first_silence_report`); `mark_lost` demotes once alike.
+            let mut flags = vec![false; 3];
+            assert!(first_time(&mut flags, 1));
+            assert!(!first_time(&mut flags, 1));
+            assert!(first_time(&mut flags, 0));
+            assert!(!first_time(&mut flags, 7), "an id outside the call");
         }
 
         #[test]
         fn failures_are_struck_witnessed_or_not_but_never_at_the_finalized_root() {
             let mut ledger = ChunkLedger::default();
-            ledger.book(addr(1), FAILED, false, false);
+            ledger.book(addr(1), FAILED, false);
             assert_eq!(
-                ledger.book(addr(2), SERVED, false, false),
+                ledger.book(addr(2), SERVED, false),
                 vec![WaveReport::Failed { addr: addr(1), witnessed: true }, WaveReport::Served(addr(2))]
             );
             let mut ledger = ChunkLedger::default();
-            ledger.book(addr(1), FAILED, false, false);
-            ledger.book(addr(2), FAILED, false, false);
+            ledger.book(addr(1), FAILED, false);
+            ledger.book(addr(2), FAILED, false);
             assert_eq!(
                 ledger.finish(false),
                 vec![
@@ -1552,25 +1642,26 @@ mod tests {
                 ]
             );
             let mut ledger = ChunkLedger::default();
-            ledger.book(addr(1), FAILED, false, true);
-            assert_eq!(ledger.book(addr(2), SERVED, false, true), vec![WaveReport::Served(addr(2))]);
-            ledger.book(addr(3), FAILED, false, true);
+            ledger.book(addr(1), FAILED, true);
+            assert_eq!(ledger.book(addr(2), SERVED, true), vec![WaveReport::Served(addr(2))]);
+            ledger.book(addr(3), FAILED, true);
             assert!(ledger.finish(true).is_empty());
         }
 
         #[test]
         fn a_peer_that_failed_and_went_silent_is_judged_by_its_failure() {
-            let both = AttemptTally { served: false, failed: true, cut: true };
+            let both = AttemptTally { served: false, failed: true, cut: true, silence_proven: true };
+            assert!(!silence_verdict(both));
             let mut ledger = ChunkLedger::default();
-            ledger.book(addr(1), both, true, false);
+            ledger.book(addr(1), both, false);
             assert_eq!(
-                ledger.book(addr(2), SERVED, false, false),
+                ledger.book(addr(2), SERVED, false),
                 vec![WaveReport::Failed { addr: addr(1), witnessed: true }, WaveReport::Served(addr(2))]
             );
             // A peer that served something is credited, whatever else it did.
-            let partial = AttemptTally { served: true, failed: true, cut: true };
+            let partial = AttemptTally { served: true, failed: true, cut: true, silence_proven: true };
             let mut ledger = ChunkLedger::default();
-            assert_eq!(ledger.book(addr(3), partial, false, false), vec![WaveReport::Served(addr(3))]);
+            assert_eq!(ledger.book(addr(3), partial, false), vec![WaveReport::Served(addr(3))]);
         }
     }
 

@@ -933,13 +933,14 @@ impl<T> RaceOutcome<T> {
     }
 }
 
-/// How long a peer write of a transaction broadcast may hold its connection's
-/// writer once it no longer matters: every rebroadcast write gets this long,
-/// and since #320 the first broadcast's writes get this long after the first
-/// of them landed ([`first_accepted`]'s `grace`). A write still blocked then
-/// is cut — tearing a connection that is wedged anyway — so no detached write
-/// holds a writer, and with it `close()` and so a pause or stop, for the whole
-/// frame-write timeout.
+/// How long a transaction broadcast's peer write may run on detached: every
+/// rebroadcast write gets this long from its start, and since #320 the first
+/// broadcast's writes get this long after the first of them landed
+/// ([`first_accepted`]'s `grace`; a pause or stop cuts those at once). A write
+/// still blocked then is cut — tearing a connection that is wedged anyway — so
+/// no detached write holds a writer, and with it `close()` and so a pause or
+/// stop, for the whole frame-write timeout. A rebroadcast write can still hold
+/// one for this long.
 const BROADCAST_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run every `attempt` as a DETACHED task, and answer as soon as one succeeds
