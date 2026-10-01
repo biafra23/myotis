@@ -933,6 +933,32 @@ impl<T> RaceOutcome<T> {
     }
 }
 
+/// Run every `attempt` to completion as a DETACHED task, and answer as soon as
+/// one succeeds — or `false` once all have failed. For writes whose success
+/// needs a single taker (a transaction broadcast): the caller is not held for
+/// the slowest connection, and the attempts still in flight when it is
+/// answered are left to finish rather than cancelled — cutting a write
+/// mid-frame tears that connection (`ManagedPeer::fail_all`).
+pub(crate) async fn first_accepted<Fut>(attempts: impl IntoIterator<Item = Fut>) -> bool
+where
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for attempt in attempts {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(attempt.await.is_ok());
+        });
+    }
+    drop(tx); // the channel closes once every attempt has reported
+    while let Some(ok) = rx.recv().await {
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
 /// Race `make(peer)` across `peers` with hedging: start the first, and every
 /// `delay` without an answer start one more (up to [`MAX_HEDGED_ATTEMPTS`] in
 /// flight), stopping at the first result `accept` approves. A slow peer keeps
@@ -6147,29 +6173,25 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        // Misses are held until the ladder settles: witnessed by a later rung
-        // that serves, unwitnessed if nobody does (#465 — a wallet polls the
-        // fee as often as the block, and this loop was poisoning the cache
-        // the same way).
-        let mut failed = Vec::new();
-        for peer in &peers {
-            let top = WindowTop::Head { number: head_num, hash: head_hash };
-            match self.fee_estimate_from(peer, start, top).await {
-                Ok(est) => {
-                    self.record_batch_failures(&failed, true).await;
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(est);
-                }
-                Err(e) => {
-                    failed.push(peer.addr());
-                    last_err = e;
-                }
-            }
-        }
-        self.record_batch_failures(&failed, false).await;
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable fee estimate: {last_err}"))
+        let top = WindowTop::Head { number: head_num, hash: head_hash };
+        // Hedged, like every other interactive read (#320): this used to walk
+        // the peers in turn, so on a memo miss a silent first peer held the
+        // wallet's gas quote for the full request timeout — twice, as the
+        // window and the bodies are two requests. `hedged_read` keeps the
+        // ladder's bookkeeping: a miss is witnessed only when another peer
+        // served the same estimate (#465), and the winner is credited.
+        self.hedged_read(
+            &peers,
+            HEDGE_DELAY,
+            |peer: std::sync::Arc<ManagedPeer>| async move {
+                self.fee_estimate_from(&peer, start, top).await
+            },
+            |_: &FeeEstimate| true,
+            |_: &FeeEstimate| true,
+            |_: &str| false,
+            "a verifiable fee estimate",
+        )
+        .await
     }
 
     /// Compute the fee estimate against a single peer: fetch the header window
@@ -6453,31 +6475,31 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
-        let total = peers.len();
-        let mut last_err = String::new();
-        // Misses held until the ladder settles, as in fee_estimate (#465).
-        let mut failed = Vec::new();
-        for peer in &peers {
-            let attempt = tokio::time::timeout(
-                FEE_HISTORY_DEADLINE,
-                self.fee_history_from(peer, oldest, count, top, reward_percentiles),
-            )
-            .await
-            .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
-            match attempt {
-                Ok(history) => {
-                    self.record_batch_failures(&failed, true).await;
-                    self.pool.record_snap_served(peer.addr()).await;
-                    return Ok(history);
-                }
-                Err(e) => {
-                    failed.push(peer.addr());
-                    last_err = e;
-                }
-            }
-        }
-        self.record_batch_failures(&failed, false).await;
-        Err(format!("all {total} snap peer(s) failed to serve a verifiable feeHistory: {last_err}"))
+        // Hedged (#320), as the estimate is: a silent first peer held the
+        // wallet's fee-history poll for a whole request timeout per request
+        // before the next peer was asked. With percentiles every block's body
+        // and receipts come along, a download a slow link is still RECEIVING
+        // after the proof-read delay, so that build hedges on the bulk delay
+        // (as a deep block window does) instead of duplicating it early. Each
+        // attempt keeps its own build deadline.
+        let delay = if reward_percentiles.is_some() { BULK_HEDGE_DELAY } else { HEDGE_DELAY };
+        self.hedged_read(
+            &peers,
+            delay,
+            |peer: std::sync::Arc<ManagedPeer>| async move {
+                tokio::time::timeout(
+                    FEE_HISTORY_DEADLINE,
+                    self.fee_history_from(&peer, oldest, count, top, reward_percentiles),
+                )
+                .await
+                .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()))
+            },
+            |_: &FeeHistory| true,
+            |_: &FeeHistory| true,
+            |_: &str| false,
+            "a verifiable feeHistory",
+        )
+        .await
     }
 
     /// Build the fee history against one peer: one anchored window
@@ -6567,14 +6589,18 @@ impl ElReader {
         if peers.is_empty() {
             return Err("no peer available to broadcast the transaction".to_string());
         }
-        // Broadcast to all peers concurrently — the success criterion is just
-        // "≥1 peer received it", so there's no reason to serialize per-peer writes.
-        let sent = futures::future::join_all(peers.iter().map(|peer| peer.send_transaction(raw_tx)))
-            .await
-            .iter()
-            .filter(|r| r.is_ok())
-            .count();
-        if sent == 0 {
+        // Broadcast to every peer, but answer the wallet at the FIRST write that
+        // lands (#320): the success criterion is "≥1 peer received it", and
+        // waiting for all of them let one wedged connection's writer hold the
+        // send step for its whole frame-write timeout. The other writes finish
+        // on their own (`first_accepted`), never cut mid-frame.
+        let raw = std::sync::Arc::<[u8]>::from(raw_tx);
+        let accepted = first_accepted(peers.iter().cloned().map(|peer| {
+            let raw = std::sync::Arc::clone(&raw);
+            async move { peer.send_transaction(&raw).await }
+        }))
+        .await;
+        if !accepted {
             return Err("no peer accepted the transaction broadcast".to_string());
         }
         // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
@@ -7200,10 +7226,10 @@ impl ElReader {
         let peers = self.pool.snap_peers().await;
         // Hedged: this runs on every confirm poll for a found tx that is not
         // final yet, and a silent first peer used to hold each one for a full
-        // request timeout. Any verified answer ends the race. As before, no
-        // reputation is recorded here: a failure may only mean the peer has not
-        // imported our anchored head, and the receipt fetch that follows in the
-        // same poll records reputation for the same pool anyway.
+        // request timeout. Any verified answer ends the race. A miss records
+        // nothing, as before: it may only mean the peer has not imported our
+        // anchored head, and the receipt fetch that follows in the same poll
+        // records reputation for the same pool anyway.
         let out = hedged_race(
             &peers,
             block_hedge_delay(head_num - loc.header.number),
@@ -7214,6 +7240,14 @@ impl ElReader {
             |_: &bool| true,
         )
         .await;
+        // An OUTPACED peer is reported, though (#320): one silent for the whole
+        // hedge delay while another verified the window is not merely behind
+        // the head — that shape answers at once, with a short window — and
+        // benching it keeps the receipt fetch in this same poll from asking it
+        // first and waiting out the delay a second time.
+        for idx in &out.outpaced {
+            self.pool.record_snap_outpaced(peers[*idx].addr()).await;
+        }
         match out.accepted {
             Some((_, canonical)) => canonical,
             None => true, // nobody could verify either way — can't disprove
@@ -12341,5 +12375,75 @@ mod restart_claim_reader_tests {
             "blocks nobody re-checked were checkpointed as final"
         );
         reader.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod first_accepted_tests {
+    use super::first_accepted;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A scripted write: lands (or fails) after `after`, noting that it ran to
+    /// completion in `finished`.
+    fn write(
+        after: Duration,
+        ok: bool,
+        finished: Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'static {
+        async move {
+            tokio::time::sleep(after).await;
+            finished.store(true, Ordering::SeqCst);
+            if ok { Ok(()) } else { Err("write failed".to_string()) }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_at_the_first_accepted_write_and_lets_the_rest_finish() {
+        // #320: a wedged writer held the send step for its whole frame-write
+        // timeout. It must not hold the answer, and must not be cut mid-frame
+        // either (that tears its connection): it runs on to completion.
+        let wedged = Arc::new(AtomicBool::new(false));
+        let quick = Arc::new(AtomicBool::new(false));
+        let started = tokio::time::Instant::now();
+        let ok = first_accepted(vec![
+            write(Duration::from_secs(30), true, Arc::clone(&wedged)),
+            write(Duration::from_millis(20), true, Arc::clone(&quick)),
+        ])
+        .await;
+        assert!(ok);
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+        assert!(quick.load(Ordering::SeqCst));
+        assert!(!wedged.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(wedged.load(Ordering::SeqCst), "the slow write ran on, it was not cancelled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_does_not_answer_but_a_later_success_does() {
+        let done = Arc::new(AtomicBool::new(false));
+        let started = tokio::time::Instant::now();
+        let ok = first_accepted(vec![
+            write(Duration::from_millis(5), false, Arc::clone(&done)),
+            write(Duration::from_millis(50), true, Arc::clone(&done)),
+        ])
+        .await;
+        assert!(ok);
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nobody_accepting_is_false_once_every_write_has_reported() {
+        let done = Arc::new(AtomicBool::new(false));
+        let started = tokio::time::Instant::now();
+        let ok = first_accepted(vec![
+            write(Duration::from_millis(5), false, Arc::clone(&done)),
+            write(Duration::from_secs(2), false, Arc::clone(&done)),
+        ])
+        .await;
+        assert!(!ok);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(!first_accepted(Vec::<std::future::Ready<Result<(), String>>>::new()).await);
     }
 }
