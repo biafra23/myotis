@@ -83,23 +83,38 @@ object LogIndexStatus {
      *  whole band where queries actually fail. */
     private const val NORMAL_HEAD_LAG = 4L
 
-    /** How far an enabled index trails the head, when that is far enough
-     *  that head-reaching `eth_getLogs` is refused; null otherwise (no index,
-     *  no head yet, or within the serving slack). This is what drives the top
-     *  bar's catch-up state: the node can be fully synced while the index,
-     *  after downtime, still has to bridge thousands of blocks — and a wallet
-     *  scanning logs to the head gets refusals until it has. */
-    fun headCatchUpGap(json: String?): Long? {
-        if (json == null || !json.contains("\"enabled\":true")) return null
-        val gap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
-            ?: return null
-        return gap.takeIf { it > NORMAL_HEAD_LAG }
+    /** Mirrors the engine's `BRIDGE_MAX_GAP` (myotis-net `el/reader.rs`): past
+     *  this the bridge deliberately holds coverage instead of mapping the gap,
+     *  so nothing is closing it and the strip must not promise progress. The
+     *  engine measures from finality, this from the head — they differ by the
+     *  finality lag (~100 blocks), which is noise at this size. */
+    const val BRIDGE_MAX_GAP = 500_000L
+
+    /** The head side of the engine's status: how far an enabled index's
+     *  coverage trails the head `latest` resolves to. 0 when the index is
+     *  disabled (nothing to catch up). Null when the status says nothing about
+     *  it — no status (a failed host fetch), an engine error envelope, or no
+     *  head yet — which callers must treat as "unknown", not "caught up". */
+    fun headGap(json: String?): Long? {
+        if (json == null) return null
+        if (json.contains("\"enabled\":false")) return 0L
+        if (!json.contains("\"enabled\":true")) return null
+        return Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
     }
 
+    /** True when [gap] is past the engine's serving slack: head-reaching
+     *  `eth_getLogs` is refused. */
+    fun refusesHeadQueries(gap: Long): Boolean = gap > NORMAL_HEAD_LAG
+
     /** The top bar's one-line label for a head catch-up. */
-    fun catchUpLine(p: CatchUpProgress): String =
-        "Log index catching up to the head — ${grouped(p.gap)} blocks behind" +
-            if (p.startGap > p.gap) " (${(p.fraction * 100).toInt()}% of ${grouped(p.startGap)})" else ""
+    fun catchUpLine(p: CatchUpProgress): String = when {
+        p.stalled ->
+            "Log index ${grouped(p.gap)} blocks behind the head — too far to bridge, not catching up"
+        p.startGap > p.gap ->
+            "Log index catching up to the head — ${grouped(p.gap)} blocks behind " +
+                "(${(p.fraction * 100).toInt()}% of ${grouped(p.startGap)})"
+        else -> "Log index catching up to the head — ${grouped(p.gap)} blocks behind"
+    }
 
     /** Human progress line for the Index tab: an ETA when the engine has a
      *  measured rate, otherwise x/y blocks (or a waiting note). Pure Kotlin —
@@ -222,32 +237,74 @@ object LogIndexStatus {
 data class CatchUpProgress(val gap: Long, val startGap: Long) {
     val fraction: Float
         get() = if (startGap <= 0L) 0f else ((startGap - gap).toFloat() / startGap).coerceIn(0f, 1f)
+
+    /** Past the engine's bridge limit nothing is closing the gap: amber, but
+     *  no progress bar and no "catching up". */
+    val stalled: Boolean get() = gap > LogIndexStatus.BRIDGE_MAX_GAP
 }
 
 /**
- * Turns the engine's instantaneous `headGap` into progress. The engine reports
- * only the current distance, so the start of a catch-up is the LARGEST gap seen
- * since the gap opened: the head keeps moving while the bridge works, and a gap
- * that is still growing must not read as progress going backwards against a
- * stale start. A gap back within the serving slack (or no index) ends the
- * catch-up, and the next one measures from its own start.
+ * Turns the engine's instantaneous `headGap` into a catch-up the top bar can
+ * show. The engine reports only the current distance, so:
  *
- * Plain state, not Compose state: [observe] is idempotent for a given gap, so
- * calling it during composition (once per snapshot) is safe, and the snapshot
- * flow already drives the recomposition.
+ * - **Start** is the LARGEST gap seen since the catch-up began: the head keeps
+ *   moving while the bridge works, and a gap still growing must not read as
+ *   progress going backwards against a stale start.
+ * - **Hysteresis.** A catch-up begins at [enterGap] and ends only when the gap
+ *   is back within the engine's serving slack. A healthy head-follow can trail
+ *   a few blocks indefinitely on a 5 s chain (the engine's
+ *   `BACKFILL_YIELD_MAX_TICKS` note); without the wider entry the strip would
+ *   flicker between green and amber and keep resetting its start.
+ * - **Unknown is not done.** A status with nothing to say about the head (a
+ *   failed host fetch, an engine error during a restart) holds the last
+ *   progress instead of ending the catch-up and starting over at 0%.
+ *
+ * Feed it EVERY network's status on every snapshot ([observeAll]), not only the
+ * one on screen, or the start of a network the user isn't looking at goes stale.
+ *
+ * Plain state, not Compose state: an update is idempotent for a given snapshot,
+ * so running it during composition is safe, and the snapshot flow already
+ * drives the recomposition.
  */
-class LogIndexCatchUp {
+class LogIndexCatchUp(private val enterGap: Long = ENTER_GAP) {
     private val startGap = HashMap<String, Long>()
+    private val last = HashMap<String, CatchUpProgress>()
 
-    /** Progress for [network] given the gap [LogIndexStatus.headCatchUpGap]
-     *  returned; null when the index is not catching up. */
+    /** Progress for [network] given [LogIndexStatus.headGap]'s answer; null
+     *  when the index is not catching up. */
     fun observe(network: String, gap: Long?): CatchUpProgress? {
-        if (gap == null) {
-            startGap.remove(network)
+        if (gap == null) return last[network]
+        val start = startGap[network]
+        if (start == null && gap < enterGap) return null
+        if (start != null && !LogIndexStatus.refusesHeadQueries(gap)) {
+            forget(network)
             return null
         }
-        val start = maxOf(startGap[network] ?: gap, gap)
-        startGap[network] = start
-        return CatchUpProgress(gap, start)
+        val progress = CatchUpProgress(gap, maxOf(start ?: gap, gap))
+        startGap[network] = progress.startGap
+        last[network] = progress
+        return progress
+    }
+
+    /** [observe] for every network's raw status JSON; networks no longer
+     *  present are forgotten, so a restarted one measures afresh. */
+    fun observeAll(statusJson: Map<String, String?>): Map<String, CatchUpProgress> {
+        (startGap.keys - statusJson.keys).toList().forEach(::forget)
+        val out = HashMap<String, CatchUpProgress>()
+        for ((network, json) in statusJson) {
+            observe(network, LogIndexStatus.headGap(json))?.let { out[network] = it }
+        }
+        return out
+    }
+
+    private fun forget(network: String) {
+        startGap.remove(network)
+        last.remove(network)
+    }
+
+    companion object {
+        /** One mainnet epoch: a gap this wide is a catch-up, not a trailing
+         *  head-follow. */
+        const val ENTER_GAP = 32L
     }
 }

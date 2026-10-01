@@ -1,6 +1,8 @@
 package io.myotis.ui
 
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.test.assertContentDescriptionEquals
+import androidx.compose.ui.test.assertRangeInfoEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import org.junit.Rule
@@ -32,6 +34,22 @@ class ReadinessStripCatchUpTest {
         assertLabel(
             "Node readiness: Log index catching up to the head — 800 blocks behind " +
                 "(75% of 3,200); eth_getLogs near the head is refused until it has caught up",
+        )
+    }
+
+    @Test
+    fun theBarsValueReachesScreenReaders() {
+        description(snapshot(), CatchUpProgress(800, 3200))
+        rule.onNodeWithTag(READINESS_STRIP_TAG, useUnmergedTree = true)
+            .assertRangeInfoEquals(ProgressBarRangeInfo(0.75f, 0f..1f))
+    }
+
+    @Test
+    fun aGapTooWideToBridgeIsAmberWithoutPromisingProgress() {
+        description(snapshot(), CatchUpProgress(600_000, 600_000))
+        assertLabel(
+            "Node readiness: Log index 600,000 blocks behind the head — too far to bridge, " +
+                "not catching up; eth_getLogs near the head is refused",
         )
     }
 

@@ -56,9 +56,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -161,8 +163,10 @@ fun NodeScreen(
     var selected by remember { mutableStateOf<String?>(null) }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
-    // Per-network start of a log-index head catch-up, so the top bar can show a fraction.
+    // Per-network log-index head catch-up for the top bar. Every network is observed on
+    // every snapshot, not just the selected one, so a catch-up's start stays current.
     val logIndexCatchUp = remember { LogIndexCatchUp() }
+    val logIndexCatchUps = logIndexCatchUp.observeAll(snapshots.mapValues { it.value.logIndexJson })
 
     // Follow the platform's light/dark appearance, and paint the scheme's own
     // background behind everything. The Surface is load-bearing twice over:
@@ -204,7 +208,7 @@ fun NodeScreen(
                 ReadinessStrip(
                     current,
                     settings.deepPoolThreshold(),
-                    logIndexCatchUp.observe(network, LogIndexStatus.headCatchUpGap(current?.logIndexJson)),
+                    logIndexCatchUps[network],
                 )
 
                 // Stale-anchor consent. The engines park fail-closed (beaconState
@@ -321,7 +325,8 @@ internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: C
         indexCatchingUp && catchUp != null ->
             Triple(Color(0xFFF9A825), 6.dp,
                 "Node readiness: ${LogIndexStatus.catchUpLine(catchUp)}; " +
-                    "eth_getLogs near the head is refused until it has caught up")
+                    "eth_getLogs near the head is refused" +
+                    if (catchUp.stalled) "" else " until it has caught up")
         s.snapServingPeers >= deepPoolThreshold ->
             Triple(Color(0xFF00E676), 6.dp,
                 "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
@@ -331,16 +336,27 @@ internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: C
     }
     if (indexCatchingUp && catchUp != null) {
         // The strip itself becomes the progress bar, with the gap spelled out beneath it.
+        // One semantics node carrying both the label and, while it moves, the bar's value.
         Column(
             Modifier.fillMaxWidth().testTag(READINESS_STRIP_TAG)
-                .clearAndSetSemantics { contentDescription = label },
+                .clearAndSetSemantics {
+                    contentDescription = label
+                    if (!catchUp.stalled) {
+                        progressBarRangeInfo = ProgressBarRangeInfo(catchUp.fraction, 0f..1f)
+                    }
+                },
         ) {
-            LinearProgressIndicator(
-                progress = { catchUp.fraction },
-                modifier = Modifier.fillMaxWidth().height(height),
-                color = color,
-                trackColor = color.copy(alpha = 0.25f),
-            )
+            if (catchUp.stalled) {
+                // Nothing is closing the gap: a bar would promise motion.
+                Box(Modifier.fillMaxWidth().height(height).background(color))
+            } else {
+                LinearProgressIndicator(
+                    progress = { catchUp.fraction },
+                    modifier = Modifier.fillMaxWidth().height(height),
+                    color = color,
+                    trackColor = color.copy(alpha = 0.25f),
+                )
+            }
             Text(
                 LogIndexStatus.catchUpLine(catchUp),
                 style = MaterialTheme.typography.bodySmall,
