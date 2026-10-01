@@ -91,16 +91,26 @@ object LogIndexStatus {
     const val BRIDGE_MAX_GAP = 500_000L
 
     /** The head side of the engine's status: how far an enabled index's
-     *  coverage trails the head `latest` resolves to. 0 when the index is
-     *  disabled (nothing to catch up). Null when the status says nothing about
-     *  it — no status (a failed host fetch), an engine error envelope, or no
-     *  head yet — which callers must treat as "unknown", not "caught up". */
+     *  coverage trails the head `latest` resolves to. 0 when there is nothing
+     *  to catch up: the index is disabled, or it is enabled with no covered
+     *  span at all (an emptied watch list — the engine then omits `headGap`
+     *  for good, and holding a catch-up through it would freeze the strip).
+     *  Null when the status says nothing about it — no status (a failed host
+     *  fetch), an engine error envelope, or coverage but no head yet — which
+     *  callers must treat as "unknown", not "caught up". */
     fun headGap(json: String?): Long? {
         if (json == null) return null
         if (json.contains("\"enabled\":false")) return 0L
         if (!json.contains("\"enabled\":true")) return null
-        return Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        val gap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
+        if (gap != null) return gap
+        // host.rs emits headGap whenever there is a head AND an append edge,
+        // and the edge exists exactly when some entry has a span — so no
+        // `coveredHigh` anywhere means nothing is indexed, not "no head yet".
+        return if (COVERED_HIGH.containsMatchIn(json)) null else 0L
     }
+
+    private val COVERED_HIGH = Regex("\"coveredHigh\":\\d")
 
     /** True when [gap] is past the engine's serving slack: head-reaching
      *  `eth_getLogs` is refused. */

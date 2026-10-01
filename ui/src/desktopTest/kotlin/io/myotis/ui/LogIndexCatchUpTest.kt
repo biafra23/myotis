@@ -10,11 +10,14 @@ import org.junit.Test
  *  how the engine's instantaneous `headGap` becomes progress. */
 class LogIndexCatchUpTest {
 
-    private fun status(gap: Long?, enabled: Boolean = true) =
+    private val coveredEntry = "{\"address\":\"0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9\"," +
+        "\"fromBlock\":14737691,\"coveredLow\":14737691,\"coveredHigh\":26094715}"
+
+    private fun status(gap: Long?, enabled: Boolean = true, entries: String = coveredEntry) =
         "{\"enabled\":$enabled,\"logCount\":426000,\"maxSpeed\":false,\"backfillPaused\":true," +
             "\"targetLow\":14737691,\"blocksRemaining\":0" +
             (gap?.let { ",\"headGap\":$it" } ?: "") +
-            ",\"entries\":[]}"
+            ",\"entries\":[$entries]}"
 
     @Test
     fun headGapReadsTheEnginesField() {
@@ -26,6 +29,25 @@ class LogIndexCatchUpTest {
     fun aDisabledIndexHasNothingToCatchUp() {
         assertEquals(0L, LogIndexStatus.headGap(status(3270, enabled = false)))
         assertEquals(0L, LogIndexStatus.headGap("{\"enabled\":false}"))
+    }
+
+    @Test
+    fun anIndexWithNothingCoveredHasNothingToCatchUp() {
+        // An emptied watch list: enabled, no span anywhere, so the engine omits headGap.
+        assertEquals(0L, LogIndexStatus.headGap(status(null, entries = "")))
+        // An entry without a span yet (just added) is the same: nothing indexed.
+        assertEquals(
+            0L,
+            LogIndexStatus.headGap(status(null, entries = "{\"address\":\"0x" + "ab".repeat(20) +
+                "\",\"fromBlock\":1}")),
+        )
+    }
+
+    @Test
+    fun emptyingTheWatchListMidCatchUpEndsIt() {
+        val t = LogIndexCatchUp()
+        t.observeAll(mapOf("mainnet" to status(3200)))
+        assertEquals(emptyMap<String, CatchUpProgress>(), t.observeAll(mapOf("mainnet" to status(null, entries = ""))))
     }
 
     @Test
