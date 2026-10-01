@@ -53,6 +53,9 @@ struct Pending {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
+/// The read loop's stamp of the last response it delivered (see
+/// `ManagedPeer::last_response`).
+type SharedLastResponse = Arc<std::sync::Mutex<Option<tokio::time::Instant>>>;
 
 /// The egress writer plus a torn-write marker. A frame write whose future is
 /// DROPPED mid-await (request futures are cancelled routinely — e.g. the
@@ -281,6 +284,12 @@ pub struct ManagedPeer {
     /// against one peer; one line says which peer went silent, the next 47
     /// would only repeat it). Reset by any delivered response.
     timeout_streak: AtomicU64,
+    /// When the read loop last delivered a response to one of our requests
+    /// (any request: a snap proof, a header window, a body). A peer whose
+    /// responses keep arriving — however slowly, on a slow link — is not
+    /// SILENT, whatever one request's age; the prefetch wave judges silence by
+    /// this, not by request age (#320).
+    last_response: SharedLastResponse,
     reader_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Negotiated eth version (66-69).
@@ -313,6 +322,12 @@ impl ManagedPeer {
         if let Some(task) = task { task.abort(); let _ = task.await; }
         self.pending.lock().await.clear();
         self.writer.lock().await.inner.take();
+    }
+
+    /// When this peer last answered one of our requests, if it ever did
+    /// (see the `last_response` field).
+    pub(crate) fn last_response(&self) -> Option<tokio::time::Instant> {
+        *self.last_response.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take over a handshook [`EthSession`], splitting its connection and
@@ -378,10 +393,12 @@ impl ManagedPeer {
             },
         )));
 
+        let last_response: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
         let reader_task = tokio::spawn(read_loop(
             reader,
             Arc::clone(&writer),
             Arc::clone(&pending),
+            Arc::clone(&last_response),
             Arc::clone(&closed),
             snap_codes,
             serve.clone(),
@@ -397,6 +414,7 @@ impl ManagedPeer {
             next_id: AtomicU64::new(1),
             closed,
             timeout_streak: AtomicU64::new(0),
+            last_response,
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
             snap,
@@ -872,6 +890,7 @@ async fn read_loop(
     mut reader: RlpxReader,
     writer: SharedWriter,
     pending: PendingMap,
+    last_response: SharedLastResponse,
     closed: Arc<AtomicBool>,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
@@ -1007,6 +1026,8 @@ async fn read_loop(
             if let Some(entry) = map.get(&id) {
                 if entry.want_code == code {
                     let entry = map.remove(&id).expect("just checked present");
+                    *last_response.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(tokio::time::Instant::now());
                     let _ = entry.tx.send(Ok(frame.payload));
                 }
             }

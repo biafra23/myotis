@@ -313,63 +313,83 @@ pub(crate) fn u256_be(bytes: &[u8]) -> Option<U256> {
     }
 }
 
-/// How long ONE request of the best-effort prefetch wave may take before the
-/// wave gives up on it (#320). The wave pins each chunk to one peer per
-/// attempt, and a silent peer used to hold its chunk for the full peer request
-/// timeout (15 s) before the rotation reached the next one — on the `eth_call`'s
-/// critical path, since the call waits for the wave (up to its 30 s bound).
+/// How long a peer may stay SILENT — answer none of our requests, any request —
+/// before the prefetch wave stops waiting on its outstanding ones (#320). The
+/// wave pins each chunk to one peer per attempt, and a silent peer used to hold
+/// its chunk for the full peer request timeout (15 s) before the rotation
+/// reached the next one — on the `eth_call`'s critical path, as the call waits
+/// for the wave (up to its 30 s bound).
 ///
-/// A deadline here does not reopen the trade the serial reads avoid by hedging
-/// instead (see `reader::HEDGE_DELAY`): nothing the wave drops is lost — the
-/// hedged serial path fetches it again, and still lets a slow peer win there.
-/// Sized as the bulk hedge delay, so that a chunk's whole burst of requests on
-/// one connection still lands on a uniformly slow link.
-const WAVE_REQUEST_DEADLINE: std::time::Duration = BULK_HEDGE_DELAY;
+/// Silence, deliberately, not a request's age. On a slow link a request's wait
+/// is set by the responses queued AHEAD of it on our own downlink (the wave
+/// keeps up to 48 in flight), so an age deadline would cut healthy requests,
+/// waste the responses already on their way, and starve the rest — turning a
+/// slow wave into a failed call, the trade `reader::HEDGE_DELAY` refuses for
+/// the serial reads. A peer whose responses keep arriving is not silent,
+/// however old one request is. Sized as the bulk hedge delay.
+const WAVE_SILENCE_DEADLINE: std::time::Duration = BULK_HEDGE_DELAY;
 
 /// How often [`wave_request`] looks again whether its request has gone out.
-const WAVE_SEND_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+const WAVE_SILENCE_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// One prefetch-wave request under [`WAVE_REQUEST_DEADLINE`], counted from the
-/// request's ACTUAL send (`peer::scope_send_marker`), as the hedged race judges
-/// an outpaced peer: a request unanswered that long after it reached its peer
-/// fails like any other, so its item rotates to the next one. Dropping it then
-/// is safe — it is waiting for its response, the peer's pending-request guard
-/// removes it, and a late answer is discarded. A request still queued for the
-/// connection's shared writer is never cut: dropping it inside a frame write
-/// would tear the stream for every request on that connection (`send_frame`),
-/// so it waits like before, bounded by the wave's own timeout.
+/// Why a prefetch-wave request came back without an answer.
+#[derive(Debug, PartialEq, Eq)]
+enum WaveFailure {
+    /// The peer stayed silent for [`WAVE_SILENCE_DEADLINE`]: the item moves to
+    /// the next peer, and the peer is not struck for it — silence there may
+    /// as well be our own link, and the hedged serial reads bench a peer that
+    /// is truly silent (their "outpaced" rule).
+    Silent,
+    /// The peer answered with an error, or the request failed outright.
+    Failed(String),
+}
+
+/// One prefetch-wave request: its answer, or [`WaveFailure::Silent`] once its
+/// peer has delivered NO response to any of our requests for
+/// [`WAVE_SILENCE_DEADLINE`], counted from the later of this request's actual
+/// send (`peer::scope_send_marker`) and the peer's last delivered response
+/// (`last_response`, `ManagedPeer::last_response`). Dropping the request then
+/// is safe — it is waiting for its response; the peer's pending-request guard
+/// removes it and a late answer is discarded. A request not yet sent (still
+/// queued for, or inside, the connection's shared writer) is never cut:
+/// dropping it mid-frame would tear the stream for every request on that
+/// connection (`send_frame`), so it waits as before, bounded by the wave.
 async fn wave_request<T>(
+    last_response: impl Fn() -> Option<tokio::time::Instant>,
     request: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+) -> Result<T, WaveFailure> {
     let (sent, request) = crate::el::peer::scope_send_marker(request);
     tokio::pin!(request);
     loop {
-        let wait = match sent.get() {
-            Some(at) => {
-                let age = at.elapsed();
-                if age >= WAVE_REQUEST_DEADLINE {
-                    return Err(format!(
-                        "prefetch request unanswered {} s after it was sent",
-                        WAVE_REQUEST_DEADLINE.as_secs()
-                    ));
+        let quiet_since = sent.get().copied().map(|at| match last_response() {
+            Some(heard) if heard > at => heard,
+            _ => at,
+        });
+        let wait = match quiet_since {
+            Some(since) => {
+                let quiet = since.elapsed();
+                if quiet >= WAVE_SILENCE_DEADLINE {
+                    return Err(WaveFailure::Silent);
                 }
-                WAVE_REQUEST_DEADLINE - age
+                WAVE_SILENCE_DEADLINE - quiet
             }
-            None => WAVE_SEND_RECHECK,
+            None => WAVE_SILENCE_RECHECK,
         };
         tokio::select! {
-            out = &mut request => return out,
+            out = &mut request => return out.map_err(WaveFailure::Failed),
             _ = tokio::time::sleep(wait) => {}
         }
     }
 }
 
-/// The peer, as a position in this call's ask order, that a wave chunk asks on
-/// one attempt: chunks start on different peers and each retry moves one
-/// along, as before — but along the order the call has LEARNED (`order`), so a
-/// peer that already lost a race in this call is asked last, not first.
-fn wave_peer(peers: usize, chunk: usize, attempt: usize) -> usize {
-    (chunk + attempt) % peers
+/// The peer, as a position in this call's wave order ([`PoolOracle::wave_ladder`]:
+/// the learned order with the peers that lost a race in this call moved
+/// behind the rest), that a wave chunk asks on one attempt: a first attempt
+/// rotates over the `healthy` peers only, so a known loser is never a chunk's
+/// first ask; each retry moves one along the whole order.
+fn wave_peer(peers: usize, healthy: usize, chunk: usize, attempt: usize) -> usize {
+    let first = if healthy == 0 { chunk % peers } else { chunk % healthy };
+    (first + attempt) % peers
 }
 
 /// A [`SnapStateOracle`] over a fixed snapshot of snap peers, bridging the sync
@@ -398,6 +418,10 @@ pub struct PoolOracle {
     /// only reorders the NEXT call's snapshot, and even an eviction does not
     /// take the peer out of this one.
     order: Mutex<Vec<usize>>,
+    /// The peers (indices into `peers`) that missed or were outpaced in this
+    /// call's latest race against them, and have not won one since — what the
+    /// prefetch wave keeps off a chunk's first ask ([`Self::wave_ladder`]).
+    lost: Mutex<Vec<bool>>,
     /// The call runs against the beacon-FINALIZED state root (the `finalized`
     /// tag; #465, #366). Two things follow, both as for the reader's own
     /// finalized state reads: a peer answering a fetch with an empty proof
@@ -428,6 +452,28 @@ fn next_order<T>(order: &[usize], asked: &[usize], out: &RaceOutcome<T>) -> Vec<
     next
 }
 
+/// Note one race over `asked` in `lost` (indexed by peer id): every peer that
+/// missed or was outpaced has lost, the winner has not. Pure, like
+/// [`next_order`].
+fn note_losers<T>(lost: &mut [bool], asked: &[usize], out: &RaceOutcome<T>) {
+    for pos in out.missed.iter().chain(&out.outpaced) {
+        if let Some(&peer) = asked.get(*pos) {
+            lost[peer] = true;
+        }
+    }
+    if let Some(&winner) = out.accepted.as_ref().and_then(|(pos, _)| asked.get(*pos)) {
+        lost[winner] = false;
+    }
+}
+
+/// `order` with the `lost` peers moved behind the rest (each group keeping its
+/// order), and how many lead it — the prefetch wave's ladder. Pure.
+fn wave_positions(order: &[usize], lost: &[bool]) -> (Vec<usize>, usize) {
+    let (healthy, losers): (Vec<usize>, Vec<usize>) = order.iter().partition(|&&i| !lost[i]);
+    let count = healthy.len();
+    (healthy.into_iter().chain(losers).collect(), count)
+}
+
 impl PoolOracle {
     pub fn new(
         peers: Vec<Arc<ManagedPeer>>,
@@ -437,6 +483,7 @@ impl PoolOracle {
         finalized: bool,
     ) -> PoolOracle {
         let order = Mutex::new((0..peers.len()).collect());
+        let lost = Mutex::new(vec![false; peers.len()]);
         PoolOracle {
             operation: super::request::Operation::current(),
             peers,
@@ -445,6 +492,7 @@ impl PoolOracle {
             leaf_memo: Mutex::new(HashMap::new()),
             stats,
             order,
+            lost,
             finalized,
         }
     }
@@ -547,11 +595,24 @@ impl PoolOracle {
         (asked, peers)
     }
 
-    /// Adapt this call's ask order to one race that asked in order `asked`.
+    /// Adapt this call's ask order to one race that asked in order `asked`,
+    /// and note who lost it (missed or outpaced) and who won.
     fn learn_order<T>(&self, asked: &[usize], out: &RaceOutcome<T>) {
-        let mut order = self.order.lock().unwrap();
-        let next = next_order(&order, asked, out);
-        *order = next;
+        {
+            let mut order = self.order.lock().unwrap();
+            let next = next_order(&order, asked, out);
+            *order = next;
+        }
+        note_losers(&mut self.lost.lock().unwrap(), asked, out);
+    }
+
+    /// The prefetch wave's peers: this call's learned order with every peer
+    /// that lost a race in it moved behind the rest, and how many lead it
+    /// unscathed ([`wave_peer`] keeps a chunk's first ask among those).
+    fn wave_ladder(&self) -> (Vec<Arc<ManagedPeer>>, usize) {
+        let order = self.order.lock().unwrap().clone();
+        let (positions, healthy) = wave_positions(&order, &self.lost.lock().unwrap());
+        (positions.iter().map(|&i| Arc::clone(&self.peers[i])).collect(), healthy)
     }
 
     /// The proof-verified account leaf at `address`, or `None` when proven absent.
@@ -668,9 +729,9 @@ impl SnapStateOracle for PoolOracle {
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let quality = self.quality.clone();
-        // The call's learned ask order, not the snapshot's: a peer that lost a
-        // hedged race in this call goes last (#320).
-        let (_, ordered) = self.ladder();
+        // The call's learned order, not the snapshot's, with this call's
+        // losers behind the rest (#320).
+        let (ordered, healthy) = self.wave_ladder();
         let ordered = &ordered;
 
         /// One item's outcome for retry + reputation bookkeeping.
@@ -678,6 +739,9 @@ impl SnapStateOracle for PoolOracle {
             Skipped, // already cached — no request sent, no reputation signal
             Served,
             Failed,
+            /// The peer went silent ([`WaveFailure::Silent`]): retried on the
+            /// next peer like a failure, but no reputation signal (#320).
+            Cut,
         }
 
         // One (account, slots) item against one peer: account leaf first (its
@@ -718,7 +782,8 @@ impl SnapStateOracle for PoolOracle {
                             return ItemOutcome::Failed;
                         };
                         let started = std::time::Instant::now();
-                        let outcome = wave_request(peer.snap_get_account(state_root, &addr)).await;
+                        let outcome =
+                            wave_request(|| peer.last_response(), peer.snap_get_account(state_root, &addr)).await;
                         if let Ok(o) = &outcome {
                             let leaf = match o {
                                 AccountOutcome::Present(l) => Some(l),
@@ -736,7 +801,8 @@ impl SnapStateOracle for PoolOracle {
                                 self.leaf_memo.lock().unwrap().insert(addr, None);
                                 return ItemOutcome::Served;
                             }
-                            Err(_) => return ItemOutcome::Failed,
+                            Err(WaveFailure::Silent) => return ItemOutcome::Cut,
+                            Err(WaveFailure::Failed(_)) => return ItemOutcome::Failed,
                         }
                     }
                 };
@@ -758,14 +824,19 @@ impl SnapStateOracle for PoolOracle {
                     let sem = Arc::clone(&sem);
                     async move {
                         let Ok(_permit) = sem.acquire().await else {
-                            return None; // closed semaphore = local failure
+                            // closed semaphore = local failure
+                            return Err(WaveFailure::Failed("semaphore closed".to_string()));
                         };
                         let started = std::time::Instant::now();
-                        let value = wave_request(peer.snap_get_storage(state_root, &addr, &leaf, &position))
-                            .await
-                            .ok()
-                            .and_then(|bytes| u256_be(&bytes));
-                        if let Some(v) = value {
+                        let value = wave_request(
+                            || peer.last_response(),
+                            peer.snap_get_storage(state_root, &addr, &leaf, &position),
+                        )
+                        .await
+                        .and_then(|bytes| {
+                            u256_be(&bytes).ok_or(WaveFailure::Failed("storage scalar too long".to_string()))
+                        });
+                        if let Ok(v) = value {
                             self.note_storage(addr, position, state_root, leaf.storage_root, v, started);
                         }
                         value
@@ -773,17 +844,22 @@ impl SnapStateOracle for PoolOracle {
                 }))
                 .await;
                 let mut any_slot_failed = false;
+                let mut any_slot_cut = false;
                 for (slot, value) in missing.iter().zip(values) {
                     match value {
-                        Some(v) => proof_sink.put_storage(state_root, &addr, slot, v),
-                        None => any_slot_failed = true,
+                        Ok(v) => proof_sink.put_storage(state_root, &addr, slot, v),
+                        Err(WaveFailure::Silent) => any_slot_cut = true,
+                        Err(WaveFailure::Failed(_)) => any_slot_failed = true,
                     }
                 }
                 // A partial slot failure fails the ITEM so the rotation retries
                 // it on the next peer — the retry only re-fetches the gaps
                 // (cached slots are filtered out above). Successful puts keep.
+                // Silence alone retries it too, without counting against the peer.
                 if any_slot_failed {
                     ItemOutcome::Failed
+                } else if any_slot_cut {
+                    ItemOutcome::Cut
                 } else {
                     ItemOutcome::Served
                 }
@@ -810,7 +886,7 @@ impl SnapStateOracle for PoolOracle {
                             if pending.is_empty() {
                                 break;
                             }
-                            let peer = &ordered[wave_peer(ordered.len(), chunk_idx, attempt)];
+                            let peer = &ordered[wave_peer(ordered.len(), healthy, chunk_idx, attempt)];
                             let outcomes = futures::future::join_all(pending.iter().map(
                                 |(addr, slots)| {
                                     fetch_item(Arc::clone(peer), *addr, slots.clone())
@@ -827,6 +903,9 @@ impl SnapStateOracle for PoolOracle {
                                         asked_any = true;
                                         still_failed.push(item);
                                     }
+                                    // Retried, but no evidence against the
+                                    // peer: its silence may be our own link.
+                                    ItemOutcome::Cut => still_failed.push(item),
                                     // Cache-skips carry NO reputation signal —
                                     // the peer was never asked.
                                     ItemOutcome::Skipped => {}
@@ -868,7 +947,7 @@ impl SnapStateOracle for PoolOracle {
 
             // Bytecode: content-addressed, verified by hash inside the peer call.
             let code_fetches = code_hashes.iter().enumerate().map(|(i, hash)| {
-                let peer = Arc::clone(&ordered[wave_peer(ordered.len(), i, 0)]);
+                let peer = Arc::clone(&ordered[wave_peer(ordered.len(), healthy, i, 0)]);
                 let sem = Arc::clone(&sem);
                 async move {
                     if code_sink.get(hash).is_some() {
@@ -878,7 +957,7 @@ impl SnapStateOracle for PoolOracle {
                         return; // closed semaphore — never bypass the bound
                     };
                     let started = std::time::Instant::now();
-                    if let Ok(code) = wave_request(peer.snap_get_bytecode(hash)).await {
+                    if let Ok(code) = wave_request(|| peer.last_response(), peer.snap_get_bytecode(hash)).await {
                         self.stats.observe_code(*hash, started.elapsed());
                         code_sink.put(hash, code.into());
                     }
@@ -1181,6 +1260,7 @@ mod tests {
 
     mod prefetch_wave {
         use super::*;
+        use std::sync::Mutex as StdMutex;
         use std::time::Duration;
 
         /// A request that goes out after `queued` on its connection's writer
@@ -1191,25 +1271,60 @@ mod tests {
             std::future::pending().await
         }
 
-        #[tokio::test(start_paused = true)]
-        async fn a_silent_request_gives_up_at_the_deadline_not_the_peer_timeout() {
-            // #320: a silent peer held its chunk for the 15 s request timeout,
-            // and the eth_call with it.
-            let started = tokio::time::Instant::now();
-            assert!(wave_request(sent_then_silent(Duration::ZERO)).await.is_err());
-            assert_eq!(started.elapsed(), WAVE_REQUEST_DEADLINE);
-            assert!(WAVE_REQUEST_DEADLINE < Duration::from_secs(15), "must beat the peer request timeout");
+        /// A request sent at once and answered after `after`.
+        async fn sent_then_answered(after: Duration) -> Result<u8, String> {
+            crate::el::peer::mark_request_sent();
+            tokio::time::sleep(after).await;
+            Ok(7)
+        }
+
+        fn never_heard() -> Option<tokio::time::Instant> {
+            None
         }
 
         #[tokio::test(start_paused = true)]
-        async fn the_deadline_counts_from_the_send_not_from_the_queue() {
+        async fn a_silent_peer_is_given_up_at_the_deadline_not_the_request_timeout() {
+            // #320: a silent peer held its chunk for the 15 s request timeout,
+            // and the eth_call with it.
+            let started = tokio::time::Instant::now();
+            let out = wave_request(never_heard, sent_then_silent(Duration::ZERO)).await;
+            assert_eq!(out, Err(WaveFailure::Silent));
+            assert_eq!(started.elapsed(), WAVE_SILENCE_DEADLINE);
+            assert!(WAVE_SILENCE_DEADLINE < Duration::from_secs(15), "must beat the peer request timeout");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_peer_still_delivering_is_never_cut() {
+            // A slow link: this request waits 20 s behind the responses queued
+            // ahead of it, but the peer's responses keep arriving — it is not
+            // silent, and cutting here would starve the wave (the #320 review).
+            let heard = std::sync::Arc::new(StdMutex::new(None::<tokio::time::Instant>));
+            let feeder = {
+                let heard = std::sync::Arc::clone(&heard);
+                tokio::spawn(async move {
+                    for _ in 0..25 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        *heard.lock().unwrap() = Some(tokio::time::Instant::now());
+                    }
+                })
+            };
+            let started = tokio::time::Instant::now();
+            let out = wave_request(|| *heard.lock().unwrap(), sent_then_answered(Duration::from_secs(20))).await;
+            assert_eq!(out, Ok(7));
+            assert_eq!(started.elapsed(), Duration::from_secs(20));
+            feeder.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn silence_counts_from_the_send_not_from_the_queue() {
             // 4 s waiting for the shared writer is not the peer's silence.
             let started = tokio::time::Instant::now();
-            assert!(wave_request(sent_then_silent(Duration::from_secs(4))).await.is_err());
+            let out = wave_request(never_heard, sent_then_silent(Duration::from_secs(4))).await;
+            assert_eq!(out, Err(WaveFailure::Silent));
             let elapsed = started.elapsed();
             assert!(
-                elapsed >= Duration::from_secs(4) + WAVE_REQUEST_DEADLINE
-                    && elapsed < Duration::from_secs(4) + WAVE_REQUEST_DEADLINE + WAVE_SEND_RECHECK,
+                elapsed >= Duration::from_secs(4) + WAVE_SILENCE_DEADLINE
+                    && elapsed < Duration::from_secs(4) + WAVE_SILENCE_DEADLINE + WAVE_SILENCE_RECHECK,
                 "{elapsed:?}"
             );
         }
@@ -1218,7 +1333,7 @@ mod tests {
         async fn a_request_that_never_went_out_is_never_cut() {
             // Dropping one still inside the writer would tear its connection:
             // it is left to finish, however long the writer took.
-            let out = wave_request(async {
+            let out = wave_request(never_heard, async {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 Ok::<_, String>(9u8)
             })
@@ -1228,19 +1343,42 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn an_answer_inside_the_deadline_is_kept() {
-            let out = wave_request(async {
-                tokio::time::sleep(WAVE_REQUEST_DEADLINE - Duration::from_millis(1)).await;
-                Ok::<_, String>(7u8)
-            })
-            .await;
+            let out = wave_request(never_heard, sent_then_answered(WAVE_SILENCE_DEADLINE - Duration::from_millis(1))).await;
             assert_eq!(out, Ok(7));
         }
 
         #[test]
-        fn chunks_start_apart_and_each_retry_moves_one_along_the_order() {
-            assert_eq!((0..3).map(|c| wave_peer(3, c, 0)).collect::<Vec<_>>(), vec![0, 1, 2]);
-            assert_eq!((0..3).map(|a| wave_peer(3, 2, a)).collect::<Vec<_>>(), vec![2, 0, 1]);
-            assert_eq!(wave_peer(1, 5, 2), 0);
+        fn a_known_loser_is_never_a_first_ask() {
+            // 3 healthy peers, then 1 that lost a race in this call (position 3).
+            let firsts: Vec<usize> = (0..8).map(|c| wave_peer(4, 3, c, 0)).collect();
+            assert!(firsts.iter().all(|&p| p < 3), "{firsts:?}");
+            // Retries move along the whole order, and reach it last.
+            assert_eq!((0..4).map(|a| wave_peer(4, 3, 2, a)).collect::<Vec<_>>(), vec![2, 3, 0, 1]);
+            // Nobody unscathed: rotate over all, as before.
+            assert_eq!((0..3).map(|c| wave_peer(3, 0, c, 0)).collect::<Vec<_>>(), vec![0, 1, 2]);
+        }
+
+        fn race(accepted: Option<usize>, missed: Vec<usize>, outpaced: Vec<usize>) -> RaceOutcome<()> {
+            RaceOutcome {
+                accepted: accepted.map(|i| (i, ())),
+                fallback: None,
+                missed,
+                outpaced,
+                errors: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn losers_go_behind_and_a_win_clears_them() {
+            let mut lost = vec![false; 4];
+            // A race asked peers [2, 0, 1]: 2 missed, 0 was outpaced, 1 won.
+            note_losers(&mut lost, &[2, 0, 1], &race(Some(2), vec![0], vec![1]));
+            assert_eq!(lost, vec![true, false, true, false]);
+            assert_eq!(wave_positions(&[1, 3, 2, 0], &lost), (vec![1, 3, 2, 0], 2));
+            assert_eq!(wave_positions(&[0, 1, 2, 3], &lost), (vec![1, 3, 0, 2], 2));
+            // Peer 0 wins a later race: no longer a loser.
+            note_losers(&mut lost, &[0], &race(Some(0), vec![], vec![]));
+            assert_eq!(wave_positions(&[0, 1, 2, 3], &lost), (vec![0, 1, 3, 2], 3));
         }
     }
 
