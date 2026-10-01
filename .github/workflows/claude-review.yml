@@ -170,6 +170,25 @@ jobs:
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # Whether this run's copy of this file is the default branch's. When it
+      # is not, the action skips without starting Claude (see Scope
+      # decisions), and the check after the first attempt has to tell that
+      # skip from an attempt that left nothing. Asked here, before the action
+      # runs: the action points origin at its app token and revokes the token
+      # on its way out, so a fetch after it would fail.
+      - name: Does this workflow match the default branch's?
+        id: workflow
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin "$DEFAULT_BRANCH"
+          if git diff --quiet FETCH_HEAD -- .github/workflows/claude-review.yml; then
+            echo "matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matches=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # The checks below ask what the reviewer posted or edited since this
       # moment: its summary (an issue comment) and its inline comments. A time,
       # not a count: a re-review may update its earlier summary instead of
@@ -198,11 +217,11 @@ jobs:
       # Model strategy above). `outcome` is the raw step result (conclusion is
       # masked to success by continue-on-error). The action sets `session_id`
       # only once Claude has run; a clean step without one is the action's skip
-      # when it is confirmed (this file differs from the default branch's), and
-      # an attempt that left nothing when it is not. The action has already
-      # flushed any buffered inline comments by now, so no comment since the
-      # start means genuinely nothing was posted and a second attempt (the
-      # fallback job) is safe.
+      # when this file differs from the default branch's (asked before the
+      # action ran), and an attempt that left nothing when it does not. The
+      # action has already flushed any buffered inline comments by now, so no
+      # comment since the start means genuinely nothing was posted and a
+      # second attempt (the fallback job) is safe.
       - name: Did the first attempt leave a review?
         id: unposted
         env:
@@ -211,13 +230,13 @@ jobs:
           SINCE: ${{ steps.start.outputs.at }}
           OUTCOME: ${{ steps.fable.outcome }}
           CLAUDE_SESSION: ${{ steps.fable.outputs.session_id }}
+          WORKFLOW_MATCHES: ${{ steps.workflow.outputs.matches }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           workflow=.github/workflows/claude-review.yml
           if [ "$OUTCOME" = success ] && [ -z "$CLAUDE_SESSION" ]; then
-            git fetch --no-tags --no-recurse-submodules --depth=1 origin "$DEFAULT_BRANCH"
-            if ! git diff --quiet FETCH_HEAD -- "$workflow"; then
+            if [ "$WORKFLOW_MATCHES" != true ]; then
               echo "safe=false" >> "$GITHUB_OUTPUT"
               echo "::warning::No automated review: this PR's $workflow differs from $DEFAULT_BRANCH's, so the action skipped (see Scope decisions in that file)."
               exit 0
