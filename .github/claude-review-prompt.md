@@ -24,4 +24,6 @@ The PR branch is checked out in the working directory. Use
 `gh pr comment` for the overall review summary and
 `mcp__github_inline_comment__create_inline_comment` (with
 `confirmed: true`) for line-specific findings. Only post GitHub
-comments — don't leave review text as plain messages.
+comments — don't leave review text as plain messages. Post the
+summary even when you find nothing to flag: a review that leaves no
+comment on the PR counts as a failed one.
