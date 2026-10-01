@@ -60,7 +60,12 @@ class RelayAdapt7702ShieldFixtureTest {
         f.code.put(Bytes.wrap(keccak(designator)), designator);
 
         JsonObject retry = f.meta.get("variants").asObject().get("retryFromDelegated").asObject();
-        assertTrue(retry.get("authorizationList") == null, "the retry is a plain call");
+        // The Rust reader refuses any field it does not apply; this one must too,
+        // or a re-recording could replay a different transaction here.
+        for (JsonObject.Member m : retry) {
+            assertTrue(List.of("from", "to", "value", "data").contains(m.getName()),
+                    "a retry field this replay would drop: " + m.getName());
+        }
         UnsignedTransaction tx = new UnsignedTransaction(
                 Address.fromHex(retry.getString("from", null)),
                 Address.fromHex(retry.getString("to", null)),
@@ -86,6 +91,13 @@ class RelayAdapt7702ShieldFixtureTest {
         return new BigInteger(v.asString().substring(2), 16);
     }
 
+    /** {@code v} as a long, failing rather than truncating (the Rust reader's
+     *  "exceeds 64 bits"); not {@code longValueExact}, which minSdk 29 lacks. */
+    private static long longOf(BigInteger v) {
+        assertTrue(v.signum() >= 0 && v.bitLength() < 64, "exceeds 64 bits: " + v);
+        return v.longValue();
+    }
+
     /** The recorded world as an oracle; an unrecorded read is a test failure. */
     private static final class Fixture implements SnapStateOracle {
         final JsonObject meta;
@@ -104,13 +116,13 @@ class RelayAdapt7702ShieldFixtureTest {
             JsonObject b = file.get("block").asObject();
             block = new BlockContext(
                     Bytes.fromHexString(b.getString("stateRoot", null)).toArrayUnsafe(),
-                    quantity(b.get("number")).longValue(),
-                    quantity(b.get("timestamp")).longValue(),
+                    longOf(quantity(b.get("number"))),
+                    longOf(quantity(b.get("timestamp"))),
                     quantity(b.get("baseFeePerGas")),
                     Address.fromHex(b.getString("coinbase", null)),
                     Bytes.fromHexString(b.getString("prevRandao", null)).toArrayUnsafe(),
                     quantity(b.get("chainId")),
-                    quantity(b.get("gasLimit")).longValue());
+                    longOf(quantity(b.get("gasLimit"))));
             for (JsonObject.Member m : file.get("accounts").asObject()) {
                 Address address = Address.fromHex(m.getName());
                 if (m.getValue().isNull()) {
@@ -118,7 +130,7 @@ class RelayAdapt7702ShieldFixtureTest {
                     continue;
                 }
                 JsonObject a = m.getValue().asObject();
-                accounts.put(address, new AccountState(address, quantity(a.get("nonce")).longValue(),
+                accounts.put(address, new AccountState(address, longOf(quantity(a.get("nonce"))),
                         quantity(a.get("balance")), Bytes.fromHexString(a.getString("codeHash", null)).toArrayUnsafe()));
             }
             for (JsonObject.Member m : file.get("storage").asObject()) {
@@ -146,7 +158,7 @@ class RelayAdapt7702ShieldFixtureTest {
         }
 
         long measured(String key) {
-            return quantity(measured.get(key)).longValue();
+            return longOf(quantity(measured.get(key)));
         }
 
         private void root(byte[] stateRoot) {

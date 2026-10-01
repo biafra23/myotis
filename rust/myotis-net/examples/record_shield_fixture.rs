@@ -147,11 +147,12 @@ async fn record_with_retries(reader: &ElReader, delegate: [u8; 20], peer_cache: 
         })?;
         match record(head, delegate).await {
             Ok(fixture) => return Ok(fixture),
-            Err(e) => {
+            Err(e) if attempt < ATTEMPTS => {
                 tracing::warn!(attempt, error = %e, "recording failed; retrying at a fresh head");
                 last_error = e;
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
+            Err(e) => last_error = e,
         }
     }
     Err(format!("no recording succeeded in {ATTEMPTS} attempts; the last failed with: {last_error}"))
