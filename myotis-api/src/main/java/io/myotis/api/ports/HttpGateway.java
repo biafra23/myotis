@@ -7,8 +7,13 @@ package io.myotis.api.ports;
  * proof-verified state, so this port needs no TLS pinning or response validation
  * beyond size/timeout hygiene.
  *
- * <p>Blocking; called from engine worker threads. Implementations should apply
- * ~10–15 s timeouts and bound the response size (~1 MiB).
+ * <p>Blocking: the Java engine calls it from its own workers, the Rust engine's JVM
+ * adapter ({@code CcipDriver}) on the thread that called the {@code EnsApi}.
+ * Implementations must bound the response size (~1 MiB) and the whole request, from
+ * connect to the body's last byte (~15 s). A per-read or headers-only timeout is not
+ * enough: a gateway URL comes from the resolver contract, and a gateway sending its
+ * body a byte at a time keeps every read short and holds that thread for as long as
+ * it keeps sending.
  */
 public interface HttpGateway {
 

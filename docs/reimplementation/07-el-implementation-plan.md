@@ -474,7 +474,8 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
    no number for reverts, plain transfer short-circuit to 21000) + the ABI subset (hand-rolled,
    doc 03 §5 hardening).
 5. **CCIP-Read + ENS.** `OffchainLookup` parse/serial gateway iteration/HttpError detection
-   via the `HttpGateway` port (blocking, wrapped `spawn_blocking`); callback re-entry capped
+   via the `HttpGateway` port (blocking; as landed, the host drives the gateway round —
+   `CcipDriver` on the JVM hosts — and re-enters via `ccipCallback`); callback re-entry capped
    at 1; ENS namehash/DNS-encode/ENSIP-10 discovery + record calls + reverse with mandatory
    forward-verification. Mainnet+sepolia only (`hasEns` gate).
    - **Landed (EL-C-5-1): ENS forward resolution core** (`myotis-evm::ens`, sans-I/O). `namehash`

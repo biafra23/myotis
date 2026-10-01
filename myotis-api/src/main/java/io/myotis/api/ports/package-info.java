@@ -7,8 +7,9 @@
  * <p>All port methods are invoked by the engine from its own worker threads:
  * implementations must be thread-safe and should not block excessively (a slow
  * cache write stalls engine progress). {@link io.myotis.api.ports.HttpGateway} is
- * the deliberate exception — it is called for its blocking transport and the
- * engine budgets its timeout.
+ * the deliberate exception: it is called for its blocking transport (by the Rust
+ * engine's JVM adapter on the thread that called the {@code EnsApi}), and it bounds
+ * itself, since no engine cuts the call short.
  *
  * <p>The same type rules as {@code io.myotis.api} apply: byte[], String,
  * long/int/boolean, enums, flat records, java.util.List only.

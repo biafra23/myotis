@@ -115,8 +115,12 @@ traits/callback interfaces exactly as written there):
   seed/listener shapes internally.)
 - `DnsServers`: `dnsServerIps() -> [String]` (null port / empty list → resolver's default).
 - `HttpGateway`: `request(method, url, body?) -> String` — **BLOCKING**, throws on any
-  transport failure; the engine wraps it into its internal async shape and budgets the
-  timeout. (The engine-internal `CcipGateway` future-shape is an implementation detail.)
+  transport failure. The implementation bounds the whole request (~15 s) and the response
+  size (~1 MiB): the Java engine wraps it into its internal async shape, where its ENS
+  timeout (`ENS_TIMEOUT_SEC`) stops waiting but frees no thread, and the Rust engine's JVM
+  adapter (`CcipDriver`) calls it on the `EnsApi` caller's thread with no timeout of its own
+  (the native engine never calls it). (The engine-internal
+  `CcipGateway` future-shape is an implementation detail.)
 - `EngineLogger`: `info/warn/error`. `EngineClock`: `elapsedMillis()` (monotonic).
 - `CachedPeerInfo = (host, port, publicKeyHex, snap, snapQuality ∈ {CONFIRMED, UNKNOWN, DENIED})`.
 - (The old `SnapQualitySink` is engine-internal now — snap-quality persistence rides

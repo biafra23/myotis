@@ -225,8 +225,9 @@ gateway failure (gateways wrap upstream 429/5xx this way). All URLs failing → 
 
 The transport is the injected **`CcipGateway`** interface (`request(method, url, body) -> bytes`) —
 so the EVM module has **no HTTP dependency**. Hosts supply it (desktop: native HTTP client; mobile:
-platform HTTP client). Needs GET+POST, ~10–15 s timeouts, and a bounded response size (the Android
-impl caps at 1 MiB).
+platform HTTP client). Needs GET+POST, a deadline on the whole request (~15 s: a per-read timeout
+never ends a body sent a byte at a time) and a bounded response size (~1 MiB; both host gateways cap
+there).
 
 ### 6.3 Callback re-execution & the verification model (critical)
 
