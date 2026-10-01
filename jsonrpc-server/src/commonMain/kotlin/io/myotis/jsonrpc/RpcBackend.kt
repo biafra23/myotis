@@ -109,6 +109,15 @@ interface RpcBackend {
     fun supportsContractCreation(): Boolean = false
 
     /**
+     * Whether this backend APPLIES the `finalized` block tag on every method
+     * that takes a selector (`io.myotis.api.VerifiedReads.supportsFinalizedTag`).
+     * Consulted BEFORE dispatch: on a backend that cannot, `finalized` is refused
+     * (-32602) rather than answered from the head — a different block, labelled
+     * as the one asked for (#366).
+     */
+    fun supportsFinalizedTag(): Boolean = false
+
+    /**
      * [call] with the `eth_call` state-override object as JSON — caller-supplied
      * state layered over verified state for this call only.
      *

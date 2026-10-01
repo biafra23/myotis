@@ -182,6 +182,14 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsFinalizedTag() {
+        // Applied on every selector-taking read (see the class doc): calls and
+        // block reads since ABI 30, the account/code/storage/nonce reads since
+        // ABI 32 — they run against, or prove at, the beacon-finalized block.
+        return true;
+    }
+
+    @Override
     public byte[] callWithOverrides(
             byte[] from,
             byte[] to,

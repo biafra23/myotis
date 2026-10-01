@@ -189,9 +189,11 @@ once and fails in-band (#312) — so keep polling and retry.
 
 ## Block tags
 
-Readiness is judged at the optimistic head, and so are `latest`, `safe` and
-`pending` (the light client has no justified anchor to apply, so `safe` and
-`pending` resolve to the head — documented, not silent; #366). The `finalized`
+Readiness is judged at the optimistic head, and so are `latest` and `pending`
+(`pending` is the head plus this node's own unmined broadcasts for the nonce: it
+has no view of the public mempool). `safe` is refused with `-32602`: the light
+client has no justified anchor to apply, and answering it from the head would be
+another block (#366). The `finalized`
 tag is **applied** since engine ABI 30 (#465): `eth_call`, `eth_getBlockByNumber`,
 `eth_getBlockReceipts` and `eth_feeHistory` run against, or serve, the
 beacon-finalized block, whose header window needs no path to the optimistic
@@ -215,9 +217,9 @@ since the node started. So keep honoring the SYNCED gate for `finalized`
 reads too; staleness does not always surface as `-32000`. On the JVM host the
 start/resume warm-up hold applies to `finalized` reads too (it waits for a
 head-serving peer that a finalized read does not need — at most 90 s).
-The Java engine still resolves `finalized` to the head (#366), except where it
-refuses the tag instead (`-32602`): `eth_estimateGas`, and an `eth_call`
-carrying gas, fees or lists.
+The Java engine would resolve `finalized` to its head, so the router refuses
+the tag there (`-32602`) on every method (`VerifiedReads.supportsFinalizedTag`,
+#366).
 
 ## Code pointers
 

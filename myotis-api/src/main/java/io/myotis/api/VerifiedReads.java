@@ -83,6 +83,22 @@ public interface VerifiedReads {
     }
 
     /**
+     * Whether this engine APPLIES the {@code finalized} block tag — reads state,
+     * blocks, receipts and fee history at the beacon-finalized block — on every
+     * method that takes a block selector.
+     *
+     * <p>Hosts consult it BEFORE dispatch and refuse (-32602) a {@code finalized}
+     * selector when it is false: an engine that resolved the tag to its head would
+     * answer for a different block than the one asked for, and the answer would be
+     * indistinguishable from a correct one (#366).
+     *
+     * @return false by default
+     */
+    default boolean supportsFinalizedTag() {
+        return false;
+    }
+
+    /**
      * {@link #call} with the JSON-RPC {@code eth_call} STATE OVERRIDE object
      * (the third parameter) as JSON — caller-supplied code/balance/nonce/storage
      * layered over verified state for this call only.

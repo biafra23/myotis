@@ -199,6 +199,8 @@ class IosRpcBackend(
 
     override fun supportsContractCreation(): Boolean = true // TxKind::Create
 
+    override fun supportsFinalizedTag(): Boolean = true     // read at the beacon-finalized block (ABI >= 32)
+
     override fun callWithOverrides(
         from: ByteArray?,
         to: ByteArray?,

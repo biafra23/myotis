@@ -11,8 +11,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.time.TimeSource
 
@@ -35,7 +33,7 @@ class RpcRouter(
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    private companion object {
+    internal companion object {
         private val HEX_DIGITS = "0123456789abcdef".toCharArray()
 
         /** Methods we have a verified implementation for. Used in strict mode to tell
@@ -54,8 +52,31 @@ class RpcRouter(
             "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash",
             "eth_getUncleByBlockNumberAndIndex", "eth_getUncleByBlockHashAndIndex",
         )
+
+        /** The most requests one batch may carry — geth's default
+         *  `BatchRequestLimit`. Elements are served one after another, so an
+         *  unbounded batch would hold the server for as long as its sender
+         *  likes (#366). */
+        internal const val MAX_BATCH_REQUESTS = 1000
+
+        /** The most reward percentiles one `eth_feeHistory` may ask for — geth's
+         *  limit. */
+        private const val MAX_FEE_HISTORY_PERCENTILES = 100
+
+        /** The most blocks one `eth_feeHistory` may ask for — the spec's (and
+         *  geth's) ceiling. A larger count is clamped, as geth clamps it: the
+         *  answer's `oldestBlock` says how many blocks were served, and the
+         *  spec lets a node serve fewer than asked. Each engine clamps further
+         *  to what it can verify cheaply. */
+        private const val MAX_FEE_HISTORY_BLOCKS = 1024L
     }
 
+    /**
+     * Handle one HTTP body: a request object or a batch array. Returns the
+     * response body, or the EMPTY string when nothing may be answered — a
+     * notification (a request without an `id`), or a batch made only of them
+     * (JSON-RPC 2.0 §4.1, §6) — which the server sends as an empty body.
+     */
     suspend fun handle(body: String): String {
         val t0 = TimeSource.Monotonic.markNow()
         val root = try {
@@ -67,7 +88,7 @@ class RpcRouter(
             return errorEnvelope(JsonNull, -32700, "Parse error")
         }
         return when (root) {
-            is JsonObject -> handleOne(root, body)
+            is JsonObject -> handleOne(root, body) ?: ""
             is JsonArray -> {
                 // JSON-RPC 2.0 batch: each request gets its own response/error object so
                 // a wallet (MetaMask batches heavily) can match them by id — not a single
@@ -76,14 +97,32 @@ class RpcRouter(
                     logger.record("<empty-batch>", "null", "ERROR", elapsedMs(t0), -32600)
                     return errorEnvelope(JsonNull, -32600, "Invalid Request")
                 }
-                val responses = root.mapIndexed { i, el ->
-                    (el as? JsonObject)?.let { handleOne(it, null, "${i + 1}/${root.size}") }
-                        ?: run {
-                            logger.record("<invalid>", "null", "ERROR", 0, -32600)
-                            errorEnvelope(JsonNull, -32600, "Invalid Request")
-                        }
+                if (root.size > MAX_BATCH_REQUESTS) {
+                    // geth's answer to an oversized batch: one error, refusing the
+                    // whole of it, carrying the first request's id — the protocol
+                    // has no way to address an error to a batch as such.
+                    logger.record("<batch-too-large>", "null", "ERROR", elapsedMs(t0), -32600)
+                    val firstId = root.firstNotNullOfOrNull { el ->
+                        (el as? JsonObject)?.get("id")?.takeIf { validId(it) }
+                    } ?: JsonNull
+                    return "[" + errorEnvelope(
+                        firstId,
+                        -32600,
+                        "batch too large: ${root.size} requests (at most $MAX_BATCH_REQUESTS)",
+                    ) + "]"
                 }
-                "[" + responses.joinToString(",") + "]"
+                val responses = root.mapIndexedNotNull { i, el ->
+                    if (el is JsonObject) {
+                        // null = a notification, which is served but never answered.
+                        handleOne(el, null, "${i + 1}/${root.size}")
+                    } else {
+                        logger.record("<invalid>", "null", "ERROR", 0, -32600)
+                        errorEnvelope(JsonNull, -32600, "Invalid Request")
+                    }
+                }
+                // A batch of notifications has nothing to answer, and an empty
+                // array is not an answer either (JSON-RPC 2.0 §6).
+                if (responses.isEmpty()) "" else "[" + responses.joinToString(",") + "]"
             }
             else -> {
                 logger.record("<invalid>", "null", "ERROR", elapsedMs(t0), -32600)
@@ -194,7 +233,9 @@ class RpcRouter(
      *  declines) and the strict branch (which names the reason), so the two can
      *  never disagree about which question is being answered. */
     private sealed interface EstimateTx {
-        class Serve(val tx: RpcTransactionArgs, val block: String) : EstimateTx
+        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : EstimateTx {
+            val block: String get() = selector.value
+        }
         class Refuse(val why: String) : EstimateTx
     }
 
@@ -208,7 +249,7 @@ class RpcRouter(
         }
         val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_estimateGas")) {
             is TxBlock.Refuse -> return EstimateTx.Refuse(selector.why)
-            is TxBlock.At -> selector.block
+            is TxBlock.At -> selector.selector
         }
         unservableTx(tx, "eth_estimateGas", "an estimate without it would be for a different transaction")
             ?.let { return EstimateTx.Refuse(it) }
@@ -228,7 +269,9 @@ class RpcRouter(
      *  served here ([CallTx.Refuse], answered -32602). ONE derivation for the
      *  handler and the strict branch. */
     private sealed interface CallTx {
-        class Serve(val tx: RpcTransactionArgs, val block: String) : CallTx
+        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : CallTx {
+            val block: String get() = selector.value
+        }
         class Refuse(val why: String) : CallTx
     }
 
@@ -239,16 +282,11 @@ class RpcRouter(
             is RpcTransactionArgs.Parsed.Invalid -> return CallTx.Refuse("invalid transaction object: ${parsed.why}")
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
-        val block = when (val param = root.params()?.getOrNull(1)) {
-            // A string selector passes on as it always has — the engine applies
-            // it or refuses it, bare digits read as decimal (#366).
-            null, is JsonPrimitive -> (param as? JsonPrimitive)?.contentOrNull ?: "latest"
-            // EIP-1898's object form is applied or refused as for
-            // eth_estimateGas — never read as the head.
-            else -> when (val selector = txBlock(param, "eth_call")) {
-                is TxBlock.Refuse -> return CallTx.Refuse(selector.why)
-                is TxBlock.At -> selector.block
-            }
+        // Every selector form — tag, number, EIP-1898's object — is applied or
+        // refused exactly as for eth_estimateGas ([txBlock], #366).
+        val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_call")) {
+            is TxBlock.Refuse -> return CallTx.Refuse(selector.why)
+            is TxBlock.At -> selector.selector
         }
         unservableTx(tx, "eth_call", "the call would run without it")?.let { return CallTx.Refuse(it) }
         return CallTx.Serve(tx, block)
@@ -276,43 +314,26 @@ class RpcRouter(
 
     /** A transaction method's block selector: one to pass on, or why not. */
     private sealed interface TxBlock {
-        class At(val block: String) : TxBlock
+        class At(val selector: Selector) : TxBlock
         class Refuse(val why: String) : TxBlock
     }
 
     /** [method]'s block selector (`params[1]`), applied or refused — never
-     *  silently read as the head: absent/null is `latest`; a tag or a 0x-hex
-     *  number passes on to the engine, which applies it; EIP-1898's
-     *  `{"blockNumber": …}` is that number; `earliest`, a block hash (bare or
-     *  `{"blockHash": …}`) and anything else are refused — this node holds no
-     *  historical state to run against. eth_estimateGas reads every selector
-     *  through it, eth_call its object form. */
-    private fun txBlock(param: JsonElement?, method: String): TxBlock {
-        val noHistory = "(this node holds no historical state)"
-        val selector = when (param) {
-            null, is JsonNull -> return TxBlock.At("latest")
-            is JsonObject -> {
-                if (param["blockHash"] != null) {
-                    return TxBlock.Refuse("$method at a block hash is not supported $noHistory")
+     *  silently read as the head: [parseSelector]'s reading of a
+     *  `BlockNumberOrHash`, less a block hash (bare or `{"blockHash": …}`),
+     *  which names historical state this node does not hold. eth_call and
+     *  eth_estimateGas read every selector through it, so a refusal here is
+     *  the same in the handler and in the strict branch. */
+    private fun txBlock(param: JsonElement?, method: String): TxBlock =
+        when (val parsed = parseSelector(param, 1, Takes.NUMBER_OR_HASH)) {
+            is SelectorParse.Refuse -> TxBlock.Refuse(parsed.why)
+            is SelectorParse.Ok ->
+                if (parsed.selector.hash) {
+                    TxBlock.Refuse("$method at a block hash is not supported (this node holds no historical state)")
+                } else {
+                    TxBlock.At(parsed.selector)
                 }
-                (param["blockNumber"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
-                    ?: return TxBlock.Refuse(
-                        "invalid block selector: expected a tag, a 0x-hex number or {\"blockNumber\": …}",
-                    )
-            }
-            is JsonPrimitive -> param.takeIf { it.isString }?.contentOrNull
-                ?: return TxBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
-            else -> return TxBlock.Refuse("invalid block selector: expected a tag or a 0x-hex number")
-        }.trim().ifEmpty { "latest" }
-        return when {
-            selector == "earliest" -> TxBlock.Refuse("$method at 'earliest' is not supported $noHistory")
-            !specShapedSelector(selector) -> TxBlock.Refuse("invalid block selector '$selector'")
-            // Past 16 hex digits it is a hash, not a number.
-            selector.length > 18 && selector.startsWith("0x", ignoreCase = true) ->
-                TxBlock.Refuse("$method at a block hash is not supported $noHistory")
-            else -> TxBlock.At(selector)
         }
-    }
 
     /** The methods that take override parameters. `eth_call` and
      *  `eth_estimateGas` state overrides are APPLIED when the backend supports
@@ -327,21 +348,63 @@ class RpcRouter(
      * ("2/5") places a batch element in the slow-call watchdog's WARN; null for a
      * single request.
      */
-    private suspend fun handleOne(root: JsonObject, wholeBody: String?, batchPos: String? = null): String {
-        val method = root["method"]?.jsonPrimitive?.contentOrNull
-        val id = root["id"] ?: JsonNull
+    private suspend fun handleOne(root: JsonObject, wholeBody: String?, batchPos: String? = null): String? {
+        // The request envelope (JSON-RPC 2.0 §4), checked before anything is
+        // served: `jsonrpc` exactly "2.0", `method` a string, `id` — when
+        // present — a string, a number or null. A request failing any of these
+        // is answered -32600 with a null id when its own is unusable; reading
+        // `method` with a cast instead of `jsonPrimitive` keeps a non-string one
+        // (`"method": {}`) from throwing out of the router mid-response (#366).
+        val rawId = root["id"]
+        val idOk = rawId == null || validId(rawId)
+        val id = if (idOk) rawId ?: JsonNull else JsonNull
+        val method = (root["method"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+        val version = (root["jsonrpc"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+        val malformed = when {
+            version != "2.0" -> "'jsonrpc' must be \"2.0\""
+            method == null -> "'method' must be a string"
+            !idOk -> "'id' must be a string, a number or null"
+            else -> null
+        }
+        if (malformed != null || method == null) {
+            logger.record(method ?: "<invalid>", idString(id), "ERROR", 0, -32600)
+            return errorEnvelope(id, -32600, "Invalid Request: ${malformed ?: "'method' must be a string"}")
+        }
         val idStr = idString(id)
         val phase = CallPhase()
-        return logger.watch(method ?: "request", idStr, batchPos, phase) {
-            dispatchOne(root, wholeBody, method, id, idStr, phase)
+        val response = logger.watch(method, idStr, batchPos, phase) {
+            try {
+                dispatchOne(root, wholeBody, method, id, idStr, phase)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // never swallow coroutine cancellation (client disconnect / shutdown)
+            } catch (e: Exception) {
+                // Nothing a handler throws may escape as a half-written HTTP
+                // response: the server streams heartbeat bytes before the
+                // answer, so an exception there truncates the body the client
+                // is already reading, and takes every batch sibling with it.
+                logger.record(method, idStr, "ERROR", 0, -32603)
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: (e::class.simpleName ?: "Exception")
+                errorEnvelope(id, -32603, "Internal error: $detail")
+            }
         }
+        // A notification (no `id` member — JSON null is an id) is served but
+        // never answered (JSON-RPC 2.0 §4.1).
+        return if (rawId == null) null else response
+    }
+
+    /** Whether [id] may identify a request: a string, a number or null
+     *  (JSON-RPC 2.0 §4) — not a boolean, object or array. */
+    private fun validId(id: JsonElement): Boolean = when (id) {
+        is JsonNull -> true
+        is JsonPrimitive -> id.isString || id.content.toDoubleOrNull() != null
+        else -> false
     }
 
     /** [handleOne]'s body: route one request, keeping [phase] current for the watchdog. */
     private suspend fun dispatchOne(
         root: JsonObject,
         wholeBody: String?,
-        method: String?,
+        method: String,
         id: JsonElement,
         idStr: String,
         phase: CallPhase,
@@ -437,24 +500,36 @@ class RpcRouter(
             // decline): the engine ENGAGED verified serving and produced a
             // diagnosis; forwarding to a proxy would mask exactly the failure
             // this path exists to surface.
-            logger.record(method ?: "request", idStr, "ERROR", elapsedMs(t0), -32000)
+            logger.record(method, idStr, "ERROR", elapsedMs(t0), -32000)
             // A STALE_ANCHOR park must keep its curated, actionable message on
             // this path too: the Rust engine reports the park through shared
             // read plumbing ("beacon not synced" via anchored_head), which now
             // arrives as an envelope — without this probe the operator
             // guidance would fire only for methods whose failures still cross
             // as bare nulls (PR review finding).
-            staleAnchorMessage(method ?: "request")?.let { return errorEnvelope(id, -32000, it) }
+            staleAnchorMessage(method)?.let { return errorEnvelope(id, -32000, it) }
             return errorEnvelope(id, -32000,
-                "method '${method ?: "request"}' cannot be served verified right now: ${e.reason}")
+                "method '$method' cannot be served verified right now: ${e.reason}")
         } catch (e: EngineRefused) {
             // The engine's PERMANENT refusal (e.g. an EVM fork this build cannot
             // price): -32602 with its reason, like the router's own override /
             // contract-creation refusals — no retry changes it, and -32000 is
             // documented as retryable. No dev-proxy fallback, for the same reason
             // as above: the engine engaged and decided.
-            logger.record(method ?: "request", idStr, "ERROR", elapsedMs(t0), -32602)
-            return errorEnvelope(id, -32602, "method '${method ?: "request"}' refused: ${e.reason}")
+            logger.record(method, idStr, "ERROR", elapsedMs(t0), -32602)
+            return errorEnvelope(id, -32602, "method '$method' refused: ${e.reason}")
+        } catch (e: InvalidParams) {
+            // The REQUEST can never be served as asked (#366): malformed, out of
+            // spec, or asking for something this node does not hold. Permanent,
+            // so -32602 with the reason — -32000 is documented as retryable, and
+            // a conforming client would retry it forever. A dev proxy still gets
+            // its chance, as for the router's other refusals: unlike the engine
+            // refusals above, nothing was asked of the engine.
+            if (proxy == null) {
+                logger.record(method, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(id, -32602, e.why)
+            }
+            null
         }
         if (verified != null) {
             // Label the answer for what it IS. A served override ran over
@@ -470,10 +545,10 @@ class RpcRouter(
             // revert is a verified (or simulated) ANSWER, not a failure to
             // answer — coverage tracks "could we serve this", not "did the
             // contract say yes".
-            logger.record(method!!, idStr, label, elapsedMs(t0))
+            logger.record(method, idStr, label, elapsedMs(t0))
             return verified
         }
-        val m = method ?: "request"
+        val m = method
         if (proxy == null) {
             // Strict (permissionless) mode: no verified answer, no proxy → error. We
             // refuse to serve unverified data. The MethodLogger still records every
@@ -607,6 +682,242 @@ class RpcRouter(
      *  engine's reason, never the retryable -32000 a client would spin on. */
     private class EngineRefused(val reason: String) : RuntimeException(reason)
 
+    /** Thrown inside [tryVerified] when the REQUEST can never be served as
+     *  asked — a malformed or out-of-spec param, or one asking for something
+     *  this node does not hold (#366). Caught at the dispatch site: -32602 with
+     *  [why] in strict mode, the dev proxy otherwise. Raised where the param is
+     *  read, so the refusal and the serve can never disagree about it. */
+    private class InvalidParams(val why: String) : RuntimeException(why)
+
+    private fun invalid(why: String): Nothing = throw InvalidParams(why)
+
+    /** params[[i]], or refused as missing. */
+    private fun JsonArray?.required(i: Int, what: String): JsonElement =
+        this?.getOrNull(i)?.takeUnless { it is JsonNull } ?: invalid("missing argument $i: $what")
+
+    /** params[[i]] as a 20-byte address. */
+    private fun JsonArray?.addressAt(i: Int): ByteArray =
+        required(i, "address").asHexBytes()?.takeIf { it.size == 20 }
+            ?: invalid("invalid argument $i: expected a 20-byte address (0x + 40 hex digits)")
+
+    /** params[[i]] as a 32-byte hash; [what] names it ("transaction hash"). */
+    private fun JsonArray?.hashAt(i: Int, what: String): ByteArray =
+        required(i, what).asHexBytes()?.takeIf { it.size == 32 }
+            ?: invalid("invalid argument $i: expected a 32-byte $what (0x + 64 hex digits)")
+
+    /** params[[i]] as hex data. */
+    private fun JsonArray?.dataAt(i: Int, what: String): ByteArray =
+        required(i, what).asHexBytes() ?: invalid("invalid argument $i: expected $what as 0x-prefixed hex")
+
+    /** The `fullTransactions` flag at params[[i]]: absent or null is false; any
+     *  other non-boolean is refused, never coerced into a different shape. */
+    private fun JsonArray?.flagAt(i: Int): Boolean {
+        val el = this?.getOrNull(i)
+        if (el == null || el is JsonNull) return false
+        return (el as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+            ?: invalid("invalid argument $i: expected a boolean")
+    }
+
+    /** params[[i]] as a list index (a hex QUANTITY). */
+    private fun JsonArray?.indexAt(i: Int): Int =
+        required(i, "index").asQuantityIndex()
+            ?: invalid("invalid argument $i: expected an index as a 0x-prefixed hex quantity")
+
+    /** Which block selectors a method takes — geth's split: a `BlockNumber`
+     *  (a tag or a number) or a `BlockNumberOrHash`, which adds a 32-byte
+     *  block hash and EIP-1898's object form. */
+    private enum class Takes { NUMBER, NUMBER_OR_HASH }
+
+    /** A block selector as read: [value] is what the engine is handed — a tag,
+     *  a 0x-number or a 0x-hash; [number] is set for a number, [hash] for a
+     *  hash. */
+    private class Selector(val value: String, val number: Long?, val hash: Boolean)
+
+    /** A selector, or why it is refused — for the transaction methods, whose
+     *  strict branch re-derives the refusal ([txBlock]). */
+    private sealed interface SelectorParse {
+        class Ok(val selector: Selector) : SelectorParse
+        class Refuse(val why: String) : SelectorParse
+    }
+
+    /**
+     * The ONE reading of a block selector, shared by every method that takes
+     * one (#366): applied or refused, never silently read as the head.
+     *  - absent or null: `latest`;
+     *  - a tag: `latest`, `pending` and `finalized` (the last only on an engine
+     *    that applies it — [RpcBackend.supportsFinalizedTag]); `safe` and
+     *    `earliest` are refused, as nothing here serves the safe head or
+     *    genesis;
+     *  - a number: 0x-hex only. Bare digits are refused rather than guessed —
+     *    the engines read them differently (the Java engine as decimal, the
+     *    Rust block reads as hex);
+     *  - where the method [takes] a `BlockNumberOrHash`: a 32-byte hash, bare or
+     *    as `{"blockHash": …}`, and `{"blockNumber": …}` for a number. Any other
+     *    object — or one where only a number is taken — is refused.
+     * Pure: it reads only the param and the backend's static capabilities.
+     */
+    private fun parseSelector(param: JsonElement?, argIndex: Int, takes: Takes): SelectorParse {
+        fun refuse(why: String) = SelectorParse.Refuse("invalid argument $argIndex: $why")
+        val raw: String = when (param) {
+            null, is JsonNull -> "latest"
+            is JsonPrimitive -> param.takeIf { it.isString }?.contentOrNull?.trim()
+                ?: return refuse("expected a block tag or a 0x-prefixed hex block number, not a JSON number")
+            is JsonObject -> {
+                if (takes != Takes.NUMBER_OR_HASH) {
+                    return refuse("expected a block tag or number; this method takes no EIP-1898 block object")
+                }
+                val byHash = param["blockHash"]?.takeUnless { it is JsonNull }
+                val byNumber = param["blockNumber"]?.takeUnless { it is JsonNull }
+                param["requireCanonical"]?.takeUnless { it is JsonNull }?.let {
+                    if ((it as? JsonPrimitive)?.takeUnless { p -> p.isString }?.booleanOrNull == null) {
+                        return refuse("'requireCanonical' must be a boolean")
+                    }
+                }
+                when {
+                    byHash != null && byNumber != null ->
+                        return refuse("a block object takes 'blockHash' or 'blockNumber', not both")
+                    byHash != null -> {
+                        val h = (byHash as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.trim()
+                        if (h == null || h.length != 66 || !isHex(h)) {
+                            return refuse("'blockHash' must be a 32-byte hash (0x + 64 hex digits)")
+                        }
+                        return SelectorParse.Ok(Selector(h.lowercase(), number = null, hash = true))
+                    }
+                    byNumber != null -> (byNumber as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.trim()
+                        ?: return refuse("'blockNumber' must be a block tag or a 0x-prefixed hex number")
+                    else -> return refuse("a block object needs 'blockHash' or 'blockNumber'")
+                }
+            }
+            else -> return refuse("expected a block tag or a 0x-prefixed hex block number")
+        }
+        val s = raw.ifEmpty { "latest" }
+        when (s) {
+            "latest", "pending" -> return SelectorParse.Ok(Selector(s, number = null, hash = false))
+            "finalized" -> return if (backend?.supportsFinalizedTag() == true) {
+                SelectorParse.Ok(Selector(s, number = null, hash = false))
+            } else {
+                refuse("the 'finalized' tag is not served by this node's engine (it would be answered from " +
+                    "the head, a different block); ask for 'latest' or a block number")
+            }
+            "safe" -> return refuse("the 'safe' tag is not served: this node tracks the verified head and the " +
+                "beacon-finalized block, not the safe (justified) head; ask for 'latest' or 'finalized'")
+            "earliest" -> return refuse("the 'earliest' tag (genesis) is not served: this node holds recent " +
+                "blocks and state only")
+        }
+        if (!(s.startsWith("0x") || s.startsWith("0X")) || s.length <= 2 || !isHex(s)) {
+            val shown = if (s.length > 70) s.take(70) + "…" else s
+            return refuse("invalid block selector '$shown': expected latest, pending, finalized or a " +
+                "0x-prefixed hex block number" + if (takes == Takes.NUMBER_OR_HASH) " or block hash" else "")
+        }
+        if (s.length == 66) {
+            return if (takes == Takes.NUMBER_OR_HASH) {
+                SelectorParse.Ok(Selector(s.lowercase(), number = null, hash = true))
+            } else {
+                refuse("a block hash is not a block number; this method takes a number or a tag")
+            }
+        }
+        val digits = s.substring(2).trimStart('0')
+        // Leading zeros are tolerated (the value is unambiguous); past 63 bits
+        // no block exists to name.
+        val n = if (digits.isEmpty()) 0L else digits.takeIf { it.length <= 16 }?.toLongOrNull(16)
+            ?: return refuse("block number $s is out of range")
+        if (n == 0L) {
+            return refuse("block 0 (genesis) is not served: this node holds recent blocks and state only")
+        }
+        return SelectorParse.Ok(Selector("0x" + n.toString(16), number = n, hash = false))
+    }
+
+    /** [parseSelector] for a handler in [tryVerified]: a refusal is raised. */
+    private fun JsonArray?.selectorAt(i: Int, takes: Takes): Selector =
+        when (val parsed = parseSelector(this?.getOrNull(i), i, takes)) {
+            is SelectorParse.Ok -> parsed.selector
+            is SelectorParse.Refuse -> invalid(parsed.why)
+        }
+
+    /** A state read's selector (eth_getBalance, eth_getCode, …): a
+     *  `BlockNumberOrHash`, but a hash names a historical state this node does
+     *  not hold — refused, never answered from the head. */
+    private fun JsonArray?.stateSelectorAt(i: Int, method: String): Selector {
+        val sel = selectorAt(i, Takes.NUMBER_OR_HASH)
+        if (sel.hash) invalid("$method at a block hash is not supported (this node holds no historical state)")
+        return sel
+    }
+
+    /**
+     * Refuse a state read pinned to a block number BEHIND the window this node
+     * serves state for ([RpcBlockWindow]) — permanent: the head only moves on,
+     * and no engine holds older state. A pin AHEAD of the window is left to the
+     * engine, which answers it retryably (the head may yet reach it), as is any
+     * pin while no verified head is known. Inside the window the engine serves
+     * head state — the documented near-head trade-off (#382).
+     */
+    private suspend fun refuseBehindWindow(sel: Selector, b: RpcBackend, method: String) {
+        val n = sel.number ?: return
+        val head = withContext(rpcIoDispatcher) { b.headBlockNumber() } ?: return
+        if (n < head - RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE) {
+            invalid("$method at block $n is not supported: it is more than " +
+                "${RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE} blocks behind the verified head ($head), and this " +
+                "node holds no historical state")
+        }
+    }
+
+    /** `eth_feeHistory`'s block count at params[[i]]: what geth takes — a hex or
+     *  decimal string, or a JSON number — at least 1, clamped to
+     *  [MAX_FEE_HISTORY_BLOCKS] (see there). */
+    private fun JsonArray?.feeHistoryBlockCountAt(i: Int): Long {
+        val prim = required(i, "block count") as? JsonPrimitive
+            ?: invalid("invalid argument $i: expected the block count as a quantity")
+        val s = prim.content.trim()
+        val digits = if (prim.isString && (s.startsWith("0x") || s.startsWith("0X"))) s.substring(2) else s
+        val radix = if (digits.length != s.length) 16 else 10
+        if (digits.isEmpty() || !digits.all { it.digitToIntOrNull(radix) != null }) {
+            invalid("invalid argument $i: expected the block count as a quantity")
+        }
+        val significant = digits.trimStart('0')
+        if (significant.isEmpty()) invalid("invalid argument $i: the block count must be at least 1")
+        // Past MAX_FEE_HISTORY_BLOCKS the exact value no longer matters: any
+        // count that does not fit a Long is far beyond it.
+        val count = significant.toLongOrNull(radix) ?: Long.MAX_VALUE
+        return minOf(count, MAX_FEE_HISTORY_BLOCKS)
+    }
+
+    /** `eth_feeHistory`'s reward percentiles at params[[i]]: absent, null or an
+     *  empty list ask for no reward column — as geth reads an empty one, so no
+     *  `reward` field is answered for it; otherwise JSON numbers in [0, 100],
+     *  non-decreasing, at most [MAX_FEE_HISTORY_PERCENTILES]. */
+    private fun JsonArray?.rewardPercentilesAt(i: Int): DoubleArray? {
+        val el = this?.getOrNull(i)
+        if (el == null || el is JsonNull) return null
+        val arr = el as? JsonArray ?: invalid("invalid argument $i: expected the reward percentiles as an array")
+        if (arr.isEmpty()) return null
+        if (arr.size > MAX_FEE_HISTORY_PERCENTILES) {
+            invalid("invalid argument $i: at most $MAX_FEE_HISTORY_PERCENTILES reward percentiles, got ${arr.size}")
+        }
+        val vals = DoubleArray(arr.size)
+        for (k in arr.indices) {
+            val d = (arr[k] as? JsonPrimitive)?.takeUnless { it.isString }?.doubleOrNull
+                ?: invalid("invalid argument $i: reward percentiles must be JSON numbers")
+            if (d.isNaN() || d < 0.0 || d > 100.0) {
+                invalid("invalid argument $i: reward percentile $d is outside [0, 100]")
+            }
+            if (k > 0 && vals[k - 1] > d) {
+                invalid("invalid argument $i: reward percentiles must be non-decreasing")
+            }
+            vals[k] = d
+        }
+        return vals
+    }
+
+    /** Whether an engine `{"error": …}` envelope carries the PERMANENT code —
+     *  the `{"error","code":-32602}` shape engines answer a request with when
+     *  no retry can change the outcome. */
+    private fun JsonObject?.permanentCode(): Boolean =
+        (this?.get("code") as? JsonPrimitive)?.takeUnless { it.isString }?.contentOrNull == "-32602"
+
+    private fun isHex(s: String): Boolean =
+        (s.startsWith("0x") || s.startsWith("0X")) &&
+            s.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+
     /** Unwrap an engine error envelope from a JSON-string read result: a
      *  single-key `{"error": ...}` object throws [EngineReadUnavailable] (so
      *  the call sites stay one-liners); every normal result — block object,
@@ -622,9 +933,13 @@ class RpcRouter(
         if (!startsWith("{\"error\"")) return this
         val parsed = try { json.parseToJsonElement(this) } catch (_: Exception) { return this }
         val obj = parsed as? JsonObject ?: return this
-        if (obj.size != 1) return this
+        // The envelope is `{"error"}`, or `{"error","code"}` when the engine
+        // marks the refusal permanent; anything else is a result. Checking the
+        // size alone served the coded form to the wallet AS A RESULT (#366).
+        if (obj.size != 1 && !(obj.size == 2 && obj.containsKey("code"))) return this
         val err = obj["error"] ?: return this
         val msg = (err as? JsonPrimitive)?.contentOrNull ?: err.toString()
+        if (obj.permanentCode()) throw EngineRefused(msg)
         throw EngineReadUnavailable(msg)
     }
 
@@ -645,7 +960,7 @@ class RpcRouter(
             "accept-stale-anchor; details via myotis_beaconStatus)"
     }
 
-    private suspend fun tryVerified(method: String?, id: JsonElement, root: JsonObject): String? {
+    private suspend fun tryVerified(method: String, id: JsonElement, root: JsonObject): String? {
         val b = backend ?: return null
         return when (method) {
             // Chain id is config-derived — always answerable, no sync needed.
@@ -720,6 +1035,11 @@ class RpcRouter(
                 // an expensive refusal where there used to be a free one, and
                 // reported as retryable though it is permanent for that build.
                 if (to == null && backend?.supportsContractCreation() != true) return null
+                // A pin behind the state window is permanent whatever the engine
+                // (#366); judged here, against the head as of dispatch, so the
+                // strict branch's re-derivation ([callTx]) stays a pure function
+                // of the request.
+                refuseBehindWindow(serve.selector, b, "eth_call")
                 // The caller (msg.sender): absent/null is anonymous (the backend uses
                 // the zero-address default). Threading it is what lets a wallet's
                 // confirm-screen simulation of a sender-gated call (ERC-20
@@ -760,42 +1080,49 @@ class RpcRouter(
                     RpcCallResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
                 }
             }
+            // The state reads: every param applied or refused (#366) — a malformed
+            // one is -32602, never the retryable "cannot be served right now" — and
+            // a block pinned behind the state window refused before the engine is
+            // asked ([refuseBehindWindow]).
             "eth_getBalance" -> {
                 val p = root.params()
-                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                val block = p.blockTag(1)
-                val bal = withContext(rpcIoDispatcher) { b.getBalance(addr, block) } ?: return null
+                val addr = p.addressAt(0)
+                val sel = p.stateSelectorAt(1, "eth_getBalance").also { refuseBehindWindow(it, b, "eth_getBalance") }
+                val bal = withContext(rpcIoDispatcher) { b.getBalance(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(bal)))
             }
             "eth_getTransactionCount" -> {
                 val p = root.params()
-                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                val block = p.blockTag(1)
-                val nonce = withContext(rpcIoDispatcher) { b.getTransactionCount(addr, block) } ?: return null
+                val addr = p.addressAt(0)
+                val sel = p.stateSelectorAt(1, "eth_getTransactionCount")
+                    .also { refuseBehindWindow(it, b, "eth_getTransactionCount") }
+                val nonce = withContext(rpcIoDispatcher) { b.getTransactionCount(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(nonce)))
             }
             "eth_getCode" -> {
                 val p = root.params()
-                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                val block = p.blockTag(1)
-                val code = withContext(rpcIoDispatcher) { b.getCode(addr, block) } ?: return null
+                val addr = p.addressAt(0)
+                val sel = p.stateSelectorAt(1, "eth_getCode").also { refuseBehindWindow(it, b, "eth_getCode") }
+                val code = withContext(rpcIoDispatcher) { b.getCode(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(code)))
             }
             "eth_getStorageAt" -> {
                 val p = root.params()
-                val addr = (p?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
-                val slot = (p?.getOrNull(1))?.asWord32() ?: return null
-                val block = p.blockTag(2)
-                val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, block) } ?: return null
+                val addr = p.addressAt(0)
+                val slot = p.required(1, "storage slot").asWord32()
+                    ?: invalid("invalid argument 1: expected a storage slot (a hex quantity or 32-byte word)")
+                val sel = p.stateSelectorAt(2, "eth_getStorageAt").also { refuseBehindWindow(it, b, "eth_getStorageAt") }
+                val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
             }
             "eth_sendRawTransaction" -> {
-                val raw = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val raw = root.params().dataAt(0, "the signed transaction")
+                if (raw.isEmpty()) invalid("invalid argument 0: the signed transaction is empty")
                 val hash = withContext(rpcIoDispatcher) { b.sendRawTransaction(raw) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(hash)))
             }
             "eth_getTransactionReceipt" -> {
-                val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val txHash = root.params().hashAt(0, "transaction hash")
                 // Backend contract: a receipt JSON object when found+verified; the literal
                 // "null" for a VERIFIED "not seen yet" (synced, not in the recent chain →
                 // eth's standard pending/unknown, a valid result); or Kotlin-null when it
@@ -806,7 +1133,7 @@ class RpcRouter(
                 resultEnvelope(id, json.parseToJsonElement(receiptJson)) // "null" → JsonNull result
             }
             "eth_getTransactionByHash" -> {
-                val txHash = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val txHash = root.params().hashAt(0, "transaction hash")
                 // Object string when found (mined or pending-from-our-cache); "null" for a
                 // verified-unknown tx; Kotlin null (can't verify) → strict error.
                 val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) }?.orEngineThrow() ?: return null
@@ -814,30 +1141,22 @@ class RpcRouter(
             }
             "eth_getBlockByNumber" -> {
                 val p = root.params()
-                val block = p.blockTag(0)                          // tag or 0x hex number
+                val sel = p.selectorAt(0, Takes.NUMBER)
                 // Default false only when the flag is ABSENT; a present-but-non-boolean
-                // value (number, "yes", object) falls through rather than being silently
-                // coerced to false and returning the wrong shape.
-                val fullParam = p?.getOrNull(1)
-                val fullTx: Boolean = when {
-                    fullParam == null || fullParam is JsonNull -> false
-                    else -> (fullParam as? JsonPrimitive)?.booleanOrNull ?: return null
-                }
+                // value (number, "yes", object) is refused rather than silently coerced
+                // to false and answered in the wrong shape.
+                val fullTx = p.flagAt(1)
                 // Object string when found; "null" for a future/unknown block; Kotlin null
                 // (can't verify) → fall through to the strict error.
-                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, fullTx) }?.orEngineThrow() ?: return null
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(sel.value, fullTx) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(blockJson))
             }
             "eth_getBlockByHash" -> {
                 val p = root.params()
-                // VerifiedReads takes the block hash as EXACTLY 32 bytes; a malformed or
-                // wrong-length param falls through (proxy in dev, strict error otherwise).
-                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val fullParam = p?.getOrNull(1)
-                val fullTx: Boolean = when {
-                    fullParam == null || fullParam is JsonNull -> false
-                    else -> (fullParam as? JsonPrimitive)?.booleanOrNull ?: return null
-                }
+                // VerifiedReads takes the block hash as EXACTLY 32 bytes; anything else
+                // names nothing verifiable and is refused.
+                val blockHash = p.hashAt(0, "block hash")
+                val fullTx = p.flagAt(1)
                 // Object string when found; "null" for an unknown/non-canonical hash; Kotlin
                 // null (can't verify) → strict error.
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, fullTx) }?.orEngineThrow() ?: return null
@@ -871,79 +1190,67 @@ class RpcRouter(
             }
             // Pure local compute (keccak-256 of the DATA param) — no chain state.
             "web3_sha3" -> {
-                val data = (root.params()?.getOrNull(0) as? JsonPrimitive)?.asHexBytes() ?: return null
+                val data = root.params().dataAt(0, "the data to hash")
                 resultEnvelope(id, JsonPrimitive(hexData(Keccak256.digest(data))))
             }
             // Counts/lookups below reuse the verified block serve and read the
             // answer out of its JSON — the tri-state (object | "null" | Kotlin
             // null) carries through unchanged.
             "eth_getBlockTransactionCountByNumber" -> {
-                val block = root.params().specShapedBlockTag(0) ?: return null
+                val block = root.params().selectorAt(0, Takes.NUMBER).value
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getBlockTransactionCountByHash" -> {
-                val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val blockHash = root.params().hashAt(0, "block hash")
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "transactions")
             }
             "eth_getTransactionByBlockNumberAndIndex" -> {
                 val p = root.params()
-                val block = p.specShapedBlockTag(0) ?: return null
-                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val block = p.selectorAt(0, Takes.NUMBER).value
+                val index = p.indexAt(1)
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getTransactionByBlockHashAndIndex" -> {
                 val p = root.params()
-                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockHash = p.hashAt(0, "block hash")
+                val index = p.indexAt(1)
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, true) }?.orEngineThrow() ?: return null
                 txAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleCountByBlockNumber" -> {
-                val block = root.params().specShapedBlockTag(0) ?: return null
+                val block = root.params().selectorAt(0, Takes.NUMBER).value
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleCountByBlockHash" -> {
-                val blockHash = (root.params()?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
+                val blockHash = root.params().hashAt(0, "block hash")
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 blockArraySizeResult(id, blockJson, "uncles")
             }
             "eth_getUncleByBlockNumberAndIndex" -> {
                 val p = root.params()
-                val block = p.specShapedBlockTag(0) ?: return null
-                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val block = p.selectorAt(0, Takes.NUMBER).value
+                val index = p.indexAt(1)
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber(block, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getUncleByBlockHashAndIndex" -> {
                 val p = root.params()
-                val blockHash = (p?.getOrNull(0))?.asHexBytes()?.takeIf { it.size == 32 } ?: return null
-                val index = p?.getOrNull(1)?.asQuantityIndex() ?: return null
+                val blockHash = p.hashAt(0, "block hash")
+                val index = p.indexAt(1)
                 val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(blockHash, false) }?.orEngineThrow() ?: return null
                 uncleAtIndexResult(id, blockJson, index)
             }
             "eth_getBlockReceipts" -> {
-                val p = root.params()
-                // One selector param: tag | 0x-hex number | 0x-32-byte hash (absent →
-                // "latest" per spec). Validated HERE, strictly, because the two
-                // engines' bare-numeric conventions differ (Java Long.decode reads
-                // decimal, the Rust selector parser hex): only spec-shaped selectors
-                // pass, so the same request can never resolve to different blocks
-                // depending on which engine is behind the router. A JSON-number param
-                // is rejected like the sibling hex helpers reject non-strings.
-                val selParam = p?.getOrNull(0)
-                // Trimmed like both backends trim it, so the gate here never rejects
-                // a selector the engines would have served identically.
-                val selector: String = when {
-                    selParam == null || selParam is JsonNull -> "latest"
-                    else -> (selParam as? JsonPrimitive)
-                        ?.takeIf { it.isString }?.contentOrNull?.trim()?.ifEmpty { "latest" }
-                        ?: return null
-                }
-                if (!specShapedSelector(selector)) return null
+                // One selector — geth's BlockNumberOrHash: a tag, a 0x-number, a
+                // 0x-32-byte hash, or EIP-1898's object (absent → "latest" per spec).
+                // Read by [parseSelector] like every other selector, so the same
+                // request can never resolve to different blocks depending on which
+                // engine is behind the router.
+                val selector = root.params().selectorAt(0, Takes.NUMBER_OR_HASH).value
                 // Array string when served; "null" for a verified unknown/future
                 // block; Kotlin null (can't verify) → strict error.
                 val receiptsJson =
@@ -964,10 +1271,14 @@ class RpcRouter(
                     ?: return errorEnvelope(id, -32602, "eth_getLogs expects one filter object param")
                 val resultJson = withContext(rpcIoDispatcher) { b.getLogs(filter.toString()) } ?: return null
                 val parsed = json.parseToJsonElement(resultJson)
-                val errorMessage = (parsed as? JsonObject)?.get("error")
+                val envelope = parsed as? JsonObject
+                val errorMessage = envelope?.get("error")
                     ?.let { (it as? JsonPrimitive)?.contentOrNull ?: it.toString() }
                 if (errorMessage != null) {
-                    errorEnvelope(id, -32000, errorMessage)
+                    // The engine marks a refusal no retry can change with -32602
+                    // (its documented `{"error","code":-32602}` envelope); anything
+                    // else stays the retryable -32000.
+                    errorEnvelope(id, if (envelope.permanentCode()) -32602 else -32000, errorMessage)
                 } else {
                     resultEnvelope(id, parsed)
                 }
@@ -982,31 +1293,14 @@ class RpcRouter(
             }
             "eth_feeHistory" -> {
                 val p = root.params()
-                // blockCount is a QUANTITY (hex) per spec, but some clients send a JSON
-                // number — accept both.
-                val countPrim = p?.getOrNull(0) as? JsonPrimitive ?: return null
-                val blockCount = countPrim.contentOrNull?.let { s ->
-                    if (s.startsWith("0x") || s.startsWith("0X")) s.substring(2).toLongOrNull(16)
-                    else s.toLongOrNull()
-                } ?: return null
-                if (blockCount <= 0) return null
-                val newest = p.blockTag(1)
-                // Percentiles must be monotonically non-decreasing in [0,100]; a request
-                // without them gets baseFee/gasUsedRatio only (no reward array).
-                val pctArr: DoubleArray? = when (val pe = p.getOrNull(2)) {
-                    null, is JsonNull -> null
-                    is JsonArray -> {
-                        val vals = DoubleArray(pe.size)
-                        for (i in pe.indices) {
-                            val d = (pe[i] as? JsonPrimitive)?.doubleOrNull ?: return null
-                            if (d < 0.0 || d > 100.0) return null
-                            if (i > 0 && vals[i - 1] > d) return null
-                            vals[i] = d
-                        }
-                        vals
-                    }
-                    else -> return null
+                val blockCount = p.feeHistoryBlockCountAt(0)
+                // Required, as geth has it: a node that picked a block for the
+                // caller would answer a question nobody asked (#366).
+                if (p?.getOrNull(1).let { it == null || it is JsonNull }) {
+                    invalid("missing argument 1: the newest block (a tag or a 0x-prefixed hex number)")
                 }
+                val newest = p.selectorAt(1, Takes.NUMBER).value
+                val pctArr = p.rewardPercentilesAt(2)
                 val historyJson = withContext(rpcIoDispatcher) { b.feeHistory(blockCount, newest, pctArr) }
                     ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(historyJson))
@@ -1025,6 +1319,7 @@ class RpcRouter(
                 val overrideJson = stateOverrideJson(root)
                 if (overrideJson != null && !b.supportsStateOverrides()) return null
                 val serve = estimateTx(root) as? EstimateTx.Serve ?: return null
+                refuseBehindWindow(serve.selector, b, "eth_estimateGas")
                 val outcome = withContext(rpcIoDispatcher) { b.estimateGasTx(serve.tx, serve.block, overrideJson) }
                 when (outcome.kind) {
                     RpcCallResult.Kind.OK ->
@@ -1049,28 +1344,6 @@ class RpcRouter(
 
     /** This request's `params` array, or null if absent / not an array. */
     private fun JsonObject.params(): JsonArray? = (this["params"] as? JsonArray)
-
-    /** The block tag at [index] (e.g. "latest"), defaulting to "latest" when absent. */
-    private fun JsonArray?.blockTag(index: Int): String =
-        (this?.getOrNull(index) as? JsonPrimitive)?.contentOrNull ?: "latest"
-
-    /** Spec-shaped block selector gate: a tag, or 0x-hex ASCII (≤ 66 chars —
-     *  covers numbers and 32-byte hashes). Applied to every selector-taking
-     *  method ADDED since the engines split, because their bare-numeric
-     *  conventions differ (the Java engine reads bare as decimal — and octal
-     *  under a leading zero — the Rust parser as hex): only spec shapes pass,
-     *  so the same request can never resolve to different blocks depending on
-     *  which engine is behind the router. Trimmed like both backends trim. */
-    private fun specShapedSelector(s: String): Boolean =
-        s in setOf("latest", "pending", "safe", "finalized", "earliest")
-            || (s.length > 2 && s.length <= 66
-                && (s.startsWith("0x") || s.startsWith("0X"))
-                && s.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
-
-    /** [blockTag] + [specShapedSelector] for the compat batch's by-number
-     *  methods: the trimmed spec-shaped selector, or null (→ proxy/strict). */
-    private fun JsonArray?.specShapedBlockTag(index: Int): String? =
-        blockTag(index).trim().ifEmpty { "latest" }.takeIf { specShapedSelector(it) }
 
     /** Decode a storage position (QUANTITY or 32-byte DATA) to a left-padded
      *  32-byte big-endian key; null if not a hex string or wider than 32 bytes. */
@@ -1172,8 +1445,6 @@ class RpcRouter(
         }
         return out.concatToString()
     }
-
-    private fun JsonObject.method(): String? = this["method"]?.jsonPrimitive?.contentOrNull
 
     private fun resultEnvelope(id: JsonElement, result: JsonElement): String =
         json.encodeToString(JsonObject.serializer(), buildJsonObject {
