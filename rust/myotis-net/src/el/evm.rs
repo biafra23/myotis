@@ -326,16 +326,42 @@ pub(crate) fn u256_be(bytes: &[u8]) -> Option<U256> {
 /// one connection still lands on a uniformly slow link.
 const WAVE_REQUEST_DEADLINE: std::time::Duration = BULK_HEDGE_DELAY;
 
-/// One prefetch-wave request under [`WAVE_REQUEST_DEADLINE`]: a request still
-/// unanswered then fails like any other, so its item rotates to the next peer.
-/// Dropping the request is safe: the peer's pending-request guard removes it,
-/// and a late response is discarded.
+/// How often [`wave_request`] looks again whether its request has gone out.
+const WAVE_SEND_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One prefetch-wave request under [`WAVE_REQUEST_DEADLINE`], counted from the
+/// request's ACTUAL send (`peer::scope_send_marker`), as the hedged race judges
+/// an outpaced peer: a request unanswered that long after it reached its peer
+/// fails like any other, so its item rotates to the next one. Dropping it then
+/// is safe — it is waiting for its response, the peer's pending-request guard
+/// removes it, and a late answer is discarded. A request still queued for the
+/// connection's shared writer is never cut: dropping it inside a frame write
+/// would tear the stream for every request on that connection (`send_frame`),
+/// so it waits like before, bounded by the wave's own timeout.
 async fn wave_request<T>(
     request: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
-    tokio::time::timeout(WAVE_REQUEST_DEADLINE, request).await.unwrap_or_else(|_| {
-        Err(format!("prefetch request unanswered after {} s", WAVE_REQUEST_DEADLINE.as_secs()))
-    })
+    let (sent, request) = crate::el::peer::scope_send_marker(request);
+    tokio::pin!(request);
+    loop {
+        let wait = match sent.get() {
+            Some(at) => {
+                let age = at.elapsed();
+                if age >= WAVE_REQUEST_DEADLINE {
+                    return Err(format!(
+                        "prefetch request unanswered {} s after it was sent",
+                        WAVE_REQUEST_DEADLINE.as_secs()
+                    ));
+                }
+                WAVE_REQUEST_DEADLINE - age
+            }
+            None => WAVE_SEND_RECHECK,
+        };
+        tokio::select! {
+            out = &mut request => return out,
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
 }
 
 /// The peer, as a position in this call's ask order, that a wave chunk asks on
@@ -1153,21 +1179,51 @@ mod tests {
         }
     }
 
-    /// The oracle's within-call ask order: a dead first peer in the call's
-    /// snapshot must cost one hedge delay per CALL, not one per state read.
     mod prefetch_wave {
         use super::*;
         use std::time::Duration;
+
+        /// A request that goes out after `queued` on its connection's writer
+        /// and is never answered.
+        async fn sent_then_silent(queued: Duration) -> Result<u8, String> {
+            tokio::time::sleep(queued).await;
+            crate::el::peer::mark_request_sent();
+            std::future::pending().await
+        }
 
         #[tokio::test(start_paused = true)]
         async fn a_silent_request_gives_up_at_the_deadline_not_the_peer_timeout() {
             // #320: a silent peer held its chunk for the 15 s request timeout,
             // and the eth_call with it.
             let started = tokio::time::Instant::now();
-            let out: Result<u8, String> = wave_request(std::future::pending()).await;
-            assert!(out.is_err());
+            assert!(wave_request(sent_then_silent(Duration::ZERO)).await.is_err());
             assert_eq!(started.elapsed(), WAVE_REQUEST_DEADLINE);
             assert!(WAVE_REQUEST_DEADLINE < Duration::from_secs(15), "must beat the peer request timeout");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_deadline_counts_from_the_send_not_from_the_queue() {
+            // 4 s waiting for the shared writer is not the peer's silence.
+            let started = tokio::time::Instant::now();
+            assert!(wave_request(sent_then_silent(Duration::from_secs(4))).await.is_err());
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(4) + WAVE_REQUEST_DEADLINE
+                    && elapsed < Duration::from_secs(4) + WAVE_REQUEST_DEADLINE + WAVE_SEND_RECHECK,
+                "{elapsed:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_that_never_went_out_is_never_cut() {
+            // Dropping one still inside the writer would tear its connection:
+            // it is left to finish, however long the writer took.
+            let out = wave_request(async {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                Ok::<_, String>(9u8)
+            })
+            .await;
+            assert_eq!(out, Ok(9));
         }
 
         #[tokio::test(start_paused = true)]
@@ -1188,6 +1244,8 @@ mod tests {
         }
     }
 
+    /// The oracle's within-call ask order: a dead first peer in the call's
+    /// snapshot must cost one hedge delay per CALL, not one per state read.
     mod ask_order {
         use super::*;
         use std::time::Duration;
