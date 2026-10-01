@@ -13,7 +13,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.InetAddress;
+import java.net.ProtocolException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -22,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.After;
 import org.junit.Test;
@@ -203,6 +206,51 @@ public class AndroidCcipGatewayTest {
         long elapsedMs = msSince(start);
         assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
         assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + SLACK_MS);
+    }
+
+    @Test(timeout = 30_000)
+    public void aDisconnectThatThrowsIsRepeated() throws IOException {
+        // The watchdog's first disconnect throws: the repeat a second later must still end
+        // a request whose headers never come, not leave it to the 15 s read timeout.
+        AndroidCcipGateway gateway = new AndroidCcipGateway(DEADLINE_MS,
+                url -> new FirstDisconnectThrows(new OkUrlFactory(new OkHttpClient()).open(url)));
+        String url = serve((head, body, out) -> Thread.sleep(60_000));
+        long start = System.nanoTime();
+        RuntimeException e = assertThrows(RuntimeException.class, () -> gateway.request(Method.GET, url, null));
+        long elapsedMs = msSince(start);
+        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
+        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + 1_000 + SLACK_MS);
+    }
+
+    /** Android's HttpURLConnection, except that its first disconnect() throws. */
+    private static final class FirstDisconnectThrows extends HttpURLConnection {
+
+        private final HttpURLConnection delegate;
+        private final AtomicBoolean thrown = new AtomicBoolean();
+
+        FirstDisconnectThrows(HttpURLConnection delegate) {
+            super(delegate.getURL());
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void disconnect() {
+            if (thrown.compareAndSet(false, true)) {
+                throw new IllegalStateException("the first disconnect fails");
+            }
+            delegate.disconnect();
+        }
+
+        @Override public boolean usingProxy() { return delegate.usingProxy(); }
+        @Override public void connect() throws IOException { delegate.connect(); }
+        @Override public void setConnectTimeout(int ms) { delegate.setConnectTimeout(ms); }
+        @Override public void setReadTimeout(int ms) { delegate.setReadTimeout(ms); }
+        @Override public void setRequestMethod(String method) throws ProtocolException { delegate.setRequestMethod(method); }
+        @Override public void setDoOutput(boolean doOutput) { delegate.setDoOutput(doOutput); }
+        @Override public void setRequestProperty(String key, String value) { delegate.setRequestProperty(key, value); }
+        @Override public OutputStream getOutputStream() throws IOException { return delegate.getOutputStream(); }
+        @Override public int getResponseCode() throws IOException { return delegate.getResponseCode(); }
+        @Override public InputStream getInputStream() throws IOException { return delegate.getInputStream(); }
     }
 
     @Test(timeout = 30_000)

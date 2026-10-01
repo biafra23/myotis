@@ -99,7 +99,12 @@ public final class AndroidCcipGateway implements HttpGateway {
             HttpURLConnection timed = conn;
             watchdog = DEADLINES.scheduleWithFixedDelay(() -> {
                 expired.set(true);
-                timed.disconnect();
+                try {
+                    timed.disconnect();
+                } catch (RuntimeException e) {
+                    // Swallowed: a run that throws ends scheduleWithFixedDelay's repeats,
+                    // and the repeat is what reaches a socket opened after this one.
+                }
             }, deadlineMs, REDISCONNECT_MS, TimeUnit.MILLISECONDS);
             if (method == Method.POST) {
                 conn.setRequestMethod("POST");
