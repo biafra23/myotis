@@ -202,7 +202,12 @@ usable until; rebuild the app with a fresh fetch after that.
   the Sepolia seed gets Sepolia configured the same way by its first start of a
   build that bundles it; the settings file records which networks are done
   (`poc.configuredNetworks`). Nothing else on a later start touches settings, and
-  a network the user turned off stays off.
+  a network the user turned off stays off. One consequence of an install having
+  no record yet: if you had set Sepolia up by hand in it, that first start
+  reconfigures it once — the port goes to 8557 and the backfill switch to off,
+  and the stored watch list is replaced by the seed's entry. Contracts you had
+  added stay subscribed (the engine unions every pushed watch list with what it
+  already indexes), but the other two are worth re-checking after the update.
 - The Index tab states what each seed covers and that it is unverified.
 
 ### Why 8555 and 8557, not 8545 and 8547

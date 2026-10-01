@@ -300,6 +300,14 @@ jobs:
               [ -z "$stray" ] || { echo "::error::the standard dmg carries the Bee PoC peer cache ($stray)"; exit 1; }
             done
           fi
+          # Neither leg here is the RAILGUN flavour (railgun-dmg.yml builds that), so
+          # neither may carry its seeds: the artefact-side half of the Gradle scrub,
+          # for a stray copy in a staging root that would otherwise ship unnoticed.
+          for f in logindex.db logindex-sepolia.db railgun-poc-seed.properties railgun-poc-seed-sepolia.properties; do
+            stray=$(find "$mnt" -type f -name "$f" | head -n1 || true)
+            [ -z "$stray" ] || { echo "::error::the ${{ matrix.flavor }} dmg carries a RAILGUN PoC file ($stray)"; exit 1; }
+          done
+          echo "OK: the ${{ matrix.flavor }} dmg carries no RAILGUN PoC seed"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
