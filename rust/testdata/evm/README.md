@@ -53,7 +53,12 @@ cargo test -p myotis-evm relay_adapt_7702_shield
 cd .. && ./gradlew :myotis-evm:test --tests '*RelayAdapt7702ShieldFixtureTest' -PskipRustEngine
 ```
 
-It takes minutes: the light-client sync, then finding snap peers. Re-record
+It takes minutes: the light-client sync, then finding snap peers, which is
+slow from scratch on mainnet. So the recorder keeps its own EL peer cache
+(`rust/target/record_shield_fixture/peers.cache`), seeded on its first run
+with a copy of the newest one an installed Myotis keeps (`~/.myotis`,
+`~/.myotis-railgun-poc`, or the daemon's `app/`), and every later run starts
+from the snap peers the earlier ones proved. Re-record
 when a change makes the EVM read state the file lacks: the replay oracle fails
 any read the recording did not make, and the replay reports it ("does not
 replay: state unavailable for 0x…").

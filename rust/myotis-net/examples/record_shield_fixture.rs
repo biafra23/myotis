@@ -20,19 +20,26 @@
 //! - `--delegate current`: delegate to the RelayAdapt7702 that
 //!   `@railgun-community/shared-models` names for mainnet today, instead of
 //!   #509's (`0x05ae73…`, which Terminal Wallet 2.0.2 used).
-//! - `--peer-cache <path>`: an EL peer cache to warm-start discovery from (a
-//!   Myotis data dir's `peers.cache`, say), and to write back to.
+//! - `--peer-cache <path>`: the EL peer cache to start discovery from and to
+//!   keep the peers it finds in. Default: the recorder's own,
+//!   `rust/target/record_shield_fixture/peers.cache`. Never point it at the
+//!   cache of a Myotis that is running.
 //!
 //! It syncs the light client first (minutes, from the embedded checkpoint),
-//! then waits until the EL reader has snap peers and a verified head. If a
-//! recording fails (a peer vanishes, the head moves past what peers serve),
-//! it retries at a fresh head with fresh keys.
+//! then waits until the EL reader has snap peers and a verified head it can
+//! serve. Finding snap peers from scratch is slow on mainnet (no pinned
+//! enodes, #414), so on its first run the recorder seeds its own peer cache
+//! with a copy of the newest one an installed Myotis keeps (`~/.myotis`, the
+//! RAILGUN PoC build's `~/.myotis-railgun-poc`, or the daemon's `app/`), and
+//! it keeps every snap peer it proves there for the next run. If a recording
+//! fails (a peer vanishes, the head moves past what peers serve), it retries
+//! at a fresh head with fresh keys.
 //!
 //! Privacy: the keys come from OS randomness for this run only and are never
 //! written anywhere. The fixture holds two fresh addresses, the signed
 //! request, and public contract state. No wallet's data is involved.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use myotis_core::keccak::keccak256;
@@ -45,9 +52,12 @@ use myotis_net::{ChainConfig, SyncHandle, SyncState};
 
 /// How long the light client gets to reach SYNCED.
 const SYNC_BUDGET: Duration = Duration::from_secs(1500);
-/// How long the EL reader gets, per attempt, to find snap peers and verify a
-/// head it can serve state for.
-const READY_BUDGET: Duration = Duration::from_secs(600);
+/// How long the EL reader gets, over all attempts, to find snap peers and
+/// verify a head it can serve state for.
+const READY_BUDGET: Duration = Duration::from_secs(1800);
+/// How often the wait for a servable head reports progress.
+const PROGRESS_EVERY: Duration = Duration::from_secs(60);
+/// Recordings tried before giving up, each at a fresh head with fresh keys.
 const ATTEMPTS: usize = 5;
 const MAINNET: u64 = 1;
 /// 0.01 ETH, a small shield like #509's.
@@ -71,6 +81,12 @@ async fn main() {
         Some(other) => fail(&format!("--delegate takes `current` (got {other})")),
     };
 
+    let peer_cache = arg("--peer-cache").map(PathBuf::from).unwrap_or_else(|| {
+        let own = own_peer_cache();
+        seed_peer_cache(&own);
+        own
+    });
+
     tracing::info!("syncing the mainnet light client");
     let sync = SyncHandle::start(ChainConfig::mainnet()).unwrap_or_else(|e| fail(&format!("light client: {e}")));
     let deadline = tokio::time::Instant::now() + SYNC_BUDGET;
@@ -91,27 +107,13 @@ async fn main() {
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    let reader = ElReader::start_mainnet(sync.exec_anchor(), arg("--peer-cache").map(PathBuf::from))
+    let reader = ElReader::start_mainnet(sync.exec_anchor(), Some(peer_cache.clone()))
         .await
         .unwrap_or_else(|e| fail(&format!("EL reader: {e}")));
-
-    let mut recorded = None;
-    for attempt in 1..=ATTEMPTS {
-        let head = ready_head(&reader).await;
-        match record(head, delegate).await {
-            Ok(fixture) => {
-                recorded = Some(fixture);
-                break;
-            }
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "recording failed; retrying at a fresh head");
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        }
-    }
+    let recorded = record_with_retries(&reader, delegate, &peer_cache).await;
     reader.stop().await;
     sync.stop().await;
-    let fixture = recorded.unwrap_or_else(|| fail(&format!("no recording succeeded in {ATTEMPTS} attempts")));
+    let fixture = recorded.unwrap_or_else(|e| fail(&e));
 
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(&format!("{}: {e}", dir.display())));
@@ -129,21 +131,89 @@ async fn main() {
     println!("wrote {}", out.display());
 }
 
-/// The verified head and an oracle over it, once the reader can serve one:
-/// discovery has found snap peers and the head's header chain verifies.
-async fn ready_head(reader: &ElReader) -> Head {
+/// Record, retrying at a fresh head when a recording fails, within one
+/// [`READY_BUDGET`] for finding a servable head.
+async fn record_with_retries(reader: &ElReader, delegate: [u8; 20], peer_cache: &Path) -> Result<EvmFixture, String> {
     let deadline = tokio::time::Instant::now() + READY_BUDGET;
-    loop {
-        if reader.snap_peer_count().await > 0 {
-            match reader.head_evm_oracle(MAINNET).await {
-                Ok(head) => return head,
-                Err(e) => tracing::info!(error = %e, "the head is not servable yet"),
+    let mut last_error = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let head = ready_head(reader, deadline, peer_cache).await?;
+        match record(head, delegate).await {
+            Ok(fixture) => return Ok(fixture),
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "recording failed; retrying at a fresh head");
+                last_error = e;
+                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         }
-        if tokio::time::Instant::now() > deadline {
-            fail(&format!("no servable verified head within {} s", READY_BUDGET.as_secs()));
+    }
+    Err(format!("no recording succeeded in {ATTEMPTS} attempts; the last failed with: {last_error}"))
+}
+
+/// The verified head and an oracle over it, once the reader can serve one:
+/// discovery has found snap peers and one of them serves the head's block.
+async fn ready_head(reader: &ElReader, deadline: tokio::time::Instant, peer_cache: &Path) -> Result<Head, String> {
+    let mut reported = tokio::time::Instant::now();
+    let mut last_error = String::from("no snap peer yet");
+    loop {
+        let snap_peers = reader.snap_peer_count().await;
+        if snap_peers > 0 {
+            match reader.head_evm_oracle(MAINNET).await {
+                Ok(head) => return Ok(head),
+                Err(e) => last_error = e,
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now > deadline {
+            return Err(format!(
+                "no servable verified head within {} min ({snap_peers} snap peer(s); the last attempt: {last_error}). \
+                 The snap peers found so far are kept in {} for the next run; a warm Myotis peers.cache \
+                 (--peer-cache) starts faster",
+                READY_BUDGET.as_secs() / 60,
+                peer_cache.display()
+            ));
+        }
+        if now.duration_since(reported) >= PROGRESS_EVERY {
+            tracing::info!(snap_peers, last_error = %last_error, "waiting for a servable verified head");
+            reported = now;
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// The recorder's own EL peer cache, kept between runs.
+fn own_peer_cache() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/record_shield_fixture/peers.cache")
+}
+
+/// Seed the recorder's own peer cache, once, with a copy of the newest mainnet
+/// EL peer cache an installed Myotis keeps. A copy: the recorder never writes
+/// another program's file.
+fn seed_peer_cache(own: &Path) {
+    if own.exists() {
+        tracing::info!(cache = %own.display(), "starting EL discovery from the recorder's peer cache");
+        return;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let candidates = [
+        home.as_ref().map(|h| h.join(".myotis/peers.cache")),
+        home.as_ref().map(|h| h.join(".myotis-railgun-poc/peers.cache")),
+        Some(repo.join("app/peers.cache")),
+    ];
+    let newest = candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|path| std::fs::metadata(&path).and_then(|m| m.modified()).ok().map(|at| (at, path)))
+        .max();
+    let Some((_, source)) = newest else {
+        tracing::info!("no Myotis peer cache found; discovering EL peers from scratch (slow on mainnet)");
+        return;
+    };
+    let copied = own.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(&source, own));
+    match copied {
+        Ok(_) => tracing::info!(from = %source.display(), "starting EL discovery from a copy of this Myotis peer cache"),
+        Err(e) => tracing::warn!(from = %source.display(), error = %e, "could not copy the peer cache; discovering from scratch"),
     }
 }
 
