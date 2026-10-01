@@ -3,7 +3,12 @@
 Documents specific to ENS resolution — forward and reverse, ENSIP-10
 wildcards, and ERC-3668 CCIP-Read. The resolver runs the ENS contracts
 inside the local EVM (see `../evm/`); cross-cutting trust and architecture
-notes live in `../architecture-doc.md`.
+notes live in `../architecture-doc.md`. These are the **Java engine's**
+(`myotis-ens`) design documents; the **Rust engine** resolves ENS the same way
+over its own EVM (`rust/myotis-net/src/el`, `resolve_ens_json` /
+`ens_record_json` in `rust/myotis-engine/src/host.rs`), with the same record
+types, CCIP-Read, and the forward-verified reverse lookup that names log-index
+entries.
 
 | Document | Scope |
 |----------|-------|

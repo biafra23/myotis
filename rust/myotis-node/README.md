@@ -5,8 +5,9 @@ Node.js binding over the myotis-engine **C ABI** (`capi.rs` /
 Electron/desktop hosts that want to run Myotis invisibly in-process, the way
 they run other embedded nodes.
 
-This is the third consumer of the same ABI seam, next to the hand-JNI surface
-(JVM hosts) and the Kotlin/Native cinterop (iOS): identical JSON shapes (pinned
+This is the third consumer of the same engine, next to the UniFFI surface
+(JVM hosts, `ffi.rs`) and the Kotlin/Native cinterop over this same C ABI
+(iOS): identical JSON shapes (pinned
 by the cross-engine golden tests), identical in-band error sentinels (negative
 handle ids, `false`, `{"error": ...}` objects — no JS exceptions for
 engine-level failures).
@@ -186,8 +187,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
   Engines before ABI 27 ignore `block` and always answer from the head, so a
   host that forwards a block number must gate on `init() >= 27`.
-- **Executor refusals** (ABI 33): `ethCallJson`, `ethCallOverridesJson` and
-  `estimateGasJson` answer `{"error": "…", "code": -32602}` — **permanent**,
+- **Executor refusals** (ABI 33): `ethCallJson` and `estimateGasJson` (and,
+  since ABI 34, `estimateGasTxJson`; the C ABI's `myotis_eth_call_overrides_json`
+  is not wrapped here) answer `{"error": "…", "code": -32602}` — **permanent**,
   like the refusals above — when the verified head's header and this engine
   build's fork table disagree about Amsterdam: an Amsterdam block without
   EIP-7843's slot number, or a slot number on a block the table puts before
@@ -253,9 +255,12 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 32** and existing JS
+This implementation targets the current engine's **ABI 35** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
-and ABI 32's one change is additive (an optional trailing argument): ABI 26 added
+ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
+no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
+(the whole transaction object; `estimateGasJson` is unchanged), and ABI 35 adds
+`ethCallTxJson` (the same for calls; `ethCallJson` is unchanged): ABI 26 added
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
 be refused; ABI 28 added `read_stats_json` (the read-fetch shadow-cache

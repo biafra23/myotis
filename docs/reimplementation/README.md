@@ -211,7 +211,9 @@ bounded by `MAX_HEADER_CHAIN_GAP = 8192`). The integration tests assert results 
 
 ### Module map (reference JVM layout → re-implementation guidance)
 
-The reference is an 11-module Gradle build. For a Go/Rust port, collapse to crates/packages
+The reference was an 11-module Gradle build when this was written (it has since grown the
+`:ui` Compose module, the `:app-desktop`/`:app-ios` hosts, the `:myotis-api` contract, the
+`:myotis-engines` selector and `:tx-history`). For a Go/Rust port, collapse to crates/packages
 along these lines (the engine boundary matters far more than the exact split):
 
 | Reference module | Responsibility | Re-impl crate/pkg | Notes |
@@ -239,7 +241,7 @@ engine and inject platform-specific adapters through small interfaces ("ports"):
             │  Desktop CLI/daemon        Android NodeService          iOS app (future)        │
             │  - UDS IPC server          - foreground service         - SwiftUI               │
             │  - file caches             - Android file caches        - iOS file caches       │
-            │  - JVM HTTP CCIP gateway   - Ktor/OkHttp CCIP gateway   - URLSession CCIP gw     │
+            │  - JVM HTTP CCIP gateway   - HttpURLConnection CCIP gw - (CCIP not driven yet)   │
             └───────────────┬───────────────────────┬───────────────────────┬────────────────┘
                             │ inject ports           │                       │
             ┌───────────────▼───────────────────────▼───────────────────────▼────────────────┐
@@ -427,11 +429,15 @@ out-of-band. A faithful port should implement the real `CRC32(genesisHash ‖ fo
 with `forkNext` for forward-compatibility (remote peers validate *our* fork id and disconnect
 on mismatch).
 
-**Checkpoint refresh** is a build-time tool: query ≥3 independent checkpoint endpoints,
-normalize to the oldest finalized slot all can serve, re-query the root there, **require
-cross-agreement** (mainnet) or tolerate a single responder with a loud warning (Gnosis, where
-public endpoints are scarce), then rewrite the pinned `checkpointRoot`/`checkpointSlot`. The
-checkpoint is deliberately kept ~1 period stale so the catch-up path is always exercised.
+**Checkpoint refresh** is a build-time tool (`./gradlew refreshCheckpoint [-Pnetwork=…]`): query
+several independent checkpoint endpoints, normalize to the oldest finalized slot all can serve,
+re-query the root there, **require agreement from at least two operators** (registrable
+domains, not URLs — `-PallowSingleSource` is the explicit opt-out Gnosis sometimes needs), then
+rewrite the pinned `checkpointRoot`/`checkpointSlot` in **both engines** from the one fetch
+(`NetworkConfig.java` and `rust/myotis-net/src/sync.rs`; a parity test fails if they diverge).
+The anchor is refreshed at head for every release; `-Pperiod` / `-Pslot` pin an older one for
+testing the catch-up path, and the weak-subjectivity gate (13 periods on mainnet/Sepolia, 3 on
+Gnosis) refuses to sync from an anchor older than the bound without the user's consent.
 
 ---
 
@@ -580,6 +586,17 @@ next BLS verify and falls back to the embedded checkpoint).
 
 ## 10. Implementation Status & Recommended Build Order
 
+> **The Rust port described by this spec has been built** (`rust/` — `myotis-core`,
+> `myotis-consensus`, `myotis-net`, `myotis-evm`, `myotis-engine`) and is the default engine
+> behind `:myotis-api`; the JVM reference remains as the Java engine. The build order below is
+> the one the Rust phase followed ([06](06-rust-phase-notes.md), [07](07-el-implementation-plan.md)).
+> Beyond this list, the Rust engine added the opt-in **log index** behind `eth_getLogs`
+> (`docs/eth-getlogs-design.md`), Tor routing of account reads, state overrides / EIP-7702 /
+> contract creation in the EVM, the `finalized` tag on state reads, hedged reads across peers,
+> and the Gloas light client. The reference's remaining gaps are tracked in
+> [`docs/implementation-status.md`](../implementation-status.md), which is the current status
+> document; the list below is kept for the build order.
+
 The reference is a working proof-of-concept; some architecture pieces are designed but not yet
 built. A re-implementation should know what's load-bearing vs aspirational.
 
@@ -613,9 +630,10 @@ built. A re-implementation should know what's load-bearing vs aspirational.
 **Not implemented (out of scope for a first port):**
 
 - EIP-4444 history-expiry fallbacks; NFT/Vyper-specific storage helpers; pooled-tx gossip
-  (announce-then-fetch) and EIP-4844 blob sidecars; `eth_getLogs`, WebSocket `eth_subscribe`;
-  multi-chain *cross-verification* (e.g. bridge proofs between two in-process light clients —
-  a designed long-term payoff of hosting multiple `ChainStack`s in one process).
+  (announce-then-fetch) and EIP-4844 blob sidecars; WebSocket `eth_subscribe`; `eth_getLogs`
+  in the JVM reference (the Rust engine serves it from its log index); multi-chain
+  *cross-verification* (e.g. bridge proofs between two in-process light clients — a designed
+  long-term payoff of hosting multiple `ChainStack`s in one process).
 
 **EVM fork schedule caveat:** the reference hardcodes **mainnet** fork boundaries (London by
 block, Paris/Shanghai/Cancun/Prague by timestamp) and throws below London. A port must replicate

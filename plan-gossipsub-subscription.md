@@ -1,5 +1,13 @@
 # Plan: Gossipsub subscription for light-client topics
 
+> **Status (2026-09): partly superseded.** Since #425 (v0.1.9) **both engines
+> run a gossipsub router with nothing subscribed or published** — enough to stop
+> Lighthouse from banning the wallet as a peer that fails gossipsub negotiation
+> (the 12-hour ban behind #422, which stalled cold starts). Subscribing to the two
+> light-client topics as planned below — real-time finality/optimistic push in
+> place of the 12 s poll — is still not built, and the code sketch below predates
+> the Rust engine (it targets the Java `BeaconP2PService` only).
+
 Goal: become a spec-compliant mesh peer on the two light-client gossipsub topics, so
 CL peers (Lighthouse / Teku / Prysm / Nimbus / Lodestar) recognize us as useful and
 stop pruning us from their peer set. Secondary goal: replace our 12 s finality-update

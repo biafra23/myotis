@@ -42,8 +42,9 @@ own decision, per the carve-out.
 
 A **Rust-engine** myotis wallet bootstraps and stays synced from roost alone —
 verified on sepolia with discovery disabled, so it cannot have been another
-peer. The **Java engine is untested against roost**, and `myotis.engine`
-defaults to *java*, so that gap is the default path: `MYOTIS_CL_STATIC_PEERS`
+peer. The **Java engine is untested against roost**; `myotis.engine` defaults
+to *auto*, which picks the Rust engine wherever it can serve, so the untested
+gap is the fallback path rather than the default one: `MYOTIS_CL_STATIC_PEERS`
 exists only on the Rust side, and pointing a Java-engine wallet at roost means
 editing `NetworkConfig` and rebuilding. `docs/lc-server-design.md` rollout step 2
 asks for both engines and for saying which is which; this is the which.
