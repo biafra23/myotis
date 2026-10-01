@@ -137,7 +137,14 @@ async fn record_with_retries(reader: &ElReader, delegate: [u8; 20], peer_cache: 
     let deadline = tokio::time::Instant::now() + READY_BUDGET;
     let mut last_error = String::new();
     for attempt in 1..=ATTEMPTS {
-        let head = ready_head(reader, deadline, peer_cache).await?;
+        // A timeout after a failed attempt must not hide why that attempt failed.
+        let head = ready_head(reader, deadline, peer_cache).await.map_err(|e| {
+            if last_error.is_empty() {
+                e
+            } else {
+                format!("{e}; the last recording failed with: {last_error}")
+            }
+        })?;
         match record(head, delegate).await {
             Ok(fixture) => return Ok(fixture),
             Err(e) => {
