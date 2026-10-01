@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
- * The eth_estimateGas transaction object (#509): what the router accepts, what
+ * The eth_call / eth_estimateGas transaction object (#509): what the router accepts, what
  * it refuses, and the canonical JSON it hands the Rust engine — pinned here and
  * parsed by the same literal in `host::tests::parse_tx_request_reads_the_routers_canonical_form`,
  * the two halves of the cross-language golden.
@@ -95,6 +95,18 @@ class RpcTransactionArgsTest {
             val why = refusal(json)
             assertTrue(why.contains(reason), "expected '$reason' for $json, got '$why'")
         }
+    }
+
+    /** A quantity is a JSON string, as geth reads one: a JSON number is
+     *  refused, never coerced. One parser serves eth_call and eth_estimateGas,
+     *  so this holds for both (eth_call accepted `"value": 0` before #509). */
+    @Test fun aQuantityMustBeAJsonString() {
+        val to = """"to":"0x2222222222222222222222222222222222222222""""
+        for (k in listOf("value", "gas", "gasPrice", "maxFeePerGas", "nonce")) {
+            val why = refusal("""{$to,"$k":0}""")
+            assertTrue(why.contains("'$k' is not a quantity"), "$k: $why")
+        }
+        assertEquals("0", valid("""{$to,"value":"0x0"}""").valueWei)
     }
 
     /** A legacy v of 27/28 is parity 0/1; left as 27 the tuple could not be

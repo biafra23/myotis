@@ -318,8 +318,8 @@ impl EvmExecutor {
         // The flat 21000 is exact only BEFORE Amsterdam: EIP-2780 decomposes it
         // (sender base + recipient access + a value charge), and a value transfer
         // to an EMPTY account also pays EIP-8037 account-creation state gas — an
-        // order of magnitude more than 21000. From AMSTERDAM the metered run below
-        // prices it instead (buffered, like every metered estimate).
+        // order of magnitude more than 21000. From AMSTERDAM the search below
+        // prices it instead (buffered, like every estimate).
         if let Some(target) = tx.to {
             if tx.data.is_empty()
                 && !tx.has_lists()

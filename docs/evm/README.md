@@ -16,5 +16,5 @@ documentation see `../architecture-doc.md` and `../implementation-status.md`.
 | [decisions.md](decisions.md) | Implementation decisions tracked against the original "Open Questions for the Implementer" list. |
 | [phase1-design.md](phase1-design.md) | Phase 1 — SNAP-backed state oracle. The first end-to-end correct EVM run against a verified `stateRoot`. |
 | [phase2-design.md](phase2-design.md) | Phase 2 — speculative prefetching. Eliminates the round-trip-per-SLOAD latency that dominated Phase 1. |
-| [phase5-design.md](phase5-design.md) | Phase 5 — local gas estimation via `DefaultEvmExecutor.estimateGas`. Intrinsic + Besu-EVM-metered + 15% buffer; revert / OOG halt instead of returning a number. Validated end-to-end against an Anvil fork. |
+| [phase5-design.md](phase5-design.md) | Phase 5 — local gas estimation via `DefaultEvmExecutor.estimateGas`: geth's search for the lowest gas limit that works, + 15% buffer (#509 stage 2); revert / OOG halt instead of returning a number. Validated end-to-end against an Anvil fork and a recorded mainnet RelayAdapt7702 shield. |
 | [prefetch-benchmarks.md](prefetch-benchmarks.md) | Convergence iteration counts and end-to-end latency for the Phase 2 corpus. |
