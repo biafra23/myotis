@@ -67,10 +67,11 @@
 | `EnginePorts` (the bundle record) | `dictionary` of callback-interface handles | struct of trait objects |
 
 Threading contract carried over: the engine invokes port callbacks from its own worker
-threads (tokio blocking pool for `HttpGateway`, never an I/O driver thread); port
-implementations must be thread-safe. `HttpGateway` stays deliberately blocking — the
-Rust side wraps it in `spawn_blocking`, exactly mirroring today's
-`PortBridges.toCcipGateway` bridge.
+threads (never an I/O driver thread); port implementations must be thread-safe.
+`HttpGateway` stays deliberately blocking, and as landed the Rust engine never calls it:
+it returns the gateway tuple to the host, whose driver (`CcipDriver` on the JVM hosts)
+makes the blocking call on the thread that called the `EnsApi` and re-enters via
+`ccipCallback`. The Java engine runs it on its own workers (`PortBridges.toCcipGateway`).
 
 ## 3. Packaging (proven pattern)
 

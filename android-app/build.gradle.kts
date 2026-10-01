@@ -285,6 +285,7 @@ kotlin {
 
 dependencies {
     testImplementation(libs.junit4)
+    testImplementation(libs.okhttp2.urlconnection) // Android's HttpURLConnection upstream (see the catalog)
     // 2.1.5 is the first release whose config desugars Stream.toList() (via an
     // emulated Stream interface at minSdk ≤ 33) — earlier 2.1.x left it as a raw
     // API-34 call that crashes on Android 10-13 devices.
