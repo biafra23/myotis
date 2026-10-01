@@ -21,10 +21,27 @@
 #   summary or inline findings (the action flushes buffered inline comments in
 #   an always() sub-step), and a second review on top of that would duplicate
 #   or contradict the first. So the fallback is gated on the property we
-#   actually care about — that the failed attempt posted nothing — measured by
-#   comparing the PR's comment count before and after. If the first attempt
-#   failed after posting, the fallback is suppressed and the job fails loudly
-#   instead of quietly stacking two reviews.
+#   actually care about — that the first attempt left nothing on the PR —
+#   measured by the reviewer's own comments posted or edited since the review
+#   started. If the first attempt failed after posting, the fallback is
+#   suppressed and the job fails loudly instead of quietly stacking two
+#   reviews.
+#
+#   An attempt can also END CLEANLY having posted nothing. On 2026-10-01 (#523)
+#   Fable 5 ran 49 turns, hit 29 permission denials and stopped without a
+#   comment; the job went green, and the PR's builds, which wait for this run
+#   to finish (wait-for-claude-review.yml), started on no review at all. The
+#   prompt asks for a summary comment on every review, findings or not, so a
+#   clean attempt that left nothing counts as a failed one: the fallback runs,
+#   and the builds wait for it too, within the gate's one-hour bound. If it
+#   leaves nothing either, the job fails, so a missing review shows as a red
+#   check, never a green one. The gate itself stays fail-open (see its
+#   header): it starts the builds once this run has ended, whatever its
+#   result. A run in which the action never started Claude because this file
+#   differs from the default branch's is not an attempt (see Scope
+#   decisions): it stays green with a warning, since a fallback would skip
+#   the same way. After each attempt, a step prints what it was refused and
+#   how it ended, so a silent attempt explains itself.
 #
 #   NOT --fallback-model: that flag only covers "overloaded or not available".
 #   Verified against a live exhausted limit — it falls back correctly from a
@@ -57,14 +74,63 @@
 #       same-repo PR runs its own copy of this file, with the repo's secrets.
 #   - A PR that edits THIS FILE cannot review itself: the action requires the
 #     workflow to match the default branch and skips, and the job still goes
-#     green. The steps before the action do run from the PR's copy, so a
-#     broken prompt step shows up there; the review steps are only exercised
-#     once merged to main.
+#     green, with a warning that there is no review. The same skip hits any
+#     branch whose copy differs from the default branch's, such as a feature
+#     branch that has not merged a change to this file; the warning shows
+#     only where that copy carries this check. The steps before the action do
+#     run from the PR's copy, so a broken prompt step shows up there, and so
+#     does the check after it, which takes its skip branch. The review itself,
+#     the comment counts, the fallback job and the steps that fail a job are
+#     only exercised once merged to main.
 name: claude-review
 
 on:
   pull_request:
     types: [opened, reopened, ready_for_review]
+
+# One review at a time per PR: the checks below credit this run with what the
+# reviewer posted since it started, so a second run (a close/reopen during a
+# review) waits for the first instead of overlapping it. The builds' gate
+# (wait-for-claude-review.yml) waits for both, with one gap: polling just as
+# the first ends, before the second has a runner, it can take a hold of over 5
+# minutes for a run stuck in the queue and start the builds early. That is
+# rare and fail-open, like the rest of the gate.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  # The login claude-code-action posts as with this setup (the Claude GitHub
+  # App, see Setup). Only its comments count as review feedback in the checks
+  # below, so a person or another bot (Copilot posts inline findings)
+  # commenting while the review runs can neither pass for a review nor
+  # suppress the fallback. A different token setup posts under a different
+  # login: change this with it, or every review reads as empty.
+  REVIEWER_LOGIN: claude[bot]
+  # What each job prints after its attempt (see "What the first attempt was
+  # refused, and how it ended"), from the transcript the action writes to
+  # its execution file: how the run ended, each refused tool call with the
+  # checker's reason and the command's length, and the start of the final
+  # message. A refusal's reason comes from its permission_denied event; a
+  # run that stopped before its result message still lists those.
+  REPORT_JQ: |
+    [.[] | select(.type == "system" and .subtype == "permission_denied")] as $events
+    | ($events | map({key: .tool_use_id, value: (.decision_reason // .message)}) | from_entries) as $why
+    | ([.[] | select(.type == "result")] | last) as $r
+    | if $r == null then "No result message: the run stopped before Claude finished."
+      else "Ended \($r.subtype)\(if $r.is_error then ", as an error" else "" end) (\($r.terminal_reason // "no terminal reason")) after \($r.num_turns) turns."
+      end,
+      (($r.errors // [])[] | "Error: \(tostring | .[:300])"),
+      (($r.permission_denials // ($events | map({tool_name, tool_use_id, tool_input: null}))) as $refused
+        | "\($refused | length) refused tool call(s):",
+          ($refused[]
+            | "- \(.tool_name)\($why[.tool_use_id // ""] // "" | if . == "" then "" else " (\(.))" end)"
+              + if .tool_input == null then ""
+                else ((.tool_input.command? // (.tool_input | tojson)) | tostring)
+                  | ", \(length) characters: \(gsub("\n"; " ") | .[:200])"
+                end)),
+      "Final message (\($r.result // "" | length) characters):",
+      ($r.result // "" | .[:2000])
 
 jobs:
   review:
@@ -76,14 +142,18 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
+    # What the fallback job needs from this one.
+    outputs:
+      fallback: ${{ steps.unposted.outputs.safe }}
+      prompt: ${{ steps.prompt.outputs.text }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # Both attempts below send the identical prompt, so it lives in one file
-      # and is assembled once here. GitHub Actions has no YAML anchors, and
-      # duplicating the prompt across two steps would drift.
+      # Both attempts send the identical prompt, so it lives in one file and is
+      # assembled once here; the fallback job receives it through this job's
+      # outputs.
       #
       # The file comes from the base commit GitHub recorded for the PR
       # (pull_request.base.sha), never from the checkout, which is the PR's own
@@ -125,25 +195,36 @@ jobs:
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # Baseline for the "posted nothing" check below. `.comments` (issue
-      # comments) + `.review_comments` (inline) come straight off the PR object,
-      # so this is one call with no pagination to get wrong.
-      - name: Count review feedback before the first attempt
-        id: before
+      # Whether this run's copy of this file is the default branch's. When it
+      # is not, the action skips without starting Claude (see Scope
+      # decisions), and the check after the first attempt has to tell that
+      # skip from an attempt that left nothing. Asked here, before the action
+      # runs: the action points origin at its app token and revokes the token
+      # on its way out, so a fetch after it would fail.
+      - name: Does this workflow match the default branch's?
+        id: workflow
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          # Assign, don't inline into echo: a failed gh api inside an echo
-          # argument would still exit 0 and silently record an empty baseline.
-          n=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '.comments + .review_comments')
-          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::Unexpected comment count: '$n'"; exit 1; }
-          echo "count=$n" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin "$DEFAULT_BRANCH"
+          if git diff --quiet FETCH_HEAD -- .github/workflows/claude-review.yml; then
+            echo "matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matches=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The checks below ask what the reviewer posted or edited since this
+      # moment: its summary (an issue comment) and its inline comments. A time,
+      # not a count: a re-review may update its earlier summary instead of
+      # posting a new one, and a comment deleted meanwhile must not cancel one
+      # posted. Two seconds early for clock skew; GitHub stamps whole seconds.
+      - name: Note when the review starts
+        id: start
+        run: echo "at=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       # First choice. continue-on-error so an exhausted Fable 5 limit falls
-      # through to the Opus fallback below instead of failing the job.
+      # through to the Opus fallback job instead of failing this one.
       - name: Review (Fable 5)
         id: fable
         continue-on-error: true
@@ -156,33 +237,157 @@ jobs:
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
-      # `outcome` is the raw step result (conclusion is masked to success by
-      # continue-on-error), so this fires exactly when Fable 5 failed. The
-      # action has already flushed any buffered inline comments by now, so an
-      # unchanged count means genuinely nothing was posted and a second attempt
-      # is safe. A human commenting during the review window also trips this —
-      # rare, and it fails safe (a loud skip, never a silent duplicate).
-      - name: Did the failed attempt post anything?
+      # What the attempt was refused, and how it ended. The action keeps the
+      # whole transcript on the runner (its execution file) and prints only
+      # counts, so a silent attempt used to leave no trace: #520's and #523's
+      # first reviews posted nothing after 23 and 29 refused calls, and their
+      # transcripts went with their runners. This prints REPORT_JQ's report
+      # (see env above), the refused calls cut to 200 characters and the final
+      # message to 2000. Only a report: it never stops the job, or a broken
+      # report would skip the check below and with it the fallback. The
+      # fallback job's copy of this step must stay identical.
+      - name: What the first attempt was refused, and how it ended
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.fable.outputs.execution_file }}
+        run: |
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "No transcript: the action did not run Claude."
+            exit 0
+          fi
+          # The text is the model's: the prefix keeps every line of it from
+          # acting as a workflow command (::…::) or a log marker (##[…]).
+          jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
+
+      # Whether the first attempt left a review, whether it failed or ended
+      # cleanly: a clean attempt that left nothing is no review either (see
+      # Model strategy above). `outcome` is the raw step result (conclusion is
+      # masked to success by continue-on-error). The action sets `session_id`
+      # only once Claude has run; a clean step without one is the action's skip
+      # when this file differs from the default branch's (asked before the
+      # action ran), and an attempt that left nothing when it does not. The
+      # action has already flushed any buffered inline comments by now, so no
+      # comment since the start means genuinely nothing was posted and a
+      # second attempt (the fallback job) is safe.
+      - name: Did the first attempt leave a review?
         id: unposted
-        if: steps.fable.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BEFORE: ${{ steps.before.outputs.count }}
+          SINCE: ${{ steps.start.outputs.at }}
+          OUTCOME: ${{ steps.fable.outcome }}
+          CLAUDE_SESSION: ${{ steps.fable.outputs.session_id }}
+          WORKFLOW_MATCHES: ${{ steps.workflow.outputs.matches }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          before=$BEFORE
-          now=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '.comments + .review_comments')
-          [[ "$now" =~ ^[0-9]+$ && "$before" =~ ^[0-9]+$ ]] \
-            || { echo "::error::Non-numeric comment count (before='$before' now='$now')"; exit 1; }
-          echo "before=$before now=$now"
-          if [ "$now" -eq "$before" ]; then
+          workflow=.github/workflows/claude-review.yml
+          if [ "$OUTCOME" = success ] && [ -z "$CLAUDE_SESSION" ]; then
+            if [ "$WORKFLOW_MATCHES" != true ]; then
+              echo "safe=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::No automated review: this PR's $workflow differs from $DEFAULT_BRANCH's, so the action skipped (see Scope decisions in that file)."
+              exit 0
+            fi
+            echo "::warning::The action ended without starting Claude, though $workflow matches $DEFAULT_BRANCH's; counting it as an attempt that posted nothing."
+          fi
+          [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
+          # The reviewer's comments posted or edited since the start, summary
+          # and inline; three tries before it gives up. Inline comments also
+          # count from github-actions[bot]: the action posts its buffered ones
+          # with this job's token when its run step died before handing over
+          # the app's, and no other workflow here comments on PRs. Each listing
+          # is assigned on its own, never inside an echo or an arithmetic
+          # expansion, where a failed gh api would still exit 0. The fallback
+          # job's "Fail when no review was posted" carries the same function: a
+          # helper shared by the two would come from the PR's own checkout or
+          # escape actionlint's shellcheck, so keep the two copies identical.
+          count() {
+            local query="since=$SINCE&per_page=100" try summaries inlines
+            local by_reviewer=".[] | select(.user.login == \"$REVIEWER_LOGIN\" and .updated_at >= \"$SINCE\") | .id"
+            local by_action=".[] | select((.user.login == \"$REVIEWER_LOGIN\" or .user.login == \"github-actions[bot]\") and .updated_at >= \"$SINCE\") | .id"
+            for try in 1 2 3; do
+              [ "$try" -eq 1 ] || sleep $((try * 10))
+              summaries=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?$query" --jq "$by_reviewer" | wc -l) || continue
+              inlines=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/comments?$query" --jq "$by_action" | wc -l) || continue
+              echo $((summaries + inlines))
+              return 0
+            done
+            return 1
+          }
+          counted=false
+          if left=$(count); then
+            # A comment posted moments ago can still be missing from a list,
+            # and a zero here starts a second review: count a zero again.
+            if [ "$left" -gt 0 ] || { sleep 30; left=$(count); }; then counted=true; fi
+          fi
+          if [ "$counted" = false ]; then
+            # Unknown. A red job here would invite a re-run, and a re-run
+            # starts a new review on top of any this one left, so a clean
+            # attempt is taken at its word; only a failed one stops the job.
+            if [ "$OUTCOME" = success ] && [ -n "$CLAUDE_SESSION" ]; then
+              echo "safe=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::Listing the PR's comments failed 3 times. Fable 5 ended cleanly, so this assumes it left its review and runs no fallback. Check the PR, and re-run this workflow if it has none."
+              exit 0
+            fi
+            echo "::error::Listing the PR's comments failed 3 times, so whether Fable 5 left a review is unknown. Check the PR before re-running: a re-run starts a new review."
+            exit 1
+          fi
+          echo "Fable 5: $OUTCOME; reviewer comments posted or edited since $SINCE: $left"
+          if [ "$left" -eq 0 ]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Fable 5 left no review (step $OUTCOME) — running the Opus fallback. The step before this one shows what it was refused and how it ended."
           else
             echo "safe=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Fable 5 failed after posting $((now - before)) comment(s) — suppressing the Opus fallback so the PR does not get two overlapping reviews."
+            if [ "$OUTCOME" = failure ]; then
+              echo "::warning::Fable 5 failed after posting $left comment(s) — suppressing the Opus fallback so the PR does not get two overlapping reviews."
+            fi
           fi
+
+      # Suppressing the fallback must not look like a clean review. Without
+      # this the job would go green (continue-on-error masks the Fable 5
+      # failure) having left only a partial review on the PR.
+      - name: Fail when the review was left incomplete
+        if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe != 'true'
+        run: |
+          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
+          exit 1
+
+  # The second attempt runs on a runner of its own. Two runs of the action in
+  # one job share state that the action never resets between them: its buffer
+  # of unconfirmed inline comments (/tmp/inline-comments-buffer.jsonl, which
+  # its post-session step reads and never clears, so a second run would post
+  # the first one's leftovers), and the working tree, where the first run has
+  # already swapped the base branch's CLAUDE.md and .claude/ in, so the second
+  # one's .claude-pr/ snapshot of the PR's copies would hold the base's. A
+  # fresh runner and checkout start the fallback where the first attempt
+  # started.
+  #
+  # While this job waits for a runner, the run counts as in progress, so the
+  # builds' gate (wait-for-claude-review.yml) waits too: its 5-minute escape
+  # is for a run that has not started. Ungated jobs free runners as they
+  # finish; at worst the gate gives up after its hour, fail-open as ever.
+  # Re-running this job alone starts a new Opus review, and its check counts
+  # only what that run posts.
+  fallback:
+    name: Fallback review (latest Opus)
+    needs: review
+    if: needs.review.outputs.fallback == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # As in the review job, but this job's own start: the review job's
+      # would credit a re-run of this job with what an earlier run posted.
+      - name: Note when the fallback starts
+        id: start
+        run: echo "at=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       # `opus` is Claude Code's alias for the latest Opus, not a model ID, so
       # this fallback moves to each new Opus with no edit here; the full ID it
@@ -195,22 +400,74 @@ jobs:
       # 2026-09-25 with action v1.0.234 / Claude Code 2.1.282: `opus` resolves
       # to claude-opus-5-5; each run's "Claude Code initialized" log line names
       # the model it got. To pin one Opus instead, put its full ID here.
-      - name: Review (latest Opus — Fable 5 failed, posted nothing)
-        if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe == 'true'
+      - name: Review (latest Opus — Fable 5 left no review)
+        id: opus
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ steps.prompt.outputs.text }}
+          prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model opus
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
-      # Suppressing the fallback must not look like a clean review. Without
-      # this the job would go green (continue-on-error masks the Fable 5
-      # failure) having left only a partial review on the PR.
-      - name: Fail when the review was left incomplete
-        if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe != 'true'
+      # The review job's report, for this attempt; keep the two identical.
+      # It runs after a failed attempt too, which the check below does not.
+      - name: What the fallback was refused, and how it ended
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.opus.outputs.execution_file }}
         run: |
-          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
-          exit 1
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "No transcript: the action did not run Claude."
+            exit 0
+          fi
+          # The text is the model's: the prefix keeps every line of it from
+          # acting as a workflow command (::…::) or a log marker (##[…]).
+          jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
+
+      # The fallback must have left a review. A failed fallback already fails
+      # the job (this step is then skipped); this catches one that ended
+      # cleanly having posted nothing, which would otherwise end the job green
+      # with no review on the PR.
+      - name: Fail when no review was posted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          set -euo pipefail
+          [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
+          # The same count as "Did the first attempt leave a review?" in the
+          # review job; keep the two copies identical. Anything since this
+          # job's start is the fallback's.
+          count() {
+            local query="since=$SINCE&per_page=100" try summaries inlines
+            local by_reviewer=".[] | select(.user.login == \"$REVIEWER_LOGIN\" and .updated_at >= \"$SINCE\") | .id"
+            local by_action=".[] | select((.user.login == \"$REVIEWER_LOGIN\" or .user.login == \"github-actions[bot]\") and .updated_at >= \"$SINCE\") | .id"
+            for try in 1 2 3; do
+              [ "$try" -eq 1 ] || sleep $((try * 10))
+              summaries=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?$query" --jq "$by_reviewer" | wc -l) || continue
+              inlines=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/comments?$query" --jq "$by_action" | wc -l) || continue
+              echo $((summaries + inlines))
+              return 0
+            done
+            return 1
+          }
+          counted=false
+          if left=$(count); then
+            # As in the review job: a zero fails this one, so count it again.
+            if [ "$left" -gt 0 ] || { sleep 30; left=$(count); }; then counted=true; fi
+          fi
+          if [ "$counted" = false ]; then
+            # As in the review job, a clean attempt is taken at its word.
+            echo "::warning::Listing the PR's comments failed 3 times. The Opus fallback ended cleanly, so this assumes it left its review. Check the PR, and re-run this job if it has none."
+            exit 0
+          fi
+          echo "Reviewer comments posted or edited since $SINCE: $left"
+          if [ "$left" -eq 0 ]; then
+            echo "::error::Neither Fable 5 nor the Opus fallback posted a review, so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
+            exit 1
+          fi
