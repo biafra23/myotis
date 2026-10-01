@@ -31,7 +31,7 @@ fun main() {
         if (f.isFile) System.setProperty("myotis.engine.lib", f.absolutePath)
     }
     // A PoC flavour (-PbeePoc / -PrailgunPoc → -Dmyotis.<flavour>=true) lives in its own
-    // data dir and seeds that network's log index from the bundle before anything reads
+    // data dir and seeds its networks' log indexes from the bundle before anything reads
     // that dir. Null for a regular build, which is every build that sets neither property.
     val poc = Poc.active()
     val dataDir = poc?.dataDir() ?: Path.of(System.getProperty("user.home"), ".myotis")
@@ -53,7 +53,7 @@ fun main() {
     }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
-    poc?.installSeedIfAbsent(resourcesDir, dataDir)
+    poc?.installSeedsIfAbsent(resourcesDir, dataDir)
     // settings first: the controller reads it at boot (configured RPC port + snap target).
     val settings = DesktopSettings(file = settingsFile)
     poc?.applyFirstStartSettings(settings, firstStart)

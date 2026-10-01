@@ -705,6 +705,9 @@ class DesktopSettings(
     private val logIndexPaused = HashMap<String, Boolean>()
     // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
     private val logIndexWatch = HashMap<String, String>()
+    // The networks a PoC flavour has configured (PocFlavour.applyFirstStartSettings); null
+    // until one first records it. Desktop-only, so it is not on the shared Settings seam.
+    private var pocConfigured: Set<String>? = null
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -759,6 +762,10 @@ class DesktopSettings(
     override fun setLogIndexWatchJson(network: String, json: String) =
         mutate { logIndexWatch[network] = json }
 
+    /** The networks a PoC flavour has configured in this settings file, or null if none is recorded. */
+    fun pocConfiguredNetworks(): Set<String>? = synchronized(this) { pocConfigured }
+    fun setPocConfiguredNetworks(networks: Set<String>) = mutate { pocConfigured = networks.toSet() }
+
     override fun displayName(network: String): String = info(network)?.displayName() ?: network
     override fun defaultRpcPort(network: String): Int = info(network)?.defaultRpcPort() ?: 8545
     override fun hasEns(network: String): Boolean = info(network)?.hasEns() ?: false
@@ -800,6 +807,12 @@ class DesktopSettings(
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.getProperty(K_POC_CONFIGURED)?.let { csv ->
+            // Empty counts as no record (never written so; a hand edit): read as "configured
+            // nothing" it would re-apply the primary network over the user's settings.
+            pocConfigured = csv.split(',').map(String::trim).filter { it.isNotEmpty() }.toSet()
+                .takeIf { it.isNotEmpty() }
+        }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexPaused[k.removePrefix(K_LOG_INDEX_PAUSED_PREFIX)] = it }
@@ -877,6 +890,7 @@ class DesktopSettings(
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
         p.setProperty(K_PREFER_JAVA, preferJava.toString())
         p.setProperty(K_TOR, torRouting.toString())
+        pocConfigured?.let { p.setProperty(K_POC_CONFIGURED, it.joinToString(",")) }
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
         logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
@@ -920,6 +934,7 @@ class DesktopSettings(
         // now (its true meant "auto", which is the default — nothing to migrate).
         const val K_PREFER_JAVA = "engine.preferJava"
         const val K_TOR = "torRouting"
+        const val K_POC_CONFIGURED = "poc.configuredNetworks"
         const val K_LOG_INDEX_PREFIX = "logIndex."
         // Distinct prefixes nested under logIndex.* so the enable-loader's
         // startsWith filter must exclude them (see load()).
