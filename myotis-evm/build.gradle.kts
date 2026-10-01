@@ -56,6 +56,14 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // RelayAdapt7702ShieldFixtureTest replays a world recorded outside this
+    // module (rust/testdata/evm, #509), or the one MYOTIS_SHIELD_FIXTURE names:
+    // a re-recording must re-run it, never answer from the up-to-date check.
+    val shieldFixtureOverride = providers.environmentVariable("MYOTIS_SHIELD_FIXTURE").orNull
+    inputs.files(listOfNotNull(
+        rootProject.file("rust/testdata/evm/relayadapt7702-shield.json"),
+        shieldFixtureOverride?.let { file(it) },
+    )).withPropertyName("shieldFixtures").withPathSensitivity(PathSensitivity.NONE)
 }
 
 // ----------------------------------------------------------------------------

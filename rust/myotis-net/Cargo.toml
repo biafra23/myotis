@@ -57,10 +57,18 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 
 [features]
 tor = ["dep:arti-client", "dep:tor-rtcompat"]
+# The EVM fixture recorder's seam (`ElReader::head_evm_oracle`) and
+# myotis-evm's recorded-world files, for examples/record_shield_fixture.rs.
+# Test tooling: on only through this crate's own dev-dependency below.
+fixture-recorder = ["myotis-evm/fixture"]
 
 [dev-dependencies]
 # readstats shape tests parse their own JSON output.
 serde_json = "1"
+# Tests and examples build this crate with `fixture-recorder`, so the fixture
+# recorder example compiles in every `cargo test`/clippy run while the engine
+# library and the shipped .so never carry its seam.
+myotis-net = { path = ".", features = ["fixture-recorder"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # test-util only: `#[tokio::test(start_paused = true)]` drives the interactive
 # read HEDGING on the paused clock, so the timing invariants are asserted

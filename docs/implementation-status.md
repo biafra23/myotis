@@ -141,7 +141,7 @@ Fee suggestions are also served verified: **`eth_gasPrice`**, **`eth_maxPriority
 
 `myotis-evm` embeds Hyperledger Besu's standalone `org.hyperledger.besu:evm` artifact and runs it against a SNAP-backed `StateOracle`.
 
-- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`. Resolves EIP-7702 delegation designators (`0xef0100‖address`) one hop so calls against delegated EOAs execute the delegate's code.
+- `DefaultEvmExecutor` runs a transaction-shaped call against state served from snap/1; every read verified by Merkle-Patricia proof against a verified `stateRoot`. Resolves EIP-7702 delegation designators (`0xef0100‖address`) one hop so calls against delegated EOAs execute the delegate's code, with the delegate warm from the start as geth and revm start it.
 - `PrefetchingEvmExecutor` runs a multi-hop speculative discovery loop (sentinel runs that record accesses without blocking), batch-fetches each hop's misses in parallel (semaphore-bounded so a 1000-token balance sweep doesn't flood one peer), then runs for real against a warm cache — eliminates the round-trip-per-SLOAD latency that would otherwise dominate. A result is only returned from a run where every read hit the verified cache.
 - `CcipReadEvmExecutor` handles ERC-3668 off-chain lookups (see Section 6).
 - Bytecode verified via `keccak256(code) == codeHash` against the proof-verified account. Block context (`block.number`, `coinbase`, `prevRandao`, `baseFeePerGas`, `gasLimit`, `chainId`) supplied from a verified header.

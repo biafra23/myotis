@@ -421,14 +421,22 @@ public final class DefaultEvmExecutor implements EvmExecutor {
             org.hyperledger.besu.evm.account.Account targetAccount) {
         Bytes contractCode = targetAccount == null ? Bytes.EMPTY : targetAccount.getCode();
         Hash contractCodeHash = targetAccount == null ? Hash.EMPTY : targetAccount.getCodeHash();
-        if (contractCode.size() == 23 && contractCode.slice(0, 3).equals(DELEGATION_PREFIX)) {
-            org.hyperledger.besu.datatypes.Address delegate =
-                    org.hyperledger.besu.datatypes.Address.wrap(contractCode.slice(3, 20));
-            var delegateAccount = scope.get(delegate);
+        var delegate = delegateOf(targetAccount);
+        if (delegate.isPresent()) {
+            var delegateAccount = scope.get(delegate.get());
             contractCode = delegateAccount == null ? Bytes.EMPTY : delegateAccount.getCode();
             contractCodeHash = delegateAccount == null ? Hash.EMPTY : delegateAccount.getCodeHash();
         }
         return evm.getOrCreateCachedJumpDest(contractCodeHash, contractCode);
+    }
+
+    /** The delegate an EIP-7702 designator in {@code account}'s code names, if any. */
+    private static java.util.Optional<org.hyperledger.besu.datatypes.Address> delegateOf(
+            org.hyperledger.besu.evm.account.Account account) {
+        Bytes code = account == null ? Bytes.EMPTY : account.getCode();
+        return code.size() == 23 && code.slice(0, 3).equals(DELEGATION_PREFIX)
+                ? java.util.Optional.of(org.hyperledger.besu.datatypes.Address.wrap(code.slice(3, 20)))
+                : java.util.Optional.empty();
     }
 
     /**
@@ -576,6 +584,11 @@ public final class DefaultEvmExecutor implements EvmExecutor {
                 // nothing is committed, so view reads are unaffected.
                 .isStatic(false)
                 .build();
+        // A delegated target's delegate starts the run warm, as the execution
+        // specs, geth and revm start it: when the delegate's code calls back into
+        // the target (RelayAdapt7702's multicall does), loading the delegate
+        // again costs the warm price, not a cold access.
+        delegateOf(targetAccount).ifPresent(frame::warmUpAddress);
 
         MessageCallProcessor processor = new MessageCallProcessor(evm, bundle.precompiles());
 
