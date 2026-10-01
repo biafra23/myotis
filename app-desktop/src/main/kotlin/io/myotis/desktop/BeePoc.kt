@@ -26,19 +26,24 @@ package io.myotis.desktop
 object BeePoc : PocFlavour(
     prop = "myotis.beePoc",
     label = "Bee PoC",
-    network = "gnosis",
     dataDirName = ".myotis-bee-poc",
-    seedFile = "logindex-gnosis.db",
-    manifestFile = "bee-poc-seed.properties",
-    installedManifestFile = "logindex-gnosis.seed.properties",
-    // A cold Gnosis pool is the PoC's other failure mode: with no cache the app once sank
-    // to a single unresponsive snap peer, the index stopped following the head, and Bee's
-    // ten-minute stall rule shut it down.
-    peerCacheFiles = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache"),
-    watchAddress = "0x45a1502382541Cd610CC9068e88727426b696293",
-    watchDeployBlock = 31_305_656L,
-    seedSubject = "PostageStamp logs",
-    seedSource = "a Gnosis full node",
+    seeds = listOf(
+        PocSeed(
+            network = "gnosis",
+            seedFile = "logindex-gnosis.db",
+            manifestFile = "bee-poc-seed.properties",
+            installedManifestFile = "logindex-gnosis.seed.properties",
+            // A cold Gnosis pool is the PoC's other failure mode: with no cache the app once
+            // sank to a single unresponsive snap peer, the index stopped following the head,
+            // and Bee's ten-minute stall rule shut it down.
+            peerCacheFiles = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache"),
+            watchAddress = "0x45a1502382541Cd610CC9068e88727426b696293",
+            watchDeployBlock = 31_305_656L,
+            seedSubject = "PostageStamp logs",
+            seedSource = "a Gnosis full node",
+            // Gnosis keeps its default 8546: no regular install serves gnosis by default.
+        ),
+    ),
     // Bee embeds the postage history below the seed (`go:embed` in Bee's
     // pkg/postage/snapshot, events to block 47,061,407) and has never once asked below it,
     // so the downward walk only steals peers from the head-follow that Bee does depend on.

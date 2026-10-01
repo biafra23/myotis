@@ -158,8 +158,8 @@ fun flavourFlag(name: String): Boolean = providers.gradleProperty(name)
 
 val beePoc: Boolean = flavourFlag("beePoc")
 
-// The RAILGUN PoC flavour flag (-PrailgunPoc): bundles the mainnet
-// RailgunSmartWallet log-index seed so the RAILGUN Terminal Wallet can use the
+// The RAILGUN PoC flavour flag (-PrailgunPoc): bundles the mainnet and Sepolia
+// RailgunSmartWallet log-index seeds so the RAILGUN Terminal Wallet can use the
 // app instead of a public RPC provider from the first minute (RailgunPoc.kt,
 // docs/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
 val railgunPoc: Boolean = flavourFlag("railgunPoc")
@@ -209,15 +209,16 @@ val prepareRustAppResources = tasks.register("prepareRustAppResources") {
             from(src)
             into(destDir)
         }
-        // The regular app must never carry the Bee PoC seed. The flavours stage
-        // into different roots, but a root that predates that split (or a stray
-        // copy) would be synced into the bundle unnoticed — scrub it here, on
-        // every regular staging run.
+        // The regular app must never carry a PoC seed. The flavours stage into
+        // different roots, but a root that predates that split (or a stray copy)
+        // would be synced into the bundle unnoticed — scrub it here, on every
+        // regular staging run.
         if (pocFlavourName == null) {
             val common = rustAppResourcesRoot.get().dir("common").asFile
             listOf(
                 "logindex-gnosis.db", "bee-poc-seed.properties", "peers-gnosis.cache", "cl-peers-gnosis.cache",
                 "logindex.db", "railgun-poc-seed.properties",
+                "logindex-sepolia.db", "railgun-poc-seed-sepolia.properties",
             ).forEach { common.resolve(it).delete() }
         }
     }
@@ -308,7 +309,7 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // resources root above keeps a regular build from ever shipping the seed.
 // ---------------------------------------------------------------------------
 // Compose flattens appResources/common/ next to the os-arch dir; both
-// flavours stage their seed there, into their own flavour-specific root.
+// flavours stage their seeds there, into their own flavour-specific root.
 val pocSeedDir = rustAppResourcesRoot.map { it.dir("common") }
 
 // The PostageStamp contract at its REAL deployment block — never the seed's
@@ -367,114 +368,176 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 }
 
 // ---------------------------------------------------------------------------
-// RAILGUN PoC flavour (-PrailgunPoc): bundle the mainnet RailgunSmartWallet
-// log-index seed so the RAILGUN Terminal Wallet can be pointed at this app
-// instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
+// RAILGUN PoC flavour (-PrailgunPoc): bundle the RailgunSmartWallet log-index
+// seeds for mainnet AND Sepolia so the RAILGUN Terminal Wallet can be pointed at
+// this app instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
 //
 // The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
-// 58 MB gzip of ~39k logs; RAILGUN's is 426k logs over 11.3M blocks — 549 MB
-// raw, and a git object nobody wants in a clone. So this task reads the fetch
-// from a directory given by -PrailgunSeedDir (default ~/myotis-node/railgun),
-// produced by the fetch described in docs/railgun-poc.md, and fails with that
-// instruction when it is not there. A missing seed must never degrade into a
-// silently seedless "RAILGUN PoC" build that then backfills for days.
+// 58 MB gzip of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
+// — 589 MB raw, and a git object nobody wants in a clone. So this task reads each
+// network's fetch from a directory given by a property — -PrailgunSeedDir for
+// mainnet (default ~/myotis-node/railgun), -PrailgunSepoliaSeedDir for Sepolia
+// (default ~/myotis-node/railgun-sepolia) — produced by the fetch described in
+// docs/railgun-poc.md, and fails with that instruction when either is not there.
+// A missing seed must never degrade into a silently seedless "RAILGUN PoC" build
+// that then backfills for days.
 // ---------------------------------------------------------------------------
-val railgunSeedDir: File = providers.gradleProperty("railgunSeedDir")
-    .map { file(it) }
-    .getOrElse(File(System.getProperty("user.home"), "myotis-node/railgun"))
 
-// The REAL deployment block, and the chain agrees: the proxy's first log is at
-// exactly 14737691 and a sweep from genesis found none below it. `from_block` is
-// the engine's "no logs below here" assertion, so a lower value here turns real
-// history into plausible empty answers (docs/railgun-poc.md spells this out).
-val railgunWatch = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691"
+/** One network's seed: where its fetch is, what it must frame as, and the names it stages under (RailgunPoc.kt). */
+data class RailgunSeed(
+    val network: String,
+    val chainId: Long,
+    val dirProperty: String,
+    val dir: File,
+    /** ADDRESS:DEPLOY_BLOCK — the proxy at its REAL deployment block. */
+    val watch: String,
+    val seedFile: String,
+    val manifestFile: String,
+)
+
+/** A seed's fetch, located and checked before anything is framed. */
+data class RailgunFetch(val seed: RailgunSeed, val meta: File, val logs: File, val toBlockTag: String?)
+
+fun railgunSeedDir(property: String, default: String): File = providers.gradleProperty(property)
+    .map { file(it) }
+    .getOrElse(File(System.getProperty("user.home"), default))
+
+// `from_block` is the engine's "no logs below here" assertion, so a watch block above
+// the real deployment turns real history into plausible empty answers
+// (docs/railgun-poc.md spells this out).
+val railgunSeeds = listOf(
+    // The REAL deployment block, and the chain agrees: the proxy's first log is at
+    // exactly 14737691 and a sweep from genesis found none below it.
+    RailgunSeed(
+        network = "mainnet",
+        chainId = 1L,
+        dirProperty = "railgunSeedDir",
+        dir = railgunSeedDir("railgunSeedDir", "myotis-node/railgun"),
+        watch = "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9:14737691",
+        seedFile = "logindex.db",
+        manifestFile = "railgun-poc-seed.properties",
+    ),
+    // The proxy's creation block. NOT the SDK's 5784866: that is where the wallet starts
+    // scanning, above the 62 logs of the deployment's own setup, so as a floor it would
+    // assert they do not exist.
+    RailgunSeed(
+        network = "sepolia",
+        chainId = 11155111L,
+        dirProperty = "railgunSepoliaSeedDir",
+        dir = railgunSeedDir("railgunSepoliaSeedDir", "myotis-node/railgun-sepolia"),
+        watch = "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea:5784774",
+        seedFile = "logindex-sepolia.db",
+        manifestFile = "railgun-poc-seed-sepolia.properties",
+    ),
+)
 
 val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
     group = "build"
-    description = "Synthesize the RAILGUN PoC mainnet log-index seed from -PrailgunSeedDir and stage it into Compose appResources (-PrailgunPoc only)"
+    description = "Synthesize the RAILGUN PoC log-index seeds (mainnet from -PrailgunSeedDir, Sepolia from -PrailgunSepoliaSeedDir) and stage them into Compose appResources (-PrailgunPoc only)"
     onlyIf { railgunPoc }
     val script = rootProject.file("scripts/synth_logindex.py")
-    val seed = pocSeedDir.map { it.file("logindex.db") }
-    val manifest = pocSeedDir.map { it.file("railgun-poc-seed.properties") }
-    val seedDir = railgunSeedDir
+    val seeds = railgunSeeds
     inputs.files(script)
-    // A fileTree behind a provider, NOT inputs.dir: a missing dir makes Gradle fail
-    // validation with "an input file was expected to be present", which buries the
-    // instruction the developer actually needs. Absent here means no inputs, and the
-    // doLast check below is the fail-loud gate that names the fix.
-    //
-    // NARROWED to the fetch's own files on purpose: the docs tell developers to run
-    // the framing script by hand in this directory to inspect the result, which drops
-    // a ~243 MB logindex.db and a manifest beside the ~549 MB jsonl. Fingerprinting
-    // the whole tree would re-hash ~800 MB on every up-to-date check and mark the
-    // task dirty after each manual inspection.
-    inputs.files(
-        provider {
-            if (seedDir.isDirectory) {
-                fileTree(seedDir) { include("*.meta.json", "railgun-logs.jsonl", "railgun-logs.jsonl.gz") }
-            } else {
-                files()
-            }
-        },
-    )
-    // The frame's OWN assertions, declared so a change to either re-runs the task.
-    // Neither is a file, and the build script is not a task input, so without these a
-    // corrected deployment block would leave the dmg shipping the previous frame —
-    // whose from_block makes the engine answer [] below the floor without consulting
-    // coverage. That is the one defect class this file keeps warning about.
-    inputs.property("watch", railgunWatch)
-    outputs.files(seed, manifest)
+    for (s in seeds) {
+        // A fileTree behind a provider, NOT inputs.dir: a missing dir makes Gradle fail
+        // validation with "an input file was expected to be present", which buries the
+        // instruction the developer actually needs. Absent here means no inputs, and the
+        // doLast check below is the fail-loud gate that names the fix.
+        //
+        // NARROWED to the fetch's own files on purpose: the docs tell developers to run
+        // the framing script by hand in this directory to inspect the result, which drops
+        // a ~250 MB logindex.db and a manifest beside the ~589 MB jsonl. Fingerprinting
+        // the whole tree would re-hash ~850 MB on every up-to-date check and mark the
+        // task dirty after each manual inspection.
+        inputs.files(
+            provider {
+                if (s.dir.isDirectory) {
+                    fileTree(s.dir) { include("*.meta.json", "railgun-logs.jsonl", "railgun-logs.jsonl.gz") }
+                } else {
+                    files()
+                }
+            },
+        ).withPropertyName("${s.network}Fetch")
+        // The frame's OWN assertion, declared so a change re-runs the task. It is not a
+        // file, and the build script is not a task input, so without this a corrected
+        // deployment block would leave the dmg shipping the previous frame — whose
+        // from_block makes the engine answer [] below the floor without consulting
+        // coverage. That is the one defect class this file keeps warning about.
+        inputs.property("${s.network}Watch", s.watch)
+        outputs.files(pocSeedDir.map { it.file(s.seedFile) }, pocSeedDir.map { it.file(s.manifestFile) })
+    }
     doLast {
-        check(seedDir.isDirectory) {
-            "railgun-poc: no seed data at $seedDir. Fetch it first (docs/railgun-poc.md, " +
-                "\"Building the seed\"), or point -PrailgunSeedDir at a directory holding the " +
-                "fetch's .jsonl and .meta.json."
+        // Every seed's fetch is checked before any is framed: framing mainnet's takes about a
+        // minute, and a missing or swapped Sepolia dir should not wait for it to say so.
+        val fetches = seeds.map { s ->
+            check(s.dir.isDirectory) {
+                "railgun-poc: no ${s.network} seed data at ${s.dir}. Fetch it first (docs/railgun-poc.md, " +
+                    "\"Building the seed\"), or point -P${s.dirProperty} at a directory holding the " +
+                    "fetch's .jsonl and .meta.json."
+            }
+            // One pair, found by shape rather than by a pinned filename: the range is
+            // in the name and a re-fetch changes it. Two pairs would be ambiguous, so
+            // refuse rather than guess which fetch the build meant.
+            val metas = s.dir.listFiles { f: File -> f.name.endsWith(".meta.json") }?.sorted().orEmpty()
+            check(metas.size == 1) {
+                "railgun-poc: expected exactly one *.meta.json in ${s.dir}, found ${metas.size} " +
+                    "${metas.map { it.name }} — leave only the fetch this build should bundle."
+            }
+            val meta = metas.single()
+            val logs = s.dir.resolve("railgun-logs.jsonl").takeIf { it.isFile }
+                ?: s.dir.resolve("railgun-logs.jsonl.gz").takeIf { it.isFile }
+                ?: throw GradleException("railgun-poc: no railgun-logs.jsonl(.gz) beside $meta")
+            val fields = groovy.json.JsonSlurper().parse(meta) as Map<*, *>
+            // Two seed dirs are easy to swap, and a frame tagged for the wrong chain is
+            // installed fine and then ignored by the engine, which checks the tag: a silently
+            // seedless network. The framing script refuses it too (--network-id below); this
+            // says so before anything is framed, and names the property to fix.
+            val chainId = (fields["chainId"] as? Number)?.toLong()
+            check(chainId == s.chainId) {
+                "railgun-poc: ${meta.name} in ${s.dir} is a fetch from chain $chainId, but " +
+                    "-P${s.dirProperty} must hold the ${s.network} fetch (chain ${s.chainId})."
+            }
+            RailgunFetch(s, meta, logs, fields["toBlockTag"]?.toString())
         }
-        // One pair, found by shape rather than by a pinned filename: the range is
-        // in the name and a re-fetch changes it. Two pairs would be ambiguous, so
-        // refuse rather than guess which fetch the build meant.
-        val metas = seedDir.listFiles { f: File -> f.name.endsWith(".meta.json") }?.sorted().orEmpty()
-        check(metas.size == 1) {
-            "railgun-poc: expected exactly one *.meta.json in $seedDir, found ${metas.size} " +
-                "${metas.map { it.name }} — leave only the fetch this build should bundle."
-        }
-        val meta = metas.single()
-        val logs = seedDir.resolve("railgun-logs.jsonl").takeIf { it.isFile }
-            ?: seedDir.resolve("railgun-logs.jsonl.gz").takeIf { it.isFile }
-            ?: throw GradleException("railgun-poc: no railgun-logs.jsonl(.gz) beside $meta")
         pocSeedDir.get().asFile.mkdirs()
-        // Trimming the top is only safe to skip when the fetch ran to a block that
-        // CANNOT reorg. The meta records which tag it used; a fetch to `latest` with
-        // margin 0 would freeze a since-reorged block into the seed and the engine
-        // would serve it as fully covered — a silent wrong answer, the exact case the
-        // coverage rules exist to prevent. So the margin follows the meta rather than
-        // a convention the developer was asked to remember.
-        val toBlockTag = groovy.json.JsonSlurper().parse(meta) .let { (it as Map<*, *>)["toBlockTag"] }?.toString()
-        val margin = if (toBlockTag == "finalized") "0" else null
-        if (margin == null) {
-            logger.lifecycle(
-                "railgun-poc: ${meta.name} does not declare toBlockTag=finalized (got ${toBlockTag ?: "nothing"}) — " +
-                    "keeping the default reorg margin, so the seed's top is trimmed",
+        for ((s, meta, logs, toBlockTag) in fetches) {
+            val seed = pocSeedDir.get().file(s.seedFile).asFile
+            val manifest = pocSeedDir.get().file(s.manifestFile).asFile
+            // Trimming the top is only safe to skip when the fetch ran to a block that
+            // CANNOT reorg. The meta records which tag it used; a fetch to `latest` with
+            // margin 0 would freeze a since-reorged block into the seed and the engine
+            // would serve it as fully covered — a silent wrong answer, the exact case the
+            // coverage rules exist to prevent. So the margin follows the meta rather than
+            // a convention the developer was asked to remember.
+            val margin = if (toBlockTag == "finalized") "0" else null
+            if (margin == null) {
+                logger.lifecycle(
+                    "railgun-poc: ${meta.name} does not declare toBlockTag=finalized (got ${toBlockTag ?: "nothing"}) — " +
+                        "keeping the default reorg margin, so the seed's top is trimmed",
+                )
+            }
+            val cmd = listOf(
+                "python3", script.absolutePath,
+                "--meta", meta.absolutePath,
+                "--logs", logs.absolutePath,
+                "--watch", s.watch,
+                // Refuses a meta from another chain — checked above as well; this is the
+                // check that reads the same bytes the frame is built from.
+                "--network-id", s.chainId.toString(),
+            ) + (margin?.let { listOf("--finality-margin", it) } ?: emptyList()) + listOf(
+                "--out", seed.absolutePath,
+                "--manifest", manifest.absolutePath,
             )
+            val proc = ProcessBuilder(cmd).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
+            val stderr = proc.errorStream.bufferedReader().readText()
+            check(proc.waitFor() == 0 && seed.isFile && manifest.isFile) {
+                "railgun-poc: scripts/synth_logindex.py failed for the ${s.network} seed (python3 required):\n$stderr"
+            }
+            val summary = manifest.readLines()
+                .filter { it.startsWith("covered") || it.startsWith("usableUntil") || it.startsWith("logs=") }
+                .joinToString(", ")
+            logger.lifecycle("railgun-poc: staged ${seed.name} — $summary")
         }
-        val cmd = listOf(
-            "python3", script.absolutePath,
-            "--meta", meta.absolutePath,
-            "--logs", logs.absolutePath,
-            "--watch", railgunWatch,
-        ) + (margin?.let { listOf("--finality-margin", it) } ?: emptyList()) + listOf(
-            "--out", seed.get().asFile.absolutePath,
-            "--manifest", manifest.get().asFile.absolutePath,
-        )
-        val proc = ProcessBuilder(cmd).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
-        val stderr = proc.errorStream.bufferedReader().readText()
-        check(proc.waitFor() == 0 && seed.get().asFile.isFile && manifest.get().asFile.isFile) {
-            "railgun-poc: scripts/synth_logindex.py failed (python3 required):\n$stderr"
-        }
-        val summary = manifest.get().asFile.readLines()
-            .filter { it.startsWith("covered") || it.startsWith("usableUntil") || it.startsWith("logs=") }
-            .joinToString(", ")
-        logger.lifecycle("railgun-poc: staged ${seed.get().asFile.name} — $summary")
     }
 }
 

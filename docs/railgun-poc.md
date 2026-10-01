@@ -2,16 +2,18 @@
 
 A flavour of the desktop app that the [RAILGUN Terminal Wallet
 CLI](https://github.com/Terminal-Wallet/terminal-wallet-cli) can be pointed at
-instead of a public RPC provider, from the first minute. It is the mainnet
-sibling of the Bee PoC build (docs/bee-rpc-service.md) and shares all of its
-machinery — see `PocFlavour.kt`, with `BeePoc.kt` and `RailgunPoc.kt` as the two
-configurations of it.
+instead of a public RPC provider, from the first minute, on mainnet and on
+Sepolia. It is the sibling of the Bee PoC build (docs/bee-rpc-service.md) and
+shares all of its machinery — see `PocFlavour.kt`, with `BeePoc.kt` and
+`RailgunPoc.kt` as the two configurations of it, and a `PocSeed` per network.
 
 ```bash
-./gradlew :app-desktop:packageDmg -PrailgunPoc -PrailgunSeedDir="$HOME/myotis-node/railgun"
+./gradlew :app-desktop:packageDmg -PrailgunPoc \
+    -PrailgunSeedDir="$HOME/myotis-node/railgun" \
+    -PrailgunSepoliaSeedDir="$HOME/myotis-node/railgun-sepolia"
 ```
 
-**DEBUG / DEMO artefact, not a production path.** The bundled index is a full
+**DEBUG / DEMO artefact, not a production path.** Each bundled index is a full
 node's `eth_getLogs` output framed by `scripts/synth_logindex.py`. It carries no
 receipt-root proof and the engine serves it indistinguishably from logs the
 walker verified itself. The repo rule stands: a local client over http "may only
@@ -22,8 +24,8 @@ The seeded-history carve-out (CLAUDE.md, owner's decision 2026-09-25;
 docs/seeded-log-histories.md) does not cover this build, so the label stands.
 It accepts a seed on its protocol maintainers' word — the RAILGUN engine's
 `rootHistory` check keeps forged commitments out of its tree but does not
-surface a withheld or altered one — and this seed is the repo's own fetch from
-a node over JSON-RPC, served without the provenance marker the carve-out
+surface a withheld or altered one — and these seeds are the repo's own fetches
+from a node over JSON-RPC, served without the provenance marker the carve-out
 makes a precondition.
 
 ## Why a seed at all
@@ -36,20 +38,28 @@ today.
 
 ## What is in it
 
-| | |
-|---|---|
-| contract | RailgunSmartWallet proxy, `0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9` |
-| deployment block | 14,737,691 |
-| coverage | 14,737,691 → the fetch's `finalized` block |
-| logs | ~426,000 over ~11.3M blocks |
-| index size | ~243 MB |
+| | mainnet | Sepolia |
+|---|---|---|
+| contract | RailgunSmartWallet proxy, `0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9` | RailgunSmartWallet proxy, `0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea` |
+| deployment block | 14,737,691 | 5,784,774 |
+| coverage | 14,737,691 → the fetch's `finalized` block | 5,784,774 → the fetch's `finalized` block |
+| logs | ~438,000 over ~11.4M blocks | ~14,800 over ~6M blocks |
+| index size | ~261 MB | ~9 MB |
+| served on | `http://127.0.0.1:8555` | `http://127.0.0.1:8557` |
 
 The Terminal Wallet hardcodes no addresses. It depends on
 `@railgun-community/wallet`, which reads them from
-`@railgun-community/shared-models`; for chain id 1 that config names this proxy.
-The relay-adapt contract it also names is used to build transactions rather than
-scanned for history, and the V3 contracts are not deployed on mainnet, so one
-watch entry covers what the wallet reads.
+`@railgun-community/shared-models`; for chain ids 1 and 11155111 that config
+names these proxies. The wallet hands its engine the proxy, the relay-adapt
+contract and the V3 contracts (`loadNetwork`, in the wallet's
+`load-provider.ts`). The relay adapt is used to build transactions rather than
+scanned for history, and the V3 contracts are deployed on neither network (empty
+in that config, with `supportsV3: false`), so one watch entry per network covers
+what the wallet reads. Sepolia's config also names a registry and an EIP-7702
+relay adapt; the wallet hands neither to its engine.
+
+Note that shared-models marks Sepolia `isDevOnlyNetwork`: a wallet build may
+hide it unless it runs in a development mode.
 
 ### The deployment block is load-bearing
 
@@ -75,7 +85,18 @@ answers (`LogIndex::query` clamps its coverage check to `from_block`,
 `el/logindex.rs:563`), which is why `synth_logindex.py` refuses a deployment
 block above the fetch's low edge.
 
-Because coverage starts *at* the deployment block, this seed's coverage is
+**On Sepolia the SDK and the chain disagree, and the chain decides.** The proxy
+was created in block 5,784,774 by a top-level transaction whose receipt names it
+as the created contract, its first log is at 5,784,776, and a sweep from genesis
+found no logs below that (zbox, 2026-10-01). shared-models gives 5,784,866
+instead: that is where the wallet *starts scanning*, after the 62 logs of the
+deployment's own setup (verifying keys, ownership, initialisation). As a watch
+floor it would assert that those 62 logs do not exist — the corrupting direction
+just described — so the seed uses the creation block. The retired Kohaku preset
+(`LogIndexWatch.legacyKohakuWatchJson`) has 5,784,774 for Sepolia, which is
+right; its mainnet number is the one that is not.
+
+Because coverage starts *at* the deployment block, each seed's coverage is
 complete downward. Nothing is left for the walker to fill, and every query is
 either served or refused as above the covered head. That is the one way this
 flavour is simpler than the Bee one, whose seed starts well above its contract's
@@ -84,8 +105,10 @@ deployment.
 ## Building the seed
 
 The data is **not committed**. The Bee flavour's set is a 58 MB gzip of ~39k
-logs; this one is 426k logs and 549 MB raw, which does not belong in a clone.
-Fetch it once, onto a host with a synced mainnet node, and point the build at it.
+logs; the mainnet one here is ~438k logs and 589 MB raw, which does not belong in
+a clone. Fetch each once, onto a host with synced nodes, and point the build at
+them. Mainnet's range starts before the Merge (block 15,537,394), so its node must
+still hold pre-Merge receipts.
 
 ```bash
 SEED=$HOME/myotis-node/railgun && mkdir -p "$SEED"
@@ -106,8 +129,14 @@ SEED=$HOME/myotis-node/railgun && mkdir -p "$SEED"
     --from-block 14737691 --to-block <resolved> --to-block-tag finalized \
     --logs "$SEED/railgun-logs.jsonl"
 
-# 3. the build frames it into build/railgunPocAppResources/common/
-./gradlew :app-desktop:prepareRailgunPocSeed -PrailgunPoc -PrailgunSeedDir="$SEED"
+# Sepolia: the same two steps against a synced Sepolia node (~4 min), with
+#   --address 0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea --from-block 5784774
+# into a directory of its own, e.g. $HOME/myotis-node/railgun-sepolia.
+SEPOLIA_SEED=$HOME/myotis-node/railgun-sepolia
+
+# 3. the build frames both into build/railgunPocAppResources/common/
+./gradlew :app-desktop:prepareRailgunPocSeed -PrailgunPoc \
+    -PrailgunSeedDir="$SEED" -PrailgunSepoliaSeedDir="$SEPOLIA_SEED"
 
 # ...or frame it by hand first, to inspect what it claims before packaging
 ./scripts/synth_logindex.py \
@@ -139,15 +168,20 @@ record the tag when the range can still reorg. That is stronger than believing
 the tag, since a fetch that ran to `latest` yesterday is final today and
 legitimately qualifies.
 
-`prepareRailgunPocSeed` expects exactly one `*.meta.json` in the seed directory
-and refuses to guess when it finds several, since the range is part of the name
-and a re-fetch leaves the old one behind.
+`prepareRailgunPocSeed` needs both directories. It expects exactly one
+`*.meta.json` in each and refuses to guess when it finds several, since the range
+is part of the name and a re-fetch leaves the old one behind. It also requires
+each meta's chain id to match the network its property names, before framing
+anything: a swapped pair would otherwise frame fine, install fine, and be ignored
+by the engine, which checks each index file's chain tag — a silently seedless
+network.
 
 ## Shelf life
 
-**500,000 mainnet blocks, about 69 days.** The head bridge maps at most that much
-above a file's top (`MAX_GAP`, `el/reader.rs`), so a seed older than that imports
-fine and then never catches up to the head. The manifest records the block it is
+**500,000 blocks, about 69 days on either network** (both have 12-second
+slots). The head bridge maps at most that much above a file's top (`MAX_GAP`,
+`el/reader.rs`), so a seed older than that imports fine and then never catches
+up to the head. The manifest records the block it is
 usable until; rebuild the app with a fresh fetch after that.
 
 ## What the flavour does at runtime
@@ -155,23 +189,30 @@ usable until; rebuild the app with a fresh fetch after that.
 - Lives in `~/.myotis-railgun-poc`, never touching a regular install's
   `~/.myotis` or the Bee flavour's dir. Bundle id
   `io.myotis.desktop.railgunpoc`, app name *Myotis RAILGUN PoC*.
-- Installs the bundled seed into that dir before the engine starts, checking it
-  against the manifest's sha256 first, and never over an index it did not install
+- Installs each bundled seed into that dir before the engine starts, checking it
+  against its manifest's sha256 first, and never over an index it did not install
   itself. A newer bundled seed re-seeds; an equal or older one is left alone —
   see *Re-seeding* below for a caveat.
-- First start only: enables mainnet, disables gnosis, switches the log index on,
-  stores the seed's watch entry, and **pins the RPC port to 8555**. Point the
-  wallet at `http://127.0.0.1:8555`; it serves as soon as the beacon sync reaches
-  `SYNCED`. Later starts never touch settings.
-- The Index tab states what the seed covers and that it is unverified.
+- First start: enables mainnet and Sepolia, disables gnosis, switches each log
+  index on, stores each seed's watch entry, and **pins the RPC ports: 8555 for
+  mainnet, 8557 for Sepolia**. Point the wallet at `http://127.0.0.1:8555` or
+  `http://127.0.0.1:8557`; each serves as soon as its beacon sync reaches `SYNCED`.
+- Each network is configured exactly once. An install whose first start predates
+  the Sepolia seed gets Sepolia configured the same way by its first start of a
+  build that bundles it; the settings file records which networks are done
+  (`poc.configuredNetworks`). Nothing else on a later start touches settings, and
+  a network the user turned off stays off.
+- The Index tab states what each seed covers and that it is unverified.
 
-### Why 8555 and not 8545
+### Why 8555 and 8557, not 8545 and 8547
 
-A regular Myotis install serves mainnet on 8545. Two installed apps would compete
-for it, only one would bind, and a wallet aimed at 8545 could silently reach the
-regular install — which has no seeded index and answers this demo's own queries
-with `-32000`, looking exactly like a broken configuration. The Bee flavour never
-had this problem because no regular install serves gnosis on 8546 by default.
+A regular Myotis install serves mainnet on 8545, and Sepolia on 8547 once it is
+switched on. Two installed apps would compete for the port, only one would bind,
+and a wallet aimed at it could silently reach the regular install — which has no
+seeded index and answers this demo's own queries with `-32000`, looking exactly
+like a broken configuration. So each is the regular port plus ten. The Bee
+flavour never had this problem because no regular install serves gnosis on 8546
+by default.
 
 ### Re-seeding, and a caveat worth knowing
 
@@ -194,58 +235,71 @@ on its own. Until then, the safe move before installing a rebuilt app on a machi
 that has been running for weeks is to keep a copy of `~/.myotis-railgun-poc`.
 
 Unlike the Bee flavour it ships **no warm peer caches** — none have been captured
-for mainnet — so discovery seeds from the embedded bootnodes. That costs a slower
+for mainnet or Sepolia — so discovery seeds from the embedded bootnodes. That costs a slower
 first minute, not correctness.
 
 ## CI
 
 `.github/workflows/railgun-dmg.yml` builds the arm64 installer on every push to
 `main`, on `v*` tags, and on manual dispatch. It is separate from
-`desktop-dmg.yml` because this flavour's seed is not in the tree: gzipped it is
-117 MB, over GitHub's 100 MB per-file limit, and nothing that size belongs in a
-clone anyway.
+`desktop-dmg.yml` because this flavour's seeds are not in the tree: mainnet's,
+gzipped, is ~120 MB, over GitHub's 100 MB per-file limit, and nothing that size
+belongs in a clone anyway.
 
-**The seed lives on the `railgun-seed` release** as two assets, and the build
+**The seeds live on the `railgun-seed` release** as four assets, and the build
 fetches them from there. Nothing needs configuring.
 
 | asset | |
 |---|---|
-| `railgun-seed.tar.gz` | the fetch: `railgun-logs.jsonl` and its `*.meta.json` |
+| `railgun-seed.tar.gz` | the mainnet fetch: `railgun-logs.jsonl` and its `*.meta.json` |
 | `railgun-seed.tar.gz.sha256` | its checksum, which the build requires and checks before framing |
+| `railgun-seed-sepolia.tar.gz` | the Sepolia fetch, in the same shape |
+| `railgun-seed-sepolia.tar.gz.sha256` | its checksum |
 
 It is a release for data, deliberately separate from the app releases: an app
-release cannot be built until the seed exists. Its tag triggers no workflow
+release cannot be built until the seeds exist. Its tag triggers no workflow
 (they all key on `v*`).
 
-The workflow **bundles** the framed index into the dmg. The installed app never
-touches the network for its index and works offline from the first start; the
-dmg is roughly 100 MB larger than the standard one for it.
+The workflow **bundles** the framed indexes into the dmg. The installed app never
+touches the network for its indexes and works offline from the first start; the
+dmg is roughly 110 MB larger than the standard one for them.
 
 ### Refreshing the seed
 
-The seed's shelf life is ~69 mainnet days (500,000 blocks, `MAX_GAP`). To
-refresh it, run the fetch again (*Building the seed* above), then replace both
-assets and rebuild:
+Each seed's shelf life is ~69 days (500,000 blocks, `MAX_GAP`). To refresh one,
+run its fetch again (*Building the seed* above), then replace both of its assets
+and rebuild. Fetch into a **fresh directory** rather than over the previous one:
+the old meta would otherwise sit beside the new one, which the build refuses, and
+the old fetch is what you roll back to.
 
 ```bash
-cd "$HOME/myotis-node/railgun" && tar -czf railgun-seed.tar.gz railgun-logs.jsonl railgun-logs-*.meta.json
+# mainnet
+cd "$SEED" && tar -czf railgun-seed.tar.gz railgun-logs.jsonl railgun-logs-*.meta.json
 sha256sum railgun-seed.tar.gz > railgun-seed.tar.gz.sha256
 gh release upload railgun-seed railgun-seed.tar.gz railgun-seed.tar.gz.sha256 --clobber
+# Sepolia: the same, as railgun-seed-sepolia.tar.gz and its .sha256
 gh workflow run railgun-dmg.yml
 ```
+
+`--clobber` deletes each old asset before its replacement finishes uploading, so a
+build that fetches in between fails. Over a slow link, upload under a temporary
+name, then delete the old asset and rename the new one
+(`gh api -X PATCH repos/<owner>/<repo>/releases/assets/<id> -f name=…`).
 
 The archive may hold the files flat or under a directory; the build locates the
 `*.meta.json` inside it either way, and refuses an archive holding more than one.
 
 ### Overrides
 
-Two repository variables redirect a build at a different seed, for a refresh
-under test or a fork's own asset. Both are optional.
+Repository variables redirect a build at a different seed, for a refresh under
+test or a fork's own asset. All are optional.
 
 | variable | |
 |---|---|
-| `RAILGUN_SEED_URL` | another `.tar.gz` of a fetch directory |
+| `RAILGUN_SEED_URL` | another `.tar.gz` of a mainnet fetch directory |
 | `RAILGUN_SEED_SHA256` | its sha256, in place of the `.sha256` sidecar the build otherwise fetches from beside the archive |
+| `RAILGUN_SEPOLIA_SEED_URL` | the same for the Sepolia fetch |
+| `RAILGUN_SEPOLIA_SEED_SHA256` | the same for its checksum |
 
 ### What the checksums establish
 
@@ -279,8 +333,9 @@ uploaded by hand.
 
 Beyond the architecture and engine checks the standard legs make, this one opens
 the built image and requires that it carries `logindex.db` (mainnet's name, with
-no network suffix — a suffixed one would install fine and never be opened), its
-manifest, a manifest pinning `deploymentBlock=14737691`, coverage starting at
-that block, and none of the Bee flavour's files. A dmg that installs cleanly with
+no network suffix — a suffixed one would install fine and never be opened) and
+`logindex-sepolia.db`, each with its manifest; manifests naming the right
+network and pinning `deploymentBlock=14737691` and `deploymentBlock=5784774`;
+coverage starting at those blocks; and none of the Bee flavour's files. A dmg that installs cleanly with
 no index inside is exactly the failure this artifact exists to prevent, and
 nothing at runtime would report it except a wallet getting `-32000` forever.

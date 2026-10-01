@@ -1,16 +1,63 @@
 package io.myotis.desktop
 
 import io.myotis.ui.LogIndexWatch
-import io.myotis.ui.Settings
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.Properties
+import java.util.concurrent.ConcurrentHashMap
 
 /** What a flavour's seed install did on this launch — the Index tab says so when it went wrong. */
 enum class SeedOutcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FAILED }
+
+/**
+ * One network a [PocFlavour] seeds: the log index it bundles for that network, the names
+ * it lands under, and what the flavour configures for the network.
+ *
+ * @param network the network this seed is for, which the flavour enables
+ * @param seedFile the engine's OWN drop-in name for [network]'s index
+ *   (`dataDir/logindex-<network>.db`, mainnet without the suffix), derived in
+ *   `rust/myotis-engine/src/host.rs` (`log_index_path`) and activated at engine start by
+ *   `activate_log_index_from_disk`. A rename on the engine side must be mirrored here or
+ *   the seed is silently never opened.
+ * @param manifestFile the bundled manifest beside the seed
+ * @param installedManifestFile the manifest's copy in the data dir — how the UI knows the
+ *   index was seeded, and how a re-seed compares versions
+ * @param peerCacheFiles warm peer caches bundled beside the seed, in the engine's own
+ *   formats and under the engine's own data-dir names. Public addresses only; the engine
+ *   re-verifies every peer it dials, so these shortcut discovery rather than grant trust.
+ *   May be empty for a network that ships none.
+ * @param watchAddress the contract the seed indexes
+ * @param watchDeployBlock its REAL deployment block. `from_block` is the engine's "no logs
+ *   below here" assertion, so this must never be the seed's fetched low edge: below it the
+ *   engine answers `[]` WITHOUT consulting coverage, and a plausible empty answer is worse
+ *   than the `-32000` refusal an out-of-coverage range gets.
+ * @param seedSubject what the seed's logs are, for the Index tab line
+ * @param seedSource where they came from, for the Index tab line
+ * @param rpcPort the port the flavour pins for [network], or null to keep that network's
+ *   default. A network a REGULAR install also serves needs one: otherwise both apps want
+ *   the same port, the second to start cannot bind it, and a client aimed at that port
+ *   silently reaches whichever won — for a PoC, an install with no seeded index, which
+ *   answers the demo's own queries with -32000.
+ */
+class PocSeed(
+    val network: String,
+    val seedFile: String,
+    val manifestFile: String,
+    val installedManifestFile: String,
+    val peerCacheFiles: List<String>,
+    val watchAddress: String,
+    val watchDeployBlock: Long,
+    val seedSubject: String,
+    val seedSource: String,
+    val rpcPort: Int? = null,
+) {
+    /** The seed's watch entry, as the Index tab and the engine both read it. */
+    val watchJson: String =
+        LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(watchAddress, watchDeployBlock)))
+}
 
 /**
  * A **seeded proof-of-concept flavour** of the desktop app: a Myotis one specific consumer
@@ -18,10 +65,10 @@ enum class SeedOutcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FA
  * instead of being walked over devp2p for days.
  *
  * Two of them exist ([BeePoc] for a Swarm Bee full node on Gnosis, [RailgunPoc] for the
- * RAILGUN Terminal Wallet on mainnet). Everything that differs between them is a
- * constructor parameter; everything below is shared, because the install, re-seed,
- * checksum and first-start rules were all learned the hard way on the Bee build and a
- * second copy of them would drift.
+ * RAILGUN Terminal Wallet on mainnet and Sepolia). Everything that differs between them is
+ * a constructor parameter, per network a [PocSeed]; everything below is shared, because
+ * the install, re-seed, checksum and first-start rules were all learned the hard way on
+ * the Bee build and a second copy of them would drift.
  *
  * Each flavour lives in its own data dir and under its own bundle id, so it never touches
  * a regular install's `~/.myotis` or the other flavour's dir, and all of it is a no-op
@@ -34,58 +81,33 @@ enum class SeedOutcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FA
  *
  * @param prop the system property the packaged app sets to select this flavour
  * @param label how the flavour names itself in logs and in the Index tab
- * @param network the one network this flavour enables on a first start
  * @param dataDirName the flavour's own directory under the user's home
- * @param seedFile the engine's OWN drop-in name for [network]'s index
- *   (`dataDir/logindex-<network>.db`, mainnet without the suffix), derived in
- *   `rust/myotis-engine/src/host.rs` (`log_index_path`) and activated at engine start by
- *   `activate_log_index_from_disk`. A rename on the engine side must be mirrored here or
- *   the seed is silently never opened.
- * @param manifestFile the bundled manifest beside the seed
- * @param installedManifestFile the manifest's copy in the data dir — how the UI knows the
- *   index was seeded, and how a re-seed compares versions
- * @param peerCacheFiles warm peer caches bundled beside the seed, in the engine's own
- *   formats and under the engine's own data-dir names. Public addresses only; the engine
- *   re-verifies every peer it dials, so these shortcut discovery rather than grant trust.
- *   May be empty for a flavour that ships none.
- * @param watchAddress the contract the seed indexes
- * @param watchDeployBlock its REAL deployment block. `from_block` is the engine's "no logs
- *   below here" assertion, so this must never be the seed's fetched low edge: below it the
- *   engine answers `[]` WITHOUT consulting coverage, and a plausible empty answer is worse
- *   than the `-32000` refusal an out-of-coverage range gets.
- * @param seedSubject what the seed's logs are, for the Index tab line
- * @param seedSource where they came from, for the Index tab line
+ * @param seeds one per network the flavour seeds and enables; the first is its primary
+ *   network, the one a first start lists first
  * @param pauseBackfillByDefault whether a network with no stored preference starts with the
  *   downward walk stopped
- * @param rpcPort the port a first start pins for [network], or null to keep that network's
- *   default. A flavour whose network a REGULAR install also serves must pin one: otherwise
- *   both apps want the same port, the second to start cannot bind it, and a client aimed at
- *   that port silently reaches whichever won — for a PoC, an install with no seeded index,
- *   which answers the demo's own queries with -32000.
  */
 open class PocFlavour(
     val prop: String,
     val label: String,
-    val network: String,
     val dataDirName: String,
-    val seedFile: String,
-    val manifestFile: String,
-    val installedManifestFile: String,
-    val peerCacheFiles: List<String>,
-    val watchAddress: String,
-    val watchDeployBlock: Long,
-    val seedSubject: String,
-    val seedSource: String,
+    val seeds: List<PocSeed>,
     val pauseBackfillByDefault: Boolean,
-    val rpcPort: Int? = null,
 ) {
-    /** The seed's watch entry, as the Index tab and the engine both read it. */
-    val watchJson: String =
-        LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(watchAddress, watchDeployBlock)))
+    init {
+        require(seeds.isNotEmpty()) { "$prop: a flavour seeds at least one network" }
+        // Each network's seed lands under that network's names, so two seeds for one
+        // network would overwrite each other in the data dir.
+        require(seeds.map { it.network }.distinct().size == seeds.size) { "$prop: one seed per network" }
+    }
 
-    @Volatile
-    var lastOutcome: SeedOutcome? = null
-        private set
+    /** The network a first start lists first — the flavour's original one. */
+    val primaryNetwork: String get() = seeds.first().network
+
+    fun seedFor(network: String): PocSeed? = seeds.firstOrNull { it.network == network }
+
+    /** What each network's seed install did on this launch, for [seededIndexNotice]. */
+    private val lastOutcomes = ConcurrentHashMap<String, SeedOutcome>()
 
     fun enabled(): Boolean = System.getProperty(prop).toBoolean()
 
@@ -111,31 +133,32 @@ open class PocFlavour(
     fun dataDir(): Path = Path.of(System.getProperty("user.home"), dataDirName)
 
     /**
-     * Install the bundled seed (and its manifest) into [dataDir]. The seed lands when no
-     * index file exists there yet, or when the bundled seed is NEWER than the one this
-     * flavour installed before (a rebuilt app after the previous seed's shelf life — the
-     * manifest's `coveredHigh` is the version); the sha256 is checked against the manifest
-     * first. It never touches an index this flavour did not install (no installed
-     * manifest), and it must run BEFORE the engine starts: the engine rewrites the seed
-     * file as its own checkpoint and activates whatever is there. Returns the outcome
-     * (also kept in [lastOutcome]).
+     * Install each network's bundled seed (and its manifest) into [dataDir]. A seed lands
+     * when no index file exists there yet for its network, or when the bundled seed is
+     * NEWER than the one this flavour installed before (a rebuilt app after the previous
+     * seed's shelf life — the manifest's `coveredHigh` is the version); the sha256 is
+     * checked against the manifest first. It never touches an index this flavour did not
+     * install (no installed manifest), and it must run BEFORE the engine starts: the engine
+     * rewrites the seed file as its own checkpoint and activates whatever is there. Returns
+     * each network's outcome (also kept for [seededIndexNotice]).
      */
-    fun installSeedIfAbsent(resourcesDir: Path?, dataDir: Path): SeedOutcome {
-        val outcome = install(resourcesDir, dataDir)
-        lastOutcome = outcome
+    fun installSeedsIfAbsent(resourcesDir: Path?, dataDir: Path): Map<String, SeedOutcome> {
+        val outcomes = seeds.associate { seed ->
+            seed.network to install(seed, resourcesDir, dataDir).also { lastOutcomes[seed.network] = it }
+        }
         installPeerCachesIfAbsent(resourcesDir, dataDir)
-        return outcome
+        return outcomes
     }
 
     /**
      * Copy each bundled peer cache into [dataDir] when the engine has none there yet.
-     * Independent of the seed's outcome, and never over an existing file: the engine
+     * Independent of the seeds' outcomes, and never over an existing file: the engine
      * rewrites these as it learns, and what it learned beats what we shipped. Returns the
      * names installed on this call.
      */
     fun installPeerCachesIfAbsent(resourcesDir: Path?, dataDir: Path): List<String> {
         val dir = resourcesDir ?: return emptyList()
-        return peerCacheFiles.filter { name ->
+        return seeds.flatMap { it.peerCacheFiles }.filter { name ->
             val src = dir.resolve(name)
             val target = dataDir.resolve(name)
             if (!Files.isRegularFile(src)) {
@@ -156,14 +179,14 @@ open class PocFlavour(
         }
     }
 
-    private fun install(resourcesDir: Path?, dataDir: Path): SeedOutcome {
+    private fun install(spec: PocSeed, resourcesDir: Path?, dataDir: Path): SeedOutcome {
         val dir = resourcesDir ?: return SeedOutcome.NOT_BUNDLED
-        val seed = dir.resolve(seedFile)
-        val manifest = dir.resolve(manifestFile)
+        val seed = dir.resolve(spec.seedFile)
+        val manifest = dir.resolve(spec.manifestFile)
         if (!Files.isRegularFile(seed) || !Files.isRegularFile(manifest)) return SeedOutcome.NOT_BUNDLED
         val bundled = loadProps(manifest) ?: return SeedOutcome.NOT_BUNDLED
-        val target = dataDir.resolve(seedFile)
-        val installedManifest = dataDir.resolve(installedManifestFile)
+        val target = dataDir.resolve(spec.seedFile)
+        val installedManifest = dataDir.resolve(spec.installedManifestFile)
         if (Files.exists(target)) {
             val installed = loadProps(installedManifest)
                 ?: return SeedOutcome.KEPT_EXISTING // an index this flavour did not install: leave it alone
@@ -184,8 +207,8 @@ open class PocFlavour(
             // The shipped Bee behaviour, which these tests pin, is to re-seed, and
             // changing it is the owner's call rather than this PR's.
             log.info(
-                "{}: the bundled seed (to block {}) is newer than the installed one (to block {}) — re-seeding",
-                logTag, bundledHigh, installedHigh,
+                "{}: the bundled {} seed (to block {}) is newer than the installed one (to block {}) — re-seeding",
+                logTag, spec.network, bundledHigh, installedHigh,
             )
         }
         val expected = bundled.getProperty("sha256")?.lowercase()
@@ -203,7 +226,7 @@ open class PocFlavour(
             atomicCopy(manifest, installedManifest)
             log.info(
                 "{}: installed the bundled {} log-index seed into {} (coverage {}–{}, usable until block {})",
-                logTag, network, target,
+                logTag, spec.network, target,
                 bundled.getProperty("coveredLow"), bundled.getProperty("coveredHigh"),
                 bundled.getProperty("usableUntilBlock"),
             )
@@ -213,7 +236,7 @@ open class PocFlavour(
             // whatever `target` holds now is intact — the previous index in the re-seed
             // path, nothing in the fresh path. Never delete it; only sweep the tmp
             // siblings a failed copy or move can leave behind.
-            log.warn("{}: seed install into {} failed, previous state kept: {}", logTag, dataDir, it.toString())
+            log.warn("{}: {} seed install into {} failed, previous state kept: {}", logTag, spec.network, dataDir, it.toString())
             for (f in listOf(target, installedManifest)) {
                 runCatching { Files.deleteIfExists(f.resolveSibling("${f.fileName}.tmp")) }
             }
@@ -221,38 +244,59 @@ open class PocFlavour(
     }
 
     /**
-     * On a genuinely first start ([firstStart] = no settings file existed yet) make the PoC
-     * boot straight into its purpose: this flavour's network only, log index on, the seed's
-     * watch entry visible in the Index tab. Later starts leave the user's settings alone —
-     * in particular, this must never persist `logIndex.<network>=false`, which would push a
-     * disable to the engine and turn the seeded index off (queries → -32000).
+     * Make the PoC boot straight into its purpose: each seeded network enabled with its log
+     * index on, the seed's watch entry visible in the Index tab, and its port pinned.
+     *
+     * Each seeded network is configured ONCE, by the first start that finds it unconfigured.
+     * On the flavour's genuinely first start ([firstStart] = no settings file existed yet)
+     * that is every seeded network, and the networks a regular install may start by default
+     * are switched off. On a later start it is only a network whose seed this build bundles
+     * and the install has never configured — an install that predates that network's seed —
+     * so updating the app brings the new network up exactly as a fresh install would.
+     * Nothing else a later start touches: in particular, it must never persist
+     * `logIndex.<network>=false`, which would push a disable to the engine and turn the
+     * seeded index off (queries → -32000), and a network the user turned off after it was
+     * configured stays off.
+     *
+     * What has been configured is recorded in the settings file
+     * ([DesktopSettings.pocConfiguredNetworks]), so deleting that file starts over. An install
+     * from before the record existed had configured exactly its [primaryNetwork], at its
+     * first start.
      */
-    fun applyFirstStartSettings(settings: Settings, firstStart: Boolean) {
-        if (!firstStart) return
-        for (other in OTHER_NETWORKS) if (other != network) settings.setNetworkEnabled(other, false)
-        settings.setNetworkEnabled(network, true)
-        rpcPort?.let { settings.setRpcPort(network, it) }
-        settings.setLogIndexEnabled(network, true)
-        settings.setLogIndexWatchJson(network, watchJson)
-        // Explicit, so the Index tab's switch shows the state the flavour runs in
-        // rather than an unset default (see backfillPausedDefault for why).
-        settings.setLogIndexBackfillPaused(network, pauseBackfillByDefault)
+    fun applyFirstStartSettings(settings: DesktopSettings, firstStart: Boolean) {
+        val done = if (firstStart) emptySet() else settings.pocConfiguredNetworks() ?: setOf(primaryNetwork)
+        val todo = seeds.filter { it.network !in done }
+        if (todo.isEmpty()) return
+        if (firstStart) {
+            for (other in OTHER_NETWORKS) if (seedFor(other) == null) settings.setNetworkEnabled(other, false)
+        }
+        for (seed in todo) {
+            settings.setNetworkEnabled(seed.network, true)
+            seed.rpcPort?.let { settings.setRpcPort(seed.network, it) }
+            settings.setLogIndexEnabled(seed.network, true)
+            settings.setLogIndexWatchJson(seed.network, seed.watchJson)
+            // Explicit, so the Index tab's switch shows the state the flavour runs in
+            // rather than an unset default (see backfillPausedDefault for why).
+            settings.setLogIndexBackfillPaused(seed.network, pauseBackfillByDefault)
+        }
+        settings.setPocConfiguredNetworks(done + todo.map { it.network })
     }
 
     /**
      * One line for the Index tab about [net]'s seed: what the installed manifest says it
      * covered (the live coverage shown next to it grows from there), or why the bundled
-     * seed did not get installed on this launch. Null for other networks and for a regular
-     * install. Cheap to call once; callers cache it — nothing here changes after start.
+     * seed did not get installed on this launch. Null for networks this flavour does not
+     * seed and for a regular install. Cheap to call once; callers cache it — nothing here
+     * changes after start.
      */
     fun seededIndexNotice(dataDir: Path, net: String): String? {
-        if (net != network) return null
-        val props = loadProps(dataDir.resolve(installedManifestFile))
+        val seed = seedFor(net) ?: return null
+        val props = loadProps(dataDir.resolve(seed.installedManifestFile))
         if (props == null) {
-            return when (lastOutcome) {
+            return when (val outcome = lastOutcomes[net]) {
                 SeedOutcome.BAD_CHECKSUM, SeedOutcome.FAILED, SeedOutcome.NOT_BUNDLED ->
                     "$label: the bundled seed was NOT installed " +
-                        "(${lastOutcome!!.name.lowercase().replace('_', ' ')}; see the log) — " +
+                        "(${outcome.name.lowercase().replace('_', ' ')}; see the log) — " +
                         "this index will backfill from peers instead, which takes days."
                 else -> null
             }
@@ -261,7 +305,7 @@ open class PocFlavour(
         val high = props.getProperty("coveredHigh") ?: return null
         val until = props.getProperty("usableUntilBlock") ?: return null
         val logs = props.getProperty("logs") ?: "?"
-        return "$label seed: $logs $seedSubject, blocks $low–$high, from $seedSource — " +
+        return "$label seed: $logs ${seed.seedSubject}, blocks $low–$high, from ${seed.seedSource} — " +
             "unverified until the walker re-fetches them (the live coverage below grows from there); " +
             "usable until about block $until, after which a rebuilt app re-seeds."
     }
@@ -297,9 +341,9 @@ open class PocFlavour(
 
     private companion object {
         /**
-         * The networks a first start explicitly switches OFF, so a flavour boots into its
-         * one network rather than whatever the defaults enable. Only networks a regular
-         * install may start by default need to be here.
+         * The networks a first start explicitly switches OFF unless the flavour seeds them,
+         * so a flavour boots into its own networks rather than whatever the defaults enable.
+         * Only networks a regular install may start by default need to be here.
          */
         val OTHER_NETWORKS = listOf("mainnet", "gnosis")
 
