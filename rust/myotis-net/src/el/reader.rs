@@ -933,30 +933,56 @@ impl<T> RaceOutcome<T> {
     }
 }
 
-/// How long one peer write of a transaction broadcast may take: the
-/// rebroadcast's bound, and since #320 the first broadcast's too, whose writes
-/// run detached. A write still blocked then is cut — tearing a connection that
-/// is wedged anyway — so no detached write can hold a writer, and with it a
-/// pause or stop, for the whole frame-write timeout.
+/// How long a peer write of a transaction broadcast may hold its connection's
+/// writer once it no longer matters: every rebroadcast write gets this long,
+/// and since #320 the first broadcast's writes get this long after the first
+/// of them landed ([`first_accepted`]'s `grace`). A write still blocked then
+/// is cut — tearing a connection that is wedged anyway — so no detached write
+/// holds a writer, and with it `close()` and so a pause or stop, for the whole
+/// frame-write timeout.
 const BROADCAST_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Run every `attempt` to completion as a DETACHED task, and answer as soon as
-/// one succeeds — or `false` once all have failed. For writes whose success
-/// needs a single taker (a transaction broadcast): the caller is not held for
-/// the slowest connection, and the attempts still in flight when it is
-/// answered are left to finish rather than cancelled — cutting a write
-/// mid-frame tears that connection (`ManagedPeer::fail_all`). Nothing waits
-/// for them afterwards, so each attempt must bound itself (the broadcast
-/// bounds every write by [`BROADCAST_WRITE_DEADLINE`]).
-pub(crate) async fn first_accepted<Fut>(attempts: impl IntoIterator<Item = Fut>) -> bool
+/// Run every `attempt` as a DETACHED task, and answer as soon as one succeeds
+/// — or `false` once all have failed. For writes whose success needs a single
+/// taker (a transaction broadcast): the caller is not held for the slowest
+/// connection.
+///
+/// The attempts still in flight when it is answered are not cancelled with
+/// the answer — cutting a write mid-frame tears its connection
+/// (`ManagedPeer::fail_all`) — but get `grace` more and are then cut: a write
+/// still blocked by then is on a wedged connection, and holding its writer
+/// would hold `close()` too. Before the first success nothing is cut here: on
+/// a slow uplink a write may need longer, and each attempt's own bound (a
+/// peer write's frame-write timeout) still applies. `shutdown` turning true
+/// cuts every attempt at once (a dropped sender counts as one).
+pub(crate) async fn first_accepted<Fut>(
+    attempts: impl IntoIterator<Item = Fut>,
+    grace: std::time::Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> bool
 where
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
+    let landed = std::sync::Arc::new(tokio::sync::watch::channel(false).0);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     for attempt in attempts {
         let tx = tx.clone();
+        let landed = std::sync::Arc::clone(&landed);
+        let mut others = landed.subscribe();
+        let mut shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = tx.send(attempt.await.is_ok());
+            let ok = tokio::select! {
+                result = attempt => result.is_ok(),
+                _ = async {
+                    let _ = others.wait_for(|landed| *landed).await;
+                    tokio::time::sleep(grace).await;
+                } => false,
+                _ = shutdown.wait_for(|stop| *stop) => false,
+            };
+            if ok {
+                landed.send_replace(true);
+            }
+            let _ = tx.send(ok);
         });
     }
     drop(tx); // the channel closes once every attempt has reported
@@ -6605,21 +6631,18 @@ impl ElReader {
         // Broadcast to every peer, but answer the wallet at the FIRST write that
         // lands (#320): the success criterion is "≥1 peer received it", and
         // waiting for all of them let one wedged connection's writer hold the
-        // send step for its whole frame-write timeout. The other writes finish
-        // on their own (`first_accepted`), never cut mid-frame.
+        // send step for its whole frame-write timeout. The other writes run on
+        // detached, for [`BROADCAST_WRITE_DEADLINE`] more at most, and a pause
+        // or stop cuts them (`first_accepted`).
         let raw = std::sync::Arc::<[u8]>::from(raw_tx);
-        let accepted = first_accepted(peers.iter().cloned().map(|peer| {
-            let raw = std::sync::Arc::clone(&raw);
-            // Bounded like the rebroadcast's writes: a detached write blocked
-            // on a wedged connection would otherwise hold that connection's
-            // writer — and `close()` waiting on it, so a pause or stop —
-            // for the whole frame-write timeout.
-            async move {
-                tokio::time::timeout(BROADCAST_WRITE_DEADLINE, peer.send_transaction(&raw))
-                    .await
-                    .unwrap_or_else(|_| Err("transaction write timed out".to_string()))
-            }
-        }))
+        let accepted = first_accepted(
+            peers.iter().cloned().map(|peer| {
+                let raw = std::sync::Arc::clone(&raw);
+                async move { peer.send_transaction(&raw).await }
+            }),
+            BROADCAST_WRITE_DEADLINE,
+            self.request_shutdown.subscribe(),
+        )
         .await;
         if !accepted {
             return Err("no peer accepted the transaction broadcast".to_string());
@@ -12407,44 +12430,129 @@ mod first_accepted_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::watch;
+
+    const GRACE: Duration = Duration::from_secs(5);
 
     /// A scripted write: lands (or fails) after `after`, noting that it ran to
-    /// completion in `finished`.
+    /// completion — it was not cut — in `finished`.
     async fn write(after: Duration, ok: bool, finished: Arc<AtomicBool>) -> Result<(), String> {
         tokio::time::sleep(after).await;
         finished.store(true, Ordering::SeqCst);
         if ok { Ok(()) } else { Err("write failed".to_string()) }
     }
 
+    fn flags<const N: usize>() -> [Arc<AtomicBool>; N] {
+        std::array::from_fn(|_| Arc::new(AtomicBool::new(false)))
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn answers_at_the_first_accepted_write_and_lets_the_rest_finish() {
+    async fn answers_at_the_first_accepted_write_then_gives_the_rest_a_grace() {
         // #320: a wedged writer held the send step for its whole frame-write
-        // timeout. It must not hold the answer, and must not be cut mid-frame
-        // either (that tears its connection): it runs on to completion.
-        let wedged = Arc::new(AtomicBool::new(false));
-        let quick = Arc::new(AtomicBool::new(false));
+        // timeout. It must not hold the answer; the writes still in flight are
+        // not cut with the answer (that tears a connection that may be fine)
+        // but get GRACE more — measured from the first acceptance at 20 ms.
+        let [quick, inside, outside, wedged] = flags();
+        let (_stop, shutdown) = watch::channel(false);
         let started = tokio::time::Instant::now();
-        let ok = first_accepted(vec![
-            write(Duration::from_secs(30), true, Arc::clone(&wedged)),
-            write(Duration::from_millis(20), true, Arc::clone(&quick)),
-        ])
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_millis(20), true, Arc::clone(&quick)),
+                write(Duration::from_millis(5_010), true, Arc::clone(&inside)),
+                write(Duration::from_millis(5_030), true, Arc::clone(&outside)),
+                write(Duration::from_secs(30), true, Arc::clone(&wedged)),
+            ],
+            GRACE,
+            shutdown,
+        )
         .await;
         assert!(ok);
         assert_eq!(started.elapsed(), Duration::from_millis(20));
         assert!(quick.load(Ordering::SeqCst));
-        assert!(!wedged.load(Ordering::SeqCst));
         tokio::time::sleep(Duration::from_secs(31)).await;
-        assert!(wedged.load(Ordering::SeqCst), "the slow write ran on, it was not cancelled");
+        assert!(inside.load(Ordering::SeqCst), "a write landing inside the grace runs on");
+        assert!(!outside.load(Ordering::SeqCst), "the grace ends 5 s after the first acceptance");
+        assert!(!wedged.load(Ordering::SeqCst), "a wedged write is cut, not left holding its writer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_cut_before_a_write_lands() {
+        // A slow uplink: the only write that can land needs 20 s. A failure
+        // elsewhere starts no grace, and nothing here bounds it before then.
+        let [failed, slow] = flags();
+        let (_stop, shutdown) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_millis(5), false, Arc::clone(&failed)),
+                write(Duration::from_secs(20), true, Arc::clone(&slow)),
+            ],
+            GRACE,
+            shutdown,
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_cuts_every_write() {
+        // Before any write landed: the answer is false at once.
+        let [a, b] = flags();
+        let (stop, shutdown) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stop.send_replace(true);
+            stop
+        });
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_secs(10), true, Arc::clone(&a)),
+                write(Duration::from_secs(30), true, Arc::clone(&b)),
+            ],
+            GRACE,
+            shutdown,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        let _stop = stopper.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(!a.load(Ordering::SeqCst) && !b.load(Ordering::SeqCst));
+
+        // After the answer: the writes running on in their grace are cut too,
+        // so a stop never waits on one.
+        let [quick, running] = flags();
+        let (stop, shutdown) = watch::channel(false);
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_millis(20), true, Arc::clone(&quick)),
+                write(Duration::from_secs(4), true, Arc::clone(&running)),
+            ],
+            GRACE,
+            shutdown,
+        )
+        .await;
+        assert!(ok);
+        stop.send_replace(true);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!running.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_write_does_not_answer_but_a_later_success_does() {
-        let done = Arc::new(AtomicBool::new(false));
+        let [failed, landed] = flags();
+        let (_stop, shutdown) = watch::channel(false);
         let started = tokio::time::Instant::now();
-        let ok = first_accepted(vec![
-            write(Duration::from_millis(5), false, Arc::clone(&done)),
-            write(Duration::from_millis(50), true, Arc::clone(&done)),
-        ])
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_millis(5), false, failed),
+                write(Duration::from_millis(50), true, landed),
+            ],
+            GRACE,
+            shutdown,
+        )
         .await;
         assert!(ok);
         assert_eq!(started.elapsed(), Duration::from_millis(50));
@@ -12452,15 +12560,20 @@ mod first_accepted_tests {
 
     #[tokio::test(start_paused = true)]
     async fn nobody_accepting_is_false_once_every_write_has_reported() {
-        let done = Arc::new(AtomicBool::new(false));
+        let [a, b] = flags();
+        let (_stop, shutdown) = watch::channel(false);
         let started = tokio::time::Instant::now();
-        let ok = first_accepted(vec![
-            write(Duration::from_millis(5), false, Arc::clone(&done)),
-            write(Duration::from_secs(2), false, Arc::clone(&done)),
-        ])
+        let ok = first_accepted(
+            vec![
+                write(Duration::from_millis(5), false, a),
+                write(Duration::from_secs(2), false, b),
+            ],
+            GRACE,
+            shutdown.clone(),
+        )
         .await;
         assert!(!ok);
         assert_eq!(started.elapsed(), Duration::from_secs(2));
-        assert!(!first_accepted(Vec::<std::future::Ready<Result<(), String>>>::new()).await);
+        assert!(!first_accepted(Vec::<std::future::Ready<Result<(), String>>>::new(), GRACE, shutdown).await);
     }
 }
