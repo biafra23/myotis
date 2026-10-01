@@ -15,9 +15,7 @@ A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API ove
 
 > **Status:** End-to-end verified `send` works on a real device — MetaMask renders the confirm screen from verified balances, fees, and a local gas estimate, then broadcasts the signed transaction over devp2p, with no proxy and no permissioned service. The remaining gaps are listed in [Implementation Status](docs/implementation-status.md).
 
-Built in Java 21 on the [tuweni](https://github.com/apache/incubator-tuweni) libraries (RLP, SECP256K1, byte utilities; via a Kotlin-rewrite fork), with in-house SSZ and Merkle-Patricia verification, a pure-Java BLS verifier, and an embedded Hyperledger Besu EVM. JVM 17 bytecode where the Android consumer needs it; long-term direction is Kotlin + Compose Multiplatform.
-
-There are now **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`): the original **Java engine** and a **Rust engine** (`rust/` Cargo workspace — discv4/discv5, RLPx, eth/66-69, snap/1, beacon light client, revm-based EVM, ENS + CCIP-Read, multichain). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust).
+There are **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`). The original **Java engine** is built on Java 21 with the [Tuweni](https://github.com/consensys/tuweni) libraries (RLP, SECP256K1, byte utilities), in-house SSZ and Merkle-Patricia verification, a BLS verifier (pure-Java Milagro, or native blst from `rust/myotis-bls` behind the `BlsBackends` seam), and an embedded Hyperledger Besu EVM; it ships JVM 17 bytecode where the Android consumer needs it. The **Rust engine** (`rust/` Cargo workspace) reimplements the whole stack natively — discv4/discv5, RLPx, eth/66-69, snap/1, the beacon light client on blst, a revm-based EVM, ENS + CCIP-Read, multichain — and is the primary engine: the default selection, and ahead of the Java engine on features (the `eth_getLogs` log index, Tor routing, EIP-7702/state overrides in the EVM, the `finalized` tag on state reads). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust). The shared UI is Kotlin + Compose Multiplatform (Android, desktop, iOS).
 
 ## Documentation
 
@@ -28,16 +26,22 @@ There are now **two interchangeable engines** behind the same zero-dependency AP
 - [Status Screen](docs/status-screen.md) — Field-by-field guide to the Status screen: the readiness strip, banners, sync bar, every status row, and the actions below them.
 - [Read Statistics](docs/read-stats.md) — The `read-stats` shadow cache: what a state-read cache (per-block, storage-root-keyed, or stale-serve) would have saved on a real session, measured without serving anything from it.
 - [Disk & Network Usage](docs/disk-and-network-usage.md) — Storage footprint of a fully synced client (peer caches, light-client snapshot — there is no on-disk block/header database) and bandwidth: initial sync, the daily cost of staying synced, and what sending a transaction costs.
-- [Re-Implementation Specification](docs/reimplementation/README.md) — A language-agnostic spec for rebuilding Myotis (everything except the Android-specific host) as a cross-platform engine in Go or Rust, consumable from Desktop, Android, and iOS apps.
+- [Re-Implementation Specification](docs/reimplementation/README.md) — The language-agnostic spec the Rust engine was built from: the trust model, wire protocols, verification ladder, engine API and the Rust-phase notes and plan (`06`, `07`).
+- [eth_getLogs: the log index](docs/eth-getlogs-design.md) — Design of the opt-in, verified log index behind `eth_getLogs` (Rust engine); companions: [verified bundles](docs/logindex-verified-bundle-design.md) (proposed) and [seeded histories](docs/seeded-log-histories.md) (the one bounded trust carve-out).
+- [Privacy & Tor](docs/privacy-and-tor.md) — What the node leaks to peers today and the (feature-gated, experimental) Tor routing of account reads on the Rust engine.
+- [Glamsterdam readiness](docs/glamsterdam-plan.md) — How the Gloas light client and the Amsterdam EVM are handled (implemented for Sepolia, awaiting the fork).
+- [Dedicated light-client server](docs/lc-server-design.md) — The design behind [`rust/roost`](rust/roost/README.md), the light-client server that keeps a free slot for wallets.
+- Integrations and proofs of concept: [Bee (Swarm) on Myotis](docs/bee-rpc-service.md) ([short version](docs/bee-node-from-source.md)), the [RAILGUN PoC build](docs/railgun-poc.md), [React Native](docs/react-native.md) (design), [inbound connections](docs/inbound-connections.md) (design), [multichain](docs/multichain-design.md).
+- Historical: [Optimisations & Limitations](OPTIMISATIONS_AND_LIMITATIONS.md) (the Java engine's Android tuning record), the [SOLID](SOLID_REVIEW.md) and [Clean Architecture](CLEAN_ARCHITECTURE_REVIEW.md) reviews of the original modules, and the review follow-ups in [docs/TODO.md](docs/TODO.md).
 
 ## Wallet API — verified JSON-RPC over HTTP
 
-The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1:8545`** for mainnet; per-network ports beside it) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
+The Android and desktop apps and the desktop daemon run an embedded JSON-RPC server (**loopback-only `127.0.0.1`** — mainnet on **8545**, Gnosis on 8546, Sepolia on 8547 by default; the apps let you change the port per network) that a same-device wallet talks to like any other Ethereum endpoint. (The iOS app carries the same listener for development, but iOS suspends backgrounded apps, so a separate wallet app cannot rely on it — on iOS a wallet embeds Myotis as a library instead.) Every method is answered **only** from cryptographically verified data; there is no trusted-RPC fallback in production (a dev-only upstream proxy exists purely to map what a wallet needs and is off in strict mode). When a request can't be served verified, the server returns a JSON-RPC error:
 
 - `-32601` — the method isn't served verified at all (the wallet can stop asking).
 - `-32000` — the method is implemented but can't be answered right now (not synced, no snap peer, the head isn't beacon-anchored yet, or an uncovered log-index range — retryable). One exception, kept for geth compatibility: an `eth_estimateGas` whose transaction does not fit the caller's own `gas` or funds answers `-32000` with geth's message verbatim (`gas required exceeds allowance (N)`, `insufficient funds for transfer`) — an answer about that transaction, which a retry only repeats.
 - `3` — `eth_call` / `eth_estimateGas` executed over verified state and the contract (or the transaction being estimated) REVERTED: the standard `execution reverted` error, with the raw revert payload in `error.data` and the decoded `Error(string)` reason in the message when present. This is a verified chain answer (not retryable) — wallets rely on it, e.g. MetaMask's ERC-165 token-standard probe expects a revert on plain ERC-20s, and a doomed transaction's estimate shows its actual revert reason instead of "node not synced".
-- `-32602` — the request's parameters are malformed, or valid but unsupported by this node, and no retry will change that: answering without them would return a well-formed result to a different question than you asked. Today this is `eth_call` / `eth_estimateGas` carrying a block override (`params[3]`), or a state override (`params[2]`) on an engine that cannot apply it (the Rust engine applies state overrides; the Java engine does not); a transaction object that is contradictory (a type-4 request without an `authorizationList`, a tip above its fee cap, `data` and `input` that differ), names another chain in `chainId`, or is a blob transaction; an `eth_estimateGas` `authorizationList` / `accessList` or contract creation on the Java engine; and an `eth_call` `authorizationList` (not yet applied to calls). Fall back to a request without the field, or use an upstream that applies it.
+- `-32602` — the request's parameters are malformed, or valid but unsupported by this node, and no retry will change that: answering without them would return a well-formed result to a different question than you asked. Today this is `eth_call` / `eth_estimateGas` carrying a block override (`params[3]`), or a state override (`params[2]`) on an engine that cannot apply it (the Rust engine applies state overrides; the Java engine does not); a transaction object that is contradictory (a type-4 request without an `authorizationList`, a tip above its fee cap, `data` and `input` that differ), names another chain in `chainId`, or is a blob transaction; an `eth_estimateGas` `authorizationList` / `accessList`, contract creation, or the `finalized` tag on the Java engine (it would answer from the head); contract creation in `eth_call` on the Java engine; an `eth_call` `authorizationList` (not yet applied to calls); an `eth_estimateGas` pinned to `earliest` or a block hash (either engine — the router refuses them), or to a number too far behind the head on the Rust engine, whose engine-side refusal reaches the wallet unfiltered (the Java engine answers the retryable `-32000` there — as do `eth_call` and the state reads on both engines, where the hosts' block-window pre-check runs before the engine and turns its permanent refusal into `-32000`: a known flattening, [docs/TODO.md](docs/TODO.md)); and a block past a fork the engine cannot execute — Amsterdam on Sepolia on the Java engine, whose Besu 26.4 cannot price it (the Rust engine's revm does). Fall back to a request without the field, or use an upstream that applies it.
 
 > **Security:** the server binds **loopback only** by default — the wallet is a same-device client, and the endpoint is unauthenticated with no TLS or rate limiting (and `eth_sendRawTransaction` relays whatever signed bytes it's handed), so it is deliberately not reachable from other devices. Exposing it on a routable interface would require an explicit, opt-in change.
 
@@ -55,14 +59,14 @@ actually been asked and answered.
 | `eth_blockNumber` | beacon optimistic-head execution block number |
 | `eth_syncing` | straight from the beacon light client: `false` once `SYNCED`, otherwise a syncing object with zero bounds (the verified surface has no block-download notion and serves no chain-state reads before `SYNCED`; config and utility methods answer regardless) |
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (absent accounts/slots proven via exclusion proof — a verified zero, not a guess) |
-| `eth_call` | local Besu EVM over proof-served state; multi-hop speculative prefetch batches the SLOAD round-trips |
+| `eth_call` | local EVM over proof-served state — revm on the Rust engine, Besu on the Java engine — with a multi-hop speculative prefetch loop batching the SLOAD round-trips on both, and hedged state fetches across peers on the Rust engine. Applied: `from`, `to`, `data`/`input`, `value`, the block selector, and on the Rust engine a state override (`params[2]`) and contract creation (an absent `to` runs the init code). Refused (`-32602`): `authorizationList`, blob fields, block overrides, and on the Java engine any state override or creation. **Not yet applied** — accepted without effect, the one remaining gap in the applied-or-refused rule and the follow-up of #509: `gas` (a fixed 30 M ceiling), the fee fields (`GASPRICE` reads 0) and `accessList`. A revert is error `3` with the payload |
 | `eth_estimateGas` | local EVM gas metering (intrinsic + EVM + 15% buffer, and at least the EIP-7623 calldata floor) over the whole transaction object: EIP-7702 `authorizationList` (applied as a mined transaction applies it — an invalid tuple is skipped), `accessList`, the `gas` cap, the fee fields (what `GASPRICE` reads, and geth's cap of what the sender can pay for), `nonce`, `type`, the block selector and a state override — the Rust engine applies all of them; the Java engine applies `gas`, fees and the block and refuses the rest (`-32602`). The answer never exceeds the caller's `gas`; a plain transfer to an EOA short-circuits to 21000; a reverting tx returns an error, never a number |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; priority-fee tips from block bodies verified against `transactionsRoot` (+ receipts vs `receiptsRoot` for the gas-weighted percentile reward walk) |
 | `eth_getBlockByNumber`, `eth_getBlockByHash` | verified header window anchored to the beacon head; tx hashes checked against `transactionsRoot` (no snap peer required); an unknown or non-canonical hash answers `null` |
 | `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex`, `eth_getUncleCountByBlockNumber`, `eth_getUncleCountByBlockHash`, `eth_getUncleByBlockNumberAndIndex`, `eth_getUncleByBlockHashAndIndex` | derived from the same verified block serve (count or element read out of the verified block); post-Merge blocks have no uncles, so the uncle reads answer `0` / `null` from a verified block, not a stub |
 | `eth_getTransactionReceipt`, `eth_getBlockReceipts` | scans the recent verified block window; receipts verified against `receiptsRoot` (handles eth/69 bloomless receipts by recomputing the bloom) |
 | `eth_getTransactionByHash` | mined txs from the verified block window; locally-broadcast txs served as *pending* from a sent-tx cache; sender recovered from the signature (legacy + EIP-2930/1559/4844/7702) |
-| `eth_getLogs` | served **only from the [log index](#log-index-verified-eth_getlogs)**: an opt-in, per-network index of the contracts you choose, every log verified against `receiptsRoot` over devp2p. A range the index has not covered is refused with `-32000` (the message says how far coverage reaches), never answered with a misleading `[]`. Historical coverage has to be built — a backfill to the contract's deployment block — and can be **bundled**: build once on an always-on daemon, `export-logindex` the portable chain-tagged `.db`, import it in the app. Rust engine only. |
+| `eth_getLogs` | served **only from the [log index](#log-index-verified-eth_getlogs)**: an opt-in, per-network index of the contracts you choose, every log verified against `receiptsRoot` over devp2p. A range the index has not covered is refused with `-32000` (the message says how far coverage reaches), never answered with a misleading `[]`. Historical coverage has to be built — a backfill to the contract's deployment block — and can be **bundled**: build once on an always-on daemon, `export-logindex` the portable chain-tagged `.db`, import it in the app. Rust engine only, and served by the JVM hosts (Android, desktop app, daemon) — the iOS app's RPC backend does not wire `eth_getLogs` yet, so it answers `-32000` there. |
 | `eth_sendRawTransaction` | gossips the user-signed bytes to devp2p peers and returns the hash (Myotis never signs — the wallet does) |
 | `eth_accounts` | the node holds no keys: exactly `[]`, a verified-grade constant |
 | `net_listening`, `net_peerCount` | `true` (the discovery listener is live whenever the node runs); the peer count comes from the node's own status snapshot, never a fabricated zero |
@@ -79,12 +83,13 @@ myotis-aware client can poll them before the node is synced or has peers:
 they were answered), and `myotis_pause` / `myotis_wakeup` (the host's background/foreground
 hooks).
 
-A number-pinned read (wallets pin every read to the block they just saw) is served from the verified head's state when the pinned block is at/near the head; a genuinely historical pin is rejected rather than answered with newer state.
+**Block selectors.** `latest`, `safe` and `pending` all resolve to the verified (optimistic) head — the light client has no justified anchor to apply, so `safe` and `pending` are documented as the head rather than silently mapped. `finalized` is **applied** on the Rust engine: `eth_call`, the block and receipt reads and `eth_feeHistory` run against the beacon-finalized block (ABI 30), and the state reads prove against the finalized state root (ABI 32; best effort, since execution clients keep only on the order of 128 recent states and finality trails the head by two epochs — a finality delay makes such a read the retryable `-32000` until finality catches up); the Java engine still resolves `finalized` to the head (#366). A number-pinned read (wallets pin every read to the block they just saw) is served from the head's state when the number is within a small window of it (on the Rust engine 64 blocks below to 16 above); a number further behind, `earliest`, or a block hash is refused rather than answered with newer state. What the wallet sees: `eth_estimateGas` answers the permanent `-32602` for `earliest` and a hash on either engine, and for a behind number on the Rust engine; everything else — `eth_call` and the state reads on both engines, a behind-number estimate on the Java engine — answers the retryable `-32000`, because the hosts' shared block-window pre-check runs before the engine and flattens its permanent refusal (a known gap, [docs/TODO.md](docs/TODO.md); only the Node addon, which has no host adapter in front, surfaces the Rust engine's `-32602` for `eth_call`). A number ahead of the window is the retryable `-32000` everywhere. One known gap: an EIP-1898 block object (`{"blockHash": …}` / `{"blockNumber": …}`) on the state reads and `eth_call` is not applied — the router reads it as `latest`. Block reads (`eth_getBlockByNumber`, the receipt scans) look back up to 512 blocks below the head. Details: [Readiness & Verified Head Age → Block tags](docs/readiness-and-verified-head-age.md#block-tags).
 
 ## Requirements
 
 - Java 21+
 - Gradle (wrapper included)
+- For the Rust engine: rustc/cargo stable (at least the workspace `rust-version` in `rust/Cargo.toml`) — optional for the JVM hosts, **required** for the Android app and the packaged desktop installers; see [Engines](#engines-java-and-rust) for the per-target toolchains.
 
 ## Build
 
@@ -129,14 +134,14 @@ On iOS the app form is a development host more than an integration point: iOS su
 
 ### Desktop app (GUI)
 
-`:app-desktop` is the Compose-Multiplatform desktop GUI — the same `:ui` NodeScreen the Android app hosts, driving the Java backend in-process. It shows sync status, peers, and the Logs tab, and serves the same verified JSON-RPC.
+`:app-desktop` is the Compose-Multiplatform desktop GUI — the same `:ui` NodeScreen the Android app hosts, running the engine in-process (the Rust engine by default, the Java engine as fallback or by choice). It shows the Status, Index, Query, Logs and Settings tabs, and serves the same verified JSON-RPC.
 
 ```bash
 # Run from source (dev loop) — starts the GUI, compiling the Rust engine first
 ./gradlew :app-desktop:run
 
-# Pick the engine: java (default) | rust | auto
-./gradlew :app-desktop:run -Pengine=rust
+# Pick the engine explicitly: auto (default) | rust | java
+./gradlew :app-desktop:run -Pengine=java
 ```
 
 Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS and the `.deb` only on Linux (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml`); locally you get the format for your OS. Only macOS and Linux formats are configured today — Windows packaging (`.msi`) isn't enabled yet, so these tasks fail on a Windows host.
@@ -229,12 +234,21 @@ Each network is fully isolated: the Gnosis daemon uses its own IPC socket
 ./gradlew :app:run -Pnetwork=gnosis -Pargs=stop
 ```
 
-To run Gnosis **alongside** mainnet on the same host, give it a separate port
-(mainnet keeps 30303) — the daemons are otherwise independent processes:
+To run Gnosis **alongside** mainnet, host both in **one** daemon process — each
+network gets its own ports, lock file and IPC socket, and client commands still
+pick the network with `-Pnetwork`:
 
 ```bash
-./gradlew :app:run -Pnetwork=gnosis -Pport=30304
+./gradlew :app:run -Pnetwork=mainnet,gnosis
 ```
+
+Two separate daemons also work, as long as the second one gets a different EL
+port (mainnet keeps 30303): `./gradlew :app:run -Pnetwork=gnosis -Pport=30304`.
+One caveat for that form: a single-network daemon binds discv5 to UDP 9000
+whatever the network, so a second **Java-engine** daemon beside mainnet fails
+that bind and carries on without CL discovery (pinned CL peers and the cache
+only); the default `auto`/Rust engine picks its own discv5 port and is
+unaffected. The one-process form avoids the collision entirely.
 
 > Note: verified-state queries (`get-account`/`get-storage`) require an active
 > EL peer that serves `snap/1`. Public Gnosis nodes are fewer and busier than
@@ -260,16 +274,22 @@ All commands are sent to the running daemon via IPC. Responses are JSON.
 
 Most commands depend on different parts of the stack being up. After
 starting the daemon, wait for the sub-system you need before issuing
-queries:
+queries. The table is also the command reference — the daemon hosts either
+engine, and a few commands exist on one engine only:
 
-| Command | Requires |
-|---------|----------|
-| `status`, `peers`, `dial` | daemon running |
-| `beacon-status` | daemon running (state progresses `SYNCING` → `CATCHING_UP` → `SYNCED`) |
-| `get-headers`, `get-block`, `get-transactions` | at least one peer in `READY` state (check with `peers`) |
-| `get-account`, `get-storage` | at least one peer with `snap=true` in `READY` state |
-| `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | `beacon-status` returns `"state":"SYNCED"` |
-| `resolve-ens` | at least one peer with `snap=true` in `READY` state |
+| Command | Engine | Requires |
+|---------|--------|----------|
+| `status`, `beacon-status`, `pause`, `resume`, `accept-stale-anchor`, `read-stats`, `stop` | both | daemon running (`beacon-status` progresses `SYNCING` → `CATCHING_UP` → `SYNCED`) |
+| `peers` | both — the Rust engine returns empty peer lists; use the counts in `status` | daemon running |
+| `dial <enode>` | Java | daemon running |
+| `get-headers`, `get-block` | Java | at least one peer in `READY` state (check with `peers`) |
+| `get-account`, `get-storage` | both | at least one snap-serving peer (`snapServingPeers > 0` in `status`) |
+| `get-account`, `get-storage`, `get-block` (full beacon verification — `verifyMethod` populated, `beaconChainVerified=true`) | — | `beacon-status` returns `"state":"SYNCED"` |
+| `resolve-ens`, `reverse-ens`, `resolve-ens-*` | both (mainnet and Sepolia — Gnosis has no ENS) | at least one snap-serving peer |
+| `build-logindex`, `logindex-backfill on\|off`, `import-logindex <file…>`, `export-logindex <file>` | Rust (the Java engine answers an error) | daemon running (see [Log index](#log-index-verified-eth_getlogs)) |
+| `logindex-status` | both — on the Java engine a stable `{"enabled":false,"logCount":0,"entries":[]}` | daemon running |
+| `get-transactions <address>` | Java, mainnet only (debug) | at least one peer in `READY` state |
+| `purge-cache` | — | runs in the client with the daemon **stopped**: deletes the first network's peer caches and sync snapshot |
 
 Account and storage queries return data with a Merkle proof against
 the peer's `stateRoot` even before the beacon light client reaches
@@ -319,7 +339,7 @@ Returns daemon operational metrics.
 ./gradlew :app:run -Pargs=peers
 ```
 
-Returns discovered peers (from the Kademlia table) and connected peers with their state, snap support, and client ID.
+Returns discovered peers (from the Kademlia table) and connected peers with their state, snap support, and client ID. Java engine only — on the Rust engine the lists come back empty and the peer counts (`snapPeers`, `snapServingPeers`, …) in `status` are the surface.
 
 ### Beacon status
 
@@ -563,9 +583,9 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 **How it works:**
 
 1. By default (AUTO) the daemon resolves against the light client's **beacon-verified finalized** execution state root first — no peer-head probe. Only if that yields no address (the record didn't exist at the finalized block) or can't be served does it fall back to a peer's head. (See *Resolution root* below.) A snap-capable peer serves the state; the proofs descend from the chosen `stateRoot`.
-2. A local EVM (Hyperledger Besu's standalone EVM module) executes a single `resolve(bytes name, bytes data)` call to the ENS Universal Resolver. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against that `stateRoot`.
-3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
-4. The Universal Resolver's return value is decoded as the resolved address.
+2. The local EVM (revm on the Rust engine, Hyperledger Besu's standalone EVM module on the Java engine) discovers the name's resolver through the ENS Registry — an ENSIP-10 walk: the exact node, then each parent — and calls it **directly**: `resolve(bytes name, bytes data)` on an ENSIP-10 (wildcard / off-chain) resolver, or the record method itself on a legacy resolver. No Universal Resolver and no shared CCIP batch gateway sit in the path. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against that `stateRoot`.
+3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS from the resolver's **own** gateway (Coinbase's for `cb.id`, for example — no third-party relay) and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
+4. The resolver's return value is decoded as the resolved address.
 
 **Resolution root (trust vs freshness):**
 
@@ -575,6 +595,8 @@ The state ENS executes against is configurable via `io.myotis.ens.EnsResolutionR
 - **`FINALIZED`** — finalized state only; no fallback. Always `beaconVerified=true`, but brand-new names return "does not resolve."
 - **`PEER_HEAD`** — resolve against a snap peer's latest head state. Freshest possible data, but the head root is the peer's *claim*, not beacon-attested, so the mapping is peer-claimed (`beaconVerified=false`). Choose this when you need the very latest ENS state and accept the weaker trust. (On Android, set via `NodeService.setEnsResolutionRoot(...)`.)
 
+On the **Rust engine** the same choice is the `root` parameter of `ens_record_json` — the call the JVM hosts issue every ENS query through: `auto` (default), `finalized`, or `optimistic` — the beacon-anchored optimistic head, which stands in for `PEER_HEAD`. The bare forward lookup `resolve_ens_json` (Node addon `resolveEnsJson`) takes no root and resolves against the optimistic head in one attempt — no finalized-first preference; a host that wants `auto` or `finalized` goes through `ens_record_json`. The Rust engine has no peer-claimed mode: every ENS answer it gives is anchored to a beacon-attested root, finalized or optimistic.
+
 **Trust model:**
 
 - **State**: every read backed by a Merkle proof against the `stateRoot` — beacon-verified in `FINALIZED` mode.
@@ -583,7 +605,7 @@ The state ENS executes against is configurable via `io.myotis.ens.EnsResolutionR
 
 The same trust model and resolution root apply to every other `resolve-ens-*` command.
 
-**Networks:** mainnet, sepolia, and holesky have canonical Registry + Universal Resolver addresses pinned. Other networks fail with `ENS not pinned for chain id …`.
+**Networks:** mainnet and Sepolia have the canonical ENS contract addresses pinned. Gnosis has no ENS, and the `resolve-ens*` commands answer `ENS is not available` there. (Holesky's addresses are still in `EnsResolver`, dead code since the network was retired in October 2025.)
 
 **Validated names** (mainnet):
 
@@ -700,7 +722,7 @@ Reads `interfaceImplementer(node, interfaceId)` (EIP-1820 over ENS) — the addr
 ./gradlew :app:run -Pargs="get-transactions 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```
 
-Returns all transactions for an address (mainnet only) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop and Android apps' Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button. (On Android the bloom/index cache lives under `filesDir/trueblocks` and can grow to multi-GB after a deep scan.)
+Returns all transactions for an address (mainnet only, **Java engine only** — the scan wraps the Java engine's raw connector and is a debug feature, not a verified read) by looking them up in the [TrueBlocks Unchained Index](https://trueblocks.io/). Results are streamed as JSON-Lines, newest first, followed by a summary object. The same scan powers the **desktop and Android apps' Query tab** ("Find transactions" under an address lookup): hits appear as block-number placeholders and upgrade in place to parsed rows, with a progress bar and a Stop button. (On Android the bloom/index cache lives under `filesDir/trueblocks` and can grow to multi-GB after a deep scan.)
 
 **How it works:**
 
@@ -770,13 +792,17 @@ Prints beacon light client sync status:
 ./beacon-status.sh
 ```
 
+### `status-gnosis.sh` / `beacon-status-gnosis.sh`
+
+The same two commands sent to the Gnosis daemon (`-Pnetwork=gnosis`).
+
 ## Beacon chain light client
 
 The daemon includes a consensus-layer light client that tracks finalized state roots from the beacon chain. This enables trustless verification of account and storage proofs against the canonical chain state.
 
 ### Trust model
 
-The only trust anchors are **sync committee BLS signatures** and the embedded historical hash accumulators. All data from devp2p and libp2p peers is cryptographically verified -- no trusted third-party RPCs or HTTP APIs are used in production.
+The only trust anchors are **sync committee BLS signatures** (chained from the embedded checkpoint) and, by design, the embedded historical hash accumulators — the accumulators are not built yet (see [Implementation Status §2](docs/implementation-status.md)), so today every verified answer rests on the sync-committee chain alone. All data from devp2p and libp2p peers is cryptographically verified -- no trusted third-party RPCs or HTTP APIs are used in production (one bounded, documented exception: a seeded log history served on its publisher's word, [docs/seeded-log-histories.md](docs/seeded-log-histories.md)).
 
 The bootstrap trust anchor is a 32-byte mainnet block root hardcoded in `NetworkConfig.MAINNET.checkpointRoot`. Every `LightClientBootstrap` response is rejected unless `hash_tree_root(response.header)` equals this committed value, so the pin is cryptographic: no peer (libp2p or HTTP checkpoint endpoint) can substitute a different anchor, even an internally-consistent one, without finding a SHA-256 preimage.
 
@@ -949,10 +975,10 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
   - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — intrinsic + EVM-metered + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
-- **myotis-ens** -- ENS resolver (`EnsResolver`, `ReverseLookup`) using the Universal Resolver via the local EVM. Forward and reverse resolution, ENSIP-10 wildcards, ERC-3668 off-chain records.
+- **myotis-ens** -- the Java engine's ENS resolver (`EnsResolver`, `ReverseLookup`): discovers each name's resolver through the Registry (ENSIP-10 walk) and calls it directly in the local EVM. Forward and reverse resolution, every record type, ENSIP-10 wildcards, ERC-3668 off-chain records. (The Rust engine has its own equivalent in `rust/myotis-net/src/el`.)
 - **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin Multiplatform/Ktor). `RpcRouter` maps the Ethereum API onto this module's `RpcBackend` seam — implemented on the JVM by `VerifiedReadsBackend` over the `io.myotis.api.VerifiedReads` contract, and on iOS by `:app-ios`'s `IosRpcBackend`. Strict permissionless mode by default; binds loopback only. (Consumed by the Android, iOS, and desktop apps and the daemon — which additionally has its CLI/IPC command surface.)
 - **rpc-backend** -- the verified RPC backend (`VerifiedRpcBackend`): anchored-head building, serve-stale policy, and the readiness probe (`verifiedHeadAgeMs`) shared by the JSON-RPC server and the hosts
-- **ui** -- shared Compose Multiplatform `NodeScreen` (status, readiness strip, peers, logs, settings) used by the Android, desktop, and iOS apps
+- **ui** -- shared Compose Multiplatform `NodeScreen` (the readiness strip and the Status, Query, Logs, Index and Settings tabs) used by the Android, desktop, and iOS apps
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **app-desktop** -- the Compose desktop GUI over `:ui`, packaged with jpackage (dmg/deb), bundling the Rust engine
 - **app-ios** -- the iOS host: a Kotlin/Native framework (`MyotisKit`) bundling `:ui` with iOS seam actuals over the Rust engine's plain C ABI; the Xcode shell lives in `ios-app/` (the JVM engine never runs on iOS)
@@ -972,13 +998,15 @@ DiscV4Service (UDP)
 
 ### Peer seeding
 
-Both discv4 (EL) and libp2p (CL) get their initial peer lists from three sources, merged at startup:
+On the **Java engine**, both discv4 (EL) and libp2p (CL) get their initial peer lists from three sources, merged at startup:
 
 1. **Hardcoded fallback** in `NetworkConfig` — a handful of IPv4 bootnodes and CL multiaddrs that ship with the binary.
 2. **On-disk cache** (`PeerCache`, `CLPeerCache`) — peers that responded successfully on a prior run. The daemon writes `peers[-<network>].cache` / `cl-peers[-<network>].cache` (plus `sync-state[-<network>].snapshot`) into its working directory; the Android app keeps the same files in the app's cache dir (`getCacheDir()`).
 3. **EIP-1459 DNS-based ENR trees** — each network can list `enrtree://<base32-pubkey>@<domain>` URLs in `NetworkConfig.elEnrTreeUrls` / `clEnrTreeUrls`. At startup the daemon walks each tree over DNS TXT records, verifies the root record's secp256k1 signature against the embedded pubkey, and decodes the leaf ENRs. Results are merged into the EL bootnode list and the CL peer list. Mainnet currently pins the Ethereum Foundation canonical tree (`all.mainnet.ethdisco.net`); the resolver is implemented in `networking/dns/DnsEnrResolver`.
 
 DNS resolution is best-effort: on timeout, missing TXT records, or signature mismatch the daemon logs a warning and starts up with whatever the hardcoded + cached sources provide. Per-tree deadline defaults to 10 s.
+
+The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the same on-disk caches (byte-identical formats, so switching engines keeps them), plus discv4/discv5 and, for the EL, any `enode://` seed pins a host hands it (`myotis_set_boot_enodes`, ABI ≥ 31). It has **no EIP-1459 DNS walk**: on mainnet — which pins no enodes — a stale bootnode list therefore never seeds EL discovery on a fresh profile, which is why the release checklist re-syncs the bootnodes from go-ethereum (CLAUDE.md §Releases).
 
 ### Key dependencies
 

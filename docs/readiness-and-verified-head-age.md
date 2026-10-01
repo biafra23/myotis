@@ -13,9 +13,9 @@ engine differences called out where they exist.
 - **On the daemon**: `./gradlew :app:run -Pargs=beacon-status` returns
   `"state":"SYNCED"`, and a query such as `get-account` returns
   `"verifyMethod":"headerChain"` (or `"stateRootMatch"`) instead of a `failReason`.
-- **Over JSON-RPC** (Android's loopback `127.0.0.1:8545`): requests return data
-  instead of error `-32000` (method cannot be served verified right now —
-  retryable).
+- **Over JSON-RPC** (the loopback endpoint every host serves — `127.0.0.1:8545`
+  for mainnet): requests return data instead of error `-32000` (method cannot
+  be served verified right now — retryable).
 
 Being *synced* is necessary but not sufficient: a node can be beacon-SYNCED and
 still unable to serve reads (e.g. no snap-serving peers yet). Readiness is the

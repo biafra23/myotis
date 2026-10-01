@@ -17,12 +17,17 @@ figures are arithmetic on top of those constants plus a few **chain-level assump
 (marked below) — average mainnet transaction rate, block body size, etc. Treat the
 byte totals as sizing estimates, not measurements.
 
-**Scope: only what a synced, wallet-serving client actually uses today.** Two features
+**Scope: only what a synced, wallet-serving client actually uses today.** Three features
 are deliberately **not** counted in the budget below: the **historical accumulators**
-(pre-Merge historical hashes, Bellatrix historical roots — today only roadmap items),
-and the **TrueBlocks Unchained Index** transaction-history scan (the daemon's
-`get-transactions` stream and the desktop Query tab) — an opt-in, per-request debug
-feature, not part of steady-state operation. Its profile, for sizing: an on-demand
+(pre-Merge historical hashes, Bellatrix historical roots — today only roadmap items);
+the opt-in **log index** behind `eth_getLogs` (Rust engine only — the one place Myotis
+does persist chain data: every verified log of the contracts you chose, in
+`logindex[-<network>].db` under the data dir, plus the bandwidth of the backfill walk
+to each contract's deployment block, which is bounded by the peers' body/receipt
+serving rate and the "Max download speed" setting — see
+[eth-getlogs-design.md](eth-getlogs-design.md)); and the **TrueBlocks Unchained Index**
+transaction-history scan (the daemon's `get-transactions` stream and the desktop Query
+tab) — an opt-in, per-request debug feature, not part of steady-state operation. Its profile, for sizing: an on-demand
 content-addressed cache under `trueblocks/` (daemon: working-dir-relative; desktop:
 `<dataDir>/trueblocks/`; Android: `filesDir/trueblocks/` — mind that a deep scan can
 grow it to multi-GB on a phone; delete the directory to reclaim) holding the manifest
@@ -62,9 +67,9 @@ Chain-level assumptions used throughout (2025/26 ballparks):
 
 ## 1. Disk footprint
 
-Myotis is a light client in the strictest sense: **no chain data is persisted**. There
-is no header database, no block store, no state database — no LevelDB/RocksDB/SQLite
-anywhere in the tree. Headers live in a small in-memory window (§1.3); state is fetched
+Myotis is a light client in the strictest sense: **no chain data is persisted** (the
+opt-in log index excluded, see the scope note above). There is no header database, no
+block store, no state database — no LevelDB/RocksDB/SQLite anywhere in the tree. Headers live in a small in-memory window (§1.3); state is fetched
 as snap/1 proofs on demand and cached only in bounded in-memory LRUs
 (`myotis-evm/.../StateProofCache.java`, `rpc-backend/.../VerifiedResultCache.java`).
 
@@ -88,7 +93,7 @@ Where the files live:
 |---|---|---|
 | `sync-state<suffix>.snapshot` | Beacon light-client store: finalized + optimistic headers, current **and** next sync committee (2 × 512 BLS pubkeys ≈ 48 KB), period/slots. Binary "LCSS" v1 (`consensus/.../lightclient/LightClientStoreSnapshot.java`, Rust twin `rust/myotis-consensus/src/snapshot.rs`). Overwritten in place; bound to the chain by genesis-validators-root. | **~50 KB** (~26 KB when the next committee isn't held yet) |
 | `sync-state<suffix>.snapshot.roots` | Recent state-root window sidecar, ≤ 64 entries × 41 B — lets a resume skip re-accumulating roots. | ≤ ~2.6 KB |
-| `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), never evicted. | ~150 B/peer → tens–hundreds of KB after weeks |
+| `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), not evicted for that — the one eviction is 50 consecutive connect failures (both engines). | ~150 B/peer → tens–hundreds of KB after weeks |
 | `cl-peers<suffix>.cache` | CL peer cache: `multiaddr[⇥periodRange][⇥b<period>][⇥lc\|nolc]` (`app/.../CLPeerCache.java`, `rust/myotis-net/src/clcache.rs`). Self-pruning: 3 consecutive failures evict the peer. | ~100 B/peer → a few–tens of KB |
 | `nodekey<suffix>.hex` | secp256k1 node identity, `0x` + 64 hex chars. | 66 B |
 
@@ -101,7 +106,7 @@ Global (not per network):
 | `~/.myotis/logs/` (desktop only) | Rolling logs, size-capped (`logback-desktop.xml`) | bounded by the rolling policy |
 
 **Total per enabled network: well under 1 MB.** The only unbounded file is the EL peer
-cache (~150 B per distinct peer ever seen READY); `purge-cache` (IPC) or the apps'
+cache (~150 B per distinct peer ever seen READY); `purge-cache` (a client-side daemon command, run with the daemon stopped) or the apps'
 cache-purge action deletes the caches and the snapshot.
 
 ### 1.2 What is deliberately *not* on disk

@@ -43,7 +43,8 @@ disproportionately fixes the "everyone is full" failure mode.
 
 **The trust model is unaffected.** Peers are never trusted (CLAUDE.md: the
 only trust anchors are sync-committee signatures and the embedded
-accumulators). Inbound changes *peer acquisition*, not verification — every
+accumulators — the latter still designed, not built). Inbound changes *peer
+acquisition*, not verification — every
 header, account, and storage proof from an inbound peer is verified exactly
 like one from a dialed peer. An attacker connecting to us can waste our
 sockets, not poison our state; the exposure is availability/DoS and
