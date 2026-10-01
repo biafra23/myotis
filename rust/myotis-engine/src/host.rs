@@ -3063,6 +3063,28 @@ mod tests {
     /// The cross-language golden: the router's canonical object for the #509
     /// request, VERBATIM from `RpcTransactionArgsTest.CANONICAL` (jsonrpc-server)
     /// — what every JVM and iOS host hands this parser. Change both together.
+    /// This parser and the fixture's read the recorded RelayAdapt7702 shield
+    /// (`rust/testdata/evm/relayadapt7702-shield.json`, #509) and its variants
+    /// as the same transactions: what the replay runs is what a wallet's
+    /// request makes this engine run. `MYOTIS_SHIELD_FIXTURE` as for the replay.
+    #[test]
+    fn parse_tx_request_reads_the_recorded_shield_as_the_replay_does() {
+        let path = std::env::var("MYOTIS_SHIELD_FIXTURE").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/evm/relayadapt7702-shield.json").to_string()
+        });
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let fixture = myotis_evm::fixture::EvmFixture::from_json(&text).unwrap();
+        assert_eq!(parse_tx_request(&fixture.request.to_string()).unwrap(), fixture.tx_request().unwrap());
+        for variant in ["requireSuccessFalse", "retryFromDelegated"] {
+            let request = &fixture.meta["variants"][variant];
+            assert_eq!(
+                parse_tx_request(&request.to_string()).unwrap(),
+                myotis_evm::fixture::request_from_json(request).unwrap(),
+                "{variant}"
+            );
+        }
+    }
+
     #[test]
     fn parse_tx_request_reads_the_routers_canonical_form() {
         const CANONICAL: &str = concat!(

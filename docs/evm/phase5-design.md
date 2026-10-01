@@ -164,6 +164,19 @@ working limit in hand after 10 s of bisecting. `EstimateGasTest` (Java) and the
 `myotis-evm` executor tests (Rust) pin the nested-call, refund-heavy and
 `gasleft()` cases against the lowest limit a call actually runs with.
 
+The real case is pinned too: `rust/testdata/evm/relayadapt7702-shield.json`
+is the world a RAILGUN "shield ETH" through a fresh EIP-7702 account reads
+(#509's transaction, with throwaway keys), recorded from the Rust engine's
+verified mainnet state by `rust/myotis-net/examples/record_shield_fixture.rs`
+(how and why: `rust/testdata/evm/README.md`). Its replay shows the estimate
+completes the shield where the request without its authorization list
+answered #509's ~49k, and with a broadcaster's `requireSuccess = false`
+multicall it shows the swallowed-call case on real code: the lowest limit at
+which that transaction succeeds swallows the shield, and the estimate, kept
+above the draw, does not. The Java engine, which refuses authorization lists,
+replays the retry from the already-delegated account and must answer the
+Rust engine's number exactly.
+
 ### Public surface
 
 `EvmExecutor.estimateGas(UnsignedTransaction tx, BlockContext ctx)` —

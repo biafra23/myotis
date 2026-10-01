@@ -50,3 +50,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The block/header types (re-exported through myotis-net) are constructed directly
 # in the block_json golden test; myotis-core is otherwise transitive via myotis-net.
 myotis-core = { path = "../myotis-core" }
+# The recorded RelayAdapt7702 shield (rust/testdata/evm): its request must parse
+# here exactly as the replay reads it.
+myotis-evm = { path = "../myotis-evm", features = ["fixture"] }
