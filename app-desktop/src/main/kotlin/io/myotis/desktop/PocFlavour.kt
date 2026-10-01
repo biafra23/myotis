@@ -41,6 +41,10 @@ enum class SeedOutcome { INSTALLED, KEPT_EXISTING, NOT_BUNDLED, BAD_CHECKSUM, FA
  *   the same port, the second to start cannot bind it, and a client aimed at that port
  *   silently reaches whichever won — for a PoC, an install with no seeded index, which
  *   answers the demo's own queries with -32000.
+ * @param enableOnFirstStart whether configuring [network] also switches it on. False makes
+ *   the network opt-in: its seed is installed and its index, watch entry and port are set,
+ *   but it stays off — each network costs its own beacon light client and EL peer pool —
+ *   until the operator switches it on, when it comes up with the seeded index.
  */
 class PocSeed(
     val network: String,
@@ -53,6 +57,7 @@ class PocSeed(
     val seedSubject: String,
     val seedSource: String,
     val rpcPort: Int? = null,
+    val enableOnFirstStart: Boolean = true,
 ) {
     /** The seed's watch entry, as the Index tab and the engine both read it. */
     val watchJson: String =
@@ -244,8 +249,10 @@ open class PocFlavour(
     }
 
     /**
-     * Make the PoC boot straight into its purpose: each seeded network enabled with its log
-     * index on, the seed's watch entry visible in the Index tab, and its port pinned.
+     * Make the PoC boot straight into its purpose: each seeded network with its log index
+     * on, the seed's watch entry visible in the Index tab, and its port pinned — and
+     * switched on, unless its seed is opt-in ([PocSeed.enableOnFirstStart]), in which case
+     * it is left as it was and comes up with its seed whenever the operator turns it on.
      *
      * Each seeded network is configured ONCE, by the first start that finds it unconfigured.
      * On the flavour's genuinely first start ([firstStart] = no settings file existed yet)
@@ -274,7 +281,7 @@ open class PocFlavour(
             for (other in OTHER_NETWORKS) if (seedFor(other) == null) settings.setNetworkEnabled(other, false)
         }
         for (seed in todo) {
-            settings.setNetworkEnabled(seed.network, true)
+            if (seed.enableOnFirstStart) settings.setNetworkEnabled(seed.network, true)
             seed.rpcPort?.let { settings.setRpcPort(seed.network, it) }
             settings.setLogIndexEnabled(seed.network, true)
             settings.setLogIndexWatchJson(seed.network, seed.watchJson)

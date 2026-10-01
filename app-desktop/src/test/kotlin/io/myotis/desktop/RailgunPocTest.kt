@@ -146,11 +146,15 @@ class RailgunPocTest {
     }
 
     @Test
-    fun `a first start boots mainnet and sepolia with the index on, and leaves later starts alone`(@TempDir dir: Path) {
+    fun `a first start boots mainnet, prepares sepolia without starting it, and leaves later starts alone`(@TempDir dir: Path) {
         val settings = DesktopSettings(file = dir.resolve("settings.properties"), networks = nets)
         RailgunPoc.applyFirstStartSettings(settings, firstStart = true)
 
-        assertEquals(listOf("mainnet", "sepolia"), settings.enabledNetworks(), "both wallet networks, mainnet first")
+        // Sepolia is opt-in (owner's decision, #530): configured below, but not switched on —
+        // a second network costs a second beacon light client and EL peer pool.
+        assertEquals(listOf("mainnet"), settings.enabledNetworks(), "mainnet only; Sepolia waits to be switched on")
+        assertTrue(RailgunPoc.seedFor("mainnet")!!.enableOnFirstStart)
+        assertFalse(sepolia.enableOnFirstStart)
         assertEquals("mainnet", settings.primaryNetwork())
         for (seed in RailgunPoc.seeds) {
             assertTrue(settings.logIndexEnabled(seed.network), seed.network)
@@ -167,19 +171,21 @@ class RailgunPocTest {
 
         // A later start must never re-apply: that would push logIndex=false style resets
         // over whatever the user changed, and turning a seeded index off makes every query
-        // a -32000.
+        // a -32000. Switching Sepolia on is the user's act, and it sticks.
         settings.setNetworkEnabled("gnosis", true)
-        settings.setNetworkEnabled("sepolia", false)
+        settings.setNetworkEnabled("sepolia", true)
         RailgunPoc.applyFirstStartSettings(settings, firstStart = false)
         assertTrue(settings.isNetworkEnabled("gnosis"), "a later start must not touch settings")
-        assertFalse(settings.isNetworkEnabled("sepolia"), "a network the user turned off stays off")
+        assertTrue(settings.isNetworkEnabled("sepolia"), "Sepolia, once switched on, stays on")
+        assertEquals(RAILGUN_SEPOLIA_RPC_PORT, settings.rpcPortFor("sepolia"), "and serves on the port set for it")
     }
 
     /**
      * The upgrade case: an install whose first start ran before this flavour seeded Sepolia
      * has a settings file that configured mainnet only, and no record of it. The next start
      * of a build that bundles the Sepolia seed configures Sepolia exactly as a first start
-     * would, and touches nothing about mainnet the user may have changed since.
+     * would — set up, but not switched on — and touches nothing about mainnet the user may
+     * have changed since.
      */
     @Test
     fun `an install from before the sepolia seed picks sepolia up once`(@TempDir dir: Path) {
@@ -198,7 +204,7 @@ class RailgunPocTest {
         RailgunPoc.applyFirstStartSettings(settings, firstStart = false)
 
         val after = DesktopSettings(nets, file) // what the next start reads back
-        assertEquals(listOf("mainnet", "sepolia"), after.enabledNetworks())
+        assertEquals(listOf("mainnet"), after.enabledNetworks(), "the update adds no running network")
         assertEquals(RAILGUN_SEPOLIA_RPC_PORT, after.rpcPortFor("sepolia"))
         assertTrue(after.logIndexEnabled("sepolia"))
         assertEquals(sepolia.watchJson, after.logIndexWatchJson("sepolia"))
@@ -208,10 +214,25 @@ class RailgunPocTest {
         assertFalse(after.logIndexBackfillPaused("mainnet"))
         assertEquals(setOf("mainnet", "sepolia"), after.pocConfiguredNetworks())
 
-        // Once configured, never again: the user turns Sepolia off, and it stays off.
-        after.setNetworkEnabled("sepolia", false)
+        // Once configured, never again: the user switches Sepolia on, and a later start
+        // neither turns it back off nor re-applies its settings.
+        after.setNetworkEnabled("sepolia", true)
+        after.setRpcPort("sepolia", 9557)
         RailgunPoc.applyFirstStartSettings(after, firstStart = false)
-        assertFalse(DesktopSettings(nets, file).isNetworkEnabled("sepolia"))
+        val later = DesktopSettings(nets, file)
+        assertTrue(later.isNetworkEnabled("sepolia"))
+        assertEquals(9557, later.rpcPortFor("sepolia"))
+    }
+
+    /** An opt-in network leaves the on/off state alone in both directions: a Sepolia the user had already switched on by hand stays on through the update. */
+    @Test
+    fun `a sepolia the user switched on before the update stays on`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        Files.writeString(file, "networks.enabled=mainnet,sepolia\nlogIndex.mainnet=true\n")
+        RailgunPoc.applyFirstStartSettings(DesktopSettings(nets, file), firstStart = false)
+        val after = DesktopSettings(nets, file)
+        assertEquals(listOf("mainnet", "sepolia"), after.enabledNetworks())
+        assertTrue(after.logIndexEnabled("sepolia"))
     }
 
     @Test
@@ -264,7 +285,8 @@ class RailgunPocTest {
         assertNull(settings.pocConfiguredNetworks())
         RailgunPoc.applyFirstStartSettings(settings, firstStart = false)
         assertEquals(9545, settings.rpcPortFor("mainnet"), "the primary network's settings stand")
-        assertTrue(settings.isNetworkEnabled("sepolia"), "the network it never configured is configured")
+        assertTrue(settings.logIndexEnabled("sepolia"), "the network it never configured is configured")
+        assertFalse(settings.isNetworkEnabled("sepolia"), "…and, being opt-in, not switched on")
     }
 
     @Test

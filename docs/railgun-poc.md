@@ -2,8 +2,8 @@
 
 A flavour of the desktop app that the [RAILGUN Terminal Wallet
 CLI](https://github.com/Terminal-Wallet/terminal-wallet-cli) can be pointed at
-instead of a public RPC provider, from the first minute, on mainnet and on
-Sepolia. It is the sibling of the Bee PoC build (docs/bee-rpc-service.md) and
+instead of a public RPC provider: on mainnet from the first minute, and on
+Sepolia as soon as Sepolia is switched on in the app. It is the sibling of the Bee PoC build (docs/bee-rpc-service.md) and
 shares all of its machinery — see `PocFlavour.kt`, with `BeePoc.kt` and
 `RailgunPoc.kt` as the two configurations of it, and a `PocSeed` per network.
 
@@ -45,7 +45,7 @@ today.
 | coverage | 14,737,691 → the fetch's `finalized` block | 5,784,774 → the fetch's `finalized` block |
 | logs | ~438,000 over ~11.4M blocks | ~14,800 over ~6M blocks |
 | index size | ~261 MB | ~9 MB |
-| served on | `http://127.0.0.1:8555` | `http://127.0.0.1:8557` |
+| served on | `http://127.0.0.1:8555` | `http://127.0.0.1:8557`, once Sepolia is switched on |
 
 The Terminal Wallet hardcodes no addresses. It depends on
 `@railgun-community/wallet`, which reads them from
@@ -194,10 +194,14 @@ usable until; rebuild the app with a fresh fetch after that.
   against its manifest's sha256 first, and never over an index it did not install
   itself. A newer bundled seed re-seeds; an equal or older one is left alone —
   see *Re-seeding* below for a caveat.
-- First start: enables mainnet and Sepolia, disables gnosis, switches each log
-  index on, stores each seed's watch entry, and **pins the RPC ports: 8555 for
-  mainnet, 8557 for Sepolia**. Point the wallet at `http://127.0.0.1:8555` or
-  `http://127.0.0.1:8557`; each serves as soon as its beacon sync reaches `SYNCED`.
+- First start: enables mainnet, disables gnosis, and for mainnet and Sepolia alike
+  switches the log index on, stores the seed's watch entry and **pins the RPC
+  port: 8555 for mainnet, 8557 for Sepolia**. **Sepolia itself stays off**
+  (owner's decision, #530: a second network runs a second beacon light client and
+  EL peer pool, which a mainnet-only demo should not pay for). Switch it on on the
+  Network screen and it comes up with its seeded index. Point the wallet at
+  `http://127.0.0.1:8555`, or `http://127.0.0.1:8557` once Sepolia is on; each
+  serves as soon as its beacon sync reaches `SYNCED`.
 - Each network is configured exactly once. An install whose first start predates
   the Sepolia seed gets Sepolia configured the same way by its first start of a
   build that bundles it; the settings file records which networks are done
@@ -205,7 +209,8 @@ usable until; rebuild the app with a fresh fetch after that.
   a network the user turned off stays off. One consequence of an install having
   no record yet: if you had set Sepolia up by hand in it, that first start
   reconfigures it once — the port goes to 8557 and the backfill switch to off,
-  and the stored watch list is replaced by the seed's entry. Contracts you had
+  and the stored watch list is replaced by the seed's entry (whether Sepolia is
+  on is left as it was). Contracts you had
   added stay subscribed (the engine unions every pushed watch list with what it
   already indexes), but the other two are worth re-checking after the update.
 - The Index tab states what each seed covers and that it is unverified.

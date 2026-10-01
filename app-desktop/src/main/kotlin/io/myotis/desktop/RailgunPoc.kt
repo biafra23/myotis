@@ -7,10 +7,12 @@ package io.myotis.desktop
  * (https://github.com/Terminal-Wallet/terminal-wallet-cli) can point at INSTEAD OF a public
  * RPC provider, from the first minute. The wallet scans one contract's whole history to
  * rebuild its private balances, which over devp2p is a multi-day walk; the log-index seeds
- * for mainnet and Sepolia are bundled in the app bundle instead, installed into the
- * flavour's own data dir on first start, and the first start enables both networks with
- * the log index on, so `http://127.0.0.1:8555` (mainnet) and `http://127.0.0.1:8557`
- * (Sepolia) serve the wallet's `eth_getLogs` pages as soon as each beacon sync is `SYNCED`.
+ * for mainnet and Sepolia are bundled in the app bundle instead and installed into the
+ * flavour's own data dir. The first start switches mainnet on with the log index on, so
+ * `http://127.0.0.1:8555` serves the wallet's `eth_getLogs` pages as soon as the beacon sync
+ * is `SYNCED`; Sepolia is set up the same way on `http://127.0.0.1:8557` but left OFF until
+ * the operator switches it on (owner's decision, #530: a second network costs a second
+ * beacon light client and EL peer pool, which a mainnet-only demo should not pay for).
  *
  * The contract is the **RailgunSmartWallet proxy**, which the CLI reaches through
  * `@railgun-community/wallet` → `@railgun-community/shared-models`; it hardcodes no address
@@ -77,6 +79,10 @@ object RailgunPoc : PocFlavour(
             // NOT Sepolia's default 8547, for the same reason as mainnet: a regular install
             // with Sepolia switched on serves it there.
             rpcPort = RAILGUN_SEPOLIA_RPC_PORT,
+            // Opt-in (owner's decision, #530): seed installed and index, watch entry and port
+            // configured, but the network stays off until switched on — on a fresh install and
+            // on one updated from a mainnet-only build alike.
+            enableOnFirstStart = false,
         ),
     ),
     // Nothing to pause in practice — coverage already starts at the deployment block, so
