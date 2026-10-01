@@ -359,8 +359,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     private final RpcLogger log;
     private final RpcClock clock;
     private final SnapQualitySink snapQuality;
-    /** CCIP-Read (ERC-3668) gateway HTTP transport — host-specific (Ktor on
-     *  Android, java.net.http on the daemon), so it's injected rather than owned. */
+    /** CCIP-Read (ERC-3668) gateway HTTP transport — host-specific (java.net.http
+     *  on the daemon and the desktop app, HttpURLConnection on Android), so it's
+     *  injected rather than owned. */
     private final io.myotis.evm.ccipread.CcipGateway ccipGateway;
 
     // ---------------------------------------------------------------------

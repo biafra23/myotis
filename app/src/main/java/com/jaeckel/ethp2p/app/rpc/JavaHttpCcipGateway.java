@@ -4,10 +4,11 @@ import io.myotis.api.ports.HttpGateway;
 
 /**
  * JVM-only {@link HttpGateway} (the engine API's CCIP-Read transport) backed by
- * {@code java.net.http.HttpClient}. Used by the daemon, where JVM 21 is guaranteed.
- * Android consumers must supply a Ktor-backed gateway per {@code CLAUDE.md}
- * (java.net.http isn't covered by Android core library desugaring below API 33) —
- * which is also why this class lives in {@code :app}.
+ * {@code java.net.http.HttpClient}. Used by the daemon and the desktop app, where
+ * JVM 21 is guaranteed. Android uses its own {@code AndroidCcipGateway} over
+ * {@code HttpURLConnection} instead, since the Android app cannot use
+ * java.net.http at its minSdk 29 — which is also why this class lives in
+ * {@code :app}.
  *
  * <p>Blocking, per the port contract: the engine calls it from its own workers and
  * bridges to its internal async shape. Per ERC-3668 §6.1, any non-2xx HTTP status
