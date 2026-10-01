@@ -423,6 +423,22 @@ asset workflow and a stronger action than the merge this file already forbids.
    strings advertise the previous release. The macOS dmg version is derived
    (major + 1) and needs no edit.
 
+## Demo bundles build on merge to `main`, never on PRs
+
+The demo / PoC installers — the RAILGUN PoC dmg (`railgun-dmg.yml`), the Bee
+PoC dmg (the `bee-poc` leg of `desktop-dmg.yml`) and any bundle added later —
+build on every push to `main`, on `v*` tags and on manual dispatch, and NOT on
+pull requests (owner ruling, 2026-10-01). A merge to `main` is what refreshes
+the artifact a demo machine pulls, so nothing waits for a release; a PR build
+would only add a macOS runner leg per push, because a change that breaks a
+bundle without failing a test is next to impossible — what a bundle adds over
+the standard app (a seed, its manifest, warm peer caches) are build inputs,
+not code paths, and the standard dmg leg already proves jpackage on every PR.
+A bundle-only regression therefore surfaces on the next `main` run, which is
+a hard gate for these legs (only the tag build is best-effort, so a PoC
+failure never blocks a release). Give a new bundle that same trigger set, and
+note here and in its doc that it has it.
+
 ## Pull requests and code review
 
 These rules are for the **PR author**, opening a PR and answering its review.

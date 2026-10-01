@@ -357,8 +357,9 @@ with the seed above bundled inside:
   next to a manifest (coverage, usable-until block, sha256), and a build
   without the flag removes any staged seed. `-PbeePoc` also works with
   `:app-desktop:run`.
-- **CI builds it on every PR, every push to `main` and every release tag**
-  (`desktop-dmg.yml`, the `bee-poc` matrix leg): the artifact
+- **CI builds it on every push to `main` and every release tag, not on PRs**
+  (`desktop-dmg.yml`, the `bee-poc` matrix leg — the rule for every demo
+  bundle, see CLAUDE.md "Demo bundles"): the artifact
   `myotis-bee-poc-dmg-arm64-<sha>` holds `Myotis-bee-poc-arm64.dmg`, and the
   leg fails unless the dmg carries the seed, its manifest and the peer caches
   (the standard leg fails if it carries a seed). On a tag the dmg is attached
