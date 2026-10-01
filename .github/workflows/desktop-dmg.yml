@@ -56,24 +56,29 @@ jobs:
       # Two flavours: the regular app, and the Bee PoC build (-PbeePoc) that
       # bundles the Gnosis PostageStamp log-index seed so a Swarm Bee full node
       # can use it from the first minute (app-desktop/build.gradle.kts,
-      # docs/bee-rpc-service.md). The PoC leg (arm64) runs on every PR, on
-      # pushes to main and on release tags, so the Swarm team always has a
-      # current artifact (owner's call — it costs a second jpackage leg per
-      # PR). On a tag its dmg is attached to the release as a BEST-EFFORT
-      # asset: the leg is continue-on-error there, so a PoC-only failure never
-      # blocks the standard dmgs (the release job needs every leg of this
-      # job), and the release job uploads the PoC dmg only if it exists. On
-      # PRs and main the leg is a hard gate like the others.
+      # docs/bee-rpc-service.md). The PoC leg (arm64) runs on pushes to main
+      # and on release tags, NOT on PRs — the rule for every demo bundle
+      # (CLAUDE.md, "Demo bundles"; railgun-dmg.yml is the other one): a merge
+      # to main refreshes the artifact the demo machine pulls, while on a PR
+      # the leg only doubled the macOS runner load, since a change that breaks
+      # the bundle but no test is next to impossible — the seed, manifest and
+      # caches it adds are build inputs, not code paths (owner's call,
+      # 2026-10-01; it had run on PRs before). On a tag its dmg is attached to
+      # the release as a BEST-EFFORT asset: the leg is continue-on-error
+      # there, so a PoC-only failure never blocks the standard dmgs (the
+      # release job needs every leg of this job), and the release job uploads
+      # the PoC dmg only if it exists. On main the leg is a hard gate like the
+      # others.
       # Each entry carries its own build flags, dmg name and artifact name so
       # the steps below stay data-driven.
       matrix:
         include: ${{ github.event_name == 'pull_request'
-          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]')
+          && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"}]')
           || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]') }}
     # The PoC is best-effort on TAG builds only — its failure is reported but
-    # never fails this job there, so it never blocks a release. On PRs and
-    # pushes to main it is a hard gate like the standard legs: a PoC
-    # regression (seed, manifest, caches, JNA stub) must turn the run red.
+    # never fails this job there, so it never blocks a release. On pushes to
+    # main it is a hard gate like the standard legs: a PoC regression (seed,
+    # manifest, caches, JNA stub) must turn the run red.
     continue-on-error: ${{ matrix.flavor == 'bee-poc' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-14
     permissions:

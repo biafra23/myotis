@@ -154,8 +154,8 @@ the bundle; the app name/bundle id; `-Dmyotis.beePoc=true` in the launcher) and
 `app-desktop/src/main/kotlin/io/myotis/desktop/BeePoc.kt` (the first-start
 install and settings). A build without the flag carries none of it.
 
-You do not have to build it: CI produces the same artifact on every PR and
-every push to `main` (`Desktop DMG (macOS)` workflow → artifact
+You do not have to build it: CI produces the same artifact on every push to
+`main`, not on PRs (`Desktop DMG (macOS)` workflow → artifact
 `myotis-bee-poc-dmg-arm64-<sha>`)
 and attaches it to each release as `Myotis-v<version>-bee-poc-arm64.dmg`
 (best-effort; releases up to v0.1.11 named it `Myotis-bee-poc-arm64.dmg`).
