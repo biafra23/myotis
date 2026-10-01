@@ -1,6 +1,7 @@
 package io.myotis.jsonrpc
 
 import io.myotis.api.VerifiedReads
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -1777,10 +1778,12 @@ class RpcRouterTest {
         val r3 = route(ahead, """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x200"]}""")
         assertEquals(-32000, errorCode(r3), r3)
         assertEquals("0x200", ahead.lastStateBlock)
-        // No verified head yet: nothing to judge the pin against — the engine decides.
-        val unsynced = FakeBackend(balance = null, head = null)
+        // No verified head: retryable, declined at once — the engine would only
+        // wait for a head again (up to its wake cap) before refusing the pin.
+        val unsynced = FakeBackend(balance = BigInteger.ONE, head = null)
         assertEquals(-32000, errorCode(route(unsynced,
             """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x10"]}""")))
+        assertNull(unsynced.lastStateBlock)
     }
 
     @Test fun estimateGas_pinBehindTheWindow_isPermanent_beforeTheEngineIsAsked() {
@@ -1974,6 +1977,9 @@ class RpcRouterTest {
             """{"jsonrpc":"2.0","id":1}""" to "1",
             """{"jsonrpc":"2.0","id":{},"method":"eth_chainId"}""" to "null", // an unusable id is answered as null
             """{"jsonrpc":"2.0","id":true,"method":"eth_chainId"}""" to "null",
+            // Parses to infinity, which cannot be written back out: answering it
+            // threw out of the router, past the catch-all (#366 review).
+            """{"jsonrpc":"2.0","id":1e400,"method":"eth_chainId"}""" to "null",
         ).forEach { (body, id) ->
             val resp = route(FakeBackend(), body)
             assertEquals(-32600, errorCode(resp), "$body -> $resp")
@@ -2009,6 +2015,70 @@ class RpcRouterTest {
         val garbled = FakeBackend().apply { blockJson = "{not json" }
         assertEquals(-32603, errorCode(route(garbled,
             """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}""")))
+    }
+
+    @Test fun aNonFiniteId_inABatch_neverTakesItsSiblingsDown() {
+        val resp = route(FakeBackend(),
+            """[{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","id":1e400,"method":"eth_chainId"}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        assertEquals("0x1", arr[0].jsonObject["result"]!!.jsonPrimitive.content)
+        assertEquals(-32600, arr[1].jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt())
+    }
+
+    @Test fun numericIds_areEchoedVerbatim() {
+        // Past a Long an id was re-encoded as a double (1.2345678901234568E29),
+        // which no client can match to its request.
+        for (id in listOf("123456789012345678901234567890", "7", "1.5", "-3")) {
+            val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":$id,"method":"eth_chainId"}""")
+            assertTrue(resp.contains("\"id\":$id,"), "$id -> $resp")
+        }
+    }
+
+    @Test fun aPinAtAHeadThisNodeReported_staysRetryable_evenBehindTheWindow() {
+        // A node whose head went back and forth (recorded MetaMask sessions show a
+        // 13.6k-block swing) must not call the number it handed out invalid
+        // params: a wallet that switches providers on -32602 would leave over
+        // the node's own glitch.
+        val b = FakeBackend(balance = BigInteger.ONE, head = 0x100)
+        val router = RpcRouter(null, MethodLogger(), VerifiedReadsBackend(b))   // ONE router: it remembers
+        fun ask(body: String) = runBlocking { router.handle(body) }
+        assertEquals("0x100", result(ask("""{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}""")))
+        b.head = 0x1000
+        val reported = ask("""{"jsonrpc":"2.0","id":2,"method":"eth_getBalance","params":["$vitalik","0x100"]}""")
+        assertEquals(-32000, errorCode(reported), reported)
+        assertNull(b.lastStateBlock)
+        // Below anything this node reported, it is the caller's: permanent.
+        val older = ask("""{"jsonrpc":"2.0","id":3,"method":"eth_getBalance","params":["$vitalik","0xff"]}""")
+        assertEquals(-32602, errorCode(older), older)
+    }
+
+    @Test fun cancellation_passesThroughTheCatchAll_neverBecomingAnInternalError() {
+        // A client disconnect cancels the request coroutine; the catch-all must
+        // rethrow it rather than answer -32603 (which it records when it does).
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val reads = object : VerifiedReads by FakeBackend() {
+            override fun getBalance(address: ByteArray, block: String): String? {
+                entered.countDown()
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                return "1"
+            }
+        }
+        val logger = MethodLogger()
+        val router = RpcRouter(null, logger, VerifiedReadsBackend(reads))
+        runBlocking {
+            val job = launch(kotlinx.coroutines.Dispatchers.Default) {
+                router.handle("""{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest"]}""")
+            }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            job.cancel()
+            release.countDown()
+            job.join()
+            assertTrue(job.isCancelled)
+        }
+        assertNull(logger.coverage()["eth_getBalance"], "the cancellation was answered: ${logger.coverage()}")
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }

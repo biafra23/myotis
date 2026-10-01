@@ -12,6 +12,10 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.put
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.TimeSource
 
 /**
@@ -103,7 +107,7 @@ class RpcRouter(
                     // has no way to address an error to a batch as such.
                     logger.record("<batch-too-large>", "null", "ERROR", elapsedMs(t0), -32600)
                     val firstId = root.firstNotNullOfOrNull { el ->
-                        (el as? JsonObject)?.get("id")?.takeIf { validId(it) }
+                        (el as? JsonObject)?.get("id")?.takeIf { validId(it) }?.let { echoId(it) }
                     } ?: JsonNull
                     return "[" + errorEnvelope(
                         firstId,
@@ -349,7 +353,7 @@ class RpcRouter(
         // (`"method": {}`) from throwing out of the router mid-response (#366).
         val rawId = root["id"]
         val idOk = rawId == null || validId(rawId)
-        val id = if (idOk) rawId ?: JsonNull else JsonNull
+        val id = if (idOk) rawId?.let { echoId(it) } ?: JsonNull else JsonNull
         val method = (root["method"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
         val version = (root["jsonrpc"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
         val malformed = when {
@@ -384,13 +388,26 @@ class RpcRouter(
         return if (rawId == null) null else response
     }
 
-    /** Whether [id] may identify a request: a string, a number or null
-     *  (JSON-RPC 2.0 §4) — not a boolean, object or array. */
+    /** Whether [id] may identify a request: a string, a FINITE number or null
+     *  (JSON-RPC 2.0 §4) — not a boolean, object or array. `1e400` parses to
+     *  infinity, and neither it nor a lenient `NaN` can be written back out:
+     *  answering one threw out of the router mid-response. */
     private fun validId(id: JsonElement): Boolean = when (id) {
         is JsonNull -> true
-        is JsonPrimitive -> id.isString || id.content.toDoubleOrNull() != null
+        is JsonPrimitive -> id.isString || id.content.toDoubleOrNull()?.isFinite() == true
         else -> false
     }
+
+    /** [id] as it is echoed back: a number VERBATIM, as the caller wrote it — an
+     *  integer past a Long would otherwise be re-encoded as a double
+     *  (`1.2345678901234568E29`), which no client can match to its request. */
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    private fun echoId(id: JsonElement): JsonElement =
+        if (id is JsonPrimitive && !id.isString && id !is JsonNull) {
+            kotlinx.serialization.json.JsonUnquotedLiteral(id.content)
+        } else {
+            id
+        }
 
     /** [handleOne]'s body: route one request, keeping [phase] current for the watchdog. */
     private suspend fun dispatchOne(
@@ -644,6 +661,8 @@ class RpcRouter(
             val response = proxy.forward(forwardBody)
             logger.record(m, idStr, "PROXY", elapsedMs(pt0))
             response
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e   // a client disconnect is not an upstream failure
         } catch (e: Exception) {
             // Upstream down/timeout: JSON-RPC error, not a raw HTTP 500, so the wallet copes.
             logger.record(m, idStr, "ERROR", elapsedMs(pt0), -32603)
@@ -847,22 +866,36 @@ class RpcRouter(
     }
 
     /**
-     * Refuse a state read pinned to a block number BEHIND the window this node
-     * serves state for ([RpcBlockWindow]) — permanent: the head only moves on,
-     * and no engine holds older state. A pin AHEAD of the window is left to the
-     * engine, which answers it retryably (the head may yet reach it), as is any
-     * pin while no verified head is known. Inside the window the engine serves
-     * head state — the documented near-head trade-off (#382).
+     * Judge a block-number pin against the window this node serves state for
+     * ([RpcBlockWindow]), before any engine is asked:
+     *  - BEHIND the window: refused for good (-32602) — no engine holds older
+     *    state, and the head moves on. Unless the pin is at or above a head this
+     *    node itself reported recently ([reportedHeads]): a node whose head went
+     *    back and forth (recorded MetaMask sessions show a 13.6k-block swing)
+     *    must not call the number it handed out invalid params, so that one is
+     *    declined retryably instead;
+     *  - no verified head known: declined retryably at once ([false]) — the
+     *    engine would wait for a head again (up to its wake cap) only to refuse;
+     *  - otherwise the engine's: inside the window it serves head state, the
+     *    documented near-head trade-off (#382); ahead of it, a retryable refusal
+     *    (the head may yet reach it).
+     * A tag or hash is never judged here ([true]).
      */
-    private suspend fun refuseBehindWindow(sel: Selector, b: RpcBackend, method: String) {
-        val n = sel.number ?: return
-        val head = withContext(rpcIoDispatcher) { b.headBlockNumber() } ?: return
+    private suspend fun pinServable(sel: Selector, b: RpcBackend, method: String): Boolean {
+        val n = sel.number ?: return true
+        val head = withContext(rpcIoDispatcher) { b.headBlockNumber() } ?: return false
         if (n < head - RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE) {
+            val lowest = reportedHeads.lowest()
+            if (lowest != null && n >= lowest) return false
             invalid("$method at block $n is not supported: it is more than " +
                 "${RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE} blocks behind the verified head ($head), and this " +
                 "node holds no historical state")
         }
+        return true
     }
+
+    /** Heads this node recently answered `eth_blockNumber` with ([pinServable]). */
+    private val reportedHeads = ReportedHeads()
 
     /** `eth_feeHistory`'s block count at params[[i]]: what geth takes — a hex or
      *  decimal string, or a JSON number — at least 1, clamped to
@@ -999,7 +1032,7 @@ class RpcRouter(
             // the IO dispatcher too — which also leaves the slow-call watchdog free to
             // report it while it is held.
             "eth_blockNumber" -> withContext(rpcIoDispatcher) { b.headBlockNumber() }
-                ?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
+                ?.let { reportedHeads.record(it); resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 
             "eth_call" -> {
                 // An override the ENGINE can apply is served (and labelled
@@ -1032,11 +1065,10 @@ class RpcRouter(
                 // an expensive refusal where there used to be a free one, and
                 // reported as retryable though it is permanent for that build.
                 if (to == null && backend?.supportsContractCreation() != true) return null
-                // A pin behind the state window is permanent whatever the engine
-                // (#366); judged here, against the head as of dispatch, so the
-                // strict branch's re-derivation ([callTx]) stays a pure function
-                // of the request.
-                refuseBehindWindow(serve.selector, b, "eth_call")
+                // A pin behind the state window is judged here ([pinServable],
+                // #366), against the head as of dispatch, so the strict branch's
+                // re-derivation ([callTx]) stays a pure function of the request.
+                if (!pinServable(serve.selector, b, "eth_call")) return null
                 // The caller (msg.sender): absent/null is anonymous (the backend uses
                 // the zero-address default). Threading it is what lets a wallet's
                 // confirm-screen simulation of a sender-gated call (ERC-20
@@ -1080,11 +1112,11 @@ class RpcRouter(
             // The state reads: every param applied or refused (#366) — a malformed
             // one is -32602, never the retryable "cannot be served right now" — and
             // a block pinned behind the state window refused before the engine is
-            // asked ([refuseBehindWindow]).
+            // asked ([pinServable]).
             "eth_getBalance" -> {
                 val p = root.params()
                 val addr = p.addressAt(0)
-                val sel = p.stateSelectorAt(1, "eth_getBalance").also { refuseBehindWindow(it, b, "eth_getBalance") }
+                val sel = p.stateSelectorAt(1, "eth_getBalance").takeIf { pinServable(it, b, "eth_getBalance") } ?: return null
                 val bal = withContext(rpcIoDispatcher) { b.getBalance(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(bal)))
             }
@@ -1092,14 +1124,14 @@ class RpcRouter(
                 val p = root.params()
                 val addr = p.addressAt(0)
                 val sel = p.stateSelectorAt(1, "eth_getTransactionCount")
-                    .also { refuseBehindWindow(it, b, "eth_getTransactionCount") }
+                    .takeIf { pinServable(it, b, "eth_getTransactionCount") } ?: return null
                 val nonce = withContext(rpcIoDispatcher) { b.getTransactionCount(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(nonce)))
             }
             "eth_getCode" -> {
                 val p = root.params()
                 val addr = p.addressAt(0)
-                val sel = p.stateSelectorAt(1, "eth_getCode").also { refuseBehindWindow(it, b, "eth_getCode") }
+                val sel = p.stateSelectorAt(1, "eth_getCode").takeIf { pinServable(it, b, "eth_getCode") } ?: return null
                 val code = withContext(rpcIoDispatcher) { b.getCode(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(code)))
             }
@@ -1108,7 +1140,7 @@ class RpcRouter(
                 val addr = p.addressAt(0)
                 val slot = p.required(1, "storage slot").asWord32()
                     ?: invalid("invalid argument 1: expected a storage slot (a hex quantity or 32-byte word)")
-                val sel = p.stateSelectorAt(2, "eth_getStorageAt").also { refuseBehindWindow(it, b, "eth_getStorageAt") }
+                val sel = p.stateSelectorAt(2, "eth_getStorageAt").takeIf { pinServable(it, b, "eth_getStorageAt") } ?: return null
                 val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
             }
@@ -1316,7 +1348,7 @@ class RpcRouter(
                 val overrideJson = stateOverrideJson(root)
                 if (overrideJson != null && !b.supportsStateOverrides()) return null
                 val serve = estimateTx(root) as? EstimateTx.Serve ?: return null
-                refuseBehindWindow(serve.selector, b, "eth_estimateGas")
+                if (!pinServable(serve.selector, b, "eth_estimateGas")) return null
                 val outcome = withContext(rpcIoDispatcher) { b.estimateGasTx(serve.tx, serve.block, overrideJson) }
                 when (outcome.kind) {
                     RpcCallResult.Kind.OK ->
@@ -1522,5 +1554,39 @@ class RpcRouter(
         // it can neither forge log lines (\n) nor visually spoof UIs (RTL override,
         // line separators). The raw bytes are always in `data` for exact decoding.
         return s.map { if (it.code in 32..126) it else ' ' }.joinToString("")
+    }
+}
+
+/**
+ * The heads the router answered `eth_blockNumber` with over the last [window]
+ * (#366 review): a wallet pins its reads to the number it was just given, so a
+ * pin at or above the lowest of them came from this node, whatever the head
+ * did since. Bounded: a new entry only when the value changes, at most
+ * [MAX_ENTRIES] of them, the oldest pruned first.
+ */
+internal class ReportedHeads(private val window: Duration = 15.minutes) {
+    private companion object {
+        const val MAX_ENTRIES = 512
+    }
+
+    private val mutex = Mutex()
+    private val entries = ArrayDeque<Pair<Long, TimeSource.Monotonic.ValueTimeMark>>()
+
+    suspend fun record(head: Long) = mutex.withLock {
+        prune()
+        if (entries.lastOrNull()?.first != head) {
+            entries.addLast(head to TimeSource.Monotonic.markNow())
+            if (entries.size > MAX_ENTRIES) entries.removeFirst()
+        }
+    }
+
+    /** The lowest head reported within the window, or null when none was. */
+    suspend fun lowest(): Long? = mutex.withLock {
+        prune()
+        entries.minOfOrNull { it.first }
+    }
+
+    private fun prune() {
+        while (entries.isNotEmpty() && entries.first().second.elapsedNow() > window) entries.removeFirst()
     }
 }

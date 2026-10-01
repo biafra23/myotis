@@ -436,12 +436,14 @@ class IosRpcBackend(
         return if (e is kotlinx.serialization.json.JsonArray) t else null
     }
 
-    /** The api VerifiedReads error envelope: a single-key `{"error": ...}`
-     *  object — same detection the router's orEngineThrow applies. */
+    /** The api VerifiedReads error envelope: `{"error": ...}`, or
+     *  `{"error", "code"}` when the engine marks the refusal permanent — the
+     *  same detection the router's orEngineThrow applies, so the code reaches
+     *  it and a permanent refusal is answered -32602, not -32000 (#366). */
     private fun isEngineErrorEnvelope(t: String): Boolean {
         if (!t.startsWith("{\"error\"")) return false
         val o = runCatching { engineJson.parseToJsonElement(t).jsonObject }.getOrNull() ?: return false
-        return o.size == 1 && o.containsKey("error")
+        return o.containsKey("error") && (o.size == 1 || (o.size == 2 && o.containsKey("code")))
     }
 
     private fun statusOrNull(handle: Long): JsonObject? =

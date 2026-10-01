@@ -2282,9 +2282,11 @@ fn parse_quantity(k: &str, val: &serde_json::Value) -> Result<U256, String> {
 /// covered by finality), or `{"error": "..."}` when it can't
 /// verify right now (which the Java side maps to a null → -32000).
 pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions: bool) -> String {
+    // A selector no retry can serve (`safe`, `earliest`, malformed) is the
+    // request's own fault: the permanent envelope (#366).
     let target = match parse_block_target(block_tag) {
         Ok(t) => t,
-        Err(msg) => return eljson::error_json(msg),
+        Err(msg) => return eljson::invalid_params_json(msg),
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -2476,20 +2478,20 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
         && (selector.starts_with("0x") || selector.starts_with("0X"))
     {
         let Some(hash) = parse_word32(selector) else {
-            return eljson::error_json("invalid block hash (expected 32-byte hex)");
+            return eljson::invalid_params_json("invalid block hash (expected 32-byte hex)");
         };
         engine.rt.block_on(reader.request(async { reader.get_block_receipts_by_hash(hash).await }))
     } else {
         let tag = if selector.is_empty() { "latest" } else { selector };
         let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
         if !is_tag && !(tag.starts_with("0x") || tag.starts_with("0X")) {
-            return eljson::error_json(
+            return eljson::invalid_params_json(
                 "invalid block selector (expected a tag, 0x-number, or 0x-hash)",
             );
         }
         let target = match parse_block_target(tag) {
             Ok(t) => t,
-            Err(msg) => return eljson::error_json(msg),
+            Err(msg) => return eljson::invalid_params_json(msg),
         };
         let target = match resolve_block_target(target, reader.finalized_block_number()) {
             Ok(t) => t,
@@ -2517,19 +2519,20 @@ pub fn fee_history_json(
     newest_block_tag: &str,
     percentiles_json: &str,
 ) -> String {
+    // The request's own shape, refused for good (#366): no retry changes it.
     if block_count < 1 {
-        return eljson::error_json("blockCount must be at least 1");
+        return eljson::invalid_params_json("blockCount must be at least 1");
     }
     // The feeHistory newest-block selector: head tags → latest (None); a number
     // must be servable AT ALL (existence is re-checked against the head inside
     // the reader); earliest/malformed are not served — mirrors rpcFeeHistory.
     let newest = match parse_block_target(newest_block_tag.trim()) {
         Ok(t) => t,
-        Err(msg) => return eljson::error_json(msg),
+        Err(msg) => return eljson::invalid_params_json(msg),
     };
     let percentiles = match parse_percentiles(percentiles_json) {
         Ok(p) => p,
-        Err(msg) => return eljson::error_json(msg),
+        Err(msg) => return eljson::invalid_params_json(msg),
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -3988,6 +3991,23 @@ mod tests {
         // No engine calls here — just the contract for a missing handle, which
         // status_json returns directly.
         assert_eq!(status_json(i64::MIN), "{}");
+    }
+
+    #[test]
+    fn block_read_selectors_no_retry_can_serve_are_permanent() {
+        // #366: `safe`, `earliest`, genesis and a malformed selector are the
+        // request's own fault — the {"error","code":-32602} envelope, not the
+        // plain (retryable) one. Checked before any handle is consulted.
+        for tag in ["safe", "earliest", "0x0", "nope"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&get_block_by_number_json(i64::MIN, tag, false)).unwrap();
+            assert_eq!(v["code"], -32602, "{tag}: {v}");
+        }
+        for (count, newest, pct) in [(0, "latest", ""), (4, "safe", ""), (4, "latest", "[\"50\"]")] {
+            let v: serde_json::Value =
+                serde_json::from_str(&fee_history_json(i64::MIN, count, newest, pct)).unwrap();
+            assert_eq!(v["code"], -32602, "{count} {newest} {pct}: {v}");
+        }
     }
 
     #[test]
