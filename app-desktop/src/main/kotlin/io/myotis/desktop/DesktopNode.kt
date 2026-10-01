@@ -762,7 +762,7 @@ class DesktopSettings(
     override fun setLogIndexWatchJson(network: String, json: String) =
         mutate { logIndexWatch[network] = json }
 
-    /** The networks a PoC flavour has configured in this settings file, or null if none was ever recorded. */
+    /** The networks a PoC flavour has configured in this settings file, or null if none is recorded. */
     fun pocConfiguredNetworks(): Set<String>? = synchronized(this) { pocConfigured }
     fun setPocConfiguredNetworks(networks: Set<String>) = mutate { pocConfigured = networks.toSet() }
 
@@ -808,7 +808,10 @@ class DesktopSettings(
         p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
         p.getProperty(K_POC_CONFIGURED)?.let { csv ->
+            // Empty counts as no record (never written so; a hand edit): read as "configured
+            // nothing" it would re-apply the primary network over the user's settings.
             pocConfigured = csv.split(',').map(String::trim).filter { it.isNotEmpty() }.toSet()
+                .takeIf { it.isNotEmpty() }
         }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()

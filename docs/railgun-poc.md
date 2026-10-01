@@ -58,8 +58,9 @@ in that config, with `supportsV3: false`), so one watch entry per network covers
 what the wallet reads. Sepolia's config also names a registry and an EIP-7702
 relay adapt; the wallet hands neither to its engine.
 
-Note that shared-models marks Sepolia `isDevOnlyNetwork`: a wallet build may
-hide it unless it runs in a development mode.
+The Terminal Wallet CLI has its own Sepolia network entry
+(`src/config/config-defaults.ts`, public providers by default), so it is pointed at
+`http://127.0.0.1:8557` the same way it is pointed at 8555 for mainnet.
 
 ### The deployment block is load-bearing
 

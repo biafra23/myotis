@@ -250,9 +250,12 @@ open class PocFlavour(
      * Each seeded network is configured ONCE, by the first start that finds it unconfigured.
      * On the flavour's genuinely first start ([firstStart] = no settings file existed yet)
      * that is every seeded network, and the networks a regular install may start by default
-     * are switched off. On a later start it is only a network whose seed this build bundles
-     * and the install has never configured — an install that predates that network's seed —
-     * so updating the app brings the new network up exactly as a fresh install would.
+     * are switched off. On a later start it is only a network this flavour seeds and the
+     * install has never configured — an install that predates that network's seed — so
+     * updating the app brings the new network up exactly as a fresh install would. Neither
+     * waits for the seed's install outcome: a packaged build carries every seed (the build
+     * refuses otherwise), and a seed that did not install is reported by
+     * [seededIndexNotice] rather than hidden behind a network left off.
      * Nothing else a later start touches: in particular, it must never persist
      * `logIndex.<network>=false`, which would push a disable to the engine and turn the
      * seeded index off (queries → -32000), and a network the user turned off after it was
@@ -297,7 +300,15 @@ open class PocFlavour(
                 SeedOutcome.BAD_CHECKSUM, SeedOutcome.FAILED, SeedOutcome.NOT_BUNDLED ->
                     "$label: the bundled seed was NOT installed " +
                         "(${outcome.name.lowercase().replace('_', ' ')}; see the log) — " +
-                        "this index will backfill from peers instead, which takes days."
+                        if (pauseBackfillByDefault) {
+                            // Not "it will backfill instead": in this flavour the walk starts
+                            // switched off, so without the seed the index would simply stay empty.
+                            "this index has none of the seed's history, and fills only by walking " +
+                                "peers, which takes days and starts switched off in this flavour " +
+                                "(the backfill switch on this tab)."
+                        } else {
+                            "this index will backfill from peers instead, which takes days."
+                        }
                 else -> null
             }
         }

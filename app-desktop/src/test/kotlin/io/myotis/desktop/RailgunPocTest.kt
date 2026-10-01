@@ -104,6 +104,47 @@ class RailgunPocTest {
         assertNotEquals(5_784_866L, sep[0].fromBlock)
     }
 
+    /**
+     * Each seed's watch entry and names are written out three times: in the flavour (the
+     * watch entry a first start pushes), in `build.gradle.kts` (what the bundled frame is
+     * built with) and in railgun-dmg.yml (what CI requires of the built dmg). A correction
+     * made in one place only would leave the frame and the pushed entry disagreeing — and
+     * the engine merges the two with the LOWER from_block, silently — so pin the copies to
+     * each other here, where a mismatch fails a unit test instead of a demo.
+     */
+    @Test
+    fun `the build and the dmg workflow name each seed exactly as the flavour does`() {
+        val build = Files.readString(repoFile("app-desktop/build.gradle.kts"))
+        for (seed in BeePoc.seeds + RailgunPoc.seeds) {
+            val watch = "\"${seed.watchAddress}:${seed.watchDeployBlock}\""
+            assertTrue(build.contains(watch), "build.gradle.kts must frame the ${seed.network} seed with $watch")
+            assertTrue(build.contains("\"${seed.seedFile}\""), "build.gradle.kts must stage ${seed.seedFile}")
+            assertTrue(build.contains("\"${seed.manifestFile}\""), "build.gradle.kts must stage ${seed.manifestFile}")
+        }
+        val workflow = Files.readString(repoFile(".github/workflows/railgun-dmg.yml"))
+        for (seed in RailgunPoc.seeds) {
+            for (needle in listOf(
+                "-name '${seed.seedFile}'",
+                "-name '${seed.manifestFile}'",
+                "grep -qx 'network=${seed.network}'",
+                "grep -qx 'deploymentBlock=${seed.watchDeployBlock}'",
+                "grep -qx 'coveredLow=${seed.watchDeployBlock}'",
+            )) {
+                assertTrue(workflow.contains(needle), "railgun-dmg.yml must assert $needle on the built dmg")
+            }
+        }
+    }
+
+    /** [rel] from the repository root, whether the test runs in the module dir (Gradle) or the root. */
+    private fun repoFile(rel: String): Path {
+        var dir: Path? = Path.of(System.getProperty("user.dir")).toAbsolutePath()
+        while (dir != null) {
+            dir.resolve(rel).takeIf { Files.isRegularFile(it) }?.let { return it }
+            dir = dir.parent
+        }
+        error("$rel not found above ${System.getProperty("user.dir")}")
+    }
+
     @Test
     fun `a first start boots mainnet and sepolia with the index on, and leaves later starts alone`(@TempDir dir: Path) {
         val settings = DesktopSettings(file = dir.resolve("settings.properties"), networks = nets)
@@ -210,6 +251,20 @@ class RailgunPocTest {
         assertEquals(SeedOutcome.NOT_BUNDLED, outcomes["sepolia"])
         val notice = RailgunPoc.seededIndexNotice(data, "sepolia")!!
         assertTrue(notice.contains("NOT installed") && notice.contains("not bundled"), notice)
+        // The walk starts paused in this flavour, so the notice must not promise one.
+        assertFalse(notice.contains("will backfill"), notice)
+        assertTrue(notice.contains("switched off"), notice)
+    }
+
+    @Test
+    fun `an empty configured-networks record counts as none, so the primary is not re-applied`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        Files.writeString(file, "networks.enabled=mainnet\nrpcPort.mainnet=9545\npoc.configuredNetworks=\n")
+        val settings = DesktopSettings(nets, file)
+        assertNull(settings.pocConfiguredNetworks())
+        RailgunPoc.applyFirstStartSettings(settings, firstStart = false)
+        assertEquals(9545, settings.rpcPortFor("mainnet"), "the primary network's settings stand")
+        assertTrue(settings.isNetworkEnabled("sepolia"), "the network it never configured is configured")
     }
 
     @Test
