@@ -1704,6 +1704,7 @@ class RpcRouterTest {
         // decimal by one engine, as hex by the other), JSON numbers, mixed-case
         // or unknown tags, malformed objects — never passed on to an engine.
         val refused = listOf("\"256\"", "256", "\"Latest\"", "\"0x\"", "\"0xzz\"", "true",
+            "\"\"", "\"   \"",   // only an absent or null selector defaults (#366 review)
             """{"blockNumber":"0x10","blockHash":"$someHash"}""", """{}""",
             """{"blockNumber":"0x10","requireCanonical":"yes"}""")
         val calls = listOf(
@@ -2079,6 +2080,78 @@ class RpcRouterTest {
             assertTrue(job.isCancelled)
         }
         assertNull(logger.coverage()["eth_getBalance"], "the cancellation was answered: ${logger.coverage()}")
+    }
+
+    @Test fun aBlockOverride_ofAnyNonInertValue_isRefused_neverIgnored() {
+        // #366 review: only a non-empty OBJECT counted as a block override, so
+        // `"bad"` in params[3] was run without it. Only absent, null and {} are
+        // inert.
+        val call = """{"to":"$vitalik","data":"0x"}"""
+        for (ov in listOf("\"bad\"", "5", "[]", "true", """{"time":"0x1"}""")) {
+            for (m in listOf("eth_call", "eth_estimateGas")) {
+                val b = FakeBackend(callResult = byteArrayOf(1), applyOverrides = true).apply { estimateResult = 21_000L }
+                val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"$m","params":[$call,"latest",null,$ov]}""")
+                assertEquals(-32602, errorCode(resp), "$m $ov -> $resp")
+                assertNull(b.lastTx, "$m $ov reached the engine")
+            }
+        }
+        for (ov in listOf("null", "{}")) {
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$call,"latest",null,$ov]}""")
+            assertEquals("0x01", result(resp), "$ov -> $resp")
+        }
+    }
+
+    @Test fun anEmptySelector_isRefused_onTheTransactionMethodsToo() {
+        for (sel in listOf("\"\"", "\" \"", """{"blockNumber":""}""")) {
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},$sel]}""")
+            assertEquals(-32602, errorCode(resp), "$sel -> $resp")
+            assertNull(b.lastTx)
+        }
+    }
+
+    @Test fun extraArguments_areRefused_asGethRefusesThem() {
+        // geth: "too many arguments, want at most N" / "non-array args"
+        // (rpc/json.go). Served with the extra one dropped, the answer would be
+        // to a question the caller did not ask (#366 review).
+        for (body in listOf(
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest","latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest",null]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":["0x1"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"latest",null,null,null]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":{"chain":"x"}}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":"$vitalik"}""",
+        )) {
+            val b = FakeBackend(balance = BigInteger.ONE, callResult = byteArrayOf(1))
+            val resp = route(b, body)
+            assertEquals(-32602, errorCode(resp), "$body -> $resp")
+            assertNull(b.lastStateBlock, body); assertNull(b.lastTx, body)
+        }
+        assertTrue(route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[1]}""")
+            .contains("too many arguments, want at most 0"))
+        // Absent, null and empty params stay fine where nothing is required.
+        for (params in listOf("", ",\"params\":null", ",\"params\":[]")) {
+            assertEquals("0x1", result(route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_chainId"$params}""")))
+        }
+    }
+
+    @Test fun aReportedHead_agesFromTheLastTimeItWasAnswered() {
+        // #366 review: a head answered steadily through a stall expired 15 min
+        // after its FIRST answer, so a pin to it turned permanent the moment the
+        // head jumped — though the node had handed it out seconds before.
+        val heads = ReportedHeads(window = kotlin.time.Duration.parse("1s"))
+        runBlocking {
+            heads.record(0x100)
+            Thread.sleep(600)
+            heads.record(0x100)            // still answered: refreshed, not kept at its first mark
+            Thread.sleep(600)              // past the window from the first answer only
+            assertEquals(0x100L, heads.lowest())
+            heads.record(0x5000)           // the head jumps
+            assertEquals(0x100L, heads.lowest())
+            Thread.sleep(1_200)            // nobody answered 0x100 since: it ages out
+            assertNull(heads.lowest())
+        }
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }

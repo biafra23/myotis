@@ -4008,6 +4008,22 @@ mod tests {
                 serde_json::from_str(&fee_history_json(i64::MIN, count, newest, pct)).unwrap();
             assert_eq!(v["code"], -32602, "{count} {newest} {pct}: {v}");
         }
+        // eth_getLogs too (#366 review): a filter no node state could serve is
+        // refused permanently even where no handle runs, not "not running".
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        for filter in [
+            format!("{{{addr},\"fromBlock\":\"safe\"}}"),
+            format!("{{{addr},\"blockHash\":\"0x{}\"}}", "cc".repeat(32)),
+            "{\"fromBlock\":\"latest\"}".to_string(),
+            format!("{{{addr},\"fromBlock\":\"0x200\",\"toBlock\":\"0x100\"}}"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&get_logs_json(i64::MIN, &filter)).unwrap();
+            assert_eq!(v["code"], -32602, "{filter}: {v}");
+        }
+        // A servable filter on a handle that is not running stays retryable.
+        let v: serde_json::Value =
+            serde_json::from_str(&get_logs_json(i64::MIN, &format!("{{{addr}}}"))).unwrap();
+        assert!(v.get("code").is_none(), "{v}");
     }
 
     #[test]
@@ -4399,38 +4415,82 @@ fn build_log_index_status(
     }
 }
 
-/// Parse an eth_getLogs filter into a typed [`LogFilter`], resolving tags
-/// against the supplied head/finalized numbers. Pure (testable): every
-/// malformed shape is a specific error string; nothing is silently ignored.
-fn parse_get_logs_filter(
-    v: &serde_json::Value,
-    head: u64,
-    finalized: u64,
-) -> Result<myotis_net::el::logindex::LogFilter, String> {
+/// A `fromBlock` / `toBlock` as an eth_getLogs filter names it, before the
+/// node's head is consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogBound {
+    /// `latest`, `pending`, or absent.
+    Head,
+    Finalized,
+    /// A number, `earliest` included (block 0).
+    Number(u64),
+}
+
+/// An eth_getLogs filter as parsed, its block tags not yet resolved.
+#[derive(Debug)]
+struct ParsedLogFilter {
+    from: LogBound,
+    to: LogBound,
+    addresses: Vec<[u8; 20]>,
+    topics: Vec<Vec<[u8; 32]>>,
+}
+
+impl ParsedLogFilter {
+    /// The typed [`LogFilter`], its tags resolved against `head` / `finalized`.
+    fn resolve(self, head: u64, finalized: u64) -> myotis_net::el::logindex::LogFilter {
+        let at = |bound| match bound {
+            LogBound::Head => head,
+            LogBound::Finalized => finalized,
+            LogBound::Number(n) => n,
+        };
+        myotis_net::el::logindex::LogFilter {
+            from_block: at(self.from),
+            to_block: at(self.to),
+            addresses: self.addresses,
+            topics: self.topics,
+        }
+    }
+}
+
+/// Parse an eth_getLogs filter, every malformed shape a specific error string
+/// and nothing silently ignored. Pure (testable), and needs no head: whatever
+/// it refuses is the request's own fault, decided before the node's state is
+/// consulted ([`ParsedLogFilter::resolve`] applies the head after).
+fn parse_get_logs_filter(v: &serde_json::Value) -> Result<ParsedLogFilter, String> {
     if v.get("blockHash").is_some_and(|b| !b.is_null()) {
         // EIP-234: silently resolving the tags instead would answer with the
         // HEAD block's logs for a question about a specific other block.
         return Err("blockHash filters are not supported by this scoped index".to_string());
     }
-    fn tag(v: Option<&serde_json::Value>, head: u64, finalized: u64) -> Result<u64, String> {
+    fn tag(v: Option<&serde_json::Value>) -> Result<LogBound, String> {
         match v {
-            None | Some(serde_json::Value::Null) => Ok(head),
+            None | Some(serde_json::Value::Null) => Ok(LogBound::Head),
             Some(serde_json::Value::String(s)) => match s.as_str() {
-                "latest" | "pending" => Ok(head),
+                "latest" | "pending" => Ok(LogBound::Head),
                 "safe" => Err(SAFE_TAG_REFUSAL.to_string()),
-                "finalized" => Ok(finalized),
-                "earliest" => Ok(0),
+                "finalized" => Ok(LogBound::Finalized),
+                "earliest" => Ok(LogBound::Number(0)),
                 hex => hex
                     .strip_prefix("0x")
                     .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_hexdigit()))
                     .and_then(|d| u64::from_str_radix(d, 16).ok())
+                    .map(LogBound::Number)
                     .ok_or_else(|| "unresolvable block tag".to_string()),
             },
             Some(_) => Err("block tag must be a string".to_string()),
         }
     }
-    let from_block = tag(v.get("fromBlock"), head, finalized)?;
-    let to_block = tag(v.get("toBlock"), head, finalized)?;
+    let from = tag(v.get("fromBlock"))?;
+    let to = tag(v.get("toBlock"))?;
+    // Two explicit bounds the wrong way round never become answerable, so
+    // they are refused here, for good (#366 review). An inversion a TAG takes
+    // part in is left to the query: `latest` resolves to the index's covered
+    // top, so a poll from the head can be inverted now and answerable later.
+    if let (LogBound::Number(from), LogBound::Number(to)) = (from, to) {
+        if from > to {
+            return Err(format!("fromBlock {from} is above toBlock {to}: no block can match"));
+        }
+    }
     let mut addresses = Vec::new();
     match v.get("address") {
         Some(serde_json::Value::String(a)) => {
@@ -4466,15 +4526,17 @@ fn parse_get_logs_filter(
         }
         Some(_) => return Err("malformed topics".to_string()),
     }
-    Ok(myotis_net::el::logindex::LogFilter { from_block, to_block, addresses, topics })
+    Ok(ParsedLogFilter { from, to, addresses, topics })
 }
 
 /// The eth_getLogs query. Returns the log array ONLY when the requested
 /// range is inside indexed coverage; every other case is `{"error": ...}`
 /// (the router maps it to strict -32000) — never an empty array for an
 /// unindexed range. A filter that fails to parse — malformed, a `safe` or hash
-/// selector, no address — is the permanent `{"error","code":-32602}` (#366);
-/// every refusal that depends on the index (coverage, the watch-list, a range
+/// selector, no address, two explicit bounds the wrong way round — is the
+/// permanent `{"error","code":-32602}` (#366), decided before the node's state
+/// is consulted, so a paused or unsynced node answers it the same; every
+/// refusal that depends on the index (coverage, the watch-list, a range
 /// inverted by `latest` resolving to the covered top) stays retryable.
 pub fn get_logs_json(handle: i64, filter_json: &str) -> String {
     let out = get_logs_json_impl(handle, filter_json);
@@ -4547,8 +4609,15 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     // A filter that does not parse, or names something this node never serves,
     // is refused for good — the -32602 envelope, never the retryable error a
     // client would spin on (#366). Coverage refusals below stay retryable.
+    // Decided BEFORE the node's state is consulted: none of these refusals
+    // depends on the head, and a paused or unsynced node must not answer one
+    // with a retryable "not running" (#366 review).
     let Ok(v) = serde_json::from_str::<serde_json::Value>(filter_json) else {
         return eljson::invalid_params_json("malformed filter");
+    };
+    let parsed = match parse_get_logs_filter(&v) {
+        Ok(f) => f,
+        Err(msg) => return eljson::invalid_params_json(&msg),
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -4571,10 +4640,7 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         .log_index_covered_high()
         .filter(|top| head.saturating_sub(*top) <= LOG_INDEX_LATEST_SLACK)
         .map_or(head, |top| top.min(head));
-    let filter = match parse_get_logs_filter(&v, servable, reader.finalized_block_number()) {
-        Ok(f) => f,
-        Err(msg) => return eljson::invalid_params_json(&msg),
-    };
+    let filter = parsed.resolve(servable, reader.finalized_block_number());
     let mut result = reader.with_log_index(|ix| ix.query(&filter));
     // On-demand tail fill. An explicit `toBlock` at the very head can land one
     // block past the covered top while the 6s appender tick hasn't recorded it
@@ -4673,10 +4739,12 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
             ),
             None => eljson::error_json("log index has not indexed any blocks yet; retry"),
         },
-        // Retryable, unlike the parse refusals above: `latest` resolves to the
-        // index's covered top, which trails the head by up to a tick, so a poll
-        // from the head to `latest` can be inverted now and answerable moments
-        // later — a permanent code here would stop a polling wallet for good.
+        // Retryable, unlike the parse refusals above: only a range a TAG took
+        // part in gets here (two explicit numbers the wrong way round are
+        // refused by the parse). `latest` resolves to the index's covered top,
+        // which trails the head by up to a tick, so a poll from the head to
+        // `latest` can be inverted now and answerable moments later — a
+        // permanent code here would stop a polling wallet for good.
         Some(Err(QueryError::Unanswerable)) => eljson::error_json("unanswerable filter (fromBlock > toBlock)"),
     }
 }
@@ -5077,7 +5145,24 @@ mod get_logs_filter_tests {
     use super::parse_get_logs_filter;
 
     fn f(json: &str) -> Result<myotis_net::el::logindex::LogFilter, String> {
-        parse_get_logs_filter(&serde_json::from_str(json).unwrap(), 1000, 900)
+        parse_get_logs_filter(&serde_json::from_str(json).unwrap()).map(|p| p.resolve(1000, 900))
+    }
+
+    #[test]
+    fn two_explicit_bounds_the_wrong_way_round_are_refused_for_good() {
+        // #366 review: no index progress can answer them, so the retryable
+        // "unanswerable" a client would spin on is wrong for these.
+        let addr = format!("\"address\":\"0x{}\"", "11".repeat(20));
+        for (from, to) in [("\"0x200\"", "\"0x100\""), ("\"0x10\"", "\"earliest\"")] {
+            let err = f(&format!("{{{addr},\"fromBlock\":{from},\"toBlock\":{to}}}")).unwrap_err();
+            assert!(err.contains("is above toBlock"), "{from}..{to}: {err}");
+        }
+        // A tag takes part: left to the query, whose `latest` moves.
+        let ok = f(&format!("{{{addr},\"fromBlock\":\"0x7d0\"}}")).unwrap();
+        assert_eq!((ok.from_block, ok.to_block), (2000, 1000));
+        assert!(f(&format!("{{{addr},\"fromBlock\":\"0x7d0\",\"toBlock\":\"finalized\"}}")).is_ok());
+        // Equal bounds are one block, not an inversion.
+        assert!(f(&format!("{{{addr},\"fromBlock\":\"0x100\",\"toBlock\":\"0x100\"}}")).is_ok());
     }
 
     #[test]

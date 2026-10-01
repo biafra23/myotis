@@ -40,22 +40,32 @@ class RpcRouter(
     internal companion object {
         private val HEX_DIGITS = "0123456789abcdef".toCharArray()
 
-        /** Methods we have a verified implementation for. Used in strict mode to tell
-         *  "supported but can't answer right now" (-32000, retryable) from "we don't
-         *  serve this verified at all" (-32601). Keep in sync with tryVerified's cases. */
-        private val VERIFIED_METHODS = setOf(
-            "eth_chainId", "net_version", "eth_blockNumber", "eth_call", "eth_getBalance",
-            "eth_getTransactionCount", "eth_getCode", "eth_getStorageAt",
-            "eth_sendRawTransaction", "eth_getTransactionReceipt", "eth_getBlockByNumber",
-            "eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory", "eth_estimateGas",
-            "eth_getTransactionByHash", "eth_getBlockByHash", "eth_getBlockReceipts", "eth_getLogs",
-            "web3_clientVersion", "eth_syncing",
-            "eth_accounts", "net_listening", "net_peerCount", "web3_sha3",
-            "eth_getBlockTransactionCountByNumber", "eth_getBlockTransactionCountByHash",
-            "eth_getTransactionByBlockNumberAndIndex", "eth_getTransactionByBlockHashAndIndex",
-            "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash",
-            "eth_getUncleByBlockNumberAndIndex", "eth_getUncleByBlockHashAndIndex",
+        /** Methods we have a verified implementation for, each with the most
+         *  positional arguments it takes: geth's arity for the method, so a
+         *  request geth refuses with "too many arguments" is refused here too,
+         *  never served with the extra argument ignored (#366). Keep in sync
+         *  with tryVerified's cases. */
+        private val VERIFIED_ARITY: Map<String, Int> = mapOf(
+            "eth_chainId" to 0, "net_version" to 0, "eth_blockNumber" to 0,
+            // transaction, block, state overrides, block overrides
+            "eth_call" to 4, "eth_estimateGas" to 4,
+            "eth_getBalance" to 2, "eth_getTransactionCount" to 2, "eth_getCode" to 2,
+            "eth_getStorageAt" to 3,
+            "eth_sendRawTransaction" to 1, "eth_getTransactionReceipt" to 1, "eth_getBlockByNumber" to 2,
+            "eth_gasPrice" to 0, "eth_maxPriorityFeePerGas" to 0, "eth_feeHistory" to 3,
+            "eth_getTransactionByHash" to 1, "eth_getBlockByHash" to 2, "eth_getBlockReceipts" to 1,
+            "eth_getLogs" to 1,
+            "web3_clientVersion" to 0, "eth_syncing" to 0,
+            "eth_accounts" to 0, "net_listening" to 0, "net_peerCount" to 0, "web3_sha3" to 1,
+            "eth_getBlockTransactionCountByNumber" to 1, "eth_getBlockTransactionCountByHash" to 1,
+            "eth_getTransactionByBlockNumberAndIndex" to 2, "eth_getTransactionByBlockHashAndIndex" to 2,
+            "eth_getUncleCountByBlockNumber" to 1, "eth_getUncleCountByBlockHash" to 1,
+            "eth_getUncleByBlockNumberAndIndex" to 2, "eth_getUncleByBlockHashAndIndex" to 2,
         )
+
+        /** Used in strict mode to tell "supported but can't answer right now"
+         *  (-32000, retryable) from "we don't serve this verified at all" (-32601). */
+        private val VERIFIED_METHODS: Set<String> = VERIFIED_ARITY.keys
 
         /** The most requests one batch may carry — geth's default
          *  `BatchRequestLimit`. Elements are served one after another, so an
@@ -218,9 +228,16 @@ class RpcRouter(
         (stateOverrideParam(root) as? OverrideParam.Valid)?.json
 
     /** `blockOverrides` (params[3]) — NOT applied by this node, so its presence
-     *  forces the refusal path even when the state override could be served. */
+     *  forces the refusal path even when the state override could be served.
+     *  Only an absent parameter, JSON null or an empty object is inert; any
+     *  other value — a non-empty object, or one that is not an object at all —
+     *  is present, refused rather than ignored (#366 review). */
     private fun blockOverridePresent(root: JsonObject): Boolean =
-        (root.params()?.getOrNull(3) as? JsonObject)?.isNotEmpty() == true
+        when (val raw = root.params()?.getOrNull(3)) {
+            null, is JsonNull -> false
+            is JsonObject -> raw.isNotEmpty()
+            else -> true
+        }
 
     /** True when the request is a contract-creation `eth_call`: `to` absent or
      *  explicitly null. A present-but-malformed `to` is NOT creation — running
@@ -813,7 +830,9 @@ class RpcRouter(
             }
             else -> return refuse("expected a block tag or a 0x-prefixed hex block number")
         }
-        val s = raw.ifEmpty { "latest" }
+        // Only an absent or null selector defaults; an empty string is not one.
+        if (raw.isEmpty()) return refuse("an empty string names no block; ask for 'latest' or a 0x-prefixed hex number")
+        val s = raw
         when (s) {
             "latest", "pending" -> return SelectorParse.Ok(Selector(s, number = null, hash = false))
             "finalized" -> return if (backend?.supportsFinalizedTag() == true) {
@@ -991,6 +1010,7 @@ class RpcRouter(
     }
 
     private suspend fun tryVerified(method: String, id: JsonElement, root: JsonObject): String? {
+        checkArguments(method, root)
         val b = backend ?: return null
         return when (method) {
             // Chain id is config-derived — always answerable, no sync needed.
@@ -1371,6 +1391,18 @@ class RpcRouter(
         }
     }
 
+    /** geth's positional-argument rules for a verified [method] (rpc/json.go):
+     *  `params` is absent, null or an array, holding at most the method's
+     *  arguments ([VERIFIED_ARITY]). Anything else carries a parameter this
+     *  node would otherwise drop — refused, never ignored (#366 review). */
+    private fun checkArguments(method: String, root: JsonObject) {
+        val arity = VERIFIED_ARITY[method] ?: return
+        val raw = root["params"]
+        if (raw == null || raw is JsonNull) return
+        val args = raw as? JsonArray ?: invalid("params must be an array of positional arguments")
+        if (args.size > arity) invalid("too many arguments, want at most $arity")
+    }
+
     /** This request's `params` array, or null if absent / not an array. */
     private fun JsonObject.params(): JsonArray? = (this["params"] as? JsonArray)
 
@@ -1561,8 +1593,10 @@ class RpcRouter(
  * The heads the router answered `eth_blockNumber` with over the last [window]
  * (#366 review): a wallet pins its reads to the number it was just given, so a
  * pin at or above the lowest of them came from this node, whatever the head
- * did since. Bounded: a new entry only when the value changes, at most
- * [MAX_ENTRIES] of them, the oldest pruned first.
+ * did since. A head ages from the LAST time it was answered, so one the node
+ * kept answering through a stall does not expire under it. Bounded: a new
+ * entry only when the value changes, at most [MAX_ENTRIES] of them, the oldest
+ * pruned first.
  */
 internal class ReportedHeads(private val window: Duration = 15.minutes) {
     private companion object {
@@ -1574,8 +1608,13 @@ internal class ReportedHeads(private val window: Duration = 15.minutes) {
 
     suspend fun record(head: Long) = mutex.withLock {
         prune()
-        if (entries.lastOrNull()?.first != head) {
-            entries.addLast(head to TimeSource.Monotonic.markNow())
+        val now = TimeSource.Monotonic.markNow()
+        if (entries.lastOrNull()?.first == head) {
+            // Refreshed in place: the newest entry stays last, so prune()'s
+            // oldest-first order holds.
+            entries[entries.lastIndex] = head to now
+        } else {
+            entries.addLast(head to now)
             if (entries.size > MAX_ENTRIES) entries.removeFirst()
         }
     }
