@@ -56,9 +56,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -161,6 +163,10 @@ fun NodeScreen(
     var selected by remember { mutableStateOf<String?>(null) }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
+    // Per-network log-index head catch-up for the top bar. Every network is observed on
+    // every snapshot, not just the selected one, so a catch-up's start stays current.
+    val logIndexCatchUp = remember { LogIndexCatchUp() }
+    val logIndexCatchUps = logIndexCatchUp.observeAll(snapshots.mapValues { it.value.logIndexJson })
 
     // Follow the platform's light/dark appearance, and paint the scheme's own
     // background behind everything. The Surface is load-bearing twice over:
@@ -199,7 +205,11 @@ fun NodeScreen(
                 Spacer(Modifier.height(8.dp))
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
                 // selected chain. Uses the configurable deep-pool threshold from Settings.
-                ReadinessStrip(current, settings.deepPoolThreshold())
+                ReadinessStrip(
+                    current,
+                    settings.deepPoolThreshold(),
+                    logIndexCatchUps[network],
+                )
 
                 // Stale-anchor consent. The engines park fail-closed (beaconState
                 // STALE_ANCHOR) when a network's sync anchor is older than the
@@ -279,12 +289,19 @@ private fun NetworkChips(
 /**
  * Readiness traffic-light — the wallet's "safe to transact" signal for the selected chain.
  * red = not running / not synced; amber = synced but the verified head is still warming (wallet
- * calls would error -32000); green = ready for simple reads; bright thick green = deep peer pool,
+ * calls would error -32000); amber progress bar = the log index is catching up to the head
+ * ([catchUp]; head-reaching `eth_getLogs` is refused until it has, so a log-scanning wallet is
+ * not ready either); green = ready for simple reads; bright thick green = deep peer pool,
  * heavy confirm screens will load. The state is exposed via a11y semantics so it isn't conveyed
  * by color/thickness alone.
  */
 @Composable
-private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
+internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUpProgress? = null) {
+    // Ranked below every red/amber node state (those explain the index's lag too, and fixing
+    // them comes first) and above both greens: a node whose index refuses head queries is
+    // not "ready", however deep its peer pool.
+    val indexCatchingUp = catchUp != null && s != null && s.running && s.lifecycle != "PAUSED" &&
+        !upgradeCutOff(s) && s.beaconState == "SYNCED" && s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS
     val (color, height, label) = when {
         s != null && s.lifecycle == "PAUSED" ->
             Triple(Color(0xFF78909C), 3.dp,
@@ -305,6 +322,11 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
         s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
             Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
+        indexCatchingUp && catchUp != null ->
+            Triple(Color(0xFFF9A825), 6.dp,
+                "Node readiness: ${LogIndexStatus.catchUpLine(catchUp)}; " +
+                    "eth_getLogs near the head is refused" +
+                    if (catchUp.stalled) "" else " until it has caught up")
         s.snapServingPeers >= deepPoolThreshold ->
             Triple(Color(0xFF00E676), 6.dp,
                 "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
@@ -312,14 +334,48 @@ private fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int) {
             Triple(Color(0xFF2E7D32), 3.dp,
                 "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
     }
+    if (indexCatchingUp && catchUp != null) {
+        // The strip itself becomes the progress bar, with the gap spelled out beneath it.
+        // One semantics node carrying both the label and, while it moves, the bar's value.
+        Column(
+            Modifier.fillMaxWidth().testTag(READINESS_STRIP_TAG)
+                .clearAndSetSemantics {
+                    contentDescription = label
+                    if (!catchUp.stalled) {
+                        progressBarRangeInfo = ProgressBarRangeInfo(catchUp.fraction, 0f..1f)
+                    }
+                },
+        ) {
+            if (catchUp.stalled) {
+                // Nothing is closing the gap: a bar would promise motion.
+                Box(Modifier.fillMaxWidth().height(height).background(color))
+            } else {
+                LinearProgressIndicator(
+                    progress = { catchUp.fraction },
+                    modifier = Modifier.fillMaxWidth().height(height),
+                    color = color,
+                    trackColor = color.copy(alpha = 0.25f),
+                )
+            }
+            Text(
+                LogIndexStatus.catchUpLine(catchUp),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+        return
+    }
     Box(
         Modifier
             .fillMaxWidth()
             .height(height)
             .background(color)
+            .testTag(READINESS_STRIP_TAG)
             .semantics { contentDescription = label },
     )
 }
+
+internal const val READINESS_STRIP_TAG = "readiness-strip"
 
 /**
  * The stale-anchor consent dialog — the interactive half of the weak-subjectivity
