@@ -1,13 +1,18 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
-Status: IN PROGRESS — written 2026-08-19; updated 2026-09-25. Sepolia's date
-and parameters are decided; A.2's EL detector shipped (#491). On the branch
-after it: A.1 (Sepolia schedule + time-gated fork id, both engines), B.0 (the
-pinned delta below), B.4 (Amsterdam EVM: served by revm 43, refused by Besu
-26.4), and B.1–B.3 in progress — the Gloas light client, fork-keyed decoding,
-and the execution anchor resolved by block hash (see "The EL anchor after
-Gloas"). Dates without a decision are projections and move whenever testing
-finds something.
+Status: IMPLEMENTED FOR SEPOLIA, awaiting the fork — written 2026-08-19;
+updated 2026-09-30. Sepolia's date and parameters are decided; A.2's EL
+detector shipped in #491, and #501 (merged 2026-09-26) landed the rest on
+`main`: A.1 (Sepolia schedule + time-gated fork id, both engines), B.0 (the
+pinned delta below), B.1–B.3 (the Gloas light client in both engines —
+fork-keyed decoding, the shape gate before BLS, relaying light-client objects
+under their own slot's digest, and the execution anchor resolved by block hash,
+see "The EL anchor after Gloas") and B.4 (Amsterdam EVM: served by revm 43 on
+the Rust engine, refused with a permanent `-32602` by the Java engine's Besu
+26.4). Still open: B.5 (eth/70–71), the mainnet and Gnosis schedule entries
+once their forks are announced, A.3's inertness check on the live fork, and the
+"Known limitations after review" list. Dates without a decision are projections
+and move whenever testing finds something.
 Sources of truth to re-check while executing: `ethereum/consensus-specs`
 (`specs/gloas/light-client/`), the EF fork announcement blog posts (they carry
 the final epochs, timestamps and fork versions per network), and a fork

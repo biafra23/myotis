@@ -25,16 +25,25 @@
   3. only programmer/state errors throw — one type, `EngineException`, which UniFFI
      models as a single flat `Error` enum.
 
-> **Status / decision (phase 1, in progress).** The first Rust-engine PRs bind via
-> **hand-JNI + JSON**, not UniFFI: `:myotis-engines` selects the engine
-> (`Engines.engine()`, `myotis.engine=java|rust|auto`), `RustEngineNative` declares a
-> small set of static natives against `rust/myotis-engine` (cdylib), and compound
-> values cross as JSON strings whose schemas are pinned by golden tests on BOTH sides
-> (`rust/testdata/networks_catalog.json` ⇄ `catalog::tests` ⇄ `NetworksJsonGoldenTest`).
-> Rationale: UniFFI's generated-bindings build step conflicts with the "cargo strictly
-> optional" requirement, and the phase-1 surface is ~a dozen natives. A stale-library
-> guard (`nativeInit()` ABI-version handshake) protects the boundary. The UniFFI
-> mapping below remains the reference for when the surface grows or iOS arrives.
+> **Status (as built).** The Rust engine is complete and is the default engine
+> (see the repo README, *Engines*). The JVM boundary is **UniFFI + JSON**: the
+> first Rust-engine PRs bound via hand-JNI, and that decision was reversed in
+> 2026-07 as a transport swap only (see [06](06-rust-phase-notes.md)) —
+> `#[uniffi::export]` functions in `rust/myotis-engine/src/ffi.rs`, generated Kotlin
+> bindings committed in `:myotis-engines` (`./gradlew uniffiGenerateKotlin`
+> regenerates them; an Android build does so automatically), `RustEngineNative`
+> reduced to a static delegator, and `:myotis-engines` selecting the engine
+> (`Engines.engine()`, `myotis.engine=java|rust|auto`). Compound values still cross
+> as JSON strings whose schemas are pinned by golden tests on BOTH sides
+> (`rust/testdata/networks_catalog.json` ⇄ `catalog::tests` ⇄ `NetworksJsonGoldenTest`),
+> so the "cargo strictly optional" requirement holds for the JVM hosts: the committed
+> bindings need no bindgen step, and UniFFI's per-function checksums replace the old
+> hand-rolled ABI probe. The non-JVM hosts — the iOS app (`:app-ios`, Kotlin/Native
+> cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — consume the same
+> engine over its plain C ABI (`rust/myotis-engine/src/capi.rs`,
+> `rust/include/myotis_engine.h`), gated on the header's `MYOTIS_ABI_VERSION`. The
+> typed-record UniFFI mapping below remains the reference path if the JSON transport
+> is ever retired.
 >
 > **Conformance corpus** (plan PR 3): `rust/myotis-bls/tests/conformance.rs` pins the
 > shared BLS fixture files, and `rust/testdata/lc/mainnet/` holds a live-captured

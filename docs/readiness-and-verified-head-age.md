@@ -13,9 +13,9 @@ engine differences called out where they exist.
 - **On the daemon**: `./gradlew :app:run -Pargs=beacon-status` returns
   `"state":"SYNCED"`, and a query such as `get-account` returns
   `"verifyMethod":"headerChain"` (or `"stateRootMatch"`) instead of a `failReason`.
-- **Over JSON-RPC** (Android's loopback `127.0.0.1:8545`): requests return data
-  instead of error `-32000` (method cannot be served verified right now —
-  retryable).
+- **Over JSON-RPC** (the loopback endpoint every host serves — `127.0.0.1:8545`
+  for mainnet): requests return data instead of error `-32000` (method cannot
+  be served verified right now — retryable).
 
 Being *synced* is necessary but not sufficient: a node can be beacon-SYNCED and
 still unable to serve reads (e.g. no snap-serving peers yet). Readiness is the
@@ -215,7 +215,9 @@ since the node started. So keep honoring the SYNCED gate for `finalized`
 reads too; staleness does not always surface as `-32000`. On the JVM host the
 start/resume warm-up hold applies to `finalized` reads too (it waits for a
 head-serving peer that a finalized read does not need — at most 90 s).
-The Java engine still resolves `finalized` to the head (#366).
+The Java engine still resolves `finalized` to the head (#366), except where it
+refuses the tag instead (`-32602`): `eth_estimateGas`, and an `eth_call`
+carrying gas, fees or lists.
 
 ## Code pointers
 

@@ -1,5 +1,13 @@
 # Clean Architecture Review
 
+> **Historical snapshot.** Written against the original four Gradle modules of
+> the Java engine (`core`, `networking`, `consensus`, `app`), before the engine
+> contract (`:myotis-api`), the `node-core`/`rpc-backend` split, the Compose hosts
+> and the Rust engine (`rust/`, today's default engine) existed. Line references
+> and the module map are as of that review; several findings (e.g. the
+> `java.net.http` checkpoint fetch inside `BeaconLightClient`) have since been
+> addressed. Kept as a record of the review, not as a description of today's layout.
+
 Read-only review of the four Gradle modules against Robert C. Martin's Clean Architecture. No code was changed.
 
 The lens here is **layering and the Dependency Rule**, not generic SOLID (see [SOLID_REVIEW.md](SOLID_REVIEW.md) for that). Layers, innermost → outermost:

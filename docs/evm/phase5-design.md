@@ -221,9 +221,14 @@ Phase 5 completion (this branch):
 
 ## Out of scope
 
-- Contract-creation transactions (`to == null`). Phase 5.1.
-- EIP-2930 access lists. Phase 5.1.
-- EIP-3860 init-code length cost. Phase 5.1.
-- Binary-search refinement. Likely never; the buffer is fine.
+- Contract-creation transactions (`to == null`). Phase 5.1 — shipped on
+  the Rust engine (#509); the Java engine refuses them (`-32602`).
+- EIP-2930 access lists. Phase 5.1 — shipped on the Rust engine (#509);
+  the Java engine refuses them (`-32602`).
+- EIP-3860 init-code length cost. Phase 5.1 — shipped on the Rust engine
+  with contract creation (#509).
+- Binary-search refinement — shipped in both engines (#509 stage 2): one
+  run plus the buffer was not a limit that works for every transaction;
+  see *Why a search* above.
 - Cross-state-root estimation (using a state different from the one
   the tx will execute against). Out of scope.

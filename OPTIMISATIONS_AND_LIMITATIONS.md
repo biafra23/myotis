@@ -6,9 +6,20 @@ the hard limits are. Every optimisation below exists to work around a specific
 phone-performance or network-latency limitation; the two halves are meant to be read
 together.
 
+> **Scope.** Written from the **Java engine on Android** (Besu's EVM on ART, the JVM
+> `VerifiedRpcBackend`); the PR numbers are that era's and the measurements predate
+> the Rust engine, which is the default engine today and carries its own versions of
+> several of these mechanisms (hedged reads across peers, admission and eviction of
+> snap peers by their announced head, `snapServingPeers` as the readiness gate,
+> per-anchored-head fee memoization — see the release notes from v0.1.8 on and
+> [docs/readiness-and-verified-head-age.md](docs/readiness-and-verified-head-age.md)).
+> The limitations in Part 1 are structural and apply to both engines.
+
 **Non-negotiable invariant.** Nothing here trades away verification. The only trust
-anchors are sync-committee signatures, the embedded pre-Merge historical-hash
-accumulator, and the Bellatrix-era historical-roots accumulator. A peer is never
+anchor in the shipped code is the sync-committee signature chain from the embedded
+checkpoint (the two embedded historical accumulators — pre-Merge historical hashes,
+Bellatrix-era historical roots — are designed, not yet built; see
+[docs/implementation-status.md](docs/implementation-status.md)). A peer is never
 trusted. Every value the wallet receives is either proven against a beacon-anchored
 state root (SNAP proof / header chain) or is an honest *error* — never fabricated data,
 never a proxied answer. The optimisations change *scheduling, caching, freshness, and
@@ -323,9 +334,11 @@ flat-state lag (§1.1).
 
 - **Sends work**, including back-to-back, on a real device once the node is warm — the
   combination of coherent block serving (§2.10), the pending-nonce overlay (§2.11), and
-  declining the heavy sweep (§2.12) unblocks the confirm + send flow.
-- **Token balances are the open rough edge**: the heavy sweep is declined, so balances
-  may not render; the convergent successor in §2.12 is the planned durable fix.
+  bounding the heavy sweep to its own peer lane (§2.7, §2.12) unblocks the confirm +
+  send flow.
+- **Token balances are the open rough edge**: the heavy sweep runs but may not complete
+  within any sane gas/time budget on a light node, so balances may not render; the
+  convergent, cached balance flow in §2.12 is the planned durable fix.
 - **A cold-start / peer-dip window still errors honestly** for a few seconds after
   launch or during a snap-peer dip — by design (we error rather than guess), but it is
   why "let it reach the green readiness strip first" matters before transacting.

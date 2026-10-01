@@ -1,11 +1,17 @@
 # A dedicated light-client server (Rust)
 
-Status: **design**, not built. Supersedes the CL half of
-`dedicated-sepolia-node.md` §8.
+Status: **built** — this design became [`rust/roost`](../rust/roost/README.md)
+(PRs #327–#337, discv5 join + ENR publication in #345, wallet-side ENR-seeded
+bootstrap + targeted lookups in #348), serving all three networks from one
+deployment. The roost README is the source of truth for what works and what is
+still open (the back-archive below the upstream's light-client floor; dropping
+the wallet-side pins once discovery is proven on every network). This document
+keeps the design rationale and the measurements it was sized from. Supersedes
+the CL half of `dedicated-sepolia-node.md` §8.
 
-**Scope: sepolia only.** Every measurement below is sepolia, and each network
-would need its own server, ENR, fork digest and archive. Two numbers in
-particular do not travel:
+**Scope of the measurements: sepolia only.** Every measurement below is sepolia,
+and each network needs its own ENR, fork digest and archive (roost derives them
+per chain). Two numbers in particular do not travel:
 
 - **~1327 periods ≈ 36 MB is sepolia's archive.** Mainnet's Altair floor and
   Gnosis's own beacon chain (`docs/multichain-design.md`) give different sizes.
