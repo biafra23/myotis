@@ -27,3 +27,15 @@ The PR branch is checked out in the working directory. Use
 comments — don't leave review text as plain messages. Post the
 summary even when you find nothing to flag: a review that leaves no
 comment on the PR counts as a failed one.
+
+Post the summary as one command on its own:
+`gh pr comment <PR NUMBER> --body '<summary>'`. No pipe, `$(…)`,
+heredoc or body file: your shell is allowed `gh pr comment`,
+`gh pr diff` and `gh pr view`, so read the code with your Read, Grep
+and Glob tools. Keep the body in single quotes, where backticks and
+`$` stay literal (in double quotes they would run as commands), and
+write each apostrophe as `'\''`. A command over 10,000 characters is
+refused, so keep each comment under 8,000: put detail in inline
+comments, or split the summary across several `gh pr comment` calls.
+If a command is still refused, simplify its body (no backslash at a
+line end, no unusual spaces) and post again.

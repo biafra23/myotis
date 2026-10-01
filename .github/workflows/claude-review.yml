@@ -40,7 +40,8 @@
 #   result. A run in which the action never started Claude because this file
 #   differs from the default branch's is not an attempt (see Scope
 #   decisions): it stays green with a warning, since a fallback would skip
-#   the same way.
+#   the same way. After each attempt, a step prints what it was refused and
+#   how it ended, so a silent attempt explains itself.
 #
 #   NOT --fallback-model: that flag only covers "overloaded or not available".
 #   Verified against a live exhausted limit — it falls back correctly from a
@@ -106,6 +107,30 @@ env:
   # suppress the fallback. A different token setup posts under a different
   # login: change this with it, or every review reads as empty.
   REVIEWER_LOGIN: claude[bot]
+  # What each job prints after its attempt (see "What the first attempt was
+  # refused, and how it ended"), from the transcript the action writes to
+  # its execution file: how the run ended, each refused tool call with the
+  # checker's reason and the command's length, and the start of the final
+  # message. A refusal's reason comes from its permission_denied event; a
+  # run that stopped before its result message still lists those.
+  REPORT_JQ: |
+    [.[] | select(.type == "system" and .subtype == "permission_denied")] as $events
+    | ($events | map({key: .tool_use_id, value: (.decision_reason // .message)}) | from_entries) as $why
+    | ([.[] | select(.type == "result")] | last) as $r
+    | if $r == null then "No result message: the run stopped before Claude finished."
+      else "Ended \($r.subtype)\(if $r.is_error then ", as an error" else "" end) (\($r.terminal_reason // "no terminal reason")) after \($r.num_turns) turns."
+      end,
+      (($r.errors // [])[] | "Error: \(tostring | .[:300])"),
+      (($r.permission_denials // ($events | map({tool_name, tool_use_id, tool_input: null}))) as $refused
+        | "\($refused | length) refused tool call(s):",
+          ($refused[]
+            | "- \(.tool_name)\($why[.tool_use_id // ""] // "" | if . == "" then "" else " (\(.))" end)"
+              + if .tool_input == null then ""
+                else ((.tool_input.command? // (.tool_input | tojson)) | tostring)
+                  | ", \(length) characters: \(gsub("\n"; " ") | .[:200])"
+                end)),
+      "Final message (\($r.result // "" | length) characters):",
+      ($r.result // "" | .[:2000])
 
 jobs:
   review:
@@ -212,6 +237,28 @@ jobs:
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
+      # What the attempt was refused, and how it ended. The action keeps the
+      # whole transcript on the runner (its execution file) and prints only
+      # counts, so a silent attempt used to leave no trace: #520's and #523's
+      # first reviews posted nothing after 23 and 29 refused calls, and their
+      # transcripts went with their runners. This prints REPORT_JQ's report
+      # (see env above), the refused calls cut to 200 characters and the final
+      # message to 2000. Only a report: it never stops the job, or a broken
+      # report would skip the check below and with it the fallback. The
+      # fallback job's copy of this step must stay identical.
+      - name: What the first attempt was refused, and how it ended
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.fable.outputs.execution_file }}
+        run: |
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "No transcript: the action did not run Claude."
+            exit 0
+          fi
+          # The text is the model's: the prefix keeps every line of it from
+          # acting as a workflow command (::…::) or a log marker (##[…]).
+          jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
+
       # Whether the first attempt left a review, whether it failed or ended
       # cleanly: a clean attempt that left nothing is no review either (see
       # Model strategy above). `outcome` is the raw step result (conclusion is
@@ -289,7 +336,7 @@ jobs:
           echo "Fable 5: $OUTCOME; reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Fable 5 left no review (step $OUTCOME) — running the Opus fallback."
+            echo "::warning::Fable 5 left no review (step $OUTCOME) — running the Opus fallback. The step before this one shows what it was refused and how it ended."
           else
             echo "safe=false" >> "$GITHUB_OUTPUT"
             if [ "$OUTCOME" = failure ]; then
@@ -354,6 +401,7 @@ jobs:
       # to claude-opus-5-5; each run's "Claude Code initialized" log line names
       # the model it got. To pin one Opus instead, put its full ID here.
       - name: Review (latest Opus — Fable 5 left no review)
+        id: opus
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -362,6 +410,22 @@ jobs:
             --model opus
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      # The review job's report, for this attempt; keep the two identical.
+      # It runs after a failed attempt too, which the check below does not.
+      - name: What the fallback was refused, and how it ended
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.opus.outputs.execution_file }}
+        run: |
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "No transcript: the action did not run Claude."
+            exit 0
+          fi
+          # The text is the model's: the prefix keeps every line of it from
+          # acting as a workflow command (::…::) or a log marker (##[…]).
+          jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
 
       # The fallback must have left a review. A failed fallback already fails
       # the job (this step is then skipped); this catches one that ended
@@ -404,6 +468,6 @@ jobs:
           fi
           echo "Reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
-            echo "::error::Neither Fable 5 nor the Opus fallback posted a review, so this PR has none. Re-run this workflow for another pass (it replays the same commit)."
+            echo "::error::Neither Fable 5 nor the Opus fallback posted a review, so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
             exit 1
           fi
