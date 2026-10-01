@@ -302,9 +302,9 @@ dependencies {
     implementation(project(":consensus"))
     // ENS resolution runs the ENS contracts in a local Besu EVM over
     // SNAP-verified state. :myotis-evm is needed directly (not just
-    // transitively) because the SnapPeer/CcipGateway/BlockContext/Address
-    // types are referenced from our adapter + NodeService, and Gradle hides
-    // a transitive `implementation` dep from the consumer's compile classpath.
+    // transitively) because our SnapPeer adapter (EthHandlerSnapPeer)
+    // references its SnapPeer type, and Gradle hides a transitive
+    // `implementation` dep from the consumer's compile classpath.
     implementation(project(":myotis-ens"))
     implementation(project(":myotis-evm"))
 

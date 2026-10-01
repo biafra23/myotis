@@ -7,9 +7,13 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>{@code :myotis-evm} stays decoupled from any specific HTTP client.
  * The handler does URL template substitution, body construction, and
- * response parsing; the wallet integration supplies the transport via
- * this interface — typically a Ktor-backed implementation per the
- * {@code CLAUDE.md} platform direction.
+ * response parsing; the wallet integration supplies the transport. The
+ * hosts implement the engine API's {@code HttpGateway} port, which
+ * {@code PortBridges.toCcipGateway} adapts to this interface: the daemon
+ * and the desktop app use {@code JavaHttpCcipGateway} over
+ * {@code java.net.http}, and Android uses {@code AndroidCcipGateway} over
+ * {@code HttpURLConnection}. Both deviate from {@code CLAUDE.md}, which
+ * asks for Ktor for exactly this transport and rules out java.net.http.
  *
  * <p>Tests substitute an in-memory implementation that returns hardcoded
  * responses for specific URL/body combinations.

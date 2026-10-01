@@ -171,10 +171,9 @@ class MainnetEnsResolutionIT {
 
     /**
      * IT-only {@link CcipGateway} backed by {@code java.net.http.HttpClient}.
-     * The wallet's Android-side implementation will use Ktor per
-     * {@code CLAUDE.md}'s platform direction; this one is fine for the
-     * JVM integration test which only runs on developer/CI machines, not
-     * on Android.
+     * Android has its own gateway, {@code AndroidCcipGateway} over
+     * {@code HttpURLConnection}; this one is fine for the JVM integration
+     * test, which only runs on developer/CI machines, not on Android.
      */
     private static final class JavaHttpCcipGateway implements CcipGateway {
         private final HttpClient client = HttpClient.newBuilder()
