@@ -187,9 +187,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
   Engines before ABI 27 ignore `block` and always answer from the head, so a
   host that forwards a block number must gate on `init() >= 27`.
-- **Executor refusals** (ABI 33): `ethCallJson` and `estimateGasJson` (and,
-  since ABI 34, `estimateGasTxJson`; the C ABI's `myotis_eth_call_overrides_json`
-  is not wrapped here) answer `{"error": "…", "code": -32602}` — **permanent**,
+- **Executor refusals** (ABI 33): `ethCallJson` and `estimateGasJson` (and
+  `estimateGasTxJson` since ABI 34, `ethCallTxJson` since ABI 35; the C ABI's
+  `myotis_eth_call_overrides_json` is not wrapped here) answer `{"error": "…", "code": -32602}` — **permanent**,
   like the refusals above — when the verified head's header and this engine
   build's fork table disagree about Amsterdam: an Amsterdam block without
   EIP-7843's slot number, or a slot number on a block the table puts before
