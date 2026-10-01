@@ -4202,6 +4202,7 @@ version = "0.1.12"
 dependencies = [
  "myotis-core",
  "revm",
+ "serde_json",
 ]
 
 [[package]]

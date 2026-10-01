@@ -471,6 +471,23 @@ impl EvmExecutor {
         self.call_tx_capped(tx, ctx, overrides, PREFETCH_ITERATION_CAP)
     }
 
+    /// Run `tx` once at `gas_limit` as a block would include it and return
+    /// revm's whole result, logs included. Test tooling for recorded-world
+    /// replays (the `fixture` feature): it skips the call path's checks, and
+    /// nothing a wallet sees answers from it.
+    #[cfg(any(test, feature = "fixture"))]
+    pub fn run_tx(
+        &self,
+        tx: &TxRequest,
+        gas_limit: u64,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<ExecutionResult, EvmError> {
+        let spec = spec_for_context(ctx)?;
+        let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
+        self.execute_with_db(&db, spec, tx, gas_limit, ctx)
+    }
+
     fn call_tx_capped(
         &self,
         tx: &TxRequest,
@@ -1003,6 +1020,9 @@ mod tests {
     use crate::fork::{CANCUN_TIME, LONDON_BLOCK};
     use crate::oracle::{FixtureSnapStateOracle, OracleAccount};
     use myotis_core::keccak::keccak256;
+
+    /// The mainnet RelayAdapt7702 shield, replayed from its recorded world (#509).
+    mod relay_adapt_7702_shield;
 
     struct CancelledOracle;
     impl SnapStateOracle for CancelledOracle {
@@ -1784,26 +1804,7 @@ mod tests {
     /// over call outcomes (the transactions in these tests are monotone in it).
     /// Only an ANSWER counts as "does not run" — anything else fails the test.
     fn lowest_limit_that_runs(exec: &EvmExecutor, tx: &TxRequest, c: &BlockContext) -> u64 {
-        let runs = |gas: u64| {
-            let mut limited = tx.clone();
-            limited.gas = Some(gas);
-            match exec.call_tx(&limited, c, StateOverrides::new()) {
-                Ok(_) => true,
-                Err(e) if e.is_infeasible() || matches!(e, EvmError::Reverted { .. } | EvmError::Halted { .. }) => false,
-                Err(e) => panic!("not an answer at gas {gas}: {e:?}"),
-            }
-        };
-        let (mut fails, mut works) = (0u64, VIEW_CALL_GAS);
-        assert!(runs(works), "the transaction must run at the budget");
-        while fails + 1 < works {
-            let mid = (fails + works) / 2;
-            if runs(mid) {
-                works = mid;
-            } else {
-                fails = mid;
-            }
-        }
-        works
+        crate::fixture::lowest_limit_that_runs(exec, tx, c, &StateOverrides::new()).unwrap()
     }
 
     /// `estimate` is the search's answer for `tx`: the lowest limit that runs,
@@ -2045,6 +2046,31 @@ mod tests {
         dropped.authorization_list = None;
         let blind = exec.estimate_tx(&dropped, &c, StateOverrides::new()).unwrap();
         assert!(blind < 30_000, "without the list the call hits an empty account: {blind}");
+    }
+
+    /// A call into a delegated account starts with the delegate warm (the
+    /// execution specs' `process_message_call`; geth's convenience warming).
+    /// The Java `DelegatedTargetTest` pins the same number: its engine charged
+    /// a cold access here, 2500 gas above this one on the RAILGUN shield.
+    #[test]
+    fn a_delegated_targets_delegate_starts_warm() {
+        let (target, delegate, other) = ([0x22; 20], [0x33; 20], [0x44; 20]);
+        // BALANCE of the delegate itself (warm: 100), then of an untouched
+        // account (cold: 2600), then STOP.
+        let mut code = vec![0x73];
+        code.extend_from_slice(&delegate);
+        code.extend_from_slice(&[0x31, 0x50, 0x73]);
+        code.extend_from_slice(&other);
+        code.extend_from_slice(&[0x31, 0x50, 0x00]);
+        let mut designator = vec![0xef, 0x01, 0x00];
+        designator.extend_from_slice(&delegate);
+        let exec = executor_with_accounts(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18)), 0),
+            (target, designator, U256::ZERO, 1),
+            (delegate, code, U256::ZERO, 1),
+        ]);
+        let tx = TxRequest::call(SENDER, Some(target), Bytes::new(), U256::ZERO);
+        assert_eq!(drawn_at_the_budget(&exec, &tx, &prague()), 21_000 + 3 + 100 + 2 + 3 + 2_600 + 2);
     }
 
     /// A chain id of 0 authorizes on every chain (EIP-7702).
