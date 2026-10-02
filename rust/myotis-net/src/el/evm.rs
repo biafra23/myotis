@@ -1109,10 +1109,12 @@ impl SnapStateOracle for PoolOracle {
             // Bytecode: content-addressed, verified by hash inside the peer call.
             // The ladder is read again: a peer the chunks just found silent is
             // no first ask here either (these fetches have no retry).
-            let (_, code_peers, code_healthy) = self.wave_ladder();
-            let code_peers = &code_peers;
+            let (code_ids, code_peers, code_healthy) = self.wave_ladder();
+            let (code_ids, code_peers) = (&code_ids, &code_peers);
+            let quality = &quality;
             let code_fetches = code_hashes.iter().enumerate().map(|(i, hash)| {
-                let peer = Arc::clone(&code_peers[wave_peer(code_peers.len(), code_healthy, i, 0)]);
+                let pos = wave_peer(code_peers.len(), code_healthy, i, 0);
+                let (id, peer) = (code_ids[pos], Arc::clone(&code_peers[pos]));
                 let sem = Arc::clone(&sem);
                 async move {
                     if code_sink.get(hash).is_some() {
@@ -1122,10 +1124,32 @@ impl SnapStateOracle for PoolOracle {
                         return; // closed semaphore — never bypass the bound
                     };
                     let started = std::time::Instant::now();
-                    // No reputation from these: a cut is simply no code.
-                    if let Ok(code) = wave_request(|| peer.last_response(), |_| false, peer.snap_get_bytecode(hash)).await {
-                        self.stats.observe_code(*hash, started.elapsed());
-                        code_sink.put(hash, code.into());
+                    match wave_request(
+                        || peer.last_response(),
+                        |since| self.link_heard_after(&peer, since),
+                        peer.snap_get_bytecode(hash),
+                    )
+                    .await
+                    {
+                        Ok(code) => {
+                            self.stats.observe_code(*hash, started.elapsed());
+                            code_sink.put(hash, code.into());
+                        }
+                        // A silent peer is judged as in the chunks (PR #534
+                        // review): asked last for the rest of the call, and
+                        // reported outpaced once, on the race's evidence.
+                        Err(WaveFailure::Silent { link_proven }) => {
+                            self.mark_lost(id);
+                            let tally = AttemptTally { cut: true, silence_proven: link_proven, ..Default::default() };
+                            if silence_verdict(tally) && self.first_silence_report(id) {
+                                if let Some(q) = quality {
+                                    q.outpaced(peer.addr()).await;
+                                }
+                            }
+                        }
+                        // A failed code fetch carries no reputation, as before:
+                        // the EVM's own read of that code still runs.
+                        Err(WaveFailure::Failed(_)) => {}
                     }
                 }
             });

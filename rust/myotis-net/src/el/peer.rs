@@ -122,6 +122,23 @@ async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(),
     result
 }
 
+/// Hand a response frame to the request waiting for it, if one still is, and
+/// only then stamp `last_response`: a cut request's late answer can beat its
+/// pending guard's async removal ([`PendingGuard`]), and a frame nobody
+/// receives is no delivered response — counting it would push back every
+/// other request's silence deadline (#320, PR #534 review).
+async fn deliver(pending: &PendingMap, last_response: &SharedLastResponse, id: u64, code: u64, payload: Vec<u8>) {
+    let mut map = pending.lock().await;
+    if map.get(&id).is_none_or(|entry| entry.want_code != code) {
+        return;
+    }
+    if let Some(entry) = map.remove(&id) {
+        if entry.tx.send(Ok(payload)).is_ok() {
+            *last_response.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
+        }
+    }
+}
+
 /// Removes a request's pending-map entry if the owning [`ManagedPeer::request`]
 /// future is DROPPED mid-flight (routine under the backfill pipeline, which
 /// cancels in-flight fetches on truncation). Without this, a cancelled request
@@ -1022,15 +1039,7 @@ async fn read_loop(
         // Otherwise try to correlate a response by (reqId, code). Anything that
         // doesn't match a waiting request is gossip/mempool — ignore it.
         if let Some(id) = request_id {
-            let mut map = pending.lock().await;
-            if let Some(entry) = map.get(&id) {
-                if entry.want_code == code {
-                    let entry = map.remove(&id).expect("just checked present");
-                    *last_response.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(tokio::time::Instant::now());
-                    let _ = entry.tx.send(Ok(frame.payload));
-                }
-            }
+            deliver(&pending, &last_response, id, code, frame.payload).await;
         }
     }
     // Backstop: every break above already set `closed` via `fail_all`, but keep
@@ -1189,6 +1198,30 @@ mod tests {
             assert!(Coverage::Near < Coverage::Unknown);
             assert!(Coverage::Unknown < Coverage::Behind);
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_response_someone_receives_counts_as_delivered() {
+        // PR #534 review: a cut request's late answer could win the race with
+        // its pending guard's removal and still stamp `last_response`.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let heard: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(1, Pending { want_code: 0x14, tx });
+        drop(rx); // the request was cut; its guard has not removed the entry yet
+        deliver(&pending, &heard, 1, 0x14, vec![1]).await;
+        assert!(heard.lock().unwrap().is_none(), "a discarded frame is no sign of life");
+        assert!(pending.lock().await.is_empty());
+        // Another code for the same id is not this request's answer.
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().await.insert(2, Pending { want_code: 0x14, tx });
+        deliver(&pending, &heard, 2, 0x15, vec![2]).await;
+        assert!(heard.lock().unwrap().is_none());
+        assert!(rx.try_recv().is_err(), "still waiting");
+        // The answer a request is waiting for: delivered, and stamped.
+        deliver(&pending, &heard, 2, 0x14, vec![3]).await;
+        assert_eq!(rx.await.unwrap(), Ok(vec![3]));
+        assert!(heard.lock().unwrap().is_some());
     }
 
     #[tokio::test(start_paused = true)]
