@@ -34,19 +34,53 @@ use revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, TxKind, B256, U256};
 use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
-use revm::interpreter::{Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
-use revm::interpreter::interpreter_types::LoopControl;
+use revm::interpreter::{CallInputs, CallOutcome, Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
+use revm::interpreter::interpreter_types::{Jumps, LoopControl};
 
-struct RequestInspector<'a>(&'a dyn SnapStateOracle);
+/// The accounts whose code a discovery pass needed (see [`RequestInspector`]).
+type CodeNeeded = std::cell::RefCell<std::collections::HashSet<[u8; 20]>>;
+
+struct RequestInspector<'a> {
+    oracle: &'a dyn SnapStateOracle,
+    /// Records, during a discovery pass, the accounts whose code the run
+    /// needed: the account each call runs the code of
+    /// (`CallInputs::bytecode_address`), and the one an `EXTCODESIZE` or
+    /// `EXTCODECOPY` inspects. Solidity guards a call to a contract with an
+    /// `EXTCODESIZE`, and against a placeholder (no code) that guard fails
+    /// before the call runs, so the target shows there a pass earlier. The
+    /// pass's wave fetches the code of these and no other (#532 review).
+    /// `None` outside discovery passes.
+    code_needed: Option<&'a CodeNeeded>,
+}
+
 impl<CTX> Inspector<CTX> for RequestInspector<'_> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
-        if self.0.check_request().is_err() {
+        if self.oracle.check_request().is_err() {
             interp.bytecode.set_action(InterpreterAction::Return(InterpreterResult {
                 result: InstructionResult::Stop,
                 output: Default::default(),
                 gas: interp.gas,
             }));
+            return;
         }
+        if let Some(code_needed) = self.code_needed {
+            let opcode = interp.bytecode.opcode();
+            if opcode == revm::bytecode::opcode::EXTCODESIZE || opcode == revm::bytecode::opcode::EXTCODECOPY {
+                if let Ok(word) = interp.stack.peek(0) {
+                    let word = word.to_be_bytes::<32>();
+                    let mut address = [0u8; 20];
+                    address.copy_from_slice(&word[12..]);
+                    code_needed.borrow_mut().insert(address);
+                }
+            }
+        }
+    }
+
+    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if let Some(code_needed) = self.code_needed {
+            code_needed.borrow_mut().insert(inputs.bytecode_address.into_array());
+        }
+        None
     }
 }
 
@@ -67,13 +101,22 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// Speculative-prefetch convergence cap: up to ten sentinel discovery passes,
 /// then the two real runs; a call still discovering at the cap fails closed.
 /// The Java engine's `DEFAULT_ITERATION_CAP` is 4 (two passes), which the Rust
-/// engine kept until #532: every contract a call reaches costs a pass or two,
-/// and the recorded RelayAdapt7702 shield, a wallet's real transaction, still
-/// made 48 of its 57 reads one round-trip at a time behind four iterations,
-/// and none behind twelve. A shallow call stops discovering as soon as a pass
-/// finds nothing new, so the higher cap costs it nothing; the answer never
-/// depends on it.
+/// engine kept until #532: every contract a call reaches costs a pass, and the
+/// recorded RelayAdapt7702 shield, a wallet's real transaction, made 48 of its
+/// 57 reads one round-trip at a time behind four iterations. Twelve, with the
+/// waves fetching the code of each contract a pass called or inspected
+/// ([`EvmExecutor::prefetch_wave`]), leaves it none. A shallow call stops
+/// discovering as soon as a pass finds nothing new, so the higher cap costs it
+/// nothing, and the answer never depends on it.
 const PREFETCH_ITERATION_CAP: usize = 12;
+
+/// How long the convergence loop may keep discovering before it makes its
+/// real runs (#532 review). Each pass is an EVM run plus a wave, and a pass's
+/// yield does not predict the next one's: in the shield a pass that found one
+/// account unlocked one that found 28 slots. So the bound is on time: on a
+/// slow link ten passes must not spend a request budget the serial reads would
+/// have answered within. Past it, the real runs fetch what is left, as before.
+pub const DISCOVERY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Interpret a converged real run for the call path.
 fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
@@ -124,6 +167,8 @@ pub struct EvmExecutor {
     bytecode_cache: Arc<dyn BytecodeCache>,
     /// EVM runs so far (for [`Self::cost`]).
     runs: std::sync::atomic::AtomicU64,
+    /// See [`DISCOVERY_TIME_BUDGET`].
+    discovery_budget: std::time::Duration,
 }
 
 /// What the calls through one executor cost (#532): its EVM runs, and its
@@ -145,7 +190,15 @@ impl EvmExecutor {
             proof_cache,
             bytecode_cache,
             runs: std::sync::atomic::AtomicU64::new(0),
+            discovery_budget: DISCOVERY_TIME_BUDGET,
         }
+    }
+
+    /// This executor with another discovery time budget than
+    /// [`DISCOVERY_TIME_BUDGET`].
+    pub fn with_discovery_budget(mut self, budget: std::time::Duration) -> EvmExecutor {
+        self.discovery_budget = budget;
+        self
     }
 
     /// What the calls through this executor have cost so far (#532).
@@ -283,6 +336,7 @@ impl EvmExecutor {
         self.prefetch_wave(
             ctx,
             &AccessSet { accounts: std::iter::once(tx.from).chain(tx.to).collect(), ..Default::default() },
+            &tx.to.into_iter().collect(),
         );
 
         // The ceiling (geth's `hi`): the executor's budget, lowered by the
@@ -531,6 +585,14 @@ impl EvmExecutor {
         // override included — exactly as for an estimate.
         let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
         let gas_limit = tx.gas.map_or(VIEW_CALL_GAS, |gas| gas.min(VIEW_CALL_GAS));
+        // The sender and the target, with the target's code, in one wave, as
+        // for an estimate: the checks below and the loop's prime read them
+        // (#532 review).
+        self.prefetch_wave(
+            ctx,
+            &AccessSet { accounts: std::iter::once(tx.from).chain(tx.to).collect(), ..Default::default() },
+            &tx.to.into_iter().collect(),
+        );
         // Then geth's checks before the run, in its order, each reported with
         // the limit it was made against — geth's `err: … (supplied gas N)`.
         let supplied = |error: EvmError| EvmError::CallFailed { supplied_gas: gas_limit, error: Box::new(error) };
@@ -594,6 +656,21 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
+        self.execute_recording(db, spec, tx, gas_limit, ctx, None)
+    }
+
+    /// [`Self::execute_with_db`], recording the accounts whose code the run
+    /// needed into `code_needed` when given (a discovery pass; see
+    /// [`RequestInspector`]).
+    fn execute_recording(
+        &self,
+        db: &OracleDatabase,
+        spec: SpecId,
+        tx: &TxRequest,
+        gas_limit: u64,
+        ctx: &BlockContext,
+        code_needed: Option<&CodeNeeded>,
+    ) -> Result<ExecutionResult, EvmError> {
         self.oracle.check_request()?;
         self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cfg = view_cfg(spec, ctx.chain_id);
@@ -603,7 +680,7 @@ impl EvmExecutor {
             .with_ref_db(db)
             .with_block(ctx.block_env())
             .with_cfg(cfg)
-            .build_mainnet_with_inspector(RequestInspector(self.oracle.as_ref()));
+            .build_mainnet_with_inspector(RequestInspector { oracle: self.oracle.as_ref(), code_needed });
 
         let result = evm.inspect_tx(tx);
         // Cancellation takes precedence over an interpreter stop (including a
@@ -715,14 +792,19 @@ impl EvmExecutor {
 
         let mut seen = AccessSet::default();
         let mut discovering = true;
+        let started = std::time::Instant::now();
         for iter in 0..cap {
             self.oracle.check_request()?;
+            if discovering && started.elapsed() >= self.discovery_budget {
+                discovering = false;
+            }
             // Sentinel while still discovering, but the LAST TWO iterations are
             // always real (one final wave + one warm real run).
             let sentinel = discovering && iter + 2 < cap;
             db.set_sentinel(sentinel);
             let misses_before = db.sentinel_misses();
-            let outcome = self.execute_with_db(db, spec, tx, gas_limit, ctx);
+            let code_needed = CodeNeeded::default();
+            let outcome = self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed));
             db.set_sentinel(false);
             let fresh = db.take_access_set().minus(&seen);
 
@@ -753,7 +835,7 @@ impl EvmExecutor {
                 if fresh.is_empty() {
                     discovering = false;
                 } else {
-                    self.prefetch_wave(ctx, &fresh);
+                    self.prefetch_wave(ctx, &fresh, &code_needed.into_inner());
                     seen.merge(fresh);
                 }
             } else {
@@ -764,8 +846,9 @@ impl EvmExecutor {
                     return Ok(result); // converged
                 }
                 // Still discovering under real mode (a sentinel zero had hidden
-                // a branch): warm the stragglers and run again.
-                self.prefetch_wave(ctx, &fresh);
+                // a branch): warm the stragglers and run again. No code to
+                // follow: the next run is real and reads what this one did.
+                self.prefetch_wave(ctx, &fresh, &Default::default());
                 seen.merge(fresh);
             }
         }
@@ -776,7 +859,7 @@ impl EvmExecutor {
     /// slots grouped per account + the touched accounts + code hashes, handed to
     /// the oracle's batch primitive (concurrent per-peer fan-out on the network
     /// oracle; no-op on fixtures).
-    fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet) {
+    fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet, code_needed: &std::collections::HashSet<[u8; 20]>) {
         let mut by_account: std::collections::HashMap<[u8; 20], Vec<U256>> =
             std::collections::HashMap::new();
         for addr in &fresh.accounts {
@@ -794,17 +877,21 @@ impl EvmExecutor {
             &*self.proof_cache,
             &*self.bytecode_cache,
         );
-        // The code of every account the wave just fetched, at once: a newly
-        // reached contract then runs in the next pass, instead of a pass that
-        // only discovers its code hash (#532 review).
+        // The code of every account this wave fetched whose code the pass
+        // needed (called, or inspected by EXTCODESIZE / EXTCODECOPY), at once:
+        // a newly reached contract then runs in the next pass, instead of a
+        // pass that only discovers its code hash (#532 review). Only those: an
+        // account a pass merely read (BALANCE, EXTCODEHASH, the coinbase)
+        // never runs, and its code is not fetched.
         let mut follow: Vec<[u8; 32]> = fresh
             .accounts
             .iter()
+            .filter(|addr| code_needed.contains(*addr))
             .filter_map(|addr| self.proof_cache.get_account(&ctx.state_root, addr).flatten())
             .map(|account| account.code_hash)
             .filter(|hash| {
                 *hash != myotis_core::trie::EMPTY_CODE_HASH
-                    && !code_hashes.contains(hash)
+                    && !fresh.code_hashes.contains(hash)
                     && self.bytecode_cache.get(hash).is_none()
             })
             .collect();
@@ -1119,7 +1206,7 @@ mod tests {
     #[test]
     fn cancelled_instruction_sets_stop_without_running_bytecode() {
         let mut interpreter = Interpreter::default_ext();
-        RequestInspector(&CancelledOracle).step(&mut interpreter, &mut ());
+        RequestInspector { oracle: &CancelledOracle, code_needed: None }.step(&mut interpreter, &mut ());
         assert!(interpreter.bytecode.action().is_some());
     }
 
@@ -1585,11 +1672,14 @@ mod tests {
 
     /// An oracle over a fixture world that counts the reads the EVM waits on
     /// one at a time, and whose prefetch waves really fill the caches (#532).
+    /// Each wave is counted, and takes `wave_delay`.
     #[derive(Default)]
     struct WaveFilling {
         inner: FixtureSnapStateOracle,
         serial_storage: std::sync::atomic::AtomicUsize,
         serial_other: std::sync::atomic::AtomicUsize,
+        waves: std::sync::atomic::AtomicUsize,
+        wave_delay: std::time::Duration,
     }
 
     impl crate::oracle::SnapStateOracle for WaveFilling {
@@ -1613,6 +1703,8 @@ mod tests {
             ps: &dyn crate::cache::StateProofCache,
             cs: &dyn crate::cache::BytecodeCache,
         ) {
+            self.waves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.wave_delay);
             for (addr, slots) in accounts {
                 if let Ok(account) = self.inner.fetch_account(root, *addr) {
                     ps.put_account(root, addr, account);
@@ -1700,6 +1792,64 @@ mod tests {
         exec.estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
         assert_eq!(oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst), storage);
         assert_eq!(oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst), other);
+    }
+
+    #[test]
+    fn a_warm_call_is_its_one_discovery_pass() {
+        // #532 review: a discovery pass that handed out no placeholder read
+        // only verified state, so it is the real run. A warm call makes that
+        // one run and no wave; it used to make a second run, after a wave over
+        // state the caches already held.
+        let (oracle, exec) = three_slot_reader();
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let cold = exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
+        let (runs, waves) = (exec.cost().evm_runs, oracle.waves.load(std::sync::atomic::Ordering::SeqCst));
+        let warm = exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
+        assert_eq!(warm, cold);
+        assert_eq!(exec.cost().evm_runs - runs, 1, "the warm call is one run");
+        assert_eq!(oracle.waves.load(std::sync::atomic::Ordering::SeqCst), waves, "and no wave");
+    }
+
+    #[test]
+    fn discovery_stops_at_its_time_budget_and_the_real_runs_finish() {
+        // #532 review: a pass's yield does not predict the next one's, so the
+        // loop's discovery is bounded in time. Here each wave takes 100 ms
+        // against a 50 ms budget: after the first wave (slot 0) the loop stops
+        // discovering, and its real run reads the second hop (slot K = 5) one
+        // round-trip at a time, to the same answer.
+        // PUSH1 0 SLOAD SLOAD PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+        let world = || {
+            let code = vec![0x60u8, 0x00, 0x54, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+            let mut fx = FixtureSnapStateOracle::new();
+            let ch = fx.with_bytecode(code);
+            let mut k = [0u8; 32];
+            k[31] = 5;
+            fx.with_account(
+                ROOT,
+                TARGET,
+                OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: ch, storage_root: [0x9; 32] },
+            )
+            .with_storage(ROOT, TARGET, [0u8; 32], U256::from(5u64))
+            .with_storage(ROOT, TARGET, k, U256::from(42u64))
+        };
+        let reader = |budget: std::time::Duration| {
+            let oracle = Arc::new(WaveFilling {
+                inner: world(),
+                wave_delay: std::time::Duration::from_millis(100),
+                ..Default::default()
+            });
+            let exec = EvmExecutor::new(
+                Arc::clone(&oracle) as Arc<dyn crate::oracle::SnapStateOracle>,
+                Arc::new(crate::cache::InMemoryStateProofCache::new(64)),
+                Arc::new(crate::cache::InMemoryBytecodeCache::default()),
+            )
+            .with_discovery_budget(budget);
+            let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
+            assert_eq!(U256::from_be_slice(&out), U256::from(42u64));
+            oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert_eq!(reader(std::time::Duration::from_millis(50)), 1, "past the budget, slot K is read one by one");
+        assert_eq!(reader(DISCOVERY_TIME_BUDGET), 0, "within it, both hops come in waves");
     }
 
     #[test]

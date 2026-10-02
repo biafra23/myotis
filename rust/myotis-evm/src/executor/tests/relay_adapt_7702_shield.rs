@@ -183,9 +183,9 @@ fn serial(oracle: &WaveServing) -> usize {
 
 /// #532: estimating the shield took 4–33 s. Its run at the ceiling was a
 /// single real run, which made each of the shield's reads (57 in this world)
-/// one round-trip at a time. Through the convergence loop, with waves that
-/// follow each fetched account to its code and a discovery cap deep enough
-/// for the shield's chain of contracts, every read goes out in a wave.
+/// one round-trip at a time. Through the convergence loop, with a discovery
+/// cap deep enough for the shield's chain of contracts and waves that fetch
+/// the code of each contract a pass reached, every read goes out in a wave.
 #[test]
 fn the_shield_estimate_reads_its_state_in_waves() {
     let (oracle, exec, fixture, requests) = wave_world(true);
@@ -201,16 +201,18 @@ fn the_shield_estimate_reads_its_state_in_waves() {
     assert!(serial(&serial_world) > 50, "{}", serial(&serial_world));
 }
 
-/// The same for a wallet's `eth_call` of the shield: all but the target's
-/// own account and code, which the loop reads before its first pass, come in
-/// waves. And the estimate right after it, as a wallet simulates and then
-/// estimates, has nothing left to read one by one (#532 proposal 5).
+/// The same for a wallet's `eth_call` of the shield: every read comes in a
+/// wave, and the output is the one the same world gives read one by one. The
+/// estimate right after it, as a wallet simulates and then estimates, has
+/// nothing left to read one by one (#532 proposal 5).
 #[test]
 fn the_shield_call_reads_its_state_in_waves_and_leaves_the_estimate_nothing() {
     let (oracle, exec, fixture, requests) = wave_world(true);
-    exec.call_tx(&requests.shield, &fixture.block, fixture.overrides()).unwrap();
-    assert!(serial(&oracle) <= 2, "{}", serial(&oracle));
-    let after_call = serial(&oracle);
+    let output = exec.call_tx(&requests.shield, &fixture.block, fixture.overrides()).unwrap();
+    assert_eq!(serial(&oracle), 0, "every read of the call in a wave");
     exec.estimate_tx(&requests.shield, &fixture.block, fixture.overrides()).unwrap();
-    assert_eq!(serial(&oracle), after_call, "the estimate after the call reads nothing one by one");
+    assert_eq!(serial(&oracle), 0, "the estimate after the call reads nothing one by one");
+    let (serial_world, exec, fixture, requests) = wave_world(false);
+    assert_eq!(exec.call_tx(&requests.shield, &fixture.block, fixture.overrides()).unwrap(), output);
+    assert!(serial(&serial_world) > 50, "{}", serial(&serial_world));
 }

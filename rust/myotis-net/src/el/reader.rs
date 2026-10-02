@@ -8013,10 +8013,12 @@ fn verify_block_receipts(
 /// Log what one EVM call cost (#532): its EVM runs, the state reads it waited
 /// on one at a time and in prefetch waves, and `other_ms` — what is left of
 /// the run once those waits are taken out, mostly the EVM's own time. `setup`
-/// is anchoring the block, before the run. `error` is the executor's error,
-/// which for an estimate includes verified answers such as a revert. An
-/// `eth_estimateGas` logs at info, as it is rare and its tail is what #532
-/// measured; an `eth_call` of a transaction object at debug.
+/// is anchoring the block, before the run. `outcome` is `ok` or the kind of
+/// the executor's error ([`EvmError::kind`]; for an estimate that includes
+/// verified answers such as a revert), never its values, so no address reaches
+/// the log the hosts drain. An `eth_estimateGas` logs at info, as it is rare
+/// and its tail is what #532 measured; an `eth_call` of a transaction object
+/// at debug.
 fn log_call_cost(
     what: &'static str,
     info: bool,
@@ -8028,12 +8030,12 @@ fn log_call_cost(
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let wire = &cost.wire;
     let other = total.saturating_sub(setup).saturating_sub(wire.serial_wait + wire.wave_wait);
-    let error = error.map(ToString::to_string).unwrap_or_default();
+    let outcome = error.map_or("ok", EvmError::kind);
     macro_rules! breakdown {
         ($level:ident) => {
             tracing::$level!(
                 what,
-                error = %error,
+                outcome,
                 total_ms = ms(total),
                 setup_ms = ms(setup),
                 evm_runs = cost.evm_runs,

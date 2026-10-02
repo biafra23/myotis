@@ -56,7 +56,8 @@ struct ViewCache {
 /// Growth is gas-bounded, not attacker-controlled: cold reads cost revm gas
 /// regardless of what this DB returns (sentinel zeros included), so one 30 M
 /// run tops out around ~14k distinct slots / ~11k accounts; `seen` accumulates
-/// ≤4 largely-overlapping iterations and dies with the per-call database.
+/// ≤12 largely-overlapping iterations (`PREFETCH_ITERATION_CAP`) and dies
+/// with the per-call database.
 #[derive(Debug, Default, Clone)]
 pub struct AccessSet {
     pub accounts: std::collections::HashSet<[u8; 20]>,
