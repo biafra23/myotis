@@ -1581,6 +1581,9 @@ pub struct ElReader {
     fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Permits for the fee computes a read left running ([`FEE_COMPUTES_MAX`]).
     fee_compute_permits: Arc<tokio::sync::Semaphore>,
+    /// The pre-broadcast check's detached account reads in flight (#531;
+    /// [`send_check::DETACHED_READS_MAX`]).
+    send_check_permits: Arc<tokio::sync::Semaphore>,
     /// Signalled whenever a fee compute stores its result or its failure: the
     /// reads waiting on a compute already in flight ([`Self::wait_for_fee`]).
     fee_stored: tokio::sync::Notify,
@@ -1768,6 +1771,7 @@ impl ElReader {
             fee_fill: tokio::sync::Mutex::new(()),
             fee_follow_task: std::sync::Mutex::new(None),
             fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
+            send_check_permits: Arc::new(tokio::sync::Semaphore::new(send_check::DETACHED_READS_MAX)),
             fee_stored: tokio::sync::Notify::new(),
         })
     }
@@ -7006,8 +7010,10 @@ impl ElReader {
                 return Err(SendError::Rejected(reason));
             }
             PreBroadcast::Unchecked(why) => {
-                // The head's age, to measure how often a send goes unjudged.
-                tracing::info!(tx = %tx_hash, why, head_age_s = ?self.head_age_s(), "pre-broadcast check skipped");
+                // The head's age by its timestamp and since this node adopted
+                // it, to measure how often a send goes unjudged, and why.
+                let (head_age_s, head_adopted_s_ago) = self.head_ages_s();
+                tracing::info!(tx = %tx_hash, why, ?head_age_s, ?head_adopted_s_ago, "pre-broadcast check skipped");
             }
             PreBroadcast::Passed => {}
         }
@@ -7074,10 +7080,12 @@ impl ElReader {
     /// [`send_check::ACCOUNT_READ_BUDGET`]. Everything that keeps it from
     /// judging is [`PreBroadcast::Unchecked`], and the send goes out as before.
     ///
-    /// The read runs detached and is waited for, not cut, at the budget: a
-    /// read dropped mid-request can tear its peer's connection
-    /// ([`hedged_race`]'s note), right before the broadcast wants that peer.
-    /// Registered like a host request, so a pause or stop still cancels it.
+    /// The read runs detached: the check stops waiting at the budget and the
+    /// read runs on for up to [`send_check::DETACHED_READ_BUDGET`] rather than
+    /// being cut, since a read dropped mid-request can tear its peer's
+    /// connection ([`hedged_race`]'s note) right before the broadcast wants
+    /// that peer. Registered like a host request, so a pause or stop still
+    /// cancels it, and at most [`send_check::DETACHED_READS_MAX`] at once.
     async fn pre_broadcast_check(self: &Arc<Self>, tx: Option<&TxSummary>) -> PreBroadcast {
         let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return PreBroadcast::Unchecked("wall clock unreadable");
@@ -7086,8 +7094,19 @@ impl ElReader {
             Ok(ready) => ready,
             Err(why) => return PreBroadcast::Unchecked(why),
         };
+        // A Tor-routed read answers at a fresh session's own head, never at the
+        // anchored root, so it could never judge: spare the send its wait and
+        // the circuit (docs/privacy-and-tor.md).
+        #[cfg(feature = "tor")]
+        if crate::el::tor::is_enabled() {
+            return PreBroadcast::Unchecked("Tor reads are not at the anchored root");
+        }
+        let Ok(permit) = Arc::clone(&self.send_check_permits).try_acquire_owned() else {
+            return PreBroadcast::Unchecked("account reads busy");
+        };
         let reader = Arc::clone(self);
         let read = tokio::spawn(async move {
+            let _permit = permit;
             reader
                 .request_with_budget(send_check::DETACHED_READ_BUDGET, reader.get_account(ReadAnchor::Head, from))
                 .await
@@ -7125,10 +7144,15 @@ impl ElReader {
         Ok((tx, from, head))
     }
 
-    /// The optimistic head's age by its proven timestamp, for the skip log.
-    fn head_age_s(&self) -> Option<u64> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        Some(now.saturating_sub(self.anchor.optimistic_head_state()?.timestamp))
+    /// The current optimistic head's age, for the skip log: by its proven
+    /// timestamp against the wall clock, and since this node adopted it on
+    /// its monotonic clock — the two freshness bounds, apart.
+    fn head_ages_s(&self) -> (Option<u64>, Option<u64>) {
+        let Some(head) = self.anchor.optimistic_head_state() else {
+            return (None, None);
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
+        (now.map(|now| now.as_secs().saturating_sub(head.timestamp)), Some(head.adopted.elapsed().as_secs()))
     }
 
     /// The "pending" nonce overlay (the Java `pendingNonceOverlay` twin): raise
@@ -13848,6 +13872,22 @@ mod pre_broadcast_tests {
             reader.send_raw_transaction(&spec_tx()).await,
             Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn a_send_goes_unchecked_while_reads_are_busy() {
+        // At most DETACHED_READS_MAX detached reads at once: past that a send
+        // goes out unchecked rather than pile reads onto slow peers.
+        let reader = offline_reader(Some(now_unix() - 5)).await;
+        let tx = tx::decode_summary(&spec_tx());
+        let all = Arc::clone(&reader.send_check_permits)
+            .acquire_many_owned(send_check::DETACHED_READS_MAX as u32)
+            .await
+            .unwrap();
+        assert_eq!(reader.pre_broadcast_check(tx.as_ref()).await, PreBroadcast::Unchecked("account reads busy"));
+        drop(all);
+        // With a permit free the read runs; offline, it finds no peer.
+        assert_eq!(reader.pre_broadcast_check(tx.as_ref()).await, PreBroadcast::Unchecked("account read failed"));
     }
 
     #[tokio::test]

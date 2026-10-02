@@ -9,9 +9,11 @@
 //!
 //! The check fails OPEN. Anything that stops it from judging (an undecodable
 //! transaction — a blob transaction's network form among them — an
-//! unrecovered sender, another chain's transaction, a stale head, a slow
-//! account read or one not proven at the head's own root) broadcasts the
-//! transaction as before: a node that lags the chain must never block a send.
+//! unrecovered sender, another chain's transaction, a stale head, an
+//! unreadable wall clock, Tor-routed reads, too many reads already in flight,
+//! a slow account read or one not proven at the head's own root) broadcasts
+//! the transaction as before: a node that lags the chain must never block a
+//! send.
 
 use std::time::Duration;
 
@@ -30,8 +32,13 @@ pub const FRESH_HEAD_GRACE: Duration = Duration::from_secs(6);
 pub const ACCOUNT_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long the read may run on, detached, after the check stopped waiting
-/// for it: it is left to finish rather than cut mid-request.
+/// for it: up to this rather than cut at [`ACCOUNT_READ_BUDGET`], since a read
+/// cut mid-request can tear its peer's connection.
 pub const DETACHED_READ_BUDGET: Duration = Duration::from_secs(20);
+
+/// The most such reads in flight at once; past that a send goes unchecked
+/// rather than pile reads onto slow peers (the fee computes' cap, #532).
+pub const DETACHED_READS_MAX: usize = 4;
 
 /// How old a head may be to judge a send by: two block times plus
 /// [`FRESH_HEAD_GRACE`].
