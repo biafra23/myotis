@@ -111,19 +111,25 @@ verdict:
 **Arguments.** The addon makes the checks the JSON-RPC routers make on the
 other hosts before they call the engine, and refuses what fails them as
 `-32602`, before the handle is consulted: a NUL byte in a string argument
-(`{"error":"argument contains NUL","code":-32602}`), a malformed address or
-hash, reward percentiles that are not JSON numbers in [0, 100] in
-non-decreasing order (at most 100; `''`, `null` or `[]` ask for no reward
-column), an empty import list, and a `blockCount` that is not a safe integer.
-A short storage `position` such as `0x0` is padded to its 32-byte word.
-`estimateGasJson` and `sendRawTransactionJson` refuse a NUL byte the same way
-since #503; their refusal used to carry no `code`. Block numbers:
+(`{"error":"argument contains NUL","code":-32602}`); a malformed address,
+hash, call data, `value` (decimal wei) or raw transaction; reward percentiles
+that are not JSON numbers in [0, 100] in non-decreasing order (at most 100;
+`''`, `null` or `[]` ask for no reward column); an empty import list; and a
+`blockCount` that is not a safe integer. Each check mirrors the engine's own
+parse, so nothing it would serve is refused. A short storage `position` such
+as `0x0` is padded to its 32-byte word. The older `requestAccountJson`,
+`estimateGasJson` and `sendRawTransactionJson` are checked the same way since
+#503; the engine's own refusals of their arguments carry no `code`.
+`ethCallJson`, `ethCallTxJson` and `estimateGasTxJson` get theirs from the
+engine. Block numbers:
 
-- `getBlockByNumberJson`, `getBlockReceiptsJson` and `feeHistoryJson` take a
-  tag or a `0x`-number. Bare digits are refused: the engine would read them as
-  hex there.
-- The state reads, `ethCallJson` and `ethCallOverridesJson` also take bare
-  decimal digits, as `ethCallJson` always has (below).
+- `getBlockByNumberJson` and `feeHistoryJson` take a tag or a `0x`-number.
+  Bare digits are refused: the engine would read them as hex there.
+  `getBlockReceiptsJson` refuses them too, up front; the engine would refuse
+  them only once the handle runs.
+- The state reads and the calls (`ethCallJson`, `ethCallTxJson`,
+  `ethCallOverridesJson`, `estimateGasTxJson`) also take bare decimal digits,
+  as `ethCallJson` always has (below).
 
 Convert a JSON-RPC quantity to a JS number before passing `blockCount` or
 `minedNonce`.
@@ -139,10 +145,12 @@ reaches, never an empty array:
 // at the top level: maxSpeed, backfillPaused.
 await myotis.setLogIndexConfig(h, JSON.stringify({
   enabled: true, watch: [{ address: '0x…', fromBlock: 14737691 }],
-}));     // '{"ok":true}', or '{"ok":false}': refused, and the engine logs why (drainLogs)
+}));     // '{"ok":true}', or '{"ok":false}': an invalid config (the engine logs
+         // why; drainLogs) or no running EL reader
 JSON.parse(await myotis.logIndexStatusJson(h));
-// { enabled, logCount, maxSpeed, backfillPaused, headGap?, …,
+// { enabled, logCount, maxSpeed?, backfillPaused?, headGap?, …,
 //   entries: [{ address, fromBlock, name?, coveredLow?, coveredHigh? }] }
+// (an index never configured: { enabled: false, logCount: 0, entries: [] })
 ```
 
 `importLogIndexFiles(h, pathsJson)` merges snapshot files into the index, as
@@ -161,9 +169,10 @@ submission. So:
 
 - A `logIndexStatusJson` poll waits behind a slow read. Poll the synchronous
   `statusJson` for liveness.
-- An import observes neither the budget nor a cancellation. It holds its
-  handle's slot until it finishes, and `stop` or `pause`, synchronous on the
-  JS thread, wait for it.
+- Once it runs, an import observes neither the budget nor a cancellation. It
+  holds its handle's slot until it finishes, and `stop` or `pause`,
+  synchronous on the JS thread, wait for it. (Queued, it expires and is
+  cancelled like any request.)
 - `getLogsJson`'s result is not capped. A host serving untrusted pages bounds
   the block range itself.
 

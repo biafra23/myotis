@@ -285,7 +285,7 @@ pub fn accept_stale_anchor(env: &Env, handle: i64) -> bool {
 /// refuses: omitted or a head tag proves at the verified head, `finalized` at
 /// the beacon-finalized block, a number only inside [head-64, head+16]
 /// (`{"error","code":-32602}` otherwise); the result names the block it
-/// proved at (`anchor`).
+/// proved at (`anchor`). A malformed address is refused the same way (#503).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn request_account_json<'env>(
     env: &'env Env,
@@ -294,11 +294,14 @@ pub fn request_account_json<'env>(
     block: Option<String>,
 ) -> Result<Object<'env>> {
     let block = block.unwrap_or_default();
-    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&block)) {
-        (Ok(a), Ok(b)) => {
-            take(unsafe { myotis_request_account_json(handle, a.as_ptr(), b.as_ptr()) })
+    scheduler::submit(env, handle, move || {
+        let (Ok(a), Ok(b)) = (c_arg(&address), c_arg(&block)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
+        if !hex_of_len(&address, 20) {
+            return invalid_params("invalid address (expected 20-byte hex)");
         }
-        _ => NUL_INVALID_PARAMS.to_string(),
+        take(unsafe { myotis_request_account_json(handle, a.as_ptr(), b.as_ptr()) })
     })
 }
 
@@ -330,7 +333,11 @@ pub fn eth_call_json<'env>(env: &'env Env,
     })
 }
 
-/// Verified eth_estimateGas (local EVM metering + safety buffer).
+/// Verified eth_estimateGas (local EVM metering + safety buffer). `to` is
+/// required; `from` empty = anonymous sender; `value` is wei as a decimal
+/// string. A malformed argument is refused as the permanent
+/// `{"error","code":-32602}` (#503), where the engine's own refusal of one
+/// carries no code.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn estimate_gas_json<'env>(env: &'env Env,
     handle: i64,
@@ -340,13 +347,23 @@ pub fn estimate_gas_json<'env>(env: &'env Env,
     value: String,
 ) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || {
-        match (c_arg(&from), c_arg(&to), c_arg(&data), c_arg(&value)) {
-            (Ok(f), Ok(t), Ok(d), Ok(v)) => take(unsafe {
-                myotis_estimate_gas_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr())
-            }),
-            // Permanent, like every other provider read's (#503).
-            _ => NUL_INVALID_PARAMS.to_string(),
+        let (Ok(f), Ok(t), Ok(d), Ok(v)) = (c_arg(&from), c_arg(&to), c_arg(&data), c_arg(&value)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
+        // The engine's checks, in its order.
+        if !hex_of_len(&to, 20) {
+            return invalid_params("invalid 'to' address (expected 20-byte hex)");
         }
+        if !from.trim().is_empty() && !hex_of_len(&from, 20) {
+            return invalid_params("invalid 'from' address (expected 20-byte hex)");
+        }
+        if !data.trim().is_empty() && !hex_bytes(&data) {
+            return invalid_params("invalid call data (expected hex)");
+        }
+        if !value.trim().is_empty() && !decimal_u256(value.trim()) {
+            return invalid_params("invalid value (expected decimal wei)");
+        }
+        take(unsafe { myotis_estimate_gas_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr()) })
     })
 }
 
@@ -431,12 +448,21 @@ pub fn fee_estimate_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'en
 }
 
 /// Gossip a signed raw transaction to devp2p peers: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`.
+/// Hex that is no transaction, or none, is refused as the permanent
+/// `{"error","code":-32602}` (#503), where the engine's own refusal carries no
+/// code.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&raw_tx_hex) {
-        Ok(r) => take(unsafe { myotis_send_raw_transaction_json(handle, r.as_ptr()) }),
-        // Permanent, like every other provider read's (#503).
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let Ok(r) = c_arg(&raw_tx_hex) else { return NUL_INVALID_PARAMS.to_string() };
+        if !hex_bytes(&raw_tx_hex) {
+            return invalid_params("invalid raw transaction hex");
+        }
+        let h = raw_tx_hex.strip_prefix("0x").or_else(|| raw_tx_hex.strip_prefix("0X")).unwrap_or(&raw_tx_hex);
+        if h.is_empty() {
+            return invalid_params("empty raw transaction");
+        }
+        take(unsafe { myotis_send_raw_transaction_json(handle, r.as_ptr()) })
     })
 }
 
@@ -483,13 +509,16 @@ pub fn eth_call_overrides_json<'env>(env: &'env Env,
 // call it on the other hosts; this binding has no router in front of it, so it
 // makes those checks here, before the engine, each refused as the permanent
 // `-32602` the routers answer: a NUL byte in a string; a block number in bare
-// digits where the engine would read them as HEX (the block, receipts and
-// fee-history selectors — the state reads and eth_call read them as decimal,
-// as ethCallJson always has, and keep doing so); a malformed address or hash,
-// which the engine refuses in a shape that looks retryable; reward percentiles
-// out of range or order; an empty import list; and a count or nonce that is
-// not a safe integer. A short storage position (`0x0`, as dApps send it) is
-// padded to its 32-byte word, as the routers pad it.
+// digits for the block, receipts and fee-history selectors (the first and last
+// would read them as HEX; the state reads and the calls read them as decimal,
+// as ethCallJson always has, and keep doing so); a malformed address, hash,
+// call data, value or raw transaction, which the engine refuses in a shape
+// that looks retryable (here and in requestAccountJson, estimateGasJson and
+// sendRawTransactionJson above); reward percentiles out of range or order; an
+// empty import list; and a count or nonce that is not a safe integer. A short
+// storage position (`0x0`, as dApps send it) is padded to its 32-byte word, as
+// the routers pad it. Each check mirrors the engine's own parse, so nothing it
+// would serve is refused.
 
 /// A permanent refusal of the request: `{"error": why, "code": -32602}`.
 fn invalid_params(why: &str) -> String {
@@ -501,10 +530,12 @@ fn safe_integer(n: f64) -> bool {
     n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
 }
 
-/// A block number in bare digits, which the block, receipts and fee-history
-/// selectors would take as HEX — `"23500000"` a block far past the head, or a
-/// smaller number silently the wrong block — while a JS caller means decimal.
-/// The JSON-RPC routers refuse it, and so do those reads.
+/// A block number in bare digits, which the block and fee-history selectors
+/// would take as HEX — `"23500000"` a block far past the head, or a smaller
+/// number silently the wrong block — while a JS caller means decimal. The
+/// JSON-RPC routers refuse it, and so do those reads; the receipts selector
+/// is refused up front too, which the engine refuses only once the handle
+/// runs.
 fn bare_digits(selector: &str) -> bool {
     let s = selector.trim();
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
@@ -515,6 +546,24 @@ fn bare_digits(selector: &str) -> bool {
 fn hex_of_len(s: &str, len: usize) -> bool {
     let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     h.len() == 2 * len && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Hex bytes of any length up to 1 MiB, `0x` optional: the engine's parser
+/// for call data and raw transactions, mirrored.
+fn hex_bytes(s: &str) -> bool {
+    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    h.len() <= 2 * 1024 * 1024 && h.len().is_multiple_of(2) && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A wei amount as the engine parses it (ruint's radix 10): decimal digits,
+/// `_` ignored, at most `U256::MAX`.
+fn decimal_u256(s: &str) -> bool {
+    const U256_MAX: &str = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    if !s.bytes().all(|b| b.is_ascii_digit() || b == b'_') {
+        return false;
+    }
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).skip_while(|&c| c == '0').collect();
+    digits.len() < U256_MAX.len() || (digits.len() == U256_MAX.len() && digits.as_str() <= U256_MAX)
 }
 
 /// A storage position as the engine reads it, `0x` and 64 hex digits; a shorter
@@ -530,7 +579,8 @@ fn storage_word(position: &str) -> Option<String> {
 /// engine leaves range and order to its caller): `''`, `null` or `[]` ask for
 /// no reward column — geth answers none for an empty list — and anything else
 /// must be JSON numbers in [0, 100], non-decreasing, at most 100. What to hand
-/// the engine, or the refusal.
+/// the engine — the numbers re-serialised, as the routers hand them over, so
+/// long numerals cannot overrun its 4 KiB bound — or the refusal.
 fn reward_percentiles(json: &str) -> std::result::Result<String, String> {
     let json = json.trim();
     if json.is_empty() || json == "null" {
@@ -558,7 +608,7 @@ fn reward_percentiles(json: &str) -> std::result::Result<String, String> {
         }
         last = d;
     }
-    Ok(json.to_string())
+    Ok(parsed.to_string())
 }
 
 /// importLogIndexFiles' paths: a non-empty JSON array of non-empty strings.
@@ -880,13 +930,40 @@ mod tests {
         assert_eq!(reward_percentiles("null").as_deref(), Ok(""));
         // geth answers no reward column for an empty list.
         assert_eq!(reward_percentiles(" [] ").as_deref(), Ok(""));
-        assert_eq!(reward_percentiles("[25, 50, 50, 75]").as_deref(), Ok("[25, 50, 50, 75]"));
+        assert_eq!(reward_percentiles("[25, 50, 50, 75]").as_deref(), Ok("[25,50,50,75]"));
+        // Re-serialised, a list of long numerals fits the engine's 4 KiB bound.
+        let long = format!("[{}]", vec!["50.000000000000000000000000000000000000001"; 100].join(","));
+        assert!(long.len() > 4096);
+        assert_eq!(reward_percentiles(&long).map(|p| p.len() <= 4096), Ok(true));
         for bad in ["[75, 25]", "[101]", "[-1]", "[\"50\"]", "{\"p\":1}", "not json"] {
             let refusal = reward_percentiles(bad).expect_err(bad);
             assert!(refusal.contains("\"code\":-32602"), "{bad}: {refusal}");
         }
         let many = format!("[{}]", vec!["50"; 101].join(","));
         assert!(reward_percentiles(&many).is_err());
+    }
+
+    #[test]
+    fn call_data_and_raw_transactions_are_checked_as_the_engine_parses_them() {
+        for ok in ["0x", "", "0xdeadBEEF", "00ff"] {
+            assert!(hex_bytes(ok), "{ok}");
+        }
+        for bad in ["0xabc", "0xzz", " 0x00", "0x0g"] {
+            assert!(!hex_bytes(bad), "{bad}");
+        }
+        assert!(hex_bytes(&"ab".repeat(1024 * 1024)) && !hex_bytes(&"ab".repeat(1024 * 1024 + 1)));
+    }
+
+    #[test]
+    fn a_value_is_decimal_wei_up_to_u256_max() {
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        for ok in ["0", "1000000000000000000", max, "1_000", "_", &format!("000{max}")] {
+            assert!(decimal_u256(ok), "{ok}");
+        }
+        let over = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+        for bad in [over, &format!("{max}0"), "0x10", "1e18", "-1", "+1", "1.5", " 1"] {
+            assert!(!decimal_u256(bad), "{bad}");
+        }
     }
 
     #[test]

@@ -299,14 +299,22 @@ test('a well-formed read reaches the engine: a not-started handle is a plain, re
       assert.deepEqual(JSON.parse(await read(h)), notStartedFor(name), name);
     }
     // What the addon passes on rather than refuses: a short storage position
-    // (padded to its word), no reward column, and bare decimal digits where
-    // the engine reads them as decimal.
+    // (padded to its word), no reward column, long numerals (re-serialised to
+    // fit the engine's bound), bare decimal digits where the engine reads them
+    // as decimal, and well-formed arguments to the older calls it now checks.
+    const longPercentiles = `[${Array(100).fill('50.000000000000000000000000000000000000001').join(',')}]`;
+    assert.ok(longPercentiles.length > 4096);
     for (const [label, call] of [
       ['storage position 0x0', () => m.getStorageAtJson(h, ADDR, '0x0')],
       ['no reward column', () => m.feeHistoryJson(h, 4, 'latest', '[]')],
       ['omitted percentiles', () => m.feeHistoryJson(h, 4, 'latest')],
+      ['long percentile numerals', () => m.feeHistoryJson(h, 4, 'latest', longPercentiles)],
       ['code at decimal digits', () => m.getCodeJson(h, ADDR, '23500000')],
       ['override call at decimal digits', () => m.ethCallOverridesJson(h, '', ADDR, '', '', '23500000', '')],
+      ['account', () => m.requestAccountJson(h, ADDR)],
+      ['estimate', () => m.estimateGasJson(h, ADDR, ADDR, '0xdeadbeef', '1000000000000000000')],
+      ['estimate without from, data or value', () => m.estimateGasJson(h, '', ADDR, '', '')],
+      ['send', () => m.sendRawTransactionJson(h, '0x02f86c')],
     ]) {
       assert.deepEqual(JSON.parse(await call()), NOT_STARTED, label);
     }
@@ -330,6 +338,8 @@ test('a NUL byte in a string argument is a permanent refusal (#503)', { skip }, 
     // The two older calls whose NUL refusal carried no code now match.
     assert.deepEqual(JSON.parse(await m.estimateGasJson(h, '\0', ADDR, '', '')), nul, 'estimateGasJson');
     assert.deepEqual(JSON.parse(await m.sendRawTransactionJson(h, '0x\0')), nul, 'sendRawTransactionJson');
+    // The overlay answers -1 on a handle that never started anyway, so this
+    // pins only that a NUL comes back in-band rather than as an exception.
     assert.equal(m.pendingNonceOverlay(h, '0x\0', 5), -1);
   });
 });
@@ -361,6 +371,14 @@ test('a request that can never be served is refused permanently, before the hand
         invalid('invalid storage position (expected hex of at most 32 bytes)')],
       ['empty import', () => m.importLogIndexFiles(h, '[]'), invalid('expected a non-empty JSON array of file paths')],
       ['import of a non-path', () => m.importLogIndexFiles(h, '[""]'), invalid('expected a non-empty JSON array of file paths')],
+      // The older calls, which the engine would refuse with a plain error.
+      ['account address', () => m.requestAccountJson(h, '0xdead'), invalid('invalid address (expected 20-byte hex)')],
+      ['estimate without to', () => m.estimateGasJson(h, '', '', '', ''), invalid("invalid 'to' address (expected 20-byte hex)")],
+      ['estimate from', () => m.estimateGasJson(h, '0x12', ADDR, '', ''), invalid("invalid 'from' address (expected 20-byte hex)")],
+      ['estimate data', () => m.estimateGasJson(h, '', ADDR, '0xabc', ''), invalid('invalid call data (expected hex)')],
+      ['estimate value in hex', () => m.estimateGasJson(h, '', ADDR, '', '0x10'), invalid('invalid value (expected decimal wei)')],
+      ['send empty', () => m.sendRawTransactionJson(h, '0x'), invalid('empty raw transaction')],
+      ['send not hex', () => m.sendRawTransactionJson(h, '0xzz'), invalid('invalid raw transaction hex')],
     ];
     for (const [label, call, expected] of refusals) {
       assert.deepEqual(JSON.parse(await call()), expected, label);

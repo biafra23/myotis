@@ -156,8 +156,11 @@ async function queries(status) {
   if (fees.error) { console.error('fee estimate failed'); failures++; }
 
   // #503: the provider reads a dApp page asks next — the head block, a fee
-  // history and a receipt. The receipt's transaction comes from the finalized
-  // block, which no reorg can take back between the two reads.
+  // history and receipts. A receipt by transaction hash is looked up near the
+  // head only (the reader scans the last 8 blocks for a hash it has not seen
+  // before), so that check takes the head block's first transaction. The
+  // receipts read by block takes the finalized block, which no reorg can
+  // take back between two reads.
   const block = await timed('block latest', m.getBlockByNumberJson(handle, 'latest'));
   if (!block?.number || !Array.isArray(block.transactions)) {
     console.error('latest block failed:', JSON.stringify(block)); failures++;
@@ -167,19 +170,35 @@ async function queries(status) {
   if (!history.oldestBlock || !Array.isArray(history.reward)) {
     console.error('fee history failed:', JSON.stringify(history)); failures++;
   }
+  const txHash = block?.transactions?.[0];
+  if (txHash) {
+    const receipt = await timed('receipt of the head block\'s first tx',
+      m.getTransactionReceiptJson(handle, txHash));
+    if (receipt === null) {
+      // A reorg between the two reads replaces the block: no engine fault.
+      const again = await timed('block again', m.getBlockByNumberJson(handle, block.number));
+      if (again?.hash && again.hash !== block.hash) {
+        log('receipt check skipped: the head block was reorged between the reads');
+      } else {
+        console.error('receipt failed: not found for', txHash); failures++;
+      }
+    } else if (receipt?.transactionHash !== txHash || receipt.blockNumber !== block.number) {
+      console.error('receipt failed:', JSON.stringify(receipt)); failures++;
+    }
+  } else if (block?.number) {
+    log('receipt check skipped: the head block carries no transaction');
+  }
   const finalized = await timed('block finalized', m.getBlockByNumberJson(handle, 'finalized'));
   if (!finalized?.number || !Array.isArray(finalized.transactions)) {
     console.error('finalized block failed:', JSON.stringify(finalized)); failures++;
-  }
-  const txHash = finalized?.transactions?.[0];
-  if (txHash) {
-    const receipt = await timed('receipt of the finalized block\'s first tx',
-      m.getTransactionReceiptJson(handle, txHash));
-    if (receipt?.transactionHash !== txHash || receipt.blockNumber !== finalized.number) {
-      console.error('receipt failed:', JSON.stringify(receipt)); failures++;
+  } else {
+    const receipts = await timed('receipts of the finalized block',
+      m.getBlockReceiptsJson(handle, finalized.number));
+    const first = finalized.transactions[0];
+    if (!Array.isArray(receipts) || receipts.length !== finalized.transactions.length ||
+        (first && (receipts[0]?.transactionHash !== first || receipts[0]?.blockNumber !== finalized.number))) {
+      console.error('block receipts failed:', JSON.stringify(receipts)?.slice(0, 400)); failures++;
     }
-  } else if (finalized?.number) {
-    log('receipt check skipped: the finalized block carries no transaction');
   }
 
   // Warm-path timing: repeat the ENS resolve now that caches are hot.
