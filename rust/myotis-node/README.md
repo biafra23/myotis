@@ -166,8 +166,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   — copying `cl-peers[-net].cache` from the old directory into the new one is
   safe (it holds peers, not trust) and shortens the cold start.
 - **`ethCallJson`'s `block`** (checked by the engine since ABI 27, #452): a
-  head tag (`latest`/`pending`/`safe`) or `''` runs against the **verified
-  head's** state. `finalized` (since ABI 30, #465) runs against the
+  head tag (`latest`/`pending`) or `''` runs against the **verified head's**
+  state. `safe` is refused as invalid params (`code: -32602`; before #366 it
+  ran against the head — another block, as nothing here tracks the safe head). `finalized` (since ABI 30, #465) runs against the
   **beacon-finalized block** — older and never reorged, but a state peers may
   already have pruned, so it can fail retryably while `latest` serves (engines
   before ABI 30 ran it against the head). Every result carries `blockNumber`

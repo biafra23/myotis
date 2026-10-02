@@ -182,6 +182,14 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsFinalizedTag() {
+        // Applied on every selector-taking read (see the class doc): calls and
+        // block reads since ABI 30, the account/code/storage/nonce reads since
+        // ABI 32 — they run against, or prove at, the beacon-finalized block.
+        return true;
+    }
+
+    @Override
     public byte[] callWithOverrides(
             byte[] from,
             byte[] to,
@@ -528,7 +536,7 @@ final class RustVerifiedReads implements VerifiedReads {
 
     /**
      * Whether a block selector can be served from the anchored head. Accepts the
-     * head tags (latest/pending/safe/finalized/default) AND a specific block NUMBER
+     * head tags (latest/pending/finalized/default; never safe, #366) AND a specific block NUMBER
      * within [head-64, head+16] — wallets (MetaMask) pin reads to the number they
      * just got from eth_blockNumber, which is at/near the head; rejecting those
      * left every number-pinned getBalance/getCode erroring. A genuinely older block

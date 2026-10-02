@@ -1,6 +1,7 @@
 package io.myotis.jsonrpc
 
 import io.myotis.api.VerifiedReads
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -388,6 +389,11 @@ class RpcRouterTest {
 
         override fun supportsContractCreation(): Boolean = serveCreation
 
+        /** Whether this fake applies `finalized` (the Rust engine does; the Java
+         *  engine answers it from the head, so it says no). */
+        var finalizedTag: Boolean = true
+        override fun supportsFinalizedTag(): Boolean = finalizedTag
+
         override fun callWithOverrides(from: ByteArray?, to: ByteArray?, data: ByteArray,
                                        valueWei: String?, block: String,
                                        stateOverridesJson: String): ByteArray? {
@@ -418,11 +424,23 @@ class RpcRouterTest {
             revertData?.let { return io.myotis.api.CallResult.reverted(it) }
             return super.callDetailed(from, to, data, valueWei, block, stateOverridesJson)
         }
-        override fun getBalance(address: ByteArray, block: String): String? = balance?.toString()
-        override fun getTransactionCount(address: ByteArray, block: String): Long? = nonce
-        override fun getCode(address: ByteArray, block: String): ByteArray? = code
+        /** The selector the last state read was asked for; null = none was asked. */
+        var lastStateBlock: String? = null
+        /** When set, getBalance throws it — a handler failure the router must contain. */
+        var balanceThrows: RuntimeException? = null
+        override fun getBalance(address: ByteArray, block: String): String? {
+            lastStateBlock = block
+            balanceThrows?.let { throw it }
+            return balance?.toString()
+        }
+        override fun getTransactionCount(address: ByteArray, block: String): Long? {
+            lastStateBlock = block; return nonce
+        }
+        override fun getCode(address: ByteArray, block: String): ByteArray? {
+            lastStateBlock = block; return code
+        }
         override fun getStorageAt(address: ByteArray, slot: ByteArray, block: String): ByteArray? {
-            lastSlot = slot; return storage
+            lastStateBlock = block; lastSlot = slot; return storage
         }
         var lastRawTx: ByteArray? = null
         var txHash: ByteArray? = null
@@ -744,7 +762,7 @@ class RpcRouterTest {
         val b = FakeBackend(storage = ByteArray(32))
         val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt",
                "params":["0xabc0000000000000000000000000000000000001","0x"]}""")
-        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))
         assertNull(b.lastSlot)
     }
 
@@ -1004,7 +1022,7 @@ class RpcRouterTest {
         val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
         val resp = route(b,
             """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["0xnothex",false]}""")
-        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))
         assertNull(b.lastBlockHash)  // backend never called
     }
 
@@ -1014,7 +1032,7 @@ class RpcRouterTest {
         val b = FakeBackend().apply { blockByHashJson = """{"number":"0x10"}""" }
         val resp = route(b,
             """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByHash","params":["0x1234",false]}""")
-        assertTrue(hasError(resp))
+        assertEquals(-32602, errorCode(resp))
         assertNull(b.lastBlockHash)  // backend never called
     }
 
@@ -1026,12 +1044,17 @@ class RpcRouterTest {
         assertTrue(json.parseToJsonElement(resp).jsonObject["result"] is kotlinx.serialization.json.JsonNull)
     }
 
-    @Test fun getBlockByNumber_nonBooleanFullTxFlag_fallsThrough() {
-        // present-but-non-boolean flag (1) must not be coerced to false → strict error.
-        val resp = route(FakeBackend().apply { blockJson = """{"number":"0x1"}""" },
-            """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",1]}""")
-        assertTrue(hasError(resp))
-        assertEquals(-32000, errorCode(resp))
+    @Test fun getBlockByNumber_nonBooleanFullTxFlag_isInvalidParams() {
+        // A present-but-non-boolean flag must not be coerced to false and answered
+        // in a shape the caller did not ask for — and no retry fixes it, so it is
+        // the permanent -32602, not the retryable -32000 (#366).
+        for (flag in listOf("1", "\"true\"", "{}")) {
+            val b = FakeBackend().apply { blockJson = """{"number":"0x1"}""" }
+            val resp = route(b,
+                """{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["latest",$flag]}""")
+            assertEquals(-32602, errorCode(resp), flag)
+            assertNull(b.lastBlockTag, flag)
+        }
     }
 
     @Test fun getBlockByNumber_cannotVerify_errors() {
@@ -1354,6 +1377,12 @@ class RpcRouterTest {
             """{"blockNumber":"earliest"}""",
             """{"blockNumber":5}""",
             "[]",
+            // Bare digits: the engines read them differently (decimal on one, hex
+            // on the other), so they are refused rather than guessed (#366).
+            "\"21000000\"",
+            "\"safe\"",
+            "\"earliest\"",
+            "\"0x0\"",
         ).forEach { selector ->
             val b = FakeBackend(callResult = byteArrayOf(1))
             val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$tx,$selector]}""")
@@ -1364,7 +1393,7 @@ class RpcRouterTest {
             """{"blockNumber":"0x100"}""" to "0x100",
             "null" to "latest",
             "\"finalized\"" to "finalized",
-            "\"21000000\"" to "21000000",
+            "\"0x0100\"" to "0x100",   // leading zeros are unambiguous: normalized, not refused
         ).forEach { (selector, expected) ->
             val b = FakeBackend(callResult = byteArrayOf(1))
             val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$tx,$selector]}""")
@@ -1609,7 +1638,7 @@ class RpcRouterTest {
         for (params in listOf("""[291]""", """["291"]""")) {
             val resp = route(b,
                 """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":$params}""")
-            assertEquals(-32000, errorCode(resp))
+            assertEquals(-32602, errorCode(resp))
             assertNull(b.lastBlockTag) // never reached the backend
         }
     }
@@ -1640,8 +1669,491 @@ class RpcRouterTest {
         }
         val resp = route(b,
             """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockNumberAndIndex","params":["0x10",1]}""")
-        assertEquals(-32000, errorCode(resp))
+        assertEquals(-32602, errorCode(resp))
+    }
+
+    // ---- #366: every parameter applied or refused ----
+
+    private val vitalik = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+    private val someHash = "0x" + "ab".repeat(32)
+
+    @Test fun stateReads_eip1898BlockNumberObject_isAppliedAsThatNumber() {
+        // The object form used to fail the string cast and become "latest" — a
+        // pinned read answered from the head with no indication (#366 item 1).
+        val b = FakeBackend(balance = BigInteger.ONE)
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance",
+               "params":["$vitalik",{"blockNumber":"0xff"}]}""")
+        assertEquals("0x1", result(resp), resp)
+        assertEquals("0xff", b.lastStateBlock)
+    }
+
+    @Test fun stateReads_blockHash_isRefused_neverAnsweredFromTheHead() {
+        for (selector in listOf("""{"blockHash":"$someHash"}""", "\"$someHash\"",
+                """{"blockHash":"$someHash","requireCanonical":true}""")) {
+            for (method in listOf("eth_getBalance", "eth_getCode", "eth_getTransactionCount")) {
+                val b = FakeBackend(balance = BigInteger.ONE, code = ByteArray(0), nonce = 1)
+                val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"$method","params":["$vitalik",$selector]}""")
+                assertEquals(-32602, errorCode(resp), "$method $selector -> $resp")
+                assertNull(b.lastStateBlock, "$method $selector reached the engine")
+            }
+        }
+    }
+
+    @Test fun selectors_outOfSpecForms_areRefused_onEveryMethodThatTakesOne() {
+        // One parser for every selector (#366 item 6): bare digits (read as
+        // decimal by one engine, as hex by the other), JSON numbers, mixed-case
+        // or unknown tags, malformed objects — never passed on to an engine.
+        val refused = listOf("\"256\"", "256", "\"Latest\"", "\"0x\"", "\"0xzz\"", "true",
+            "\"\"", "\"   \"",   // only an absent or null selector defaults (#366 review)
+            """{"blockNumber":"0x10","blockHash":"$someHash"}""", """{}""",
+            """{"blockNumber":"0x10","requireCanonical":"yes"}""")
+        val calls = listOf(
+            { sel: String -> """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik",$sel]}""" },
+            { sel: String -> """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["$vitalik","0x0",$sel]}""" },
+            { sel: String -> """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":[$sel,false]}""" },
+            { sel: String -> """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":[$sel]}""" },
+            { sel: String -> """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":["0x1",$sel,[]]}""" },
+        )
+        for (sel in refused) for (call in calls) {
+            val b = FakeBackend(balance = BigInteger.ONE, storage = ByteArray(32)).apply {
+                blockJson = "{}"; blockReceiptsJson = "[]"; feeHistoryJson = "{}"
+            }
+            val body = call(sel)
+            val resp = route(b, body)
+            assertEquals(-32602, errorCode(resp), "$body -> $resp")
+            assertNull(b.lastStateBlock, body); assertNull(b.lastBlockTag, body)
+            assertNull(b.lastReceiptsSelector, body); assertNull(b.lastFeeNewest, body)
+        }
+    }
+
+    @Test fun selectors_safeEarliestAndGenesis_areRefused_notServedFromTheHead() {
+        // Nothing here serves the safe (justified) head or genesis: both engines
+        // used to answer `safe` from the head — another block (#366 item 5).
+        for (sel in listOf("\"safe\"", "\"earliest\"", "\"0x0\"", "\"0x000\"")) {
+            val b = FakeBackend(balance = BigInteger.ONE).apply { blockJson = "{}" }
+            assertEquals(-32602, errorCode(route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik",$sel]}""")), sel)
+            assertEquals(-32602, errorCode(route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":[$sel,false]}""")), sel)
+            assertNull(b.lastStateBlock); assertNull(b.lastBlockTag)
+        }
+    }
+
+    @Test fun finalized_isApplied_whereTheEngineCan_andRefusedWhereItCannot() {
+        // The Java engine resolves `finalized` to its head — block reads would
+        // return the HEAD block for it — so on an engine that does not apply the
+        // tag it is refused, never answered for a different block (#366 item 5).
+        val java = FakeBackend(balance = BigInteger.ONE).apply { finalizedTag = false; blockJson = "{}" }
+        for (body in listOf(
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","finalized"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"finalized"]}""",
+        )) {
+            assertEquals(-32602, errorCode(route(java, body)), body)
+        }
+        assertNull(java.lastStateBlock); assertNull(java.lastBlockTag); assertNull(java.lastTo)
+        val rust = FakeBackend(balance = BigInteger.ONE).apply { blockJson = """{"number":"0x80"}""" }
+        assertEquals("0x1", result(route(rust,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","finalized"]}""")))
+        assertEquals("finalized", rust.lastStateBlock)
+        route(rust, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}""")
+        assertEquals("finalized", rust.lastBlockTag)
+    }
+
+    @Test fun stateRead_pinBehindTheWindow_isPermanent_aheadOfItStaysRetryable() {
+        // head = 0x100. Behind [head-64] no engine holds the state and the head
+        // only moves on: -32602, the engine never asked (#366 item 4). Ahead of
+        // the head is the engine's call — retryable, the head may yet reach it.
+        val behind = FakeBackend(balance = BigInteger.ONE)
+        val r1 = route(behind, """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x10"]}""")
+        assertEquals(-32602, errorCode(r1), r1)
+        assertNull(behind.lastStateBlock)
+        val r2 = route(FakeBackend(callResult = byteArrayOf(1)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"0x10"]}""")
+        assertEquals(-32602, errorCode(r2), r2)
+        val inWindow = FakeBackend(balance = BigInteger.ONE)
+        assertEquals("0x1", result(route(inWindow,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0xc0"]}""")))
+        assertEquals("0xc0", inWindow.lastStateBlock)
+        val ahead = FakeBackend(balance = null)   // the engine cannot answer it (yet)
+        val r3 = route(ahead, """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x200"]}""")
+        assertEquals(-32000, errorCode(r3), r3)
+        assertEquals("0x200", ahead.lastStateBlock)
+        // No verified head: retryable, declined at once — the engine would only
+        // wait for a head again (up to its wake cap) before refusing the pin.
+        val unsynced = FakeBackend(balance = BigInteger.ONE, head = null)
+        assertEquals(-32000, errorCode(route(unsynced,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","0x10"]}""")))
+        assertNull(unsynced.lastStateBlock)
+    }
+
+    @Test fun estimateGas_pinBehindTheWindow_isPermanent_beforeTheEngineIsAsked() {
+        val b = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L) }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"$vitalik"},"0x10"]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertNull(b.lastTx)
+        // In the window it is the engine's to apply.
+        assertEquals("0x5208", result(route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas",
+               "params":[{"to":"$vitalik"},"0xff"]}""")))
+        assertEquals("0xff", b.lastTxBlock)
+    }
+
+    @Test fun ethCall_refusedSelector_namesWhy_inStrictMode() {
+        // The strict branch re-derives the refusal ([callTx]); it must carry the
+        // selector's reason, not a generic "cannot be served".
+        val safe = route(FakeBackend(callResult = byteArrayOf(1)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"safe"]}""")
+        assertEquals(-32602, errorCode(safe))
+        assertTrue(safe.contains("'safe' tag is not served"), safe)
+        val java = FakeBackend(callResult = byteArrayOf(1)).apply { finalizedTag = false }
+        val fin = route(java, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"to":"$vitalik"},"finalized"]}""")
+        assertEquals(-32602, errorCode(fin))
+        assertTrue(fin.contains("'finalized' tag is not served"), fin)
+    }
+
+    @Test fun eip1898BlockNumber_withSixtyFourHexDigits_isANumberOutOfRange_neverAHash() {
+        // A `blockNumber` field is a number: 64 hex digits there are out of
+        // range, not a hash to look the block up by.
+        val b = FakeBackend().apply { blockReceiptsJson = "[]" }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts",
+               "params":[{"blockNumber":"$someHash"}]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertNull(b.lastReceiptsSelector)
+        // ...while the same digits left-padded to a small number are that number.
+        val padded = "0x" + "0".repeat(62) + "10"
+        route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":[{"blockNumber":"$padded"}]}""")
+        assertEquals("0x10", b.lastReceiptsSelector)
+    }
+
+    @Test fun blockNumberMethods_takeNoBlockObjectOrHash() {
+        // geth's BlockNumber, not BlockNumberOrHash: an EIP-1898 object or a hash
+        // was read as "latest" by these methods (#366 items 1 and 7).
+        for (sel in listOf("""{"blockNumber":"0x10"}""", """{"blockHash":"$someHash"}""", "\"$someHash\"")) {
+            val b = FakeBackend().apply { blockJson = "{}"; feeHistoryJson = "{}" }
+            assertEquals(-32602, errorCode(route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":[$sel,false]}""")), sel)
+            assertEquals(-32602, errorCode(route(b,
+                """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":["0x1",$sel,[50]]}""")), sel)
+            assertNull(b.lastBlockTag); assertNull(b.lastFeeNewest)
+        }
+    }
+
+    @Test fun blockReceipts_takesEveryBlockNumberOrHashForm() {
+        mapOf(
+            """{"blockHash":"$someHash"}""" to someHash,
+            """{"blockNumber":"0x10"}""" to "0x10",
+            "\"$someHash\"" to someHash,
+            "\"0x10\"" to "0x10",
+        ).forEach { (sel, expected) ->
+            val b = FakeBackend().apply { blockReceiptsJson = "[]" }
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":[$sel]}""")
+            assertTrue(!hasError(resp), "$sel -> $resp")
+            assertEquals(expected, b.lastReceiptsSelector)
+        }
+    }
+
+    @Test fun malformedParams_areInvalidParams_neverTheRetryableCode() {
+        // A malformed param used to fall through to -32000, which the README
+        // documents as retryable: a conforming client retried forever (#366 item 4).
+        val shortHash = "0x1234"
+        val bodies = listOf(
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x1234","latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":[42,"latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["0xzz","latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["$vitalik","0xzz","latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["$shortHash"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByHash","params":[]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0xzz"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"web3_sha3","params":["0xzz"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getUncleCountByBlockHash","params":["$shortHash"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionByBlockHashAndIndex","params":["$someHash","1"]}""",
+        )
+        for (body in bodies) {
+            val b = FakeBackend(balance = BigInteger.ONE, nonce = 1, code = ByteArray(0), storage = ByteArray(32))
+                .apply { receiptJson = "null"; txByHashJson = "null"; txHash = ByteArray(32); blockByHashJson = "{}" }
+            val resp = route(b, body)
+            assertEquals(-32602, errorCode(resp), "$body -> $resp")
+            assertNull(b.lastStateBlock, body); assertNull(b.lastReceiptTxHash, body)
+            assertNull(b.lastByHashTxHash, body); assertNull(b.lastRawTx, body); assertNull(b.lastBlockHash, body)
+        }
+    }
+
+    @Test fun invalidParams_stillReachTheDevProxy() {
+        // Like the router's other refusals: in dev mode the upstream answers.
+        val unreachable = UpstreamProxy("http://127.0.0.1:1/")
+        val b = FakeBackend(balance = BigInteger.ONE)
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x1234","latest"]}""",
+            proxy = unreachable)
+        assertEquals(-32603, errorCode(resp))   // proxy attempted, upstream unreachable
+        assertNull(b.lastStateBlock)
+        unreachable.close()
+    }
+
+    @Test fun feeHistory_everyParamIsAppliedOrRefused() {
+        fun fee(params: String, b: FakeBackend = FakeBackend().apply { feeHistoryJson = """{"oldestBlock":"0x1"}""" }) =
+            b to route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_feeHistory","params":$params}""")
+        for (params in listOf(
+            """["0x4"]""",                          // newestBlock is required, as geth has it
+            """["0x4",null,[50]]""",
+            """["0x0","latest",[50]]""",            // at least one block
+            """["0","latest",[50]]""",
+            """[-1,"latest",[50]]""",
+            """["0x4","latest",["50"]]""",          // percentiles are numbers, not strings
+            """["0x4","latest",[50,25]]""",         // non-decreasing
+            """["0x4","latest",[101]]""",
+            """["0x4","latest",{}]""",
+            """["0x4","latest",[${(1..101).joinToString(",")}]]""",
+        )) {
+            val (b, resp) = fee(params)
+            assertEquals(-32602, errorCode(resp), "$params -> $resp")
+            assertNull(b.lastFeeBlockCount, params)
+        }
+        // An empty list asks for no reward column, exactly as an absent one does.
+        val (empty, r1) = fee("""["0x4","latest",[]]""")
+        assertTrue(!hasError(r1)); assertNull(empty.lastFeePercentiles)
+        // geth's quantity forms, and its clamp at 1024 blocks.
+        assertEquals(5L, fee("""["5","latest"]""").first.lastFeeBlockCount)
+        assertEquals(5L, fee("""[5,"latest"]""").first.lastFeeBlockCount)
+        assertEquals(1024L, fee("""["0xffffffffffffffffff","latest"]""").first.lastFeeBlockCount)
+        val (ok, r2) = fee("""["0x4","0x10",[25,50,75]]""")
+        assertTrue(!hasError(r2), r2)
+        assertEquals("0x10", ok.lastFeeNewest)
+        assertArrayEquals(doubleArrayOf(25.0, 50.0, 75.0), ok.lastFeePercentiles, 0.0)
+    }
+
+    @Test fun engineEnvelopeWithPermanentCode_isARefusal_neverServedAsAResult() {
+        // The engine's documented `{"error","code":-32602}` envelope used to fail
+        // the router's one-key check and reach the wallet AS A RESULT (#366).
+        val b = FakeBackend().apply { blockJson = """{"error":"beyond the verify window","code":-32602}""" }
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x10",false]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+        assertTrue(resp.contains("beyond the verify window"))
+        // ...and the retryable one-key form keeps its retryable code.
+        b.blockJson = """{"error":"no peer"}"""
+        assertEquals(-32000, errorCode(route(b,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x10",false]}""")))
+    }
+
+    @Test fun getLogs_engineEnvelopeWithPermanentCode_isInvalidParams() {
+        val reads = object : VerifiedReads by FakeBackend() {
+            override fun getLogs(filterJson: String): String =
+                """{"error":"unanswerable filter (fromBlock > toBlock)","code":-32602}"""
+        }
+        val resp = route(reads, """{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"address":"$vitalik"}]}""")
+        assertEquals(-32602, errorCode(resp), resp)
+    }
+
+    // ---- #366 item 8: protocol hygiene ----
+
+    @Test fun notification_isServedButNeverAnswered() {
+        // No `id` member: served (the broadcast happens) but not answered
+        // (JSON-RPC 2.0 §4.1). A JSON-null id IS an id, and is answered.
+        val b = FakeBackend().apply { txHash = ByteArray(32) }
+        assertEquals("", route(b, """{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x01"]}"""))
+        assertNotNull(b.lastRawTx)
+        val withNullId = route(FakeBackend(), """{"jsonrpc":"2.0","id":null,"method":"eth_chainId","params":[]}""")
+        assertEquals("0x1", result(withNullId))
+    }
+
+    @Test fun batch_answersOnlyItsCalls_andNothingForAllNotifications() {
+        val b = FakeBackend()
+        val mixed = route(b, """[{"jsonrpc":"2.0","method":"eth_chainId"},
+                                 {"jsonrpc":"2.0","id":7,"method":"eth_chainId"}]""")
+        val arr = json.parseToJsonElement(mixed).jsonArray
+        assertEquals(1, arr.size, mixed)
+        assertEquals("7", arr[0].jsonObject["id"]!!.jsonPrimitive.content)
+        assertEquals("", route(b, """[{"jsonrpc":"2.0","method":"eth_chainId"},
+                                       {"jsonrpc":"2.0","method":"net_version"}]"""))
+    }
+
+    @Test fun malformedEnvelope_isInvalidRequest_andNeverThrows() {
+        mapOf(
+            """{"id":1,"method":"eth_chainId"}""" to "1",                   // no "jsonrpc"
+            """{"jsonrpc":"1.0","id":1,"method":"eth_chainId"}""" to "1",
+            """{"jsonrpc":"2.0","id":1,"method":{}}""" to "1",              // threw out of the router
+            """{"jsonrpc":"2.0","id":1,"method":7}""" to "1",
+            """{"jsonrpc":"2.0","id":1}""" to "1",
+            """{"jsonrpc":"2.0","id":{},"method":"eth_chainId"}""" to "null", // an unusable id is answered as null
+            """{"jsonrpc":"2.0","id":true,"method":"eth_chainId"}""" to "null",
+            // Parses to infinity, which cannot be written back out: answering it
+            // threw out of the router, past the catch-all (#366 review).
+            """{"jsonrpc":"2.0","id":1e400,"method":"eth_chainId"}""" to "null",
+        ).forEach { (body, id) ->
+            val resp = route(FakeBackend(), body)
+            assertEquals(-32600, errorCode(resp), "$body -> $resp")
+            assertEquals(id, json.parseToJsonElement(resp).jsonObject["id"].toString(), body)
+        }
+    }
+
+    @Test fun batch_overTheLimit_isRefusedWhole_withTheFirstId() {
+        val one = """{"jsonrpc":"2.0","id":"first","method":"eth_chainId"}"""
+        val body = "[" + List(RpcRouter.MAX_BATCH_REQUESTS + 1) { one }.joinToString(",") + "]"
+        val b = FakeBackend()
+        val arr = json.parseToJsonElement(route(b, body)).jsonArray
+        assertEquals(1, arr.size)
+        val err = arr[0].jsonObject
+        assertEquals("\"first\"", err["id"].toString())
+        assertEquals(-32600, err["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt())
+        // At the limit it is served.
+        val atLimit = "[" + List(RpcRouter.MAX_BATCH_REQUESTS) { one }.joinToString(",") + "]"
+        assertEquals(RpcRouter.MAX_BATCH_REQUESTS, json.parseToJsonElement(route(b, atLimit)).jsonArray.size)
+    }
+
+    @Test fun aThrowingHandler_isAnInternalError_notATruncatedResponse() {
+        // The server streams heartbeat bytes before the answer, so an exception
+        // escaping the router cut the body mid-response — and every batch
+        // sibling with it.
+        val b = FakeBackend(balance = BigInteger.ONE).apply { balanceThrows = IllegalStateException("boom") }
+        val resp = route(b, """[{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest"]},
+                               {"jsonrpc":"2.0","id":2,"method":"eth_chainId"}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        assertEquals(-32603, arr[0].jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt())
+        assertEquals("0x1", arr[1].jsonObject["result"]!!.jsonPrimitive.content)
+        // A backend answer that is not JSON fails the same way, not by throwing.
+        val garbled = FakeBackend().apply { blockJson = "{not json" }
+        assertEquals(-32603, errorCode(route(garbled,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}""")))
+    }
+
+    @Test fun aNonFiniteId_inABatch_neverTakesItsSiblingsDown() {
+        val resp = route(FakeBackend(),
+            """[{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","id":1e400,"method":"eth_chainId"}]""")
+        val arr = json.parseToJsonElement(resp).jsonArray
+        assertEquals("0x1", arr[0].jsonObject["result"]!!.jsonPrimitive.content)
+        assertEquals(-32600, arr[1].jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt())
+    }
+
+    @Test fun numericIds_areEchoedVerbatim() {
+        // Past a Long an id was re-encoded as a double (1.2345678901234568E29),
+        // which no client can match to its request.
+        for (id in listOf("123456789012345678901234567890", "7", "1.5", "-3")) {
+            val resp = route(FakeBackend(), """{"jsonrpc":"2.0","id":$id,"method":"eth_chainId"}""")
+            assertTrue(resp.contains("\"id\":$id,"), "$id -> $resp")
+        }
+    }
+
+    @Test fun aPinAtAHeadThisNodeReported_staysRetryable_evenBehindTheWindow() {
+        // A node whose head went back and forth (recorded MetaMask sessions show a
+        // 13.6k-block swing) must not call the number it handed out invalid
+        // params: a wallet that switches providers on -32602 would leave over
+        // the node's own glitch.
+        val b = FakeBackend(balance = BigInteger.ONE, head = 0x100)
+        val router = RpcRouter(null, MethodLogger(), VerifiedReadsBackend(b))   // ONE router: it remembers
+        fun ask(body: String) = runBlocking { router.handle(body) }
+        assertEquals("0x100", result(ask("""{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}""")))
+        b.head = 0x1000
+        val reported = ask("""{"jsonrpc":"2.0","id":2,"method":"eth_getBalance","params":["$vitalik","0x100"]}""")
+        assertEquals(-32000, errorCode(reported), reported)
+        assertNull(b.lastStateBlock)
+        // Below anything this node reported, it is the caller's: permanent.
+        val older = ask("""{"jsonrpc":"2.0","id":3,"method":"eth_getBalance","params":["$vitalik","0xff"]}""")
+        assertEquals(-32602, errorCode(older), older)
+    }
+
+    @Test fun cancellation_passesThroughTheCatchAll_neverBecomingAnInternalError() {
+        // A client disconnect cancels the request coroutine; the catch-all must
+        // rethrow it rather than answer -32603 (which it records when it does).
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val reads = object : VerifiedReads by FakeBackend() {
+            override fun getBalance(address: ByteArray, block: String): String? {
+                entered.countDown()
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                return "1"
+            }
+        }
+        val logger = MethodLogger()
+        val router = RpcRouter(null, logger, VerifiedReadsBackend(reads))
+        runBlocking {
+            val job = launch(kotlinx.coroutines.Dispatchers.Default) {
+                router.handle("""{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest"]}""")
+            }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            job.cancel()
+            release.countDown()
+            job.join()
+            assertTrue(job.isCancelled)
+        }
+        assertNull(logger.coverage()["eth_getBalance"], "the cancellation was answered: ${logger.coverage()}")
+    }
+
+    @Test fun aBlockOverride_ofAnyNonInertValue_isRefused_neverIgnored() {
+        // #366 review: only a non-empty OBJECT counted as a block override, so
+        // `"bad"` in params[3] was run without it. Only absent, null and {} are
+        // inert.
+        val call = """{"to":"$vitalik","data":"0x"}"""
+        for (ov in listOf("\"bad\"", "5", "[]", "true", """{"time":"0x1"}""")) {
+            for (m in listOf("eth_call", "eth_estimateGas")) {
+                val b = FakeBackend(callResult = byteArrayOf(1), applyOverrides = true).apply { estimateResult = 21_000L }
+                val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"$m","params":[$call,"latest",null,$ov]}""")
+                assertEquals(-32602, errorCode(resp), "$m $ov -> $resp")
+                assertNull(b.lastTx, "$m $ov reached the engine")
+            }
+        }
+        for (ov in listOf("null", "{}")) {
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[$call,"latest",null,$ov]}""")
+            assertEquals("0x01", result(resp), "$ov -> $resp")
+        }
+    }
+
+    @Test fun anEmptySelector_isRefused_onTheTransactionMethodsToo() {
+        for (sel in listOf("\"\"", "\" \"", """{"blockNumber":""}""")) {
+            val b = FakeBackend(callResult = byteArrayOf(1))
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},$sel]}""")
+            assertEquals(-32602, errorCode(resp), "$sel -> $resp")
+            assertNull(b.lastTx)
+        }
+    }
+
+    @Test fun extraArguments_areRefused_asGethRefusesThem() {
+        // geth: "too many arguments, want at most N" / "non-array args"
+        // (rpc/json.go). Served with the extra one dropped, the answer would be
+        // to a question the caller did not ask (#366 review).
+        for (body in listOf(
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest","latest"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik","latest",null]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":["0x1"]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"latest",null,null,null]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":{"chain":"x"}}""",
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":"$vitalik"}""",
+        )) {
+            val b = FakeBackend(balance = BigInteger.ONE, callResult = byteArrayOf(1))
+            val resp = route(b, body)
+            assertEquals(-32602, errorCode(resp), "$body -> $resp")
+            assertNull(b.lastStateBlock, body); assertNull(b.lastTx, body)
+        }
+        assertTrue(route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[1]}""")
+            .contains("too many arguments, want at most 0"))
+        // Absent, null and empty params stay fine where nothing is required.
+        for (params in listOf("", ",\"params\":null", ",\"params\":[]")) {
+            assertEquals("0x1", result(route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"eth_chainId"$params}""")))
+        }
+    }
+
+    @Test fun aReportedHead_agesFromTheLastTimeItWasAnswered() {
+        // #366 review: a head answered steadily through a stall expired 15 min
+        // after its FIRST answer, so a pin to it turned permanent the moment the
+        // head jumped — though the node had handed it out seconds before.
+        val heads = ReportedHeads(window = kotlin.time.Duration.parse("1s"))
+        runBlocking {
+            heads.record(0x100)
+            Thread.sleep(600)
+            heads.record(0x100)            // still answered: refreshed, not kept at its first mark
+            Thread.sleep(600)              // past the window from the first answer only
+            assertEquals(0x100L, heads.lowest())
+            heads.record(0x5000)           // the head jumps
+            assertEquals(0x100L, heads.lowest())
+            Thread.sleep(1_200)            // nobody answered 0x100 since: it ages out
+            assertNull(heads.lowest())
+        }
     }
 
     private fun ByteArray.toHex() = joinToString(prefix = "0x", separator = "") { "%02x".format(it.toInt() and 0xff) }
 }
+

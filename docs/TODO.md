@@ -123,11 +123,13 @@ complete on its own.
   `resultOrNull` drop the engine's `code`, so a `-32602` from
   `request_account_json` / `get_code_json` / `get_storage_at_json` reaches
   the wallet as the retryable `-32000` a client is documented to spin on.
-  Reachable today only in the one-block race between the hosts' window
-  pre-check and the engine's head; a real loop the moment the state reads
-  accept a selector the hosts do not pre-filter. Decide deliberately (a typed
-  refusal the router maps to `-32602`, as `eth_call`'s `CallResult` does)
-  rather than inherit (review of #483).
+  Reachable today only in the one-block race between the router's window
+  check and the engine's head: since #366 the router refuses every selector it
+  can judge (`safe`, `earliest`, a hash, a malformed one, a pin behind the
+  window) with `-32602` before the engine runs. Still a real loop the moment
+  the state reads accept a selector the router does not pre-filter. Decide
+  deliberately (a typed refusal the router maps to `-32602`, as `eth_call`'s
+  `CallResult` does) rather than inherit (review of #483).
 - [ ] **Parity entries for #342.** Rust-only behaviour introduced by the
   three PRs, to be listed there as differs-fixed or differs-accepted:
   admission by announced head and lag eviction (the Java `EthHandler`

@@ -49,6 +49,8 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
 
     override fun supportsContractCreation(): Boolean = v.supportsContractCreation()
 
+    override fun supportsFinalizedTag(): Boolean = v.supportsFinalizedTag()
+
     override fun callWithOverrides(
         from: ByteArray?,
         to: ByteArray?,
