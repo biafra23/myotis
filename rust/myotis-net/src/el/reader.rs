@@ -1497,8 +1497,14 @@ pub struct ElReader {
     /// Brief-hold lock; never held across an await.
     fee_cache: std::sync::Mutex<crate::el::feecache::FeeCache>,
     /// Single-flight for the fee estimate compute: concurrent misses (and the
-    /// follower) run ONE peer ladder per head. Held across the network build.
-    fee_estimate_compute: tokio::sync::Mutex<()>,
+    /// follower) run ONE peer ladder per head. Held across the network build;
+    /// in an `Arc` so a read can hand its compute an owned guard.
+    fee_estimate_compute: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the per-block fills (bodies, receipts) of all fee computes,
+    /// each re-reading the memo under it: concurrent computes — the follower
+    /// and a read's, or two `eth_feeHistory` shapes — never fetch the same
+    /// block twice (PR #535 review).
+    fee_fill: tokio::sync::Mutex<()>,
     /// The fee follower (see [`Self::ensure_fee_follower`]): refreshes the fee
     /// reads a wallet is polling on every new head, off the request path.
     fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1685,7 +1691,8 @@ impl ElReader {
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
             fee_cache: std::sync::Mutex::new(crate::el::feecache::FeeCache::default()),
-            fee_estimate_compute: tokio::sync::Mutex::new(()),
+            fee_estimate_compute: Arc::new(tokio::sync::Mutex::new(())),
+            fee_fill: tokio::sync::Mutex::new(()),
             fee_follow_task: std::sync::Mutex::new(None),
             fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
             fee_stored: tokio::sync::Notify::new(),
@@ -6230,30 +6237,18 @@ impl ElReader {
             }
             Lookup::Miss => {
                 // A compute already in flight (the follower's, or another
-                // read's) is waited on, not queued behind (#532 review).
-                let started = tokio::time::Instant::now();
-                let computed = if self.fee_estimate_compute.try_lock().is_err() {
-                    Ok(None)
-                } else {
-                    // The detached compute takes the single-flight lock only
-                    // if it is still free: one that lost the race hands its
-                    // permit back at once instead of parking it behind the
-                    // compute in flight (PR #535 review).
-                    self.bounded_fee_compute(FEE_READ_WAIT, move |r| async move {
-                        match r.fee_estimate_compute.try_lock() {
-                            Ok(flight) => r.fee_estimate_refresh_locked(head, flight).await.map(Some),
-                            Err(_) => Ok(None),
-                        }
-                    })
-                    .await
-                };
-                let result = match computed {
-                    Ok(Some(est)) => Ok(est),
-                    Ok(None) => {
-                        let left = FEE_READ_WAIT.saturating_sub(started.elapsed());
-                        self.wait_for_fee(left, || self.estimate_settled()).await
+                // read's) is waited on, not queued behind (#532 review). The
+                // read that takes the single-flight lock hands it, owned, to
+                // its compute: no other read can take a permit and park it
+                // behind that lock in between (PR #535 review).
+                let result = match Arc::clone(&self.fee_estimate_compute).try_lock_owned() {
+                    Ok(flight) => {
+                        self.bounded_fee_compute(FEE_READ_WAIT, move |r| async move {
+                            r.fee_estimate_refresh_locked(head, flight).await
+                        })
+                        .await
                     }
-                    Err(e) => Err(e),
+                    Err(_) => self.wait_for_fee(FEE_READ_WAIT, || self.estimate_settled()).await,
                 };
                 let _ = self.with_fee_cache(|c| c.stats.missed(false, result.is_ok(), Instant::now()));
                 result
@@ -6347,7 +6342,7 @@ impl ElReader {
 
     /// Compute (single-flight) and memoize the estimate for `head`.
     async fn fee_estimate_refresh(&self, requested: Head) -> Result<FeeEstimate, String> {
-        let flight = self.fee_estimate_compute.lock().await;
+        let flight = Arc::clone(&self.fee_estimate_compute).lock_owned().await;
         self.fee_estimate_refresh_locked(requested, flight).await
     }
 
@@ -6356,7 +6351,7 @@ impl ElReader {
     async fn fee_estimate_refresh_locked(
         &self,
         requested: Head,
-        _flight: tokio::sync::MutexGuard<'_, ()>,
+        _flight: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<FeeEstimate, String> {
         // The head may have moved on while this waited: compute for the one
         // current now, not an outdated one whose result `store` would discard
@@ -6439,6 +6434,10 @@ impl ElReader {
         top: WindowTop,
     ) -> Result<FeeEstimate, String> {
         let window = fetch_anchored_window(peer, start, top).await?;
+        // The per-block fill is serialized with every other fee compute's,
+        // and the memo read under it: a block another compute just fetched is
+        // not fetched again (PR #535 review).
+        let _fill = self.fee_fill.lock().await;
         // Tips are keyed by the window's own (chain-verified) (number, hash),
         // so a remembered list is exactly what this block's verified body gives.
         let mut per_block: Vec<Option<Arc<Vec<u128>>>> = self.with_fee_cache(|c| {
@@ -6672,28 +6671,17 @@ impl ElReader {
             // follows, gets the time a cold build needs.
             Lookup::Miss => {
                 let wait = if shape.follows_head() { FEE_READ_WAIT } else { FEE_PINNED_READ_WAIT };
-                let started = tokio::time::Instant::now();
-                let computed = if lock.try_lock().is_err() {
-                    Ok(None)
-                } else {
-                    let shape = shape.clone();
-                    // As for the estimate: compute only if the lock is still
-                    // free, never park the permit behind it (PR #535 review).
-                    self.bounded_fee_compute(wait, move |r| async move {
-                        match lock.try_lock() {
-                            Ok(flight) => r.fee_history_refresh_locked(&shape, flight, plan).await.map(Some),
-                            Err(_) => Ok(None),
-                        }
-                    })
-                    .await
-                };
-                let result = match computed {
-                    Ok(Some(history)) => Ok(history),
-                    Ok(None) => {
-                        let left = wait.saturating_sub(started.elapsed());
-                        self.wait_for_fee(left, || self.history_settled(&shape)).await
+                // As for the estimate: an owned guard for the read's compute,
+                // or a wait on the compute in flight (PR #535 review).
+                let result = match Arc::clone(&lock).try_lock_owned() {
+                    Ok(flight) => {
+                        let shape = shape.clone();
+                        self.bounded_fee_compute(wait, move |r| async move {
+                            r.fee_history_refresh_locked(&shape, flight, plan).await
+                        })
+                        .await
                     }
-                    Err(e) => Err(e),
+                    Err(_) => self.wait_for_fee(wait, || self.history_settled(&shape)).await,
                 };
                 let _ = self.with_fee_cache(|c| c.stats.missed(true, result.is_ok(), Instant::now()));
                 result.map_err(FeeHistoryError::Build)
@@ -6733,10 +6721,10 @@ impl ElReader {
     async fn fee_history_refresh(
         &self,
         shape: &HistoryShape,
-        lock: &tokio::sync::Mutex<()>,
+        lock: &Arc<tokio::sync::Mutex<()>>,
         plan: FeeHistoryPlan,
     ) -> Result<FeeHistory, String> {
-        let flight = lock.lock().await;
+        let flight = Arc::clone(lock).lock_owned().await;
         self.fee_history_refresh_locked(shape, flight, plan).await
     }
 
@@ -6745,7 +6733,7 @@ impl ElReader {
     async fn fee_history_refresh_locked(
         &self,
         shape: &HistoryShape,
-        _flight: tokio::sync::MutexGuard<'_, ()>,
+        _flight: tokio::sync::OwnedMutexGuard<()>,
         plan: FeeHistoryPlan,
     ) -> Result<FeeHistory, String> {
         // As for the estimate: plan against the head current now (#532 review).
@@ -6872,7 +6860,7 @@ impl ElReader {
         let reward = match reward_percentiles {
             None => None,
             Some(percentiles) => {
-                let inputs = reward_inputs(&self.fee_cache, &window[..count], |hash, with_body| async move {
+                let inputs = reward_inputs(&self.fee_cache, &self.fee_fill, &window[..count], |hash, with_body| async move {
                     let hash = [hash];
                     if with_body {
                         let (bodies, receipts) =
@@ -8087,12 +8075,15 @@ fn log_fee_summary(line: Option<String>) {
 /// connection (one slowest-block round-trip, the Java pipelined
 /// `verifiedBlockTipsAsync`). So a new head costs one receipts fetch here
 /// when the estimate fetched its body, one body and one receipts fetch when it
-/// did not, and never the whole window again (#532). Every block that
-/// verifies is remembered, even when another one fails the call.
+/// did not, and never the whole window again (#532). The fill holds `fill`
+/// (the reader's `fee_fill`) and reads the memo under it, so concurrent fee
+/// computes never fetch the same block twice (PR #535 review). Every block
+/// that verifies is remembered, even when another one fails the call.
 /// `fetch(hash, with_body)` returns the block's bodies response (only when
 /// asked for) and its receipts response.
 async fn reward_inputs<F, Fut>(
     cache: &std::sync::Mutex<FeeCache>,
+    fill: &tokio::sync::Mutex<()>,
     blocks: &[crate::el::eth::messages::VerifiedHeader],
     fetch: F,
 ) -> Result<Vec<BlockRewards>, String>
@@ -8106,6 +8097,7 @@ where
     >,
 {
     let unavailable = |_| "fee cache unavailable".to_string();
+    let _fill = fill.lock().await;
     // Per block: its cached list, else the complete tips its receipts need.
     let (mut inputs, known_tips): (Vec<Option<BlockRewards>>, Vec<Option<BlockTips>>) = {
         let cache = cache.lock().map_err(unavailable)?;
@@ -9463,32 +9455,57 @@ mod tests {
         #[tokio::test]
         async fn a_new_head_fetches_one_block_not_the_window() {
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let asked = Mutex::new(Vec::<[u8; 32]>::new());
             let fetch = |hash: [u8; 32], with_body: bool| {
                 asked.lock().unwrap().push(hash);
                 async move { empty_block(with_body) }
             };
-            let first = reward_inputs(&cache, &window(0, 10), fetch).await.unwrap();
+            let first = reward_inputs(&cache, &fill, &window(0, 10), fetch).await.unwrap();
             assert_eq!(first.len(), 10);
             assert_eq!(asked.lock().unwrap().len(), 10, "a cold memo fetches the window");
             // The head moves on by one: only the new block is fetched.
             asked.lock().unwrap().clear();
-            let next = reward_inputs(&cache, &window(1, 11), fetch).await.unwrap();
+            let next = reward_inputs(&cache, &fill, &window(1, 11), fetch).await.unwrap();
             assert_eq!(next.len(), 10);
             assert_eq!(*asked.lock().unwrap(), vec![keccak256(&10u64.to_be_bytes())]);
             // The same window again, or a shorter shape inside it: nothing.
             asked.lock().unwrap().clear();
-            reward_inputs(&cache, &window(1, 11), fetch).await.unwrap();
-            reward_inputs(&cache, &window(6, 11), fetch).await.unwrap();
+            reward_inputs(&cache, &fill, &window(1, 11), fetch).await.unwrap();
+            reward_inputs(&cache, &fill, &window(6, 11), fetch).await.unwrap();
             assert!(asked.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn concurrent_fills_fetch_each_block_once() {
+            // PR #535 review: two computes (the follower and a read's, or two
+            // shapes) both saw a block missing and both fetched it.
+            let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
+            let asked = Mutex::new(0usize);
+            let fetch = |_hash: [u8; 32], with_body: bool| {
+                *asked.lock().unwrap() += 1;
+                async move {
+                    tokio::task::yield_now().await;
+                    empty_block(with_body)
+                }
+            };
+            let blocks = window(0, 10);
+            let (a, b) = tokio::join!(
+                reward_inputs(&cache, &fill, &blocks, fetch),
+                reward_inputs(&cache, &fill, &blocks[3..], fetch)
+            );
+            assert_eq!((a.unwrap().len(), b.unwrap().len()), (10, 7));
+            assert_eq!(*asked.lock().unwrap(), 10, "each block fetched once");
         }
 
         #[tokio::test]
         async fn a_cold_block_is_weighed_from_its_body_and_receipts_and_serves_the_estimate() {
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let (vh, _, _) = one_tx_block(8, GWEI, 2 * GWEI);
             let fetch = |_hash: [u8; 32], with_body: bool| async move { serve(8, 2 * GWEI, with_body) };
-            let inputs = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            let inputs = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap();
             assert_eq!(*inputs[0], vec![(2 * GWEI, 21_000)]);
             // The estimate then reads the block's tips from the memo, unfetched.
             assert_eq!(cache.lock().unwrap().tips((8, vh.hash)).as_deref(), Some(&vec![2 * GWEI]));
@@ -9499,6 +9516,7 @@ mod tests {
             // #532 review: the follower runs the estimate first, which keeps the
             // new head's complete tips — so the history fetches its receipts alone.
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let (vh, _, _) = one_tx_block(7, GWEI, 3 * GWEI);
             cache.lock().unwrap().put_tips((7, vh.hash), Arc::new(vec![3 * GWEI]), true);
             let asked = Mutex::new(Vec::new());
@@ -9506,35 +9524,38 @@ mod tests {
                 asked.lock().unwrap().push(with_body);
                 async move { serve(7, 3 * GWEI, with_body) }
             };
-            let inputs = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            let inputs = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap();
             assert_eq!(*asked.lock().unwrap(), vec![false], "receipts only");
             assert_eq!(*inputs[0], vec![(3 * GWEI, 21_000)]);
             assert_eq!(cache.lock().unwrap().weighted((7, vh.hash)).as_deref(), Some(&vec![(3 * GWEI, 21_000)]));
             // Incomplete tips (an undecodable transaction): the body again.
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             cache.lock().unwrap().put_tips((7, vh.hash), Arc::new(Vec::new()), false);
             asked.lock().unwrap().clear();
-            reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap();
             assert_eq!(*asked.lock().unwrap(), vec![true]);
             // A block known to hold no transactions needs no fetch at all.
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let quiet = window(3, 4);
             cache.lock().unwrap().put_tips((3, quiet[0].hash), Arc::new(Vec::new()), true);
             asked.lock().unwrap().clear();
-            assert!(reward_inputs(&cache, &quiet, fetch).await.unwrap()[0].is_empty());
+            assert!(reward_inputs(&cache, &fill, &quiet, fetch).await.unwrap()[0].is_empty());
             assert!(asked.lock().unwrap().is_empty());
         }
 
         #[tokio::test]
         async fn receipts_that_miss_the_root_fail_and_are_not_remembered() {
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let (vh, _, _) = one_tx_block(9, GWEI, GWEI);
             cache.lock().unwrap().put_tips((9, vh.hash), Arc::new(vec![GWEI]), true);
             let fetch = |_hash: [u8; 32], _with_body: bool| async {
                 let wrong: Fetched = (None, Ok(vec![BlockReceipts::Canonical(receipts_of(&[30_000]))]));
                 wrong
             };
-            let err = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap_err();
+            let err = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap_err();
             assert!(err.contains("receiptsRoot"), "{err}");
             assert!(cache.lock().unwrap().weighted((9, vh.hash)).is_none());
         }
@@ -9554,10 +9575,11 @@ mod tests {
         async fn cached_tips_that_miss_the_receipt_count_fail_the_block() {
             // Two cached tips, receipts for one transaction: refused, not paired.
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let (vh, _, _) = one_tx_block(12, GWEI, GWEI);
             cache.lock().unwrap().put_tips((12, vh.hash), Arc::new(vec![GWEI, 2 * GWEI]), true);
             let fetch = |_hash: [u8; 32], with_body: bool| async move { serve(12, GWEI, with_body) };
-            let err = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap_err();
+            let err = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap_err();
             assert!(err.contains("receipt count mismatch"), "{err}");
         }
 
@@ -9565,10 +9587,11 @@ mod tests {
         async fn a_failing_block_keeps_its_verified_neighbours() {
             // #532 review: one bad block threw away the others fetched with it.
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let mut blocks = window(0, 3);
             blocks[1].header.transactions_root = [0xAA; 32]; // the empty body does not match
             let fetch = |_hash: [u8; 32], with_body: bool| async move { empty_block(with_body) };
-            assert!(reward_inputs(&cache, &blocks, fetch).await.is_err());
+            assert!(reward_inputs(&cache, &fill, &blocks, fetch).await.is_err());
             let c = cache.lock().unwrap();
             assert!(c.weighted((1, blocks[1].hash)).is_none());
             assert!(c.weighted((0, blocks[0].hash)).is_some());
@@ -9578,11 +9601,12 @@ mod tests {
         #[tokio::test]
         async fn a_failed_fetch_fails_the_rows() {
             let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
             let fetch = |_hash: [u8; 32], _with_body: bool| async {
                 let failed: Fetched = (Some(Err("request timed out".to_string())), Ok(Vec::new()));
                 failed
             };
-            let err = reward_inputs(&cache, &window(0, 2), fetch).await.unwrap_err();
+            let err = reward_inputs(&cache, &fill, &window(0, 2), fetch).await.unwrap_err();
             assert!(err.contains("timed out"), "{err}");
         }
     }
