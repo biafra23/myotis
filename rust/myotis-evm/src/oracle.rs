@@ -115,6 +115,26 @@ impl std::fmt::Display for OracleError {
     }
 }
 
+impl OracleError {
+    /// The error's kind, without the values it carries (an address, a code
+    /// hash, a proof's detail): what a log line at info may name (#532
+    /// review). A cancellation is told apart only by the one reason the
+    /// slow requests #532 is about end with; its free-form text never
+    /// reaches the log. That reason is myotis-net's `Operation::check`
+    /// wording, which this crate cannot import; a test there pins that the
+    /// two agree.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            OracleError::Cancelled { reason } if reason == "request deadline exceeded" => "request deadline exceeded",
+            OracleError::Cancelled { .. } => "request cancelled",
+            OracleError::StateUnavailable { .. } => "state unavailable",
+            OracleError::BytecodeUnavailable { .. } => "bytecode unavailable",
+            OracleError::InvalidProof { .. } => "invalid proof",
+            OracleError::BlockHashUnsupported { .. } => "BLOCKHASH unsupported",
+        }
+    }
+}
+
 impl std::error::Error for OracleError {}
 
 // `revm`'s `Database::Error` bound. Marks our error as a database error type.
@@ -131,12 +151,50 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// What one call's state reads cost on the wire, as its oracle measured them
+/// (#532): the reads the EVM waited on one at a time, and the prefetch waves
+/// that fetched many at once, with the time each kind kept it waiting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WireCost {
+    /// Oracle reads the EVM waited on one at a time (accounts, slots, code).
+    /// Some cost no round-trip (an oracle's own memo, a proof shortcut such as
+    /// an empty storage trie); `serial_wait` is what they took together.
+    pub serial_reads: u64,
+    pub serial_wait: std::time::Duration,
+    /// Prefetch waves, and the accounts, slots and code hashes they asked
+    /// for. The executor leaves out what its caches hold, except that an
+    /// account is asked for (and counted) with its missing slots.
+    pub waves: u64,
+    pub wave_items: u64,
+    pub wave_wait: std::time::Duration,
+}
+
 /// The verified world-state source the EVM reads through. See the module docs
 /// for the verification and threading contract.
 pub trait SnapStateOracle: Send + Sync {
     /// Cooperative execution check, including cache-only EVM instruction runs.
     /// Fixtures and sans-I/O consumers may leave this unlimited.
     fn check_request(&self) -> Result<(), OracleError> { Ok(()) }
+
+    /// What this oracle's reads have cost on the wire so far — for the
+    /// per-call breakdown a host logs (#532). Default: nothing measured.
+    fn wire_cost(&self) -> WireCost {
+        WireCost::default()
+    }
+
+    /// Whether a convergence loop may start discovery pass `pass`: the loop
+    /// asks before each one, and pass 0 starts a loop. A pass is an EVM run
+    /// plus a prefetch wave, and its yield does not predict the next one's,
+    /// so discovery is bounded in time (#532 review). The bound is the
+    /// oracle's to keep, as it owns a clock and this crate holds none. It
+    /// decides when passes may start, and a pass under way finishes its wave,
+    /// which fetches the state the pass found. Past
+    /// it the loop makes its real runs, which fetch what is left one read at
+    /// a time; the answer never depends on it. Default: always, so only the
+    /// iteration cap bounds discovery.
+    fn keep_discovering(&self, _pass: usize) -> bool {
+        true
+    }
 
     /// The proof-verified account at `address`, or `Ok(None)` when an exclusion
     /// proof shows it absent. `Err` only when it cannot be verified.

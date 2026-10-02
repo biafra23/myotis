@@ -34,7 +34,7 @@ use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
     BlockContext, BytecodeCache, EvmError, OracleAccount, OracleError, SnapStateOracle,
-    StateProofCache, U256,
+    StateProofCache, WireCost, U256,
 };
 
 use crate::el::peer::ManagedPeer;
@@ -332,6 +332,19 @@ const WAVE_SILENCE_DEADLINE: std::time::Duration = BULK_HEDGE_DELAY;
 /// How often [`wave_request`] looks again whether its request has gone out.
 const WAVE_SILENCE_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long a convergence loop may keep starting discovery passes (#532
+/// review; [`SnapStateOracle::keep_discovering`]). Each pass is an EVM run
+/// plus a prefetch wave, and its yield does not predict the next one's (in
+/// the recorded RAILGUN shield, a pass that finds four new items comes before
+/// one that finds 28), so the bound is on time: on a slow link the passes must
+/// not spend the request budget that the serial reads after them need. A pass
+/// under way still finishes its wave: what the wave fetches is mostly state
+/// the real runs need, which they would otherwise read one round-trip at a
+/// time (the rest is what placeholders led the pass to). The bound is per
+/// loop and does not look at the request's own deadline, which cuts a wave
+/// by itself (`PoolOracle::wait`).
+const DISCOVERY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Why a prefetch-wave request came back without an answer.
 #[derive(Debug, PartialEq, Eq)]
 enum WaveFailure {
@@ -550,6 +563,64 @@ pub struct PoolOracle {
     /// witnessed failure (`record_race`, the prefetch wave) — and the shadow
     /// cache, which measures head traffic, is not fed.
     finalized: bool,
+    /// What this call's reads cost on the wire (#532; [`SnapStateOracle::wire_cost`]).
+    wire: WireCounters,
+    /// When the current convergence loop started discovering, and how long
+    /// it may keep starting passes ([`DISCOVERY_TIME_BUDGET`]).
+    discovery_started: Mutex<Option<std::time::Instant>>,
+    discovery_budget: std::time::Duration,
+}
+
+/// The counters behind [`PoolOracle`]'s [`SnapStateOracle::wire_cost`]
+/// (#532): the reads the EVM waited on one at a time, the prefetch waves,
+/// and the time each kind kept it waiting.
+#[derive(Default)]
+struct WireCounters {
+    serial_reads: std::sync::atomic::AtomicU64,
+    serial_nanos: std::sync::atomic::AtomicU64,
+    waves: std::sync::atomic::AtomicU64,
+    wave_items: std::sync::atomic::AtomicU64,
+    wave_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl WireCounters {
+    /// Count one read the EVM waits on; the guard adds its time when dropped.
+    fn serial(&self) -> WireTimer<'_> {
+        self.serial_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WireTimer { nanos: &self.serial_nanos, started: std::time::Instant::now() }
+    }
+
+    /// Count one prefetch wave asking for `items` accounts, slots and codes.
+    fn wave(&self, items: u64) -> WireTimer<'_> {
+        self.waves.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wave_items.fetch_add(items, std::sync::atomic::Ordering::Relaxed);
+        WireTimer { nanos: &self.wave_nanos, started: std::time::Instant::now() }
+    }
+
+    fn snapshot(&self) -> WireCost {
+        let load = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
+        WireCost {
+            serial_reads: load(&self.serial_reads),
+            serial_wait: std::time::Duration::from_nanos(load(&self.serial_nanos)),
+            waves: load(&self.waves),
+            wave_items: load(&self.wave_items),
+            wave_wait: std::time::Duration::from_nanos(load(&self.wave_nanos)),
+        }
+    }
+}
+
+/// Adds the time since it was made to its counter when dropped — however the
+/// read it times ends.
+struct WireTimer<'a> {
+    nanos: &'a std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
+}
+
+impl Drop for WireTimer<'_> {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// This call's ask order after one hedged race over `asked` (the order that
@@ -624,6 +695,9 @@ impl PoolOracle {
             lost,
             silence_reported,
             finalized,
+            wire: WireCounters::default(),
+            discovery_started: Mutex::new(None),
+            discovery_budget: DISCOVERY_TIME_BUDGET,
         }
     }
 
@@ -835,11 +909,25 @@ impl SnapStateOracle for PoolOracle {
         }
     }
 
+    fn wire_cost(&self) -> WireCost {
+        self.wire.snapshot()
+    }
+
+    fn keep_discovering(&self, pass: usize) -> bool {
+        let now = std::time::Instant::now();
+        let mut started = self.discovery_started.lock().unwrap();
+        if pass == 0 || started.is_none() {
+            *started = Some(now);
+        }
+        started.is_some_and(|at| now.duration_since(at) < self.discovery_budget)
+    }
+
     fn fetch_account(
         &self,
         state_root: &[u8; 32],
         address: [u8; 20],
     ) -> Result<Option<OracleAccount>, OracleError> {
+        let _timer = self.wire.serial();
         match self.leaf(state_root, address)? {
             Some(leaf) => leaf_account(&leaf)
                 .ok_or_else(|| OracleError::InvalidProof {
@@ -885,6 +973,10 @@ impl SnapStateOracle for PoolOracle {
         if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
             return;
         }
+        // Counted as asked for. The executor leaves out what the caches hold,
+        // but an account comes (and counts) with its missing slots.
+        let items = accounts.iter().map(|(_, slots)| 1 + slots.len()).sum::<usize>() + code_hashes.len();
+        let _timer = self.wire.wave(u64::try_from(items).unwrap_or(u64::MAX));
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let quality = self.quality.clone();
 
@@ -1172,6 +1264,7 @@ impl SnapStateOracle for PoolOracle {
         address: [u8; 20],
         slot: U256,
     ) -> Result<U256, OracleError> {
+        let _timer = self.wire.serial();
         // An absent account (or one with an empty storage trie) has every slot
         // provably zero — no round trip.
         let Some(leaf) = self.leaf(state_root, address)? else {
@@ -1221,6 +1314,7 @@ impl SnapStateOracle for PoolOracle {
     }
 
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+        let _timer = self.wire.serial();
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
@@ -1446,6 +1540,39 @@ mod tests {
             let outcome = CallOutcome::from_executor(run(&sepolia_header(Vec::new())));
             assert!(matches!(outcome, CallOutcome::Refused(_)), "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn wire_counters_count_reads_and_waves_with_their_time() {
+        // #532: the per-call breakdown an eth_estimateGas logs.
+        let wire = WireCounters::default();
+        {
+            let _read = wire.serial();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(wire.serial());
+        drop(wire.wave(5));
+        let cost = wire.snapshot();
+        assert_eq!((cost.serial_reads, cost.waves, cost.wave_items), (2, 1, 5));
+        assert!(cost.serial_wait >= std::time::Duration::from_millis(2), "{cost:?}");
+    }
+
+    #[test]
+    fn discovery_starts_passes_within_its_budget_and_each_loop_starts_it_afresh() {
+        // #532 review: the oracle owns the clock that bounds a convergence
+        // loop's discovery; the EVM crate holds none.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut oracle =
+            PoolOracle::new(Vec::new(), runtime.handle().clone(), None, Arc::new(ReadStats::default()), false);
+        assert!(oracle.keep_discovering(0) && oracle.keep_discovering(9));
+        // The budget spent: no further pass, until the next loop starts.
+        let spent = std::time::Instant::now().checked_sub(DISCOVERY_TIME_BUDGET).unwrap();
+        *oracle.discovery_started.lock().unwrap() = Some(spent);
+        assert!(!oracle.keep_discovering(3));
+        assert!(oracle.keep_discovering(0));
+        // No budget: no discovery pass at all.
+        oracle.discovery_budget = std::time::Duration::ZERO;
+        assert!(!oracle.keep_discovering(0));
     }
 
     mod prefetch_wave {

@@ -5609,10 +5609,18 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallAnswer, String> {
+        let started = Instant::now();
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let setup = started.elapsed();
         let block_number = ctx.block_number;
-        let joined =
-            super::request::blocking(move || executor.call_tx(&tx, &ctx, overrides)).await?;
+        // Logged inside the blocking run, which always finishes: a call whose
+        // request timed out or was cancelled still shows what it cost.
+        let joined = super::request::blocking(move || {
+            let joined = executor.call_tx(&tx, &ctx, overrides);
+            log_call_cost("eth_call", false, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
+        })
+        .await?;
         Ok(Self::call_answer(anchor, block_number, joined))
     }
 
@@ -5644,9 +5652,15 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<GasOutcome, String> {
+        let started = Instant::now();
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "estimateGas").await?;
-        let joined =
-            super::request::blocking(move || executor.estimate_tx(&tx, &ctx, overrides)).await?;
+        let setup = started.elapsed();
+        let joined = super::request::blocking(move || {
+            let joined = executor.estimate_tx(&tx, &ctx, overrides);
+            log_call_cost("eth_estimateGas", true, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
+        })
+        .await?;
         // Revert payloads survive as the verified answer; executor refusals
         // (a contradictory request, an Amsterdam block without its slot number)
         // become permanent.
@@ -7994,6 +8008,52 @@ fn verify_block_receipts(
         ));
     }
     Ok(())
+}
+
+/// Log what one EVM call cost (#532): its EVM runs, the state reads it waited
+/// on one at a time and in prefetch waves, and `other_ms` — what is left of
+/// the run once those waits are taken out, mostly the EVM's own time. `setup`
+/// is anchoring the block, before the run. `outcome` is `ok` or the kind of
+/// the executor's error ([`EvmError::kind`]; for an estimate that includes
+/// verified answers such as a revert), never its values, so no address reaches
+/// the log the hosts drain. An `eth_estimateGas` logs at info, as it is rare
+/// and its tail is what #532 measured; an `eth_call` of a transaction object
+/// at debug.
+fn log_call_cost(
+    what: &'static str,
+    info: bool,
+    setup: Duration,
+    total: Duration,
+    cost: &myotis_evm::CallCost,
+    error: Option<&EvmError>,
+) {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let wire = &cost.wire;
+    let other = total.saturating_sub(setup).saturating_sub(wire.serial_wait + wire.wave_wait);
+    let outcome = error.map_or("ok", EvmError::kind);
+    macro_rules! breakdown {
+        ($level:ident) => {
+            tracing::$level!(
+                what,
+                outcome,
+                total_ms = ms(total),
+                setup_ms = ms(setup),
+                evm_runs = cost.evm_runs,
+                serial_reads = wire.serial_reads,
+                serial_wait_ms = ms(wire.serial_wait),
+                waves = wire.waves,
+                wave_items = wire.wave_items,
+                wave_wait_ms = ms(wire.wave_wait),
+                other_ms = ms(other),
+                "EVM call breakdown"
+            )
+        };
+    }
+    if info {
+        breakdown!(info);
+    } else {
+        breakdown!(debug);
+    }
 }
 
 /// Wait for a detached fee compute at most `wait` (#532). Giving up drops only

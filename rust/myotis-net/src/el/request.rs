@@ -255,6 +255,23 @@ mod tests {
         assert!(!touched.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn the_evm_call_breakdown_names_an_expired_request_as_one() {
+        // #532 (PR #536 review): `OracleError::kind` tells a deadline apart
+        // from other cancellations by this module's exact wording, which the
+        // EVM crate cannot import (the crates depend the other way). Reword
+        // the message here and this fails, instead of every timeout quietly
+        // logging as a plain cancellation.
+        let reason = |deadline: Instant, cancelled: bool| {
+            let submission = Submission { deadline, cancelled: Arc::new(AtomicBool::new(cancelled)) };
+            let op = submitted(submission, || Operation::new(watch::channel(false).1, REQUEST_BUDGET));
+            op.check().unwrap_err()
+        };
+        let kind = |reason: String| myotis_evm::OracleError::Cancelled { reason }.kind();
+        assert_eq!(kind(reason(Instant::now(), false)), "request deadline exceeded");
+        assert_eq!(kind(reason(Instant::now() + REQUEST_BUDGET, true)), "request cancelled");
+    }
+
     #[tokio::test]
     async fn ready_result_survives_cancellation_during_commit() {
         let (shutdown, receiver) = watch::channel(false);

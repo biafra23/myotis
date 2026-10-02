@@ -152,6 +152,38 @@ impl From<OracleError> for EvmError {
     }
 }
 
+impl EvmError {
+    /// The error's kind, without the values it carries (an address, a
+    /// balance, revert data): what a log line at info may name (#532 review).
+    /// An oracle error is named by its own kind ([`OracleError::kind`]), so a
+    /// request that ran out of time and a proof that failed are told apart.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EvmError::Oracle(error) => error.kind(),
+            EvmError::Reverted { .. } => "reverted",
+            EvmError::OutOfGas => "out of gas",
+            EvmError::Halted { .. } => "halted",
+            EvmError::ForkTooOld { .. } => "fork too old",
+            EvmError::UnsupportedChain { .. } => "unsupported chain",
+            EvmError::Transaction { .. } => "transaction",
+            EvmError::IterationLimitExceeded { .. } => "iteration limit exceeded",
+            EvmError::MissingSlotNumber { .. } => "missing slot number",
+            EvmError::UnexpectedSlotNumber { .. } => "unexpected slot number",
+            EvmError::InvalidRequest { .. } => "invalid request",
+            EvmError::GasAllowanceExceeded { .. } => "gas allowance exceeded",
+            EvmError::InsufficientFundsForTransfer => "insufficient funds for transfer",
+            EvmError::InsufficientFunds { .. } => "insufficient funds",
+            EvmError::FeeCapTooLow { .. } => "fee cap too low",
+            EvmError::IntrinsicGasTooLow { .. } => "intrinsic gas too low",
+            EvmError::FloorDataGasTooLow { .. } => "floor data gas too low",
+            EvmError::CallOutOfGas => "call out of gas",
+            EvmError::FailedWithGas { error, .. } | EvmError::CallFailed { error, .. } => error.kind(),
+            EvmError::RequiredBalanceOverflow { .. } => "required balance overflow",
+            EvmError::CallBudgetExceeded { .. } => "call budget exceeded",
+        }
+    }
+}
+
 impl std::fmt::Display for EvmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -228,3 +260,31 @@ impl std::fmt::Display for EvmError {
 }
 
 impl std::error::Error for EvmError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kind_names_the_error_never_its_values() {
+        // #532 review: the call breakdown logs at info, so it names an error's
+        // kind and leaves its values (here an address) out. A wrapped error
+        // is named by what it wraps.
+        let funds = EvmError::InsufficientFunds { address: [0xab; 20], have: U256::from(1u64), want: U256::from(2u64) };
+        assert!(funds.to_string().contains("abab"), "{funds}");
+        assert_eq!(funds.kind(), "insufficient funds");
+        let call = EvmError::CallFailed { supplied_gas: 21_000, error: Box::new(funds) };
+        assert_eq!(call.kind(), "insufficient funds");
+        let revert = EvmError::Reverted { data: vec![0xde, 0xad] };
+        let estimate = EvmError::FailedWithGas { gas: 50_000, error: Box::new(revert) };
+        assert_eq!(estimate.kind(), "reverted");
+        // An oracle error by its own kind: a cut request is not a bad proof.
+        let cut = EvmError::Oracle(OracleError::Cancelled { reason: "request deadline exceeded".into() });
+        assert_eq!(cut.kind(), "request deadline exceeded");
+        // Any other reason is a plain cancellation: its text is not logged.
+        let other = OracleError::Cancelled { reason: "peer 0xabab… went away".into() };
+        assert_eq!(EvmError::Oracle(other).kind(), "request cancelled");
+        let proof = OracleError::InvalidProof { state_root: [1; 32], address: [0xab; 20], detail: "root mismatch".into() };
+        assert_eq!(EvmError::Oracle(proof).kind(), "invalid proof");
+    }
+}
