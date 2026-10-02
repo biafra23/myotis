@@ -64,10 +64,16 @@ use crate::tx::{Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_SET_CODE};
 /// doesn't clip an `eth_call` that legitimately wants the full block budget.
 pub const VIEW_CALL_GAS: u64 = 30_000_000;
 
-/// Speculative-prefetch convergence cap (Java `DEFAULT_ITERATION_CAP` — plan-
-/// mandated 4): at most two sentinel discovery passes, then real runs; a call
-/// still discovering at the cap fails closed.
-const PREFETCH_ITERATION_CAP: usize = 4;
+/// Speculative-prefetch convergence cap: up to ten sentinel discovery passes,
+/// then the two real runs; a call still discovering at the cap fails closed.
+/// The Java engine's `DEFAULT_ITERATION_CAP` is 4 (two passes), which the Rust
+/// engine kept until #532: every contract a call reaches costs a pass or two,
+/// and the recorded RelayAdapt7702 shield, a wallet's real transaction, still
+/// made 48 of its 57 reads one round-trip at a time behind four iterations,
+/// and none behind twelve. A shallow call stops discovering as soon as a pass
+/// finds nothing new, so the higher cap costs it nothing; the answer never
+/// depends on it.
+const PREFETCH_ITERATION_CAP: usize = 12;
 
 /// Interpret a converged real run for the call path.
 fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
@@ -735,12 +741,16 @@ impl EvmExecutor {
                 // (Java re-derives the identical revert from the next real run
                 // — all-verified reads make the outcome deterministic, so this
                 // is the same answer one iteration sooner).
-                if fresh.is_empty() {
-                    if db.sentinel_misses() == misses_before {
-                        if let Ok(result) = outcome {
-                            return Ok(result);
-                        }
+                // A pass that handed out no placeholder read only verified
+                // state: it IS a real run, whatever it touched, so a warm call
+                // ends here instead of making a real run and an empty wave
+                // (#532 review).
+                if db.sentinel_misses() == misses_before {
+                    if let Ok(result) = outcome {
+                        return Ok(result);
                     }
+                }
+                if fresh.is_empty() {
                     discovering = false;
                 } else {
                     self.prefetch_wave(ctx, &fresh);
@@ -784,6 +794,25 @@ impl EvmExecutor {
             &*self.proof_cache,
             &*self.bytecode_cache,
         );
+        // The code of every account the wave just fetched, at once: a newly
+        // reached contract then runs in the next pass, instead of a pass that
+        // only discovers its code hash (#532 review).
+        let mut follow: Vec<[u8; 32]> = fresh
+            .accounts
+            .iter()
+            .filter_map(|addr| self.proof_cache.get_account(&ctx.state_root, addr).flatten())
+            .map(|account| account.code_hash)
+            .filter(|hash| {
+                *hash != myotis_core::trie::EMPTY_CODE_HASH
+                    && !code_hashes.contains(hash)
+                    && self.bytecode_cache.get(hash).is_none()
+            })
+            .collect();
+        follow.sort_unstable();
+        follow.dedup();
+        if !follow.is_empty() {
+            self.oracle.prefetch_batch(&ctx.state_root, &[], &follow, &*self.proof_cache, &*self.bytecode_cache);
+        }
     }
 }
 
@@ -1645,8 +1674,8 @@ mod tests {
         assert!(estimate > 21_000, "{estimate}");
         assert_eq!(oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst), 0, "no slot read one by one");
         assert!(exec.cost().evm_runs > 1, "the discovery pass, the real run, the search's probes");
-        // The same answer a cold, serial world gives: waves change the cost,
-        // never the result.
+        // The same answer a world without waves or caches gives: waves change
+        // the cost, never the result.
         let fx_only = EvmExecutor::new(
             Arc::new(three_slot_world()) as Arc<dyn crate::oracle::SnapStateOracle>,
             Arc::new(NoopStateProofCache),
@@ -1658,7 +1687,9 @@ mod tests {
     #[test]
     fn an_estimate_after_the_same_call_reads_nothing_one_by_one() {
         // #532 proposal 5: a wallet simulates, then estimates, the same
-        // transaction: the call's verified state serves the estimate.
+        // transaction: the call's verified state serves the estimate, through
+        // the caches the two share (as before this change; pinned here, with
+        // the shield's own case in `relay_adapt_7702_shield`).
         let (oracle, exec) = three_slot_reader();
         let c = ctx(19_500_000, CANCUN_TIME + 1);
         exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();

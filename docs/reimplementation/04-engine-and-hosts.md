@@ -199,7 +199,7 @@ levels**: *intra-call* (one big multicall) and *inter-call* (many requests at on
 
 A single multicall may touch hundreds of accounts and storage slots; the synchronous EVM would
 block on each miss serially. The prefetch executor turns that into a few **parallel waves** with a
-*sentinel-return* loop (cap `DEFAULT_ITERATION_CAP = 4`):
+*sentinel-return* loop (cap `DEFAULT_ITERATION_CAP = 4`; the Rust engine's `PREFETCH_ITERATION_CAP` is 12 since #532, for call chains as deep as a RAILGUN shield):
 
 ```
 prime:  fetch the target (multicall) contract's account + bytecode synchronously         (~2 RTT)

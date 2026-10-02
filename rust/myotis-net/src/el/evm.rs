@@ -938,8 +938,6 @@ impl SnapStateOracle for PoolOracle {
     ) {
         use futures::stream::{self, StreamExt};
         const BATCH_PATHSET_CHUNK: usize = 64; // Java SnapBackedStateOracle parity
-        let items = accounts.iter().map(|(_, slots)| 1 + slots.len()).sum::<usize>() + code_hashes.len();
-        let _timer = self.wire.wave(u64::try_from(items).unwrap_or(u64::MAX));
         const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT (per request)
         const MAX_ATTEMPTS: usize = 3; // Java DEFAULT_MAX_ATTEMPTS
         const WAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -947,6 +945,9 @@ impl SnapStateOracle for PoolOracle {
         if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
             return;
         }
+        // Counted as asked for: items the caches already hold are in it.
+        let items = accounts.iter().map(|(_, slots)| 1 + slots.len()).sum::<usize>() + code_hashes.len();
+        let _timer = self.wire.wave(u64::try_from(items).unwrap_or(u64::MAX));
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let quality = self.quality.clone();
 

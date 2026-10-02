@@ -5613,12 +5613,14 @@ impl ElReader {
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
         let setup = started.elapsed();
         let block_number = ctx.block_number;
-        let (joined, cost) = super::request::blocking(move || {
+        // Logged inside the blocking run, which always finishes: a call whose
+        // request timed out or was cancelled still shows what it cost.
+        let joined = super::request::blocking(move || {
             let joined = executor.call_tx(&tx, &ctx, overrides);
-            (joined, executor.cost())
+            log_call_cost("eth_call", false, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
         })
         .await?;
-        log_call_cost("eth_call", false, setup, started.elapsed(), &cost, joined.is_ok());
         Ok(Self::call_answer(anchor, block_number, joined))
     }
 
@@ -5653,12 +5655,12 @@ impl ElReader {
         let started = Instant::now();
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "estimateGas").await?;
         let setup = started.elapsed();
-        let (joined, cost) = super::request::blocking(move || {
+        let joined = super::request::blocking(move || {
             let joined = executor.estimate_tx(&tx, &ctx, overrides);
-            (joined, executor.cost())
+            log_call_cost("eth_estimateGas", true, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
         })
         .await?;
-        log_call_cost("eth_estimateGas", true, setup, started.elapsed(), &cost, joined.is_ok());
         // Revert payloads survive as the verified answer; executor refusals
         // (a contradictory request, an Amsterdam block without its slot number)
         // become permanent.
@@ -8009,26 +8011,29 @@ fn verify_block_receipts(
 }
 
 /// Log what one EVM call cost (#532): its EVM runs, the state reads it waited
-/// on one at a time and in prefetch waves, and the rest — the EVM's own time —
-/// apart from the setup (anchoring the block). An `eth_estimateGas` logs at
-/// info, as it is rare and its tail is what #532 measured; an `eth_call` at
-/// debug.
+/// on one at a time and in prefetch waves, and `other_ms` — what is left of
+/// the run once those waits are taken out, mostly the EVM's own time. `setup`
+/// is anchoring the block, before the run. `error` is the executor's error,
+/// which for an estimate includes verified answers such as a revert. An
+/// `eth_estimateGas` logs at info, as it is rare and its tail is what #532
+/// measured; an `eth_call` of a transaction object at debug.
 fn log_call_cost(
     what: &'static str,
     info: bool,
     setup: Duration,
     total: Duration,
     cost: &myotis_evm::CallCost,
-    answered: bool,
+    error: Option<&EvmError>,
 ) {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let wire = &cost.wire;
-    let evm = total.saturating_sub(setup).saturating_sub(wire.serial_wait + wire.wave_wait);
+    let other = total.saturating_sub(setup).saturating_sub(wire.serial_wait + wire.wave_wait);
+    let error = error.map(ToString::to_string).unwrap_or_default();
     macro_rules! breakdown {
         ($level:ident) => {
             tracing::$level!(
                 what,
-                answered,
+                error = %error,
                 total_ms = ms(total),
                 setup_ms = ms(setup),
                 evm_runs = cost.evm_runs,
@@ -8037,7 +8042,7 @@ fn log_call_cost(
                 waves = wire.waves,
                 wave_items = wire.wave_items,
                 wave_wait_ms = ms(wire.wave_wait),
-                evm_ms = ms(evm),
+                other_ms = ms(other),
                 "EVM call breakdown"
             )
         };
