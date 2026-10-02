@@ -38,7 +38,7 @@ use myotis_evm::{
 use crate::el::anchor::{ExecAnchor, FinalizedExecution};
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
-use crate::el::feecache::{BlockRewards, FeeCache, Head, HistoryShape, Lookup};
+use crate::el::feecache::{BlockRewards, BlockTips, FeeCache, Head, HistoryShape, Lookup};
 use crate::el::evm::{
     block_context, ReadAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
     EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
@@ -1215,6 +1215,17 @@ const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(6
 /// compute carries on in the background, filling the memo for the next poll.
 const FEE_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The same for an `eth_feeHistory` pinned to a block number: nothing follows
+/// such a shape, and its top moves with finality, so a polled retry may find
+/// no memo to hit. It gets the time a cold build needs, still well inside the
+/// 90 s request budget (#532 review).
+const FEE_PINNED_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fee computes a read may leave running in the background at once (#532
+/// review): past this a miss answers its retryable error at once, so a client
+/// sending new request shapes cannot pile up peer ladders.
+const FEE_COMPUTES_MAX: usize = 4;
+
 /// A resolved `eth_feeHistory` request: the anchored window top, the served
 /// block count and the oldest block.
 #[derive(Debug, Clone, Copy)]
@@ -1319,6 +1330,22 @@ pub struct FeeHistory {
 pub struct FeeEstimate {
     pub max_priority_fee_wei: u128,
     pub gas_price_wei: u128,
+}
+
+impl FeeEstimate {
+    /// This estimate served `behind` blocks after the head it was computed for
+    /// (#532 review): the gas price's base-fee part raised by the most it can
+    /// have grown since — 12.5% a block, EIP-1559's cap — so a legacy
+    /// transaction priced from it is not left under the base fee after a run
+    /// of full blocks. The tip is a market median, not a protocol bound: it is
+    /// served as it was.
+    pub(crate) fn raised_for(self, behind: u64) -> FeeEstimate {
+        let k = u32::try_from(behind.min(crate::el::feecache::STALE_MAX_BLOCKS)).unwrap_or(0);
+        let base = self.gas_price_wei.saturating_sub(self.max_priority_fee_wei);
+        let (num, den) = (9u128.pow(k), 8u128.pow(k));
+        let raised = base.saturating_mul(num).saturating_add(den - 1) / den;
+        FeeEstimate { gas_price_wei: raised.saturating_add(self.max_priority_fee_wei), ..self }
+    }
 }
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
@@ -1470,6 +1497,8 @@ pub struct ElReader {
     /// The fee follower (see [`Self::ensure_fee_follower`]): refreshes the fee
     /// reads a wallet is polling on every new head, off the request path.
     fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Permits for the fee computes a read left running ([`FEE_COMPUTES_MAX`]).
+    fee_compute_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// The scan-cursor map plus its last TTL sweep — one lock covers both, so the
@@ -1650,6 +1679,7 @@ impl ElReader {
             fee_cache: std::sync::Mutex::new(crate::el::feecache::FeeCache::default()),
             fee_estimate_compute: tokio::sync::Mutex::new(()),
             fee_follow_task: std::sync::Mutex::new(None),
+            fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
         })
     }
 
@@ -6161,33 +6191,38 @@ impl ElReader {
     /// Served from the per-head memo (#510): exact for as long as the anchored
     /// head is unchanged, and STALE (within `feecache`'s block/age bounds) just
     /// after a head advance while the fee follower refreshes it in the
-    /// background. Only a miss with no recent value starts a compute —
-    /// single-flight, so concurrent misses share one peer ladder — and it waits
-    /// for it at most [`FEE_READ_WAIT`] ([`Self::bounded_fee_compute`], #532).
+    /// background — its gas price raised for the blocks it is behind
+    /// ([`FeeEstimate::raised_for`]). Only a miss with no recent value starts a
+    /// compute — single-flight, so concurrent misses share one peer ladder,
+    /// and a ladder that just failed is not rerun for them — and it waits for
+    /// it at most [`FEE_READ_WAIT`] ([`Self::bounded_fee_compute`], #532).
     pub async fn fee_estimate(self: &Arc<Self>) -> Result<FeeEstimate, String> {
         let head = self.anchored_head()?;
         let now = Instant::now();
-        let hit = self.with_fee_cache(|c| {
+        let (hit, summary) = self.with_fee_cache(|c| {
             c.note_estimate_demand(now);
             let hit = c.estimate.lookup(head, now, true);
             c.stats.touch(now);
             c.stats.estimate.served(&hit);
-            hit
+            (hit, c.stats.take_summary(now))
         })?;
+        log_fee_summary(summary);
         self.ensure_fee_follower();
         match hit {
             Lookup::Fresh(est) => Ok(est),
-            Lookup::Stale(est, age) => {
+            Lookup::Stale(est, staleness) => {
                 tracing::debug!(
                     head = head.0,
-                    age_secs = age.as_secs(),
+                    behind = staleness.behind,
+                    age_secs = staleness.age.as_secs(),
                     "fee estimate: serving a previous head's value while refreshing"
                 );
-                Ok(est)
+                Ok(est.raised_for(staleness.behind))
             }
             Lookup::Miss => {
-                let result =
-                    self.bounded_fee_compute(move |r| async move { r.fee_estimate_refresh(head).await }).await;
+                let result = self
+                    .bounded_fee_compute(FEE_READ_WAIT, move |r| async move { r.fee_estimate_refresh(head).await })
+                    .await;
                 let _ = self.with_fee_cache(|c| c.stats.estimate.missed(result.is_ok()));
                 result
             }
@@ -6206,28 +6241,42 @@ impl ElReader {
     /// still cancels it — and its result lands in the memo for the next poll.
     /// Before, the read itself waited on the peer ladder, up to the 90 s
     /// request budget, long after the wallet had given up at 10 s.
-    async fn bounded_fee_compute<T, F, Fut>(self: &Arc<Self>, compute: F) -> Result<T, String>
+    ///
+    /// At most [`FEE_COMPUTES_MAX`] such computes run at once; past that a
+    /// read answers its retryable error at once.
+    async fn bounded_fee_compute<T, F, Fut>(self: &Arc<Self>, wait: Duration, compute: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, String>> + Send,
     {
+        let Ok(permit) = Arc::clone(&self.fee_compute_permits).try_acquire_owned() else {
+            return Err("fee data is being computed; retry shortly".to_string());
+        };
         let reader = Arc::clone(self);
         let task = tokio::spawn(async move {
+            let _permit = permit;
             let compute = compute(Arc::clone(&reader));
             reader.request_with_budget(FEE_REFRESH_BUDGET, compute).await
         });
-        await_bounded(task, FEE_READ_WAIT).await
+        await_bounded(task, wait).await
     }
 
     /// Compute (single-flight) and memoize the estimate for `head`.
     async fn fee_estimate_refresh(&self, head: Head) -> Result<FeeEstimate, String> {
         let _flight = self.fee_estimate_compute.lock().await;
-        // Another caller (or the follower) may have finished it while we waited.
-        if let Lookup::Fresh(est) =
-            self.with_fee_cache(|c| c.estimate.lookup(head, Instant::now(), false))?
-        {
+        // Another caller (or the follower) may have finished it while we waited,
+        // or failed it a moment ago: that ladder is not rerun for every caller
+        // that queued behind it (#532 review).
+        let (hit, failed) = self.with_fee_cache(|c| {
+            let now = Instant::now();
+            (c.estimate.lookup(head, now, false), c.estimate.failed_recently(head, now))
+        })?;
+        if let Lookup::Fresh(est) = hit {
             return Ok(est);
+        }
+        if failed {
+            return Err("the fee estimate for this head just failed; retry shortly".to_string());
         }
         let result = self.fee_estimate_at(head).await;
         let current = self.anchored_head().ok();
@@ -6316,7 +6365,10 @@ impl ElReader {
                 let tips: Arc<Vec<u128>> = Arc::new(
                     body.transactions.iter().filter_map(|raw| tx::effective_tip(raw, base)).collect(),
                 );
-                self.with_fee_cache(|c| c.put_tips((vh.header.number, vh.hash), Arc::clone(&tips)))?;
+                // Every transaction decoded: its receipts alone complete the
+                // block's reward input (`reward_inputs`).
+                let complete = tips.len() == body.transactions.len();
+                self.with_fee_cache(|c| c.put_tips((vh.header.number, vh.hash), Arc::clone(&tips), complete))?;
                 per_block[i] = Some(tips);
             }
         }
@@ -6380,15 +6432,28 @@ impl ElReader {
             return false;
         };
         if !active || *self.request_shutdown.borrow() {
+            // Going quiet: the window so far is logged now, not folded into
+            // the next one across the idle gap (#532 review).
+            log_fee_summary(self.with_fee_cache(|c| c.stats.flush(Instant::now())).ok().flatten());
             return false;
         }
         let Ok(head) = self.anchored_head() else {
             return true;
         };
-        // The histories BEFORE the estimate: one with reward rows fetches the
-        // new head's body and receipts, and the estimate then finds that
-        // block's tips in the per-block memo — one body and one receipts fetch
-        // per head for every fee read a wallet polls (#532).
+        // The estimate FIRST, so it is never held up behind a slow history
+        // refresh: it fetches the new head's body (one block), and a history
+        // with reward rows then fetches only that block's receipts — one body
+        // and one receipts fetch per head for every fee read (#532).
+        if estimate_followed
+            && self.with_fee_cache(|c| c.estimate.wants_refresh(head, now)).unwrap_or(false)
+        {
+            let started = Instant::now();
+            let outcome = self.request_with_budget(FEE_REFRESH_BUDGET, self.fee_estimate_refresh(head)).await;
+            self.note_fee_refresh("estimate", head.0, started, &outcome);
+            if outcome.is_err() {
+                let _ = self.with_fee_cache(|c| c.estimate.record_failure(head, Instant::now()));
+            }
+        }
         for (shape, lock) in shapes {
             let Ok(plan) = self.fee_history_plan(shape.block_count, None, head) else {
                 continue;
@@ -6409,19 +6474,7 @@ impl ElReader {
                 let _ = self.with_fee_cache(|c| c.record_history_failure(&shape, top, Instant::now()));
             }
         }
-        if estimate_followed
-            && self.with_fee_cache(|c| c.estimate.wants_refresh(head, now)).unwrap_or(false)
-        {
-            let started = Instant::now();
-            let outcome = self.request_with_budget(FEE_REFRESH_BUDGET, self.fee_estimate_refresh(head)).await;
-            self.note_fee_refresh("gasPrice", head.0, started, &outcome);
-            if outcome.is_err() {
-                let _ = self.with_fee_cache(|c| c.estimate.record_failure(head, Instant::now()));
-            }
-        }
-        if let Ok(Some(line)) = self.with_fee_cache(|c| c.stats.take_summary(Instant::now())) {
-            tracing::info!("{line}");
-        }
+        log_fee_summary(self.with_fee_cache(|c| c.stats.take_summary(Instant::now())).ok().flatten());
         true
     }
 
@@ -6491,31 +6544,37 @@ impl ElReader {
         );
         let top = (plan.top.number(), *plan.top.hash());
         let now = Instant::now();
-        let (hit, lock) = self
+        let (hit, lock, summary) = self
             .with_fee_cache(|c| {
                 let (hit, lock) = c.history_lookup(&shape, top, now);
                 c.stats.touch(now);
                 c.stats.history.served(&hit);
-                (hit, lock)
+                (hit, lock, c.stats.take_summary(now))
             })
             .map_err(FeeHistoryError::Build)?;
+        log_fee_summary(summary);
         if shape.follows_head() {
             self.ensure_fee_follower();
         }
         match hit {
             Lookup::Fresh(history) => Ok(history),
-            Lookup::Stale(history, age) => {
+            // A self-describing window (its `oldestBlock` says which blocks),
+            // served as it was computed.
+            Lookup::Stale(history, staleness) => {
                 tracing::debug!(
                     head = head.0,
-                    age_secs = age.as_secs(),
+                    behind = staleness.behind,
+                    age_secs = staleness.age.as_secs(),
                     "eth_feeHistory: serving a previous head's result while refreshing"
                 );
                 Ok(history)
             }
-            // At most FEE_READ_WAIT, like the estimate (#532).
+            // Bounded like the estimate (#532); a pinned shape, which nothing
+            // follows, gets the time a cold build needs.
             Lookup::Miss => {
+                let wait = if shape.follows_head() { FEE_READ_WAIT } else { FEE_PINNED_READ_WAIT };
                 let result = self
-                    .bounded_fee_compute(move |r| async move { r.fee_history_refresh(&shape, &lock, plan).await })
+                    .bounded_fee_compute(wait, move |r| async move { r.fee_history_refresh(&shape, &lock, plan).await })
                     .await;
                 let _ = self.with_fee_cache(|c| c.stats.history.missed(result.is_ok()));
                 result.map_err(FeeHistoryError::Build)
@@ -6560,8 +6619,17 @@ impl ElReader {
     ) -> Result<FeeHistory, String> {
         let _flight = lock.lock().await;
         let top = (plan.top.number(), *plan.top.hash());
-        if let Some(history) = self.with_fee_cache(|c| c.history_fresh(shape, top, Instant::now()))? {
+        let (fresh, failed) = self.with_fee_cache(|c| {
+            let now = Instant::now();
+            (c.history_fresh(shape, top, now), c.history_failed_recently(shape, top, now))
+        })?;
+        if let Some(history) = fresh {
             return Ok(history);
+        }
+        // As for the estimate: a ladder that just failed is not rerun for every
+        // caller queued behind it (#532 review).
+        if failed {
+            return Err("the feeHistory build for this block just failed; retry shortly".to_string());
         }
         let percentiles = shape.percentiles();
         let result =
@@ -6664,9 +6732,15 @@ impl ElReader {
         let reward = match reward_percentiles {
             None => None,
             Some(percentiles) => {
-                let inputs = reward_inputs(&self.fee_cache, &window[..count], |hash| async move {
+                let inputs = reward_inputs(&self.fee_cache, &window[..count], |hash, with_body| async move {
                     let hash = [hash];
-                    futures::future::join(peer.get_block_bodies(&hash), peer.get_receipts(&hash)).await
+                    if with_body {
+                        let (bodies, receipts) =
+                            futures::future::join(peer.get_block_bodies(&hash), peer.get_receipts(&hash)).await;
+                        (Some(bodies), receipts)
+                    } else {
+                        (None, peer.get_receipts(&hash).await)
+                    }
                 })
                 .await?;
                 Some(inputs.iter().map(|tips| percentile_rewards(tips.as_ref().clone(), percentiles)).collect())
@@ -7468,6 +7542,9 @@ impl ElReader {
         // Stop producers before collecting/draining registered work.
         self.stop_log_index_appender().await;
         self.stop_fee_follower().await;
+        // A pause or stop is often the moment a user gave up on a slow fee
+        // read: log the window that saw it (#532 review).
+        log_fee_summary(self.with_fee_cache(|c| c.stats.flush(Instant::now())).ok().flatten());
         let requests: Vec<_> = self.requests.lock().map(|requests| requests.iter().filter_map(std::sync::Weak::upgrade).collect()).unwrap_or_default();
         for request in requests { request.settled().await; }
         if let Ok(mut t) = self.log_index_task.lock() {
@@ -7801,40 +7878,93 @@ async fn await_bounded<T>(task: tokio::task::JoinHandle<Result<T, String>>, wait
     }
 }
 
+/// Log a `[fee-reads]` summary line, when there is one (#532).
+fn log_fee_summary(line: Option<String>) {
+    if let Some(line) = line {
+        tracing::info!("{line}");
+    }
+}
+
 /// Every block's `(tip, gas used)` list for the `eth_feeHistory` reward rows,
-/// in `blocks` order: from the per-block fee memo where it holds the block,
-/// else fetched — body and receipts for exactly the blocks it lacks, all in
-/// flight at once on the peer's multiplexed connection (one slowest-block
-/// round-trip, the Java pipelined `verifiedBlockTipsAsync`) — and verified
-/// ([`block_tx_tips`]) before it is remembered. A new head therefore costs one
-/// body and one receipts fetch, not the whole window again (#532). `fetch`
-/// gets a block hash and returns that block's bodies and receipts responses.
+/// in `blocks` order, each verified before it is trusted or remembered:
+/// - from the per-block fee memo where it holds the list;
+/// - from the block's receipts alone where the memo holds its complete tips —
+///   the estimate already fetched and verified that body ([`weigh_tips`]);
+/// - else from its body and receipts ([`block_tx_tips`]).
+///
+/// What is missing is fetched all at once on the peer's multiplexed
+/// connection (one slowest-block round-trip, the Java pipelined
+/// `verifiedBlockTipsAsync`). So a new head costs one receipts fetch here
+/// when the estimate fetched its body, one body and one receipts fetch when it
+/// did not, and never the whole window again (#532). Every block that
+/// verifies is remembered, even when another one fails the call.
+/// `fetch(hash, with_body)` returns the block's bodies response (only when
+/// asked for) and its receipts response.
 async fn reward_inputs<F, Fut>(
     cache: &std::sync::Mutex<FeeCache>,
     blocks: &[crate::el::eth::messages::VerifiedHeader],
     fetch: F,
 ) -> Result<Vec<BlockRewards>, String>
 where
-    F: Fn([u8; 32]) -> Fut,
+    F: Fn([u8; 32], bool) -> Fut,
     Fut: std::future::Future<
         Output = (
-            Result<Vec<crate::el::eth::messages::BlockBody>, String>,
+            Option<Result<Vec<crate::el::eth::messages::BlockBody>, String>>,
             Result<Vec<crate::el::eth::messages::BlockReceipts>, String>,
         ),
     >,
 {
     let unavailable = |_| "fee cache unavailable".to_string();
-    let mut inputs: Vec<Option<BlockRewards>> = {
+    // Per block: its cached list, else the complete tips its receipts need.
+    let (mut inputs, known_tips): (Vec<Option<BlockRewards>>, Vec<Option<BlockTips>>) = {
         let cache = cache.lock().map_err(unavailable)?;
-        blocks.iter().map(|vh| cache.weighted((vh.header.number, vh.hash))).collect()
+        blocks
+            .iter()
+            .map(|vh| {
+                let head = (vh.header.number, vh.hash);
+                match cache.weighted(head) {
+                    Some(weighted) => (Some(weighted), None),
+                    None => (None, cache.complete_tips(head)),
+                }
+            })
+            .unzip()
     };
     let missing: Vec<usize> = (0..blocks.len()).filter(|&i| inputs[i].is_none()).collect();
-    let fetched = futures::future::join_all(missing.iter().map(|&i| fetch(blocks[i].hash))).await;
-    for (&i, (bodies, receipts)) in missing.iter().zip(fetched) {
+    // A block known to hold no transactions needs no fetch: its gasUsed is all
+    // there is to check.
+    let empty = |i: usize| known_tips[i].as_ref().is_some_and(|tips| tips.is_empty());
+    let fetched = futures::future::join_all(
+        missing.iter().filter(|&&i| !empty(i)).map(|&i| fetch(blocks[i].hash, known_tips[i].is_none())),
+    )
+    .await;
+    let mut fetched = fetched.into_iter();
+    let mut first_err = None;
+    for &i in &missing {
         let vh = &blocks[i];
-        let weighted = Arc::new(block_tx_tips(&vh.header, bodies?, receipts?)?);
-        cache.lock().map_err(unavailable)?.put_weighted((vh.header.number, vh.hash), Arc::clone(&weighted));
-        inputs[i] = Some(weighted);
+        let weighted = if empty(i) {
+            weigh_tips(&vh.header, &[], Vec::new())
+        } else {
+            match (fetched.next(), &known_tips[i]) {
+                (Some((_, receipts)), Some(tips)) => receipts.and_then(|r| weigh_tips(&vh.header, tips, r)),
+                (Some((Some(bodies), receipts)), None) => {
+                    bodies.and_then(|b| receipts.and_then(|r| block_tx_tips(&vh.header, b, r)))
+                }
+                _ => Err("a block's fetch went missing".to_string()),
+            }
+        };
+        match weighted {
+            Ok(weighted) => {
+                let weighted = Arc::new(weighted);
+                cache.lock().map_err(unavailable)?.put_weighted((vh.header.number, vh.hash), Arc::clone(&weighted));
+                inputs[i] = Some(weighted);
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     inputs.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| "a block's reward input went missing".to_string())
 }
@@ -7849,9 +7979,37 @@ fn block_tx_tips(
     bodies: Vec<crate::el::eth::messages::BlockBody>,
     receipt_blocks: Vec<crate::el::eth::messages::BlockReceipts>,
 ) -> Result<Vec<(u128, u64)>, String> {
+    let tips = strict_body_tips(header, bodies)?;
+    weigh_tips(header, &tips, receipt_blocks)
+}
+
+/// Every transaction's effective tip, in order, from a FETCHED body verified
+/// against the anchored header's `transactionsRoot` — strict: an undecodable
+/// tx fails the block.
+fn strict_body_tips(
+    header: &BlockHeader,
+    bodies: Vec<crate::el::eth::messages::BlockBody>,
+) -> Result<Vec<u128>, String> {
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
     verify_body_transactions(header, &body)?;
-    if body.transactions.is_empty() {
+    let base_fee = header_base_fee(header);
+    body.transactions
+        .iter()
+        .map(|raw| {
+            tx::effective_tip(raw, base_fee).ok_or_else(|| format!("block {} has an undecodable tx", header.number))
+        })
+        .collect()
+}
+
+/// Weigh a block's `tips` — every transaction's, in order, from a body
+/// verified against the anchored header — by the gas each used, from FETCHED
+/// receipts verified against the header's `receiptsRoot` first.
+fn weigh_tips(
+    header: &BlockHeader,
+    tips: &[u128],
+    receipt_blocks: Vec<crate::el::eth::messages::BlockReceipts>,
+) -> Result<Vec<(u128, u64)>, String> {
+    if tips.is_empty() {
         // A root-verified EMPTY tx list ⇒ the anchored header must carry
         // gasUsed 0 (same strictness as the non-empty path's final-sum check).
         // Receipts are deliberately NOT consulted here — no weights to derive —
@@ -7867,24 +8025,20 @@ fn block_tx_tips(
         return Ok(Vec::new());
     }
     let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
-    if receipts.len() != body.transactions.len() {
+    if receipts.len() != tips.len() {
         return Err(format!(
             "block {} receipt count mismatch ({} receipts for {} txs)",
             header.number,
             receipts.len(),
-            body.transactions.len()
+            tips.len()
         ));
     }
-    let receipts = receipts
-        .canonical(body.transactions.len())
-        .map_err(|e| format!("block {}: {}", header.number, e.0))?;
+    let receipts =
+        receipts.canonical(tips.len()).map_err(|e| format!("block {}: {}", header.number, e.0))?;
     verify_block_receipts(header, &receipts)?;
-    let base_fee = header_base_fee(header);
-    let mut out = Vec::with_capacity(body.transactions.len());
+    let mut out = Vec::with_capacity(tips.len());
     let mut prev_cum = 0u64;
-    for (raw, receipt) in body.transactions.iter().zip(receipts.iter()) {
-        let tip = tx::effective_tip(raw, base_fee)
-            .ok_or_else(|| format!("block {} has an undecodable tx", header.number))?;
+    for (&tip, receipt) in tips.iter().zip(receipts.iter()) {
         let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
         // Strict, like the rest of this path: cumulative gas must be
         // monotonic (a regression is impossible in a consensus-valid block —
@@ -8993,20 +9147,39 @@ mod tests {
             assert!(err.contains("still being computed"), "{err}");
             assert!(took >= FEE_READ_WAIT && took < FEE_READ_WAIT + Duration::from_secs(3), "{took:?}");
             drop(held);
+            // With every compute permit taken, a miss answers at once: a client
+            // cannot pile up peer ladders (#532 review).
+            // (Waiting for the compute just released to hand its permit back.)
+            let permits = tokio::time::timeout(
+                Duration::from_secs(10),
+                Arc::clone(&reader.fee_compute_permits).acquire_many_owned(FEE_COMPUTES_MAX as u32),
+            )
+            .await
+            .expect("the released compute returns its permit")
+            .expect("the semaphore is never closed");
+            let started = std::time::Instant::now();
+            let busy = reader.fee_estimate().await.unwrap_err();
+            assert!(busy.contains("being computed"), "{busy}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            drop(permits);
             let stats = reader.with_fee_cache(|c| c.stats.estimate).unwrap();
-            assert_eq!(stats.miss_failed, 2);
+            assert_eq!(stats.miss_failed, 3);
             reader.stop().await;
         }
     }
 
     /// The `eth_feeHistory` reward rows' per-block input ([`reward_inputs`],
-    /// #532): a new head fetches one block, not the whole window again.
+    /// #532): a new head fetches one block, not the whole window again, and
+    /// only its receipts when the estimate already verified its body.
     mod fee_reward_inputs {
         use super::*;
-        use crate::el::eth::messages::{BlockBody, BlockReceipts, VerifiedHeader};
+        use crate::el::eth::messages::{BlockBody, BlockReceipts, RawList, VerifiedHeader};
+        use myotis_core::rlp::{encode, Item};
         use std::sync::Mutex;
 
-        type Fetched = (Result<Vec<BlockBody>, String>, Result<Vec<BlockReceipts>, String>);
+        const GWEI: u128 = 1_000_000_000;
+
+        type Fetched = (Option<Result<Vec<BlockBody>, String>>, Result<Vec<BlockReceipts>, String>);
 
         /// Headers `from..to` committing to an empty body (whose receipts are
         /// never consulted).
@@ -9019,18 +9192,74 @@ mod tests {
                 .collect()
         }
 
-        fn empty_block() -> Fetched {
-            let body = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
-            (Ok(vec![body]), Ok(Vec::new()))
+        fn empty_block(with_body: bool) -> Fetched {
+            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0 };
+            (with_body.then(|| Ok(vec![body])), Ok(Vec::new()))
+        }
+
+        /// A minimal-length big-endian scalar.
+        fn be(v: u128) -> Vec<u8> {
+            let bytes = v.to_be_bytes();
+            let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            bytes[first..].to_vec()
+        }
+
+        fn receipts_of(cumulative: &[u64]) -> RawList {
+            let mut list = RawList::new();
+            for &gas in cumulative {
+                let receipt = Item::List(vec![
+                    Item::Bytes(vec![1]),
+                    Item::Bytes(be(u128::from(gas))),
+                    Item::Bytes(vec![0; 256]),
+                    Item::List(Vec::new()),
+                ]);
+                list.push(&encode(&receipt));
+            }
+            list
+        }
+
+        /// Block `number` holding one legacy transaction that pays `tip` over
+        /// the base fee `base` and uses 21 000 gas: its header (both roots
+        /// computed), body and receipts.
+        fn one_tx_block(number: u64, base: u128, tip: u128) -> (VerifiedHeader, BlockBody, BlockReceipts) {
+            let tx = encode(&Item::List(vec![
+                Item::Bytes(Vec::new()),
+                Item::Bytes(be(base + tip)),
+                Item::Bytes(be(21_000)),
+                Item::Bytes(vec![0x11; 20]),
+                Item::Bytes(Vec::new()),
+                Item::Bytes(Vec::new()),
+                Item::Bytes(vec![27]),
+                Item::Bytes(vec![1; 32]),
+                Item::Bytes(vec![2; 32]),
+            ]));
+            let mut transactions = RawList::new();
+            transactions.push(&tx);
+            let receipts = receipts_of(&[21_000]);
+            let header = BlockHeader {
+                number,
+                gas_used: 21_000,
+                base_fee_per_gas: Some(be(base)),
+                transactions_root: triehash::ordered_trie_root(transactions.iter()),
+                receipts_root: triehash::ordered_trie_root(receipts.iter()),
+                ..Default::default()
+            };
+            let vh = VerifiedHeader { hash: keccak256(&number.to_be_bytes()), raw_rlp: Vec::new(), header };
+            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }, BlockReceipts::Canonical(receipts))
+        }
+
+        fn serve(number: u64, tip: u128, with_body: bool) -> Fetched {
+            let (_, body, receipts) = one_tx_block(number, GWEI, tip);
+            (with_body.then(|| Ok(vec![body])), Ok(vec![receipts]))
         }
 
         #[tokio::test]
         async fn a_new_head_fetches_one_block_not_the_window() {
             let cache = Mutex::new(FeeCache::default());
             let asked = Mutex::new(Vec::<[u8; 32]>::new());
-            let fetch = |hash: [u8; 32]| {
+            let fetch = |hash: [u8; 32], with_body: bool| {
                 asked.lock().unwrap().push(hash);
-                async { empty_block() }
+                async move { empty_block(with_body) }
             };
             let first = reward_inputs(&cache, &window(0, 10), fetch).await.unwrap();
             assert_eq!(first.len(), 10);
@@ -9045,32 +9274,103 @@ mod tests {
             reward_inputs(&cache, &window(1, 11), fetch).await.unwrap();
             reward_inputs(&cache, &window(6, 11), fetch).await.unwrap();
             assert!(asked.lock().unwrap().is_empty());
-            // The estimate reads the same blocks' tips from the memo.
-            assert!(cache.lock().unwrap().tips((10, keccak256(&10u64.to_be_bytes()))).is_some());
         }
 
         #[tokio::test]
-        async fn a_block_that_fails_verification_is_not_remembered() {
+        async fn a_cold_block_is_weighed_from_its_body_and_receipts_and_serves_the_estimate() {
+            let cache = Mutex::new(FeeCache::default());
+            let (vh, _, _) = one_tx_block(8, GWEI, 2 * GWEI);
+            let fetch = |_hash: [u8; 32], with_body: bool| async move { serve(8, 2 * GWEI, with_body) };
+            let inputs = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            assert_eq!(*inputs[0], vec![(2 * GWEI, 21_000)]);
+            // The estimate then reads the block's tips from the memo, unfetched.
+            assert_eq!(cache.lock().unwrap().tips((8, vh.hash)).as_deref(), Some(&vec![2 * GWEI]));
+        }
+
+        #[tokio::test]
+        async fn the_estimates_verified_body_leaves_only_the_receipts_to_fetch() {
+            // #532 review: the follower runs the estimate first, which keeps the
+            // new head's complete tips — so the history fetches its receipts alone.
+            let cache = Mutex::new(FeeCache::default());
+            let (vh, _, _) = one_tx_block(7, GWEI, 3 * GWEI);
+            cache.lock().unwrap().put_tips((7, vh.hash), Arc::new(vec![3 * GWEI]), true);
+            let asked = Mutex::new(Vec::new());
+            let fetch = |_hash: [u8; 32], with_body: bool| {
+                asked.lock().unwrap().push(with_body);
+                async move { serve(7, 3 * GWEI, with_body) }
+            };
+            let inputs = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            assert_eq!(*asked.lock().unwrap(), vec![false], "receipts only");
+            assert_eq!(*inputs[0], vec![(3 * GWEI, 21_000)]);
+            assert_eq!(cache.lock().unwrap().weighted((7, vh.hash)).as_deref(), Some(&vec![(3 * GWEI, 21_000)]));
+            // Incomplete tips (an undecodable transaction): the body again.
+            let cache = Mutex::new(FeeCache::default());
+            cache.lock().unwrap().put_tips((7, vh.hash), Arc::new(Vec::new()), false);
+            asked.lock().unwrap().clear();
+            reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap();
+            assert_eq!(*asked.lock().unwrap(), vec![true]);
+            // A block known to hold no transactions needs no fetch at all.
+            let cache = Mutex::new(FeeCache::default());
+            let quiet = window(3, 4);
+            cache.lock().unwrap().put_tips((3, quiet[0].hash), Arc::new(Vec::new()), true);
+            asked.lock().unwrap().clear();
+            assert!(reward_inputs(&cache, &quiet, fetch).await.unwrap()[0].is_empty());
+            assert!(asked.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn receipts_that_miss_the_root_fail_and_are_not_remembered() {
+            let cache = Mutex::new(FeeCache::default());
+            let (vh, _, _) = one_tx_block(9, GWEI, GWEI);
+            cache.lock().unwrap().put_tips((9, vh.hash), Arc::new(vec![GWEI]), true);
+            let fetch = |_hash: [u8; 32], _with_body: bool| async {
+                let wrong: Fetched = (None, Ok(vec![BlockReceipts::Canonical(receipts_of(&[30_000]))]));
+                wrong
+            };
+            let err = reward_inputs(&cache, std::slice::from_ref(&vh), fetch).await.unwrap_err();
+            assert!(err.contains("receiptsRoot"), "{err}");
+            assert!(cache.lock().unwrap().weighted((9, vh.hash)).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_failing_block_keeps_its_verified_neighbours() {
+            // #532 review: one bad block threw away the others fetched with it.
             let cache = Mutex::new(FeeCache::default());
             let mut blocks = window(0, 3);
             blocks[1].header.transactions_root = [0xAA; 32]; // the empty body does not match
-            let fetch = |_hash: [u8; 32]| async { empty_block() };
+            let fetch = |_hash: [u8; 32], with_body: bool| async move { empty_block(with_body) };
             assert!(reward_inputs(&cache, &blocks, fetch).await.is_err());
             let c = cache.lock().unwrap();
             assert!(c.weighted((1, blocks[1].hash)).is_none());
-            assert!(c.weighted((0, blocks[0].hash)).is_some(), "a block verified before it is kept");
+            assert!(c.weighted((0, blocks[0].hash)).is_some());
+            assert!(c.weighted((2, blocks[2].hash)).is_some());
         }
 
         #[tokio::test]
         async fn a_failed_fetch_fails_the_rows() {
             let cache = Mutex::new(FeeCache::default());
-            let fetch = |_hash: [u8; 32]| async {
-                let failed: Fetched = (Err("request timed out".to_string()), Ok(Vec::new()));
+            let fetch = |_hash: [u8; 32], _with_body: bool| async {
+                let failed: Fetched = (Some(Err("request timed out".to_string())), Ok(Vec::new()));
                 failed
             };
             let err = reward_inputs(&cache, &window(0, 2), fetch).await.unwrap_err();
             assert!(err.contains("timed out"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_stale_gas_price_is_raised_for_the_blocks_it_is_behind() {
+        // #532 review: five blocks behind, the next base fee may be up to
+        // 1.125^5 higher; served as it was, a legacy transaction could sit
+        // under the base fee. The tip is left alone.
+        let est = FeeEstimate { max_priority_fee_wei: 2, gas_price_wei: 1_000_000_002 };
+        assert_eq!(est.raised_for(0), est);
+        assert_eq!(est.raised_for(1).gas_price_wei, 1_125_000_002);
+        // 10^9 × (9/8)^5 = 1 802 032 470.7…, rounded up.
+        assert_eq!(est.raised_for(5).gas_price_wei, 1_802_032_471 + 2);
+        assert_eq!(est.raised_for(5).max_priority_fee_wei, 2);
+        // Never past the stale bound, however far behind it is asked for.
+        assert_eq!(est.raised_for(50), est.raised_for(crate::el::feecache::STALE_MAX_BLOCKS));
     }
 
     /// The receipt scan's body fetch ([`verified_bodies_newest_first`]): the

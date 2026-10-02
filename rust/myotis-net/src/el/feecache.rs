@@ -30,6 +30,8 @@ pub(crate) type Head = (u64, [u8; 32]);
 /// One block's `(effective tip, gas used)` per transaction, in transaction
 /// order: the `eth_feeHistory` reward rows' input.
 pub(crate) type BlockRewards = Arc<Vec<(u128, u64)>>;
+/// One block's effective tips per transaction.
+pub(crate) type BlockTips = Arc<Vec<u128>>;
 
 /// How many blocks behind the current head a cached fee may still be served.
 /// Wide enough to ride out a refresh that fails or runs long (a slow peer, a
@@ -57,13 +59,22 @@ pub(crate) const SUMMARY_EVERY: Duration = Duration::from_secs(300);
 /// two); the least recently requested is evicted past this.
 const HISTORY_SHAPES_MAX: usize = 16;
 
+/// How far behind a stale value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Staleness {
+    /// Blocks between the top it was computed for and the current one.
+    pub behind: u64,
+    /// Since it was computed.
+    pub age: Duration,
+}
+
 /// What a lookup found for the current top.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Lookup<T> {
     /// Computed against exactly this top: the answer a fresh compute gives.
     Fresh(T),
-    /// Computed against an older top within the stale bounds, this long ago.
-    Stale(T, Duration),
+    /// Computed against an older top within the stale bounds.
+    Stale(T, Staleness),
     Miss,
 }
 
@@ -94,8 +105,8 @@ impl<T: Clone> Slot<T> {
         // backwards — both are misses, never stale.
         let behind = head.0.checked_sub(at_head.0).filter(|&b| b > 0);
         let age = now.saturating_duration_since(*at);
-        if allow_stale && behind.is_some_and(|b| b <= STALE_MAX_BLOCKS) && age <= STALE_MAX_AGE {
-            return Lookup::Stale(value.clone(), age);
+        if let Some(behind) = behind.filter(|&b| allow_stale && b <= STALE_MAX_BLOCKS && age <= STALE_MAX_AGE) {
+            return Lookup::Stale(value.clone(), Staleness { behind, age });
         }
         Lookup::Miss
     }
@@ -130,9 +141,13 @@ impl<T: Clone> Slot<T> {
         if self.cached.as_ref().is_some_and(|(h, _, _)| *h == head) {
             return false;
         }
-        !self
-            .failed
-            .is_some_and(|(h, at)| h == head && now.saturating_duration_since(at) < RETRY_AFTER)
+        !self.failed_recently(head, now)
+    }
+
+    /// A compute for `head` failed within [`RETRY_AFTER`]: a caller queued
+    /// behind it answers that at once instead of running the ladder again.
+    pub(crate) fn failed_recently(&self, head: Head, now: Instant) -> bool {
+        self.failed.is_some_and(|(h, at)| h == head && now.saturating_duration_since(at) < RETRY_AFTER)
     }
 }
 
@@ -181,6 +196,9 @@ struct HistoryEntry {
 struct BlockFees {
     /// The transactions' effective tips — the estimate's sample (the body).
     tips: Arc<Vec<u128>>,
+    /// `tips` holds every transaction's tip, in transaction order (none was
+    /// undecodable): with the block's receipts it gives `weighted`.
+    complete: bool,
     /// Each tip with the gas its transaction used, in transaction order — the
     /// reward rows' input (the body and the receipts). Its tips are `tips`.
     weighted: Option<BlockRewards>,
@@ -222,11 +240,17 @@ impl FeeCache {
         self.block(head).and_then(|b| b.weighted.clone())
     }
 
-    /// Remember a block's tips from its verified body. A block already known
-    /// keeps what it has.
-    pub(crate) fn put_tips(&mut self, head: Head, tips: Arc<Vec<u128>>) {
+    /// The block's tips when they hold every transaction in order — so its
+    /// receipts alone complete the reward input (#532).
+    pub(crate) fn complete_tips(&self, head: Head) -> Option<BlockTips> {
+        self.block(head).filter(|b| b.complete).map(|b| Arc::clone(&b.tips))
+    }
+
+    /// Remember a block's tips from its verified body; `complete` when no
+    /// transaction was undecodable. A block already known keeps what it has.
+    pub(crate) fn put_tips(&mut self, head: Head, tips: Arc<Vec<u128>>, complete: bool) {
         if self.block(head).is_none() {
-            self.push_block(head, BlockFees { tips, weighted: None });
+            self.push_block(head, BlockFees { tips, complete, weighted: None });
         }
     }
 
@@ -239,7 +263,7 @@ impl FeeCache {
             return;
         }
         let tips = Arc::new(weighted.iter().map(|&(tip, _)| tip).collect());
-        self.push_block(head, BlockFees { tips, weighted: Some(weighted) });
+        self.push_block(head, BlockFees { tips, complete: true, weighted: Some(weighted) });
     }
 
     fn push_block(&mut self, head: Head, fees: BlockFees) {
@@ -331,6 +355,11 @@ impl FeeCache {
         self.histories.get(shape).is_some_and(|e| e.slot.wants_refresh(top, now))
     }
 
+    /// A compute for `shape` at `top` failed within [`RETRY_AFTER`].
+    pub(crate) fn history_failed_recently(&self, shape: &HistoryShape, top: Head, now: Instant) -> bool {
+        self.histories.get(shape).is_some_and(|e| e.slot.failed_recently(top, now))
+    }
+
     /// Anything left for the follower to do?
     pub(crate) fn any_followed(&self, now: Instant) -> bool {
         self.estimate_followed(now)
@@ -362,9 +391,9 @@ impl ServeCounts {
     pub(crate) fn served<T>(&mut self, lookup: &Lookup<T>) {
         match lookup {
             Lookup::Fresh(_) => self.fresh += 1,
-            Lookup::Stale(_, age) => {
+            Lookup::Stale(_, staleness) => {
                 self.stale += 1;
-                self.stale_oldest = self.stale_oldest.max(*age);
+                self.stale_oldest = self.stale_oldest.max(staleness.age);
             }
             Lookup::Miss => {}
         }
@@ -417,10 +446,17 @@ impl FeeStats {
     /// counted.
     pub(crate) fn take_summary(&mut self, now: Instant) -> Option<String> {
         let since = self.since?;
-        let span = now.saturating_duration_since(since);
-        if span < SUMMARY_EVERY {
+        if now.saturating_duration_since(since) < SUMMARY_EVERY {
             return None;
         }
+        self.flush(now)
+    }
+
+    /// The summary line for whatever was counted, however short the window —
+    /// when demand stops or the reader stops, so a window is never lost or
+    /// folded into the next one across an idle gap. Resets the counts.
+    pub(crate) fn flush(&mut self, now: Instant) -> Option<String> {
+        let span = now.saturating_duration_since(self.since?);
         let active = self.estimate.any() || self.history.any() || self.refreshes_ok + self.refreshes_failed > 0;
         let line = active.then(|| {
             let kind = |name: &str, c: &ServeCounts| {
@@ -436,7 +472,7 @@ impl FeeStats {
             format!(
                 "[fee-reads] last {}s: {} | {} | refreshes ok={} failed={} slowest={}ms",
                 span.as_secs(),
-                kind("gasPrice", &self.estimate),
+                kind("estimate", &self.estimate),
                 kind("feeHistory", &self.history),
                 self.refreshes_ok,
                 self.refreshes_failed,
@@ -503,7 +539,10 @@ mod tests {
         let mut s = Slot::default();
         s.store(h(100, 1), est(7), t0, None);
         let t = t0 + Duration::from_secs(41);
-        assert_eq!(s.lookup(h(104, 4), t, true), Lookup::Stale(est(7), Duration::from_secs(41)));
+        assert_eq!(
+            s.lookup(h(104, 4), t, true),
+            Lookup::Stale(est(7), Staleness { behind: 4, age: Duration::from_secs(41) })
+        );
         assert_eq!(STALE_MAX_BLOCKS, 5);
         assert_eq!(STALE_MAX_AGE, Duration::from_secs(75));
     }
@@ -569,7 +608,7 @@ mod tests {
     fn tips_window_keeps_the_newest_blocks() {
         let mut c = FeeCache::default();
         for n in 0..(BLOCKS_KEEP as u64 + 3) {
-            c.put_tips(h(n, n as u8), Arc::new(vec![n as u128]));
+            c.put_tips(h(n, n as u8), Arc::new(vec![n as u128]), true);
         }
         assert!(c.tips(h(0, 0)).is_none());
         assert!(c.tips(h(2, 2)).is_none());
@@ -587,14 +626,20 @@ mod tests {
         assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
         assert_eq!(c.weighted(h(5, 5)).as_deref(), Some(&vec![(10, 21_000), (20, 50_000)]));
         // A body-only block serves the estimate, not the reward rows…
-        c.put_tips(h(6, 6), Arc::new(vec![7]));
+        c.put_tips(h(6, 6), Arc::new(vec![7]), true);
         assert!(c.weighted(h(6, 6)).is_none());
+        // …though its complete tips need only its receipts to get there; a
+        // block with an undecodable transaction needs its body again.
+        assert_eq!(c.complete_tips(h(6, 6)).as_deref(), Some(&vec![7]));
+        c.put_tips(h(7, 7), Arc::new(vec![9]), false);
+        assert!(c.complete_tips(h(7, 7)).is_none());
+        assert_eq!(c.tips(h(7, 7)).as_deref(), Some(&vec![9]));
         // …until its receipts are fetched; its tips stay as they were.
         c.put_weighted(h(6, 6), Arc::new(vec![(7, 21_000)]));
         assert_eq!(c.weighted(h(6, 6)).as_deref(), Some(&vec![(7, 21_000)]));
         assert_eq!(c.tips(h(6, 6)).as_deref(), Some(&vec![7]));
         // A known block keeps its facts.
-        c.put_tips(h(5, 5), Arc::new(vec![99]));
+        c.put_tips(h(5, 5), Arc::new(vec![99]), true);
         assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
         // The window covers a feeHistory's 10 blocks across a full stale window.
         assert!(BLOCKS_KEEP as u64 > 10 + STALE_MAX_BLOCKS);
@@ -609,20 +654,39 @@ mod tests {
         st.touch(t0);
         st.estimate.served(&Lookup::Fresh(est(1)));
         st.estimate.served(&Lookup::Fresh(est(1)));
-        st.estimate.served(&Lookup::Stale(est(1), Duration::from_secs(41)));
-        st.estimate.served(&Lookup::Stale(est(1), Duration::from_secs(9)));
+        let stale = |secs| Staleness { behind: 1, age: Duration::from_secs(secs) };
+        st.estimate.served(&Lookup::Stale(est(1), stale(41)));
+        st.estimate.served(&Lookup::Stale(est(1), stale(9)));
         st.estimate.missed(true);
         st.history.missed(false);
         st.refreshed(true, Duration::from_millis(800));
         st.refreshed(false, Duration::from_millis(2_500));
         assert!(st.take_summary(t0 + Duration::from_secs(10)).is_none(), "not before the window ends");
         let line = st.take_summary(t0 + SUMMARY_EVERY).expect("a line once the window ends");
-        assert!(line.contains("gasPrice fresh=2 stale=2 (oldest 41s) miss served=1 failed=0"), "{line}");
+        assert!(line.contains("estimate fresh=2 stale=2 (oldest 41s) miss served=1 failed=0"), "{line}");
         assert!(line.contains("feeHistory fresh=0 stale=0 (oldest 0s) miss served=0 failed=1"), "{line}");
         assert!(line.contains("refreshes ok=1 failed=1 slowest=2500ms"), "{line}");
         // Reset: the next window starts empty.
         assert!(st.take_summary(t0 + SUMMARY_EVERY * 3).is_none());
         assert_eq!(st.estimate, ServeCounts::default());
+        // A flush (demand stopped, the reader stopped) does not wait for the
+        // window to end, and needs something counted.
+        assert!(st.flush(t0).is_none());
+        st.touch(t0);
+        st.history.served(&Lookup::Fresh(est(1)));
+        let line = st.flush(t0 + Duration::from_secs(40)).expect("a short window is flushed");
+        assert!(line.starts_with("[fee-reads] last 40s:"), "{line}");
+        assert!(st.flush(t0 + Duration::from_secs(41)).is_none());
+    }
+
+    #[test]
+    fn a_failure_holds_queued_callers_off_the_same_head_briefly() {
+        let t0 = Instant::now();
+        let mut s: Slot<FeeEstimate> = Slot::default();
+        s.record_failure(h(100, 1), t0);
+        assert!(s.failed_recently(h(100, 1), t0 + Duration::from_secs(1)));
+        assert!(!s.failed_recently(h(100, 1), t0 + RETRY_AFTER));
+        assert!(!s.failed_recently(h(101, 2), t0), "another head is tried at once");
     }
 
     fn hist(oldest: u64) -> FeeHistory {
