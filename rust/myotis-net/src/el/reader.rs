@@ -6646,6 +6646,11 @@ impl ElReader {
         )
         .await;
         if !accepted {
+            // A pause or stop cut the writes (`first_accepted`'s shutdown):
+            // say so, rather than blame the peers for a send we cut ourselves.
+            if *self.request_shutdown.borrow() {
+                return Err("transaction broadcast cut: the node is pausing or stopping".to_string());
+            }
             return Err("no peer accepted the transaction broadcast".to_string());
         }
         // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):

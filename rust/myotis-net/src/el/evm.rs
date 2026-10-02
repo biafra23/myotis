@@ -359,6 +359,11 @@ enum WaveFailure {
 /// queued for, or inside, the connection's shared writer) is never cut:
 /// dropping it mid-frame would tear the stream for every request on that
 /// connection (`send_frame`), so it waits as before, bounded by the wave.
+///
+/// `request` must make AT MOST ONE peer request (each `snap_get_*` getter
+/// makes one). The send marker records the first send only, so a cut of a
+/// multi-request future could land inside a later `send_frame` and tear the
+/// connection after all.
 async fn wave_request<T>(
     last_response: impl Fn() -> Option<tokio::time::Instant>,
     link_heard_after: impl Fn(tokio::time::Instant) -> bool,
@@ -989,7 +994,7 @@ impl SnapStateOracle for PoolOracle {
                         )
                         .await
                         .and_then(|bytes| {
-                            u256_be(&bytes).ok_or(WaveFailure::Failed("storage scalar too long".to_string()))
+                            u256_be(&bytes).ok_or_else(|| WaveFailure::Failed("storage scalar too long".to_string()))
                         });
                         if let Ok(v) = value {
                             self.note_storage(addr, position, state_root, leaf.storage_root, v, started);
