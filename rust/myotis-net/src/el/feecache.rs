@@ -8,10 +8,11 @@
 //! history), so re-serving it while that top is unchanged is exactly the answer
 //! a fresh compute would give. Past a head advance a value is only STALE: it is
 //! re-served for at most [`STALE_MAX_BLOCKS`] blocks and [`STALE_MAX_AGE`] while
-//! the reader's fee follower refreshes it off the request path — a fee from one
-//! block ago is a far better wallet answer than a 15 s wait or a -32000. A
-//! reorg (same number, other hash) or a head that moved backwards is a miss,
-//! never stale.
+//! the reader's fee follower refreshes it off the request path, and keeps
+//! retrying a refresh that fails or runs long. The base fee moves at most 12.5%
+//! per block, so a fee a few blocks old is a far better wallet answer than a
+//! timeout or a -32000 (#532). A reorg (same number, other hash) or a head that
+//! moved backwards is a miss, never stale.
 //!
 //! This module is pure state (no I/O, no clocks of its own — callers pass
 //! `now`), so the freshness rules are unit-tested here; the reader owns the
@@ -26,10 +27,20 @@ use crate::el::reader::{FeeEstimate, FeeHistory};
 /// A window top: `(block number, block hash)`.
 pub(crate) type Head = (u64, [u8; 32]);
 
+/// One block's `(effective tip, gas used)` per transaction, in transaction
+/// order: the `eth_feeHistory` reward rows' input.
+pub(crate) type BlockRewards = Arc<Vec<(u128, u64)>>;
+/// One block's effective tips per transaction.
+pub(crate) type BlockTips = Arc<Vec<u128>>;
+
 /// How many blocks behind the current head a cached fee may still be served.
-pub(crate) const STALE_MAX_BLOCKS: u64 = 2;
+/// Wide enough to ride out a refresh that fails or runs long (a slow peer, a
+/// 15 s request timeout, the [`RETRY_AFTER`] back-off): with two blocks a
+/// polling wallet fell through to a request-path compute and waited on the
+/// peer ladder, 10–90 s (#532).
+pub(crate) const STALE_MAX_BLOCKS: u64 = 5;
 /// How old (since it was computed) a cached fee may still be served stale.
-pub(crate) const STALE_MAX_AGE: Duration = Duration::from_secs(30);
+pub(crate) const STALE_MAX_AGE: Duration = Duration::from_secs(75);
 /// The follower keeps refreshing a fee read on every new head for this long
 /// after the last request for it, then goes quiet (a wallet that stopped
 /// polling costs nothing).
@@ -37,12 +48,30 @@ pub(crate) const FOLLOW_IDLE: Duration = Duration::from_secs(120);
 /// After a failed compute for a head, the follower waits this long before
 /// retrying the SAME head (a failing pool is not hammered once per tick).
 pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(3);
-/// Per-block tip lists kept for the rolling estimate window: the estimate
-/// samples 3 blocks, so this covers a few heads of slack for a lagging peer.
-const TIPS_KEEP: usize = 8;
+/// Per-block fee facts kept for the rolling windows: the `eth_feeHistory`
+/// reward rows read up to `FEE_HISTORY_MAX_BLOCKS` blocks and may be refreshed
+/// up to [`STALE_MAX_BLOCKS`] behind, so this covers a refresh after a full
+/// stale window with a block of slack (#532).
+const BLOCKS_KEEP: usize = 16;
+
+/// Enforced at COMPILE time, not in prose: raising the feeHistory clamp past
+/// what the memo covers would quietly bring back the per-head refetch of most
+/// of the window (PR #535 review).
+const _: () = assert!(BLOCKS_KEEP as u64 > crate::el::reader::FEE_HISTORY_MAX_BLOCKS + STALE_MAX_BLOCKS);
+/// How often the reader logs the [`FeeStats`] summary while fee reads flow.
+pub(crate) const SUMMARY_EVERY: Duration = Duration::from_secs(300);
 /// Distinct `eth_feeHistory` request shapes remembered (wallets use one or
 /// two); the least recently requested is evicted past this.
 const HISTORY_SHAPES_MAX: usize = 16;
+
+/// How far behind a stale value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Staleness {
+    /// Blocks between the top it was computed for and the current one.
+    pub behind: u64,
+    /// Since it was computed.
+    pub age: Duration,
+}
 
 /// What a lookup found for the current top.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +79,7 @@ pub(crate) enum Lookup<T> {
     /// Computed against exactly this top: the answer a fresh compute gives.
     Fresh(T),
     /// Computed against an older top within the stale bounds.
-    Stale(T),
+    Stale(T, Staleness),
     Miss,
 }
 
@@ -80,11 +109,9 @@ impl<T: Clone> Slot<T> {
         // hash is a reorg; a HIGHER cached number means the head went
         // backwards — both are misses, never stale.
         let behind = head.0.checked_sub(at_head.0).filter(|&b| b > 0);
-        if allow_stale
-            && behind.is_some_and(|b| b <= STALE_MAX_BLOCKS)
-            && now.saturating_duration_since(*at) <= STALE_MAX_AGE
-        {
-            return Lookup::Stale(value.clone());
+        let age = now.saturating_duration_since(*at);
+        if let Some(behind) = behind.filter(|&b| allow_stale && b <= STALE_MAX_BLOCKS && age <= STALE_MAX_AGE) {
+            return Lookup::Stale(value.clone(), Staleness { behind, age });
         }
         Lookup::Miss
     }
@@ -119,9 +146,13 @@ impl<T: Clone> Slot<T> {
         if self.cached.as_ref().is_some_and(|(h, _, _)| *h == head) {
             return false;
         }
-        !self
-            .failed
-            .is_some_and(|(h, at)| h == head && now.saturating_duration_since(at) < RETRY_AFTER)
+        !self.failed_recently(head, now)
+    }
+
+    /// A compute for `head` failed within [`RETRY_AFTER`]: a caller queued
+    /// behind it answers that at once instead of running the ladder again.
+    pub(crate) fn failed_recently(&self, head: Head, now: Instant) -> bool {
+        self.failed.is_some_and(|(h, at)| h == head && now.saturating_duration_since(at) < RETRY_AFTER)
     }
 }
 
@@ -162,17 +193,33 @@ struct HistoryEntry {
     last_demand: Instant,
 }
 
+/// One block's fee facts, verified against its anchored header and keyed by
+/// `(number, hash)`: shared by the estimate and every `eth_feeHistory` shape,
+/// so a new head costs one body (and, for reward rows, one receipts) fetch
+/// whatever the request shapes (#510, #532).
+#[derive(Debug, Clone)]
+struct BlockFees {
+    /// The transactions' effective tips — the estimate's sample (the body).
+    tips: Arc<Vec<u128>>,
+    /// `tips` holds every transaction's tip, in transaction order (none was
+    /// undecodable): with the block's receipts it gives `weighted`.
+    complete: bool,
+    /// Each tip with the gas its transaction used, in transaction order — the
+    /// reward rows' input (the body and the receipts). Its tips are `tips`.
+    weighted: Option<BlockRewards>,
+}
+
 /// The reader's fee memo. Held under one brief-hold std mutex; never across
 /// an await.
 #[derive(Default)]
 pub(crate) struct FeeCache {
     pub(crate) estimate: Slot<FeeEstimate>,
     estimate_demand: Option<Instant>,
-    /// Per-block effective tips, verified against the block's
-    /// `transactionsRoot`, keyed by `(number, hash)` — so a new head needs
-    /// ONE new body for the rolling estimate window, not all of them.
-    tips: VecDeque<(Head, Arc<Vec<u128>>)>,
+    /// Per-block fee facts for the newest [`BLOCKS_KEEP`] blocks seen.
+    blocks: VecDeque<(Head, BlockFees)>,
     histories: HashMap<HistoryShape, HistoryEntry>,
+    /// What the fee reads served, for the periodic summary.
+    pub(crate) stats: FeeStats,
 }
 
 impl FeeCache {
@@ -184,19 +231,57 @@ impl FeeCache {
         recent(self.estimate_demand, now)
     }
 
-    pub(crate) fn tips(&self, head: Head) -> Option<Arc<Vec<u128>>> {
-        self.tips.iter().find(|(h, _)| *h == head).map(|(_, t)| Arc::clone(t))
+    fn block(&self, head: Head) -> Option<&BlockFees> {
+        self.blocks.iter().find(|(h, _)| *h == head).map(|(_, b)| b)
     }
 
-    pub(crate) fn put_tips(&mut self, head: Head, tips: Arc<Vec<u128>>) {
-        if self.tips.iter().any(|(h, _)| *h == head) {
-            return;
+    /// The block's effective tips, from either kind of fetch.
+    pub(crate) fn tips(&self, head: Head) -> Option<Arc<Vec<u128>>> {
+        self.block(head).map(|b| Arc::clone(&b.tips))
+    }
+
+    /// The block's `(tip, gas used)` list, once its receipts were fetched.
+    pub(crate) fn weighted(&self, head: Head) -> Option<BlockRewards> {
+        self.block(head).and_then(|b| b.weighted.clone())
+    }
+
+    /// The block's tips when they hold every transaction in order — so its
+    /// receipts alone complete the reward input (#532).
+    pub(crate) fn complete_tips(&self, head: Head) -> Option<BlockTips> {
+        self.block(head).filter(|b| b.complete).map(|b| Arc::clone(&b.tips))
+    }
+
+    /// Remember a block's tips from its verified body; `complete` when no
+    /// transaction was undecodable. A block already known keeps what it has.
+    pub(crate) fn put_tips(&mut self, head: Head, tips: Arc<Vec<u128>>, complete: bool) {
+        if self.block(head).is_none() {
+            self.push_block(head, BlockFees { tips, complete, weighted: None });
         }
-        self.tips.push_back((head, tips));
-        while self.tips.len() > TIPS_KEEP {
+    }
+
+    /// Remember a block's `(tip, gas used)` list from its verified body and
+    /// receipts. Its tips serve the estimate too, so a block both kinds of
+    /// read want is fetched once.
+    pub(crate) fn put_weighted(&mut self, head: Head, weighted: BlockRewards) {
+        // Its tips come from a strict decode of the verified body: they are
+        // every transaction's, whatever an earlier body-only entry held.
+        let fees = BlockFees {
+            tips: Arc::new(weighted.iter().map(|&(tip, _)| tip).collect()),
+            complete: true,
+            weighted: Some(weighted),
+        };
+        match self.blocks.iter_mut().find(|(h, _)| *h == head) {
+            Some((_, b)) => *b = fees,
+            None => self.push_block(head, fees),
+        }
+    }
+
+    fn push_block(&mut self, head: Head, fees: BlockFees) {
+        self.blocks.push_back((head, fees));
+        while self.blocks.len() > BLOCKS_KEEP {
             // Drop the LOWEST block number (a reorg can append out of order).
             let Some(lowest) = self
-                .tips
+                .blocks
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, (h, _))| h.0)
@@ -204,7 +289,7 @@ impl FeeCache {
             else {
                 break;
             };
-            self.tips.remove(lowest);
+            self.blocks.remove(lowest);
         }
     }
 
@@ -280,6 +365,17 @@ impl FeeCache {
         self.histories.get(shape).is_some_and(|e| e.slot.wants_refresh(top, now))
     }
 
+    /// What the memo holds for `shape` at `top`, without noting demand — for a
+    /// read waiting on a compute already in flight.
+    pub(crate) fn history_peek(&self, shape: &HistoryShape, top: Head, now: Instant) -> Lookup<FeeHistory> {
+        self.histories.get(shape).map_or(Lookup::Miss, |e| e.slot.lookup(top, now, shape.follows_head()))
+    }
+
+    /// A compute for `shape` at `top` failed within [`RETRY_AFTER`].
+    pub(crate) fn history_failed_recently(&self, shape: &HistoryShape, top: Head, now: Instant) -> bool {
+        self.histories.get(shape).is_some_and(|e| e.slot.failed_recently(top, now))
+    }
+
     /// Anything left for the follower to do?
     pub(crate) fn any_followed(&self, now: Instant) -> bool {
         self.estimate_followed(now)
@@ -289,6 +385,127 @@ impl FeeCache {
 
 fn recent(at: Option<Instant>, now: Instant) -> bool {
     at.is_some_and(|at| now.saturating_duration_since(at) < FOLLOW_IDLE)
+}
+
+/// How one kind of fee read was served (#532).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServeCounts {
+    /// Exact for the current top.
+    pub fresh: u64,
+    /// A previous top's value, within the stale bounds.
+    pub stale: u64,
+    /// The oldest stale value served.
+    pub stale_oldest: Duration,
+    /// Nothing usable: answered by a compute within the wait bound.
+    pub miss_served: u64,
+    /// Nothing usable, and no answer within the bound: a retryable error.
+    pub miss_failed: u64,
+}
+
+impl ServeCounts {
+    /// Count a served lookup (a miss is counted when the wait settles).
+    pub(crate) fn served<T>(&mut self, lookup: &Lookup<T>) {
+        match lookup {
+            Lookup::Fresh(_) => self.fresh += 1,
+            Lookup::Stale(_, staleness) => {
+                self.stale += 1;
+                self.stale_oldest = self.stale_oldest.max(staleness.age);
+            }
+            Lookup::Miss => {}
+        }
+    }
+
+    /// Count a miss once its bounded wait settled: answered, or not.
+    pub(crate) fn missed(&mut self, served: bool) {
+        // (The caller opens the stats window: see `FeeStats::missed`.)
+        if served {
+            self.miss_served += 1;
+        } else {
+            self.miss_failed += 1;
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.fresh + self.stale + self.miss_served + self.miss_failed > 0
+    }
+}
+
+/// What the fee reads served and how the follower's refreshes went, since the
+/// last summary (#532: the tail could not be attributed without it).
+#[derive(Debug, Default)]
+pub(crate) struct FeeStats {
+    pub estimate: ServeCounts,
+    pub history: ServeCounts,
+    pub refreshes_ok: u64,
+    pub refreshes_failed: u64,
+    pub refresh_slowest: Duration,
+    /// When this window began (the first event after the last summary).
+    since: Option<Instant>,
+}
+
+impl FeeStats {
+    /// Note that something was counted at `now` (opens a window).
+    pub(crate) fn touch(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    /// Count a settled miss of the estimate or of a history, in the window
+    /// open now (a summary may have closed the one the read started in).
+    pub(crate) fn missed(&mut self, history: bool, served: bool, now: Instant) {
+        self.touch(now);
+        if history { &mut self.history } else { &mut self.estimate }.missed(served);
+    }
+
+    pub(crate) fn refreshed(&mut self, ok: bool, took: Duration) {
+        if ok {
+            self.refreshes_ok += 1;
+        } else {
+            self.refreshes_failed += 1;
+        }
+        self.refresh_slowest = self.refresh_slowest.max(took);
+    }
+
+    /// The summary line once [`SUMMARY_EVERY`] has passed since the window
+    /// opened, resetting the counts; `None` before that or with nothing
+    /// counted.
+    pub(crate) fn take_summary(&mut self, now: Instant) -> Option<String> {
+        let since = self.since?;
+        if now.saturating_duration_since(since) < SUMMARY_EVERY {
+            return None;
+        }
+        self.flush(now)
+    }
+
+    /// The summary line for whatever was counted, however short the window —
+    /// when demand stops or the reader stops, so a window is never lost or
+    /// folded into the next one across an idle gap. Resets the counts.
+    pub(crate) fn flush(&mut self, now: Instant) -> Option<String> {
+        let span = now.saturating_duration_since(self.since?);
+        let active = self.estimate.any() || self.history.any() || self.refreshes_ok + self.refreshes_failed > 0;
+        let line = active.then(|| {
+            let kind = |name: &str, c: &ServeCounts| {
+                format!(
+                    "{name} fresh={} stale={} (oldest {}s) miss served={} failed={}",
+                    c.fresh,
+                    c.stale,
+                    c.stale_oldest.as_secs(),
+                    c.miss_served,
+                    c.miss_failed
+                )
+            };
+            format!(
+                "[fee-reads] last {}s: {} | {} | refreshes ok={} failed={} slowest={}ms",
+                span.as_secs(),
+                kind("estimate", &self.estimate),
+                kind("feeHistory", &self.history),
+                self.refreshes_ok,
+                self.refreshes_failed,
+                self.refresh_slowest.as_millis()
+            )
+        });
+        *self = FeeStats::default();
+        line
+    }
 }
 
 #[cfg(test)]
@@ -306,7 +523,7 @@ mod tests {
     fn tip_of(l: Lookup<FeeEstimate>) -> Option<(bool, u128)> {
         match l {
             Lookup::Fresh(e) => Some((true, e.max_priority_fee_wei)),
-            Lookup::Stale(e) => Some((false, e.max_priority_fee_wei)),
+            Lookup::Stale(e, _) => Some((false, e.max_priority_fee_wei)),
             Lookup::Miss => None,
         }
     }
@@ -329,13 +546,29 @@ mod tests {
         s.store(h(100, 1), est(7), t0, None);
         let t = t0 + Duration::from_secs(12);
         assert_eq!(tip_of(s.lookup(h(101, 2), t, true)), Some((false, 7)));
-        assert_eq!(tip_of(s.lookup(h(102, 3), t, true)), Some((false, 7)));
+        assert_eq!(tip_of(s.lookup(h(100 + STALE_MAX_BLOCKS, 3), t, true)), Some((false, 7)));
         // Too many blocks behind.
-        assert_eq!(tip_of(s.lookup(h(103, 4), t, true)), None);
+        assert_eq!(tip_of(s.lookup(h(101 + STALE_MAX_BLOCKS, 4), t, true)), None);
         // Too old.
         assert_eq!(tip_of(s.lookup(h(101, 2), t0 + STALE_MAX_AGE + Duration::from_secs(1), true)), None);
         // Stale not allowed for this caller.
         assert_eq!(tip_of(s.lookup(h(101, 2), t, false)), None);
+    }
+
+    #[test]
+    fn stale_rides_out_a_slow_refresh_and_reports_its_age() {
+        // #532: a refresh that failed or ran long let a 2-block, 30 s value
+        // expire under a polling wallet, which then waited on the peer ladder.
+        let t0 = Instant::now();
+        let mut s = Slot::default();
+        s.store(h(100, 1), est(7), t0, None);
+        let t = t0 + Duration::from_secs(41);
+        assert_eq!(
+            s.lookup(h(104, 4), t, true),
+            Lookup::Stale(est(7), Staleness { behind: 4, age: Duration::from_secs(41) })
+        );
+        assert_eq!(STALE_MAX_BLOCKS, 5);
+        assert_eq!(STALE_MAX_AGE, Duration::from_secs(75));
     }
 
     #[test]
@@ -398,15 +631,87 @@ mod tests {
     #[test]
     fn tips_window_keeps_the_newest_blocks() {
         let mut c = FeeCache::default();
-        for n in 0..(TIPS_KEEP as u64 + 3) {
-            c.put_tips(h(n, n as u8), Arc::new(vec![n as u128]));
+        for n in 0..(BLOCKS_KEEP as u64 + 3) {
+            c.put_tips(h(n, n as u8), Arc::new(vec![n as u128]), true);
         }
         assert!(c.tips(h(0, 0)).is_none());
         assert!(c.tips(h(2, 2)).is_none());
-        let top = TIPS_KEEP as u64 + 2;
+        let top = BLOCKS_KEEP as u64 + 2;
         assert_eq!(c.tips(h(top, top as u8)).as_deref(), Some(&vec![top as u128]));
         // Keyed by hash too: a reorged block is not served another's tips.
         assert!(c.tips(h(top, 0xee)).is_none());
+    }
+
+    #[test]
+    fn a_block_fetched_with_its_receipts_serves_the_estimate_too() {
+        // #532: one body + receipts fetch per new head serves every read.
+        let mut c = FeeCache::default();
+        c.put_weighted(h(5, 5), Arc::new(vec![(10, 21_000), (20, 50_000)]));
+        assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
+        assert_eq!(c.weighted(h(5, 5)).as_deref(), Some(&vec![(10, 21_000), (20, 50_000)]));
+        // A body-only block serves the estimate, not the reward rows…
+        c.put_tips(h(6, 6), Arc::new(vec![7]), true);
+        assert!(c.weighted(h(6, 6)).is_none());
+        // …though its complete tips need only its receipts to get there; a
+        // block with an undecodable transaction needs its body again.
+        assert_eq!(c.complete_tips(h(6, 6)).as_deref(), Some(&vec![7]));
+        c.put_tips(h(7, 7), Arc::new(vec![9]), false);
+        assert!(c.complete_tips(h(7, 7)).is_none());
+        assert_eq!(c.tips(h(7, 7)).as_deref(), Some(&vec![9]));
+        // …until its receipts are fetched; the weighted list then holds the tips.
+        c.put_weighted(h(6, 6), Arc::new(vec![(7, 21_000)]));
+        assert_eq!(c.weighted(h(6, 6)).as_deref(), Some(&vec![(7, 21_000)]));
+        assert_eq!(c.tips(h(6, 6)).as_deref(), Some(&vec![7]));
+        // An incomplete body-only entry is replaced whole by a strict decode.
+        c.put_weighted(h(7, 7), Arc::new(vec![(9, 21_000), (4, 30_000)]));
+        assert_eq!(c.complete_tips(h(7, 7)).as_deref(), Some(&vec![9, 4]));
+        // A known block keeps its facts.
+        c.put_tips(h(5, 5), Arc::new(vec![99]), true);
+        assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
+    }
+
+    #[test]
+    fn fee_stats_summarize_a_window_then_reset() {
+        let t0 = Instant::now();
+        let mut st = FeeStats::default();
+        // Nothing counted: no line, however long.
+        assert!(st.take_summary(t0 + SUMMARY_EVERY * 2).is_none());
+        st.touch(t0);
+        st.estimate.served(&Lookup::Fresh(est(1)));
+        st.estimate.served(&Lookup::Fresh(est(1)));
+        let stale = |secs| Staleness { behind: 1, age: Duration::from_secs(secs) };
+        st.estimate.served(&Lookup::Stale(est(1), stale(41)));
+        st.estimate.served(&Lookup::Stale(est(1), stale(9)));
+        st.estimate.missed(true);
+        st.history.missed(false);
+        st.refreshed(true, Duration::from_millis(800));
+        st.refreshed(false, Duration::from_millis(2_500));
+        assert!(st.take_summary(t0 + Duration::from_secs(10)).is_none(), "not before the window ends");
+        let line = st.take_summary(t0 + SUMMARY_EVERY).expect("a line once the window ends");
+        assert!(line.contains("estimate fresh=2 stale=2 (oldest 41s) miss served=1 failed=0"), "{line}");
+        assert!(line.contains("feeHistory fresh=0 stale=0 (oldest 0s) miss served=0 failed=1"), "{line}");
+        assert!(line.contains("refreshes ok=1 failed=1 slowest=2500ms"), "{line}");
+        // Reset: the next window starts empty.
+        assert!(st.take_summary(t0 + SUMMARY_EVERY * 3).is_none());
+        assert_eq!(st.estimate, ServeCounts::default());
+        // A flush (demand stopped, the reader stopped) does not wait for the
+        // window to end, and needs something counted.
+        assert!(st.flush(t0).is_none());
+        st.touch(t0);
+        st.history.served(&Lookup::Fresh(est(1)));
+        let line = st.flush(t0 + Duration::from_secs(40)).expect("a short window is flushed");
+        assert!(line.starts_with("[fee-reads] last 40s:"), "{line}");
+        assert!(st.flush(t0 + Duration::from_secs(41)).is_none());
+    }
+
+    #[test]
+    fn a_failure_holds_queued_callers_off_the_same_head_briefly() {
+        let t0 = Instant::now();
+        let mut s: Slot<FeeEstimate> = Slot::default();
+        s.record_failure(h(100, 1), t0);
+        assert!(s.failed_recently(h(100, 1), t0 + Duration::from_secs(1)));
+        assert!(!s.failed_recently(h(100, 1), t0 + RETRY_AFTER));
+        assert!(!s.failed_recently(h(101, 2), t0), "another head is tried at once");
     }
 
     fn hist(oldest: u64) -> FeeHistory {
@@ -426,7 +731,7 @@ mod tests {
         }
         let t = t0 + Duration::from_secs(12);
         assert!(matches!(c.history_lookup(&latest, h(100, 1), t).0, Lookup::Fresh(_)));
-        assert!(matches!(c.history_lookup(&latest, h(101, 2), t).0, Lookup::Stale(_)));
+        assert!(matches!(c.history_lookup(&latest, h(101, 2), t).0, Lookup::Stale(..)));
         assert!(matches!(c.history_lookup(&pinned, h(101, 2), t).0, Lookup::Miss));
         assert!(c.history_fresh(&latest, h(101, 2), t).is_none());
         // Other percentiles are another shape.
