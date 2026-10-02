@@ -53,6 +53,9 @@ struct Pending {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
+/// The read loop's stamp of the last response it delivered (see
+/// `ManagedPeer::last_response`).
+type SharedLastResponse = Arc<std::sync::Mutex<Option<tokio::time::Instant>>>;
 
 /// The egress writer plus a torn-write marker. A frame write whose future is
 /// DROPPED mid-await (request futures are cancelled routinely — e.g. the
@@ -117,6 +120,23 @@ async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(),
     // closed-store) can't write onto the corrupt stream.
     w.torn = result.is_err();
     result
+}
+
+/// Hand a response frame to the request waiting for it, if one still is, and
+/// only then stamp `last_response`: a cut request's late answer can beat its
+/// pending guard's async removal ([`PendingGuard`]), and a frame nobody
+/// receives is no delivered response — counting it would push back every
+/// other request's silence deadline (#320, PR #534 review).
+async fn deliver(pending: &PendingMap, last_response: &SharedLastResponse, id: u64, code: u64, payload: Vec<u8>) {
+    let mut map = pending.lock().await;
+    if map.get(&id).is_none_or(|entry| entry.want_code != code) {
+        return;
+    }
+    if let Some(entry) = map.remove(&id) {
+        if entry.tx.send(Ok(payload)).is_ok() {
+            *last_response.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
+        }
+    }
 }
 
 /// Removes a request's pending-map entry if the owning [`ManagedPeer::request`]
@@ -281,6 +301,12 @@ pub struct ManagedPeer {
     /// against one peer; one line says which peer went silent, the next 47
     /// would only repeat it). Reset by any delivered response.
     timeout_streak: AtomicU64,
+    /// When the read loop last delivered a response to one of our requests
+    /// (any request: a snap proof, a header window, a body). A peer whose
+    /// responses keep arriving — however slowly, on a slow link — is not
+    /// SILENT, whatever one request's age; the prefetch wave judges silence by
+    /// this, not by request age (#320).
+    last_response: SharedLastResponse,
     reader_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Negotiated eth version (66-69).
@@ -313,6 +339,12 @@ impl ManagedPeer {
         if let Some(task) = task { task.abort(); let _ = task.await; }
         self.pending.lock().await.clear();
         self.writer.lock().await.inner.take();
+    }
+
+    /// When this peer last answered one of our requests, if it ever did
+    /// (see the `last_response` field).
+    pub(crate) fn last_response(&self) -> Option<tokio::time::Instant> {
+        *self.last_response.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take over a handshook [`EthSession`], splitting its connection and
@@ -378,10 +410,12 @@ impl ManagedPeer {
             },
         )));
 
+        let last_response: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
         let reader_task = tokio::spawn(read_loop(
             reader,
             Arc::clone(&writer),
             Arc::clone(&pending),
+            Arc::clone(&last_response),
             Arc::clone(&closed),
             snap_codes,
             serve.clone(),
@@ -397,6 +431,7 @@ impl ManagedPeer {
             next_id: AtomicU64::new(1),
             closed,
             timeout_streak: AtomicU64::new(0),
+            last_response,
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
             snap,
@@ -872,6 +907,7 @@ async fn read_loop(
     mut reader: RlpxReader,
     writer: SharedWriter,
     pending: PendingMap,
+    last_response: SharedLastResponse,
     closed: Arc<AtomicBool>,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
@@ -1003,13 +1039,7 @@ async fn read_loop(
         // Otherwise try to correlate a response by (reqId, code). Anything that
         // doesn't match a waiting request is gossip/mempool — ignore it.
         if let Some(id) = request_id {
-            let mut map = pending.lock().await;
-            if let Some(entry) = map.get(&id) {
-                if entry.want_code == code {
-                    let entry = map.remove(&id).expect("just checked present");
-                    let _ = entry.tx.send(Ok(frame.payload));
-                }
-            }
+            deliver(&pending, &last_response, id, code, frame.payload).await;
         }
     }
     // Backstop: every break above already set `closed` via `fail_all`, but keep
@@ -1168,6 +1198,30 @@ mod tests {
             assert!(Coverage::Near < Coverage::Unknown);
             assert!(Coverage::Unknown < Coverage::Behind);
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_response_someone_receives_counts_as_delivered() {
+        // PR #534 review: a cut request's late answer could win the race with
+        // its pending guard's removal and still stamp `last_response`.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let heard: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(1, Pending { want_code: 0x14, tx });
+        drop(rx); // the request was cut; its guard has not removed the entry yet
+        deliver(&pending, &heard, 1, 0x14, vec![1]).await;
+        assert!(heard.lock().unwrap().is_none(), "a discarded frame is no sign of life");
+        assert!(pending.lock().await.is_empty());
+        // Another code for the same id is not this request's answer.
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().await.insert(2, Pending { want_code: 0x14, tx });
+        deliver(&pending, &heard, 2, 0x15, vec![2]).await;
+        assert!(heard.lock().unwrap().is_none());
+        assert!(rx.try_recv().is_err(), "still waiting");
+        // The answer a request is waiting for: delivered, and stamped.
+        deliver(&pending, &heard, 2, 0x14, vec![3]).await;
+        assert_eq!(rx.await.unwrap(), Ok(vec![3]));
+        assert!(heard.lock().unwrap().is_some());
     }
 
     #[tokio::test(start_paused = true)]
