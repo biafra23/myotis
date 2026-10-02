@@ -258,12 +258,17 @@ impl FeeCache {
     /// receipts. Its tips serve the estimate too, so a block both kinds of
     /// read want is fetched once.
     pub(crate) fn put_weighted(&mut self, head: Head, weighted: BlockRewards) {
-        if let Some((_, b)) = self.blocks.iter_mut().find(|(h, _)| *h == head) {
-            b.weighted = Some(weighted);
-            return;
+        // Its tips come from a strict decode of the verified body: they are
+        // every transaction's, whatever an earlier body-only entry held.
+        let fees = BlockFees {
+            tips: Arc::new(weighted.iter().map(|&(tip, _)| tip).collect()),
+            complete: true,
+            weighted: Some(weighted),
+        };
+        match self.blocks.iter_mut().find(|(h, _)| *h == head) {
+            Some((_, b)) => *b = fees,
+            None => self.push_block(head, fees),
         }
-        let tips = Arc::new(weighted.iter().map(|&(tip, _)| tip).collect());
-        self.push_block(head, BlockFees { tips, complete: true, weighted: Some(weighted) });
     }
 
     fn push_block(&mut self, head: Head, fees: BlockFees) {
@@ -355,6 +360,12 @@ impl FeeCache {
         self.histories.get(shape).is_some_and(|e| e.slot.wants_refresh(top, now))
     }
 
+    /// What the memo holds for `shape` at `top`, without noting demand — for a
+    /// read waiting on a compute already in flight.
+    pub(crate) fn history_peek(&self, shape: &HistoryShape, top: Head, now: Instant) -> Lookup<FeeHistory> {
+        self.histories.get(shape).map_or(Lookup::Miss, |e| e.slot.lookup(top, now, shape.follows_head()))
+    }
+
     /// A compute for `shape` at `top` failed within [`RETRY_AFTER`].
     pub(crate) fn history_failed_recently(&self, shape: &HistoryShape, top: Head, now: Instant) -> bool {
         self.histories.get(shape).is_some_and(|e| e.slot.failed_recently(top, now))
@@ -401,6 +412,7 @@ impl ServeCounts {
 
     /// Count a miss once its bounded wait settled: answered, or not.
     pub(crate) fn missed(&mut self, served: bool) {
+        // (The caller opens the stats window: see `FeeStats::missed`.)
         if served {
             self.miss_served += 1;
         } else {
@@ -430,6 +442,13 @@ impl FeeStats {
     /// Note that something was counted at `now` (opens a window).
     pub(crate) fn touch(&mut self, now: Instant) {
         self.since.get_or_insert(now);
+    }
+
+    /// Count a settled miss of the estimate or of a history, in the window
+    /// open now (a summary may have closed the one the read started in).
+    pub(crate) fn missed(&mut self, history: bool, served: bool, now: Instant) {
+        self.touch(now);
+        if history { &mut self.history } else { &mut self.estimate }.missed(served);
     }
 
     pub(crate) fn refreshed(&mut self, ok: bool, took: Duration) {
@@ -634,10 +653,13 @@ mod tests {
         c.put_tips(h(7, 7), Arc::new(vec![9]), false);
         assert!(c.complete_tips(h(7, 7)).is_none());
         assert_eq!(c.tips(h(7, 7)).as_deref(), Some(&vec![9]));
-        // …until its receipts are fetched; its tips stay as they were.
+        // …until its receipts are fetched; the weighted list then holds the tips.
         c.put_weighted(h(6, 6), Arc::new(vec![(7, 21_000)]));
         assert_eq!(c.weighted(h(6, 6)).as_deref(), Some(&vec![(7, 21_000)]));
         assert_eq!(c.tips(h(6, 6)).as_deref(), Some(&vec![7]));
+        // An incomplete body-only entry is replaced whole by a strict decode.
+        c.put_weighted(h(7, 7), Arc::new(vec![(9, 21_000), (4, 30_000)]));
+        assert_eq!(c.complete_tips(h(7, 7)).as_deref(), Some(&vec![9, 4]));
         // A known block keeps its facts.
         c.put_tips(h(5, 5), Arc::new(vec![99]), true);
         assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
