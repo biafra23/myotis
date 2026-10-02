@@ -517,8 +517,8 @@ pub fn eth_call_overrides_json<'env>(env: &'env Env,
 // sendRawTransactionJson above); reward percentiles out of range or order; an
 // empty import list; and a count or nonce that is not a safe integer. A short
 // storage position (`0x0`, as dApps send it) is padded to its 32-byte word, as
-// the routers pad it. Each check mirrors the engine's own parse, so nothing it
-// would serve is refused.
+// the routers pad it. Each check is the engine's own parse or a router's rule,
+// so what this binding refuses, the other hosts refuse too.
 
 /// A permanent refusal of the request: `{"error": why, "code": -32602}`.
 fn invalid_params(why: &str) -> String {

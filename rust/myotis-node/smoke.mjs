@@ -174,16 +174,16 @@ async function queries(status) {
   if (txHash) {
     const receipt = await timed('receipt of the head block\'s first tx',
       m.getTransactionReceiptJson(handle, txHash));
-    if (receipt === null) {
-      // A reorg between the two reads replaces the block: no engine fault.
+    if (receipt?.transactionHash !== txHash || receipt.blockNumber !== block.number) {
+      // A reorg between the two reads can drop the transaction or move it to
+      // another block, and the head can step back below this block: no engine
+      // fault. Re-read the block to tell.
       const again = await timed('block again', m.getBlockByNumberJson(handle, block.number));
-      if (again?.hash && again.hash !== block.hash) {
+      if (again === null || (again?.hash && again.hash !== block.hash)) {
         log('receipt check skipped: the head block was reorged between the reads');
       } else {
-        console.error('receipt failed: not found for', txHash); failures++;
+        console.error('receipt failed:', JSON.stringify(receipt)); failures++;
       }
-    } else if (receipt?.transactionHash !== txHash || receipt.blockNumber !== block.number) {
-      console.error('receipt failed:', JSON.stringify(receipt)); failures++;
     }
   } else if (block?.number) {
     log('receipt check skipped: the head block carries no transaction');

@@ -115,13 +115,14 @@ other hosts before they call the engine, and refuses what fails them as
 hash, call data, `value` (decimal wei) or raw transaction; reward percentiles
 that are not JSON numbers in [0, 100] in non-decreasing order (at most 100;
 `''`, `null` or `[]` ask for no reward column); an empty import list; and a
-`blockCount` that is not a safe integer. Each check mirrors the engine's own
-parse, so nothing it would serve is refused. A short storage `position` such
+`blockCount` that is not a safe integer. Each check is the engine's own parse
+or a JSON-RPC router's rule, so what the addon refuses, the other hosts refuse
+too. A short storage `position` such
 as `0x0` is padded to its 32-byte word. The older `requestAccountJson`,
 `estimateGasJson` and `sendRawTransactionJson` are checked the same way since
 #503; the engine's own refusals of their arguments carry no `code`.
-`ethCallJson`, `ethCallTxJson` and `estimateGasTxJson` get theirs from the
-engine. Block numbers:
+`ethCallJson`, `ethCallTxJson`, `ethCallOverridesJson` and `estimateGasTxJson`
+get theirs from the engine. Block numbers:
 
 - `getBlockByNumberJson` and `feeHistoryJson` take a tag or a `0x`-number.
   Bare digits are refused: the engine would read them as hex there.
