@@ -49,10 +49,15 @@ pub(crate) const FOLLOW_IDLE: Duration = Duration::from_secs(120);
 /// retrying the SAME head (a failing pool is not hammered once per tick).
 pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(3);
 /// Per-block fee facts kept for the rolling windows: the `eth_feeHistory`
-/// reward rows read up to 10 blocks (`FEE_HISTORY_MAX_BLOCKS`) and may be
-/// refreshed up to [`STALE_MAX_BLOCKS`] behind, so this covers a refresh after
-/// a full stale window with a block of slack (#532).
+/// reward rows read up to `FEE_HISTORY_MAX_BLOCKS` blocks and may be refreshed
+/// up to [`STALE_MAX_BLOCKS`] behind, so this covers a refresh after a full
+/// stale window with a block of slack (#532).
 const BLOCKS_KEEP: usize = 16;
+
+/// Enforced at COMPILE time, not in prose: raising the feeHistory clamp past
+/// what the memo covers would quietly bring back the per-head refetch of most
+/// of the window (PR #535 review).
+const _: () = assert!(BLOCKS_KEEP as u64 > crate::el::reader::FEE_HISTORY_MAX_BLOCKS + STALE_MAX_BLOCKS);
 /// How often the reader logs the [`FeeStats`] summary while fee reads flow.
 pub(crate) const SUMMARY_EVERY: Duration = Duration::from_secs(300);
 /// Distinct `eth_feeHistory` request shapes remembered (wallets use one or
@@ -663,8 +668,6 @@ mod tests {
         // A known block keeps its facts.
         c.put_tips(h(5, 5), Arc::new(vec![99]), true);
         assert_eq!(c.tips(h(5, 5)).as_deref(), Some(&vec![10, 20]));
-        // The window covers a feeHistory's 10 blocks across a full stale window.
-        assert!(BLOCKS_KEEP as u64 > 10 + STALE_MAX_BLOCKS);
     }
 
     #[test]
