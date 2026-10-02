@@ -161,8 +161,9 @@ pub struct WireCost {
     /// an empty storage trie); `serial_wait` is what they took together.
     pub serial_reads: u64,
     pub serial_wait: std::time::Duration,
-    /// Prefetch waves, and the accounts, slots and code hashes they asked for
-    /// (cached ones included).
+    /// Prefetch waves, and the accounts, slots and code hashes they asked
+    /// for. The executor leaves out what its caches hold, except that an
+    /// account is asked for (and counted) with its missing slots.
     pub waves: u64,
     pub wave_items: u64,
     pub wave_wait: std::time::Duration,

@@ -973,7 +973,8 @@ impl SnapStateOracle for PoolOracle {
         if self.peers.is_empty() || (accounts.is_empty() && code_hashes.is_empty()) {
             return;
         }
-        // Counted as asked for: items the caches already hold are in it.
+        // Counted as asked for. The executor leaves out what the caches hold,
+        // but an account comes (and counts) with its missing slots.
         let items = accounts.iter().map(|(_, slots)| 1 + slots.len()).sum::<usize>() + code_hashes.len();
         let _timer = self.wire.wave(u64::try_from(items).unwrap_or(u64::MAX));
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
