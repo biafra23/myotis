@@ -170,7 +170,17 @@ uniffi::setup_scaffolding!();
 ///      than block base fee: …"), where it used to estimate. The JVM
 ///      `RustEngineNative` wrappers, the Node addon and the iOS wrapper moved
 ///      with it.
-pub const ABI_VERSION: i32 = 35;
+/// v36: send_raw_transaction_json judges a transaction before it broadcasts it
+///      (#531): one its sender cannot pay for (`value + gas × fee` above the
+///      balance) or whose nonce is used — on the sender's account as proven at
+///      a fresh head — is answered `{"status":"rejected","reason"}` with
+///      geth's txpool verdict ("insufficient funds for gas * price + value: …",
+///      "nonce too low: …"), which the hosts serve verbatim under geth's
+///      -32000, and is never broadcast. Anything that keeps it from judging
+///      sends as before. No signature change; the JVM `RustChainHandle` and
+///      the iOS `IosRpcBackend` read the new shape, and the Node addon passes
+///      it through.
+pub const ABI_VERSION: i32 = 36;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

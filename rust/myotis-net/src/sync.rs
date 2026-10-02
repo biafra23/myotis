@@ -3662,6 +3662,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
                     e.block_number,
                     e.block_hash,
                     e.state_root,
+                    e.timestamp,
                 );
             }
             HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {
@@ -3824,6 +3825,7 @@ mod tests {
                 state_root,
                 block_number,
                 block_hash,
+                timestamp: 1_700_000_000 + 12 * slot,
                 ..Default::default()
             })),
             execution_branch: Vec::new(),
@@ -3885,6 +3887,11 @@ mod tests {
         assert_eq!(anchor.finalized_slot(), 1000);
         assert_eq!(anchor.optimistic_block_number(), 21_000_002);
         assert_eq!(anchor.optimistic_block_hash(), Some([0x44; 32]));
+        // The payload header's own timestamp rides along (#531).
+        assert_eq!(
+            anchor.optimistic_head_state().map(|h| (h.number, h.timestamp)),
+            Some((21_000_002, 1_700_000_000 + 12 * 1002))
+        );
         // Both roots seed the stateRootMatch window, each keyed by ITS block's
         // slot — the optimistic root at the attested block slot 1002, NOT the
         // store's signature slot 1003.

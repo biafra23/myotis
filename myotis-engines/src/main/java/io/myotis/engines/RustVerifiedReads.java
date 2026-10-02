@@ -265,14 +265,23 @@ final class RustVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
-        if (rawTx == null || rawTx.length == 0) return null;
+        // A refusal (#531) is no hash either: null, as before ABI 36.
+        io.myotis.api.SendResult r = sendRawTransactionDetailed(rawTx);
+        return r.status() == io.myotis.api.SendResult.Status.SENT ? r.txHash() : null;
+    }
+
+    @Override
+    public io.myotis.api.SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        if (rawTx == null || rawTx.length == 0) return io.myotis.api.SendResult.unavailable("empty raw transaction");
         try {
             // The engine never signs — it gossips the user-signed tx and returns
-            // keccak256(rawTx). null on no-peer / not-a-tx (→ strict -32000).
-            return handle.sendRawTransactionVerified(toHex(rawTx));
+            // keccak256(rawTx), or refuses one that can never be mined as sent
+            // (REJECTED, geth's reason). Unavailable on no-peer / not-a-tx
+            // (→ strict -32000).
+            return handle.sendRawTransactionDetailedVerified(toHex(rawTx));
         } catch (RuntimeException e) {
             log.debug("[engines] sendRawTransaction failed: {}", e.getMessage());
-            return null;
+            return io.myotis.api.SendResult.unavailable(e.getMessage());
         }
     }
 

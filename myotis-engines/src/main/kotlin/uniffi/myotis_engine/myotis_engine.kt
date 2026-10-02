@@ -1064,7 +1064,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_resume_handle() != 4974) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 26871) {
+    if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 13582) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_log_index_config() != 49994) {
@@ -1888,7 +1888,7 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Gossip a signed raw transaction; `{"txHash":"0x…"}` or `{"error": ...}`.
+         * Gossip a signed raw transaction; `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`.
          */ fun `sendRawTransactionJson`(`handle`: kotlin.Long, `rawTxHex`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->

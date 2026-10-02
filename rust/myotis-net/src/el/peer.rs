@@ -937,20 +937,29 @@ async fn read_loop(
         if code == messages::NEW_POOLED_TRANSACTION_HASHES || code == messages::TRANSACTIONS {
             if let Some(watch) = &tx_watch {
                 let now = std::time::Instant::now();
-                let watching = {
+                let (watching, unseen) = {
                     let mut w = watch.lock().unwrap();
-                    w.evict_expired(now);
-                    w.watching_any()
+                    let unseen = w.evict_expired(now);
+                    (w.watching_any(), unseen)
                 };
+                crate::el::sent_tx::log_unseen_expiries(&unseen);
                 if watching {
                     let hashes = if code == messages::TRANSACTIONS {
                         messages::transactions_gossip_hashes(&frame.payload)
                     } else {
                         messages::decode_new_pooled_tx_hashes(&frame.payload)
                     };
-                    let mut w = watch.lock().unwrap();
-                    for hash in hashes {
-                        w.mark_seen(&hash, now);
+                    let sighted: Vec<([u8; 32], std::time::Duration)> = {
+                        let mut w = watch.lock().unwrap();
+                        hashes.into_iter().filter_map(|hash| w.mark_seen(&hash, now).map(|after| (hash, after))).collect()
+                    };
+                    // The first sighting of one of ours, once each (#531).
+                    for (hash, after) in sighted {
+                        tracing::info!(
+                            tx = %crate::el::sent_tx::hash_hex(&hash),
+                            after_ms = after.as_millis(),
+                            "sent transaction seen in gossip"
+                        );
                     }
                 }
             }

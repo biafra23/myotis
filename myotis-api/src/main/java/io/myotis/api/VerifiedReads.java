@@ -170,8 +170,21 @@ public interface VerifiedReads {
      * Gossip a signed raw transaction to peers (the engine never signs).
      *
      * @return keccak256(rawTx) — the tx hash — or null when no peer accepted it
+     *         (or the engine refused it: see {@link #sendRawTransactionDetailed})
      */
     byte[] sendRawTransaction(byte[] rawTx);
+
+    /**
+     * {@link #sendRawTransaction} with its outcome told apart (#531): an engine
+     * that judges a send before broadcasting it answers a transaction that can
+     * never be mined as sent {@link SendResult.Status#REJECTED}, with geth's
+     * reason, instead of a hash. The default wraps {@link #sendRawTransaction}:
+     * a hash is {@code SENT}, null {@code UNAVAILABLE}.
+     */
+    default SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        byte[] hash = sendRawTransaction(rawTx);
+        return hash != null ? SendResult.sent(hash) : SendResult.unavailable(null);
+    }
 
     /** Receipt JSON (verified vs receiptsRoot) | "null" literal | null. */
     String getTransactionReceipt(byte[] txHash);

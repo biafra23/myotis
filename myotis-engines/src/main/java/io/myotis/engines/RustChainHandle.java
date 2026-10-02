@@ -1399,13 +1399,37 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     /**
-     * Gossip a signed raw transaction and return its 32-byte hash. Throws
-     * {@link EngineException} when no peer could be reached / the input isn't a
-     * plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
+     * Gossip a signed raw transaction: its 32-byte hash as
+     * {@link io.myotis.api.SendResult.Status#SENT}, or (ABI 36, #531)
+     * {@link io.myotis.api.SendResult.Status#REJECTED} with geth's reason for
+     * one the engine refused before broadcasting it. Throws
+     * {@link EngineException} when no peer could be reached / the input isn't
+     * a plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
      */
-    byte[] sendRawTransactionVerified(String rawTxHex) {
-        return txHashFromJson(
+    io.myotis.api.SendResult sendRawTransactionDetailedVerified(String rawTxHex) {
+        return sendResultFromJson(
                 gated(() -> RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex)));
+    }
+
+    /**
+     * Package-private test seam: send-tx JSON → its outcome.
+     * {@code {"status":"rejected","reason"}} is the engine's answer (geth's
+     * txpool verdict, nothing broadcast); otherwise the hash, as
+     * {@link #txHashFromJson} reads it (throwing on an error or a malformed
+     * payload).
+     */
+    static io.myotis.api.SendResult sendResultFromJson(String json) {
+        JsonObject o = parseJsonObject(json, "sendRawTransaction");
+        if ("rejected".equals(stringOrNull(o, "status"))) {
+            String reason = stringOrNull(o, "reason");
+            // Fail closed on a reason-less refusal: the wallet would be told
+            // nothing about why, and a retry might as well be offered.
+            if (reason == null || reason.isBlank()) {
+                throw new EngineException("send-tx JSON rejected without a reason");
+            }
+            return io.myotis.api.SendResult.rejected(reason);
+        }
+        return io.myotis.api.SendResult.sent(txHashFromJson(json));
     }
 
     /** Package-private test seam: send-tx JSON → the 32-byte tx hash (throws on error). */

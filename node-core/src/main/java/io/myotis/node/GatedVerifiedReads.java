@@ -144,6 +144,15 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public io.myotis.api.SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        // Forwarded, not inherited: the default would collapse the backend's
+        // own verdict into hash-or-null (#531).
+        io.myotis.api.SendResult r = guarded(d -> d.sendRawTransactionDetailed(rawTx));
+        // guarded() returns null when no backend is available — retryable.
+        return r != null ? r : io.myotis.api.SendResult.unavailable("stack not ready");
+    }
+
+    @Override
     public String getTransactionReceipt(byte[] txHash) {
         return guardedJson(d -> d.getTransactionReceipt(txHash));
     }

@@ -1167,8 +1167,15 @@ class RpcRouter(
             "eth_sendRawTransaction" -> {
                 val raw = root.params().dataAt(0, "the signed transaction")
                 if (raw.isEmpty()) invalid("invalid argument 0: the signed transaction is empty")
-                val hash = withContext(rpcIoDispatcher) { b.sendRawTransaction(raw) } ?: return null
-                resultEnvelope(id, JsonPrimitive(hexData(hash)))
+                val outcome = withContext(rpcIoDispatcher) { b.sendRawTransactionDetailed(raw) }
+                when (outcome.kind) {
+                    RpcSendResult.Kind.SENT -> resultEnvelope(id, JsonPrimitive(hexData(outcome.txHash!!)))
+                    // Refused before broadcast (#531): geth's txpool verdict,
+                    // verbatim under geth's -32000 — wallets classify the words.
+                    RpcSendResult.Kind.REJECTED ->
+                        errorEnvelope(id, -32000, outcome.detail ?: "transaction rejected")
+                    RpcSendResult.Kind.UNAVAILABLE -> return null
+                }
             }
             "eth_getTransactionReceipt" -> {
                 val txHash = root.params().hashAt(0, "transaction hash")

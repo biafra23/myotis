@@ -54,9 +54,12 @@ impl SentTxTracker {
         SentTxTracker { watched: HashMap::new() }
     }
 
-    /// Start (or restart — a re-send overwrites) watching a broadcast tx.
+    /// Start (or restart — a re-send restarts the clock) watching a broadcast
+    /// tx. A re-send of a tx the network already echoed back stays seen: it is
+    /// not rebroadcast, nor logged as dropped when its watch expires (#531).
     pub fn watch(&mut self, hash: [u8; 32], now: Instant, broadcast_head: Option<u64>) {
-        self.watched.insert(hash, Watch { broadcast_at: now, seen_at: None, broadcast_head });
+        let seen_at = self.watched.get(&hash).and_then(|w| w.seen_at);
+        self.watched.insert(hash, Watch { broadcast_at: now, seen_at, broadcast_head });
     }
 
     /// The head number recorded when WE broadcast this tx, or `None` for a tx
@@ -96,12 +99,19 @@ impl SentTxTracker {
 
     /// Drop watches older than [`SENT_TX_WATCH_TTL`] (strictly older — at
     /// exactly the boundary a watch is still live, the Java `>` mirrored).
-    /// Returns how many were evicted.
-    pub fn evict_expired(&mut self, now: Instant) -> usize {
-        let before = self.watched.len();
-        self.watched
-            .retain(|_, w| now.saturating_duration_since(w.broadcast_at) <= SENT_TX_WATCH_TTL);
-        before - self.watched.len()
+    /// Returns the evicted ones the network never echoed back: likely dropped
+    /// (#531), for the caller to log. Weak evidence, as a peer does not
+    /// announce a transaction back to the connection it came from.
+    pub fn evict_expired(&mut self, now: Instant) -> Vec<[u8; 32]> {
+        let mut unseen = Vec::new();
+        self.watched.retain(|hash, w| {
+            let live = now.saturating_duration_since(w.broadcast_at) <= SENT_TX_WATCH_TTL;
+            if !live && w.seen_at.is_none() {
+                unseen.push(*hash);
+            }
+            live
+        });
+        unseen
     }
 
     pub fn len(&self) -> usize {
@@ -110,6 +120,29 @@ impl SentTxTracker {
 
     pub fn is_empty(&self) -> bool {
         self.watched.is_empty()
+    }
+}
+
+/// A tx hash as `0x…` hex, for the send log lines (#531).
+pub fn hash_hex(hash: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(66);
+    out.push_str("0x");
+    for b in hash {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Log the watched transactions [`SentTxTracker::evict_expired`] found never
+/// echoed back (#531).
+pub fn log_unseen_expiries(unseen: &[[u8; 32]]) {
+    for hash in unseen {
+        tracing::info!(
+            tx = %hash_hex(hash),
+            "transaction not seen in gossip within {} s and no receipt served for it; likely dropped",
+            SENT_TX_WATCH_TTL.as_secs()
+        );
     }
 }
 
@@ -227,11 +260,48 @@ mod tests {
         let start = t0();
         w.watch([1; 32], start, None);
         // Exactly at the boundary: still live (Java `>` semantics).
-        assert_eq!(w.evict_expired(start + SENT_TX_WATCH_TTL), 0);
+        assert!(w.evict_expired(start + SENT_TX_WATCH_TTL).is_empty());
         assert_eq!(w.len(), 1);
         // One millisecond past: evicted.
-        assert_eq!(w.evict_expired(start + SENT_TX_WATCH_TTL + Duration::from_millis(1)), 1);
+        assert_eq!(w.evict_expired(start + SENT_TX_WATCH_TTL + Duration::from_millis(1)).len(), 1);
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn only_a_watch_never_echoed_back_expires_as_likely_dropped() {
+        // #531: the expiry log names what the network never showed us; a tx
+        // seen in gossip but not yet mined is merely no longer watched.
+        let mut w = SentTxTracker::new();
+        let start = t0();
+        w.watch([1; 32], start, None);
+        w.watch([2; 32], start, None);
+        w.mark_seen(&[2; 32], start + Duration::from_secs(1));
+        let past = start + SENT_TX_WATCH_TTL + Duration::from_millis(1);
+        assert_eq!(w.evict_expired(past), vec![[1; 32]]);
+        assert!(w.is_empty(), "both stop being watched");
+    }
+
+    #[test]
+    fn a_resend_of_a_seen_tx_stays_seen() {
+        let mut w = SentTxTracker::new();
+        let start = t0();
+        w.watch([1; 32], start, None);
+        w.mark_seen(&[1; 32], start + Duration::from_secs(1));
+        // The wallet sends the same bytes again: the clock restarts, the
+        // network's echo still counts.
+        w.watch([1; 32], start + Duration::from_secs(5), None);
+        assert!(w.unseen().is_empty(), "no rebroadcast of a seen tx");
+        assert_eq!(w.mark_seen(&[1; 32], start + Duration::from_secs(6)), None, "its sighting was counted once");
+        let past = start + Duration::from_secs(5) + SENT_TX_WATCH_TTL + Duration::from_millis(1);
+        assert!(w.evict_expired(past).is_empty(), "not logged as dropped");
+    }
+
+    #[test]
+    fn a_hash_logs_as_0x_hex() {
+        let mut hash = [0u8; 32];
+        hash[0] = 0xab;
+        hash[31] = 0x01;
+        assert_eq!(hash_hex(&hash), format!("0xab{}01", "00".repeat(30)));
     }
 
     // ---- PendingNonceTracker (PendingNonceTrackerTest twin) ----

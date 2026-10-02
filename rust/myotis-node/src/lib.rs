@@ -424,7 +424,7 @@ pub fn fee_estimate_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'en
     scheduler::submit(env, handle, move || take(unsafe { myotis_fee_estimate_json(handle) }))
 }
 
-/// Gossip a signed raw transaction to devp2p peers: `{"txHash":"0x…"}`.
+/// Gossip a signed raw transaction to devp2p peers: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&raw_tx_hex) {

@@ -26,6 +26,7 @@ pub mod rlpx;
 /// compiled with `--features tor`; a no-op absence otherwise.
 #[cfg(feature = "tor")]
 pub mod tor;
+pub mod send_check;
 pub mod sent_tx;
 pub mod served;
 pub mod snap;
