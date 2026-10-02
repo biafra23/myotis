@@ -49,12 +49,13 @@ pub fn fresh_bound(block_time: Duration) -> Duration {
 /// Whether a head is fresh enough to judge a send by ([`fresh_bound`]): by
 /// its proven timestamp (unix seconds) against the wall clock `now_unix` — a
 /// head in the future, clock skew, counts as fresh — AND by how long ago this
-/// node adopted it, on its own monotonic clock, which a wall clock set wrong
-/// cannot fake: a stalled light client's head ages there whatever the wall
-/// clock says.
-pub fn head_is_fresh(now_unix: u64, head_timestamp: u64, adopted_ago: Duration, block_time: Duration) -> bool {
+/// node learned it advancing, on its own monotonic clock, which a wall clock
+/// set wrong cannot fake: a stalled light client's head ages there whatever
+/// the wall clock says. A head never seen to advance (`adopted_ago` `None`:
+/// the first after a start, a restored snapshot's) is not fresh.
+pub fn head_is_fresh(now_unix: u64, head_timestamp: u64, adopted_ago: Option<Duration>, block_time: Duration) -> bool {
     let bound = fresh_bound(block_time);
-    now_unix <= head_timestamp.saturating_add(bound.as_secs()) && adopted_ago <= bound
+    now_unix <= head_timestamp.saturating_add(bound.as_secs()) && adopted_ago.is_some_and(|ago| ago <= bound)
 }
 
 /// What the transaction may cost its sender at most: `value + gas × fee`, the
@@ -169,7 +170,7 @@ mod tests {
     fn a_head_is_fresh_for_two_block_times_and_the_grace() {
         let slot = Duration::from_secs(12);
         let head = 1_700_000_000;
-        let just = Duration::from_secs(1);
+        let just = Some(Duration::from_secs(1));
         // A light client's head is normally one to two blocks old.
         assert!(head_is_fresh(head + 12, head, just, slot));
         assert!(head_is_fresh(head + 30, head, just, slot), "2 × 12 s + 6 s");
@@ -186,7 +187,10 @@ mod tests {
         // The wall clock says the head is 10 s old, but this node adopted it a
         // minute ago and has heard of no newer one: its light client stalled.
         let slot = Duration::from_secs(12);
-        assert!(!head_is_fresh(1_700_000_010, 1_700_000_000, Duration::from_secs(60), slot));
-        assert!(head_is_fresh(1_700_000_010, 1_700_000_000, Duration::from_secs(30), slot));
+        assert!(!head_is_fresh(1_700_000_010, 1_700_000_000, Some(Duration::from_secs(60)), slot));
+        assert!(head_is_fresh(1_700_000_010, 1_700_000_000, Some(Duration::from_secs(30)), slot));
+        // Never seen to advance (a restored snapshot's head, fed first on a
+        // start): not fresh, whatever the wall clock says.
+        assert!(!head_is_fresh(1_700_000_010, 1_700_000_000, None, slot));
     }
 }

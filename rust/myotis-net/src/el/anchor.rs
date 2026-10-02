@@ -69,8 +69,9 @@ pub struct HeadState {
     pub state_root: [u8; 32],
     /// The block's own timestamp (unix seconds), proven with it.
     pub timestamp: u64,
-    /// When this node adopted the block (monotonic).
-    pub adopted: std::time::Instant,
+    /// When this node learned the block advancing the head (monotonic), or
+    /// `None`: the first head after a start, or one that did not advance.
+    pub adopted: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -88,9 +89,15 @@ struct Inner {
     /// Gloas header is the one that hashes to the proven block hash. 0 until
     /// a head lands.
     optimistic_timestamp: u64,
-    /// When this node adopted the current optimistic block (monotonic): a
-    /// head's age by our own clock, which a wall clock set wrong cannot fake.
+    /// When this node learned the current optimistic block, if it was seen to
+    /// ADVANCE past an earlier head live (monotonic; see [`set_optimistic`]):
+    /// a head's age by our own clock, which a wall clock set wrong cannot
+    /// fake. `None` for the first head after a start — a restored snapshot's,
+    /// fed before any live update — and for one at or below the head before.
     optimistic_adopted: Option<std::time::Instant>,
+    /// When the pending optimistic hash was noted: a Gloas head counts from
+    /// when the light client proved it, not from when its header resolved.
+    pending_optimistic_noted: Option<std::time::Instant>,
     known_roots: VecDeque<SlottedStateRoot>,
     finality_current: bool,
     /// Gloas: a finalized execution block hash the light client proved at this
@@ -163,6 +170,7 @@ impl ExecAnchor {
             optimistic_block_hash,
             optimistic_state_root,
             optimistic_timestamp,
+            Some(std::time::Instant::now()),
         );
     }
 
@@ -215,6 +223,7 @@ impl ExecAnchor {
         }
         if inner.pending_optimistic.map(|(_, h)| h) != Some(block_hash) {
             self.pending_changed.notify_one();
+            inner.pending_optimistic_noted = Some(std::time::Instant::now());
         }
         inner.pending_optimistic = Some((slot, block_hash));
     }
@@ -265,7 +274,8 @@ impl ExecAnchor {
         }
         if let Some((slot, pending)) = inner.pending_optimistic {
             if pending == hash {
-                set_optimistic(&mut inner, slot, number, hash, root, timestamp);
+                let learned = inner.pending_optimistic_noted;
+                set_optimistic(&mut inner, slot, number, hash, root, timestamp, learned);
                 inner.pending_optimistic = None;
                 adopted = true;
             }
@@ -371,16 +381,16 @@ impl ExecAnchor {
 
     /// The optimistic execution head as a send is judged by (#531), read
     /// under ONE lock: its number, its BLS-attested state root, its own
-    /// timestamp and when this node adopted it. `None` until a head with its
-    /// timestamp lands.
+    /// timestamp and when this node learned it advancing. `None` until a head
+    /// with its timestamp lands.
     pub fn optimistic_head_state(&self) -> Option<HeadState> {
         let inner = self.inner.lock().expect("anchor mutex");
-        match (inner.optimistic_state_root, inner.optimistic_adopted) {
-            (Some(state_root), Some(adopted)) if inner.optimistic_timestamp > 0 => Some(HeadState {
+        match inner.optimistic_state_root {
+            Some(state_root) if inner.optimistic_timestamp > 0 => Some(HeadState {
                 number: inner.optimistic_block_number,
                 state_root,
                 timestamp: inner.optimistic_timestamp,
-                adopted,
+                adopted: inner.optimistic_adopted,
             }),
             _ => None,
         }
@@ -417,11 +427,24 @@ fn set_finalized(inner: &mut Inner, slot: u64, state_root: [u8; 32], number: u64
     push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
-fn set_optimistic(inner: &mut Inner, slot: u64, number: u64, hash: [u8; 32], state_root: [u8; 32], timestamp: u64) {
-    // Adopted when the block changes; the light-client loop re-offers the same
-    // head on every poll, and that is no newer a head.
+fn set_optimistic(
+    inner: &mut Inner,
+    slot: u64,
+    number: u64,
+    hash: [u8; 32],
+    state_root: [u8; 32],
+    timestamp: u64,
+    learned: Option<std::time::Instant>,
+) {
+    // Adopted (#531) only when the block changes — the light-client loop
+    // re-offers the same head on every poll, and that is no newer a head —
+    // and only when it ADVANCES past a head this anchor already had: the
+    // first head after a start is a restored snapshot's (fed before any live
+    // update), and a step back is no fresher. It counts from when it was
+    // `learned`, which for a Gloas head is when its hash was proven.
     if inner.optimistic_block_hash != Some(hash) {
-        inner.optimistic_adopted = Some(std::time::Instant::now());
+        let advanced = inner.optimistic_block_hash.is_some() && number > inner.optimistic_block_number;
+        inner.optimistic_adopted = if advanced { learned } else { None };
     }
     inner.optimistic_slot = slot;
     inner.optimistic_block_number = number;
@@ -567,19 +590,43 @@ mod tests {
     }
 
     #[test]
-    fn a_head_offered_again_keeps_its_adoption_time() {
-        // The light-client loop offers its head on every poll; the same block
-        // again is no newer a head (#531: a stalled light client's head ages).
+    fn only_a_head_seen_to_advance_counts_as_adopted() {
+        // #531: the first head after a start is a restored snapshot's (fed
+        // before any live update), so it carries no adoption time.
         let anchor = ExecAnchor::new();
         anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2), 1_700_000_000);
-        let first = anchor.optimistic_head_state().expect("a head").adopted;
+        assert_eq!(anchor.optimistic_head_state().map(|h| h.adopted), Some(None));
+        // A live head past it is adopted.
+        anchor.update_optimistic(103, 21_000_006, root(0xf3), root(3), 1_700_000_012);
+        let first = anchor.optimistic_head_state().and_then(|h| h.adopted).expect("adopted");
+        // The light-client loop offers its head on every poll; the same block
+        // again is no newer a head, so a stalled light client's head ages.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        anchor.update_optimistic(103, 21_000_005, root(0xf2), root(2), 1_700_000_000);
-        assert_eq!(anchor.optimistic_head_state().map(|h| h.adopted), Some(first));
         anchor.update_optimistic(104, 21_000_006, root(0xf3), root(3), 1_700_000_012);
-        let next = anchor.optimistic_head_state().expect("a head");
-        assert_eq!((next.number, next.state_root), (21_000_006, root(3)));
-        assert!(next.adopted > first, "a new block is adopted anew");
+        assert_eq!(anchor.optimistic_head_state().and_then(|h| h.adopted), Some(first));
+        // The next block is adopted anew; a step back (a reorg to an older
+        // block, an older restore) is not adopted at all.
+        anchor.update_optimistic(105, 21_000_007, root(0xf4), root(4), 1_700_000_024);
+        assert!(anchor.optimistic_head_state().and_then(|h| h.adopted).is_some_and(|at| at > first));
+        anchor.update_optimistic(106, 21_000_006, root(0xf5), root(5), 1_700_000_012);
+        assert_eq!(anchor.optimistic_head_state().map(|h| h.adopted), Some(None));
+    }
+
+    #[test]
+    fn a_gloas_head_counts_from_when_its_hash_was_proven() {
+        // A header can resolve long after the light client proved its hash:
+        // the head is as old as the proof, not the fetch (PR #537 review).
+        let anchor = ExecAnchor::new();
+        let (a, b) = (header(1, root(1)), header(2, root(2)));
+        anchor.note_optimistic_hash(10, a.hash);
+        assert!(anchor.resolve_header(&a));
+        let before_note = std::time::Instant::now();
+        anchor.note_optimistic_hash(20, b.hash);
+        let after_note = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(anchor.resolve_header(&b));
+        let adopted = anchor.optimistic_head_state().and_then(|h| h.adopted).expect("advanced");
+        assert!(adopted >= before_note && adopted <= after_note, "stamped at the note, not the resolution");
     }
 
     /// A genuine header (raw RLP, keccak hash) with this number and state

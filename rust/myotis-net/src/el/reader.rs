@@ -287,7 +287,19 @@ impl std::fmt::Display for SendError {
 /// proof of the head's state. A read proven against any other root — one a
 /// peer fell back to, or a newer head's than the one judged fresh — does not,
 /// whatever block number it carries.
-fn judge_read(tx: &TxSummary, head: &HeadState, read: Option<Result<VerifiedAccount, String>>) -> PreBroadcast {
+///
+/// `now_unix` is read after the read: the head must still be fresh
+/// ([`send_check::head_is_fresh`]) when the verdict is made.
+fn judge_read(
+    tx: &TxSummary,
+    head: &HeadState,
+    read: Option<Result<VerifiedAccount, String>>,
+    now_unix: u64,
+    block_time: Duration,
+) -> PreBroadcast {
+    if !send_check::head_is_fresh(now_unix, head.timestamp, head.adopted.map(|at| at.elapsed()), block_time) {
+        return PreBroadcast::Unchecked("head went stale during the read");
+    }
     let account = match read {
         None => return PreBroadcast::Unchecked("account read timed out"),
         Some(Err(_)) => return PreBroadcast::Unchecked("account read failed"),
@@ -7115,7 +7127,13 @@ impl ElReader {
             Err(_) => None, // still running: detached, not cut
             Ok(joined) => Some(joined.unwrap_or_else(|e| Err(format!("account read task failed: {e}")))),
         };
-        judge_read(tx, &head, read)
+        // The bound must hold at the verdict, not only before the read: a
+        // head just inside it when the read began may have crossed it since
+        // (PR #537 review).
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return PreBroadcast::Unchecked("wall clock unreadable");
+        };
+        judge_read(tx, &head, read, now.as_secs(), self.block_time)
     }
 
     /// The transaction, its sender and the head a verdict would be judged at,
@@ -7138,7 +7156,7 @@ impl ElReader {
             return Err("another chain's transaction");
         }
         let head = self.anchor.optimistic_head_state().ok_or("no verified head yet")?;
-        if !send_check::head_is_fresh(now_unix, head.timestamp, head.adopted.elapsed(), self.block_time) {
+        if !send_check::head_is_fresh(now_unix, head.timestamp, head.adopted.map(|at| at.elapsed()), self.block_time) {
             return Err("head not fresh");
         }
         Ok((tx, from, head))
@@ -7152,7 +7170,7 @@ impl ElReader {
             return (None, None);
         };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok();
-        (now.map(|now| now.as_secs().saturating_sub(head.timestamp)), Some(head.adopted.elapsed().as_secs()))
+        (now.map(|now| now.as_secs().saturating_sub(head.timestamp)), head.adopted.map(|at| at.elapsed().as_secs()))
     }
 
     /// The "pending" nonce overlay (the Java `pendingNonceOverlay` twin): raise
@@ -13726,9 +13744,15 @@ mod pre_broadcast_tests {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
     }
 
-    /// The head a verdict is judged at: block 100 with state root `[2; 32]`.
+    /// The head a verdict is judged at: block 100 with state root `[2; 32]`,
+    /// 5 s old, learned advancing just now.
     fn head_at() -> HeadState {
-        HeadState { number: 100, state_root: [2; 32], timestamp: 1_700_000_000, adopted: std::time::Instant::now() }
+        HeadState { number: 100, state_root: [2; 32], timestamp: now_unix() - 5, adopted: Some(std::time::Instant::now()) }
+    }
+
+    /// [`judge_read`] at mainnet's 12 s blocks, now.
+    fn judge_now(tx: &TxSummary, head: &HeadState, read: Option<Result<VerifiedAccount, String>>) -> PreBroadcast {
+        judge_read(tx, head, read, now_unix(), Duration::from_secs(12))
     }
 
     /// The sender's account as a head read returns it, proven against
@@ -13759,11 +13783,12 @@ mod pre_broadcast_tests {
 
     /// A mainnet reader with no network, its optimistic head at block 100
     /// (state root `[2; 32]`) with that block's timestamp `head_time` (`None`:
-    /// no head yet).
+    /// no head yet), seen to advance from block 99 as a live head is.
     async fn offline_reader(head_time: Option<u64>) -> Arc<ElReader> {
         let anchor = Arc::new(ExecAnchor::new());
         if let Some(time) = head_time {
             anchor.update_finalized(36, [1; 32], 36, [3; 32]);
+            anchor.update_optimistic(99, 99, [5; 32], [6; 32], time - 12);
             anchor.update_optimistic(100, 100, [4; 32], [2; 32], time);
         }
         let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
@@ -13782,7 +13807,7 @@ mod pre_broadcast_tests {
     fn only_an_account_proven_against_the_heads_own_root_judges_the_send() {
         let tx = tx::decode_summary(&spec_tx()).expect("decodes");
         let head = head_at();
-        let judge = |read| judge_read(&tx, &head, read);
+        let judge = |read| judge_now(&tx, &head, read);
         let at_head = head.state_root;
         // 1 wei short of the cost: geth's refusal, in geth's words.
         assert_eq!(
@@ -13811,6 +13836,55 @@ mod pre_broadcast_tests {
     }
 
     #[test]
+    fn a_head_that_went_stale_during_the_read_does_not_judge() {
+        // PR #537 review: the bound holds at the verdict, not only before the
+        // read. Each of these would refuse at a head still fresh.
+        let tx = tx::decode_summary(&spec_tx()).expect("decodes");
+        let doomed = || Some(Ok(account([2; 32], 9, 0, true)));
+        let slot = Duration::from_secs(12);
+        let head = head_at();
+        assert!(matches!(judge_read(&tx, &head, doomed(), now_unix(), slot), PreBroadcast::Doomed(_)));
+        // Its timestamp crossed the bound while the read ran.
+        assert_eq!(
+            judge_read(&tx, &head, doomed(), head.timestamp + 31, slot),
+            PreBroadcast::Unchecked("head went stale during the read")
+        );
+        // Learned too long ago by this node's own clock, or never seen to
+        // advance (a restored snapshot's head).
+        let long_ago = std::time::Instant::now().checked_sub(Duration::from_secs(31)).unwrap();
+        for adopted in [Some(long_ago), None] {
+            assert_eq!(
+                judge_read(&tx, &HeadState { adopted, ..head }, doomed(), now_unix(), slot),
+                PreBroadcast::Unchecked("head went stale during the read")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restored_head_does_not_judge_until_the_head_advances() {
+        // A start feeds the anchor its restored snapshot's head before any
+        // live update: never judged by, whatever the wall clock says.
+        let anchor = Arc::new(ExecAnchor::new());
+        anchor.update_finalized(36, [1; 32], 36, [3; 32]);
+        anchor.update_optimistic(100, 100, [4; 32], [2; 32], now_unix() - 5);
+        let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
+        let cfg = ElConfig {
+            bootnodes: Vec::new(),
+            boot_enodes: Vec::new(),
+            discv4_port: 0,
+            cache_path: None,
+            log_index_path: None,
+            ..ElConfig::mainnet()
+        };
+        let reader = ElReader::start(key, Arc::clone(&anchor), cfg).await.expect("offline reader");
+        let tx = tx::decode_summary(&spec_tx());
+        assert_eq!(reader.ready_to_judge(tx.as_ref(), now_unix()).err(), Some("head not fresh"));
+        // The first live head after it is.
+        anchor.update_optimistic(101, 101, [7; 32], [8; 32], now_unix() - 3);
+        assert!(reader.ready_to_judge(tx.as_ref(), now_unix()).is_ok());
+    }
+
+    #[test]
     fn a_signed_type_2_or_4_transaction_is_judged_by_its_own_fields() {
         // The motivating case is a type-4 shield: decoded from the real
         // signed bytes, its cost and sender drive the verdict.
@@ -13821,7 +13895,7 @@ mod pre_broadcast_tests {
             let tx = tx::decode_summary(&signed_typed(ty, 1, &key)).expect("decodes");
             assert_eq!((tx.ty, tx.from), (ty, Some(sender)));
             assert_eq!(
-                judge_read(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST - 1, true)))),
+                judge_now(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST - 1, true)))),
                 PreBroadcast::Doomed(format!(
                     "insufficient funds for gas * price + value: balance {}, tx cost {TYPED_COST}, overshot 1",
                     TYPED_COST - 1
@@ -13829,7 +13903,7 @@ mod pre_broadcast_tests {
                 "type {ty}"
             );
             assert_eq!(
-                judge_read(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST, true)))),
+                judge_now(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST, true)))),
                 PreBroadcast::Passed,
                 "type {ty}"
             );
