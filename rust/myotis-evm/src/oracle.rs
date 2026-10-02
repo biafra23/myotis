@@ -133,10 +133,30 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The verified world-state source the EVM reads through. See the module docs
 /// for the verification and threading contract.
+/// What one call's state reads cost on the wire, as its oracle measured them
+/// (#532): the reads the EVM waited on one at a time, and the prefetch waves
+/// that fetched many at once, with the time each kind kept it waiting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WireCost {
+    /// Reads the EVM waited on one at a time (accounts, slots, code).
+    pub serial_reads: u64,
+    pub serial_wait: std::time::Duration,
+    /// Prefetch waves, and the accounts, slots and code hashes they asked for.
+    pub waves: u64,
+    pub wave_items: u64,
+    pub wave_wait: std::time::Duration,
+}
+
 pub trait SnapStateOracle: Send + Sync {
     /// Cooperative execution check, including cache-only EVM instruction runs.
     /// Fixtures and sans-I/O consumers may leave this unlimited.
     fn check_request(&self) -> Result<(), OracleError> { Ok(()) }
+
+    /// What this oracle's reads have cost on the wire so far — for the
+    /// per-call breakdown a host logs (#532). Default: nothing measured.
+    fn wire_cost(&self) -> WireCost {
+        WireCost::default()
+    }
 
     /// The proof-verified account at `address`, or `Ok(None)` when an exclusion
     /// proof shows it absent. `Err` only when it cannot be verified.

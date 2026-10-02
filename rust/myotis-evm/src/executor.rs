@@ -116,6 +116,16 @@ pub struct EvmExecutor {
     oracle: Arc<dyn SnapStateOracle>,
     proof_cache: Arc<dyn StateProofCache>,
     bytecode_cache: Arc<dyn BytecodeCache>,
+    /// EVM runs so far (for [`Self::cost`]).
+    runs: std::sync::atomic::AtomicU64,
+}
+
+/// What the calls through one executor cost (#532): its EVM runs, and its
+/// state reads on the wire as the oracle measured them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CallCost {
+    pub evm_runs: u64,
+    pub wire: crate::oracle::WireCost,
 }
 
 impl EvmExecutor {
@@ -128,6 +138,15 @@ impl EvmExecutor {
             oracle,
             proof_cache,
             bytecode_cache,
+            runs: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// What the calls through this executor have cost so far (#532).
+    pub fn cost(&self) -> CallCost {
+        CallCost {
+            evm_runs: self.runs.load(std::sync::atomic::Ordering::Relaxed),
+            wire: self.oracle.wire_cost(),
         }
     }
 
@@ -336,7 +355,11 @@ impl EvmExecutor {
                 }
             }
         }
-        let run = self.execute_with_db(&db, spec, tx, hi, ctx).map_err(|e| match e {
+        // Through the convergence loop, like every call path: its discovery
+        // passes fetch what the run touches in parallel waves. A single real
+        // run fetched each miss one round-trip at a time — the 4–33 s #532
+        // measured. The search's probes below then run on what it fetched.
+        let run = self.converge(&db, spec, tx, hi, ctx, PREFETCH_ITERATION_CAP).map_err(|e| match e {
             // The intrinsic cost or the EIP-7623 floor above the ceiling: for an
             // estimate that is the caller's allowance talking, exactly like
             // running out of gas during execution — geth answers the same.
@@ -566,6 +589,7 @@ impl EvmExecutor {
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
         self.oracle.check_request()?;
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cfg = view_cfg(spec, ctx.chain_id);
         let tx = tx_env(tx, gas_limit, ctx.chain_id)?;
 
@@ -657,6 +681,21 @@ impl EvmExecutor {
         ctx: &BlockContext,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
+        self.converge(db, spec, tx, gas_limit, ctx, cap).and_then(finish_call)
+    }
+
+    /// The convergence loop itself: the converged run's whole result — its
+    /// output, and the gas it used, which [`Self::estimate_tx`] searches
+    /// from.
+    fn converge(
+        &self,
+        db: &OracleDatabase,
+        spec: SpecId,
+        tx: &TxRequest,
+        gas_limit: u64,
+        ctx: &BlockContext,
+        cap: usize,
+    ) -> Result<ExecutionResult, EvmError> {
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
         // code instead of a sentinel empty account.
@@ -699,7 +738,7 @@ impl EvmExecutor {
                 if fresh.is_empty() {
                     if db.sentinel_misses() == misses_before {
                         if let Ok(result) = outcome {
-                            return finish_call(result);
+                            return Ok(result);
                         }
                     }
                     discovering = false;
@@ -712,7 +751,7 @@ impl EvmExecutor {
                 // they ARE the answer, callers key on the revert data) propagate.
                 let result = outcome?;
                 if fresh.is_empty() {
-                    return finish_call(result); // converged
+                    return Ok(result); // converged
                 }
                 // Still discovering under real mode (a sentinel zero had hidden
                 // a branch): warm the stragglers and run again.
@@ -1513,6 +1552,123 @@ mod tests {
         );
         let after_second = oracle.fetches.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_first, after_second, "warm second call must not touch the oracle");
+    }
+
+    /// An oracle over a fixture world that counts the reads the EVM waits on
+    /// one at a time, and whose prefetch waves really fill the caches (#532).
+    #[derive(Default)]
+    struct WaveFilling {
+        inner: FixtureSnapStateOracle,
+        serial_storage: std::sync::atomic::AtomicUsize,
+        serial_other: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::oracle::SnapStateOracle for WaveFilling {
+        fn fetch_account(&self, r: &[u8; 32], a: [u8; 20]) -> Result<Option<OracleAccount>, crate::oracle::OracleError> {
+            self.serial_other.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_account(r, a)
+        }
+        fn fetch_storage(&self, r: &[u8; 32], a: [u8; 20], s: U256) -> Result<U256, crate::oracle::OracleError> {
+            self.serial_storage.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_storage(r, a, s)
+        }
+        fn fetch_bytecode(&self, h: &[u8; 32]) -> Result<Vec<u8>, crate::oracle::OracleError> {
+            self.serial_other.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_bytecode(h)
+        }
+        fn prefetch_batch(
+            &self,
+            root: &[u8; 32],
+            accounts: &[([u8; 20], Vec<U256>)],
+            code: &[[u8; 32]],
+            ps: &dyn crate::cache::StateProofCache,
+            cs: &dyn crate::cache::BytecodeCache,
+        ) {
+            for (addr, slots) in accounts {
+                if let Ok(account) = self.inner.fetch_account(root, *addr) {
+                    ps.put_account(root, addr, account);
+                }
+                for slot in slots {
+                    if let Ok(value) = self.inner.fetch_storage(root, *addr, *slot) {
+                        ps.put_storage(root, addr, slot, value);
+                    }
+                }
+            }
+            for hash in code {
+                if let Ok(bytes) = self.inner.fetch_bytecode(hash) {
+                    cs.put(hash, Bytes::from(bytes));
+                }
+            }
+        }
+    }
+
+    /// A world holding a contract that reads three slots: PUSH1 i SLOAD POP
+    /// for i = 0, 1, 2.
+    fn three_slot_world() -> FixtureSnapStateOracle {
+        let code = vec![
+            0x60u8, 0x00, 0x54, 0x50, 0x60, 0x01, 0x54, 0x50, 0x60, 0x02, 0x54, 0x50, 0x00,
+        ];
+        let mut fx = FixtureSnapStateOracle::new();
+        let ch = fx.with_bytecode(code);
+        let mut fx = fx.with_account(
+            ROOT,
+            TARGET,
+            OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: ch, storage_root: [0x9; 32] },
+        );
+        for i in 0..3u8 {
+            let mut slot = [0u8; 32];
+            slot[31] = i;
+            fx = fx.with_storage(ROOT, TARGET, slot, U256::from(100u64 + u64::from(i)));
+        }
+        fx
+    }
+
+    /// [`three_slot_world`] behind a [`WaveFilling`] oracle and real caches.
+    fn three_slot_reader() -> (Arc<WaveFilling>, EvmExecutor) {
+        let oracle = Arc::new(WaveFilling { inner: three_slot_world(), ..Default::default() });
+        let exec = EvmExecutor::new(
+            Arc::clone(&oracle) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(crate::cache::InMemoryStateProofCache::new(1024)),
+            Arc::new(crate::cache::InMemoryBytecodeCache::default()),
+        );
+        (oracle, exec)
+    }
+
+    #[test]
+    fn an_estimate_fetches_what_it_touches_in_waves_not_one_by_one() {
+        // #532: the estimate's first run was a single real run, so each slot it
+        // touched was a serial round-trip — 4–33 s for a shield. Through the
+        // convergence loop its discovery pass hands the slots to a wave.
+        let (oracle, exec) = three_slot_reader();
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let estimate = exec.estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
+        assert!(estimate > 21_000, "{estimate}");
+        assert_eq!(oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst), 0, "no slot read one by one");
+        assert!(exec.cost().evm_runs > 1, "the discovery pass, the real run, the search's probes");
+        // The same answer a cold, serial world gives: waves change the cost,
+        // never the result.
+        let fx_only = EvmExecutor::new(
+            Arc::new(three_slot_world()) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(NoopStateProofCache),
+            Arc::new(NoopBytecodeCache),
+        );
+        assert_eq!(fx_only.estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap(), estimate);
+    }
+
+    #[test]
+    fn an_estimate_after_the_same_call_reads_nothing_one_by_one() {
+        // #532 proposal 5: a wallet simulates, then estimates, the same
+        // transaction: the call's verified state serves the estimate.
+        let (oracle, exec) = three_slot_reader();
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
+        let (storage, other) = (
+            oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst),
+            oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        exec.estimate_gas([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
+        assert_eq!(oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst), storage);
+        assert_eq!(oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst), other);
     }
 
     #[test]

@@ -34,7 +34,7 @@ use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
 use myotis_evm::{
     BlockContext, BytecodeCache, EvmError, OracleAccount, OracleError, SnapStateOracle,
-    StateProofCache, U256,
+    StateProofCache, WireCost, U256,
 };
 
 use crate::el::peer::ManagedPeer;
@@ -550,6 +550,60 @@ pub struct PoolOracle {
     /// witnessed failure (`record_race`, the prefetch wave) — and the shadow
     /// cache, which measures head traffic, is not fed.
     finalized: bool,
+    /// What this call's reads cost on the wire (#532; [`SnapStateOracle::wire_cost`]).
+    wire: WireCounters,
+}
+
+/// The counters behind [`PoolOracle`]'s [`SnapStateOracle::wire_cost`]
+/// (#532): the reads the EVM waited on one at a time, the prefetch waves,
+/// and the time each kind kept it waiting.
+#[derive(Default)]
+struct WireCounters {
+    serial_reads: std::sync::atomic::AtomicU64,
+    serial_nanos: std::sync::atomic::AtomicU64,
+    waves: std::sync::atomic::AtomicU64,
+    wave_items: std::sync::atomic::AtomicU64,
+    wave_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl WireCounters {
+    /// Count one read the EVM waits on; the guard adds its time when dropped.
+    fn serial(&self) -> WireTimer<'_> {
+        self.serial_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WireTimer { nanos: &self.serial_nanos, started: std::time::Instant::now() }
+    }
+
+    /// Count one prefetch wave asking for `items` accounts, slots and codes.
+    fn wave(&self, items: u64) -> WireTimer<'_> {
+        self.waves.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wave_items.fetch_add(items, std::sync::atomic::Ordering::Relaxed);
+        WireTimer { nanos: &self.wave_nanos, started: std::time::Instant::now() }
+    }
+
+    fn snapshot(&self) -> WireCost {
+        let load = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
+        WireCost {
+            serial_reads: load(&self.serial_reads),
+            serial_wait: std::time::Duration::from_nanos(load(&self.serial_nanos)),
+            waves: load(&self.waves),
+            wave_items: load(&self.wave_items),
+            wave_wait: std::time::Duration::from_nanos(load(&self.wave_nanos)),
+        }
+    }
+}
+
+/// Adds the time since it was made to its counter when dropped — however the
+/// read it times ends.
+struct WireTimer<'a> {
+    nanos: &'a std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
+}
+
+impl Drop for WireTimer<'_> {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// This call's ask order after one hedged race over `asked` (the order that
@@ -624,6 +678,7 @@ impl PoolOracle {
             lost,
             silence_reported,
             finalized,
+            wire: WireCounters::default(),
         }
     }
 
@@ -835,11 +890,16 @@ impl SnapStateOracle for PoolOracle {
         }
     }
 
+    fn wire_cost(&self) -> WireCost {
+        self.wire.snapshot()
+    }
+
     fn fetch_account(
         &self,
         state_root: &[u8; 32],
         address: [u8; 20],
     ) -> Result<Option<OracleAccount>, OracleError> {
+        let _timer = self.wire.serial();
         match self.leaf(state_root, address)? {
             Some(leaf) => leaf_account(&leaf)
                 .ok_or_else(|| OracleError::InvalidProof {
@@ -878,6 +938,8 @@ impl SnapStateOracle for PoolOracle {
     ) {
         use futures::stream::{self, StreamExt};
         const BATCH_PATHSET_CHUNK: usize = 64; // Java SnapBackedStateOracle parity
+        let items = accounts.iter().map(|(_, slots)| 1 + slots.len()).sum::<usize>() + code_hashes.len();
+        let _timer = self.wire.wave(u64::try_from(items).unwrap_or(u64::MAX));
         const MAX_IN_FLIGHT: usize = 48; // Java PREFETCH_MAX_IN_FLIGHT (per request)
         const MAX_ATTEMPTS: usize = 3; // Java DEFAULT_MAX_ATTEMPTS
         const WAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1172,6 +1234,7 @@ impl SnapStateOracle for PoolOracle {
         address: [u8; 20],
         slot: U256,
     ) -> Result<U256, OracleError> {
+        let _timer = self.wire.serial();
         // An absent account (or one with an empty storage trie) has every slot
         // provably zero — no round trip.
         let Some(leaf) = self.leaf(state_root, address)? else {
@@ -1221,6 +1284,7 @@ impl SnapStateOracle for PoolOracle {
     }
 
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
+        let _timer = self.wire.serial();
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
@@ -1446,6 +1510,21 @@ mod tests {
             let outcome = CallOutcome::from_executor(run(&sepolia_header(Vec::new())));
             assert!(matches!(outcome, CallOutcome::Refused(_)), "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn wire_counters_count_reads_and_waves_with_their_time() {
+        // #532: the per-call breakdown an eth_estimateGas logs.
+        let wire = WireCounters::default();
+        {
+            let _read = wire.serial();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(wire.serial());
+        drop(wire.wave(5));
+        let cost = wire.snapshot();
+        assert_eq!((cost.serial_reads, cost.waves, cost.wave_items), (2, 1, 5));
+        assert!(cost.serial_wait >= std::time::Duration::from_millis(2), "{cost:?}");
     }
 
     mod prefetch_wave {

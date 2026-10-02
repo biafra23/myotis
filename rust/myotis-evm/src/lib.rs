@@ -64,8 +64,8 @@ pub use ens::{
     reverse_resolve, EnsError, EthCaller, ExecutorCaller, OffchainLookup,
 };
 pub use error::EvmError;
-pub use executor::EvmExecutor;
-pub use oracle::{OracleAccount, OracleError, SnapStateOracle};
+pub use executor::{CallCost, EvmExecutor};
+pub use oracle::{OracleAccount, OracleError, SnapStateOracle, WireCost};
 pub use tx::TxRequest;
 
 #[cfg(any(test, feature = "fixture"))]
