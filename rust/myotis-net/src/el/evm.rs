@@ -332,6 +332,16 @@ const WAVE_SILENCE_DEADLINE: std::time::Duration = BULK_HEDGE_DELAY;
 /// How often [`wave_request`] looks again whether its request has gone out.
 const WAVE_SILENCE_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long a convergence loop may keep starting discovery passes (#532
+/// review; [`SnapStateOracle::keep_discovering`]). Each pass is an EVM run
+/// plus a prefetch wave, and its yield does not predict the next one's (in
+/// the recorded RAILGUN shield, a pass that finds four new items comes before
+/// one that finds 28), so the bound is on time: on a slow link the passes must
+/// not spend the request budget that the serial reads after them need. A pass
+/// under way still finishes its wave: what the wave fetches is state the pass
+/// found, which the real runs would otherwise read one round-trip at a time.
+const DISCOVERY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Why a prefetch-wave request came back without an answer.
 #[derive(Debug, PartialEq, Eq)]
 enum WaveFailure {
@@ -552,6 +562,10 @@ pub struct PoolOracle {
     finalized: bool,
     /// What this call's reads cost on the wire (#532; [`SnapStateOracle::wire_cost`]).
     wire: WireCounters,
+    /// When the current convergence loop started discovering, and how long
+    /// it may keep starting passes ([`DISCOVERY_TIME_BUDGET`]).
+    discovery_started: Mutex<Option<std::time::Instant>>,
+    discovery_budget: std::time::Duration,
 }
 
 /// The counters behind [`PoolOracle`]'s [`SnapStateOracle::wire_cost`]
@@ -679,6 +693,8 @@ impl PoolOracle {
             silence_reported,
             finalized,
             wire: WireCounters::default(),
+            discovery_started: Mutex::new(None),
+            discovery_budget: DISCOVERY_TIME_BUDGET,
         }
     }
 
@@ -892,6 +908,15 @@ impl SnapStateOracle for PoolOracle {
 
     fn wire_cost(&self) -> WireCost {
         self.wire.snapshot()
+    }
+
+    fn keep_discovering(&self, pass: usize) -> bool {
+        let now = std::time::Instant::now();
+        let mut started = self.discovery_started.lock().unwrap();
+        if pass == 0 || started.is_none() {
+            *started = Some(now);
+        }
+        started.is_some_and(|at| now.duration_since(at) < self.discovery_budget)
     }
 
     fn fetch_account(
@@ -1526,6 +1551,24 @@ mod tests {
         let cost = wire.snapshot();
         assert_eq!((cost.serial_reads, cost.waves, cost.wave_items), (2, 1, 5));
         assert!(cost.serial_wait >= std::time::Duration::from_millis(2), "{cost:?}");
+    }
+
+    #[test]
+    fn discovery_starts_passes_within_its_budget_and_each_loop_starts_it_afresh() {
+        // #532 review: the oracle owns the clock that bounds a convergence
+        // loop's discovery; the EVM crate holds none.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut oracle =
+            PoolOracle::new(Vec::new(), runtime.handle().clone(), None, Arc::new(ReadStats::default()), false);
+        assert!(oracle.keep_discovering(0) && oracle.keep_discovering(9));
+        // The budget spent: no further pass, until the next loop starts.
+        let spent = std::time::Instant::now().checked_sub(DISCOVERY_TIME_BUDGET).unwrap();
+        *oracle.discovery_started.lock().unwrap() = Some(spent);
+        assert!(!oracle.keep_discovering(3));
+        assert!(oracle.keep_discovering(0));
+        // No budget: no discovery pass at all.
+        oracle.discovery_budget = std::time::Duration::ZERO;
+        assert!(!oracle.keep_discovering(0));
     }
 
     mod prefetch_wave {

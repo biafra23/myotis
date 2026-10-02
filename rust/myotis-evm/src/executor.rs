@@ -110,14 +110,6 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// nothing, and the answer never depends on it.
 const PREFETCH_ITERATION_CAP: usize = 12;
 
-/// How long the convergence loop may keep discovering before it makes its
-/// real runs (#532 review). Each pass is an EVM run plus a wave, and a pass's
-/// yield does not predict the next one's: in the shield a pass that found one
-/// account unlocked one that found 28 slots. So the bound is on time: on a
-/// slow link ten passes must not spend a request budget the serial reads would
-/// have answered within. Past it, the real runs fetch what is left, as before.
-pub const DISCOVERY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Interpret a converged real run for the call path.
 fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
     match result {
@@ -167,8 +159,6 @@ pub struct EvmExecutor {
     bytecode_cache: Arc<dyn BytecodeCache>,
     /// EVM runs so far (for [`Self::cost`]).
     runs: std::sync::atomic::AtomicU64,
-    /// See [`DISCOVERY_TIME_BUDGET`].
-    discovery_budget: std::time::Duration,
 }
 
 /// What the calls through one executor cost (#532): its EVM runs, and its
@@ -190,15 +180,7 @@ impl EvmExecutor {
             proof_cache,
             bytecode_cache,
             runs: std::sync::atomic::AtomicU64::new(0),
-            discovery_budget: DISCOVERY_TIME_BUDGET,
         }
-    }
-
-    /// This executor with another discovery time budget than
-    /// [`DISCOVERY_TIME_BUDGET`].
-    pub fn with_discovery_budget(mut self, budget: std::time::Duration) -> EvmExecutor {
-        self.discovery_budget = budget;
-        self
     }
 
     /// What the calls through this executor have cost so far (#532).
@@ -332,12 +314,8 @@ impl EvmExecutor {
         check_tx(tx, ctx, spec)?;
         let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
         // The checks and the short-circuit below read the sender's balance and
-        // the target's code, and the run reads both: one parallel wave.
-        self.prefetch_wave(
-            ctx,
-            &AccessSet { accounts: std::iter::once(tx.from).chain(tx.to).collect(), ..Default::default() },
-            &tx.to.into_iter().collect(),
-        );
+        // the target's code, and the run reads both.
+        self.first_wave(ctx, tx);
 
         // The ceiling (geth's `hi`): the executor's budget, lowered by the
         // caller's `gas` — below 21000 geth reads it as no limit, and so do we;
@@ -585,18 +563,14 @@ impl EvmExecutor {
         // override included — exactly as for an estimate.
         let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
         let gas_limit = tx.gas.map_or(VIEW_CALL_GAS, |gas| gas.min(VIEW_CALL_GAS));
-        // The sender and the target, with the target's code, in one wave, as
-        // for an estimate: the checks below and the loop's prime read them
-        // (#532 review).
-        self.prefetch_wave(
-            ctx,
-            &AccessSet { accounts: std::iter::once(tx.from).chain(tx.to).collect(), ..Default::default() },
-            &tx.to.into_iter().collect(),
-        );
         // Then geth's checks before the run, in its order, each reported with
         // the limit it was made against — geth's `err: … (supplied gas N)`.
         let supplied = |error: EvmError| EvmError::CallFailed { supplied_gas: gas_limit, error: Box::new(error) };
         check_fee_cap(tx, ctx).map_err(supplied)?;
+        // The rest read state (the sender's balance below, the target in the
+        // loop's prime), so the first wave goes here, as for an estimate (#532
+        // review).
+        self.first_wave(ctx, tx);
         // geth's buyGas, fee or no fee. Checked here, not by revm: its own
         // balance check would read a prefetch placeholder on a discovery pass,
         // and here the read also primes the sender before the first pass.
@@ -792,15 +766,15 @@ impl EvmExecutor {
 
         let mut seen = AccessSet::default();
         let mut discovering = true;
-        let started = std::time::Instant::now();
         for iter in 0..cap {
             self.oracle.check_request()?;
-            if discovering && started.elapsed() >= self.discovery_budget {
-                discovering = false;
-            }
             // Sentinel while still discovering, but the LAST TWO iterations are
-            // always real (one final wave + one warm real run).
-            let sentinel = discovering && iter + 2 < cap;
+            // always real (one final wave + one warm real run). The oracle
+            // bounds discovery in time (`keep_discovering`; #532 review): this
+            // crate holds no clock. Discovery passes are the loop's first
+            // iterations, so `iter` numbers them.
+            discovering = discovering && iter + 2 < cap && self.oracle.keep_discovering(iter);
+            let sentinel = discovering;
             db.set_sentinel(sentinel);
             let misses_before = db.sentinel_misses();
             let code_needed = CodeNeeded::default();
@@ -858,25 +832,33 @@ impl EvmExecutor {
     /// One best-effort parallel warm-up wave over freshly-discovered accesses:
     /// slots grouped per account + the touched accounts + code hashes, handed to
     /// the oracle's batch primitive (concurrent per-peer fan-out on the network
-    /// oracle; no-op on fixtures).
+    /// oracle; no-op on fixtures). What the caches already hold is left out, and
+    /// a wave left with nothing is not made: a warm call makes none (#532
+    /// review).
     fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet, code_needed: &std::collections::HashSet<[u8; 20]>) {
+        let root = &ctx.state_root;
+        let batch = |accounts: &[([u8; 20], Vec<U256>)], code_hashes: &[[u8; 32]]| {
+            if !accounts.is_empty() || !code_hashes.is_empty() {
+                self.oracle.prefetch_batch(root, accounts, code_hashes, &*self.proof_cache, &*self.bytecode_cache);
+            }
+        };
         let mut by_account: std::collections::HashMap<[u8; 20], Vec<U256>> =
             std::collections::HashMap::new();
         for addr in &fresh.accounts {
             by_account.entry(*addr).or_default();
         }
         for (addr, slot) in &fresh.slots {
-            by_account.entry(*addr).or_default().push(*slot);
+            if self.proof_cache.get_storage(root, addr, slot).is_none() {
+                by_account.entry(*addr).or_default().push(*slot);
+            }
         }
-        let items: Vec<([u8; 20], Vec<U256>)> = by_account.into_iter().collect();
-        let code_hashes: Vec<[u8; 32]> = fresh.code_hashes.iter().copied().collect();
-        self.oracle.prefetch_batch(
-            &ctx.state_root,
-            &items,
-            &code_hashes,
-            &*self.proof_cache,
-            &*self.bytecode_cache,
-        );
+        let items: Vec<([u8; 20], Vec<U256>)> = by_account
+            .into_iter()
+            .filter(|(addr, slots)| !slots.is_empty() || self.proof_cache.get_account(root, addr).is_none())
+            .collect();
+        let code_hashes: Vec<[u8; 32]> =
+            fresh.code_hashes.iter().copied().filter(|hash| self.bytecode_cache.get(hash).is_none()).collect();
+        batch(&items, &code_hashes);
         // The code of every account this wave fetched whose code the pass
         // needed (called, or inspected by EXTCODESIZE / EXTCODECOPY), at once:
         // a newly reached contract then runs in the next pass, instead of a
@@ -887,7 +869,7 @@ impl EvmExecutor {
             .accounts
             .iter()
             .filter(|addr| code_needed.contains(*addr))
-            .filter_map(|addr| self.proof_cache.get_account(&ctx.state_root, addr).flatten())
+            .filter_map(|addr| self.proof_cache.get_account(root, addr).flatten())
             .map(|account| account.code_hash)
             .filter(|hash| {
                 *hash != myotis_core::trie::EMPTY_CODE_HASH
@@ -897,9 +879,21 @@ impl EvmExecutor {
             .collect();
         follow.sort_unstable();
         follow.dedup();
-        if !follow.is_empty() {
-            self.oracle.prefetch_batch(&ctx.state_root, &[], &follow, &*self.proof_cache, &*self.bytecode_cache);
-        }
+        batch(&[], &follow);
+    }
+
+    /// The first wave of an estimate or a call of a transaction object (#532):
+    /// the sender, the target and each authorization's delegate, then the code
+    /// of the target and the delegates. The checks before the run read the
+    /// sender and the target, and the run starts in the target's code or in a
+    /// delegate's. A discovery pass would see a delegate only a pass late, as
+    /// a call hook sees the delegating account, not its delegate (#532
+    /// review).
+    fn first_wave(&self, ctx: &BlockContext, tx: &TxRequest) {
+        let delegates = tx.authorization_list.iter().flatten().map(|auth| auth.address);
+        let code_needed: std::collections::HashSet<[u8; 20]> = tx.to.into_iter().chain(delegates).collect();
+        let accounts = std::iter::once(tx.from).chain(code_needed.iter().copied()).collect();
+        self.prefetch_wave(ctx, &AccessSet { accounts, ..Default::default() }, &code_needed);
     }
 }
 
@@ -1672,14 +1666,21 @@ mod tests {
 
     /// An oracle over a fixture world that counts the reads the EVM waits on
     /// one at a time, and whose prefetch waves really fill the caches (#532).
-    /// Each wave is counted, and takes `wave_delay`.
+    /// It counts its waves, and lets a loop make `discovery_passes` discovery
+    /// passes (`None`: any number).
     #[derive(Default)]
     struct WaveFilling {
         inner: FixtureSnapStateOracle,
         serial_storage: std::sync::atomic::AtomicUsize,
         serial_other: std::sync::atomic::AtomicUsize,
         waves: std::sync::atomic::AtomicUsize,
-        wave_delay: std::time::Duration,
+        discovery_passes: Option<usize>,
+    }
+
+    impl WaveFilling {
+        fn waves(&self) -> usize {
+            self.waves.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl crate::oracle::SnapStateOracle for WaveFilling {
@@ -1695,6 +1696,9 @@ mod tests {
             self.serial_other.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.fetch_bytecode(h)
         }
+        fn keep_discovering(&self, pass: usize) -> bool {
+            self.discovery_passes.is_none_or(|passes| pass < passes)
+        }
         fn prefetch_batch(
             &self,
             root: &[u8; 32],
@@ -1704,7 +1708,6 @@ mod tests {
             cs: &dyn crate::cache::BytecodeCache,
         ) {
             self.waves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            std::thread::sleep(self.wave_delay);
             for (addr, slots) in accounts {
                 if let Ok(account) = self.inner.fetch_account(root, *addr) {
                     ps.put_account(root, addr, account);
@@ -1803,18 +1806,24 @@ mod tests {
         let (oracle, exec) = three_slot_reader();
         let c = ctx(19_500_000, CANCUN_TIME + 1);
         let cold = exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
-        let (runs, waves) = (exec.cost().evm_runs, oracle.waves.load(std::sync::atomic::Ordering::SeqCst));
+        let (runs, waves) = (exec.cost().evm_runs, oracle.waves());
         let warm = exec.call_view_from([0x42; 20], TARGET, &[], U256::ZERO, &c).unwrap();
         assert_eq!(warm, cold);
         assert_eq!(exec.cost().evm_runs - runs, 1, "the warm call is one run");
-        assert_eq!(oracle.waves.load(std::sync::atomic::Ordering::SeqCst), waves, "and no wave");
+        assert_eq!(oracle.waves(), waves, "and no wave");
+        // The same for a transaction object, whose first wave finds the
+        // sender and the target cached and is not made.
+        let tx = TxRequest::call([0x42; 20], Some(TARGET), Bytes::new(), U256::ZERO);
+        let (runs, waves) = (exec.cost().evm_runs, oracle.waves());
+        assert_eq!(exec.call_tx(&tx, &c, StateOverrides::new()).unwrap(), cold);
+        assert_eq!(exec.cost().evm_runs - runs, 1);
+        assert_eq!(oracle.waves(), waves);
     }
 
     #[test]
-    fn discovery_stops_at_its_time_budget_and_the_real_runs_finish() {
-        // #532 review: a pass's yield does not predict the next one's, so the
-        // loop's discovery is bounded in time. Here each wave takes 100 ms
-        // against a 50 ms budget: after the first wave (slot 0) the loop stops
+    fn discovery_stops_where_the_oracle_bounds_it_and_the_real_runs_finish() {
+        // #532 review: the oracle bounds discovery (the network oracle in
+        // time). Here it allows one pass: the loop finds slot 0, then stops
         // discovering, and its real run reads the second hop (slot K = 5) one
         // round-trip at a time, to the same answer.
         // PUSH1 0 SLOAD SLOAD PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
@@ -1832,24 +1841,137 @@ mod tests {
             .with_storage(ROOT, TARGET, [0u8; 32], U256::from(5u64))
             .with_storage(ROOT, TARGET, k, U256::from(42u64))
         };
-        let reader = |budget: std::time::Duration| {
-            let oracle = Arc::new(WaveFilling {
-                inner: world(),
-                wave_delay: std::time::Duration::from_millis(100),
-                ..Default::default()
-            });
+        let reader = |discovery_passes: Option<usize>| {
+            let oracle = Arc::new(WaveFilling { inner: world(), discovery_passes, ..Default::default() });
             let exec = EvmExecutor::new(
                 Arc::clone(&oracle) as Arc<dyn crate::oracle::SnapStateOracle>,
                 Arc::new(crate::cache::InMemoryStateProofCache::new(64)),
                 Arc::new(crate::cache::InMemoryBytecodeCache::default()),
-            )
-            .with_discovery_budget(budget);
+            );
             let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
             assert_eq!(U256::from_be_slice(&out), U256::from(42u64));
             oracle.serial_storage.load(std::sync::atomic::Ordering::SeqCst)
         };
-        assert_eq!(reader(std::time::Duration::from_millis(50)), 1, "past the budget, slot K is read one by one");
-        assert_eq!(reader(DISCOVERY_TIME_BUDGET), 0, "within it, both hops come in waves");
+        assert_eq!(reader(Some(1)), 1, "past the bound, slot K is read one by one");
+        assert_eq!(reader(None), 0, "within it, both hops come in waves");
+    }
+
+    /// A world of `(address, code, balance)` contracts and EOAs behind a
+    /// [`WaveFilling`] oracle, with real caches the test can look into.
+    fn wave_reader(
+        accounts: &[([u8; 20], Vec<u8>, U256)],
+    ) -> (Arc<WaveFilling>, EvmExecutor, Arc<crate::cache::InMemoryBytecodeCache>) {
+        let mut fx = FixtureSnapStateOracle::new();
+        for (address, code, balance) in accounts {
+            let code_hash = if code.is_empty() { EMPTY_CODE_HASH } else { fx.with_bytecode(code.clone()) };
+            fx = fx.with_account(
+                ROOT,
+                *address,
+                OracleAccount { nonce: 1, balance: *balance, code_hash, storage_root: [0x9; 32] },
+            );
+        }
+        let oracle = Arc::new(WaveFilling { inner: fx, ..Default::default() });
+        let code_cache = Arc::new(crate::cache::InMemoryBytecodeCache::default());
+        let exec = EvmExecutor::new(
+            Arc::clone(&oracle) as Arc<dyn crate::oracle::SnapStateOracle>,
+            Arc::new(crate::cache::InMemoryStateProofCache::new(64)),
+            Arc::clone(&code_cache) as Arc<dyn BytecodeCache>,
+        );
+        (oracle, exec, code_cache)
+    }
+
+    #[test]
+    fn a_contract_the_call_only_reads_is_not_followed_to_its_code() {
+        // #532 review: a wave follows to its code only an account the pass
+        // called or inspected. The call reads the balance of a contract and
+        // never runs it, so the contract's code is never fetched.
+        let contract = [0x77; 20];
+        let contract_code = vec![0x60u8, 0x01, 0x00];
+        // PUSH20 contract BALANCE PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+        let mut code = vec![0x73];
+        code.extend_from_slice(&contract);
+        code.extend_from_slice(&[0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let (oracle, exec, code_cache) =
+            wave_reader(&[(TARGET, code, U256::ZERO), (contract, contract_code.clone(), U256::from(7u64))]);
+        let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
+        assert_eq!(word(&out), U256::from(7u64));
+        assert_eq!(oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst), 2, "only the prime's two reads");
+        assert!(code_cache.get(&keccak256(&contract_code)).is_none(), "the contract's code is never fetched");
+    }
+
+    /// Code that calls `callee` and returns the first word it returned:
+    /// PUSH1 32 PUSH1 0 PUSH1 0 PUSH1 0 PUSH1 0 PUSH20 callee GAS CALL POP
+    /// PUSH1 32 PUSH1 0 RETURN.
+    fn calling(callee: [u8; 20]) -> Vec<u8> {
+        let mut code = vec![0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(&callee);
+        code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        code
+    }
+
+    /// Runs `code` (at [`TARGET`]) against a callee that returns 42, and
+    /// returns the EVM runs the call took and the reads it made one by one.
+    fn runs_to_reach_the_callee(callee: [u8; 20], code: Vec<u8>) -> (u64, usize) {
+        let (oracle, exec, _) =
+            wave_reader(&[(TARGET, code, U256::ZERO), (callee, returning(&[0x60, 0x2a]), U256::ZERO)]);
+        let out = exec.call_view(TARGET, &[], &ctx(19_500_000, CANCUN_TIME + 1)).unwrap();
+        assert_eq!(word(&out), U256::from(42u64));
+        (exec.cost().evm_runs, oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_called_contract_runs_in_the_pass_after_it_is_found() {
+        // #532 review: the pass that calls a contract records it, its wave
+        // fetches the account and then the code, and the next pass runs it:
+        // two EVM runs, not three (the third would only have found the code
+        // hash). The prime's two reads are the only ones made one by one.
+        let callee = [0x66; 20];
+        assert_eq!(runs_to_reach_the_callee(callee, calling(callee)), (2, 2));
+    }
+
+    #[test]
+    fn a_call_behind_an_extcodesize_guard_runs_in_the_pass_after_it_is_found() {
+        // The same behind Solidity's guard, an EXTCODESIZE that fails against
+        // a placeholder before the call runs: the pass records the contract
+        // at the guard.
+        // PUSH20 callee EXTCODESIZE PUSH1 30 JUMPI PUSH1 0 PUSH1 0 REVERT
+        // 30: JUMPDEST, then the call.
+        let callee = [0x66; 20];
+        let mut code = vec![0x73];
+        code.extend_from_slice(&callee);
+        code.extend_from_slice(&[0x3b, 0x60, 30, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd, 0x5b]);
+        code.extend(calling(callee));
+        assert_eq!(runs_to_reach_the_callee(callee, code), (2, 2));
+    }
+
+    #[test]
+    fn a_call_refused_for_its_fee_cap_makes_no_wave() {
+        // #532 review: the fee cap against the base fee reads no state, so a
+        // call it refuses is refused before the first wave.
+        let (oracle, exec, _) = wave_reader(&[(SENDER, vec![], U256::from(10u64).pow(U256::from(18)))]);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.fees = Fees::Legacy { gas_price: 6 }; // the base fee is 7
+        let refused = exec.call_tx(&tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap_err();
+        assert!(matches!(&refused, EvmError::CallFailed { error, .. } if matches!(**error, EvmError::FeeCapTooLow { .. })), "{refused:?}");
+        assert_eq!(oracle.waves(), 0);
+    }
+
+    #[test]
+    fn a_delegates_code_comes_with_the_first_wave() {
+        // #532 review: a call hook sees the account a 7702 transaction
+        // delegates, not its delegate, so the delegate would reach a wave
+        // only through two discovery passes (its account, then its code). The
+        // first wave fetches each authorization's delegate with its code.
+        let ephemeral = key(0x0d);
+        let (oracle, exec, _) = wave_reader(&[
+            (SENDER, vec![], U256::from(10u64).pow(U256::from(18))),
+            (DELEGATE, returning(&[0x60, 0x2a]), U256::ZERO),
+        ]);
+        let tx = set_code_call(SENDER, address_of(&ephemeral), vec![sign_authorization(&ephemeral, 1, DELEGATE, 0)]);
+        let out = exec.call_tx(&tx, &prague(), StateOverrides::new()).unwrap();
+        assert_eq!(word(&out), U256::from(42u64));
+        assert!(exec.cost().evm_runs <= 2, "the delegate runs in the first pass: {}", exec.cost().evm_runs);
+        assert_eq!(oracle.serial_other.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing read one by one");
     }
 
     #[test]

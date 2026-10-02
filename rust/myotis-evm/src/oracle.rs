@@ -115,6 +115,22 @@ impl std::fmt::Display for OracleError {
     }
 }
 
+impl OracleError {
+    /// The error's kind, without the values it carries (an address, a code
+    /// hash, a proof's detail): what a log line at info may name (#532
+    /// review). A cancellation names its reason, which says why ("request
+    /// deadline exceeded") and carries no value.
+    pub fn kind(&self) -> &str {
+        match self {
+            OracleError::Cancelled { reason } => reason,
+            OracleError::StateUnavailable { .. } => "state unavailable",
+            OracleError::BytecodeUnavailable { .. } => "bytecode unavailable",
+            OracleError::InvalidProof { .. } => "invalid proof",
+            OracleError::BlockHashUnsupported { .. } => "BLOCKHASH unsupported",
+        }
+    }
+}
+
 impl std::error::Error for OracleError {}
 
 // `revm`'s `Database::Error` bound. Marks our error as a database error type.
@@ -159,6 +175,20 @@ pub trait SnapStateOracle: Send + Sync {
     /// per-call breakdown a host logs (#532). Default: nothing measured.
     fn wire_cost(&self) -> WireCost {
         WireCost::default()
+    }
+
+    /// Whether a convergence loop may start discovery pass `pass`: the loop
+    /// asks before each one, and pass 0 starts a loop. A pass is an EVM run
+    /// plus a prefetch wave, and its yield does not predict the next one's,
+    /// so discovery is bounded in time (#532 review). The bound is the
+    /// oracle's to keep, as it owns the clock and the request's deadline and
+    /// this crate holds neither. It decides when passes may start, and a pass
+    /// under way finishes its wave, which fetches state the pass found. Past
+    /// it the loop makes its real runs, which fetch what is left one read at
+    /// a time; the answer never depends on it. Default: always, so only the
+    /// iteration cap bounds discovery.
+    fn keep_discovering(&self, _pass: usize) -> bool {
+        true
     }
 
     /// The proof-verified account at `address`, or `Ok(None)` when an exclusion
