@@ -1,6 +1,7 @@
 // Addon-level API tests for createWithCheckpoint (ABI 26, #441), for
-// ethCallJson's block check (ABI 27, #452) and for the transaction-object
-// refusals of estimateGasTxJson (ABI 34) and ethCallTxJson (ABI 35, #509).
+// ethCallJson's block check (ABI 27, #452), for the transaction-object
+// refusals of estimateGasTxJson (ABI 34) and ethCallTxJson (ABI 35, #509), and
+// for the rest of a provider's verified reads (#503).
 // Run against a
 // BUILT addon: node --test addon-api.test.mjs, with MYOTIS_NODE_ADDON pointing at
 // the .node (or a cargo output: libmyotis_node.so/.dylib, myotis_node.dll);
@@ -225,4 +226,125 @@ test('ethCallTxJson refuses a contradictory transaction object as permanent inva
     if (h >= 1) m.stop(h);
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+// #503: the rest of a dApp provider's verified reads, the log index they serve
+// eth_getLogs from, eth_call with a state override and the pending nonce. Each
+// read resolves to the engine's JSON unchanged; these pin, on a handle that
+// was never started (no network needed), the camel-cased exports, the
+// unknown-handle sentinel, the NUL refusal and the engine's own refusals.
+const ADDR = '0x' + '11'.repeat(20);
+const HASH = '0x' + 'cd'.repeat(32);
+const SLOT0 = '0x' + '00'.repeat(32);
+const FILTER = JSON.stringify({ address: ADDR, fromBlock: '0x1', toBlock: '0x2' });
+const CONFIG = JSON.stringify({ enabled: true, watch: [{ address: ADDR, fromBlock: 1 }] });
+// Each read, called with well-formed arguments, or with `arg` in place of its
+// first string argument.
+const READS = {
+  getBlockByNumberJson: (h, arg = 'latest') => m.getBlockByNumberJson(h, arg, false),
+  getBlockByHashJson: (h, arg = HASH) => m.getBlockByHashJson(h, arg, true),
+  feeHistoryJson: (h, arg = 'latest') => m.feeHistoryJson(h, 4, arg, '[25,75]'),
+  getTransactionReceiptJson: (h, arg = HASH) => m.getTransactionReceiptJson(h, arg),
+  getBlockReceiptsJson: (h, arg = 'latest') => m.getBlockReceiptsJson(h, arg),
+  getTransactionByHashJson: (h, arg = HASH) => m.getTransactionByHashJson(h, arg),
+  getCodeJson: (h, arg = ADDR) => m.getCodeJson(h, arg, 'latest'),
+  getStorageAtJson: (h, arg = ADDR) => m.getStorageAtJson(h, arg, SLOT0, 'latest'),
+  getLogsJson: (h, arg = FILTER) => m.getLogsJson(h, arg),
+  ethCallOverridesJson: (h, arg = 'latest') => m.ethCallOverridesJson(h, '', ADDR, '', '', arg, ''),
+  importLogIndexFiles: (h, arg = JSON.stringify(['/nonexistent/logindex.db'])) => m.importLogIndexFiles(h, arg),
+};
+
+async function withCreatedHandle(fn) {
+  const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
+  let h = -1;
+  try {
+    h = m.create('mainnet', join(base, 'reads'));
+    assert.ok(h >= 1, `create failed: ${h}`);
+    await fn(h);
+  } finally {
+    if (h >= 1) m.stop(h);
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test('the remaining verified reads are exported (#503)', { skip }, () => {
+  for (const name of [...Object.keys(READS), 'logIndexStatusJson', 'setLogIndexConfig', 'pendingNonceOverlay']) {
+    assert.equal(typeof m[name], 'function', name);
+  }
+});
+
+test('an unknown handle gets the usual sentinel from every new call (#503)', { skip }, async () => {
+  const notOurs = { error: 'handle does not belong to this environment' };
+  for (const [name, read] of Object.entries(READS)) {
+    assert.deepEqual(JSON.parse(await read(-1)), notOurs, name);
+  }
+  assert.deepEqual(JSON.parse(await m.logIndexStatusJson(-1)), notOurs);
+  assert.deepEqual(JSON.parse(await m.setLogIndexConfig(-1, CONFIG)), notOurs);
+  assert.equal(m.pendingNonceOverlay(-1, ADDR, 5), -1);
+});
+
+test('a well-formed read reaches the engine: a not-started handle is a plain, retryable error (#503)', { skip }, async () => {
+  await withCreatedHandle(async (h) => {
+    for (const [name, read] of Object.entries(READS)) {
+      const r = JSON.parse(await read(h));
+      assert.equal(typeof r.error, 'string', `${name}: ${JSON.stringify(r)}`);
+      assert.equal(r.code, undefined, `${name}: ${JSON.stringify(r)}`);
+    }
+    const status = JSON.parse(await m.logIndexStatusJson(h));
+    assert.equal(typeof status.error, 'string', JSON.stringify(status));
+    // No EL reader to install it on: refused, which the engine logs.
+    assert.deepEqual(JSON.parse(await m.setLogIndexConfig(h, CONFIG)), { ok: false });
+    assert.equal(m.pendingNonceOverlay(h, ADDR, 5), -1, 'no reader: serve the mined nonce');
+  });
+});
+
+test('a NUL byte in a string argument is a permanent refusal (#503)', { skip }, async () => {
+  const nul = { error: 'argument contains NUL', code: -32602 };
+  await withCreatedHandle(async (h) => {
+    for (const [name, read] of Object.entries(READS)) {
+      assert.deepEqual(JSON.parse(await read(h, 'x\0y')), nul, name);
+    }
+    assert.deepEqual(JSON.parse(await m.feeHistoryJson(h, 4, 'latest', '[25,\0]')), nul, 'percentiles');
+    assert.deepEqual(JSON.parse(await m.getStorageAtJson(h, ADDR, SLOT0, 'lat\0est')), nul, 'block');
+    assert.deepEqual(JSON.parse(await m.setLogIndexConfig(h, '{\0}')), nul);
+    assert.equal(m.pendingNonceOverlay(h, '0x\0', 5), -1);
+  });
+});
+
+test('a request that can never be served is refused permanently, before the handle (#503)', { skip }, async () => {
+  await withCreatedHandle(async (h) => {
+    const permanent = async (label, promise) => {
+      const r = JSON.parse(await promise);
+      assert.equal(r.code, -32602, `${label}: ${JSON.stringify(r)}`);
+      assert.equal(typeof r.error, 'string', label);
+    };
+    await permanent('block earliest', m.getBlockByNumberJson(h, 'earliest', false));
+    // (getBlockReceiptsJson checks its selector only once the handle runs.)
+    await permanent('feeHistory blockCount 0', m.feeHistoryJson(h, 0, 'latest', ''));
+    // A count that is no integer is refused by the addon, never truncated.
+    for (const count of [1.5, NaN, Infinity, 2 ** 53]) {
+      const r = JSON.parse(await m.feeHistoryJson(h, count, 'latest', ''));
+      assert.deepEqual(r, { error: 'blockCount must be an integer', code: -32602 }, String(count));
+    }
+    await permanent('feeHistory percentiles', m.feeHistoryJson(h, 4, 'latest', 'not json'));
+    await permanent('code at a block hash', m.getCodeJson(h, ADDR, HASH));
+    await permanent('logs filter', m.getLogsJson(h, 'not json'));
+    await permanent('override call earliest', m.ethCallOverridesJson(h, '', ADDR, '', '', 'earliest', ''));
+    await permanent('override malformed', m.ethCallOverridesJson(h, '', ADDR, '', '', 'latest', '{"0x11":'));
+    // A malformed address or hash is refused too, as a plain error (the
+    // engine's shape for it; the JSON-RPC routers check hex before calling).
+    for (const [label, promise] of [
+      ['receipt hash', m.getTransactionReceiptJson(h, '0xdead')],
+      ['tx hash', m.getTransactionByHashJson(h, '0xdead')],
+      ['block hash', m.getBlockByHashJson(h, '0xdead', false)],
+      ['code address', m.getCodeJson(h, '0xdead', 'latest')],
+    ]) {
+      assert.match(JSON.parse(await promise).error, /^invalid .* \(expected (20|32)-byte hex\)$/, label);
+    }
+    assert.match(JSON.parse(await m.importLogIndexFiles(h, '[]')).error, /non-empty JSON array/);
+    // The pending nonce takes a non-negative safe integer.
+    for (const nonce of [-1, 1.5, NaN, 2 ** 53]) {
+      assert.equal(m.pendingNonceOverlay(h, ADDR, nonce), -1, String(nonce));
+    }
+  });
 });

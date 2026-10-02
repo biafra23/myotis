@@ -60,9 +60,65 @@ myotis.resume(h);  // warm restart
 myotis.stop(h);
 ```
 
+### A dApp provider's methods
+
+Every verified read the other hosts serve is exported (#503), so a host can
+route a page's `window.ethereum` requests here rather than to a proxy RPC.
+Each resolves to the engine's JSON **unchanged**: the result object or array,
+the literal `"null"` for a verified not-found, or an `{"error": …}` object
+(`"code":-32602` marks a refusal that no retry changes). A NUL byte in a
+string argument is refused here, as `{"error":"argument contains NUL","code":-32602}`,
+and an unknown handle gets the usual `{"error":"handle does not belong to this environment"}`.
+
+| JSON-RPC method | call |
+|---|---|
+| `eth_blockNumber` | no call: `statusJson().optimisticBlockNumber` (the verified head, as the iOS host serves it) |
+| `eth_getBalance`, `eth_getTransactionCount` | `requestAccountJson(h, address, block?)` |
+| `eth_getTransactionCount` at `pending` | the mined nonce above through `pendingNonceOverlay(h, address, minedNonce)` — synchronous; raises it past this node's own unmined broadcast, -1 = serve the mined nonce |
+| `eth_getCode` | `getCodeJson(h, address, block?)` |
+| `eth_getStorageAt` | `getStorageAtJson(h, address, position, block?)` |
+| `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
+| `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
+| `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
+| `eth_gasPrice`, `eth_maxPriorityFeePerGas` | `feeEstimateJson(h)` |
+| `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
+| `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions)` |
+| `eth_getBlockByHash` | `getBlockByHashJson(h, blockHash, fullTransactions)` |
+| `eth_getTransactionByHash` | `getTransactionByHashJson(h, txHash)` |
+| `eth_getTransactionReceipt` | `getTransactionReceiptJson(h, txHash)` |
+| `eth_getBlockReceipts` | `getBlockReceiptsJson(h, selector)` (a tag, a 0x-number or a 0x-hash) |
+| `eth_getLogs` | `getLogsJson(h, filterJson)`: only for contracts in the log index, below |
+| `eth_sendRawTransaction` | `sendRawTransactionJson(h, rawTxHex)` |
+
+**The log index.** `eth_getLogs` is served only from an opt-in index of the
+contracts a host chooses (docs/eth-getlogs-design.md), and only inside its
+verified coverage — anything else is an `{"error"}` that says how far coverage
+reaches, never an empty array:
+
+```js
+// Watch a contract from its deployment block (a JSON number; optional per
+// entry: name, topic0s), and the index catches up. Top level, optionally:
+// maxSpeed, backfillPaused.
+await myotis.setLogIndexConfig(h, JSON.stringify({
+  enabled: true, watch: [{ address: '0x…', fromBlock: 14737691 }],
+}));                                        // '{"ok":true}', or '{"ok":false}' (refused: see drainLogs)
+// Or load a bundled snapshot of one, as the desktop and Android apps do:
+await myotis.importLogIndexFiles(h, JSON.stringify(['/abs/path/logindex.db']));
+JSON.parse(await myotis.logIndexStatusJson(h));  // { enabled, entries: [{ address, coverage… }], logCount, … }
+```
+
+Installing a config or importing takes the index's write lock, so these run on
+the request workers like the reads; an import occupies its handle's execution
+slot until it finishes, and that handle's reads queue behind it.
+
+These calls need no newer engine: the C functions are in the ABI this addon
+targets. A host detects them by the export
+(`typeof myotis.getBlockByNumberJson === 'function'`).
+
 `smoke.mjs` is the end-to-end check: syncs mainnet from plain Node, then runs
 `resolve-ens` + `contenthash` + `get-account` with verification fields and
-cold/warm timing:
+cold/warm timing, a fee estimate, the latest block, a fee history and the
+receipt of a transaction in that block:
 
 ```bash
 node smoke.mjs ./data-dir ../target/debug/myotis-node.node

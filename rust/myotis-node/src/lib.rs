@@ -36,11 +36,16 @@ use napi_derive::napi;
 use myotis_engine::capi::{
     myotis_accept_stale_anchor, myotis_available_networks_json, myotis_canonical_network_name,
     myotis_create, myotis_create_with_checkpoint, myotis_drain_logs, myotis_ens_record_json,
-    myotis_estimate_gas_json, myotis_estimate_gas_tx_json, myotis_eth_call_tx_json,
-    myotis_eth_call_json, myotis_fee_estimate_json, myotis_init, myotis_pause,
+    myotis_estimate_gas_json, myotis_estimate_gas_tx_json, myotis_eth_call_overrides_json,
+    myotis_eth_call_tx_json, myotis_eth_call_json, myotis_fee_estimate_json,
+    myotis_fee_history_json, myotis_get_block_by_hash_json, myotis_get_block_by_number_json,
+    myotis_get_block_receipts_json, myotis_get_code_json, myotis_get_logs_json,
+    myotis_get_storage_at_json, myotis_get_transaction_by_hash_json,
+    myotis_get_transaction_receipt_json, myotis_import_log_index_files, myotis_init,
+    myotis_log_index_status_json, myotis_pause, myotis_pending_nonce_overlay,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
-    myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_ws_bound_periods,
-    myotis_start,
+    myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_log_index_config,
+    myotis_set_ws_bound_periods, myotis_start,
     myotis_status_json, myotis_stop, myotis_string_free,
 };
 
@@ -431,4 +436,251 @@ pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: 
         Ok(r) => take(unsafe { myotis_send_raw_transaction_json(handle, r.as_ptr()) }),
         Err(e) => e,
     })
+}
+
+/// `eth_call` with a STATE OVERRIDE object (`stateOverrides`, JSON; '' = none):
+/// a simulation over verified state under the caller's hypothesis, not a chain
+/// fact. Every other argument, and the result, are ethCallJson's; a malformed
+/// override is refused as permanently as a malformed `block` (#503).
+#[napi(ts_return_type = "Promise<string>")]
+#[allow(clippy::too_many_arguments)]
+pub fn eth_call_overrides_json<'env>(env: &'env Env,
+    handle: i64,
+    from: String,
+    to: String,
+    data: String,
+    value: String,
+    block: String,
+    state_overrides: String,
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || {
+        match (c_arg(&from), c_arg(&to), c_arg(&data), c_arg(&value), c_arg(&block), c_arg(&state_overrides)) {
+            (Ok(f), Ok(t), Ok(d), Ok(v), Ok(b), Ok(o)) => take(unsafe {
+                myotis_eth_call_overrides_json(
+                    handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr(), b.as_ptr(), o.as_ptr(),
+                )
+            }),
+            _ => NUL_INVALID_PARAMS.to_string(),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The rest of a provider's verified reads (#503): blocks, receipts,
+// transactions, fee history, code and storage, logs
+// ---------------------------------------------------------------------------
+//
+// Wrapped as the reads above are, each resolves to the engine's JSON
+// UNCHANGED: the result object or array, the literal `"null"` for a verified
+// not-found, or an `{"error": …}` object — a refusal of the request itself
+// carries `"code":-32602` and is permanent (README "Notes"). A NUL byte in a
+// string argument is refused here, before the engine, just as permanently.
+
+/// The refusal of a JS number that is not a safe integer where the engine
+/// takes an integer: the request can never be served as asked.
+const NOT_AN_INTEGER: &str = r#"{"error":"blockCount must be an integer","code":-32602}"#;
+
+/// Whether a JS number is an integer this binding can pass on exactly.
+fn safe_integer(n: f64) -> bool {
+    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+}
+
+/// eth_getBlockByNumber: the block JSON, the literal `"null"`, or
+/// `{"error"}`. `blockTag` is a tag or a 0x-number; `fullTransactions` selects
+/// decoded transaction objects over hashes.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_block_by_number_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    block_tag: String,
+    full_transactions: bool,
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&block_tag) {
+        Ok(b) => take(unsafe { myotis_get_block_by_number_json(handle, b.as_ptr(), full_transactions) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getBlockByHash: the block JSON, the literal `"null"` (a hash this node
+/// never verified), or `{"error"}`.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_block_by_hash_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    block_hash: String,
+    full_transactions: bool,
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&block_hash) {
+        Ok(h) => take(unsafe { myotis_get_block_by_hash_json(handle, h.as_ptr(), full_transactions) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_feeHistory: `{"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}`
+/// or `{"error"}`. `blockCount` is a JS integer (the engine refuses one below 1
+/// and clamps a large one to what it serves); `newestBlock` a tag or a
+/// 0x-number; `percentilesJson` a JSON number array, or omitted / '' for no
+/// reward matrix.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn fee_history_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    block_count: f64,
+    newest_block: String,
+    percentiles_json: Option<String>,
+) -> Result<Object<'env>> {
+    let percentiles = percentiles_json.unwrap_or_default();
+    scheduler::submit(env, handle, move || {
+        if !safe_integer(block_count) {
+            return NOT_AN_INTEGER.to_string();
+        }
+        match (c_arg(&newest_block), c_arg(&percentiles)) {
+            (Ok(n), Ok(p)) => take(unsafe {
+                myotis_fee_history_json(handle, block_count as i64, n.as_ptr(), p.as_ptr())
+            }),
+            _ => NUL_INVALID_PARAMS.to_string(),
+        }
+    })
+}
+
+/// eth_getTransactionReceipt: the receipt JSON (verified against the block's
+/// `receiptsRoot`), the literal `"null"` (verified not seen), or `{"error"}`.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_transaction_receipt_json<'env>(env: &'env Env, handle: i64, tx_hash: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&tx_hash) {
+        Ok(h) => take(unsafe { myotis_get_transaction_receipt_json(handle, h.as_ptr()) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getBlockReceipts: the receipts ARRAY JSON, the literal `"null"` (an
+/// unknown or future block, or a hash this node never verified), or
+/// `{"error"}`. `selector` is a tag, a 0x-number or a 0x-hash.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_block_receipts_json<'env>(env: &'env Env, handle: i64, selector: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&selector) {
+        Ok(s) => take(unsafe { myotis_get_block_receipts_json(handle, s.as_ptr()) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getTransactionByHash: the transaction JSON (verified against the
+/// block's `transactionsRoot`; this node's own unmined send reads as pending),
+/// the literal `"null"` (verified not seen), or `{"error"}`.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_transaction_by_hash_json<'env>(env: &'env Env, handle: i64, tx_hash: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&tx_hash) {
+        Ok(h) => take(unsafe { myotis_get_transaction_by_hash_json(handle, h.as_ptr()) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getCode: the code JSON, verified against the proven code hash. `block`
+/// (optional) is checked as for requestAccountJson: omitted or a head tag
+/// proves at the verified head, `finalized` at the beacon-finalized block, a
+/// number only inside [head-64, head+16].
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_code_json<'env>(env: &'env Env, handle: i64, address: String, block: Option<String>) -> Result<Object<'env>> {
+    let block = block.unwrap_or_default();
+    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&block)) {
+        (Ok(a), Ok(b)) => take(unsafe { myotis_get_code_json(handle, a.as_ptr(), b.as_ptr()) }),
+        _ => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getStorageAt: the storage word JSON, proof-verified. `position` is the
+/// 32-byte slot as hex; `block` is checked as for getCodeJson.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_storage_at_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    address: String,
+    position: String,
+    block: Option<String>,
+) -> Result<Object<'env>> {
+    let block = block.unwrap_or_default();
+    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&position), c_arg(&block)) {
+        (Ok(a), Ok(p), Ok(b)) => take(unsafe { myotis_get_storage_at_json(handle, a.as_ptr(), p.as_ptr(), b.as_ptr()) }),
+        _ => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// eth_getLogs over the opt-in log index (setLogIndexConfig,
+/// importLogIndexFiles): the logs ARRAY JSON, served only inside the index's
+/// verified coverage; anything else is an `{"error"}` that says how far
+/// coverage reaches — never an empty array for a range the index has not
+/// covered. A filter that cannot parse carries `"code":-32602`.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&filter_json) {
+        Ok(f) => take(unsafe { myotis_get_logs_json(handle, f.as_ptr()) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The log index (#503): what eth_getLogs serves from
+// ---------------------------------------------------------------------------
+//
+// These run on the request workers like the reads: installing a config or
+// importing a snapshot takes the index's write lock, which its own appender or
+// an import can hold for a while, and that must not block the JS thread. An
+// import occupies its handle's one execution slot until it finishes, so that
+// handle's reads queue behind it.
+
+/// Install the watch-list config (docs/eth-getlogs-design.md; the same JSON the
+/// other hosts push). Resolves `{"ok":true}` when installed, `{"ok":false}`
+/// when refused — invalid JSON, a watch entry without `address` or
+/// `fromBlock`, an address listed twice, or a handle without a running EL
+/// reader; the engine logs which (drainLogs).
+#[napi(ts_return_type = "Promise<string>")]
+pub fn set_log_index_config<'env>(env: &'env Env, handle: i64, config_json: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&config_json) {
+        Ok(c) => {
+            let installed = unsafe { myotis_set_log_index_config(handle, c.as_ptr()) };
+            format!(r#"{{"ok":{installed}}}"#)
+        }
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+/// The log index's status: whether it is on, its watch entries with their
+/// verified coverage, the log count and the catch-up rate — what a host shows
+/// and what decides whether an eth_getLogs range is served.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn log_index_status_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || take(unsafe { myotis_log_index_status_json(handle) }))
+}
+
+/// Import portable log-index snapshots (`pathsJson`: a JSON array of absolute
+/// file paths, each a self-describing snapshot of this handle's chain), merged
+/// all or nothing; importing is the opt-in, and catch-up starts at once.
+/// Resolves `{"ok":true,"status":…}` (the status as logIndexStatusJson reports
+/// it) or `{"error"}`.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn import_log_index_files<'env>(env: &'env Env, handle: i64, paths_json: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&paths_json) {
+        Ok(p) => take(unsafe { myotis_import_log_index_files(handle, p.as_ptr()) }),
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The pending nonce (#503; synchronous — an in-memory lookup)
+// ---------------------------------------------------------------------------
+
+/// eth_getTransactionCount at `"pending"`: `minedNonce` (the verified nonce at
+/// the head, from requestAccountJson) raised to this node's own unmined
+/// broadcast's nonce + 1 while that broadcast is unexpired, unchanged
+/// otherwise. -1 for an unknown handle, a malformed address, or a `minedNonce`
+/// that is not a non-negative safe integer: serve the plain mined nonce then.
+#[napi]
+pub fn pending_nonce_overlay(env: &Env, handle: i64, address_hex: String, mined_nonce: f64) -> i64 {
+    if !scheduler::owns(env, handle) || !safe_integer(mined_nonce) || mined_nonce < 0.0 {
+        return -1;
+    }
+    match c_arg(&address_hex) {
+        Ok(a) => unsafe { myotis_pending_nonce_overlay(handle, a.as_ptr(), mined_nonce as i64) },
+        Err(_) => -1,
+    }
 }
