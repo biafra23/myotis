@@ -155,6 +155,57 @@ async function queries(status) {
   const fees = await timed('fee-estimate', m.feeEstimateJson(handle));
   if (fees.error) { console.error('fee estimate failed'); failures++; }
 
+  // #503: the provider reads a dApp page asks next — the head block, a fee
+  // history and receipts. A receipt by transaction hash is looked up near the
+  // head only (the reader scans the last 8 blocks for a hash it has not seen
+  // before), so that check takes the head block's first transaction. The
+  // receipts read by block takes the finalized block, which no reorg can
+  // take back between two reads.
+  const block = await timed('block latest', m.getBlockByNumberJson(handle, 'latest'));
+  if (!block?.number || !Array.isArray(block.transactions)) {
+    console.error('latest block failed:', JSON.stringify(block)); failures++;
+  }
+  const history = await timed('fee-history 4 latest',
+    m.feeHistoryJson(handle, 4, 'latest', JSON.stringify([25, 50, 75])));
+  if (!history.oldestBlock || !Array.isArray(history.reward)) {
+    console.error('fee history failed:', JSON.stringify(history)); failures++;
+  }
+  const txHash = block?.transactions?.[0];
+  if (txHash) {
+    const receipt = await timed('receipt of the head block\'s first tx',
+      m.getTransactionReceiptJson(handle, txHash));
+    if (receipt?.transactionHash !== txHash || receipt.blockNumber !== block.number) {
+      // A reorg between the two reads can drop the transaction or move it to
+      // another block, and the head can step back below this block: no engine
+      // fault. Re-read the block to tell.
+      const again = await timed('block again', m.getBlockByNumberJson(handle, block.number));
+      if (again === null || (again?.hash && again.hash !== block.hash)) {
+        log('receipt check skipped: the head block was reorged between the reads');
+      } else if (!again?.hash) {
+        // The re-read itself failed, so the check is inconclusive rather than
+        // an engine verdict; the block reads above and below still fail a
+        // broken engine.
+        log('receipt check inconclusive: the block re-read failed:', JSON.stringify(again));
+      } else {
+        console.error('receipt failed:', JSON.stringify(receipt)); failures++;
+      }
+    }
+  } else if (block?.number) {
+    log('receipt check skipped: the head block carries no transaction');
+  }
+  const finalized = await timed('block finalized', m.getBlockByNumberJson(handle, 'finalized'));
+  if (!finalized?.number || !Array.isArray(finalized.transactions)) {
+    console.error('finalized block failed:', JSON.stringify(finalized)); failures++;
+  } else {
+    const receipts = await timed('receipts of the finalized block',
+      m.getBlockReceiptsJson(handle, finalized.number));
+    const first = finalized.transactions[0];
+    if (!Array.isArray(receipts) || receipts.length !== finalized.transactions.length ||
+        (first && (receipts[0]?.transactionHash !== first || receipts[0]?.blockNumber !== finalized.number))) {
+      console.error('block receipts failed:', JSON.stringify(receipts)?.slice(0, 400)); failures++;
+    }
+  }
+
   // Warm-path timing: repeat the ENS resolve now that caches are hot.
   await timed('resolve-ens (warm) vitalik.eth', m.resolveEnsJson(handle, 'vitalik.eth'));
 

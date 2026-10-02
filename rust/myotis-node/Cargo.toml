@@ -16,6 +16,8 @@ crate-type = ["cdylib"]
 myotis-engine = { path = "../myotis-engine" }
 napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"
+# Checks the JSON arguments the engine leaves to its caller (#503).
+serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"
