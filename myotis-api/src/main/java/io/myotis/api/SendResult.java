@@ -28,16 +28,20 @@ public record SendResult(Status status, byte[] txHash, String detail) {
 
     public SendResult {
         java.util.Objects.requireNonNull(status, "status");
+        // The fields the status promises: a SENT result without its hash, or a
+        // refusal without geth's reason, would reach the router as a crash.
+        if (status == Status.SENT) java.util.Objects.requireNonNull(txHash, "txHash");
+        if (status == Status.REJECTED) java.util.Objects.requireNonNull(detail, "detail");
     }
 
     public enum Status { SENT, REJECTED, UNAVAILABLE }
 
     public static SendResult sent(byte[] txHash) {
-        return new SendResult(Status.SENT, java.util.Objects.requireNonNull(txHash, "txHash"), null);
+        return new SendResult(Status.SENT, txHash, null);
     }
 
     public static SendResult rejected(String detail) {
-        return new SendResult(Status.REJECTED, null, java.util.Objects.requireNonNull(detail, "detail"));
+        return new SendResult(Status.REJECTED, null, detail);
     }
 
     public static SendResult unavailable(String detail) {

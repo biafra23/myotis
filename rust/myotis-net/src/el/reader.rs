@@ -35,7 +35,7 @@ use myotis_evm::{
     InMemoryStateProofCache, U256,
 };
 
-use crate::el::anchor::{ExecAnchor, FinalizedExecution};
+use crate::el::anchor::{ExecAnchor, FinalizedExecution, HeadState};
 use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
 use crate::el::feecache::{BlockRewards, BlockTips, FeeCache, Head, HistoryShape, Lookup};
@@ -282,10 +282,12 @@ impl std::fmt::Display for SendError {
 }
 
 /// [`ElReader::pre_broadcast_check`]'s verdict on the sender's account read
-/// at `head` (`None`: the read timed out). Only an account proven at that very
-/// head judges: not one a peer served from an older root it fell back to, nor
-/// from a newer head than the one judged fresh.
-fn judge_read(tx: &TxSummary, head: u64, read: Option<Result<VerifiedAccount, String>>) -> PreBroadcast {
+/// at `head` (`None`: the read timed out). Only an account proven against the
+/// head's own state root judges: that root is BLS-attested, so the proof is a
+/// proof of the head's state. A read proven against any other root — one a
+/// peer fell back to, or a newer head's than the one judged fresh — does not,
+/// whatever block number it carries.
+fn judge_read(tx: &TxSummary, head: &HeadState, read: Option<Result<VerifiedAccount, String>>) -> PreBroadcast {
     let account = match read {
         None => return PreBroadcast::Unchecked("account read timed out"),
         Some(Err(_)) => return PreBroadcast::Unchecked("account read failed"),
@@ -294,8 +296,8 @@ fn judge_read(tx: &TxSummary, head: u64, read: Option<Result<VerifiedAccount, St
     if account.verify_method.is_none() {
         return PreBroadcast::Unchecked("account not verified");
     }
-    if account.block_number != head {
-        return PreBroadcast::Unchecked("account read at another head");
+    if account.peer_state_root != head.state_root {
+        return PreBroadcast::Unchecked("account not read at the head's root");
     }
     let Some(balance) = U256::try_from_be_slice(&account.balance) else {
         return PreBroadcast::Unchecked("balance unreadable");
@@ -1435,6 +1437,9 @@ pub struct ElReader {
     min_suggested_tip_wei: u128,
     /// From `ElConfig::block_time`.
     block_time: Duration,
+    /// The chain's id: `ElConfig::network_id`, which equals it on every
+    /// network served (a send for another chain is not judged, #531).
+    chain_id: u64,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
     /// sound. Because a call pins to the CURRENT head (whose root advances ~every
@@ -1729,6 +1734,7 @@ impl ElReader {
             eth_cfg,
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             block_time: cfg.block_time,
+            chain_id: cfg.network_id,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
             read_stats,
@@ -6969,7 +6975,7 @@ impl ElReader {
     /// [`SendError::Rejected`] in geth's words and never broadcast — no peer
     /// would keep it, and none would say so. It judges only on fresh, verified
     /// state ([`Self::pre_broadcast_check`]) and otherwise broadcasts as before.
-    pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<[u8; 32], SendError> {
+    pub async fn send_raw_transaction(self: &Arc<Self>, raw_tx: &[u8]) -> Result<[u8; 32], SendError> {
         // Minimal sanity only (we never sign or fully validate — peers reject a bad
         // tx): non-empty with a plausible prefix — a legacy RLP list (>= 0xc0) or an
         // EIP-2718 type byte (0x01..=0x7f). Avoids gossiping obvious garbage.
@@ -7000,13 +7006,18 @@ impl ElReader {
                 return Err(SendError::Rejected(reason));
             }
             PreBroadcast::Unchecked(why) => {
-                tracing::info!(tx = %tx_hash, why, "transaction broadcast unchecked");
+                // The head's age, to measure how often a send goes unjudged.
+                tracing::info!(tx = %tx_hash, why, head_age_s = ?self.head_age_s(), "pre-broadcast check skipped");
             }
             PreBroadcast::Passed => {}
         }
+        let not_broadcast = |reason: &str| {
+            tracing::info!(tx = %tx_hash, reason, "transaction not broadcast");
+            SendError::Unavailable(reason.to_string())
+        };
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
-            return Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()));
+            return Err(not_broadcast("no peer available to broadcast the transaction"));
         }
         // Broadcast to every peer, but answer the wallet at the FIRST write that
         // lands (#320): the success criterion is "≥1 peer received it", and
@@ -7028,11 +7039,9 @@ impl ElReader {
             // A pause or stop cut the writes (`first_accepted`'s shutdown):
             // say so, rather than blame the peers for a send we cut ourselves.
             if *self.request_shutdown.borrow() {
-                return Err(SendError::Unavailable(
-                    "transaction broadcast cut: the node is pausing or stopping".to_string(),
-                ));
+                return Err(not_broadcast("transaction broadcast cut: the node is pausing or stopping"));
             }
-            return Err(SendError::Unavailable("no peer accepted the transaction broadcast".to_string()));
+            return Err(not_broadcast("no peer accepted the transaction broadcast"));
         }
         tracing::info!(tx = %tx_hash, peers = peers.len(), "transaction broadcast");
         // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
@@ -7060,41 +7069,66 @@ impl ElReader {
     }
 
     /// Judge a send before it is broadcast (#531): [`PreBroadcast::Doomed`]
-    /// only on the sender's account as proven at a FRESH head
-    /// ([`send_check::head_is_fresh`]) and read at that head within
+    /// only on the sender's account as proven against a FRESH head's own state
+    /// root ([`Self::ready_to_judge`], [`judge_read`]), read within
     /// [`send_check::ACCOUNT_READ_BUDGET`]. Everything that keeps it from
     /// judging is [`PreBroadcast::Unchecked`], and the send goes out as before.
-    async fn pre_broadcast_check(&self, tx: Option<&TxSummary>) -> PreBroadcast {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        let (tx, from, head) = match self.ready_to_judge(tx, now_unix) {
+    ///
+    /// The read runs detached and is waited for, not cut, at the budget: a
+    /// read dropped mid-request can tear its peer's connection
+    /// ([`hedged_race`]'s note), right before the broadcast wants that peer.
+    /// Registered like a host request, so a pause or stop still cancels it.
+    async fn pre_broadcast_check(self: &Arc<Self>, tx: Option<&TxSummary>) -> PreBroadcast {
+        let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return PreBroadcast::Unchecked("wall clock unreadable");
+        };
+        let (tx, from, head) = match self.ready_to_judge(tx, since_epoch.as_secs()) {
             Ok(ready) => ready,
             Err(why) => return PreBroadcast::Unchecked(why),
         };
-        let read = tokio::time::timeout(send_check::ACCOUNT_READ_BUDGET, self.get_account(ReadAnchor::Head, from))
-            .await
-            .ok();
-        judge_read(tx, head, read)
+        let reader = Arc::clone(self);
+        let read = tokio::spawn(async move {
+            reader
+                .request_with_budget(send_check::DETACHED_READ_BUDGET, reader.get_account(ReadAnchor::Head, from))
+                .await
+        });
+        let read = match tokio::time::timeout(send_check::ACCOUNT_READ_BUDGET, read).await {
+            Err(_) => None, // still running: detached, not cut
+            Ok(joined) => Some(joined.unwrap_or_else(|e| Err(format!("account read task failed: {e}")))),
+        };
+        judge_read(tx, &head, read)
     }
 
     /// The transaction, its sender and the head a verdict would be judged at,
     /// or why there is nothing to judge: an undecoded transaction (a blob
     /// transaction's network form included: it wraps the blobs around the
     /// transaction, which the summary does not read), an unrecovered sender,
-    /// no head, or a head older than [`send_check::head_is_fresh`] allows.
+    /// another chain's transaction (peers drop it anyway, and this chain's
+    /// state says nothing about it), no head, or a head older than
+    /// [`send_check::fresh_bound`] — by its proven timestamp against the wall
+    /// clock, and by when this node adopted it against its own monotonic clock,
+    /// so a wall clock set wrong cannot pass a stalled head as fresh.
     fn ready_to_judge<'t>(
         &self,
         tx: Option<&'t TxSummary>,
         now_unix: u64,
-    ) -> Result<(&'t TxSummary, [u8; 20], u64), &'static str> {
+    ) -> Result<(&'t TxSummary, [u8; 20], HeadState), &'static str> {
         let tx = tx.ok_or("not decoded")?;
         let from = tx.from.ok_or("sender not recovered")?;
-        let (head, head_time) = self.anchor.optimistic_head_time().ok_or("no verified head yet")?;
-        if !send_check::head_is_fresh(now_unix, head_time, self.block_time) {
+        if tx.chain_id.is_some_and(|id| id != self.chain_id) {
+            return Err("another chain's transaction");
+        }
+        let head = self.anchor.optimistic_head_state().ok_or("no verified head yet")?;
+        if !send_check::head_is_fresh(now_unix, head.timestamp, head.adopted.elapsed(), self.block_time) {
             return Err("head not fresh");
         }
         Ok((tx, from, head))
+    }
+
+    /// The optimistic head's age by its proven timestamp, for the skip log.
+    fn head_age_s(&self) -> Option<u64> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        Some(now.saturating_sub(self.anchor.optimistic_head_state()?.timestamp))
     }
 
     /// The "pending" nonce overlay (the Java `pendingNonceOverlay` twin): raise
@@ -13622,12 +13656,60 @@ mod pre_broadcast_tests {
     /// The spec transaction's maximum cost: 21 000 × 20 gwei + 1 ETH.
     const SPEC_COST: u128 = 21_000 * 20_000_000_000 + 1_000_000_000_000_000_000;
 
+    /// A signed type-`ty` (2 or 4) transaction from `key` on chain `chain`:
+    /// nonce 9, 100 000 gas at a max fee of 30 gwei, 0.5 ETH ([`TYPED_COST`]).
+    fn signed_typed(ty: u8, chain: u64, key: &NodeKey) -> Vec<u8> {
+        use myotis_core::rlp::{encode, Item};
+        let be = |v: u128| v.to_be_bytes().iter().copied().skip_while(|b| *b == 0).collect::<Vec<u8>>();
+        let mut fields = vec![
+            Item::Bytes(be(chain.into())),
+            Item::Bytes(be(9)),
+            Item::Bytes(be(1_000_000_000)),
+            Item::Bytes(be(30_000_000_000)),
+            Item::Bytes(be(100_000)),
+            Item::Bytes(vec![0x35; 20]),
+            Item::Bytes(be(500_000_000_000_000_000)),
+            Item::Bytes(Vec::new()),
+            Item::List(Vec::new()),
+        ];
+        if ty == 4 {
+            // One authorization; its contents are not read here.
+            fields.push(Item::List(vec![Item::List(vec![
+                Item::Bytes(be(chain.into())),
+                Item::Bytes(vec![0xde; 20]),
+                Item::Bytes(Vec::new()),
+                Item::Bytes(be(1)),
+                Item::Bytes(vec![1; 32]),
+                Item::Bytes(vec![2; 32]),
+            ])]));
+        }
+        let mut preimage = vec![ty];
+        preimage.extend_from_slice(&encode(&Item::List(fields.clone())));
+        let sig = key.sign_hash(&keccak256(&preimage)).unwrap();
+        let strip = |b: &[u8]| b.iter().copied().skip_while(|x| *x == 0).collect::<Vec<u8>>();
+        fields.push(Item::Bytes(be(u128::from(sig[64]))));
+        fields.push(Item::Bytes(strip(&sig[..32])));
+        fields.push(Item::Bytes(strip(&sig[32..64])));
+        let mut raw = vec![ty];
+        raw.extend_from_slice(&encode(&Item::List(fields)));
+        raw
+    }
+
+    /// [`signed_typed`]'s maximum cost: 100 000 × 30 gwei + 0.5 ETH.
+    const TYPED_COST: u128 = 100_000 * 30_000_000_000 + 500_000_000_000_000_000;
+
     fn now_unix() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
     }
 
-    /// The sender's account as a head read returns it.
-    fn account(block_number: u64, nonce: u64, balance: u128, verified: bool) -> VerifiedAccount {
+    /// The head a verdict is judged at: block 100 with state root `[2; 32]`.
+    fn head_at() -> HeadState {
+        HeadState { number: 100, state_root: [2; 32], timestamp: 1_700_000_000, adopted: std::time::Instant::now() }
+    }
+
+    /// The sender's account as a head read returns it, proven against
+    /// `state_root` and labelled with block 100.
+    fn account(state_root: [u8; 32], nonce: u64, balance: u128, verified: bool) -> VerifiedAccount {
         VerifiedAccount {
             address: [0x9d; 20],
             account_hash: [0; 32],
@@ -13636,8 +13718,8 @@ mod pre_broadcast_tests {
             balance: balance.to_be_bytes().iter().copied().skip_while(|b| *b == 0).collect(),
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: EMPTY_CODE_HASH,
-            block_number,
-            peer_state_root: [2; 32],
+            block_number: 100,
+            peer_state_root: state_root,
             peer_proof_valid: true,
             beacon_chain_verified: verified,
             bls_verified: verified,
@@ -13646,18 +13728,19 @@ mod pre_broadcast_tests {
             fail_reason: (!verified).then_some("beaconBlockUnavailable"),
             beacon_synced: true,
             finalized_block_number: 36,
-            optimistic_block_number: block_number,
+            optimistic_block_number: 100,
             finalized: false,
         }
     }
 
-    /// A mainnet reader with no network, its optimistic head at `head` with
-    /// that block's timestamp `head_time` (`None`: no head yet).
-    async fn offline_reader(head: Option<(u64, u64)>) -> ElReader {
+    /// A mainnet reader with no network, its optimistic head at block 100
+    /// (state root `[2; 32]`) with that block's timestamp `head_time` (`None`:
+    /// no head yet).
+    async fn offline_reader(head_time: Option<u64>) -> Arc<ElReader> {
         let anchor = Arc::new(ExecAnchor::new());
-        if let Some((number, time)) = head {
-            anchor.update_finalized(number - 64, [1; 32], number - 64, [3; 32]);
-            anchor.update_optimistic(number, number, [4; 32], [2; 32], time);
+        if let Some(time) = head_time {
+            anchor.update_finalized(36, [1; 32], 36, [3; 32]);
+            anchor.update_optimistic(100, 100, [4; 32], [2; 32], time);
         }
         let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
         let cfg = ElConfig {
@@ -13668,45 +13751,79 @@ mod pre_broadcast_tests {
             log_index_path: None,
             ..ElConfig::mainnet()
         };
-        ElReader::start(key, anchor, cfg).await.expect("offline reader")
+        Arc::new(ElReader::start(key, anchor, cfg).await.expect("offline reader"))
     }
 
     #[test]
-    fn only_an_account_proven_at_the_judged_head_judges_the_send() {
+    fn only_an_account_proven_against_the_heads_own_root_judges_the_send() {
         let tx = tx::decode_summary(&spec_tx()).expect("decodes");
-        let judge = |read| judge_read(&tx, 100, read);
+        let head = head_at();
+        let judge = |read| judge_read(&tx, &head, read);
+        let at_head = head.state_root;
         // 1 wei short of the cost: geth's refusal, in geth's words.
         assert_eq!(
-            judge(Some(Ok(account(100, 9, SPEC_COST - 1, true)))),
+            judge(Some(Ok(account(at_head, 9, SPEC_COST - 1, true)))),
             PreBroadcast::Doomed(format!(
                 "insufficient funds for gas * price + value: balance {}, tx cost {SPEC_COST}, overshot 1",
                 SPEC_COST - 1
             ))
         );
-        assert_eq!(judge(Some(Ok(account(100, 9, SPEC_COST, true)))), PreBroadcast::Passed);
+        assert_eq!(judge(Some(Ok(account(at_head, 9, SPEC_COST, true)))), PreBroadcast::Passed);
         assert_eq!(
-            judge(Some(Ok(account(100, 10, SPEC_COST, true)))),
+            judge(Some(Ok(account(at_head, 10, SPEC_COST, true)))),
             PreBroadcast::Doomed("nonce too low: next nonce 10, tx nonce 9".to_string())
         );
         // A gap is not an error.
-        assert_eq!(judge(Some(Ok(account(100, 3, SPEC_COST, true)))), PreBroadcast::Passed);
-        // Not proven, or proven at another head: not judged, however short.
-        assert_eq!(judge(Some(Ok(account(100, 9, 0, false)))), PreBroadcast::Unchecked("account not verified"));
-        assert_eq!(judge(Some(Ok(account(99, 9, 0, true)))), PreBroadcast::Unchecked("account read at another head"));
-        assert_eq!(judge(Some(Ok(account(101, 9, 0, true)))), PreBroadcast::Unchecked("account read at another head"));
+        assert_eq!(judge(Some(Ok(account(at_head, 3, SPEC_COST, true)))), PreBroadcast::Passed);
+        // Not proven, or proven against another root — even labelled with the
+        // head's own block number: not judged, however short.
+        assert_eq!(judge(Some(Ok(account(at_head, 9, 0, false)))), PreBroadcast::Unchecked("account not verified"));
+        assert_eq!(
+            judge(Some(Ok(account([7; 32], 9, 0, true)))),
+            PreBroadcast::Unchecked("account not read at the head's root")
+        );
         assert_eq!(judge(Some(Err("no snap peer available".to_string()))), PreBroadcast::Unchecked("account read failed"));
         assert_eq!(judge(None), PreBroadcast::Unchecked("account read timed out"));
     }
 
+    #[test]
+    fn a_signed_type_2_or_4_transaction_is_judged_by_its_own_fields() {
+        // The motivating case is a type-4 shield: decoded from the real
+        // signed bytes, its cost and sender drive the verdict.
+        let key = NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
+        let sender: [u8; 20] = keccak256(&key.public_key_bytes())[12..].try_into().unwrap();
+        let head = head_at();
+        for ty in [2u8, 4] {
+            let tx = tx::decode_summary(&signed_typed(ty, 1, &key)).expect("decodes");
+            assert_eq!((tx.ty, tx.from), (ty, Some(sender)));
+            assert_eq!(
+                judge_read(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST - 1, true)))),
+                PreBroadcast::Doomed(format!(
+                    "insufficient funds for gas * price + value: balance {}, tx cost {TYPED_COST}, overshot 1",
+                    TYPED_COST - 1
+                )),
+                "type {ty}"
+            );
+            assert_eq!(
+                judge_read(&tx, &head, Some(Ok(account(head.state_root, 9, TYPED_COST, true)))),
+                PreBroadcast::Passed,
+                "type {ty}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn a_send_is_judged_only_at_a_fresh_head() {
+    async fn a_send_is_judged_only_at_a_fresh_head_on_its_own_chain() {
         let now = now_unix();
         let tx = tx::decode_summary(&spec_tx());
         let sender = tx.as_ref().and_then(|t| t.from).expect("the spec vector's sender");
         // A light client's head is normally one to two blocks old.
-        let fresh = offline_reader(Some((100, now - 20))).await;
-        assert_eq!(fresh.ready_to_judge(tx.as_ref(), now).map(|(_, from, head)| (from, head)), Ok((sender, 100)));
-        let stale = offline_reader(Some((100, now - 60))).await;
+        let fresh = offline_reader(Some(now - 20)).await;
+        assert_eq!(
+            fresh.ready_to_judge(tx.as_ref(), now).map(|(_, from, head)| (from, head.number, head.state_root)),
+            Ok((sender, 100, [2; 32]))
+        );
+        let stale = offline_reader(Some(now - 60)).await;
         assert_eq!(stale.ready_to_judge(tx.as_ref(), now).err(), Some("head not fresh"));
         let headless = offline_reader(None).await;
         assert_eq!(headless.ready_to_judge(tx.as_ref(), now).err(), Some("no verified head yet"));
@@ -13714,6 +13831,11 @@ mod pre_broadcast_tests {
         assert_eq!(fresh.ready_to_judge(None, now).err(), Some("not decoded"));
         let senderless = tx.map(|t| TxSummary { from: None, ..t });
         assert_eq!(fresh.ready_to_judge(senderless.as_ref(), now).err(), Some("sender not recovered"));
+        // Signed for Sepolia, posted to mainnet: this chain's state says
+        // nothing about it.
+        let key = NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
+        let sepolia = tx::decode_summary(&signed_typed(2, 11_155_111, &key));
+        assert_eq!(fresh.ready_to_judge(sepolia.as_ref(), now).err(), Some("another chain's transaction"));
     }
 
     #[tokio::test]
@@ -13721,7 +13843,7 @@ mod pre_broadcast_tests {
         // A fresh head, but no peer to prove the sender's account: the check
         // fails open, and the send fails only for want of a peer to broadcast
         // to, retryable as before. It is never refused unjudged.
-        let reader = offline_reader(Some((100, now_unix() - 5))).await;
+        let reader = offline_reader(Some(now_unix() - 5)).await;
         assert_eq!(
             reader.send_raw_transaction(&spec_tx()).await,
             Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
@@ -13729,15 +13851,16 @@ mod pre_broadcast_tests {
     }
 
     #[tokio::test]
-    async fn a_doomed_send_is_refused_and_never_broadcast() {
-        let reader = offline_reader(Some((100, now_unix() - 5))).await;
+    async fn a_doomed_send_is_refused_and_any_other_goes_out() {
+        let reader = offline_reader(Some(now_unix() - 5)).await;
         let reason = "nonce too low: next nonce 10, tx nonce 9".to_string();
         let raw = spec_tx();
-        let refused = reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Doomed(reason.clone())).await;
-        assert_eq!(refused, Err(SendError::Rejected(reason)));
-        // Not broadcast, so not watched for a rebroadcast either.
-        assert!(!reader.sent_tx_watch.lock().unwrap().watching_any());
-        // Any other verdict goes out: here, for want of a peer, it cannot.
+        // Refused before the broadcast is attempted ...
+        assert_eq!(
+            reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Doomed(reason.clone())).await,
+            Err(SendError::Rejected(reason))
+        );
+        // ... while any other verdict goes on to it: here it finds no peer.
         for verdict in [PreBroadcast::Passed, PreBroadcast::Unchecked("head not fresh")] {
             assert_eq!(
                 reader.send_judged(&raw, tx::decode_summary(&raw), verdict).await,
@@ -13747,14 +13870,15 @@ mod pre_broadcast_tests {
     }
 
     #[test]
-    fn a_networks_block_time_is_its_beacon_slot() {
+    fn a_networks_block_time_is_its_beacon_slot_and_its_network_id_its_chain_id() {
         use crate::sync::ChainConfig;
-        for (el, cl) in [
-            (ElConfig::mainnet(), ChainConfig::mainnet()),
-            (ElConfig::sepolia(), ChainConfig::sepolia()),
-            (ElConfig::gnosis(), ChainConfig::gnosis()),
+        for (el, cl, chain_id) in [
+            (ElConfig::mainnet(), ChainConfig::mainnet(), 1),
+            (ElConfig::sepolia(), ChainConfig::sepolia(), 11_155_111),
+            (ElConfig::gnosis(), ChainConfig::gnosis(), 100),
         ] {
             assert_eq!(el.block_time.as_secs(), cl.seconds_per_slot, "{}", el.network_id);
+            assert_eq!(el.network_id, chain_id);
         }
     }
 }

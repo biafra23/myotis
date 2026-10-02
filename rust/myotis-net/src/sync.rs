@@ -3888,7 +3888,10 @@ mod tests {
         assert_eq!(anchor.optimistic_block_number(), 21_000_002);
         assert_eq!(anchor.optimistic_block_hash(), Some([0x44; 32]));
         // The payload header's own timestamp rides along (#531).
-        assert_eq!(anchor.optimistic_head_time(), Some((21_000_002, 1_700_000_000 + 12 * 1002)));
+        assert_eq!(
+            anchor.optimistic_head_state().map(|h| (h.number, h.timestamp)),
+            Some((21_000_002, 1_700_000_000 + 12 * 1002))
+        );
         // Both roots seed the stateRootMatch window, each keyed by ITS block's
         // slot — the optimistic root at the attested block slot 1002, NOT the
         // store's signature slot 1003.

@@ -7,10 +7,11 @@
 //! whether state is new enough to judge by. The reader supplies the verified
 //! account and the clock.
 //!
-//! The check fails OPEN. Anything that stops it from judging (an undecodable or
-//! blob transaction, an unrecovered sender, a stale head, a slow or unverified
-//! account read) broadcasts the transaction as before: a node that lags the
-//! chain must never block a send.
+//! The check fails OPEN. Anything that stops it from judging (an undecodable
+//! transaction — a blob transaction's network form among them — an
+//! unrecovered sender, another chain's transaction, a stale head, a slow
+//! account read or one not proven at the head's own root) broadcasts the
+//! transaction as before: a node that lags the chain must never block a send.
 
 use std::time::Duration;
 
@@ -28,12 +29,25 @@ pub const FRESH_HEAD_GRACE: Duration = Duration::from_secs(6);
 /// account read takes 0.1–0.8 s on a healthy pool (#531's log).
 pub const ACCOUNT_READ_BUDGET: Duration = Duration::from_secs(2);
 
-/// Whether a head timestamped `head_timestamp` (unix seconds) is fresh enough
-/// at `now_unix` to judge a send by: at most two block times plus
-/// [`FRESH_HEAD_GRACE`] old. A head in the future (clock skew) counts as fresh.
-pub fn head_is_fresh(now_unix: u64, head_timestamp: u64, block_time: Duration) -> bool {
-    let bound = (2 * block_time + FRESH_HEAD_GRACE).as_secs();
-    now_unix <= head_timestamp.saturating_add(bound)
+/// How long the read may run on, detached, after the check stopped waiting
+/// for it: it is left to finish rather than cut mid-request.
+pub const DETACHED_READ_BUDGET: Duration = Duration::from_secs(20);
+
+/// How old a head may be to judge a send by: two block times plus
+/// [`FRESH_HEAD_GRACE`].
+pub fn fresh_bound(block_time: Duration) -> Duration {
+    2 * block_time + FRESH_HEAD_GRACE
+}
+
+/// Whether a head is fresh enough to judge a send by ([`fresh_bound`]): by
+/// its proven timestamp (unix seconds) against the wall clock `now_unix` — a
+/// head in the future, clock skew, counts as fresh — AND by how long ago this
+/// node adopted it, on its own monotonic clock, which a wall clock set wrong
+/// cannot fake: a stalled light client's head ages there whatever the wall
+/// clock says.
+pub fn head_is_fresh(now_unix: u64, head_timestamp: u64, adopted_ago: Duration, block_time: Duration) -> bool {
+    let bound = fresh_bound(block_time);
+    now_unix <= head_timestamp.saturating_add(bound.as_secs()) && adopted_ago <= bound
 }
 
 /// What the transaction may cost its sender at most: `value + gas × fee`, the
@@ -54,9 +68,11 @@ pub fn max_cost(tx: &TxSummary) -> Option<U256> {
 /// geth's txpool verdict for `tx` against its sender's account, in geth's
 /// order and words: `Some(message)` when the transaction can never be mined as
 /// sent, `None` when it may be. A nonce above the account's is a gap a later
-/// transaction fills (geth queues it), and each transaction is judged alone,
-/// as geth's `ValidateTransactionWithState` judges it: a replacement at the
-/// same nonce must still pass.
+/// transaction fills (geth queues it). Each transaction is judged alone
+/// against the balance: geth's pool also counts the sender's transactions it
+/// already queued, which this node does not see, and a replacement at the
+/// same nonce must still pass. A transaction whose cost is unknown (a decoded
+/// blob transaction) is judged by its nonce only.
 pub fn verdict(tx: &TxSummary, balance: U256, account_nonce: u64) -> Option<String> {
     if tx.nonce < account_nonce {
         return Some(format!("nonce too low: next nonce {account_nonce}, tx nonce {}", tx.nonce));
@@ -146,14 +162,24 @@ mod tests {
     fn a_head_is_fresh_for_two_block_times_and_the_grace() {
         let slot = Duration::from_secs(12);
         let head = 1_700_000_000;
+        let just = Duration::from_secs(1);
         // A light client's head is normally one to two blocks old.
-        assert!(head_is_fresh(head + 12, head, slot));
-        assert!(head_is_fresh(head + 30, head, slot), "2 × 12 s + 6 s");
-        assert!(!head_is_fresh(head + 31, head, slot));
+        assert!(head_is_fresh(head + 12, head, just, slot));
+        assert!(head_is_fresh(head + 30, head, just, slot), "2 × 12 s + 6 s");
+        assert!(!head_is_fresh(head + 31, head, just, slot));
         // Gnosis: 5 s blocks.
-        assert!(head_is_fresh(head + 16, head, Duration::from_secs(5)));
-        assert!(!head_is_fresh(head + 17, head, Duration::from_secs(5)));
+        assert!(head_is_fresh(head + 16, head, just, Duration::from_secs(5)));
+        assert!(!head_is_fresh(head + 17, head, just, Duration::from_secs(5)));
         // A clock behind the chain's.
-        assert!(head_is_fresh(head - 3, head, slot));
+        assert!(head_is_fresh(head - 3, head, just, slot));
+    }
+
+    #[test]
+    fn a_wrong_wall_clock_cannot_pass_a_stalled_head_as_fresh() {
+        // The wall clock says the head is 10 s old, but this node adopted it a
+        // minute ago and has heard of no newer one: its light client stalled.
+        let slot = Duration::from_secs(12);
+        assert!(!head_is_fresh(1_700_000_010, 1_700_000_000, Duration::from_secs(60), slot));
+        assert!(head_is_fresh(1_700_000_010, 1_700_000_000, Duration::from_secs(30), slot));
     }
 }

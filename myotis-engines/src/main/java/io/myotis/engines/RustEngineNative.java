@@ -338,7 +338,8 @@ final class RustEngineNative {
         return Myotis_engineKt.feeEstimateJson(handle);
     }
 
-    /** Gossip a signed raw tx; {@code {"txHash":"0x…"}} or an error object. */
+    /** Gossip a signed raw tx; {@code {"txHash":"0x…"}}, {@code {"status":"rejected","reason"}}
+     *  (ABI 36: refused before broadcast, geth's txpool verdict) or an error object. */
     static String nativeSendRawTransactionJson(long handle, String rawTxHex) {
         return Myotis_engineKt.sendRawTransactionJson(handle, nz(rawTxHex));
     }

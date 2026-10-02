@@ -177,8 +177,9 @@ uniffi::setup_scaffolding!();
 ///      geth's txpool verdict ("insufficient funds for gas * price + value: …",
 ///      "nonce too low: …"), which the hosts serve verbatim under geth's
 ///      -32000, and is never broadcast. Anything that keeps it from judging
-///      sends as before. No signature change; the JVM `RustEngineNative`
-///      wrappers and the iOS wrapper read the new shape.
+///      sends as before. No signature change; the JVM `RustChainHandle` and
+///      the iOS `IosRpcBackend` read the new shape, and the Node addon passes
+///      it through.
 pub const ABI_VERSION: i32 = 36;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the

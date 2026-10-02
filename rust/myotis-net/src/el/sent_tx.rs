@@ -54,9 +54,12 @@ impl SentTxTracker {
         SentTxTracker { watched: HashMap::new() }
     }
 
-    /// Start (or restart — a re-send overwrites) watching a broadcast tx.
+    /// Start (or restart — a re-send restarts the clock) watching a broadcast
+    /// tx. A re-send of a tx the network already echoed back stays seen: it is
+    /// not rebroadcast, nor logged as dropped when its watch expires (#531).
     pub fn watch(&mut self, hash: [u8; 32], now: Instant, broadcast_head: Option<u64>) {
-        self.watched.insert(hash, Watch { broadcast_at: now, seen_at: None, broadcast_head });
+        let seen_at = self.watched.get(&hash).and_then(|w| w.seen_at);
+        self.watched.insert(hash, Watch { broadcast_at: now, seen_at, broadcast_head });
     }
 
     /// The head number recorded when WE broadcast this tx, or `None` for a tx
@@ -137,7 +140,7 @@ pub fn log_unseen_expiries(unseen: &[[u8; 32]]) {
     for hash in unseen {
         tracing::info!(
             tx = %hash_hex(hash),
-            "transaction not seen in gossip within {} s and not mined; likely dropped",
+            "transaction not seen in gossip within {} s and no receipt served for it; likely dropped",
             SENT_TX_WATCH_TTL.as_secs()
         );
     }
@@ -276,6 +279,21 @@ mod tests {
         let past = start + SENT_TX_WATCH_TTL + Duration::from_millis(1);
         assert_eq!(w.evict_expired(past), vec![[1; 32]]);
         assert!(w.is_empty(), "both stop being watched");
+    }
+
+    #[test]
+    fn a_resend_of_a_seen_tx_stays_seen() {
+        let mut w = SentTxTracker::new();
+        let start = t0();
+        w.watch([1; 32], start, None);
+        w.mark_seen(&[1; 32], start + Duration::from_secs(1));
+        // The wallet sends the same bytes again: the clock restarts, the
+        // network's echo still counts.
+        w.watch([1; 32], start + Duration::from_secs(5), None);
+        assert!(w.unseen().is_empty(), "no rebroadcast of a seen tx");
+        assert_eq!(w.mark_seen(&[1; 32], start + Duration::from_secs(6)), None, "its sighting was counted once");
+        let past = start + Duration::from_secs(5) + SENT_TX_WATCH_TTL + Duration::from_millis(1);
+        assert!(w.evict_expired(past).is_empty(), "not logged as dropped");
     }
 
     #[test]

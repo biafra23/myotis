@@ -1399,21 +1399,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     /**
-     * Gossip a signed raw transaction and return its 32-byte hash. Throws
-     * {@link EngineException} when no peer could be reached / the input isn't a
-     * plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
-     */
-    byte[] sendRawTransactionVerified(String rawTxHex) {
-        return txHashFromJson(
-                gated(() -> RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex)));
-    }
-
-    /**
-     * {@link #sendRawTransactionVerified} with the engine's verdict kept (ABI
-     * 36, #531): a transaction refused before broadcast is
-     * {@link io.myotis.api.SendResult.Status#REJECTED} with geth's reason.
-     * Throws {@link EngineException} where {@link #sendRawTransactionVerified}
-     * does.
+     * Gossip a signed raw transaction: its 32-byte hash as
+     * {@link io.myotis.api.SendResult.Status#SENT}, or (ABI 36, #531)
+     * {@link io.myotis.api.SendResult.Status#REJECTED} with geth's reason for
+     * one the engine refused before broadcasting it. Throws
+     * {@link EngineException} when no peer could be reached / the input isn't
+     * a plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
      */
     io.myotis.api.SendResult sendRawTransactionDetailedVerified(String rawTxHex) {
         return sendResultFromJson(

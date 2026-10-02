@@ -284,7 +284,7 @@ pub fn fee_estimate_json(handle: i64) -> String {
     crate::host::fee_estimate_json(handle)
 }
 
-/// Gossip a signed raw transaction; `{"txHash":"0x…"}` or `{"error": ...}`.
+/// Gossip a signed raw transaction; `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`.
 #[uniffi::export]
 pub fn send_raw_transaction_json(handle: i64, raw_tx_hex: String) -> String {
     crate::host::send_raw_transaction_json(handle, &raw_tx_hex)

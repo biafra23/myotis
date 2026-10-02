@@ -256,7 +256,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 35** and existing JS
+This implementation targets the current engine's **ABI 36** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -275,8 +275,12 @@ call result (the block string passes through unchanged; a host that relied on
 `setBootEnodes` and the `snapServingPeers` status key (a key addition — older
 readers ignore it); ABI 32 gives `requestAccountJson` an optional `block`
 selector (`finalized` proves at the beacon-finalized block; a number only near
-the head; the result carries `anchor`). It is not a drop-in artifact for a host
-pinned to ABI 22.
+the head; the result carries `anchor`); ABI 36 lets `sendRawTransactionJson`
+answer `{"status":"rejected","reason"}` for a transaction the engine refuses
+before broadcasting it, because its sender cannot pay for it or its nonce is
+used (#531): nothing was sent, and the reason is geth's txpool verdict — a
+caller that reads only `txHash` and `error` must handle it. It is not a
+drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 
