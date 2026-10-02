@@ -120,7 +120,9 @@ impl OracleError {
     /// hash, a proof's detail): what a log line at info may name (#532
     /// review). A cancellation is told apart only by the one reason the
     /// slow requests #532 is about end with; its free-form text never
-    /// reaches the log.
+    /// reaches the log. That reason is myotis-net's `Operation::check`
+    /// wording, which this crate cannot import; a test there pins that the
+    /// two agree.
     pub fn kind(&self) -> &'static str {
         match self {
             OracleError::Cancelled { reason } if reason == "request deadline exceeded" => "request deadline exceeded",
