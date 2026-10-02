@@ -888,7 +888,8 @@ impl EvmExecutor {
     /// sender and the target, and the run starts in the target's code or in a
     /// delegate's. A discovery pass would see a delegate only a pass late, as
     /// a call hook sees the delegating account, not its delegate (#532
-    /// review).
+    /// review). An authorization revm will skip (another chain, a stale nonce,
+    /// a bad signature) costs a fetch its run never reads, nothing more.
     fn first_wave(&self, ctx: &BlockContext, tx: &TxRequest) {
         let delegates = tx.authorization_list.iter().flatten().map(|auth| auth.address);
         let code_needed: std::collections::HashSet<[u8; 20]> = tx.to.into_iter().chain(delegates).collect();

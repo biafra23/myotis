@@ -157,7 +157,7 @@ impl EvmError {
     /// balance, revert data): what a log line at info may name (#532 review).
     /// An oracle error is named by its own kind ([`OracleError::kind`]), so a
     /// request that ran out of time and a proof that failed are told apart.
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'static str {
         match self {
             EvmError::Oracle(error) => error.kind(),
             EvmError::Reverted { .. } => "reverted",
@@ -281,6 +281,9 @@ mod tests {
         // An oracle error by its own kind: a cut request is not a bad proof.
         let cut = EvmError::Oracle(OracleError::Cancelled { reason: "request deadline exceeded".into() });
         assert_eq!(cut.kind(), "request deadline exceeded");
+        // Any other reason is a plain cancellation: its text is not logged.
+        let other = OracleError::Cancelled { reason: "peer 0xabab… went away".into() };
+        assert_eq!(EvmError::Oracle(other).kind(), "request cancelled");
         let proof = OracleError::InvalidProof { state_root: [1; 32], address: [0xab; 20], detail: "root mismatch".into() };
         assert_eq!(EvmError::Oracle(proof).kind(), "invalid proof");
     }

@@ -118,11 +118,13 @@ impl std::fmt::Display for OracleError {
 impl OracleError {
     /// The error's kind, without the values it carries (an address, a code
     /// hash, a proof's detail): what a log line at info may name (#532
-    /// review). A cancellation names its reason, which says why ("request
-    /// deadline exceeded") and carries no value.
-    pub fn kind(&self) -> &str {
+    /// review). A cancellation is told apart only by the one reason the
+    /// slow requests #532 is about end with; its free-form text never
+    /// reaches the log.
+    pub fn kind(&self) -> &'static str {
         match self {
-            OracleError::Cancelled { reason } => reason,
+            OracleError::Cancelled { reason } if reason == "request deadline exceeded" => "request deadline exceeded",
+            OracleError::Cancelled { .. } => "request cancelled",
             OracleError::StateUnavailable { .. } => "state unavailable",
             OracleError::BytecodeUnavailable { .. } => "bytecode unavailable",
             OracleError::InvalidProof { .. } => "invalid proof",
@@ -181,9 +183,9 @@ pub trait SnapStateOracle: Send + Sync {
     /// asks before each one, and pass 0 starts a loop. A pass is an EVM run
     /// plus a prefetch wave, and its yield does not predict the next one's,
     /// so discovery is bounded in time (#532 review). The bound is the
-    /// oracle's to keep, as it owns the clock and the request's deadline and
-    /// this crate holds neither. It decides when passes may start, and a pass
-    /// under way finishes its wave, which fetches state the pass found. Past
+    /// oracle's to keep, as it owns a clock and this crate holds none. It
+    /// decides when passes may start, and a pass under way finishes its wave,
+    /// which fetches the state the pass found. Past
     /// it the loop makes its real runs, which fetch what is left one read at
     /// a time; the answer never depends on it. Default: always, so only the
     /// iteration cap bounds discovery.

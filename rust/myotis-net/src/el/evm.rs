@@ -338,8 +338,11 @@ const WAVE_SILENCE_RECHECK: std::time::Duration = std::time::Duration::from_mill
 /// the recorded RAILGUN shield, a pass that finds four new items comes before
 /// one that finds 28), so the bound is on time: on a slow link the passes must
 /// not spend the request budget that the serial reads after them need. A pass
-/// under way still finishes its wave: what the wave fetches is state the pass
-/// found, which the real runs would otherwise read one round-trip at a time.
+/// under way still finishes its wave: what the wave fetches is mostly state
+/// the real runs need, which they would otherwise read one round-trip at a
+/// time (the rest is what placeholders led the pass to). The bound is per
+/// loop and does not look at the request's own deadline, which cuts a wave
+/// by itself (`PoolOracle::wait`).
 const DISCOVERY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Why a prefetch-wave request came back without an answer.
