@@ -65,14 +65,15 @@ myotis.stop(h);
 Every verified read the other hosts serve is exported (#503), so a host can
 route a page's `window.ethereum` requests here rather than to a proxy RPC.
 Each resolves to the engine's JSON **unchanged**: the result object or array,
-the literal `"null"` for a verified not-found, or an `{"error": …}` object
-(`"code":-32602` marks a refusal that no retry changes). A NUL byte in a
-string argument is refused here, as `{"error":"argument contains NUL","code":-32602}`,
-and an unknown handle gets the usual `{"error":"handle does not belong to this environment"}`.
+the literal `"null"` for a verified not-found, or an `{"error": …}` object.
+`"code":-32602` marks a refusal no retry changes: answer it as JSON-RPC
+invalid params. A plain `{"error"}` is retryable: answer it as -32000. An
+unknown handle gets the usual
+`{"error":"handle does not belong to this environment"}`.
 
 | JSON-RPC method | call |
 |---|---|
-| `eth_blockNumber` | no call: `statusJson().optimisticBlockNumber` (the verified head, as the iOS host serves it) |
+| `eth_blockNumber` | no call: `statusJson().optimisticBlockNumber`, the verified head (`0` = none yet: do not serve it) |
 | `eth_getBalance`, `eth_getTransactionCount` | `requestAccountJson(h, address, block?)` |
 | `eth_getTransactionCount` at `pending` | the mined nonce above through `pendingNonceOverlay(h, address, minedNonce)` — synchronous; raises it past this node's own unmined broadcast, -1 = serve the mined nonce |
 | `eth_getCode` | `getCodeJson(h, address, block?)` |
@@ -82,13 +83,50 @@ and an unknown handle gets the usual `{"error":"handle does not belong to this e
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | `feeEstimateJson(h)` |
 | `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
-| `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions)` |
-| `eth_getBlockByHash` | `getBlockByHashJson(h, blockHash, fullTransactions)` |
+| `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions?)` |
+| `eth_getBlockByHash` | `getBlockByHashJson(h, blockHash, fullTransactions?)` |
 | `eth_getTransactionByHash` | `getTransactionByHashJson(h, txHash)` |
 | `eth_getTransactionReceipt` | `getTransactionReceiptJson(h, txHash)` |
 | `eth_getBlockReceipts` | `getBlockReceiptsJson(h, selector)` (a tag, a 0x-number or a 0x-hash) |
 | `eth_getLogs` | `getLogsJson(h, filterJson)`: only for contracts in the log index, below |
 | `eth_sendRawTransaction` | `sendRawTransactionJson(h, rawTxHex)` |
+
+**Serve a state read only with its verdict.** `requestAccountJson`,
+`getCodeJson` and `getStorageAtJson` answer with a full object even when
+nothing could be verified: `verifyMethod` is then `null` and `failReason`
+says why. Their data keys are an answer **only when `verifyMethod` is set**;
+otherwise there is no answer yet (retryable, as a plain `{"error"}`). With a
+verdict:
+
+- `eth_getBalance`: `balanceWei` is a **decimal** string; serve it as a
+  quantity (`'0x' + BigInt(balanceWei).toString(16)`). An account proven
+  absent (`exists: false`) has `balanceWei: null`: serve `0x0`.
+- `eth_getTransactionCount`: `nonce`, `-1` for an account proven absent:
+  serve `0x0`.
+- `eth_getCode`: `codeHex` (`0x` for an account without code).
+- `eth_getStorageAt`: `valueHex` is the value without leading zeros (`null`
+  for an empty slot): left-pad it to the 32-byte word a JSON-RPC answer
+  carries.
+
+**Arguments.** The addon makes the checks the JSON-RPC routers make on the
+other hosts before they call the engine, and refuses what fails them as
+`-32602`, before the handle is consulted: a NUL byte in a string argument
+(`{"error":"argument contains NUL","code":-32602}`), a malformed address or
+hash, reward percentiles that are not JSON numbers in [0, 100] in
+non-decreasing order (at most 100; `''`, `null` or `[]` ask for no reward
+column), an empty import list, and a `blockCount` that is not a safe integer.
+A short storage `position` such as `0x0` is padded to its 32-byte word.
+`estimateGasJson` and `sendRawTransactionJson` refuse a NUL byte the same way
+since #503; their refusal used to carry no `code`. Block numbers:
+
+- `getBlockByNumberJson`, `getBlockReceiptsJson` and `feeHistoryJson` take a
+  tag or a `0x`-number. Bare digits are refused: the engine would read them as
+  hex there.
+- The state reads, `ethCallJson` and `ethCallOverridesJson` also take bare
+  decimal digits, as `ethCallJson` always has (below).
+
+Convert a JSON-RPC quantity to a JS number before passing `blockCount` or
+`minedNonce`.
 
 **The log index.** `eth_getLogs` is served only from an opt-in index of the
 contracts a host chooses (docs/eth-getlogs-design.md), and only inside its
@@ -96,20 +134,38 @@ verified coverage — anything else is an `{"error"}` that says how far coverage
 reaches, never an empty array:
 
 ```js
-// Watch a contract from its deployment block (a JSON number; optional per
-// entry: name, topic0s), and the index catches up. Top level, optionally:
-// maxSpeed, backfillPaused.
+// Watch a contract from its deployment block (a JSON number); the index then
+// catches up. `enabled` defaults to false. Optional per entry: name, topic0s;
+// at the top level: maxSpeed, backfillPaused.
 await myotis.setLogIndexConfig(h, JSON.stringify({
   enabled: true, watch: [{ address: '0x…', fromBlock: 14737691 }],
-}));                                        // '{"ok":true}', or '{"ok":false}' (refused: see drainLogs)
-// Or load a bundled snapshot of one, as the desktop and Android apps do:
-await myotis.importLogIndexFiles(h, JSON.stringify(['/abs/path/logindex.db']));
-JSON.parse(await myotis.logIndexStatusJson(h));  // { enabled, entries: [{ address, coverage… }], logCount, … }
+}));     // '{"ok":true}', or '{"ok":false}': refused, and the engine logs why (drainLogs)
+JSON.parse(await myotis.logIndexStatusJson(h));
+// { enabled, logCount, maxSpeed, backfillPaused, headGap?, …,
+//   entries: [{ address, fromBlock, name?, coveredLow?, coveredHigh? }] }
 ```
 
-Installing a config or importing takes the index's write lock, so these run on
-the request workers like the reads; an import occupies its handle's execution
-slot until it finishes, and that handle's reads queue behind it.
+`importLogIndexFiles(h, pathsJson)` merges snapshot files into the index, as
+the desktop, Android and iOS apps do with a file **the user picked**. Treat it
+as that same deliberate act, never as something fetched: a snapshot is the
+claim of whoever produced it, served as covered without being re-verified,
+and served logs do not say which coverage was imported
+(docs/eth-getlogs-design.md §Import, docs/seeded-log-histories.md).
+Subscriptions are add-only: a later config is merged with what is there, so
+an imported address stays in the index.
+
+**The request queue.** These calls go through the same scheduler as the other
+reads (§Request ownership and cancellation): at most four requests per handle
+queued or running, one running at a time, and a 90 s budget that starts at
+submission. So:
+
+- A `logIndexStatusJson` poll waits behind a slow read. Poll the synchronous
+  `statusJson` for liveness.
+- An import observes neither the budget nor a cancellation. It holds its
+  handle's slot until it finishes, and `stop` or `pause`, synchronous on the
+  JS thread, wait for it.
+- `getLogsJson`'s result is not capped. A host serving untrusted pages bounds
+  the block range itself.
 
 These calls need no newer engine: the C functions are in the ABI this addon
 targets. A host detects them by the export
@@ -117,8 +173,8 @@ targets. A host detects them by the export
 
 `smoke.mjs` is the end-to-end check: syncs mainnet from plain Node, then runs
 `resolve-ens` + `contenthash` + `get-account` with verification fields and
-cold/warm timing, a fee estimate, the latest block, a fee history and the
-receipt of a transaction in that block:
+cold/warm timing, a fee estimate, the latest block, a fee history, and the
+finalized block with the receipt of its first transaction:
 
 ```bash
 node smoke.mjs ./data-dir ../target/debug/myotis-node.node
@@ -143,7 +199,8 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 - **Readiness**: serve verified reads only when `statusJson` shows
   `beaconState === 'SYNCED'`, `elReaderAvailable`, and `snapServingPeers >= 1`;
-  before that, reads honestly error rather than guess. `snapServingPeers`
+  before that, reads answer with an error or without a verdict, never with a
+  guess. `snapServingPeers`
   (ABI >= 31) counts the pooled peers that can answer a read at the anchored
   head *now*; `snapPeers` counts every pooled snap peer, and right after SYNCED
   a cold pool can be full of peers still syncing themselves — `snapPeers > 0`
@@ -245,8 +302,8 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   Engines before ABI 27 ignore `block` and always answer from the head, so a
   host that forwards a block number must gate on `init() >= 27`.
 - **Executor refusals** (ABI 33): `ethCallJson` and `estimateGasJson` (and
-  `estimateGasTxJson` since ABI 34, `ethCallTxJson` since ABI 35; the C ABI's
-  `myotis_eth_call_overrides_json` is not wrapped here) answer `{"error": "…", "code": -32602}` — **permanent**,
+  `estimateGasTxJson` since ABI 34, `ethCallTxJson` since ABI 35, and
+  `ethCallOverridesJson`) answer `{"error": "…", "code": -32602}` — **permanent**,
   like the refusals above — when the verified head's header and this engine
   build's fork table disagree about Amsterdam: an Amsterdam block without
   EIP-7843's slot number, or a slot number on a block the table puts before

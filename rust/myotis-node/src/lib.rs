@@ -344,7 +344,8 @@ pub fn estimate_gas_json<'env>(env: &'env Env,
             (Ok(f), Ok(t), Ok(d), Ok(v)) => take(unsafe {
                 myotis_estimate_gas_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr())
             }),
-            _ => r#"{"error":"argument contains NUL"}"#.to_string(),
+            // Permanent, like every other provider read's (#503).
+            _ => NUL_INVALID_PARAMS.to_string(),
         }
     })
 }
@@ -434,7 +435,8 @@ pub fn fee_estimate_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'en
 pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&raw_tx_hex) {
         Ok(r) => take(unsafe { myotis_send_raw_transaction_json(handle, r.as_ptr()) }),
-        Err(e) => e,
+        // Permanent, like every other provider read's (#503).
+        Err(_) => NUL_INVALID_PARAMS.to_string(),
     })
 }
 
@@ -473,54 +475,149 @@ pub fn eth_call_overrides_json<'env>(env: &'env Env,
 // Wrapped as the reads above are, each resolves to the engine's JSON
 // UNCHANGED: the result object or array, the literal `"null"` for a verified
 // not-found, or an `{"error": …}` object — a refusal of the request itself
-// carries `"code":-32602` and is permanent (README "Notes"). A NUL byte in a
-// string argument is refused here, before the engine, just as permanently.
+// carries `"code":-32602` and is permanent (README "Notes"). The state reads
+// have a fourth outcome, a result without a verdict (`verifyMethod: null`),
+// which is not to be served (README).
+//
+// The engine leaves part of a request's checking to the JSON-RPC routers that
+// call it on the other hosts; this binding has no router in front of it, so it
+// makes those checks here, before the engine, each refused as the permanent
+// `-32602` the routers answer: a NUL byte in a string; a block number in bare
+// digits where the engine would read them as HEX (the block, receipts and
+// fee-history selectors — the state reads and eth_call read them as decimal,
+// as ethCallJson always has, and keep doing so); a malformed address or hash,
+// which the engine refuses in a shape that looks retryable; reward percentiles
+// out of range or order; an empty import list; and a count or nonce that is
+// not a safe integer. A short storage position (`0x0`, as dApps send it) is
+// padded to its 32-byte word, as the routers pad it.
 
-/// The refusal of a JS number that is not a safe integer where the engine
-/// takes an integer: the request can never be served as asked.
-const NOT_AN_INTEGER: &str = r#"{"error":"blockCount must be an integer","code":-32602}"#;
+/// A permanent refusal of the request: `{"error": why, "code": -32602}`.
+fn invalid_params(why: &str) -> String {
+    format!(r#"{{"error":{},"code":-32602}}"#, serde_json::Value::from(why))
+}
 
 /// Whether a JS number is an integer this binding can pass on exactly.
 fn safe_integer(n: f64) -> bool {
     n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
 }
 
+/// A block number in bare digits, which the block, receipts and fee-history
+/// selectors would take as HEX — `"23500000"` a block far past the head, or a
+/// smaller number silently the wrong block — while a JS caller means decimal.
+/// The JSON-RPC routers refuse it, and so do those reads.
+fn bare_digits(selector: &str) -> bool {
+    let s = selector.trim();
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Hex of exactly `len` bytes, `0x` optional: the engine's own address and
+/// 32-byte-word parsers, mirrored, so only what it would refuse is refused.
+fn hex_of_len(s: &str, len: usize) -> bool {
+    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    h.len() == 2 * len && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A storage position as the engine reads it, `0x` and 64 hex digits; a shorter
+/// quantity (`0x0`) is left-padded, as the routers pad it. `None` when it is no
+/// hex or longer than 32 bytes.
+fn storage_word(position: &str) -> Option<String> {
+    let h = position.strip_prefix("0x").or_else(|| position.strip_prefix("0X")).unwrap_or(position);
+    let hex = !h.is_empty() && h.len() <= 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+    hex.then(|| format!("0x{h:0>64}"))
+}
+
+/// eth_feeHistory's reward percentiles, checked as the routers check them (the
+/// engine leaves range and order to its caller): `''`, `null` or `[]` ask for
+/// no reward column — geth answers none for an empty list — and anything else
+/// must be JSON numbers in [0, 100], non-decreasing, at most 100. What to hand
+/// the engine, or the refusal.
+fn reward_percentiles(json: &str) -> std::result::Result<String, String> {
+    let json = json.trim();
+    if json.is_empty() || json == "null" {
+        return Ok(String::new());
+    }
+    let not_an_array = || invalid_params("reward percentiles must be a JSON array");
+    let parsed: serde_json::Value = serde_json::from_str(json).map_err(|_| not_an_array())?;
+    let list = parsed.as_array().ok_or_else(not_an_array)?;
+    if list.is_empty() {
+        return Ok(String::new());
+    }
+    if list.len() > 100 {
+        return Err(invalid_params(&format!("at most 100 reward percentiles, got {}", list.len())));
+    }
+    let mut last = 0.0;
+    for p in list {
+        let Some(d) = p.as_f64() else {
+            return Err(invalid_params("reward percentiles must be JSON numbers"));
+        };
+        if !(0.0..=100.0).contains(&d) {
+            return Err(invalid_params(&format!("reward percentile {d} is outside [0, 100]")));
+        }
+        if d < last {
+            return Err(invalid_params("reward percentiles must be non-decreasing"));
+        }
+        last = d;
+    }
+    Ok(json.to_string())
+}
+
+/// importLogIndexFiles' paths: a non-empty JSON array of non-empty strings.
+fn import_paths_ok(json: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(json)
+        .is_ok_and(|paths| !paths.is_empty() && paths.iter().all(|p| !p.trim().is_empty()))
+}
+
+/// pendingNonceOverlay's mined nonce: a non-negative safe integer.
+fn nonce_arg(n: f64) -> Option<i64> {
+    (safe_integer(n) && n >= 0.0).then_some(n as i64)
+}
+
 /// eth_getBlockByNumber: the block JSON, the literal `"null"`, or
-/// `{"error"}`. `blockTag` is a tag or a 0x-number; `fullTransactions` selects
-/// decoded transaction objects over hashes.
+/// `{"error"}`. `blockTag` is a tag or a 0x-number (bare digits are refused);
+/// `fullTransactions` (default false) selects decoded transaction objects over
+/// hashes.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_block_by_number_json<'env>(
     env: &'env Env,
     handle: i64,
     block_tag: String,
-    full_transactions: bool,
+    full_transactions: Option<bool>,
 ) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&block_tag) {
-        Ok(b) => take(unsafe { myotis_get_block_by_number_json(handle, b.as_ptr(), full_transactions) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    let full = full_transactions.unwrap_or(false);
+    scheduler::submit(env, handle, move || {
+        let Ok(b) = c_arg(&block_tag) else { return NUL_INVALID_PARAMS.to_string() };
+        if bare_digits(&block_tag) {
+            return invalid_params("a block number must be 0x-hex");
+        }
+        take(unsafe { myotis_get_block_by_number_json(handle, b.as_ptr(), full) })
     })
 }
 
 /// eth_getBlockByHash: the block JSON, the literal `"null"` (a hash this node
-/// never verified), or `{"error"}`.
+/// never verified), or `{"error"}`. `fullTransactions` defaults to false.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_block_by_hash_json<'env>(
     env: &'env Env,
     handle: i64,
     block_hash: String,
-    full_transactions: bool,
+    full_transactions: Option<bool>,
 ) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&block_hash) {
-        Ok(h) => take(unsafe { myotis_get_block_by_hash_json(handle, h.as_ptr(), full_transactions) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    let full = full_transactions.unwrap_or(false);
+    scheduler::submit(env, handle, move || {
+        let Ok(h) = c_arg(&block_hash) else { return NUL_INVALID_PARAMS.to_string() };
+        if !hex_of_len(&block_hash, 32) {
+            return invalid_params("invalid block hash (expected 32-byte hex)");
+        }
+        take(unsafe { myotis_get_block_by_hash_json(handle, h.as_ptr(), full) })
     })
 }
 
 /// eth_feeHistory: `{"oldestBlock","baseFeePerGas","gasUsedRatio"[,"reward"]}`
-/// or `{"error"}`. `blockCount` is a JS integer (the engine refuses one below 1
-/// and clamps a large one to what it serves); `newestBlock` a tag or a
-/// 0x-number; `percentilesJson` a JSON number array, or omitted / '' for no
-/// reward matrix.
+/// or `{"error"}`. `blockCount` is a JS number, a safe integer (the engine
+/// refuses one below 1 and clamps a large one to what it serves) — convert a
+/// JSON-RPC quantity first; `newestBlock` a tag or a 0x-number;
+/// `percentilesJson` a JSON number array, or omitted / '' / `[]` for no reward
+/// column.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn fee_history_json<'env>(
     env: &'env Env,
@@ -531,15 +628,21 @@ pub fn fee_history_json<'env>(
 ) -> Result<Object<'env>> {
     let percentiles = percentiles_json.unwrap_or_default();
     scheduler::submit(env, handle, move || {
+        let (Ok(n), Ok(_)) = (c_arg(&newest_block), c_arg(&percentiles)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
         if !safe_integer(block_count) {
-            return NOT_AN_INTEGER.to_string();
+            return invalid_params("blockCount must be an integer");
         }
-        match (c_arg(&newest_block), c_arg(&percentiles)) {
-            (Ok(n), Ok(p)) => take(unsafe {
-                myotis_fee_history_json(handle, block_count as i64, n.as_ptr(), p.as_ptr())
-            }),
-            _ => NUL_INVALID_PARAMS.to_string(),
+        if bare_digits(&newest_block) {
+            return invalid_params("a block number must be 0x-hex");
         }
+        let p = match reward_percentiles(&percentiles).map(|p| c_arg(&p)) {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => return NUL_INVALID_PARAMS.to_string(),
+            Err(refusal) => return refusal,
+        };
+        take(unsafe { myotis_fee_history_json(handle, block_count as i64, n.as_ptr(), p.as_ptr()) })
     })
 }
 
@@ -547,20 +650,28 @@ pub fn fee_history_json<'env>(
 /// `receiptsRoot`), the literal `"null"` (verified not seen), or `{"error"}`.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_transaction_receipt_json<'env>(env: &'env Env, handle: i64, tx_hash: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&tx_hash) {
-        Ok(h) => take(unsafe { myotis_get_transaction_receipt_json(handle, h.as_ptr()) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let Ok(h) = c_arg(&tx_hash) else { return NUL_INVALID_PARAMS.to_string() };
+        if !hex_of_len(&tx_hash, 32) {
+            return invalid_params("invalid transaction hash (expected 32-byte hex)");
+        }
+        take(unsafe { myotis_get_transaction_receipt_json(handle, h.as_ptr()) })
     })
 }
 
 /// eth_getBlockReceipts: the receipts ARRAY JSON, the literal `"null"` (an
 /// unknown or future block, or a hash this node never verified), or
-/// `{"error"}`. `selector` is a tag, a 0x-number or a 0x-hash.
+/// `{"error"}`. `selector` is a tag, a 0x-number or a 0x-hash; bare digits are
+/// refused. The engine checks the rest of a selector only once the handle
+/// runs, so on a paused handle a malformed one reports the pause first.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_block_receipts_json<'env>(env: &'env Env, handle: i64, selector: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&selector) {
-        Ok(s) => take(unsafe { myotis_get_block_receipts_json(handle, s.as_ptr()) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let Ok(s) = c_arg(&selector) else { return NUL_INVALID_PARAMS.to_string() };
+        if bare_digits(&selector) {
+            return invalid_params("a block number must be 0x-hex");
+        }
+        take(unsafe { myotis_get_block_receipts_json(handle, s.as_ptr()) })
     })
 }
 
@@ -569,27 +680,38 @@ pub fn get_block_receipts_json<'env>(env: &'env Env, handle: i64, selector: Stri
 /// the literal `"null"` (verified not seen), or `{"error"}`.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_transaction_by_hash_json<'env>(env: &'env Env, handle: i64, tx_hash: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&tx_hash) {
-        Ok(h) => take(unsafe { myotis_get_transaction_by_hash_json(handle, h.as_ptr()) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let Ok(h) = c_arg(&tx_hash) else { return NUL_INVALID_PARAMS.to_string() };
+        if !hex_of_len(&tx_hash, 32) {
+            return invalid_params("invalid transaction hash (expected 32-byte hex)");
+        }
+        take(unsafe { myotis_get_transaction_by_hash_json(handle, h.as_ptr()) })
     })
 }
 
-/// eth_getCode: the code JSON, verified against the proven code hash. `block`
-/// (optional) is checked as for requestAccountJson: omitted or a head tag
-/// proves at the verified head, `finalized` at the beacon-finalized block, a
-/// number only inside [head-64, head+16].
+/// eth_getCode: `{"codeHex", "verifyMethod", "failReason", …}`. Serve
+/// `codeHex` only when `verifyMethod` is set: without a verdict it is no
+/// answer (README). `block` (optional) is checked as for requestAccountJson:
+/// omitted or a head tag proves at the verified head, `finalized` at the
+/// beacon-finalized block, a number only inside [head-64, head+16].
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_code_json<'env>(env: &'env Env, handle: i64, address: String, block: Option<String>) -> Result<Object<'env>> {
     let block = block.unwrap_or_default();
-    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&block)) {
-        (Ok(a), Ok(b)) => take(unsafe { myotis_get_code_json(handle, a.as_ptr(), b.as_ptr()) }),
-        _ => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let (Ok(a), Ok(b)) = (c_arg(&address), c_arg(&block)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
+        if !hex_of_len(&address, 20) {
+            return invalid_params("invalid address (expected 20-byte hex)");
+        }
+        take(unsafe { myotis_get_code_json(handle, a.as_ptr(), b.as_ptr()) })
     })
 }
 
-/// eth_getStorageAt: the storage word JSON, proof-verified. `position` is the
-/// 32-byte slot as hex; `block` is checked as for getCodeJson.
+/// eth_getStorageAt: `{"valueHex", "verifyMethod", "failReason", …}`, served
+/// only with a verdict, as for getCodeJson. `position` is the slot as hex — a
+/// short quantity such as `0x0` is padded to its 32-byte word; `block` is
+/// checked as for getCodeJson.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_storage_at_json<'env>(
     env: &'env Env,
@@ -599,9 +721,17 @@ pub fn get_storage_at_json<'env>(
     block: Option<String>,
 ) -> Result<Object<'env>> {
     let block = block.unwrap_or_default();
-    scheduler::submit(env, handle, move || match (c_arg(&address), c_arg(&position), c_arg(&block)) {
-        (Ok(a), Ok(p), Ok(b)) => take(unsafe { myotis_get_storage_at_json(handle, a.as_ptr(), p.as_ptr(), b.as_ptr()) }),
-        _ => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let (Ok(a), Ok(_), Ok(b)) = (c_arg(&address), c_arg(&position), c_arg(&block)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
+        if !hex_of_len(&address, 20) {
+            return invalid_params("invalid address (expected 20-byte hex)");
+        }
+        let Some(Ok(p)) = storage_word(&position).map(|w| c_arg(&w)) else {
+            return invalid_params("invalid storage position (expected hex of at most 32 bytes)");
+        };
+        take(unsafe { myotis_get_storage_at_json(handle, a.as_ptr(), p.as_ptr(), b.as_ptr()) })
     })
 }
 
@@ -609,7 +739,8 @@ pub fn get_storage_at_json<'env>(
 /// importLogIndexFiles): the logs ARRAY JSON, served only inside the index's
 /// verified coverage; anything else is an `{"error"}` that says how far
 /// coverage reaches — never an empty array for a range the index has not
-/// covered. A filter that cannot parse carries `"code":-32602`.
+/// covered. A filter that cannot parse carries `"code":-32602`. The result is
+/// not capped: a host serving untrusted pages bounds the range itself.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&filter_json) {
@@ -625,14 +756,15 @@ pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> 
 // These run on the request workers like the reads: installing a config or
 // importing a snapshot takes the index's write lock, which its own appender or
 // an import can hold for a while, and that must not block the JS thread. An
-// import occupies its handle's one execution slot until it finishes, so that
-// handle's reads queue behind it.
+// import is neither bounded by the 90 s budget nor cancellable: it occupies its
+// handle's one execution slot until it finishes, that handle's reads queue
+// behind it, and `stop`/`pause` — synchronous on the JS thread — wait for it.
 
-/// Install the watch-list config (docs/eth-getlogs-design.md; the same JSON the
+/// Install the watch-list config (docs/eth-getlogs-design.md; the JSON the
 /// other hosts push). Resolves `{"ok":true}` when installed, `{"ok":false}`
-/// when refused — invalid JSON, a watch entry without `address` or
+/// when refused — invalid JSON, a watch entry without `address` or a numeric
 /// `fromBlock`, an address listed twice, or a handle without a running EL
-/// reader; the engine logs which (drainLogs).
+/// reader; the engine logs the config refusals (drainLogs).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn set_log_index_config<'env>(env: &'env Env, handle: i64, config_json: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&config_json) {
@@ -646,22 +778,27 @@ pub fn set_log_index_config<'env>(env: &'env Env, handle: i64, config_json: Stri
 
 /// The log index's status: whether it is on, its watch entries with their
 /// verified coverage, the log count and the catch-up rate — what a host shows
-/// and what decides whether an eth_getLogs range is served.
+/// and what decides whether an eth_getLogs range is served. It shares the
+/// handle's execution slot with the reads, so a poll waits behind a slow one.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn log_index_status_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || take(unsafe { myotis_log_index_status_json(handle) }))
 }
 
-/// Import portable log-index snapshots (`pathsJson`: a JSON array of absolute
-/// file paths, each a self-describing snapshot of this handle's chain), merged
-/// all or nothing; importing is the opt-in, and catch-up starts at once.
-/// Resolves `{"ok":true,"status":…}` (the status as logIndexStatusJson reports
-/// it) or `{"error"}`.
+/// Import portable log-index snapshots (`pathsJson`: a non-empty JSON array of
+/// absolute file paths, each a self-describing snapshot of this handle's
+/// chain), merged all or nothing; importing is the opt-in, and catch-up starts
+/// at once. An imported file is its producer's claim, served as covered
+/// without being re-verified (README). Resolves `{"ok":true,"status":…}` (the
+/// status as logIndexStatusJson reports it) or `{"error"}`.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn import_log_index_files<'env>(env: &'env Env, handle: i64, paths_json: String) -> Result<Object<'env>> {
-    scheduler::submit(env, handle, move || match c_arg(&paths_json) {
-        Ok(p) => take(unsafe { myotis_import_log_index_files(handle, p.as_ptr()) }),
-        Err(_) => NUL_INVALID_PARAMS.to_string(),
+    scheduler::submit(env, handle, move || {
+        let Ok(p) = c_arg(&paths_json) else { return NUL_INVALID_PARAMS.to_string() };
+        if !import_paths_ok(&paths_json) {
+            return invalid_params("expected a non-empty JSON array of file paths");
+        }
+        take(unsafe { myotis_import_log_index_files(handle, p.as_ptr()) })
     })
 }
 
@@ -676,11 +813,94 @@ pub fn import_log_index_files<'env>(env: &'env Env, handle: i64, paths_json: Str
 /// that is not a non-negative safe integer: serve the plain mined nonce then.
 #[napi]
 pub fn pending_nonce_overlay(env: &Env, handle: i64, address_hex: String, mined_nonce: f64) -> i64 {
-    if !scheduler::owns(env, handle) || !safe_integer(mined_nonce) || mined_nonce < 0.0 {
+    let Some(mined) = nonce_arg(mined_nonce) else {
+        return -1;
+    };
+    if !scheduler::owns(env, handle) {
         return -1;
     }
     match c_arg(&address_hex) {
-        Ok(a) => unsafe { myotis_pending_nonce_overlay(handle, a.as_ptr(), mined_nonce as i64) },
+        Ok(a) => unsafe { myotis_pending_nonce_overlay(handle, a.as_ptr(), mined) },
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_count_or_nonce_must_be_a_safe_integer() {
+        for n in [1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2f64.powi(53)] {
+            assert!(!safe_integer(n), "{n}");
+            assert_eq!(nonce_arg(n), None, "{n}");
+        }
+        assert!(safe_integer(4.0) && safe_integer(0.0) && safe_integer(-3.0));
+        assert_eq!(nonce_arg(-1.0), None, "a nonce is never negative");
+        assert_eq!(nonce_arg(7.0), Some(7));
+        assert_eq!(nonce_arg(9_007_199_254_740_991.0), Some(9_007_199_254_740_991));
+    }
+
+    #[test]
+    fn bare_digits_are_refused_and_tags_and_hex_are_not() {
+        for s in ["23500000", " 42 ", "0"] {
+            assert!(bare_digits(s), "{s}");
+        }
+        for s in ["0x166f9e0", "latest", "finalized", "", "  "] {
+            assert!(!bare_digits(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn hex_is_checked_as_the_engine_parses_it() {
+        let addr = "11".repeat(20);
+        for ok in [format!("0x{addr}"), format!("0X{addr}"), addr.clone()] {
+            assert!(hex_of_len(&ok, 20), "{ok}");
+        }
+        assert!(!hex_of_len("0xdead", 20) && !hex_of_len(&format!("0x{addr}00"), 20));
+        assert!(!hex_of_len(&format!("0x{}zz", "11".repeat(19)), 20), "a non-hex digit");
+        assert!(!hex_of_len(&format!(" 0x{addr}"), 20), "no trimming, as the engine does none");
+        assert!(hex_of_len(&format!("0x{}", "cd".repeat(32)), 32));
+    }
+
+    #[test]
+    fn a_short_storage_position_is_padded_to_its_word() {
+        assert_eq!(storage_word("0x0"), Some(format!("0x{}", "0".repeat(64))));
+        assert_eq!(storage_word("0x1f"), Some(format!("0x{}1f", "0".repeat(62))));
+        let full = "ab".repeat(32);
+        assert_eq!(storage_word(&format!("0x{full}")), Some(format!("0x{full}")));
+        for bad in ["0x", "", "0xzz", &format!("0x{full}00")] {
+            assert_eq!(storage_word(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn reward_percentiles_are_checked_as_the_routers_check_them() {
+        assert_eq!(reward_percentiles("").as_deref(), Ok(""));
+        assert_eq!(reward_percentiles("null").as_deref(), Ok(""));
+        // geth answers no reward column for an empty list.
+        assert_eq!(reward_percentiles(" [] ").as_deref(), Ok(""));
+        assert_eq!(reward_percentiles("[25, 50, 50, 75]").as_deref(), Ok("[25, 50, 50, 75]"));
+        for bad in ["[75, 25]", "[101]", "[-1]", "[\"50\"]", "{\"p\":1}", "not json"] {
+            let refusal = reward_percentiles(bad).expect_err(bad);
+            assert!(refusal.contains("\"code\":-32602"), "{bad}: {refusal}");
+        }
+        let many = format!("[{}]", vec!["50"; 101].join(","));
+        assert!(reward_percentiles(&many).is_err());
+    }
+
+    #[test]
+    fn import_paths_must_be_a_non_empty_list_of_paths() {
+        assert!(import_paths_ok(r#"["/a/logindex.db"]"#));
+        for bad in ["[]", r#"[""]"#, r#"["  "]"#, "\"/a\"", "[1]", "nope"] {
+            assert!(!import_paths_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_permanent_invalid_params_with_its_reason_escaped() {
+        let why = "a \"quoted\" reason";
+        let r: serde_json::Value = serde_json::from_str(&invalid_params(why)).unwrap();
+        assert_eq!((r["error"].as_str(), r["code"].as_i64()), (Some(why), Some(-32602)));
     }
 }

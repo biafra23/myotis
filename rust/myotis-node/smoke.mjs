@@ -156,8 +156,9 @@ async function queries(status) {
   if (fees.error) { console.error('fee estimate failed'); failures++; }
 
   // #503: the provider reads a dApp page asks next — the head block, a fee
-  // history and a receipt, the latter for a transaction of the head block.
-  const block = await timed('block latest', m.getBlockByNumberJson(handle, 'latest', false));
+  // history and a receipt. The receipt's transaction comes from the finalized
+  // block, which no reorg can take back between the two reads.
+  const block = await timed('block latest', m.getBlockByNumberJson(handle, 'latest'));
   if (!block?.number || !Array.isArray(block.transactions)) {
     console.error('latest block failed:', JSON.stringify(block)); failures++;
   }
@@ -166,15 +167,19 @@ async function queries(status) {
   if (!history.oldestBlock || !Array.isArray(history.reward)) {
     console.error('fee history failed:', JSON.stringify(history)); failures++;
   }
-  const txHash = block?.transactions?.[0];
+  const finalized = await timed('block finalized', m.getBlockByNumberJson(handle, 'finalized'));
+  if (!finalized?.number || !Array.isArray(finalized.transactions)) {
+    console.error('finalized block failed:', JSON.stringify(finalized)); failures++;
+  }
+  const txHash = finalized?.transactions?.[0];
   if (txHash) {
-    const receipt = await timed('receipt of the head block\'s first tx',
+    const receipt = await timed('receipt of the finalized block\'s first tx',
       m.getTransactionReceiptJson(handle, txHash));
-    if (receipt?.transactionHash !== txHash || receipt.blockNumber !== block.number) {
+    if (receipt?.transactionHash !== txHash || receipt.blockNumber !== finalized.number) {
       console.error('receipt failed:', JSON.stringify(receipt)); failures++;
     }
-  } else {
-    log('receipt check skipped: the head block carries no transaction');
+  } else if (finalized?.number) {
+    log('receipt check skipped: the finalized block carries no transaction');
   }
 
   // Warm-path timing: repeat the ENS resolve now that caches are hot.

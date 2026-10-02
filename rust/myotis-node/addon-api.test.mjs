@@ -232,16 +232,19 @@ test('ethCallTxJson refuses a contradictory transaction object as permanent inva
 // eth_getLogs from, eth_call with a state override and the pending nonce. Each
 // read resolves to the engine's JSON unchanged; these pin, on a handle that
 // was never started (no network needed), the camel-cased exports, the
-// unknown-handle sentinel, the NUL refusal and the engine's own refusals.
+// unknown-handle sentinel, the NUL refusal, and the refusals the addon makes
+// itself where the JSON-RPC routers would check before calling the engine.
+// Every call is awaited before the next: a handle takes four requests at most.
 const ADDR = '0x' + '11'.repeat(20);
 const HASH = '0x' + 'cd'.repeat(32);
 const SLOT0 = '0x' + '00'.repeat(32);
 const FILTER = JSON.stringify({ address: ADDR, fromBlock: '0x1', toBlock: '0x2' });
 const CONFIG = JSON.stringify({ enabled: true, watch: [{ address: ADDR, fromBlock: 1 }] });
 // Each read, called with well-formed arguments, or with `arg` in place of its
-// first string argument.
+// first string argument. `getBlockByNumberJson` omits `fullTransactions`,
+// which defaults to false.
 const READS = {
-  getBlockByNumberJson: (h, arg = 'latest') => m.getBlockByNumberJson(h, arg, false),
+  getBlockByNumberJson: (h, arg = 'latest') => m.getBlockByNumberJson(h, arg),
   getBlockByHashJson: (h, arg = HASH) => m.getBlockByHashJson(h, arg, true),
   feeHistoryJson: (h, arg = 'latest') => m.feeHistoryJson(h, 4, arg, '[25,75]'),
   getTransactionReceiptJson: (h, arg = HASH) => m.getTransactionReceiptJson(h, arg),
@@ -253,6 +256,13 @@ const READS = {
   ethCallOverridesJson: (h, arg = 'latest') => m.ethCallOverridesJson(h, '', ADDR, '', '', arg, ''),
   importLogIndexFiles: (h, arg = JSON.stringify(['/nonexistent/logindex.db'])) => m.importLogIndexFiles(h, arg),
 };
+// What the engine answers on a handle that was never started — a message only
+// the engine produces, so a read that gets it reached the engine. The log
+// index's calls word it as its callers check it.
+const NOT_STARTED = { error: 'handle not started' };
+const NOT_RUNNING = { error: 'node is not running' };
+const notStartedFor = (name) => (['getLogsJson', 'importLogIndexFiles'].includes(name) ? NOT_RUNNING : NOT_STARTED);
+const invalid = (error) => ({ error, code: -32602 });
 
 async function withCreatedHandle(fn) {
   const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
@@ -286,12 +296,21 @@ test('an unknown handle gets the usual sentinel from every new call (#503)', { s
 test('a well-formed read reaches the engine: a not-started handle is a plain, retryable error (#503)', { skip }, async () => {
   await withCreatedHandle(async (h) => {
     for (const [name, read] of Object.entries(READS)) {
-      const r = JSON.parse(await read(h));
-      assert.equal(typeof r.error, 'string', `${name}: ${JSON.stringify(r)}`);
-      assert.equal(r.code, undefined, `${name}: ${JSON.stringify(r)}`);
+      assert.deepEqual(JSON.parse(await read(h)), notStartedFor(name), name);
     }
-    const status = JSON.parse(await m.logIndexStatusJson(h));
-    assert.equal(typeof status.error, 'string', JSON.stringify(status));
+    // What the addon passes on rather than refuses: a short storage position
+    // (padded to its word), no reward column, and bare decimal digits where
+    // the engine reads them as decimal.
+    for (const [label, call] of [
+      ['storage position 0x0', () => m.getStorageAtJson(h, ADDR, '0x0')],
+      ['no reward column', () => m.feeHistoryJson(h, 4, 'latest', '[]')],
+      ['omitted percentiles', () => m.feeHistoryJson(h, 4, 'latest')],
+      ['code at decimal digits', () => m.getCodeJson(h, ADDR, '23500000')],
+      ['override call at decimal digits', () => m.ethCallOverridesJson(h, '', ADDR, '', '', '23500000', '')],
+    ]) {
+      assert.deepEqual(JSON.parse(await call()), NOT_STARTED, label);
+    }
+    assert.deepEqual(JSON.parse(await m.logIndexStatusJson(h)), NOT_STARTED);
     // No EL reader to install it on: refused, which the engine logs.
     assert.deepEqual(JSON.parse(await m.setLogIndexConfig(h, CONFIG)), { ok: false });
     assert.equal(m.pendingNonceOverlay(h, ADDR, 5), -1, 'no reader: serve the mined nonce');
@@ -299,49 +318,66 @@ test('a well-formed read reaches the engine: a not-started handle is a plain, re
 });
 
 test('a NUL byte in a string argument is a permanent refusal (#503)', { skip }, async () => {
-  const nul = { error: 'argument contains NUL', code: -32602 };
+  const nul = invalid('argument contains NUL');
   await withCreatedHandle(async (h) => {
     for (const [name, read] of Object.entries(READS)) {
       assert.deepEqual(JSON.parse(await read(h, 'x\0y')), nul, name);
     }
     assert.deepEqual(JSON.parse(await m.feeHistoryJson(h, 4, 'latest', '[25,\0]')), nul, 'percentiles');
+    assert.deepEqual(JSON.parse(await m.getStorageAtJson(h, ADDR, '0x\0', 'latest')), nul, 'position');
     assert.deepEqual(JSON.parse(await m.getStorageAtJson(h, ADDR, SLOT0, 'lat\0est')), nul, 'block');
     assert.deepEqual(JSON.parse(await m.setLogIndexConfig(h, '{\0}')), nul);
+    // The two older calls whose NUL refusal carried no code now match.
+    assert.deepEqual(JSON.parse(await m.estimateGasJson(h, '\0', ADDR, '', '')), nul, 'estimateGasJson');
+    assert.deepEqual(JSON.parse(await m.sendRawTransactionJson(h, '0x\0')), nul, 'sendRawTransactionJson');
     assert.equal(m.pendingNonceOverlay(h, '0x\0', 5), -1);
   });
 });
 
 test('a request that can never be served is refused permanently, before the handle (#503)', { skip }, async () => {
   await withCreatedHandle(async (h) => {
-    const permanent = async (label, promise) => {
-      const r = JSON.parse(await promise);
+    const refusals = [
+      // Bare digits where the engine would read them as hex.
+      ['block number in digits', () => m.getBlockByNumberJson(h, '23500000'), invalid('a block number must be 0x-hex')],
+      ['receipts selector in digits', () => m.getBlockReceiptsJson(h, '12'), invalid('a block number must be 0x-hex')],
+      ['fee history newest in digits', () => m.feeHistoryJson(h, 4, '23500000', ''), invalid('a block number must be 0x-hex')],
+      // A count that is no integer is refused, never truncated.
+      ...[1.5, NaN, Infinity, 2 ** 53].map((count) =>
+        [`blockCount ${count}`, () => m.feeHistoryJson(h, count, 'latest', ''), invalid('blockCount must be an integer')]),
+      // Reward percentiles, checked as the routers check them.
+      ['percentiles not json', () => m.feeHistoryJson(h, 4, 'latest', 'not json'), invalid('reward percentiles must be a JSON array')],
+      ['percentiles as strings', () => m.feeHistoryJson(h, 4, 'latest', '["50"]'), invalid('reward percentiles must be JSON numbers')],
+      ['percentile above 100', () => m.feeHistoryJson(h, 4, 'latest', '[101]'), invalid('reward percentile 101 is outside [0, 100]')],
+      ['percentiles decreasing', () => m.feeHistoryJson(h, 4, 'latest', '[75,25]'), invalid('reward percentiles must be non-decreasing')],
+      // A malformed address, hash or position.
+      ['receipt hash', () => m.getTransactionReceiptJson(h, '0xdead'), invalid('invalid transaction hash (expected 32-byte hex)')],
+      ['tx hash', () => m.getTransactionByHashJson(h, '0xdead'), invalid('invalid transaction hash (expected 32-byte hex)')],
+      ['block hash', () => m.getBlockByHashJson(h, '0xdead'), invalid('invalid block hash (expected 32-byte hex)')],
+      ['code address', () => m.getCodeJson(h, '0xdead', 'latest'), invalid('invalid address (expected 20-byte hex)')],
+      ['storage address', () => m.getStorageAtJson(h, '0xdead', SLOT0), invalid('invalid address (expected 20-byte hex)')],
+      ['storage position too long', () => m.getStorageAtJson(h, ADDR, '0x' + '1'.repeat(65)),
+        invalid('invalid storage position (expected hex of at most 32 bytes)')],
+      ['storage position not hex', () => m.getStorageAtJson(h, ADDR, '0xzz'),
+        invalid('invalid storage position (expected hex of at most 32 bytes)')],
+      ['empty import', () => m.importLogIndexFiles(h, '[]'), invalid('expected a non-empty JSON array of file paths')],
+      ['import of a non-path', () => m.importLogIndexFiles(h, '[""]'), invalid('expected a non-empty JSON array of file paths')],
+    ];
+    for (const [label, call, expected] of refusals) {
+      assert.deepEqual(JSON.parse(await call()), expected, label);
+    }
+    // The engine's own refusals, made before it consults the handle.
+    for (const [label, call] of [
+      ['block earliest', () => m.getBlockByNumberJson(h, 'earliest', false)],
+      ['feeHistory blockCount 0', () => m.feeHistoryJson(h, 0, 'latest', '')],
+      ['code at a block hash', () => m.getCodeJson(h, ADDR, HASH)],
+      ['logs filter', () => m.getLogsJson(h, 'not json')],
+      ['override call earliest', () => m.ethCallOverridesJson(h, '', ADDR, '', '', 'earliest', '')],
+      ['override malformed', () => m.ethCallOverridesJson(h, '', ADDR, '', '', 'latest', '{"0x11":')],
+    ]) {
+      const r = JSON.parse(await call());
       assert.equal(r.code, -32602, `${label}: ${JSON.stringify(r)}`);
       assert.equal(typeof r.error, 'string', label);
-    };
-    await permanent('block earliest', m.getBlockByNumberJson(h, 'earliest', false));
-    // (getBlockReceiptsJson checks its selector only once the handle runs.)
-    await permanent('feeHistory blockCount 0', m.feeHistoryJson(h, 0, 'latest', ''));
-    // A count that is no integer is refused by the addon, never truncated.
-    for (const count of [1.5, NaN, Infinity, 2 ** 53]) {
-      const r = JSON.parse(await m.feeHistoryJson(h, count, 'latest', ''));
-      assert.deepEqual(r, { error: 'blockCount must be an integer', code: -32602 }, String(count));
     }
-    await permanent('feeHistory percentiles', m.feeHistoryJson(h, 4, 'latest', 'not json'));
-    await permanent('code at a block hash', m.getCodeJson(h, ADDR, HASH));
-    await permanent('logs filter', m.getLogsJson(h, 'not json'));
-    await permanent('override call earliest', m.ethCallOverridesJson(h, '', ADDR, '', '', 'earliest', ''));
-    await permanent('override malformed', m.ethCallOverridesJson(h, '', ADDR, '', '', 'latest', '{"0x11":'));
-    // A malformed address or hash is refused too, as a plain error (the
-    // engine's shape for it; the JSON-RPC routers check hex before calling).
-    for (const [label, promise] of [
-      ['receipt hash', m.getTransactionReceiptJson(h, '0xdead')],
-      ['tx hash', m.getTransactionByHashJson(h, '0xdead')],
-      ['block hash', m.getBlockByHashJson(h, '0xdead', false)],
-      ['code address', m.getCodeJson(h, '0xdead', 'latest')],
-    ]) {
-      assert.match(JSON.parse(await promise).error, /^invalid .* \(expected (20|32)-byte hex\)$/, label);
-    }
-    assert.match(JSON.parse(await m.importLogIndexFiles(h, '[]')).error, /non-empty JSON array/);
     // The pending nonce takes a non-negative safe integer.
     for (const nonce of [-1, 1.5, NaN, 2 ** 53]) {
       assert.equal(m.pendingNonceOverlay(h, ADDR, nonce), -1, String(nonce));
