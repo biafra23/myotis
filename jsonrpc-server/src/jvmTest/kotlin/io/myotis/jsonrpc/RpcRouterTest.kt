@@ -845,6 +845,42 @@ class RpcRouterTest {
             """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")))
     }
 
+    /** A backend whose detailed send answers [outcome] (#531). */
+    private fun sending(outcome: io.myotis.api.SendResult) = object : VerifiedReads by FakeBackend() {
+        override fun sendRawTransactionDetailed(rawTx: ByteArray?): io.myotis.api.SendResult = outcome
+    }
+
+    @Test fun sendRawTransaction_rejected_isGethsVerdictAt32000() {
+        // #531: refused before broadcast — geth's txpool words, verbatim under
+        // geth's -32000, which ethers v6 and viem classify (INSUFFICIENT_FUNDS,
+        // NONCE_EXPIRED). No hash: nothing was sent.
+        for (reason in listOf(
+            "insufficient funds for gas * price + value: balance 1, tx cost 2, overshot 1",
+            "nonce too low: next nonce 10, tx nonce 9",
+        )) {
+            val resp = route(sending(io.myotis.api.SendResult.rejected(reason)),
+                """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")
+            assertEquals(-32000, errorCode(resp))
+            val error = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+            assertEquals(reason, error["message"]!!.jsonPrimitive.content)
+            assertTrue("result" !in json.parseToJsonElement(resp).jsonObject)
+        }
+    }
+
+    @Test fun sendRawTransaction_unavailable_keepsTheStrictPath() {
+        val resp = route(sending(io.myotis.api.SendResult.unavailable("no peer available to broadcast the transaction")),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")
+        assertTrue(hasError(resp))
+        assertEquals(-32000, errorCode(resp))
+    }
+
+    @Test fun sendRawTransaction_sentDetailed_isTheHash() {
+        val hash = ByteArray(32).also { it[0] = 0x0a }
+        val resp = route(sending(io.myotis.api.SendResult.sent(hash)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")
+        assertEquals("0x0a" + "00".repeat(31), result(resp))
+    }
+
     @Test fun getTransactionReceipt_verified_embedsReceiptObject() {
         val b = FakeBackend().apply {
             receiptJson = """{"status":"0x1","blockNumber":"0x10","transactionHash":"0xab","logs":[]}"""

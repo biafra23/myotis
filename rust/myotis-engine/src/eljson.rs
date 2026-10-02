@@ -755,6 +755,16 @@ pub fn tx_hash_json(hash: &[u8; 32]) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// `eth_sendRawTransaction` refused before broadcast (ABI ≥ 36, #531):
+/// `{"status":"rejected","reason":"…"}`, the reason being geth's txpool
+/// verdict in geth's words, which hosts serve verbatim under geth's -32000.
+pub fn send_rejected_json(reason: &str) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".into(), "rejected".into());
+    obj.insert("reason".into(), reason.into());
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
     format!("0x{v:x}")
@@ -1730,5 +1740,18 @@ mod get_logs_json_tests {
         );
         assert_eq!(super::get_logs_json(&[log]), expected);
         assert_eq!(super::get_logs_json(&[]), "[]");
+    }
+
+    #[test]
+    fn a_send_is_a_hash_or_geths_refusal() {
+        // The hosts' golden twins pin the same two shapes (#531, ABI 36).
+        let sent: serde_json::Value = serde_json::from_str(&super::tx_hash_json(&[0xab; 32])).unwrap();
+        assert_eq!(sent["txHash"], format!("0x{}", "ab".repeat(32)));
+        assert!(sent.get("status").is_none(), "the success shape predates ABI 36 and is unchanged");
+        let reason = "insufficient funds for gas * price + value: balance 1, tx cost 2, overshot 1";
+        let rejected: serde_json::Value = serde_json::from_str(&super::send_rejected_json(reason)).unwrap();
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["reason"], reason);
+        assert!(rejected.get("txHash").is_none(), "nothing was sent");
     }
 }

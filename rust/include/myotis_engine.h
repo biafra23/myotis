@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 35
+#define MYOTIS_ABI_VERSION 36
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -249,7 +249,9 @@ char *myotis_fee_estimate_json(int64_t handle);
 char *myotis_fee_history_json(int64_t handle, int64_t block_count,
                               const char *newest_block_tag,
                               const char *percentiles_json);
-/* {"txHash":"0x..."} or {"error"}. */
+/* {"txHash":"0x..."}, {"status":"rejected","reason"} (ABI >= 36: never
+ * broadcast; reason = geth's txpool verdict, served under -32000), or
+ * {"error"}. */
 char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
 
 /* Release any char* returned by the functions above. NULL is a no-op. */

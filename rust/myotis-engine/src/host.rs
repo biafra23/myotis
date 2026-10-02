@@ -2416,8 +2416,12 @@ pub fn get_block_by_hash_json(
 
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
 /// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
-/// no peer could be reached / the input isn't a plausible tx. A WRITE — nothing is
-/// beacon-verified; the engine never signs. `raw_hex` is the 0x-hex raw tx.
+/// no peer could be reached / the input isn't a plausible tx. A WRITE — the
+/// engine never signs. Since ABI 36, `{"status":"rejected","reason":"…"}` for a
+/// transaction its sender cannot pay for or whose nonce is used, judged on
+/// fresh verified state and never broadcast (#531): the reason is geth's
+/// txpool verdict, which hosts serve verbatim under geth's -32000. `raw_hex` is
+/// the 0x-hex raw tx.
 pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     let Some(raw) = parse_hex_bytes(raw_hex) else {
         return eljson::error_json("invalid raw transaction hex");
@@ -2432,9 +2436,11 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(reader.request(async { reader.send_raw_transaction(&raw).await })) {
-        Ok(hash) => eljson::tx_hash_json(&hash),
-        Err(e) => eljson::error_json(&e),
+    use myotis_net::el::reader::SendError;
+    match engine.rt.block_on(reader.request(async { Ok(reader.send_raw_transaction(&raw).await) })) {
+        Ok(Ok(hash)) => eljson::tx_hash_json(&hash),
+        Ok(Err(SendError::Rejected(reason))) => eljson::send_rejected_json(&reason),
+        Ok(Err(SendError::Unavailable(e))) | Err(e) => eljson::error_json(&e),
     }
 }
 

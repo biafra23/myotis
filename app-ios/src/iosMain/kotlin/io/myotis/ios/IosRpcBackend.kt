@@ -3,6 +3,7 @@ package io.myotis.ios
 import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
+import io.myotis.jsonrpc.RpcSendResult
 import io.myotis.jsonrpc.RpcBlockWindow
 import io.myotis.jsonrpc.RpcTransactionArgs
 import kotlinx.serialization.json.JsonNull
@@ -301,15 +302,28 @@ class IosRpcBackend(
         }
     }
 
-    override fun sendRawTransaction(rawTx: ByteArray): ByteArray? {
-        if (rawTx.isEmpty()) return null
-        val handle = handleProvider() ?: return null
-        val o = resultOrNull(RustEngine.sendRawTransactionJson(handle, hex(rawTx))) ?: return null
+    override fun sendRawTransaction(rawTx: ByteArray): ByteArray? =
+        sendRawTransactionDetailed(rawTx).takeIf { it.kind == RpcSendResult.Kind.SENT }?.txHash
+
+    override fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
+        if (rawTx.isEmpty()) return RpcSendResult.unavailable("empty raw transaction")
+        val handle = handleProvider() ?: return RpcSendResult.unavailable()
+        val o = resultOrNull(RustEngine.sendRawTransactionJson(handle, hex(rawTx)))
+            ?: return RpcSendResult.unavailable()
+        // Refused before broadcast (ABI >= 36, #531): geth's txpool verdict,
+        // which the router serves under -32000. A reason-less refusal fails
+        // closed (JNI parity: RustChainHandle.sendResultFromJson throws).
+        if (o.engineString("status") == "rejected") {
+            val reason = o.engineString("reason")?.takeIf { it.isNotBlank() }
+                ?: return RpcSendResult.unavailable("send rejected without a reason")
+            return RpcSendResult.rejected(reason)
+        }
         // Fail CLOSED on a missing/short hash (JNI parity: txHashFromJson throws,
-        // the adapter maps it to null → strict -32000). A success "0x" here would
-        // tell the wallet a send succeeded with a bogus hash.
-        val hash = o.engineString("txHash")?.let(::hexToBytes) ?: return null
-        return hash.takeIf { it.size == 32 }
+        // the adapter maps it to unavailable → strict -32000). A success "0x" here
+        // would tell the wallet a send succeeded with a bogus hash.
+        val hash = o.engineString("txHash")?.let(::hexToBytes)?.takeIf { it.size == 32 }
+            ?: return RpcSendResult.unavailable()
+        return RpcSendResult.sent(hash)
     }
 
     override fun getTransactionReceipt(txHash: ByteArray): String? {

@@ -737,4 +737,39 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class,
                 () -> RustChainHandle.txHashFromJson("{\"txHash\":\"0xdead\"}"));
     }
+
+    // ---- eth_sendRawTransaction outcomes (sendResultFromJson, ABI 36, #531) ----
+    // The Rust golden twin: eljson's a_send_is_a_hash_or_geths_refusal.
+
+    @Test
+    void sendTxHashIsSent() {
+        io.myotis.api.SendResult r =
+                RustChainHandle.sendResultFromJson("{\"txHash\":\"0x" + "ab".repeat(32) + "\"}");
+        assertEquals(io.myotis.api.SendResult.Status.SENT, r.status());
+        assertEquals(32, r.txHash().length);
+    }
+
+    @Test
+    void sendTxRejectionIsGethsVerdictNotAHash() {
+        String reason = "insufficient funds for gas * price + value: balance 1, tx cost 2, overshot 1";
+        io.myotis.api.SendResult r = RustChainHandle.sendResultFromJson(
+                "{\"status\":\"rejected\",\"reason\":\"" + reason + "\"}");
+        assertEquals(io.myotis.api.SendResult.Status.REJECTED, r.status());
+        assertEquals(reason, r.detail());
+        assertNull(r.txHash());
+    }
+
+    @Test
+    void sendTxRejectionWithoutAReasonFailsClosed() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"status\":\"rejected\"}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"status\":\"rejected\",\"reason\":\" \"}"));
+    }
+
+    @Test
+    void sendTxErrorIsStillAnEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.sendResultFromJson(
+                "{\"error\":\"no peer available to broadcast the transaction\"}"));
+    }
 }

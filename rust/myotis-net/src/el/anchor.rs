@@ -69,6 +69,11 @@ struct Inner {
     optimistic_block_number: u64,
     optimistic_block_hash: Option<[u8; 32]>,
     optimistic_state_root: Option<[u8; 32]>,
+    /// The optimistic execution block's own timestamp (unix seconds), proven
+    /// with it: the light-client payload header carries it, and a resolved
+    /// Gloas header is the one that hashes to the proven block hash. 0 until
+    /// a head lands.
+    optimistic_timestamp: u64,
     known_roots: VecDeque<SlottedStateRoot>,
     finality_current: bool,
     /// Gloas: a finalized execution block hash the light client proved at this
@@ -123,13 +128,15 @@ impl ExecAnchor {
     }
 
     /// Record the optimistic (attested) execution head (~1-2 slots behind wall
-    /// clock, vs ~2 epochs for finalized). Also appends to the window.
+    /// clock, vs ~2 epochs for finalized), with its execution timestamp. Also
+    /// appends to the window.
     pub fn update_optimistic(
         &self,
         optimistic_slot: u64,
         optimistic_block_number: u64,
         optimistic_block_hash: [u8; 32],
         optimistic_state_root: [u8; 32],
+        optimistic_timestamp: u64,
     ) {
         let mut inner = self.inner.lock().expect("anchor mutex");
         set_optimistic(
@@ -138,6 +145,7 @@ impl ExecAnchor {
             optimistic_block_number,
             optimistic_block_hash,
             optimistic_state_root,
+            optimistic_timestamp,
         );
     }
 
@@ -228,7 +236,7 @@ impl ExecAnchor {
         if hash != header.hash {
             return false;
         }
-        let (number, root) = (header.header.number, header.header.state_root);
+        let (number, root, timestamp) = (header.header.number, header.header.state_root, header.header.timestamp);
         let mut inner = self.inner.lock().expect("anchor mutex");
         let mut adopted = false;
         if let Some((slot, pending)) = inner.pending_finalized {
@@ -240,7 +248,7 @@ impl ExecAnchor {
         }
         if let Some((slot, pending)) = inner.pending_optimistic {
             if pending == hash {
-                set_optimistic(&mut inner, slot, number, hash, root);
+                set_optimistic(&mut inner, slot, number, hash, root, timestamp);
                 inner.pending_optimistic = None;
                 adopted = true;
             }
@@ -344,6 +352,15 @@ impl ExecAnchor {
             .map(|root| (inner.optimistic_block_number, root))
     }
 
+    /// The optimistic execution head's `(block_number, timestamp)` read under
+    /// ONE lock: how old the state a head read answers from is (#531). `None`
+    /// until a head with its timestamp lands.
+    pub fn optimistic_head_time(&self) -> Option<(u64, u64)> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        (inner.optimistic_state_root.is_some() && inner.optimistic_timestamp > 0)
+            .then_some((inner.optimistic_block_number, inner.optimistic_timestamp))
+    }
+
     /// The `stateRootMatch` fast-path lookup: is `state_root` a root the beacon
     /// client already recorded? Searches NEWEST-first (twin of
     /// `findStateRoot`'s `descendingIterator`) so the freshest/best match wins.
@@ -375,11 +392,12 @@ fn set_finalized(inner: &mut Inner, slot: u64, state_root: [u8; 32], number: u64
     push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
-fn set_optimistic(inner: &mut Inner, slot: u64, number: u64, hash: [u8; 32], state_root: [u8; 32]) {
+fn set_optimistic(inner: &mut Inner, slot: u64, number: u64, hash: [u8; 32], state_root: [u8; 32], timestamp: u64) {
     inner.optimistic_slot = slot;
     inner.optimistic_block_number = number;
     inner.optimistic_block_hash = Some(hash);
     inner.optimistic_state_root = Some(state_root);
+    inner.optimistic_timestamp = timestamp;
     push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
@@ -453,7 +471,10 @@ mod tests {
         assert_eq!(anchor.finalized_slot(), 100);
 
         assert_eq!(anchor.optimistic_head(), None); // no optimistic update yet
-        anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2));
+        assert_eq!(anchor.optimistic_head_time(), None);
+        anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2), 1_700_000_000);
+        // The head's age comes with it, under the same lock (#531).
+        assert_eq!(anchor.optimistic_head_time(), Some((21_000_005, 1_700_000_000)));
         assert_eq!(anchor.optimistic_block_hash(), Some(root(0xf2)));
         assert_eq!(anchor.optimistic_block_number(), 21_000_005);
         assert_eq!(anchor.optimistic_head(), Some((21_000_005, root(0xf2))));
@@ -514,12 +535,14 @@ mod tests {
         assert_eq!(anchor.known_root_count(), 3);
     }
 
-    /// A genuine header (raw RLP, keccak hash) with this number and state root.
+    /// A genuine header (raw RLP, keccak hash) with this number and state
+    /// root, timestamped 12 s per block from 1 700 000 000.
     fn header(number: u64, state_root: [u8; 32]) -> VerifiedHeader {
         let (_, genesis) = crate::el::served::mainnet_genesis().expect("embedded genesis");
         let mut h = myotis_core::header::BlockHeader::decode(&genesis).expect("genesis decodes");
         h.number = number;
         h.state_root = state_root;
+        h.timestamp = 1_700_000_000 + 12 * number;
         let raw_rlp = h.encode();
         VerifiedHeader {
             hash: myotis_core::keccak::keccak256(&raw_rlp),
@@ -656,6 +679,8 @@ mod tests {
         assert!(anchor.resolve_header(&h));
         assert_eq!(anchor.optimistic_head(), Some((9, h.hash)));
         assert_eq!(anchor.optimistic_execution(), Some((9, root(9))));
+        // A Gloas head's age is its resolved header's own timestamp (#531).
+        assert_eq!(anchor.optimistic_head_time(), Some((9, 1_700_000_108)));
         assert_eq!(
             anchor.finalized_execution().map(|f| f.block_number),
             Some(9)

@@ -78,6 +78,28 @@ class RpcEstimateResult private constructor(
     }
 }
 
+/**
+ * `io.myotis.api.SendResult`'s pure-Kotlin mirror: the outcome of a detailed
+ * `eth_sendRawTransaction` (#531). REJECTED is an answer, not a failure: judged
+ * on fresh verified state, the transaction can never be mined as sent, nothing
+ * was broadcast, and [detail] is geth's txpool verdict ("insufficient funds for
+ * gas * price + value: …", "nonce too low: …"), served verbatim under geth's
+ * -32000 so wallets classify it. UNAVAILABLE keeps the retryable -32000 path.
+ */
+class RpcSendResult private constructor(
+    val kind: Kind,
+    val txHash: ByteArray?,
+    val detail: String?,
+) {
+    enum class Kind { SENT, REJECTED, UNAVAILABLE }
+
+    companion object {
+        fun sent(txHash: ByteArray): RpcSendResult = RpcSendResult(Kind.SENT, txHash, null)
+        fun rejected(detail: String): RpcSendResult = RpcSendResult(Kind.REJECTED, null, detail)
+        fun unavailable(detail: String? = null): RpcSendResult = RpcSendResult(Kind.UNAVAILABLE, null, detail)
+    }
+}
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
@@ -161,6 +183,15 @@ interface RpcBackend {
     fun getCode(address: ByteArray, block: String): ByteArray?
     fun getStorageAt(address: ByteArray, slot32: ByteArray, block: String): ByteArray?
     fun sendRawTransaction(rawTx: ByteArray): ByteArray?
+
+    /** [sendRawTransaction] with its outcome told apart (#531): an engine that
+     *  judges a send before broadcasting it refuses one that can never be mined
+     *  as sent ([RpcSendResult.Kind.REJECTED], geth's reason). The default wraps
+     *  [sendRawTransaction]: a hash is SENT, null UNAVAILABLE. */
+    fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
+        val hash = sendRawTransaction(rawTx)
+        return if (hash == null) RpcSendResult.unavailable() else RpcSendResult.sent(hash)
+    }
     fun getTransactionReceipt(txHash: ByteArray): String?
     fun getTransactionByHash(txHash: ByteArray): String?
     /** Tri-state like the other JSON methods, but the found form is an ARRAY
