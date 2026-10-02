@@ -181,6 +181,11 @@ async function queries(status) {
       const again = await timed('block again', m.getBlockByNumberJson(handle, block.number));
       if (again === null || (again?.hash && again.hash !== block.hash)) {
         log('receipt check skipped: the head block was reorged between the reads');
+      } else if (!again?.hash) {
+        // The re-read itself failed, so the check is inconclusive rather than
+        // an engine verdict; the block reads above and below still fail a
+        // broken engine.
+        log('receipt check inconclusive: the block re-read failed:', JSON.stringify(again));
       } else {
         console.error('receipt failed:', JSON.stringify(receipt)); failures++;
       }

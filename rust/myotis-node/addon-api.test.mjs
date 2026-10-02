@@ -355,7 +355,8 @@ test('a request that can never be served is refused permanently, before the hand
       ...[1.5, NaN, Infinity, 2 ** 53].map((count) =>
         [`blockCount ${count}`, () => m.feeHistoryJson(h, count, 'latest', ''), invalid('blockCount must be an integer')]),
       // Reward percentiles, checked as the routers check them.
-      ['percentiles not json', () => m.feeHistoryJson(h, 4, 'latest', 'not json'), invalid('reward percentiles must be a JSON array')],
+      ['percentiles not json', () => m.feeHistoryJson(h, 4, 'latest', 'not json'), invalid('reward percentiles must be a JSON array of numbers')],
+      ['percentile past f64', () => m.feeHistoryJson(h, 4, 'latest', '[1e400]'), invalid('reward percentiles must be a JSON array of numbers')],
       ['percentiles as strings', () => m.feeHistoryJson(h, 4, 'latest', '["50"]'), invalid('reward percentiles must be JSON numbers')],
       ['percentile above 100', () => m.feeHistoryJson(h, 4, 'latest', '[101]'), invalid('reward percentile 101 is outside [0, 100]')],
       ['percentiles decreasing', () => m.feeHistoryJson(h, 4, 'latest', '[75,25]'), invalid('reward percentiles must be non-decreasing')],

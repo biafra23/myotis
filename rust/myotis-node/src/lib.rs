@@ -586,7 +586,9 @@ fn reward_percentiles(json: &str) -> std::result::Result<String, String> {
     if json.is_empty() || json == "null" {
         return Ok(String::new());
     }
-    let not_an_array = || invalid_params("reward percentiles must be a JSON array");
+    // A numeral past f64's range fails the parse itself, so the message names
+    // the numbers too.
+    let not_an_array = || invalid_params("reward percentiles must be a JSON array of numbers");
     let parsed: serde_json::Value = serde_json::from_str(json).map_err(|_| not_an_array())?;
     let list = parsed.as_array().ok_or_else(not_an_array)?;
     if list.is_empty() {
@@ -935,7 +937,7 @@ mod tests {
         let long = format!("[{}]", vec!["50.000000000000000000000000000000000000001"; 100].join(","));
         assert!(long.len() > 4096);
         assert_eq!(reward_percentiles(&long).map(|p| p.len() <= 4096), Ok(true));
-        for bad in ["[75, 25]", "[101]", "[-1]", "[\"50\"]", "{\"p\":1}", "not json"] {
+        for bad in ["[75, 25]", "[101]", "[-1]", "[\"50\"]", "{\"p\":1}", "not json", "[1e400]"] {
             let refusal = reward_percentiles(bad).expect_err(bad);
             assert!(refusal.contains("\"code\":-32602"), "{bad}: {refusal}");
         }
