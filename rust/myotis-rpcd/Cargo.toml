@@ -1,0 +1,26 @@
+[package]
+name = "myotis-rpcd"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Standalone JSON-RPC daemon over the myotis-engine verified reads — no JVM"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The engine's public `ffi` surface (plus the one `capi` entry `ffi` has no
+# wrapper for, create-with-checkpoint). Default features: no Tor.
+myotis-engine = { path = "../myotis-engine" }
+# No tokio and no tracing here: the engine owns its runtime and its log ring,
+# and this crate only ever calls the engine's blocking functions.
+serde_json = "1"
+# Only for `IgnoredAny` (counting a long result's elements in the call log
+# without building them); already in the lock through serde_json.
+serde = "1"
+# clap is already in the lock (uniffi); its default `color` feature is left off
+# because it alone would add six crates to it.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+# A blocking HTTP/1.1 server: every engine read blocks (it may hold for a
+# verified head), so a fixed worker pool over a synchronous server is the whole
+# design — see main.rs. No async stack is linked for it.
+tiny_http = "0.12"
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
