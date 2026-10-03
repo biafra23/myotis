@@ -159,7 +159,10 @@ class BeaconLightClientGloasTest {
             blc.setBlobParameters(275712L, 21L);
             byte[] fulu = hex("74d01459");
             byte[] gloas = hex("669e6c11");
-            assertArrayEquals(fulu, blc.relayDigest(11_209_280L)); // the pinned checkpoint's slot
+            // A Fulu-era slot (v0.1.12's Sepolia checkpoint), kept as a literal so a
+            // checkpoint refresh never moves it: every slot below the Gloas epoch's
+            // first slot keeps the Fulu digest.
+            assertArrayEquals(fulu, blc.relayDigest(11_209_280L));
             assertArrayEquals(fulu, blc.relayDigest(353_024L * 32 - 1));
             assertArrayEquals(gloas, blc.relayDigest(353_024L * 32));
         } finally {
