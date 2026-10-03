@@ -57,7 +57,7 @@ exclude = ["tor-poc", "roost"]
 # and `verifyRustVersionFloor` fails `check` when a lock update pulls in a
 # crate that needs more.
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 rust-version = "1.91"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
