@@ -22,9 +22,11 @@ phone says where the coverage came from.
 ## What you need
 
 - **The Rust engine.** The log index exists only there. It is the default:
-  leave Settings → **Prefer Java engine** off. The Status tab's per-network
-  engine badge should read Rust. An APK built with `-PskipRustEngine` cannot
-  do this. With a forced Java engine the Index tab is not shown at all.
+  leave Settings → **Prefer Java engine** off. The network chips in the header
+  show each network's engine as a one-letter suffix (`NetworkChips`):
+  "Sepolia (r)" is the Rust engine, "(j)" would be the Java one. An APK built
+  with `-PskipRustEngine` cannot do this. With a forced Java engine the Index
+  tab is not shown at all.
 - **The framed seed.** Not the release asset itself, which is a raw fetch;
   step 1 frames it. Start with Sepolia: it is 9 MB instead of 261 MB, imports
   in moments, and needs no real funds.
@@ -230,9 +232,17 @@ The [Terminal Wallet CLI](https://github.com/Terminal-Wallet/terminal-wallet-cli
 which the desktop PoC targets, accepts `http://` endpoints. Running it on the
 phone is **untested**. It needs Node ≥ 20 and the native `leveldown` module.
 `leveldown` 6.1.1 ships an `android-arm64` prebuild, which may let plain Termux
-work; a `proot-distro` Debian inside Termux is the fallback. Set
-`REMOTE_CONFIG_RPC=http://127.0.0.1:8545` so its remote-config lookup does not
-go to a public RPC as well.
+work; a `proot-distro` Debian inside Termux is the fallback.
+
+Its RPC list is not the only RPC it uses. At start it also reads a remote config
+with one `eth_call` (`getConfig()` on `0x5e982525d50046A813DBf55Ae72a3E00e99fbC94`,
+an Ethereum mainnet contract). That call goes to `REMOTE_CONFIG_RPC`, or to
+`https://ethereum-rpc.publicnode.com` when the variable is unset
+(`loadConfigForNetwork`, `src/railgun/network/network-util.ts` in its source as
+of 2026-08-20). Set `REMOTE_CONFIG_RPC=http://127.0.0.1:8545` to keep that call
+on the phone. The call needs mainnet running in Myotis even when you test on
+Sepolia. If it fails, the wallet logs it and falls back to its built-in
+defaults.
 
 ## Shelf life, storage, and removal
 
