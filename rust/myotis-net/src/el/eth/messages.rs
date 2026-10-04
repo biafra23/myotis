@@ -509,7 +509,8 @@ fn collect_hashes(items: Vec<&[u8]>) -> Vec<[u8; 32]> {
 /// however small, so it waits for [`BlockReceipts::canonical`]. That takes the
 /// block's transaction count from its verified body, and refuses any other
 /// count before recomputing anything: a peer cannot make us expand more
-/// receipts than the block holds (#454).
+/// receipts than the block holds (#454). A caller without the body bounds the
+/// count from the trusted header instead — [`BlockReceipts::canonical_at_most`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockReceipts {
     /// eth/66-68: each element is already the receipts-trie value.
@@ -534,7 +535,8 @@ impl BlockReceipts {
     /// transactions. Any other number of receipts is an error, raised before an
     /// eth/69 bloom is recomputed. The count must come from the block's
     /// transactionsRoot-verified body: that is what bounds the expansion, so
-    /// every caller verifies the body first.
+    /// every caller that has the body verifies it first. One that does not
+    /// uses [`Self::canonical_at_most`].
     pub fn canonical(&self, verified_tx_count: usize) -> Result<Cow<'_, RawList>, CoreError> {
         if self.len() != verified_tx_count {
             return Err(CoreError(format!(
@@ -542,6 +544,27 @@ impl BlockReceipts {
                 self.len()
             )));
         }
+        self.expand()
+    }
+
+    /// The receipts-trie values of a block whose body is NOT in hand (#544):
+    /// at most `max_count` receipts, refused before an eth/69 bloom is
+    /// recomputed. `max_count` must come from data that is already trusted —
+    /// the anchored header's `gasUsed` — because it is the only thing bounding
+    /// the expansion here. It is an upper bound, not the block's count: the
+    /// caller's `receiptsRoot` check is what pins that.
+    pub fn canonical_at_most(&self, max_count: usize) -> Result<Cow<'_, RawList>, CoreError> {
+        if self.len() > max_count {
+            return Err(CoreError(format!(
+                "{} receipts, more than the {max_count} the block can hold",
+                self.len()
+            )));
+        }
+        self.expand()
+    }
+
+    /// The expansion itself. Private: every way in bounds the count first.
+    fn expand(&self) -> Result<Cow<'_, RawList>, CoreError> {
         match self {
             BlockReceipts::Canonical(list) => Ok(Cow::Borrowed(list)),
             BlockReceipts::Eth69(wire) => {
@@ -1313,6 +1336,16 @@ mod tests {
         let canonical = blocks[0].canonical(2).unwrap();
         let fields = rlp::decode(canonical.get(0).unwrap()).unwrap();
         assert_eq!(fields.as_list().unwrap()[2].as_bytes().unwrap(), &EMPTY_BLOOM[..]);
+        // Without a body the count is only bounded from above (#544): more
+        // receipts than the bound are refused before any bloom is recomputed,
+        // and anything within it expands to the same values.
+        assert_eq!(
+            blocks[0].canonical_at_most(1).unwrap_err().0,
+            "2 receipts, more than the 1 the block can hold"
+        );
+        for max in [2, 3] {
+            assert_eq!(blocks[0].canonical_at_most(max).unwrap(), canonical);
+        }
 
         // A malformed receipt still fails the response on decode, as before.
         for (bad, error) in [

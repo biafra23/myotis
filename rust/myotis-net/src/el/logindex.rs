@@ -85,11 +85,18 @@ impl LogIndexConfig {
     /// fetchers can pre-filter against a captured config snapshot instead of
     /// buffering every log of every candidate block.
     pub fn watches(&self, log: &StoredLog) -> bool {
+        self.watches_parts(log.block_number, &log.address, log.topics.first())
+    }
+
+    /// [`Self::watches`] for a log that is not a [`StoredLog`] yet: the three
+    /// things the rule reads. A receipts-only scan asks this before the block's
+    /// body (and so the log's transaction hash) has been fetched at all (#544).
+    /// One rule for both, so the scan and the store cannot disagree.
+    pub fn watches_parts(&self, block_number: u64, address: &[u8; 20], topic0: Option<&[u8; 32]>) -> bool {
         self.watch.iter().any(|w| {
-            w.address == log.address
-                && log.block_number >= w.from_block
-                && (w.topic0s.is_empty()
-                    || log.topics.first().is_some_and(|t| w.topic0s.contains(t)))
+            w.address == *address
+                && block_number >= w.from_block
+                && (w.topic0s.is_empty() || topic0.is_some_and(|t| w.topic0s.contains(t)))
         })
     }
 
