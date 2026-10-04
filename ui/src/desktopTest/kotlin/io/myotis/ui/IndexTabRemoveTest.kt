@@ -1,0 +1,223 @@
+package io.myotis.ui
+
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isSelectable
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+
+/**
+ * Remove on the Index tab has to REACH the engine. Its config push is additive,
+ * so a contract that merely left the list stayed indexed — the walk kept going
+ * and the logs stayed. These pin what the tab now does instead: mark the address
+ * removed and push, after asking; and offer the contracts the engine indexes
+ * behind the list's back (earlier removals, old imports) for the same treatment.
+ */
+class IndexTabRemoveTest {
+
+    @get:Rule
+    val rule = createComposeRule()
+
+    private val a = "0x45a1502382541cd610cc9068e88727426b696293"
+    private val b = "0xb20c66c4de72433f3ce747b58b86830c459ca911"
+    private val c = "0x58e8dcc13be9780fc42e8723d8ead4cf46943df2"
+
+    private class IndexSettings(
+        var watchJson: String,
+        private var enabled: Boolean = true,
+    ) : Settings by FakeSettings() {
+        private var configured = enabled
+        var maxSpeed = false
+        var backfillPaused = false
+        override fun logIndexEnabled(network: String): Boolean = enabled
+        override fun setLogIndexEnabled(network: String, on: Boolean) {
+            enabled = on
+            configured = true
+        }
+        override fun logIndexConfigured(network: String): Boolean = configured
+        override fun logIndexWatchJson(network: String): String = watchJson
+        override fun setLogIndexWatchJson(network: String, json: String) { watchJson = json }
+        override fun logIndexMaxSpeed(network: String): Boolean = maxSpeed
+        override fun setLogIndexMaxSpeed(network: String, on: Boolean) { maxSpeed = on }
+        override fun logIndexBackfillPaused(network: String): Boolean = backfillPaused
+        override fun setLogIndexBackfillPaused(network: String, on: Boolean) { backfillPaused = on }
+
+        /** What the host would push right now. */
+        fun push(): String? =
+            LogIndexWatch.configJson(watchJson, enabled, maxSpeed, configured, backfillPaused)
+    }
+
+    /** A running mainnet whose engine indexes [indexed]. */
+    private class Engine(indexed: List<String>, private val backfillPaused: Boolean = false) : FakeController() {
+        var applied = 0
+        private val status = indexed.joinToString(
+            ",",
+            """{"enabled":true,"logCount":12,"maxSpeed":false,"backfillPaused":$backfillPaused,"entries":[""",
+            "]}",
+        ) { """{"address":"$it","fromBlock":100,"coveredLow":100,"coveredHigh":200}""" }
+        override val running: Boolean = true
+        override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
+            flowOf(mapOf("mainnet" to runningMainnetSnapshot().copy(logIndexJson = status)))
+        override fun applyLogIndex(network: String) { applied++ }
+    }
+
+    private fun store(vararg addresses: String) =
+        LogIndexWatch.serialize(addresses.map { LogIndexWatch.Entry(it, 100) })
+
+    @Test
+    fun `remove asks first, then marks the contract and pushes`() {
+        val settings = IndexSettings(store(a, b))
+        val engine = Engine(listOf(a, b))
+        open(engine, settings)
+
+        rule.onAllNodesWithText("Remove")[0].performScrollTo().performClick()
+        pumpFrames()
+        // Nothing happens until the user confirms: the logs are not recoverable.
+        rule.onNodeWithText("Remove this contract?").assertIsDisplayed()
+        assertEquals(store(a, b), settings.watchJson)
+        assertEquals(0, engine.applied)
+
+        rule.onNodeWithTag(INDEX_REMOVE_CONFIRM_TAG).performClick()
+        pumpFrames()
+        assertEquals(listOf(LogIndexWatch.Entry(b, 100)), LogIndexWatch.parse(settings.watchJson))
+        assertEquals(1, engine.applied)
+        assertTrue(settings.push()!!, settings.push()!!.contains(""""unwatch":["$a"]"""))
+        // Until the engine has taken the push it still reports the contract;
+        // the tab says what is happening to it rather than offering it again.
+        rule.onNodeWithText("removing…").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Indexed, but not in your list").assertDoesNotExist()
+    }
+
+    @Test
+    fun `cancelling the dialog removes nothing`() {
+        val settings = IndexSettings(store(a))
+        val engine = Engine(listOf(a))
+        open(engine, settings)
+
+        rule.onNodeWithText("Remove").performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithText("Cancel").performClick()
+        pumpFrames()
+        assertEquals(store(a), settings.watchJson)
+        assertEquals(0, engine.applied)
+    }
+
+    @Test
+    fun `contracts the engine indexes behind the list are offered for cleanup`() {
+        // b and c are indexed but not listed: removed back when Remove only
+        // edited the list, or brought in by an old import.
+        val settings = IndexSettings(store(a))
+        val engine = Engine(listOf(a, b, c))
+        open(engine, settings)
+        rule.onNodeWithText("Indexed, but not in your list").performScrollTo().assertIsDisplayed()
+
+        // Keep lists one; the engine already indexes it, so nothing is pushed.
+        rule.onAllNodesWithText("Keep")[0].performScrollTo().performClick()
+        pumpFrames()
+        assertEquals(
+            listOf(LogIndexWatch.Entry(a, 100), LogIndexWatch.Entry(b, 100)),
+            LogIndexWatch.parse(settings.watchJson),
+        )
+        assertEquals(0, engine.applied)
+        rule.onAllNodesWithText("Keep").assertCountEquals(1)
+    }
+
+    @Test
+    fun `remove all unsubscribes every unlisted contract in one push`() {
+        val settings = IndexSettings(store(a))
+        val engine = Engine(listOf(a, b, c))
+        open(engine, settings)
+
+        rule.onNodeWithText("Remove all 2").performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithText("Remove 2 contracts?").assertIsDisplayed()
+        rule.onNodeWithTag(INDEX_REMOVE_CONFIRM_TAG).performClick()
+        pumpFrames()
+
+        assertEquals(listOf(LogIndexWatch.Entry(a, 100)), LogIndexWatch.parse(settings.watchJson))
+        assertEquals(1, engine.applied)
+        val push = settings.push()!!
+        assertTrue(push, push.endsWith(""","watch":[{"address":"$a","fromBlock":100}],"unwatch":["$b","$c"]}"""))
+        rule.onNodeWithText("Indexed, but not in your list").assertDoesNotExist()
+    }
+
+    @Test
+    fun `a contract the engine never indexed is removed without asking`() {
+        // Typed in, never collected: nothing to lose, so no dialog.
+        val settings = IndexSettings(store(a), enabled = false)
+        val engine = Engine(emptyList())
+        open(engine, settings)
+
+        rule.onNodeWithText("Remove").performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithText("Remove this contract?").assertDoesNotExist()
+        assertTrue(LogIndexWatch.parse(settings.watchJson).isEmpty())
+    }
+
+    @Test
+    fun `removing from an index this host never configured takes it over as the engine runs it`() {
+        // A snapshot dropped into the data dir: the engine activated it (serving,
+        // walk paused) and this host has never pushed anything — a push built from
+        // its untouched settings would switch the index off. Removing one of its
+        // contracts must reach the engine WITHOUT changing what the engine does.
+        val settings = IndexSettings("[]", enabled = false)
+        val engine = Engine(listOf(a, b), backfillPaused = true)
+        open(engine, settings)
+        assertEquals(null, settings.push())
+
+        rule.onAllNodesWithText("Remove")[0].performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithTag(INDEX_REMOVE_CONFIRM_TAG).performClick()
+        pumpFrames()
+
+        assertEquals(1, engine.applied)
+        assertEquals(
+            """{"enabled":true,"maxSpeed":false,"backfillPaused":true,"watch":[],"unwatch":["$a"]}""",
+            settings.push(),
+        )
+    }
+
+    private fun open(controller: NodeController, settings: Settings) {
+        rule.setContent { NodeScreen(controller = controller, settings = settings, logs = NoLogs) }
+        pumpFrames()
+        rule.onNode(isSelectable() and hasText("Index")).performClick()
+        pumpFrames()
+    }
+
+    private fun pumpFrames(n: Int = 3) = repeat(n) { rule.mainClock.advanceTimeByFrame() }
+
+    private object NoLogs : LogSource {
+        override fun version(): Long = 0
+        override fun snapshot(): List<LogLine> = emptyList()
+        override fun clear() {}
+        override fun level(): LogLevel = LogLevel.INFO
+        override fun setLevel(level: LogLevel) {}
+    }
+
+    private companion object {
+        fun runningMainnetSnapshot() = NodeSnapshot(
+            running = true, lifecycle = "RUNNING", network = "mainnet", engine = "rust",
+            beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
+            snapServingPeers = 2, clConnectedPeers = 0, clServedPeersLastMin = 2,
+            clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
+            elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
+            blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,
+            finalizedSlot = 1, syncStartPeriod = -1, syncCurrentPeriod = 0, syncTargetPeriod = 0,
+            verifiedHeadAgeMs = 1_000, uptimeSeconds = 60, peerHeaderRequests = 0,
+            peerHeaderRequestsServed = 0, peerBodyRequests = 0, peerBodyRequestsServed = 0,
+            readyPeerList = emptyList(), pauseCount = 0, totalPausedMs = 0,
+            lastPauseEpochMs = 0, lastResumeEpochMs = 0, lastWakeReason = null,
+        )
+    }
+}

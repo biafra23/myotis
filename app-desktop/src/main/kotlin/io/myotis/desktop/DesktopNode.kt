@@ -341,12 +341,22 @@ class DesktopNodeController(
                 val pathsJson = files.joinToString(",", "[", "]") {
                     "\"${it.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                 }
+                // What the index subscribed BEFORE the import, to tell what the
+                // import brought in (LogIndexWatch.adoptImported).
+                val before = runCatching { handle.logIndexStatusJson() }.getOrDefault("")
                 val result = runCatching { handle.importLogIndexFiles(pathsJson) }
                     .getOrElse { "{\"error\":\"${it.message}\"}" }
                 if (result.startsWith("{\"ok\":true")) {
                     // Importing is the opt-in: persist the flag so the next
                     // start's config push keeps the index enabled.
                     settings.setLogIndexEnabled(canonical, true)
+                    // …and list the imported contracts, so the Index tab's watch
+                    // list keeps describing what the index holds (and a contract
+                    // removed earlier is not unwatched again by the next push).
+                    settings.setLogIndexWatchJson(
+                        canonical,
+                        LogIndexWatch.adoptImported(settings.logIndexWatchJson(canonical), before, result),
+                    )
                     onResult("Imported ${files.size} snapshot${if (files.size == 1) "" else "s"} — catch-up started.")
                 } else {
                     val err = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(result)
@@ -823,10 +833,12 @@ class DesktopSettings(
         }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_WATCH_PREFIX) }.forEach { k ->
             // Round-trip through the parser so a hand-edited value degrades to the
-            // entries that do parse rather than reaching the engine raw.
+            // entries that do parse rather than reaching the engine raw. normalize,
+            // not parse+serialize: the store also carries the removed-address markers,
+            // and dropping those here would lose every removal still waiting for the
+            // network to start.
             p.getProperty(k)?.let {
-                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] =
-                    LogIndexWatch.serialize(LogIndexWatch.parse(it))
+                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] = LogIndexWatch.normalize(it)
             }
         }
         p.stringPropertyNames()

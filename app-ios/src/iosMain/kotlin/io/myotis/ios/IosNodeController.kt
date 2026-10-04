@@ -217,11 +217,21 @@ class IosNodeController(
                 val pathsJson = paths.joinToString(",", "[", "]") {
                     "\"${it.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                 }
+                // What the index subscribed BEFORE the import, to tell what the
+                // import brought in (LogIndexWatch.adoptImported).
+                val before = RustEngine.logIndexStatusJson(handle)
                 val r = RustEngine.importLogIndexFiles(handle, pathsJson)
                 if (r.startsWith("{\"ok\":true")) {
                     // Importing is the opt-in: persist the flag so the next
                     // start's config push keeps the index enabled.
                     settings.setLogIndexEnabled(net, true)
+                    // …and list the imported contracts, so the Index tab's watch
+                    // list keeps describing what the index holds (and a contract
+                    // removed earlier is not unwatched again by the next push).
+                    settings.setLogIndexWatchJson(
+                        net,
+                        io.myotis.ui.LogIndexWatch.adoptImported(settings.logIndexWatchJson(net), before, r),
+                    )
                     onResult(
                         "Imported ${paths.size} snapshot${if (paths.size == 1) "" else "s"} — catch-up started."
                     )

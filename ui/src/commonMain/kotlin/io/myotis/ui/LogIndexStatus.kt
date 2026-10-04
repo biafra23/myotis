@@ -38,6 +38,8 @@ object LogIndexStatus {
          *  engine's status). Coverage then stays where it is: the Index tab must
          *  not present the remaining-blocks figure as progress. */
         val backfillPaused: Boolean = false,
+        /** The pacing bit as the engine holds it (`maxSpeed` in its status). */
+        val maxSpeed: Boolean = false,
     )
 
     /** Structured parse of the engine's status JSON (regex over the fixed
@@ -64,7 +66,8 @@ object LogIndexStatus {
         val bps = Regex("\"blocksPerSec\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
         val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val headGap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
-        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap, backfillPaused)
+        val maxSpeed = json.contains("\"maxSpeed\":true")
+        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap, backfillPaused, maxSpeed)
     }
 
     /** The head-side line: while coverage trails the head `latest` resolves

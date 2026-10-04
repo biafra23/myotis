@@ -15,6 +15,19 @@ import kotlin.jvm.JvmStatic
  * deployment makes the index answer without the earlier part being covered —
  * events silently vanish. Undershooting cannot lie (no logs exist below
  * deployment); the Index tab's copy says so.
+ *
+ * REMOVING a contract is recorded here, not just forgotten: the engine's
+ * config push is additive (it unions with what the index already subscribes),
+ * so an address that merely disappeared from this list would stay indexed
+ * forever. A removed address stays in the store as an `unwatched` marker —
+ * `{"address":"0x…","unwatched":true}`, no `fromBlock` — and every push names
+ * it under the config's `unwatch`, which is what makes the engine drop the
+ * entry with its coverage and its logs (engine ABI ≥ 37). The marker is kept
+ * after the engine acted on it: an unwatch of an address the index no longer
+ * holds costs nothing, and re-sending it is what repairs a removal the engine
+ * never got (the network was stopped) or lost (a crash before its checkpoint).
+ * It goes when the address is subscribed again — added by hand ([watch]) or
+ * brought in by an import ([adoptImported]).
  */
 object LogIndexWatch {
 
@@ -27,12 +40,19 @@ object LogIndexWatch {
             it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F'
         }
 
-    /** Serialize for [Settings.setLogIndexWatchJson]. */
+    /**
+     * Serialize for [Settings.setLogIndexWatchJson]: the watched [entries],
+     * then one marker per removed address in [unwatched]. A marker carries no
+     * `fromBlock` on purpose — that is what keeps [parse] (and an older build
+     * reading this store after a downgrade) from mistaking it for a
+     * subscription.
+     */
     @JvmStatic
-    fun serialize(entries: List<Entry>): String =
-        entries.joinToString(",", "[", "]") {
-            """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
-        }
+    @JvmOverloads
+    fun serialize(entries: List<Entry>, unwatched: List<String> = emptyList()): String =
+        (entries.map { """{"address":"${it.address}","fromBlock":${it.fromBlock}}""" } +
+            unwatched.map { """{"address":"$it","unwatched":true}""" })
+            .joinToString(",", "[", "]")
 
     /**
      * Parse [Settings.logIndexWatchJson]'s array. Tolerant the same way the
@@ -44,7 +64,8 @@ object LogIndexWatch {
      * addresses (bytes-equal, so case-insensitively) keep the FIRST entry:
      * the engine rejects a config with a duplicate address OUTRIGHT — the
      * whole network's eth_getLogs would go dark over one — so dedup must
-     * happen at every boundary the store passes through.
+     * happen at every boundary the store passes through. Removed-address
+     * markers are not entries and are skipped — [unwatched] reads those.
      */
     @JvmStatic
     fun parse(json: String): List<Entry> {
@@ -59,6 +80,99 @@ object LogIndexWatch {
                 if (isValidAddress(addr) && seen.add(addr.lowercase())) Entry(addr, from) else null
             }
             .toList()
+    }
+
+    /**
+     * The removed addresses [json] carries (see the class doc), in store
+     * order, deduplicated like [parse]. An address that ALSO parses as a
+     * watched entry is not reported: the engine refuses a push naming one
+     * address under both `watch` and `unwatch`, and a hand-edited store must
+     * not be able to turn the whole network's eth_getLogs off that way. The
+     * subscription wins: it is the one the Index tab shows, and silently
+     * dropping a contract the user can see listed is the worse surprise.
+     */
+    @JvmStatic
+    fun unwatched(json: String): List<String> {
+        val addrRe = Regex(""""address"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+        val markRe = Regex(""""unwatched"\s*:\s*true""")
+        val watched = parse(json).mapTo(HashSet()) { it.address.lowercase() }
+        val seen = HashSet<String>()
+        return Regex("""\{[^{}]*\}""").findAll(json)
+            .mapNotNull { obj ->
+                if (!markRe.containsMatchIn(obj.value)) return@mapNotNull null
+                val addr = addrRe.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
+                val key = addr.lowercase()
+                if (isValidAddress(addr) && key !in watched && seen.add(key)) addr else null
+            }
+            .toList()
+    }
+
+    /**
+     * [json] with everything that does not parse dropped, entries and removal
+     * markers alike kept — what a host runs a persisted value through on load
+     * so a hand-edited one degrades instead of reaching the engine raw.
+     */
+    @JvmStatic
+    fun normalize(json: String): String = serialize(parse(json), unwatched(json))
+
+    /**
+     * The store after the user added [entry]: appended to the watched
+     * entries, and no longer marked removed — subscribing again is the newer
+     * statement. An address already watched keeps its existing entry (the
+     * Index tab refuses the duplicate before it gets here).
+     */
+    @JvmStatic
+    fun watch(json: String, entry: Entry): String {
+        val key = entry.address.lowercase()
+        val entries = parse(json)
+        return serialize(
+            if (entries.any { it.address.lowercase() == key }) entries else entries + entry,
+            unwatched(json).filterNot { it.lowercase() == key },
+        )
+    }
+
+    /**
+     * The store after the user removed [address]: its entry is gone and the
+     * address is marked removed, so the next config push tells the engine to
+     * drop it. Marked even when no entry was there — that is how a contract
+     * the engine indexes but this list never held (an imported snapshot's, or
+     * one removed before removal reached the engine) is unsubscribed.
+     */
+    @JvmStatic
+    fun unwatch(json: String, address: String): String {
+        val key = address.lowercase()
+        val marked = unwatched(json)
+        return serialize(
+            parse(json).filterNot { it.address.lowercase() == key },
+            if (marked.any { it.lowercase() == key }) marked else marked + address,
+        )
+    }
+
+    /**
+     * The store after a successful snapshot import: every contract the import
+     * BROUGHT IN joins the watched entries, so this list keeps describing what
+     * the index holds and an imported subscription is not left looking like
+     * one the user never asked for. "Brought in" is the engine's entry list
+     * after the import ([statusAfter] — the import result, which embeds the
+     * status) minus the one before it ([statusBefore]): a contract the engine
+     * already indexed without being listed here stays unlisted, since that is
+     * exactly the state the Index tab offers to clean up.
+     *
+     * A brought-in address also loses its removal marker. Importing it is the
+     * newer statement, and a marker left behind would have the very next push
+     * delete what was just imported.
+     */
+    @JvmStatic
+    fun adoptImported(json: String, statusBefore: String, statusAfter: String): String {
+        val before = LogIndexStatus.parse(statusBefore).entries.mapTo(HashSet()) { it.address }
+        val brought = LogIndexStatus.parse(statusAfter).entries.filter { it.address !in before }
+        val entries = parse(json)
+        val listed = entries.mapTo(HashSet()) { it.address.lowercase() }
+        val broughtKeys = brought.mapTo(HashSet()) { it.address }
+        return serialize(
+            entries + brought.filter { it.address !in listed }.map { Entry(it.address, it.fromBlock) },
+            unwatched(json).filterNot { it.lowercase() in broughtKeys },
+        )
     }
 
     /**
@@ -83,6 +197,10 @@ object LogIndexWatch {
      *
      * No names: display names are resolved by the receiving engine (ENS
      * reverse lookup in its naming pass), never entered here.
+     *
+     * Removed addresses ride along as `unwatch` (see the class doc), on
+     * exactly the pushes that go out anyway. A null push needs none: nothing
+     * this host ever sent can have subscribed them.
      */
     @JvmStatic
     @JvmOverloads
@@ -98,7 +216,12 @@ object LogIndexWatch {
         val watch = entries.joinToString(",") {
             """{"address":"${it.address}","fromBlock":${it.fromBlock}}"""
         }
-        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"backfillPaused":$backfillPaused,"watch":[$watch]}"""
+        // Omitted when empty, so a store without removals pushes the exact
+        // JSON it always did.
+        val unwatch = unwatched(watchJson).takeIf { it.isNotEmpty() }
+            ?.joinToString(",", ""","unwatch":[""", "]") { "\"$it\"" }
+            .orEmpty()
+        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"backfillPaused":$backfillPaused,"watch":[$watch]$unwatch}"""
     }
 
     /**

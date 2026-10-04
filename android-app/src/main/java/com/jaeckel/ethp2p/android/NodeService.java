@@ -369,6 +369,10 @@ public final class NodeService extends Service {
      * content: URIs into app storage first — the engine reads paths, not
      * streams). Persists the enabled flag on success: importing is the
      * opt-in, and the next start's config push must keep the index alive.
+     * The contracts the import brought in join the persisted watch list
+     * ({@code LogIndexWatch.adoptImported}), so the Index tab keeps describing
+     * what the index holds and a contract removed earlier is not unwatched
+     * again by the next push.
      * Returns the engine's {@code {"ok":...}} / {@code {"error":...}} JSON.
      */
     public String importLogIndex(String network, String pathsJson) {
@@ -380,10 +384,21 @@ public final class NodeService extends Service {
         if (handle == null) {
             return "{\"error\":\"" + net + " is not running\"}";
         }
+        // What the index subscribed before the import, to tell what it brought in.
+        // A probe that fails must not cost the import: with nothing to compare
+        // against, everything the result lists counts as brought in.
+        String before;
+        try {
+            before = handle.logIndexStatusJson();
+        } catch (RuntimeException e) {
+            before = "";
+        }
         try {
             String r = handle.importLogIndexFiles(pathsJson);
             if (r.startsWith("{\"ok\":true")) {
                 setLogIndexEnabled(this, net, true);
+                setLogIndexWatchJson(this, net, io.myotis.ui.LogIndexWatch.adoptImported(
+                        logIndexWatchJson(this, net), before, r));
             }
             return r;
         } catch (RuntimeException e) {

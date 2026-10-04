@@ -35,6 +35,10 @@ class LogIndexStatusTest {
             "\"coveredLow\":6100000,\"coveredHigh\":6200000}]}"
         val p = LogIndexStatus.parse(json)
         assertTrue("backfillPaused must parse", p.backfillPaused)
+        // The pacing bit parses beside it: the Index tab records both as the
+        // host's settings when it takes over an index it never configured.
+        assertFalse(p.maxSpeed)
+        assertTrue(LogIndexStatus.parse(withSpans).maxSpeed)
         val line = LogIndexStatus.progressLine(p)!!
         assertTrue(line, line.contains("paused"))
         assertTrue(line, line.contains("refused"))

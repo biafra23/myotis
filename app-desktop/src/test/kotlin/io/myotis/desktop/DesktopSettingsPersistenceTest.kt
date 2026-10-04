@@ -113,6 +113,27 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `a removed contract's marker survives a restart`(@TempDir dir: Path) {
+        // The marker is what makes the next config push name the address under
+        // `unwatch`. A removal made while the network was stopped exists ONLY as
+        // this marker until the network starts — so a load that normalized the
+        // store through the entry parser alone would silently cancel it.
+        val file = dir.resolve("settings.properties")
+        val removed = io.myotis.ui.LogIndexWatch.unwatch(
+            """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":7},""" +
+                """{"address":"0xB20c66C4DE72433F3cE747b58B86830c459CA911","fromBlock":9}]""",
+            "0xB20c66C4DE72433F3cE747b58B86830c459CA911",
+        )
+        DesktopSettings(nets, file).setLogIndexWatchJson("gnosis", removed)
+
+        val reloaded = DesktopSettings(nets, file)
+        assertEquals(removed, reloaded.logIndexWatchJson("gnosis"))
+        reloaded.setLogIndexEnabled("gnosis", true)
+        val push = logIndexConfigJson(reloaded, "gnosis")!!
+        assertTrue(push.contains(""""unwatch":["0xB20c66C4DE72433F3cE747b58B86830c459CA911"]"""), push)
+    }
+
+    @Test
     fun `a kohaku-preset user's enabled flag seeds the legacy watch list`(@TempDir dir: Path) {
         // Pre-generic users have logIndex.<net>=true persisted but NO watch
         // entries (the preset lived in code). Without the seed, their first
