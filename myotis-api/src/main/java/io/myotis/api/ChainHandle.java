@@ -179,8 +179,14 @@ public interface ChainHandle {
     BlockResult getBlockVerified(long blockNumber);
 
     /**
-     * Install (or replace) the opt-in eth_getLogs watch-list config as JSON
-     * ({@code {"enabled":bool,"watch":[{"address","fromBlock","topic0s"?}]}}).
+     * Install the opt-in eth_getLogs watch-list config as JSON
+     * ({@code {"enabled":bool,"watch":[{"address","fromBlock","topic0s"?}],
+     * "unwatch":["0x…"]?}}). {@code watch} is ADDITIVE: it is unioned with what
+     * the index already subscribes, so an address left out of it stays indexed.
+     * {@code unwatch} is the unsubscribe — each address it names leaves the
+     * index before the union, with its coverage and its stored logs, while the
+     * other entries keep theirs; an address the index does not watch is
+     * ignored, and one listed under both keys refuses the push.
      * Default false: the Java engine has no log index (its verified getLogs
      * answers the strict cannot-serve), so hosts may call this unconditionally.
      */

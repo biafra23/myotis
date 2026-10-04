@@ -4099,8 +4099,21 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
-/// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}]}`. False on malformed
-/// input, duplicate addresses, or an unavailable reader.
+/// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}],"unwatch":["0x..",..]?}`.
+/// False on malformed input, duplicate addresses, an address under both
+/// `watch` and `unwatch`, or an unavailable reader.
+///
+/// `watch` is ADDITIVE — unioned with what the index already subscribes — so
+/// leaving an address out of it removes nothing. `unwatch` (ABI ≥ 37) is the
+/// unsubscribe: each address it names is dropped from the index before the
+/// union, with its coverage and its stored logs, while every other entry
+/// keeps its own (`ElReader::unwatch_log_index`). An address the index does
+/// not watch is ignored, so a host may repeat the list on every push.
+///
+/// The unwatch and the union are two steps, in that order. By the time the
+/// first has run the parser has passed the config, so the only refusal left
+/// for the second is a poisoned lock — the one case where a push returns
+/// false with its unwatch already applied.
 pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     // Both refusals below were silent: the caller got a bare `false` with
     // nothing in the engine log to say why, and since the parser screens
@@ -4118,6 +4131,14 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         );
         return false;
     };
+    let Some(unwatch) = parse_log_index_unwatch(&v, &config) else {
+        tracing::warn!(
+            "log-index config refused: `unwatch` is not an array of 20-byte hex \
+             addresses, or it names an address the same push lists under `watch`; \
+             ignoring the push"
+        );
+        return false;
+    };
     let enabled = config.enabled;
     let bits = (config.enabled, config.max_speed, config.backfill_paused);
     let Some(engine) = engine() else {
@@ -4126,6 +4147,11 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return false;
     };
+    // The unwatch FIRST: the push below unions with whatever the index still
+    // subscribes, so anything left in it at that point comes straight back.
+    if reader.unwatch_log_index(&unwatch).is_none() {
+        return false;
+    }
     let installed = reader.set_log_index_config(config);
     if installed {
         // Remember what the host asked for, so a resume re-applies it instead of
@@ -4146,6 +4172,36 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         reader.ensure_log_index_appender(engine.rt.handle());
     }
     installed
+}
+
+/// The config JSON's `unwatch` list — the addresses the host no longer wants
+/// indexed (see [`set_log_index_config_json`]). Absent or `null` is the empty
+/// list. `None` = malformed: `unwatch` is there but is not an array, an
+/// element is not a 20-byte hex address, or an address is also in `config`'s
+/// watch-list. A push cannot both subscribe and unsubscribe one address, and
+/// picking one for the caller would silently drop either its subscription or
+/// its unwatch (CLAUDE.md §Trust — applied or refused). Naming an address
+/// twice is harmless — an unwatch is idempotent — and is folded into one.
+/// Pure — unit-tested.
+fn parse_log_index_unwatch(
+    v: &serde_json::Value,
+    config: &myotis_net::el::logindex::LogIndexConfig,
+) -> Option<Vec<[u8; 20]>> {
+    let entries = match v.get("unwatch") {
+        None | Some(serde_json::Value::Null) => return Some(Vec::new()),
+        Some(other) => other.as_array()?,
+    };
+    let mut unwatch = Vec::with_capacity(entries.len());
+    for e in entries {
+        let address = e.as_str().and_then(parse_address)?;
+        if config.watch.iter().any(|w| w.address == address) {
+            return None;
+        }
+        if !unwatch.contains(&address) {
+            unwatch.push(address);
+        }
+    }
+    Some(unwatch)
 }
 
 /// A JSON boolean field that must be a boolean if it is there at all.
@@ -4757,10 +4813,48 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
 
 #[cfg(test)]
 mod log_index_json_tests {
-    use super::{build_log_index_status, parse_log_index_config};
+    use super::{build_log_index_status, parse_log_index_config, parse_log_index_unwatch};
 
     fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
         parse_log_index_config(&serde_json::from_str(json).unwrap())
+    }
+
+    /// The `unwatch` list of a config that itself parses.
+    fn unwatch(json: &str) -> Option<Vec<[u8; 20]>> {
+        let v = serde_json::from_str(json).unwrap();
+        parse_log_index_unwatch(&v, &parse_log_index_config(&v).expect("config parses"))
+    }
+
+    #[test]
+    fn parses_the_unwatch_list_and_refuses_what_it_cannot_apply() {
+        let a = "0x4e69fD587118dFb64957d18654E3894118E9b1BF";
+        let b = format!("0x{}", "ab".repeat(20));
+        // Absent and null are the empty list: a host that predates the key
+        // unwatches nothing.
+        assert_eq!(unwatch(r#"{"enabled":true,"watch":[]}"#), Some(vec![]));
+        assert_eq!(unwatch(r#"{"enabled":true,"watch":[],"unwatch":null}"#), Some(vec![]));
+        // Addresses are normalized like watch entries; a repeat folds into one.
+        let twice = format!(r#"{{"enabled":false,"unwatch":["{a}","{}","{b}"]}}"#, a.to_lowercase());
+        let parsed = unwatch(&twice).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1], [0xab; 20]);
+        // Applied or refused: a malformed list refuses the push rather than
+        // unwatching the part of it that happened to parse.
+        assert!(unwatch(r#"{"enabled":true,"unwatch":"0x4e69fD587118dFb64957d18654E3894118E9b1BF"}"#).is_none());
+        assert!(unwatch(&format!(r#"{{"enabled":true,"unwatch":["{a}","0x1234"]}}"#)).is_none());
+        assert!(unwatch(&format!(r#"{{"enabled":true,"unwatch":["{a}",7]}}"#)).is_none());
+        // One address cannot be subscribed and unsubscribed by the same push —
+        // in either spelling.
+        let both = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}}],"unwatch":["{}"]}}"#,
+            a.to_lowercase()
+        );
+        assert!(unwatch(&both).is_none(), "an address under both watch and unwatch parsed");
+        // …while unwatching one address and watching another is the ordinary case.
+        let swap = format!(
+            r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}}],"unwatch":["{b}"]}}"#
+        );
+        assert_eq!(unwatch(&swap), Some(vec![[0xab; 20]]));
     }
 
     #[test]

@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 36
+#define MYOTIS_ABI_VERSION 37
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -262,7 +262,15 @@ void myotis_string_free(char *s);
  * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
  * that fails to parse (malformed, a `safe` or hash selector, no address)
  * carries "code": -32602 as well, like eth_call's refusals; a refusal that
- * depends on the index (coverage, the watch-list) stays plain and retryable. */
+ * depends on the index (coverage, the watch-list) stays plain and retryable.
+ *
+ * set_log_index_config takes {"enabled":bool,"watch":[{"address","fromBlock",
+ * "topic0s"?,"name"?}],"unwatch":["0x..",..]?}. `watch` is additive (v24): an
+ * address left out of it stays subscribed. `unwatch` (v37) is the unsubscribe
+ * — each address it names leaves the index before the union, with its
+ * coverage and its stored logs; the other entries keep theirs, and an address
+ * the index does not watch is ignored. false for malformed JSON, an address
+ * listed twice or under both keys, or a handle without a running EL reader. */
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);

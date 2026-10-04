@@ -813,10 +813,13 @@ pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> 
 // behind it, and `stop`/`pause` — synchronous on the JS thread — wait for it.
 
 /// Install the watch-list config (docs/eth-getlogs-design.md; the JSON the
-/// other hosts push). Resolves `{"ok":true}` when installed, `{"ok":false}`
+/// other hosts push). `watch` is additive; an address leaves the index only by
+/// being named under `unwatch` (ABI ≥ 37), which drops its entry, its coverage
+/// and its stored logs. Resolves `{"ok":true}` when installed, `{"ok":false}`
 /// when refused — invalid JSON, a watch entry without `address` or a numeric
-/// `fromBlock`, an address listed twice, or a handle without a running EL
-/// reader; the engine logs the config refusals (drainLogs).
+/// `fromBlock`, an address listed twice or under both `watch` and `unwatch`,
+/// or a handle without a running EL reader; the engine logs the config
+/// refusals (drainLogs).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn set_log_index_config<'env>(env: &'env Env, handle: i64, config_json: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&config_json) {

@@ -380,6 +380,53 @@ impl LogIndex {
         true
     }
 
+    /// The explicit unsubscribe: drop every entry in `addresses` that this
+    /// index watches — its watch entry, its coverage and every log it stored
+    /// for that address. The other entries keep all of theirs: spans are per
+    /// entry, and a stored log names its own address (addresses are unique
+    /// across entries, so a log at a dropped address belonged to exactly that
+    /// entry). An address the index does not watch is ignored, which makes a
+    /// repeated unwatch a no-op. Returns how many entries were dropped.
+    ///
+    /// This is the one path by which an address leaves an index without the
+    /// index being rebuilt: [`LogIndexConfig::union_with`] and [`Self::merge`]
+    /// only ever add.
+    ///
+    /// The cursor stays while the walk can still resume from it
+    /// ([`walk_resumable`]). The surviving entries are a subset of the ones it
+    /// was resumable for, so it goes only when the last covered entry did — a
+    /// cursor with nothing covered above it has nothing to chain into, and the
+    /// appender re-seeds it at the top.
+    ///
+    /// The watch-list fingerprint changes with the entries, which is what
+    /// makes a backfill batch, bridge plan or tail window that was computed
+    /// against the old list discard itself rather than apply.
+    pub fn unwatch(&mut self, addresses: &[[u8; 20]]) -> usize {
+        let before = self.config.watch.len();
+        let watch = std::mem::take(&mut self.config.watch);
+        let coverage = std::mem::take(&mut self.coverage);
+        for (w, c) in watch.into_iter().zip(coverage) {
+            if !addresses.contains(&w.address) {
+                self.config.watch.push(w);
+                self.coverage.push(c);
+            }
+        }
+        let dropped = before - self.config.watch.len();
+        if dropped == 0 {
+            return 0;
+        }
+        self.logs.retain(|_, l| !addresses.contains(&l.address));
+        if !walk_resumable(&self.config.watch, &self.coverage, self.cursor) {
+            self.cursor = None;
+        }
+        dropped
+    }
+
+    /// Whether `address` has a watch entry here.
+    pub fn watches_address(&self, address: &[u8; 20]) -> bool {
+        self.config.watch.iter().any(|w| &w.address == address)
+    }
+
     /// Flip the backfill pacing bit without touching accumulated state (same
     /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
     pub fn set_max_speed(&mut self, max_speed: bool) {
@@ -2501,6 +2548,95 @@ mod tests {
             watch_all(addr(2), 150),
         ]);
         assert!(!ix.adopt_config(retopiced));
+    }
+
+    #[test]
+    fn unwatch_drops_the_entry_its_coverage_and_its_logs_and_nothing_else() {
+        let logs = vec![
+            log(120, 0, addr(1), vec![]),
+            log(120, 1, addr(2), vec![]),
+            log(180, 0, addr(1), vec![]),
+            log(200, 0, addr(2), vec![]),
+        ];
+        let mut ix =
+            span_ix(config(vec![watch_all(addr(1), 100), watch_all(addr(2), 100)]), 100, 200, logs);
+        let before = ix.config().fingerprint();
+        assert_eq!(ix.log_count(), 4);
+
+        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+
+        // The entry and its coverage are gone, so a query for it is refused as
+        // unwatched rather than answered from an index that no longer follows it.
+        assert!(!ix.watches_address(&addr(1)));
+        assert_eq!(ix.coverage_of(&addr(1)), None);
+        assert_eq!(ix.query(&filter(100, 200, addr(1))), Err(QueryError::UnwatchedAddress(addr(1))));
+        // The other entry lost nothing: same span, same logs.
+        assert_eq!(ix.config().watch, vec![watch_all(addr(2), 100)]);
+        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((100, 200)));
+        let kept = ix.query(&filter(100, 200, addr(2))).unwrap();
+        assert_eq!(kept.iter().map(|l| (l.block_number, l.log_index)).collect::<Vec<_>>(), vec![(120, 1), (200, 0)]);
+        assert_eq!(ix.log_count(), 2, "only the unwatched address's logs were dropped");
+        // In-flight work computed against the old list must not apply.
+        assert_ne!(ix.config().fingerprint(), before);
+
+        // The checkpoint carries the same story: nothing of the address is
+        // left for a restart's union to bring back.
+        let (_, back) = LogIndex::deserialize_portable(&ix.serialize(&tag())).expect("portable");
+        assert_eq!(back.config().watch, vec![watch_all(addr(2), 100)]);
+        assert_eq!(back.log_count(), 2);
+
+        // Idempotent: unknown addresses are ignored and change nothing.
+        let fp = ix.config().fingerprint();
+        assert_eq!(ix.unwatch(&[addr(1), addr(9)]), 0);
+        assert_eq!(ix.config().fingerprint(), fp);
+        assert_eq!(ix.log_count(), 2);
+    }
+
+    /// Dropping the entry the walk was descending for stops the walk; dropping
+    /// a finished one leaves the walk able to finish. Either way head-follow
+    /// keeps appending — the entries left behind still share one high.
+    #[test]
+    fn unwatch_keeps_the_walk_resumable_for_the_entries_left_behind() {
+        // addr(1) wants history down to 50, addr(2) only to 150. The walk has
+        // reached 120: addr(2) is complete, addr(1) is 70 blocks short.
+        let build = || span_ix(config(vec![watch_all(addr(1), 50), watch_all(addr(2), 150)]), 120, 200, vec![]);
+
+        let mut ix = build();
+        assert_eq!(ix.walk_target(), Some(50));
+        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+        assert!(ix.backfill_complete(), "the only incomplete entry left — nothing more to walk");
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(120), "the trust edge is still usable");
+        ix.append_block(201, [7; 32], vec![]).expect("head-follow continues");
+        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((150, 201)));
+
+        let mut ix = build();
+        assert_eq!(ix.unwatch(&[addr(2)]), 1);
+        assert_eq!(ix.walk_target(), Some(50));
+        assert_eq!(ix.cursor.map(|(n, _)| n), Some(120));
+        assert_catch_up_completes(&mut ix);
+    }
+
+    #[test]
+    fn unwatch_of_the_last_covered_entry_drops_the_cursor() {
+        // addr(2) starts above everything indexed so far, so it has no span:
+        // once addr(1) goes, nothing is covered and the cursor chains into
+        // nothing.
+        let mut ix =
+            span_ix(config(vec![watch_all(addr(1), 100), watch_all(addr(2), 500)]), 150, 200, vec![]);
+        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+        assert_eq!(ix.cursor, None);
+        assert_eq!(ix.append_edge(), None);
+        assert_eq!(ix.log_count(), 0);
+        // The appender starts over at the head and re-seeds the trust edge.
+        ix.append_block(600, [6; 32], vec![log(600, 0, addr(2), vec![])]).unwrap();
+        assert_eq!(ix.cursor, Some((600, [6; 32])));
+        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((600, 600)));
+
+        // Unwatching everything leaves a valid, empty index.
+        assert_eq!(ix.unwatch(&[addr(2)]), 1);
+        assert!(ix.config().watch.is_empty());
+        assert_eq!(ix.log_count(), 0);
+        assert_eq!(ix.cursor, None);
     }
 
     /// Drive the (simulated) appender + walker over `ix` to completion,

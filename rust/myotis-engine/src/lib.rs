@@ -180,7 +180,18 @@ uniffi::setup_scaffolding!();
 ///      sends as before. No signature change; the JVM `RustChainHandle` and
 ///      the iOS `IosRpcBackend` read the new shape, and the Node addon passes
 ///      it through.
-pub const ABI_VERSION: i32 = 36;
+/// v37: set_log_index_config's JSON gained `unwatch`, an array of addresses:
+///      the explicit unsubscribe the additive union (v24) never had. Each
+///      address it names leaves the index BEFORE the union — its watch entry,
+///      its coverage and its stored logs — while every other entry keeps its
+///      own; an address the index does not watch is ignored, and one the same
+///      push also lists under `watch` refuses the push. A payload extension,
+///      no signature change — bumped because an older engine would take the
+///      key and silently ignore it, which is the one thing a host must not be
+///      able to pair with. The hosts' Index tab sends it for a removed
+///      contract (`LogIndexWatch.configJson`); the Node addon and the iOS
+///      wrapper pass the JSON through unchanged.
+pub const ABI_VERSION: i32 = 37;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

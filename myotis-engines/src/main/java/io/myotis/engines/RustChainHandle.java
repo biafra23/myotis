@@ -1220,7 +1220,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return gated(() -> RustEngineNative.nativeGetLogsJson(handle, filterJson));
     }
 
-    /** Install the log-index config; false = invalid config or gate down. */
+    /** Install the log-index config (and apply its {@code unwatch} list); false = invalid config or gate down. */
     @Override
     public boolean setLogIndexConfig(String configJson) {
         try {
