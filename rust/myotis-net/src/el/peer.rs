@@ -44,7 +44,10 @@ use crate::el::snap::fetch::{self, AccountOutcome};
 use crate::el::snap::messages as snap;
 use crate::el::verify::Verdict;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one request may wait for its response. Crate-visible because the
+/// log index sizes its candidate chunks to finish well inside it
+/// (`reader::CHUNK_SLOW_AFTER`).
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One in-flight request: the response code it expects and the delivery channel.
 struct Pending {
