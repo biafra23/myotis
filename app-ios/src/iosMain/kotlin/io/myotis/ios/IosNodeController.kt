@@ -191,7 +191,16 @@ class IosNodeController(
             settings.logIndexMaxSpeed(net),
             configured = settings.logIndexConfigured(net),
             backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
-        if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
+        // No push lock here, unlike the JVM hosts: every caller — boot, the
+        // settings pokes, an import — runs on the single-threaded lifecycleLane,
+        // so pushes are built and applied one at a time, in order.
+        if (RustEngine.setLogIndexConfig(handle, json)) {
+            // The engine took the push, the removals it named included, and made
+            // them durable: their markers have done their job (LogIndexWatch.delivered).
+            val now = settings.logIndexWatchJson(net)
+            val left = io.myotis.ui.LogIndexWatch.delivered(now, json)
+            if (left != now) settings.setLogIndexWatchJson(net, left)
+        } else if (settings.logIndexEnabled(net)) {
             logs.append("WARN log index config rejected for $net")
         }
     }
@@ -217,11 +226,25 @@ class IosNodeController(
                 val pathsJson = paths.joinToString(",", "[", "]") {
                     "\"${it.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                 }
+                // Push first: a removal still waiting for delivery reaches the
+                // engine BEFORE the import, so it cannot delete afterwards what
+                // the import merged into that address.
+                pushLogIndexConfig(net, handle)
+                // What the index subscribed BEFORE the import, to tell what the
+                // import brought in (LogIndexWatch.adoptImported).
+                val before = RustEngine.logIndexStatusJson(handle)
                 val r = RustEngine.importLogIndexFiles(handle, pathsJson)
                 if (r.startsWith("{\"ok\":true")) {
                     // Importing is the opt-in: persist the flag so the next
                     // start's config push keeps the index enabled.
                     settings.setLogIndexEnabled(net, true)
+                    // …and list the imported contracts, so the Index tab's watch
+                    // list keeps describing what the index holds (and a contract
+                    // removed earlier is not unwatched again by the next push).
+                    settings.setLogIndexWatchJson(
+                        net,
+                        io.myotis.ui.LogIndexWatch.adoptImported(settings.logIndexWatchJson(net), before, r),
+                    )
                     onResult(
                         "Imported ${paths.size} snapshot${if (paths.size == 1) "" else "s"} — catch-up started."
                     )

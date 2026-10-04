@@ -132,4 +132,185 @@ class LogIndexWatchTest {
         // enabled:false push that kills a dropped-in snapshot at boot.
         assertNull(LogIndexWatch.configJson(watch, enabled = false, configured = false))
     }
+
+    // ---- Removal: the engine's push is additive, so a removed address has to
+    // be NAMED to it. These pin the marker's round trip and what the push says.
+
+    private val a = "0x45a1502382541cD610CC9068e88727426b696293"
+    private val b = "0xB20c66C4DE72433F3cE747b58B86830c459CA911"
+    private val c = "0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2"
+
+    @Test
+    fun removing_a_contract_marks_it_and_the_push_names_it_under_unwatch() {
+        val store = LogIndexWatch.serialize(
+            listOf(LogIndexWatch.Entry(a, 31_305_656), LogIndexWatch.Entry(b, 14_173_395)),
+        )
+        val removed = LogIndexWatch.unwatch(store, a)
+        assertEquals(listOf(LogIndexWatch.Entry(b, 14_173_395)), LogIndexWatch.parse(removed))
+        assertEquals(listOf(a), LogIndexWatch.unwatched(removed))
+
+        val json = LogIndexWatch.configJson(removed, enabled = true)!!
+        assertTrue(json, json.endsWith(""","watch":[{"address":"$b","fromBlock":14173395}],"unwatch":["$a"]}"""))
+        // A disable push carries it too: the index is dropped from, not just
+        // switched off.
+        val off = LogIndexWatch.configJson(removed, enabled = false, configured = true)!!
+        assertTrue(off, off.contains(""""unwatch":["$a"]"""))
+        // …and a store with nothing removed pushes the JSON it always did.
+        assertFalse(LogIndexWatch.configJson(store, enabled = true)!!.contains("unwatch"))
+
+        // Removing it again, in another spelling, does not mark it twice.
+        assertEquals(listOf(a), LogIndexWatch.unwatched(LogIndexWatch.unwatch(removed, a.uppercase().replace("0X", "0x"))))
+    }
+
+    @Test
+    fun a_contract_the_list_never_held_can_still_be_removed() {
+        // The Index tab's cleanup: the engine indexes it (an imported snapshot's
+        // contract, or one removed before removal reached the engine), the list
+        // does not — the marker alone is what unsubscribes it.
+        val removed = LogIndexWatch.unwatch("[]", a)
+        assertTrue(LogIndexWatch.parse(removed).isEmpty())
+        assertEquals(listOf(a), LogIndexWatch.unwatched(removed))
+        assertEquals(
+            """{"enabled":true,"maxSpeed":false,"backfillPaused":false,"watch":[],"unwatch":["$a"]}""",
+            LogIndexWatch.configJson(removed, enabled = true),
+        )
+    }
+
+    @Test
+    fun adding_a_removed_contract_back_clears_its_marker() {
+        val removed = LogIndexWatch.unwatch(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(a, 7))), a)
+        val back = LogIndexWatch.watch(removed, LogIndexWatch.Entry(a.lowercase(), 9))
+        assertEquals(listOf(LogIndexWatch.Entry(a.lowercase(), 9)), LogIndexWatch.parse(back))
+        assertTrue("a re-added contract is still marked removed", LogIndexWatch.unwatched(back).isEmpty())
+        assertFalse(LogIndexWatch.configJson(back, enabled = true)!!.contains("unwatch"))
+        // Adding an address that is already watched keeps the entry it has.
+        assertEquals(back, LogIndexWatch.watch(back, LogIndexWatch.Entry(a, 1)))
+    }
+
+    @Test
+    fun a_marker_is_not_an_entry_and_survives_normalizing() {
+        val removed = LogIndexWatch.unwatch(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 7))), a)
+        // No fromBlock in the marker: parse — this build's, and an older one's
+        // after a downgrade — cannot mistake it for a subscription.
+        assertEquals("""[{"address":"$b","fromBlock":7},{"address":"$a","unwatched":true}]""", removed)
+        assertEquals(listOf(LogIndexWatch.Entry(b, 7)), LogIndexWatch.parse(removed))
+        // What a host runs a loaded value through: the marker must not be lost
+        // there, or a removal queued while the network was stopped never ships.
+        assertEquals(removed, LogIndexWatch.normalize(removed))
+        assertEquals("[]", LogIndexWatch.normalize("not json at all"))
+        // A malformed marker is dropped like a malformed entry.
+        assertTrue(LogIndexWatch.unwatched("""[{"address":"0xnope","unwatched":true}]""").isEmpty())
+    }
+
+    @Test
+    fun an_address_both_watched_and_marked_is_pushed_as_watched_only() {
+        // The engine refuses a push naming one address under both keys — the
+        // whole network's eth_getLogs would go dark over a hand-edited store.
+        val both = """[{"address":"$a","fromBlock":7},{"address":"${a.lowercase()}","unwatched":true}]"""
+        assertEquals(listOf(LogIndexWatch.Entry(a, 7)), LogIndexWatch.parse(both))
+        assertTrue(LogIndexWatch.unwatched(both).isEmpty())
+        assertFalse(LogIndexWatch.configJson(both, enabled = true)!!.contains("unwatch"))
+    }
+
+    private fun status(vararg addresses: String) = addresses.joinToString(
+        ",", """{"enabled":true,"logCount":0,"entries":[""", "]}",
+    ) { """{"address":"${it.lowercase()}","fromBlock":100}""" }
+
+    @Test
+    fun an_import_adopts_the_contracts_it_brought_and_only_those() {
+        // Listed: a. Indexed but unlisted before the import: b (the state the
+        // Index tab offers to clean up). The import brings c.
+        val store = LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(a, 7)))
+        val after = """{"ok":true,"status":${status(a, b, c)}}"""
+        val adopted = LogIndexWatch.adoptImported(store, status(a, b), after)
+        assertEquals(
+            listOf(LogIndexWatch.Entry(a, 7), LogIndexWatch.Entry(c.lowercase(), 100)),
+            LogIndexWatch.parse(adopted),
+        )
+        // An import that brought nothing new changes nothing.
+        assertEquals(store, LogIndexWatch.adoptImported(store, status(a, b), """{"ok":true,"status":${status(a, b)}}"""))
+    }
+
+    @Test
+    fun an_import_clears_the_marker_of_a_contract_it_brought_back() {
+        // a was removed and the engine dropped it; importing a snapshot that
+        // holds a is the newer statement — a marker left behind would have the
+        // next push delete what was just imported.
+        val store = LogIndexWatch.unwatch(LogIndexWatch.unwatch("[]", a), b)
+        val adopted = LogIndexWatch.adoptImported(store, status(), """{"ok":true,"status":${status(a)}}""")
+        assertEquals(listOf(LogIndexWatch.Entry(a.lowercase(), 100)), LogIndexWatch.parse(adopted))
+        assertEquals("the other removal must stand", listOf(b), LogIndexWatch.unwatched(adopted))
+        // A removal the engine has NOT acted on yet (a is still indexed before
+        // the import) is not undone by importing something else.
+        val pending = LogIndexWatch.adoptImported(store, status(a), """{"ok":true,"status":${status(a)}}""")
+        assertEquals(store, pending)
+    }
+
+    @Test
+    fun an_import_does_not_list_a_topic_restricted_contract() {
+        // The store carries no topics: listed, the next push would name the
+        // address unrestricted — a topic conflict, on which the engine replaces
+        // the WHOLE index. It still clears that address's pending marker.
+        val restricted = """{"ok":true,"status":{"enabled":true,"logCount":0,"entries":[""" +
+            """{"address":"${a.lowercase()}","fromBlock":100,"coveredLow":100,"coveredHigh":200,"restricted":true},""" +
+            """{"address":"${b.lowercase()}","fromBlock":100}]}}"""
+        val adopted = LogIndexWatch.adoptImported(LogIndexWatch.unwatch("[]", a), status(), restricted)
+        assertEquals(listOf(LogIndexWatch.Entry(b.lowercase(), 100)), LogIndexWatch.parse(adopted))
+        assertTrue(LogIndexWatch.unwatched(adopted).isEmpty())
+    }
+
+    @Test
+    fun forgetting_a_contract_leaves_neither_entry_nor_marker() {
+        val store = LogIndexWatch.unwatch(
+            LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(a, 7), LogIndexWatch.Entry(b, 9))), c,
+        )
+        assertEquals(
+            LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 9))),
+            LogIndexWatch.forget(LogIndexWatch.forget(store, a.lowercase()), c),
+        )
+    }
+
+    @Test
+    fun an_import_whose_before_status_is_unknown_adopts_nothing() {
+        // With nothing to subtract, everything the engine holds would count as
+        // brought in — a pending removal included, which would be listed again
+        // and lose its marker. Not knowing is not the same as "was empty".
+        val store = LogIndexWatch.unwatch(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 7))), a)
+        val after = """{"ok":true,"status":${status(a, b)}}"""
+        assertEquals(store, LogIndexWatch.adoptImported(store, null, after))
+        assertEquals(store, LogIndexWatch.adoptImported(store, """{"error":"handle is paused"}""", after))
+        // An index that really was empty before says so, and adopts.
+        val fresh = LogIndexWatch.adoptImported("[]", """{"enabled":false,"logCount":0,"entries":[]}""", after)
+        assertEquals(2, LogIndexWatch.parse(fresh).size)
+    }
+
+    @Test
+    fun a_marker_goes_once_the_engine_took_a_push_that_carried_it() {
+        // A marker is a removal waiting to be delivered, not a standing ban: left
+        // in place it would unwatch the address on every later push, also after
+        // something the host cannot see had subscribed it anew.
+        val store = LogIndexWatch.unwatch(LogIndexWatch.unwatch(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 7))), a), c)
+        val pushed = LogIndexWatch.configJson(store, enabled = true)!!
+        val after = LogIndexWatch.delivered(store, pushed)
+        assertEquals(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 7))), after)
+        assertFalse(LogIndexWatch.configJson(after, enabled = true)!!.contains("unwatch"))
+
+        // A push without removals delivers none: the SAME string comes back, so
+        // a host can skip the write.
+        val plain = LogIndexWatch.configJson(LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 7))), enabled = true)!!
+        assertTrue(LogIndexWatch.delivered(store, plain) === store)
+    }
+
+    @Test
+    fun delivery_only_drops_what_that_push_carried() {
+        // The store moved on while the push was in flight (a host pushes from
+        // its own thread): c was removed after the push was built, a was added
+        // back. Only a marker that is both still there and was in the push goes.
+        val atPush = LogIndexWatch.unwatch(LogIndexWatch.unwatch("[]", a), b)
+        val pushed = LogIndexWatch.configJson(atPush, enabled = true)!!
+        val now = LogIndexWatch.unwatch(LogIndexWatch.watch(atPush, LogIndexWatch.Entry(a, 5)), c)
+        val after = LogIndexWatch.delivered(now, pushed)
+        assertEquals(listOf(LogIndexWatch.Entry(a, 5)), LogIndexWatch.parse(after))
+        assertEquals("c was not in the push and must wait for the next", listOf(c), LogIndexWatch.unwatched(after))
+    }
 }

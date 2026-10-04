@@ -789,6 +789,18 @@ struct SentTxState {
     last_rebroadcast: std::time::Instant,
 }
 
+/// Why an unwatch is not done (see [`ElReader::unwatch_log_index`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwatchError {
+    /// A lock was poisoned. Nothing was changed.
+    Unavailable,
+    /// The entries are gone from the live index, but the checkpoint that
+    /// makes that outlive a restart could not be written: the file on disk
+    /// still names them. Not undone — and not done either. The caller should
+    /// ask again; the repeat retries the write.
+    NotPersisted,
+}
+
 /// An in-progress head-gap bridge: the plan that carries log-index coverage
 /// from its stale append edge up to a finalized anchor after downtime (see
 /// [`ElReader::log_index_bridge_step`]).
@@ -1495,6 +1507,13 @@ pub struct ElReader {
     /// Throttles the full-index checkpoint: when the file on disk last became
     /// current, and what it weighed. See [`PersistClock`].
     log_index_persist: PersistClock,
+    /// An unwatch dropped entries from the live index and no checkpoint has
+    /// landed since: the file on disk still names them, so a restart would
+    /// bring them back. Set by [`Self::unwatch_log_index`], cleared by the
+    /// next checkpoint of this node's own index that lands
+    /// ([`Self::write_own_checkpoint`]) — every such write serializes the
+    /// index after the unwatch, since both hold `log_index_write`.
+    log_index_unwatch_owed: std::sync::atomic::AtomicBool,
     /// Serializes CHECKPOINT WRITES to `log_index_path` against each other,
     /// spanning serialize→rename. `log_index` used to do this by accident:
     /// every writer held it across the whole write. Now that the fsync happens
@@ -1780,6 +1799,7 @@ impl ElReader {
             log_index_tail: std::sync::Mutex::new(Vec::new()),
             log_index_claim: std::sync::Mutex::new(RestartClaimState::default()),
             log_index_persist: PersistClock::new(),
+            log_index_unwatch_owed: std::sync::atomic::AtomicBool::new(false),
             log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
             log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1806,7 +1826,9 @@ impl ElReader {
     /// host re-applying its shipped preset EXTENDS an imported subscription
     /// instead of replacing it. Without this, every restart's preset push
     /// would fingerprint-mismatch the imported index into a full re-index
-    /// (see docs/eth-getlogs-design.md §import).
+    /// (see docs/eth-getlogs-design.md §import). So an address this push
+    /// leaves out stays subscribed; it leaves only through
+    /// [`Self::unwatch_log_index`].
     ///
     /// Accumulated coverage survives whenever the union changes nothing an
     /// index can't absorb in place (bit flips, renames, a LOWERED
@@ -2015,16 +2037,9 @@ impl ElReader {
                 }
             };
             let installed_is_empty = fresh.log_count() == 0;
-            // A restart claim vouches for coverage, so it survives exactly as
-            // far as the coverage did: a merge keeps it, a fresh index has
-            // nothing for it to vouch for.
-            let high = fresh.append_edge().map(|edge| edge.saturating_sub(1));
-            if let Ok(mut claim) = self.log_index_claim.lock() {
-                let kept = high.map_or(0, |h| claim.vouched.min(h));
-                if kept != claim.vouched {
-                    *claim = RestartClaimState { vouched: kept, first_finality: 0 };
-                }
-            }
+            // A merge keeps the restart claim; a fresh index has nothing for
+            // it to vouch for.
+            self.keep_restart_claim_within(fresh.append_edge().map(|edge| edge.saturating_sub(1)));
             *slot = Some(fresh);
             // The checkpoint above put a full-size file on disk, so it starts
             // an interval — without one the next appender tick would rewrite
@@ -2172,6 +2187,162 @@ impl ElReader {
         }
         reset_rate();
         true
+    }
+
+    /// The explicit unsubscribe: drop `addresses` from the log index — each
+    /// one's watch entry, its coverage and the logs stored for it
+    /// ([`crate::el::logindex::LogIndex::unwatch`]). Every other entry keeps
+    /// what it has, so head-follow and the walk carry on for them; nothing
+    /// descends for a dropped entry any more.
+    ///
+    /// This is what [`Self::set_log_index_config`] cannot do: that push is
+    /// additive, so leaving an address out of it removes nothing. A host sends
+    /// the two together (the config JSON's `unwatch`) with this one first, and
+    /// the union then finds nothing to bring back.
+    ///
+    /// `Ok(n)`: `n` entries were dropped and the checkpoint on disk says so.
+    /// `Ok(0)` — the index watches none of them — costs nothing and writes
+    /// nothing. The two errors are what a caller must not read as "done":
+    /// see [`UnwatchError`].
+    ///
+    /// What surrounds the index follows the coverage it describes. The bridge
+    /// plan goes: its bloom verdicts were computed for the old list (it would
+    /// discard itself by fingerprint anyway). The tail record and the restart
+    /// claim stay while any entry is still covered — the surviving entries
+    /// cover exactly the blocks they did, so the record still names their
+    /// unconfirmed top and the claim still vouches for the rest. With nothing
+    /// left covered they go with the coverage, which is
+    /// [`Self::retire_tail_record`]'s rule.
+    ///
+    /// The checkpoint is written at once, and the unwatch is not done until
+    /// it has landed: the file on disk is where a restart's union would bring
+    /// the address back from, with every log it had. A write that fails
+    /// leaves the entries dropped in memory — there is no putting them back,
+    /// the index moved on while the write was out — and is REPORTED
+    /// ([`UnwatchError::NotPersisted`]), so the caller keeps asking. Until a
+    /// checkpoint lands the unwatch is owed one: a repeat with nothing left
+    /// to drop tries the write again rather than answering `Ok(0)`.
+    ///
+    /// With no index installed, a portable snapshot at this reader's own path
+    /// is installed first, with activation's defaults: the config push that
+    /// follows would load that file and union with its watch-table, which is
+    /// exactly where the address would come back from.
+    ///
+    /// BLOCKS like the config push once there is something to drop — on the
+    /// checkpoint lock, which an import holds for as long as merging GBs
+    /// takes. Not a UI-thread call.
+    pub fn unwatch_log_index(&self, addresses: &[[u8; 20]]) -> Result<usize, UnwatchError> {
+        use std::sync::atomic::Ordering;
+        if addresses.is_empty() {
+            return Ok(0);
+        }
+        // Nothing to drop and nothing owed is answered under the index lock
+        // alone, without queueing behind whoever holds the checkpoint lock: a
+        // caller that repeats an unwatch the index already took must not wait
+        // out an import for it.
+        match self.log_index.lock() {
+            Ok(slot) => {
+                let nothing_to_drop =
+                    slot.as_ref().is_some_and(|ix| !addresses.iter().any(|a| ix.watches_address(a)));
+                if nothing_to_drop && !self.log_index_unwatch_owed.load(Ordering::Acquire) {
+                    return Ok(0);
+                }
+            }
+            Err(_) => return Err(UnwatchError::Unavailable),
+        }
+        // The checkpoint lock, BEFORE the index lock (see `log_index_write`),
+        // and held across the whole unwatch: an import checkpoints the live
+        // index, merges through that file and installs the result under this
+        // lock, so an unwatch that slipped in between would be replaced by an
+        // index merged from the file that still had the address.
+        let Ok(_writing) = self.log_index_write.lock() else {
+            return Err(UnwatchError::Unavailable);
+        };
+        let installed = match self.log_index.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => return Err(UnwatchError::Unavailable),
+        };
+        if !installed && !self.install_log_index_from_disk() {
+            return Ok(0); // no index, and no snapshot a push could union with
+        }
+        let finalized_now = self.finalized_block_number();
+        let tag = self.chain_tag();
+        let (dropped, bytes) = {
+            let Ok(mut slot) = self.log_index.lock() else {
+                return Err(UnwatchError::Unavailable);
+            };
+            let Some(ix) = slot.as_mut() else {
+                return Ok(0);
+            };
+            let dropped = ix.unwatch(addresses);
+            // Re-read under the checkpoint lock: every writer that can settle
+            // the debt holds it, so it cannot change from here to the write.
+            if dropped == 0 && !self.log_index_unwatch_owed.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            if dropped > 0 {
+                self.clear_log_index_bridge();
+                let high = ix.append_edge().map(|edge| edge.saturating_sub(1));
+                if high.is_none() {
+                    // Nothing is covered any more: the record's coverage went
+                    // with the entries, so the record goes with it.
+                    if let Ok(mut t) = self.log_index_tail.lock() {
+                        t.clear();
+                    }
+                }
+                // Untouched while an entry is still covered.
+                self.keep_restart_claim_within(high);
+                tracing::info!(
+                    dropped,
+                    remaining = ix.config().watch.len(),
+                    logs = ix.log_count(),
+                    "log index: unwatched — the dropped entries' coverage and logs are gone"
+                );
+            }
+            // Serialized under the index lock, written outside it: the fsync
+            // dominates a checkpoint, and holding the index mutex across it
+            // stalls the appender, the walk and every getLogs query.
+            let bytes = self.log_index_path.as_deref().map(|p| {
+                let clamp = self.checkpoint_clamp_for(finalized_now);
+                (p, checkpoint_bytes(ix, &tag, clamp), clamp)
+            });
+            (dropped, bytes)
+        };
+        if dropped > 0 {
+            // A new walk target: the measured rate describes the old one.
+            if let Ok(mut rate) = self.log_index_rate.lock() {
+                *rate = None;
+            }
+        }
+        let Some((path, bytes, clamp)) = bytes else {
+            // No data dir: nothing on disk to bring the address back from.
+            self.log_index_unwatch_owed.store(false, Ordering::Release);
+            return Ok(dropped);
+        };
+        // Owed BEFORE the attempt, so no outcome can leave it unset; the write
+        // that lands clears it (`write_own_checkpoint`).
+        self.log_index_unwatch_owed.store(true, Ordering::Release);
+        match self.write_own_checkpoint(path, &bytes, clamp) {
+            Ok(()) => {
+                self.log_index_persist
+                    .wrote(std::time::Instant::now(), Some(bytes.len() as u64));
+                Ok(dropped)
+            }
+            // The clock is left alone, unlike a failed periodic checkpoint:
+            // stamping it would put a whole interval between this and the next
+            // periodic attempt, and for that long the file on disk still names
+            // the dropped address.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not checkpoint the log index after an unwatch; the entries are \
+                     dropped in memory, but the file on disk still names them and a \
+                     restart would bring them back — the unwatch is reported as not done"
+                );
+                Err(UnwatchError::NotPersisted)
+            }
+        }
     }
 
     /// Activate a portable log-index snapshot found at this reader's own
@@ -2626,7 +2797,9 @@ impl ElReader {
         if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
-        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        // Off, or on with nothing watched (every contract unwatched): either way
+        // there is no coverage to advance — see `LogIndex::follows_head`.
+        let enabled = self.with_log_index(|ix| ix.follows_head()).unwrap_or(false);
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
             self.retire_tail_record();
@@ -3344,6 +3517,21 @@ impl ElReader {
         self.log_index_claim.lock().map(|c| c.vouched).unwrap_or(0)
     }
 
+    /// A restart claim vouches for coverage, so it survives exactly as far as
+    /// the coverage did. `high` is the covered top of the index now installed
+    /// (`None`: nothing covered): the claim is cut back to it, and one that
+    /// had to be cut starts over unweighed. Call it under the index lock, with
+    /// the index it describes — the order every path that replaces or shrinks
+    /// the installed index uses.
+    fn keep_restart_claim_within(&self, high: Option<u64>) {
+        if let Ok(mut claim) = self.log_index_claim.lock() {
+            let kept = high.map_or(0, |h| claim.vouched.min(h));
+            if kept != claim.vouched {
+                *claim = RestartClaimState { vouched: kept, first_finality: 0 };
+            }
+        }
+    }
+
     /// Write one checkpoint of this node's OWN index — bytes
     /// [`checkpoint_bytes`] produced at `clamp` — and record beside it the
     /// finality it may claim. The index write is the result; the claim is
@@ -3356,6 +3544,9 @@ impl ElReader {
         clamp: Option<u64>,
     ) -> std::io::Result<()> {
         crate::el::logindex::write_atomic(path, bytes)?;
+        // The file now holds the index as it stands — an unwatch included.
+        self.log_index_unwatch_owed
+            .store(false, std::sync::atomic::Ordering::Release);
         self.publish_finality_claim(path, bytes, clamp);
         Ok(())
     }
@@ -15011,6 +15202,187 @@ mod restart_claim_reader_tests {
         assert!(reader.set_log_index_config(conflicting));
         assert_eq!(reader.log_index_covered_high(), None);
         assert_eq!(vouched(&reader), 0);
+        reader.stop().await;
+    }
+
+    const OTHER: [u8; 20] = [0x46; 20];
+
+    fn watch_two() -> LogIndexConfig {
+        let mut config = watch();
+        config.watch.push(WatchEntry {
+            address: OTHER,
+            from_block: 31_305_656,
+            topic0s: vec![],
+            name: String::new(),
+        });
+        config
+    }
+
+    /// [`append`] for an index that also watches `OTHER`: every tenth block
+    /// carries one log of each address.
+    fn append_two(reader: &ElReader, from: u64, to: u64, record: bool) {
+        let mut slot = reader.log_index.lock().unwrap();
+        let ix = slot.as_mut().expect("index installed");
+        for n in from..=to {
+            let logs = if n % 10 == 0 {
+                let mut other = stamp_log(n, 2);
+                other.address = OTHER;
+                other.log_index = 1;
+                vec![stamp_log(n, 1), other]
+            } else {
+                vec![]
+            };
+            ix.append_block(n, hash(n), logs).unwrap();
+            if record {
+                reader.log_index_tail.lock().unwrap().push((n, hash(n)));
+            }
+        }
+    }
+
+    fn watches(reader: &ElReader, address: &[u8; 20]) -> bool {
+        reader.with_log_index(|ix| ix.watches_address(address)).expect("index installed")
+    }
+
+    fn log_count(reader: &ElReader) -> usize {
+        reader.with_log_index(|ix| ix.log_count()).expect("index installed")
+    }
+
+    /// Run 1 for the unwatch tests: [`run_to_shutdown`] with two watched
+    /// addresses.
+    async fn run_two_to_shutdown(dir: &Path) -> PathBuf {
+        let path = dir.join("logindex-gnosis.db");
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.set_log_index_config(watch_two()));
+        append_two(&reader, LOW, F1, false);
+        reader.stop().await;
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+        path
+    }
+
+    /// The unsubscribe the additive push lacks. One entry goes — with its logs
+    /// — and everything that describes the OTHER entry's coverage stays put:
+    /// the covered top above finality, the tail record that lets it be
+    /// re-checked, and the restart claim under it.
+    #[tokio::test]
+    async fn an_unwatch_drops_one_entry_and_leaves_the_rest_exactly_as_it_was() {
+        let dir = TempDir::new("unwatch");
+        let path = run_two_to_shutdown(&dir.0).await;
+        // Finality stale, head above the claim: the tail may append again.
+        let reader = offline_reader(anchor_at(F0, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        append_two(&reader, F1 + 1, F1 + 5, true);
+        let before = log_count(&reader);
+
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(1));
+
+        assert!(!watches(&reader, &OTHER));
+        assert_eq!(log_count(&reader), before / 2, "exactly the unwatched address's logs went");
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "the surviving entry lost coverage");
+        assert_eq!(reader.log_index_tail.lock().unwrap().len(), 5, "its tail record was retired");
+        assert_eq!(vouched(&reader), F1, "its restart claim did not survive");
+        // On disk at once, as this node's own checkpoint: a restart's union
+        // finds nothing of the address to bring back.
+        assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
+        let (disk, _) = LogIndex::load_portable_with_id(&path).unwrap();
+        assert_eq!(disk.config().watch.iter().map(|w| w.address).collect::<Vec<_>>(), vec![STAMP]);
+
+        // The additive push that follows has nothing to union the address
+        // back from, and costs the surviving entry nothing.
+        assert!(reader.set_log_index_config(watch()));
+        assert!(!watches(&reader, &OTHER));
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
+
+        // Repeating it is free: nothing to drop, nothing owed, nothing written.
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
+
+        // With the last entry goes everything that described its coverage.
+        assert_eq!(reader.unwatch_log_index(&[STAMP, OTHER]), Ok(1));
+        assert_eq!(log_count(&reader), 0);
+        assert_eq!(reader.log_index_covered_high(), None);
+        assert!(reader.log_index_tail.lock().unwrap().is_empty(), "a record outlived its coverage");
+        assert_eq!(vouched(&reader), 0, "a claim outlived its coverage");
+        reader.stop().await;
+    }
+
+    /// The hole the unwatch would otherwise have at boot: with no index
+    /// installed yet, the push loads the snapshot on disk and unions with ITS
+    /// watch-table — so an unwatch that only looked at the (absent) live index
+    /// would report nothing to do, and the push would bring the address back.
+    #[tokio::test]
+    async fn an_unwatch_before_any_index_is_installed_reaches_the_snapshot_on_disk() {
+        let dir = TempDir::new("unwatch-boot");
+        let path = run_two_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.with_log_index(|_| ()).is_none(), "nothing installed yet");
+
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(1));
+        assert!(reader.set_log_index_config(watch()));
+
+        assert!(!watches(&reader, &OTHER), "the boot union brought the address back");
+        assert_eq!(reader.log_index_covered_high(), Some(F1), "the snapshot's coverage was lost");
+        reader.stop().await;
+    }
+
+    /// An unwatch whose checkpoint did not land is not done: the file on disk
+    /// still names the address, and a restart's union would bring it back with
+    /// every log it had. It must say so — a host that heard "done" stops
+    /// asking — and a repeat with nothing left to drop must try the write
+    /// again instead of answering that there was nothing to do.
+    #[tokio::test]
+    async fn an_unwatch_whose_checkpoint_fails_is_reported_and_owed_until_one_lands() {
+        let dir = TempDir::new("unwatch-owed");
+        let path = run_two_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+
+        // The disk goes away under the index (a full one fails the same way:
+        // the scratch file cannot be created).
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+        assert!(!watches(&reader, &OTHER), "the entries stay dropped in memory");
+        // Nothing left to drop — and still not done.
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+
+        std::fs::create_dir_all(&dir.0).unwrap();
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0), "the owed checkpoint was not retried");
+        let (disk, _) = LogIndex::load_portable_with_id(&path).expect("the retried checkpoint");
+        assert_eq!(disk.config().watch.iter().map(|w| w.address).collect::<Vec<_>>(), vec![STAMP]);
+        // Settled: the next repeat is the free one again.
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        reader.stop().await;
+    }
+
+    /// Any checkpoint of this node's own index settles the debt, not only the
+    /// unwatch's own retry: it serializes the index as it stands.
+    #[tokio::test]
+    async fn a_periodic_checkpoint_settles_an_owed_unwatch() {
+        let dir = TempDir::new("unwatch-owed-periodic");
+        let path = run_two_to_shutdown(&dir.0).await;
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert!(reader.install_log_index_from_disk());
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+
+        std::fs::create_dir_all(&dir.0).unwrap();
+        assert!(reader.persist_log_index(F1, false));
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0), "the debt outlived a landed checkpoint");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unwatch_with_no_index_and_no_snapshot_installs_nothing() {
+        let dir = TempDir::new("unwatch-none");
+        let path = dir.0.join("logindex-gnosis.db");
+        let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
+        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        assert_eq!(reader.unwatch_log_index(&[]), Ok(0));
+        assert!(reader.with_log_index(|_| ()).is_none(), "an unwatch conjured an index");
+        assert!(!path.exists());
         reader.stop().await;
     }
 

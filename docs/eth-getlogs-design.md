@@ -572,10 +572,12 @@ post-create call rather than a `create_handle` signature break:
   (`capi.rs` + `rust/include/myotis_engine.h`), `ABI_VERSION` bump with a
   changelog line (`lib.rs:34`).
 - Config JSON: `{ "enabled": bool, "watch": [{"address": "0x…",
-  "fromBlock": n, "topic0s": ["0x…", …]? }, …] }`. Watch lists live host-side
-  as data, not in the engine — originally a built-in preset (the kohaku
-  contract set per network), since 2026-08-20 the user's own entries
-  (`LogIndexWatch`, entered on the Index tab and persisted per network).
+  "fromBlock": n, "topic0s": ["0x…", …]? }, …], "unwatch": ["0x…", …]? }`.
+  Watch lists live host-side as data, not in the engine — originally a
+  built-in preset (the kohaku contract set per network), since 2026-08-20 the
+  user's own entries (`LogIndexWatch`, entered on the Index tab and persisted
+  per network). `watch` is additive and `unwatch` is the unsubscribe — see
+  §Import, *Unsubscribe*.
 - Hosts: `NodeController` gains logIndex getters/setters next to
   `servedBlockWindow` (`ui/.../NodeController.kt:158`); persisted by each
   host's `Settings` actual; applied on (re)start via `RustChainHandle` right
@@ -624,9 +626,10 @@ router/API changes in this design already accommodate it.
 6. Generic build / import / export — DONE (2026-08-14), see §Import below.
 7. Follow-ups (separate): Unchained-Index-assisted discovery, JVM twin,
    `watch`-channel head notifications, EIP-7745 alignment, per-entry
-   frontiers (see §Import, canonical-shape note), snapshot provenance
-   (imported-coverage marker / signed snapshots) and an explicit
-   unsubscribe surface (see §Import, trust notes). The production answer
+   frontiers (see §Import, canonical-shape note) and snapshot provenance
+   (imported-coverage marker / signed snapshots). The explicit unsubscribe
+   surface that used to be listed here is DONE (2026-10-04, ABI 37 — see
+   §Import, *Unsubscribe*). The production answer
    to "download a history instead of walking it" is NOT a trusted
    snapshot but a bundle of block data the walker verifies itself —
    [logindex-verified-bundle-design.md](logindex-verified-bundle-design.md)
@@ -690,11 +693,84 @@ the hosts, never something fetched. Two properties to state plainly
 imported coverage (a provenance marker in the status JSON, or a signed
 snapshot format, is tracked follow-up hardening — and a precondition for
 serving a seeded history as a production path under the 2026-09-25
-carve-out, docs/seeded-log-histories.md); and subscriptions are
-currently ADD-ONLY — config pushes union and imports merge, so an address
-can only leave the index via a topic-conflict replace or a cache wipe. An
-explicit unsubscribe/replace surface is follow-up work; until then, note
-that an imported subscription is sticky.
+carve-out, docs/seeded-log-histories.md); and config pushes union and imports
+merge, so an address never leaves the index by being left out of either — only
+by an explicit unwatch (below), a topic-conflict replace or a cache wipe. An
+imported subscription is therefore sticky until someone removes it.
+
+**Unsubscribe (2026-10-04, ABI 37):** the config JSON's `unwatch` is a list of
+addresses the host no longer wants indexed. Each one the index watches is
+dropped BEFORE the push's union (`ElReader::unwatch_log_index` →
+`LogIndex::unwatch`): its watch entry, its coverage and every log stored for
+it. Nothing else moves — spans are per entry and a stored log names its own
+address, so the other entries keep their coverage, their logs, the tail record
+above finality and the restart claim under it; head-follow and the walk carry
+on for them, and nothing descends for the dropped entry any more. Its
+`eth_getLogs` is refused as unwatched from then on, which is the honest answer
+(a query the index stopped following must not be served from what it had).
+The checkpoint is rewritten at once, so a restart's union finds nothing of the
+address to bring back — and the push answers `true` only once that write has
+landed. A write that fails (a full disk is the likely cause, and the likely
+moment to be removing a contract) leaves the entries dropped in memory and
+answers `false`; the unwatch is then owed a checkpoint, and a repeat with
+nothing left to drop retries the write instead of reporting nothing to do.
+
+Two rules keep it from going quietly wrong. An address the index does not
+watch is IGNORED, so the unwatch is idempotent and costs nothing when there is
+nothing to drop; and an address named under both `watch` and `unwatch` REFUSES
+the push, since applying either half would silently discard the other
+(CLAUDE.md §Trust — applied or refused).
+
+Why data is deleted rather than kept and frozen: the canonical shape (below)
+needs every covered entry to share one high, so an entry that stopped
+advancing would wedge the appender for all of them, and logs kept without
+their entry are unreachable — a query needs the entry's coverage to be
+answerable at all. Keeping a frozen history would take per-entry frontiers.
+
+Host side, the hosts' Index tab is where this is used (`LogIndexWatch`). A
+removed contract stays in the persisted watch store as a marker
+(`{"address":"0x…","unwatched":true}`) and the push names it under `unwatch`.
+The marker is a removal waiting to be DELIVERED, not a standing ban: it
+survives a push that never happened (the network was stopped — the removal
+then takes effect at the next start) or that the engine did not take, and the
+host drops it as soon as a push carrying it was taken
+(`LogIndexWatch.delivered`). Kept, it would unwatch the address again on every
+later push — also after something the host cannot see had subscribed it anew
+(a snapshot dropped into the data dir), deleting what was just supplied.
+"Taken" includes durable (above), so a removal whose checkpoint could not be
+written keeps its marker and is sent again. On the JVM hosts each network's
+pushes and imports run under one lock, with the push built inside it: they
+are issued from several threads and wait at the engine's wake gate, and a
+push built before a removal must not be applied after the one that carried
+it (iOS runs them on a single-threaded lane).
+
+The hosts list an import's contracts in the watch store
+(`LogIndexWatch.adoptImported`: the engine's entries after the import minus
+those before it), which also clears a still-undelivered marker of a
+brought-in address, so the next push does not delete what was just imported.
+After-minus-before cannot see a snapshot naming an address the engine already
+held, so the hosts push before they import: a removal still waiting is
+delivered first and cannot delete afterwards what the import merged into that
+address. (What is left is that push being refused and the import after it
+succeeding; closing that would take an import result that lists the
+snapshot's own addresses.)
+An entry indexed under a topic0 restriction is the exception: the hosts' list
+carries no topics, so pushing such an address from it would be a topic
+conflict, which replaces the whole index. The status marks those entries
+(`"restricted":true`) and the hosts neither adopt nor list them; they can be
+removed.
+The tab lists what the engine indexes that the store does not hold —
+contracts removed before removal reached the engine, or imported before
+imports were listed — with Keep and Remove, so nothing is indexed out of the
+user's sight. A host that never configured the index sends no push at all (a
+dropped-in snapshot must not be switched off by an untouched settings store);
+removing one of that index's contracts first records the engine's own runtime
+bits as the host's settings, so the push that carries the removal re-asserts
+exactly what the engine was already doing.
+
+An enabled index that watches nothing (every contract removed, collection
+left on) is idle: the appender does not follow the head for it
+(`LogIndex::follows_head`).
 
 **Merge rules** (`LogIndex::merge`): watch union (same address requires equal
 topic0 sets — a span's meaning includes the restriction it was indexed under;
@@ -720,9 +796,9 @@ per-entry frontiers) is the tracked follow-up that would make merges lossless;
 it needs append/bridge machinery per entry.
 
 **Additive config (behavior change in v23):** `set_log_index_config` unions
-the pushed config with the already-subscribed set (live index, or on boot the
-portable snapshot's own watch-table). Without this, every host restart's
-preset push would fingerprint-mismatch an imported index into a full
+the pushed config's `watch` with the already-subscribed set (live index, or on
+boot the portable snapshot's own watch-table). Without this, every host
+restart's preset push would fingerprint-mismatch an imported index into a full
 re-index. Coverage survives bit flips, renames, LOWERED from_blocks (the
 cursor drops when the new hole sits above it — the walk re-descends), and
 even genuinely NEW addresses (the push merges with the existing index as a
