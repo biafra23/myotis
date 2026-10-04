@@ -149,10 +149,11 @@ complete on its own.
 ### Accepted as tuning, revisit on live data
 
 - `HEAD_LAG_TOLERANCE = 32` blocks (judged at the moment the peer spoke),
-  `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (not cleared by the
-  hunt's backoff bypass; below target it shrinks with the shortfall, to 60 s
-  at an empty pool — `LAGGING_RECHECK_FLOOR`; transient and busy never go
-  under geth's 30 s inbound throttle, `PEER_INBOUND_THROTTLE`; #539),
+  `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (below target it
+  shrinks with the shortfall, to 60 s at an empty pool —
+  `LAGGING_RECHECK_FLOOR`; transient and busy never go under geth's 30 s
+  inbound throttle, `PEER_INBOUND_THROTTLE`, which is also why the EL hunt no
+  longer clears a confirmed server's transient backoff outright; #539),
   `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
 - A warm resume's first read can cost up to one maintainer tick (~10 s) on
   an eth/68-only pool, since proving a peer now needs a probe round-trip;
