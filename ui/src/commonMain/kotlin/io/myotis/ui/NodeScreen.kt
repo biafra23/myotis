@@ -654,10 +654,9 @@ private fun SettingsTab(
                     "only. On: force the original Java engine everywhere, giving up those " +
                     "features — currently the only way to use the Query tab's " +
                     "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                    "network is (re)started, not to already-running networks. Note: " +
-                    "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
-                    "regardless of the idle-sleep setting (the Status screen's Sleep row " +
-                    "says so per network).",
+                    "network is (re)started, not to already-running networks. On hosts with " +
+                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
+                    "Sleep row shows it per network.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

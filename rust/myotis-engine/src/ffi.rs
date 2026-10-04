@@ -59,7 +59,8 @@ pub fn canonical_network_name(name_or_alias: String) -> Option<String> {
 // must not resume such a directory from the embedded anchor.
 // ---------------------------------------------------------------------------
 
-/// Allocate a not-yet-started handle for `network` (R1: mainnet only).
+/// Allocate a not-yet-started handle for `network` (`mainnet`, `sepolia` or `gnosis`
+/// — the catalog's canonical names; an alias is canonicalised first).
 #[uniffi::export]
 pub fn create_handle(network: String, data_dir: String) -> i64 {
     crate::host::create(&network, &data_dir)

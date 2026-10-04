@@ -16,9 +16,10 @@
 //! never inject unverified state — a peer that fails to prove is skipped, and if
 //! none can prove, the fetch fails closed with [`OracleError`].
 //!
-//! Deferred to EL-C-3 (dispatch fairness): this path does not yet record snap
-//! peer served/failure reputation (a peer that fails only `eth_call` fetches isn't
-//! deprioritised via this loop), nor does it batch/parallelise fetches. Also note
+//! Dispatch fairness: fetches are hedged across peers (`hedged_race`) and batched
+//! into parallel waves (`prefetch_batch`), and each race's outcome feeds the pool's
+//! peer ranking (`record_race`) — a peer that keeps losing is evicted, and the
+//! oracle learns its peer order within a call. Also note
 //! that `revm` executes attacker-influenceable calldata on a blocking thread; under
 //! the workspace's `panic = "abort"` a panic inside `revm` would abort — a residual
 //! DoS surface that `catch_unwind` can't cover, tracked against the panic strategy.

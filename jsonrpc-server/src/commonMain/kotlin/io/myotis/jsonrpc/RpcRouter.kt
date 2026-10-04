@@ -1080,7 +1080,8 @@ class RpcRouter(
                 // form).
                 val to = tx.to
                 // Ask BEFORE dispatching. On an engine that can't serve creation
-                // (the Java engine is still the default) the call would wake a
+                // (the Java engine — the fallback wherever the Rust engine cannot
+                // serve, and the forced choice behind "Prefer Java engine") the call would wake a
                 // paused stack, wait for a verified head, and refuse anyway —
                 // an expensive refusal where there used to be a free one, and
                 // reported as retryable though it is permanent for that build.

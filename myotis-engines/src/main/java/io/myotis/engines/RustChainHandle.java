@@ -61,8 +61,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     private static final Logger log = LoggerFactory.getLogger(RustChainHandle.class);
 
-    /** Message for the queries the CL-only R1 engine can't answer yet. */
-    private static final String NOT_AVAILABLE = "not available on the R1 Rust engine (CL-only)";
+    /** Message for the operator queries only the Java engine serves — {@code get-headers},
+     *  {@code get-block} and {@code dial}. The Rust engine's block reads go through
+     *  {@link io.myotis.api.VerifiedReads} instead, and it dials from its own pool. */
+    private static final String NOT_AVAILABLE =
+            "not available on the Rust engine (a Java-engine operator query: get-headers, get-block, dial)";
 
     private final long handle;
     private final String networkName;
@@ -731,7 +734,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public void setTargetSnapPeers(int target) {
-        log.debug("[engines] setTargetSnapPeers({}) is a no-op on the R1 Rust engine (CL-only)",
+        // The Rust engine sizes its own snap pool (see myotis-net's PoolConfig) and
+        // exports no target knob over the FFI, so the Settings value has nothing to
+        // reach; the Java engine's maintainer is the only consumer of it.
+        log.debug("[engines] setTargetSnapPeers({}) is a no-op on the Rust engine (it sizes its own pool)",
                 target);
     }
 
@@ -765,7 +771,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public void clearPeerState() {
-        log.debug("[engines] clearPeerState is a no-op on the R1 Rust engine (CL-only)");
+        // The Rust engine owns its peer caches as files under the data dir and exports
+        // no clear over the FFI, so there is nothing to forward: the hosts' "Clear peer
+        // caches" action deletes the files itself. That sticks only while the network
+        // is stopped — a running pool rewrites the file from memory on its next flush —
+        // which is why the UI offers the action only then; a live-handle clear would
+        // need a new FFI export.
+        log.debug("[engines] clearPeerState is a no-op on the Rust engine (the hosts delete its cache files)");
     }
 
     @Override

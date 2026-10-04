@@ -25,10 +25,10 @@ pub enum EvmError {
     /// The target block predates London; the engine does not execute pre-London
     /// state (no local archive, and the fork rules below London aren't modelled).
     ForkTooOld { block_number: u64, timestamp: u64 },
-    /// The block context is for a chain this executor can't run. The fork table is
-    /// mainnet-only, so a non-mainnet chain id would otherwise get mainnet forks —
-    /// fail closed instead of returning a silently-wrong result. (Multichain support
-    /// makes the fork table chain-aware and relaxes this.)
+    /// The block context is for a chain this executor has no fork table for (the
+    /// table covers mainnet, Sepolia and Gnosis), so any other chain id would
+    /// otherwise run under another chain's forks — fail closed instead of returning
+    /// a silently-wrong result.
     UnsupportedChain { chain_id: u64 },
     /// revm rejected the transaction envelope itself (should not happen for a
     /// well-formed view call — surfaced rather than swallowed).
@@ -198,7 +198,7 @@ impl std::fmt::Display for EvmError {
                 "pre-London blocks are not supported (blockNumber={block_number}, timestamp={timestamp})"
             ),
             EvmError::UnsupportedChain { chain_id } => {
-                write!(f, "unsupported chain id {chain_id} (executor is mainnet-only)")
+                write!(f, "unsupported chain id {chain_id} (no fork table: the executor runs mainnet, sepolia and gnosis)")
             }
             EvmError::Transaction { detail } => write!(f, "invalid transaction: {detail}"),
             EvmError::IterationLimitExceeded { cap } => write!(
