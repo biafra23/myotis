@@ -105,7 +105,9 @@ complete on its own.
     snap-capable peers discovered, 150+ addresses in backoff), and one peer
     that went silent after serving cost 4–5 s reads and two retryable
     `-32000`s over four minutes until the EL hunt engaged and evicted it —
-    the #320 latency class, on a thin pool.
+    the #320 latency class, on a thin pool. (#539 shortens backoffs and
+    re-dials discovery's table while the pool is below target, and logs why
+    each pooled peer closed.)
   - Seed pin through the Node addon on a fresh data dir: a DNS-named entry
     refused (`false`), a `snapok` peer pushed (`true`), dialed on the first
     tick (`EL pool host seed pins replaced count=1`, `snap peer connected`);
@@ -148,7 +150,9 @@ complete on its own.
 
 - `HEAD_LAG_TOLERANCE = 32` blocks (judged at the moment the peer spoke),
   `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (not cleared by the
-  hunt's backoff bypass), `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
+  hunt's backoff bypass; below target it shrinks with the shortfall, to one
+  maintainer tick at an empty pool — `SCARCITY_FLOOR`, #539),
+  `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
 - A warm resume's first read can cost up to one maintainer tick (~10 s) on
   an eth/68-only pool, since proving a peer now needs a probe round-trip;
   eth/69 peers prove at the handshake.

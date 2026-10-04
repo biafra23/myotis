@@ -337,7 +337,7 @@ Returns daemon operational metrics.
 | `readyPeers` | long | Peers that completed the eth handshake |
 | `snapPeers` | long | Ready peers that also support snap/1 |
 | `snapServingPeers` | int | Snap peers in the serving pool right now — gate reads on this, not on `snapPeers` (#465). Rust engine: peers whose announced or served head is at or near the anchored head; Java engine: active snap sessions |
-| `backedOffPeers` | long | Peers in temporary exponential backoff |
+| `backedOffPeers` | long | Peers in temporary backoff (connect failure, busy, lagging, incompatible). Rust engine: entries still blocking a dial at the pool's current shortfall — below target, a window shrinks in proportion to it (#539) |
 | `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 
 ### Peers

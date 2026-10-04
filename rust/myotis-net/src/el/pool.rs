@@ -28,7 +28,7 @@ use tokio::time::Instant;
 use myotis_core::nodekey::NodeKey;
 
 use crate::el::anchor::ExecAnchor;
-use crate::el::discv4::TableEntry;
+use crate::el::discv4::{KademliaTable, TableEntry};
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::fork_watch::{self, ForkWatch};
 use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
@@ -72,6 +72,28 @@ pub(crate) fn is_busy_disconnect(e: &str) -> bool {
 /// How often the maintainer checks the pool and tops it back up to target
 /// (Java's `maintainSnapPeers` fixed delay).
 const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Scarcity (#539): while the pool is BELOW target, a backed-off peer's window
+/// shrinks in proportion to the shortfall — `window × live / target`, never
+/// below this floor (one maintainer tick) and never above the window — so a
+/// pool holding 2 of 8 re-dials a 10-minute laggard after 2.5 minutes, and an
+/// empty pool after one tick, while a full pool keeps every window whole.
+/// Incompatible (wrong-chain) windows never shrink: no shortage makes a
+/// foreign node usable. Proportional rather than binary on purpose: the Java
+/// twin keys its hunt on an EMPTY serving pool because a below-target trigger
+/// would hunt forever on a chain whose target is unreachable (gnosis) —
+/// scaling gives such a chain shorter windows, not a treadmill. Owner ruling
+/// 2026-10-03: with so few active peers, every possible peer is dialed again.
+const SCARCITY_FLOOR: Duration = MAINTAINER_INTERVAL;
+
+/// Re-dials of discovery-known peers the maintainer launches per tick while
+/// below target (#539), on top of the cache and pin dials: bounded so a phone
+/// below target spends at most this many handshakes a tick, not its whole
+/// routing table.
+const SCARCITY_REDIALS_PER_TICK: usize = 4;
+
+/// How often the maintainer says it is re-dialing under shortened windows.
+const SCARCITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// EL hunt: the serving pool has been EMPTY this long → emergency mode. Not
 /// "below target" — on snap-scarce chains (gnosis) the target is simply
@@ -146,6 +168,89 @@ fn union_pins(network: &[Enode], host: &[Enode]) -> Vec<Enode> {
         }
     }
     out
+}
+
+/// Why an address is cooling off — decides whether scarcity may shorten it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffKind {
+    /// Refused, timed out, no snap, read failures: the peer may be fine later.
+    Transient,
+    /// TooManyPeers: alive, just full.
+    Busy,
+    /// Its head is far behind the anchored one: syncing or stalled.
+    Lagging,
+    /// Wrong chain or an undecodable Status: never usable (its node id is
+    /// blacklisted besides).
+    Incompatible,
+}
+
+/// A cooling-off address: when it was recorded and the window it earned.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    since: Instant,
+    window: Duration,
+    kind: BackoffKind,
+}
+
+impl Backoff {
+    /// Whether this entry still blocks a dial at `now` for a pool holding
+    /// `live` of `target` peers ([`scaled_backoff`]; incompatible never shrinks).
+    fn blocks(&self, live: usize, target: usize, now: Instant) -> bool {
+        let window = if self.kind == BackoffKind::Incompatible {
+            self.window
+        } else {
+            scaled_backoff(self.window, live, target)
+        };
+        now < self.since + window
+    }
+
+    /// Whether the full window has elapsed at `now` — the bookkeeping sweep,
+    /// scarcity aside.
+    fn elapsed(&self, now: Instant) -> bool {
+        now >= self.since + self.window
+    }
+}
+
+/// The window a failure of `kind` earns. Busy peers retry on the transient
+/// cadence while the hunt is engaged: with the serving pool empty they are the
+/// only realistic source of a freed slot, and slots are won by fast retries
+/// (Java `busyBackoffMs` twin).
+fn backoff_window(kind: BackoffKind, hunting: bool) -> Duration {
+    match kind {
+        BackoffKind::Transient => BACKOFF_TRANSIENT,
+        BackoffKind::Busy if hunting => BACKOFF_TRANSIENT,
+        BackoffKind::Busy => BACKOFF_BUSY,
+        BackoffKind::Lagging => BACKOFF_LAGGING,
+        BackoffKind::Incompatible => BACKOFF_INCOMPATIBLE,
+    }
+}
+
+/// Pure: `window` shortened by the pool's shortfall — `window × live / target`,
+/// clamped to `[SCARCITY_FLOOR, window]`. At or above target, or with no
+/// target, the window is whole.
+fn scaled_backoff(window: Duration, live: usize, target: usize) -> Duration {
+    if target == 0 || live >= target {
+        return window;
+    }
+    window
+        .mul_f64(live as f64 / target as f64)
+        .max(SCARCITY_FLOOR)
+        .min(window)
+}
+
+/// Pure: `items` from `cursor` on, wrapping around — the order the scarcity
+/// re-dial walks discovery's table, so successive ticks continue where the
+/// last stopped instead of re-trying the same head of the list.
+fn rotate_from<T: Clone>(items: &[T], cursor: usize) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let c = cursor % items.len();
+    items[c..]
+        .iter()
+        .chain(items[..c].iter())
+        .cloned()
+        .collect()
 }
 
 /// Pure trigger: pool empty AND it has been empty past the stall window.
@@ -232,6 +337,8 @@ fn outpace_verdict(streak_before: u32) -> (u32, bool) {
 struct PooledPeer {
     addr: SocketAddr,
     peer: Arc<ManagedPeer>,
+    /// When the pool admitted it — how long it lived is logged when it closes.
+    admitted_at: Instant,
     /// Sidelined until this instant after a verified-read failure (see
     /// [`READ_FAIL_BENCH`]); `None`/past = in the front of the read ladder.
     benched_until: Option<Instant>,
@@ -404,8 +511,9 @@ struct PoolInner {
     /// Addresses dialed and not yet failed — in-flight OR connected. Prevents
     /// re-dialing a live peer or racing two dials to the same address.
     attempted: Mutex<HashSet<SocketAddr>>,
-    /// Address → earliest instant it may be dialed again.
-    backoff: Mutex<HashMap<SocketAddr, Instant>>,
+    /// Address → its cooling-off record; the pool's shortfall may shorten
+    /// the window it blocks for ([`Backoff::blocks`]).
+    backoff: Mutex<HashMap<SocketAddr, Backoff>>,
     /// Node ids of wrong-chain peers, never dialed again this run.
     blacklist: Mutex<HashSet<[u8; 64]>>,
     /// Proven snap-capable peers, persisted for warm-start on the next run.
@@ -467,6 +575,14 @@ struct PoolInner {
     /// cache-/warm-start peer may never enter the table on its own). Best-effort
     /// `try_send`; `None` for pools without discovery (tests).
     probe: Option<mpsc::Sender<SocketAddr>>,
+    /// Discovery's routing table, attached by the reader
+    /// ([`PeerPool::attach_discovery`]): what the below-target re-dial (#539)
+    /// walks. `None` for pools without discovery (tests).
+    discovery_table: std::sync::Mutex<Option<Arc<std::sync::Mutex<KademliaTable>>>>,
+    /// Where the last below-target walk of the table stopped.
+    scarcity_cursor: std::sync::atomic::AtomicUsize,
+    /// When the maintainer last logged a below-target re-dial.
+    last_scarcity_log: Mutex<Option<Instant>>,
     /// The host-owned fork watch (EIP-2124 stale-software detection), fed the
     /// fork id of every compatible peer's Status. Set once right after start —
     /// the handle owns it so it outlives this pool across pause/resume; unset
@@ -562,7 +678,7 @@ impl PoolInner {
                         // laggard as both un-backed-off AND un-claimed and re-dial
                         // it in the gap.
                         drop(peers);
-                        self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
+                        self.record_backoff(addr, BackoffKind::Transient, Instant::now()).await;
                         self.attempted.lock().await.remove(&addr);
                         // fall through to the persisted verdict below
                         return self.persist_quality(addr, outcome).await;
@@ -637,11 +753,16 @@ impl PoolInner {
     /// the number of remaining live peers (so callers avoid a second `peers`
     /// lock just to read the count).
     async fn prune_closed(&self) -> usize {
+        let now = Instant::now();
         let mut peers = self.peers.lock().await;
         let mut freed = Vec::new();
         peers.retain(|p| {
             if p.peer.is_closed() {
-                freed.push(p.addr);
+                freed.push((
+                    p.addr,
+                    now.saturating_duration_since(p.admitted_at),
+                    p.peer.close_reason(),
+                ));
                 false
             } else {
                 true
@@ -649,7 +770,16 @@ impl PoolInner {
         });
         if !freed.is_empty() {
             let mut attempted = self.attempted.lock().await;
-            for addr in freed {
+            for (addr, lived, reason) in freed {
+                // INFO, one line per lost slot: a pool that churned through
+                // peers (#539: 236 admissions of 21 peers in 28 minutes) left
+                // no line saying why any of them went.
+                tracing::info!(
+                    %addr,
+                    lived_s = lived.as_secs(),
+                    reason = reason.as_deref().unwrap_or("unknown"),
+                    "pooled snap peer closed"
+                );
                 attempted.remove(&addr);
             }
         }
@@ -700,7 +830,7 @@ impl PoolInner {
             return;
         }
         tracing::info!(%addr, "evicting snap peer as lagging: {why}");
-        self.record_backoff(addr, BACKOFF_LAGGING, Instant::now()).await;
+        self.record_backoff(addr, BackoffKind::Lagging, Instant::now()).await;
         self.attempted.lock().await.remove(&addr);
     }
 
@@ -721,15 +851,23 @@ impl PoolInner {
     }
 
     /// Record an address backoff for `window` (one of the BACKOFF_* consts).
-    async fn record_backoff(&self, addr: SocketAddr, window: Duration, now: Instant) {
+    async fn record_backoff(&self, addr: SocketAddr, kind: BackoffKind, now: Instant) {
+        let window = backoff_window(kind, self.hunting.load(Ordering::Relaxed));
         let mut backoff = self.backoff.lock().await;
         // Entries are normally dropped when their address resurfaces as a
         // candidate, but an address that never comes back would linger forever.
         // Sweep expired entries when the map grows large so it stays bounded.
         if backoff.len() >= self.pool_cfg.max_attempted {
-            backoff.retain(|_, expiry| *expiry > now);
+            backoff.retain(|_, b| !b.elapsed(now));
         }
-        backoff.insert(addr, now + window);
+        backoff.insert(
+            addr,
+            Backoff {
+                since: now,
+                window,
+                kind,
+            },
+        );
     }
 
     /// Dial one candidate through the full eth+snap handshake, updating the
@@ -753,7 +891,7 @@ impl PoolInner {
                     cache.record_connect_failure(addr);
                     cache.flush();
                 }
-                self.record_backoff(addr, BACKOFF_TRANSIENT, Instant::now()).await;
+                self.record_backoff(addr, BackoffKind::Transient, Instant::now()).await;
                 self.attempted.lock().await.remove(&addr);
                 return;
             }
@@ -812,7 +950,7 @@ impl PoolInner {
                         cache.record_connect_success(addr);
                         cache.flush();
                     }
-                    self.record_backoff(addr, BACKOFF_LAGGING, now).await;
+                    self.record_backoff(addr, BackoffKind::Lagging, now).await;
                     self.attempted.lock().await.remove(&addr);
                     return;
                 }
@@ -841,6 +979,7 @@ impl PoolInner {
                 self.peers.lock().await.push(PooledPeer {
                     addr,
                     peer,
+                    admitted_at: Instant::now(),
                     benched_until: None,
                     read_fails: 0,
                     outpaced: 0,
@@ -868,7 +1007,7 @@ impl PoolInner {
                     cache.record_connect_success(addr);
                     cache.flush();
                 }
-                self.record_backoff(addr, BACKOFF_TRANSIENT, now).await;
+                self.record_backoff(addr, BackoffKind::Transient, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
             Err(e) => {
@@ -888,22 +1027,16 @@ impl PoolInner {
                 if incompatible {
                     self.blacklist.lock().await.insert(pubkey);
                 }
-                let window = if incompatible {
-                    BACKOFF_INCOMPATIBLE
+                let kind = if incompatible {
+                    BackoffKind::Incompatible
                 } else if busy {
-                    // While the EL hunt is engaged, busy peers retry on the
-                    // transient cadence: with the serving pool empty they are
-                    // the only realistic source of a freed slot, and slots
-                    // are won by fast retries (Java busyBackoffMs twin).
-                    if self.hunting.load(Ordering::Relaxed) {
-                        BACKOFF_TRANSIENT
-                    } else {
-                        BACKOFF_BUSY
-                    }
+                    // Busy retries on the transient cadence while the hunt is
+                    // engaged — see `backoff_window`.
+                    BackoffKind::Busy
                 } else {
-                    BACKOFF_TRANSIENT
+                    BackoffKind::Transient
                 };
-                self.record_backoff(addr, window, now).await;
+                self.record_backoff(addr, kind, now).await;
                 self.attempted.lock().await.remove(&addr);
             }
         }
@@ -953,6 +1086,9 @@ impl PeerPool {
             peers: Mutex::new(Vec::new()),
             attempted: Mutex::new(HashSet::new()),
             backoff: Mutex::new(HashMap::new()),
+            discovery_table: std::sync::Mutex::new(None),
+            scarcity_cursor: std::sync::atomic::AtomicUsize::new(0),
+            last_scarcity_log: Mutex::new(None),
             blacklist: Mutex::new(HashSet::new()),
             cache: Mutex::new(cache),
             boot_enodes,
@@ -1071,14 +1207,18 @@ impl PeerPool {
         self.inner.blacklist.lock().await.len()
     }
 
-    /// Count of ACTIVE (non-expired) backoffs, pruning expired entries as a
-    /// side effect — matching the `StatusSnapshot.backedOffPeers` "active,
-    /// pruned on read" semantics (and the Java `activeBackoffCount`). Pruning
-    /// here also keeps the map from lingering with dead entries.
+    /// Count of ACTIVE backoffs — entries still blocking a dial at the pool's
+    /// current shortfall (#539) — pruning the rest as a side effect, matching
+    /// the `StatusSnapshot.backedOffPeers` "active, pruned on read" semantics
+    /// (and the Java `activeBackoffCount`). Pruning here also keeps the map
+    /// from lingering with dead entries.
     pub async fn backoff_count(&self) -> usize {
         let now = Instant::now();
+        // The live count before the backoff lock, never under it.
+        let live = self.inner.peers.lock().await.len();
+        let target = self.inner.pool_cfg.target_snap_peers;
         let mut backoff = self.inner.backoff.lock().await;
-        backoff.retain(|_, expiry| *expiry > now);
+        backoff.retain(|_, b| b.blocks(live, target, now));
         backoff.len()
     }
 
@@ -1145,6 +1285,16 @@ impl PeerPool {
     /// and stops with them.
     pub fn start_anchor_resolver(&self, anchor: Arc<ExecAnchor>) {
         self.inner.tasks.spawn(anchor_resolver_loop(Arc::clone(&self.inner), anchor));
+    }
+
+    /// Hand the pool discovery's routing table, so the below-target re-dial
+    /// (#539) can re-offer every peer discovery knows, not only the cache's.
+    pub fn attach_discovery(&self, table: Arc<std::sync::Mutex<KademliaTable>>) {
+        *self
+            .inner
+            .discovery_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(table);
     }
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
@@ -1290,16 +1440,41 @@ async fn dial_pins(inner: &Arc<PoolInner>, pins: Vec<Enode>) -> bool {
 /// the dial semaphore is closed (the pool is shutting down) so the caller can
 /// stop iterating; `true` otherwise (skipped or dialed).
 async fn try_dial(inner: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) -> bool {
+    try_dial_verdict(inner, addr, pubkey).await != DialVerdict::Shutdown
+}
+
+/// What [`try_dial_verdict`] did with a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialVerdict {
+    /// Blacklisted, cooling off, in flight or connected already, or over the
+    /// attempted cap: nothing was dialed.
+    Skipped,
+    /// A dial task was launched.
+    Dialed,
+    /// The dial semaphore is closed: the pool is shutting down.
+    Shutdown,
+}
+
+/// [`try_dial`], telling a dial apart from a skip — the below-target re-dial
+/// counts the dials it launches (#539).
+async fn try_dial_verdict(
+    inner: &Arc<PoolInner>,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+) -> DialVerdict {
     if inner.blacklist.lock().await.contains(&pubkey) {
-        return true;
+        return DialVerdict::Skipped;
     }
-    // Backoff: skip while cooling off; drop the entry once expired so the map
-    // doesn't grow unbounded.
+    // Backoff: skip while cooling off — for a window the pool's shortfall may
+    // have shortened (`Backoff::blocks`, #539) — and drop the entry once it no
+    // longer blocks so the map doesn't grow unbounded. The live count is read
+    // before the backoff lock, never under it.
+    let live = inner.peers.lock().await.len();
     {
         let mut backoff = inner.backoff.lock().await;
-        if let Some(&expiry) = backoff.get(&addr) {
-            if Instant::now() < expiry {
-                return true;
+        if let Some(b) = backoff.get(&addr) {
+            if b.blocks(live, inner.pool_cfg.target_snap_peers, Instant::now()) {
+                return DialVerdict::Skipped;
             }
             backoff.remove(&addr);
         }
@@ -1308,21 +1483,21 @@ async fn try_dial(inner: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) ->
     {
         let mut attempted = inner.attempted.lock().await;
         if attempted.len() >= inner.pool_cfg.max_attempted || !attempted.insert(addr) {
-            return true;
+            return DialVerdict::Skipped;
         }
     }
     // Bound concurrency: acquire a dial permit (waits when saturated), then dial
     // in a task that releases it when done.
     let Ok(permit) = Arc::clone(&inner.dial_slots).acquire_owned().await else {
         inner.attempted.lock().await.remove(&addr);
-        return false;
+        return DialVerdict::Shutdown;
     };
     let inner2 = Arc::clone(inner);
     inner.tasks.spawn(async move {
         inner2.dial_one(addr, pubkey).await;
         drop(permit);
     });
-    true
+    DialVerdict::Dialed
 }
 
 /// Max headers requested per backfill tick — converges a full 4096-cap window
@@ -1745,28 +1920,27 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         if live >= inner.pool_cfg.target_snap_peers {
             continue;
         }
-        if cached.is_empty() {
-            continue;
-        }
-        if hunting {
+        if hunting && !cached.is_empty() {
             // Emergency: free the TRANSIENT backoffs of CONFIRMED snap servers
             // so the dial loop below reaches them NOW instead of after the
             // standard cool-off. Confirmed = served us chain-verified snap
-            // data. Entries whose remaining window exceeds the transient
-            // length are INCOMPATIBLE (10 min) or a not-yet-elapsed 60s busy
-            // entry — keep those: the timer must stay honest (and for
-            // incompatible, try_dial's blacklist would block the dial anyway).
+            // data. Entries with a longer window are INCOMPATIBLE (10 min),
+            // LAGGING, or a 60 s busy entry — keep those: the timer must stay
+            // honest (and for incompatible, try_dial's blacklist would block
+            // the dial anyway).
             // Hunt-time BUSY entries are written at the transient window, so a
             // confirmed-but-busy server is clearable immediately and re-dials
             // roughly every maintainer tick while the pool is empty —
             // intentional, bounded slot-farming (Java maintainSnapPeers twin
             // documents the same trade-off). Non-confirmed peers keep timers.
-            let now = Instant::now();
             let mut backoff = inner.backoff.lock().await;
-            for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
+            for c in cached
+                .iter()
+                .filter(|c| c.quality == SnapQuality::Confirmed)
+            {
                 if backoff
                     .get(&c.addr)
-                    .is_some_and(|exp| exp.saturating_duration_since(now) <= BACKOFF_TRANSIENT)
+                    .is_some_and(|b| b.window <= BACKOFF_TRANSIENT)
                 {
                     backoff.remove(&c.addr);
                 }
@@ -1791,7 +1965,77 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
                 return; // pool shutting down
             }
         }
+        // Scarcity (#539): below target, re-offer every peer discovery knows —
+        // not only the cache, which holds peers that were once ADMITTED —
+        // under the shortened windows `try_dial_verdict` applies.
+        if !scarcity_redial(&inner).await {
+            return; // pool shutting down
+        }
     }
+}
+
+/// One tick of the below-target re-dial (#539): walk discovery's table from
+/// where the last tick stopped and launch at most [`SCARCITY_REDIALS_PER_TICK`]
+/// dials; blacklisted node ids, connected and in-flight addresses, and
+/// windows still blocking at the current shortfall are skipped as always.
+/// `false` when the pool is shutting down.
+async fn scarcity_redial(inner: &Arc<PoolInner>) -> bool {
+    let table: Vec<TableEntry> = {
+        let handle = inner
+            .discovery_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match handle {
+            Some(t) => t.lock().unwrap_or_else(|e| e.into_inner()).all_peers(),
+            None => return true,
+        }
+    };
+    if table.is_empty() {
+        return true;
+    }
+    let target = inner.pool_cfg.target_snap_peers;
+    let cursor = inner.scarcity_cursor.load(Ordering::Relaxed) % table.len();
+    let mut dialed = 0usize;
+    let mut consumed = 0usize;
+    for entry in rotate_from(&table, cursor) {
+        if dialed >= SCARCITY_REDIALS_PER_TICK || inner.peers.lock().await.len() >= target {
+            break;
+        }
+        consumed += 1;
+        let (Some(addr), Some(pubkey)) = (
+            to_socket_addr(&entry.ip, entry.tcp_port),
+            to_pubkey(&entry.node_id),
+        ) else {
+            continue;
+        };
+        match try_dial_verdict(inner, addr, pubkey).await {
+            DialVerdict::Dialed => dialed += 1,
+            DialVerdict::Skipped => {}
+            DialVerdict::Shutdown => return false,
+        }
+    }
+    inner
+        .scarcity_cursor
+        .store((cursor + consumed) % table.len(), Ordering::Relaxed);
+    if dialed > 0 {
+        // Throttled: one line a minute says the pool is dialing under
+        // shortened windows (the live count read before the log lock).
+        let live = inner.peers.lock().await.len();
+        let now = Instant::now();
+        let mut last = inner.last_scarcity_log.lock().await;
+        if last.is_none_or(|t| now.saturating_duration_since(t) >= SCARCITY_LOG_INTERVAL) {
+            *last = Some(now);
+            tracing::info!(
+                live,
+                target,
+                dialed,
+                known = table.len(),
+                "EL pool below target — re-dialing discovery-known peers under shortened backoffs"
+            );
+        }
+    }
+    true
 }
 
 /// A discv4 entry's TCP socket, IPv4 or IPv6, or `None` if the address is
@@ -1851,6 +2095,91 @@ impl SnapQualitySink {
 
 #[cfg(test)]
 mod tests {
+    /// The below-target re-dial (#539): windows shrink with the shortfall,
+    /// never below the floor and never for a wrong-chain peer; busy keeps its
+    /// hunt-time cadence; the table walk rotates.
+    mod scarcity {
+        use super::super::{
+            backoff_window, rotate_from, scaled_backoff, Backoff, BackoffKind, BACKOFF_BUSY,
+            BACKOFF_INCOMPATIBLE, BACKOFF_LAGGING, BACKOFF_TRANSIENT, SCARCITY_FLOOR,
+        };
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        #[test]
+        fn a_full_pool_keeps_every_window_whole() {
+            for live in [8, 9, 100] {
+                assert_eq!(scaled_backoff(BACKOFF_LAGGING, live, 8), BACKOFF_LAGGING);
+            }
+            // target 0 = maintainer deliberately idle: nothing shrinks.
+            assert_eq!(scaled_backoff(BACKOFF_LAGGING, 0, 0), BACKOFF_LAGGING);
+        }
+
+        #[test]
+        fn windows_shrink_in_proportion_to_the_shortfall() {
+            // 2 of 8: a quarter of the window.
+            assert_eq!(
+                scaled_backoff(BACKOFF_LAGGING, 2, 8),
+                Duration::from_secs(150)
+            );
+            assert_eq!(scaled_backoff(BACKOFF_BUSY, 4, 8), Duration::from_secs(30));
+            // An empty pool: the floor, one maintainer tick.
+            assert_eq!(scaled_backoff(BACKOFF_LAGGING, 0, 8), SCARCITY_FLOOR);
+        }
+
+        #[test]
+        fn the_floor_holds_and_a_short_window_is_never_lengthened() {
+            // 30 s × 2/8 = 7.5 s, below the floor.
+            assert_eq!(scaled_backoff(BACKOFF_TRANSIENT, 2, 8), SCARCITY_FLOOR);
+            let short = Duration::from_secs(3);
+            assert_eq!(scaled_backoff(short, 1, 8), short);
+        }
+
+        #[test]
+        fn an_incompatible_backoff_never_shrinks_but_a_laggard_does() {
+            let since = Instant::now();
+            let foreign = Backoff {
+                since,
+                window: BACKOFF_INCOMPATIBLE,
+                kind: BackoffKind::Incompatible,
+            };
+            assert!(foreign.blocks(0, 8, since + BACKOFF_INCOMPATIBLE / 2));
+            assert!(!foreign.blocks(0, 8, since + BACKOFF_INCOMPATIBLE));
+            let laggard = Backoff {
+                since,
+                window: BACKOFF_LAGGING,
+                kind: BackoffKind::Lagging,
+            };
+            // The same length, but an empty pool re-dials it after one tick…
+            assert!(!laggard.blocks(0, 8, since + SCARCITY_FLOOR));
+            // …and a full pool waits out the whole window.
+            assert!(laggard.blocks(8, 8, since + BACKOFF_LAGGING / 2));
+            assert!(!laggard.blocks(8, 8, since + BACKOFF_LAGGING));
+        }
+
+        #[test]
+        fn busy_retries_on_the_transient_cadence_only_while_hunting() {
+            assert_eq!(backoff_window(BackoffKind::Busy, false), BACKOFF_BUSY);
+            assert_eq!(backoff_window(BackoffKind::Busy, true), BACKOFF_TRANSIENT);
+            assert_eq!(
+                backoff_window(BackoffKind::Transient, true),
+                BACKOFF_TRANSIENT
+            );
+            assert_eq!(backoff_window(BackoffKind::Lagging, true), BACKOFF_LAGGING);
+            assert_eq!(
+                backoff_window(BackoffKind::Incompatible, true),
+                BACKOFF_INCOMPATIBLE
+            );
+        }
+
+        #[test]
+        fn the_table_walk_rotates_from_the_cursor_and_wraps() {
+            assert_eq!(rotate_from(&[1, 2, 3, 4], 2), vec![3, 4, 1, 2]);
+            assert_eq!(rotate_from(&[1, 2, 3, 4], 4), vec![1, 2, 3, 4]);
+            assert!(rotate_from::<u8>(&[], 3).is_empty());
+        }
+    }
+
     /// The read-ladder rotation (2026-09-02 stale-pool wedge): benched peers
     /// go behind unbenched ones but are never dropped from the ladder, and
     /// repeated read failures evict — except the sole peer.
