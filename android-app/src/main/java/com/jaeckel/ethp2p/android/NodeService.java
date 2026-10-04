@@ -384,28 +384,50 @@ public final class NodeService extends Service {
         if (handle == null) {
             return "{\"error\":\"" + net + " is not running\"}";
         }
-        // What the index subscribed before the import, to tell what it brought in.
-        // A probe that fails must not cost the import; adoptImported then leaves
-        // the list alone rather than guess.
-        String before;
-        try {
-            before = handle.logIndexStatusJson();
-        } catch (RuntimeException e) {
-            before = null;
-        }
-        try {
-            String r = handle.importLogIndexFiles(pathsJson);
-            if (r.startsWith("{\"ok\":true")) {
-                setLogIndexEnabled(this, net, true);
-                setLogIndexWatchJson(this, net, io.myotis.ui.LogIndexWatch.adoptImported(
-                        logIndexWatchJson(this, net), before, r));
+        // Under the push lock (see logIndexLock): a push built before this import
+        // must not be applied after it.
+        synchronized (logIndexLock(net)) {
+            // What the index subscribed before the import, to tell what it brought in.
+            // A probe that fails must not cost the import; adoptImported then leaves
+            // the list alone rather than guess.
+            String before;
+            try {
+                before = handle.logIndexStatusJson();
+            } catch (RuntimeException e) {
+                before = null;
             }
-            return r;
-        } catch (RuntimeException e) {
-            String msg = e.getMessage() == null ? "import failed" : e.getMessage();
-            return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"")
-                    .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"}";
+            try {
+                String r = handle.importLogIndexFiles(pathsJson);
+                if (r.startsWith("{\"ok\":true")) {
+                    setLogIndexEnabled(this, net, true);
+                    setLogIndexWatchJson(this, net, io.myotis.ui.LogIndexWatch.adoptImported(
+                            logIndexWatchJson(this, net), before, r));
+                }
+                return r;
+            } catch (RuntimeException e) {
+                String msg = e.getMessage() == null ? "import failed" : e.getMessage();
+                return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"")
+                        .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"}";
+            }
         }
+    }
+
+    /**
+     * One lock per network around everything that sends the engine a log-index
+     * config or changes what the index subscribes: BUILD the push from the
+     * settings, hand it over, and record what it delivered — and an import with
+     * its adoption. Pushes run on their own threads (the boot path, one per
+     * settings change) and each waits at the engine's wake gate for up to its
+     * ~90 s cap, so without this they are applied in whatever order the gate
+     * releases them: a push built BEFORE the user removed a contract could land
+     * AFTER the one that unwatched it and subscribe it again, with the removal's
+     * marker already dropped. Built under the lock, a push describes the
+     * settings as they are when it is its turn.
+     */
+    private final ConcurrentHashMap<String, Object> logIndexLocks = new ConcurrentHashMap<>();
+
+    private Object logIndexLock(String net) {
+        return logIndexLocks.computeIfAbsent(net, k -> new Object());
     }
 
     /** Push the persisted log-index preset for a RUNNING network's handle. */
@@ -427,27 +449,30 @@ public final class NodeService extends Service {
     }
 
     private void pushLogIndexConfig(String net, ChainHandle handle) {
-        boolean enabled = logIndexEnabled(this, net);
-        String json = io.myotis.ui.LogIndexWatch.configJson(
-                logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
-                logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
-        if (json == null) {
-            return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
-        }
-        boolean ok = handle.setLogIndexConfig(json);
-        if (ok) {
-            // The engine took the push, the removals it named included: their
-            // markers have done their job (LogIndexWatch.delivered).
-            String now = logIndexWatchJson(this, net);
-            String left = io.myotis.ui.LogIndexWatch.delivered(now, json);
-            if (!left.equals(now)) {
-                setLogIndexWatchJson(this, net, left);
+        synchronized (logIndexLock(net)) {
+            boolean enabled = logIndexEnabled(this, net);
+            String json = io.myotis.ui.LogIndexWatch.configJson(
+                    logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
+                    logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
+            if (json == null) {
+                return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
             }
-        }
-        if (enabled && !ok) {
-            // LogBuffer so the rejection shows in the in-app log view like
-            // every other boot-path message.
-            LogBuffer.e(TAG, "log index config rejected for " + net);
+            boolean ok = handle.setLogIndexConfig(json);
+            if (ok) {
+                // The engine took the push, the removals it named included, and
+                // made them durable: their markers have done their job
+                // (LogIndexWatch.delivered).
+                String now = logIndexWatchJson(this, net);
+                String left = io.myotis.ui.LogIndexWatch.delivered(now, json);
+                if (!left.equals(now)) {
+                    setLogIndexWatchJson(this, net, left);
+                }
+            }
+            if (enabled && !ok) {
+                // LogBuffer so the rejection shows in the in-app log view like
+                // every other boot-path message.
+                LogBuffer.e(TAG, "log index config rejected for " + net);
+            }
         }
     }
 

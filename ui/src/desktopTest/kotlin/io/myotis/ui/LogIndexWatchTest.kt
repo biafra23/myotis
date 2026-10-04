@@ -247,6 +247,30 @@ class LogIndexWatchTest {
     }
 
     @Test
+    fun an_import_does_not_list_a_topic_restricted_contract() {
+        // The store carries no topics: listed, the next push would name the
+        // address unrestricted — a topic conflict, on which the engine replaces
+        // the WHOLE index. It still clears that address's pending marker.
+        val restricted = """{"ok":true,"status":{"enabled":true,"logCount":0,"entries":[""" +
+            """{"address":"${a.lowercase()}","fromBlock":100,"coveredLow":100,"coveredHigh":200,"restricted":true},""" +
+            """{"address":"${b.lowercase()}","fromBlock":100}]}}"""
+        val adopted = LogIndexWatch.adoptImported(LogIndexWatch.unwatch("[]", a), status(), restricted)
+        assertEquals(listOf(LogIndexWatch.Entry(b.lowercase(), 100)), LogIndexWatch.parse(adopted))
+        assertTrue(LogIndexWatch.unwatched(adopted).isEmpty())
+    }
+
+    @Test
+    fun forgetting_a_contract_leaves_neither_entry_nor_marker() {
+        val store = LogIndexWatch.unwatch(
+            LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(a, 7), LogIndexWatch.Entry(b, 9))), c,
+        )
+        assertEquals(
+            LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(b, 9))),
+            LogIndexWatch.forget(LogIndexWatch.forget(store, a.lowercase()), c),
+        )
+    }
+
+    @Test
     fun an_import_whose_before_status_is_unknown_adopts_nothing() {
         // With nothing to subtract, everything the engine holds would count as
         // brought in — a pending removal included, which would be listed again

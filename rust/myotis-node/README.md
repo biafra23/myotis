@@ -154,10 +154,13 @@ await myotis.setLogIndexConfig(h, JSON.stringify({
 await myotis.setLogIndexConfig(h, JSON.stringify({
   enabled: true, watch: [], unwatch: ['0x…'],
 }));     // an address the index does not watch is ignored; one listed under
-         // both `watch` and `unwatch` refuses the push
+         // both `watch` and `unwatch` refuses the push. '{"ok":true}' means the
+         // unwatch is durable; '{"ok":false}' can also mean its checkpoint
+         // could not be written (dropped in memory only — send it again)
 JSON.parse(await myotis.logIndexStatusJson(h));
 // { enabled, logCount, maxSpeed?, backfillPaused?, headGap?, …,
-//   entries: [{ address, fromBlock, name?, coveredLow?, coveredHigh? }] }
+//   entries: [{ address, fromBlock, name?, coveredLow?, coveredHigh?,
+//               restricted? }] }   (restricted: indexed under topic0s; ABI 37)
 // (an index never configured: { enabled: false, logCount: 0, entries: [] })
 ```
 

@@ -186,7 +186,10 @@ public interface ChainHandle {
      * {@code unwatch} is the unsubscribe — each address it names leaves the
      * index before the union, with its coverage and its stored logs, while the
      * other entries keep theirs; an address the index does not watch is
-     * ignored, and one listed under both keys refuses the push.
+     * ignored, and one listed under both keys refuses the push. {@code true}
+     * means the push is done and its unwatch durable; {@code false} also
+     * covers an unwatch whose checkpoint could not be written (repeat the
+     * push).
      * Default false: the Java engine has no log index (its verified getLogs
      * answers the strict cannot-serve), so hosts may call this unconditionally.
      */

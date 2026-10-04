@@ -188,9 +188,15 @@ uniffi::setup_scaffolding!();
 ///      push also lists under `watch` refuses the push. A payload extension,
 ///      no signature change — bumped because an older engine would take the
 ///      key and silently ignore it, which is the one thing a host must not be
-///      able to pair with. The hosts' Index tab sends it for a removed
-///      contract (`LogIndexWatch.configJson`); the Node addon and the iOS
-///      wrapper pass the JSON through unchanged.
+///      able to pair with. `true` now also means the unwatch is DURABLE:
+///      a push whose unwatch could not write its checkpoint answers `false`
+///      (the entries are dropped in memory, the rest of the push is not
+///      applied, and repeating the push retries the write). The status JSON
+///      marks an entry indexed under a topic0 restriction with a trailing
+///      `"restricted":true` (other entries keep their shape). The hosts'
+///      Index tab sends `unwatch` for a removed contract
+///      (`LogIndexWatch.configJson`); the Node addon and the iOS wrapper pass
+///      the JSON through unchanged.
 pub const ABI_VERSION: i32 = 37;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the

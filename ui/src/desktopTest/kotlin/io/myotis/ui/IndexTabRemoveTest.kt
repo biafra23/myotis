@@ -11,7 +11,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -58,17 +58,31 @@ class IndexTabRemoveTest {
             LogIndexWatch.configJson(watchJson, enabled, maxSpeed, configured, backfillPaused)
     }
 
-    /** A running mainnet whose engine indexes [indexed]. */
-    private class Engine(indexed: List<String>, private val backfillPaused: Boolean = false) : FakeController() {
+    /**
+     * A running mainnet whose engine indexes [indexed] ([restricted]: the ones
+     * indexed under a topic restriction). [report] swaps in a later status.
+     */
+    private class Engine(
+        indexed: List<String>,
+        private val backfillPaused: Boolean = false,
+        private val restricted: Set<String> = emptySet(),
+    ) : FakeController() {
         var applied = 0
-        private val status = indexed.joinToString(
+        private val snapshots = MutableStateFlow(snapshotOf(status(indexed)))
+        private fun status(indexed: List<String>) = indexed.joinToString(
             ",",
             """{"enabled":true,"logCount":12,"maxSpeed":false,"backfillPaused":$backfillPaused,"entries":[""",
             "]}",
-        ) { """{"address":"$it","fromBlock":100,"coveredLow":100,"coveredHigh":200}""" }
+        ) {
+            """{"address":"$it","fromBlock":100,"coveredLow":100,"coveredHigh":200""" +
+                (if (it in restricted) ""","restricted":true}""" else "}")
+        }
+        private fun snapshotOf(raw: String) =
+            mapOf("mainnet" to runningMainnetSnapshot().copy(logIndexJson = raw))
+        fun report(indexed: List<String>) { snapshots.value = snapshotOf(status(indexed)) }
+        fun reportRaw(raw: String) { snapshots.value = snapshotOf(raw) }
         override val running: Boolean = true
-        override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
-            flowOf(mapOf("mainnet" to runningMainnetSnapshot().copy(logIndexJson = status)))
+        override fun snapshots(): Flow<Map<String, NodeSnapshot>> = snapshots
         override fun applyLogIndex(network: String) { applied++ }
     }
 
@@ -101,6 +115,50 @@ class IndexTabRemoveTest {
         rule.onNodeWithText("Retry").performScrollTo().performClick()
         pumpFrames()
         assertEquals(2, engine.applied)
+
+        // The host delivers it (its own thread drops the marker) and the engine's
+        // next status no longer lists the contract: the row is gone.
+        settings.watchJson = LogIndexWatch.delivered(settings.watchJson, settings.push()!!)
+        engine.report(listOf(b))
+        pumpFrames()
+        rule.onNodeWithText("removing…").assertDoesNotExist()
+        rule.onNodeWithText("Indexed, but not in your list").assertDoesNotExist()
+
+        // Should the engine ever hold it again with no marker left here, it is
+        // not hidden behind a stale "removing…": it shows as indexed and unlisted.
+        engine.report(listOf(a, b))
+        pumpFrames()
+        rule.onNodeWithText("removing…").assertDoesNotExist()
+        rule.onNodeWithText("Indexed, but not in your list").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun `a paused engine's error status is not read as an empty index`() {
+        // The status probe is ungated: a handle in idle sleep answers it with an
+        // error object, which parses to "no entries". Taking that for "nothing to
+        // lose" would skip the confirmation for a contract with months of logs.
+        val settings = IndexSettings(store(a))
+        val engine = Engine(listOf(a))
+        open(engine, settings)
+        engine.reportRaw("""{"error":"handle is paused"}""")
+        pumpFrames()
+
+        rule.onNodeWithText("Remove").performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithText("Remove this contract?").assertIsDisplayed()
+        assertEquals(store(a), settings.watchJson)
+    }
+
+    @Test
+    fun `a topic-restricted contract can be removed but not listed`() {
+        // The list carries no topics: listing it would make the next push name it
+        // unrestricted, a conflict the engine answers by replacing the whole index.
+        val settings = IndexSettings(store(a))
+        val engine = Engine(listOf(a, b, c), restricted = setOf(b))
+        open(engine, settings)
+
+        rule.onNodeWithText("selected events only", substring = true).performScrollTo().assertIsDisplayed()
+        rule.onAllNodesWithText("Keep").assertCountEquals(1) // c only
     }
 
     @Test
@@ -166,7 +224,10 @@ class IndexTabRemoveTest {
         rule.onNodeWithText("Remove").performScrollTo().performClick()
         pumpFrames()
         rule.onNodeWithText("Remove this contract?").assertDoesNotExist()
-        assertTrue(LogIndexWatch.parse(settings.watchJson).isEmpty())
+        // …and without a marker: this host never pushed anything, so there is
+        // nothing to deliver — a marker would only lie in wait for a contract
+        // that arrived by other means.
+        assertEquals("[]", settings.watchJson)
     }
 
     @Test
@@ -204,7 +265,7 @@ class IndexTabRemoveTest {
         rule.onAllNodesWithText("Remove")[0].performScrollTo().performClick()
         pumpFrames()
         rule.onNodeWithText("Remove this contract?").assertDoesNotExist()
-        assertEquals(listOf(LogIndexWatch.Entry(c, 100)), LogIndexWatch.parse(settings.watchJson))
+        assertEquals(store(c), settings.watchJson)
         assertEquals(false, settings.logIndexEnabled("mainnet"))
         assertEquals("an untouched host must still have nothing to push", null, settings.push())
     }

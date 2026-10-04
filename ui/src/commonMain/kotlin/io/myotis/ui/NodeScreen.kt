@@ -2177,28 +2177,26 @@ private fun IndexTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
-        // The persisted watch store as this tab last read or wrote it. Every edit
-        // goes through `edit`, which starts from the store's CURRENT value rather
-        // than from this copy: a host changes it from its own thread (an import's
-        // contracts are added, a delivered removal's marker dropped — see
-        // LogIndexWatch), and writing a stale copy back would undo that.
-        // The copy is deliberately NOT refreshed when a marker is dropped: until
-        // the engine's next status no longer lists the contract, the marker here
-        // is what keeps its row reading "removing…" instead of the contract
-        // showing up below as one nobody listed.
-        var store by remember(network) { mutableStateOf(settings.logIndexWatchJson(network)) }
+        // The persisted watch store. The tab is not its only writer — a host
+        // changes it from its own thread (an import's contracts are added, a
+        // delivered removal's marker dropped; see LogIndexWatch) — so it is
+        // re-read with every status snapshot as well as after every edit here,
+        // and an edit starts from the store's CURRENT value, never from this copy.
+        var storeRev by remember(network) { mutableStateOf(0) }
+        val store = remember(network, storeRev, snapshot) { settings.logIndexWatchJson(network) }
         val watch = remember(store) { LogIndexWatch.parse(store) }
         val unwatched = remember(store) {
             LogIndexWatch.unwatched(store).mapTo(HashSet()) { it.lowercase() }
         }
         val edit: ((String) -> String) -> Unit = { change ->
-            val next = change(settings.logIndexWatchJson(network))
-            settings.setLogIndexWatchJson(network, next)
-            store = next
+            settings.setLogIndexWatchJson(network, change(settings.logIndexWatchJson(network)))
+            storeRev++
         }
-        val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
-        // The addresses the engine's index holds, as far as it says: null without
-        // a status (the network is not running).
+        // Null while the engine gives no status — the network is stopped, or its
+        // handle is paused or still starting and answers the probe with an error
+        // object. That is "unknown", never "the index holds nothing".
+        val parsed = LogIndexStatus.parseOrNull(snapshot?.logIndexJson)
+        // The addresses the engine's index holds; null while that is unknown.
         val indexed = parsed?.entries?.mapTo(HashSet()) { it.address }
         // Whether this host has a config push to send at all (LogIndexWatch.configJson
         // sends none for an index it never configured). A removal travels in that
@@ -2209,22 +2207,30 @@ private fun IndexTab(
         // the address marked removed and the push names it under `unwatch` — at
         // once while the network runs, on its next start otherwise.
         val remove: (List<String>) -> Unit = { addresses ->
-            edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.unwatch(acc, a) } }
-            // An index this host never configured (a snapshot dropped into the data
-            // dir, activated engine-side) gets no push — one would switch it off or
-            // start a backfill the user never asked for. Removing one of ITS
-            // contracts is the user taking it over, so record what the engine is
-            // doing as this host's settings first: the push then re-asserts exactly
-            // that state. Only then — a contract the engine does not hold needs no
-            // push, and must not turn collection on for the rest of the list.
-            if (!pushes && parsed != null && addresses.any { it.lowercase() in indexed.orEmpty() }) {
-                settings.setLogIndexMaxSpeed(network, parsed.maxSpeed)
-                settings.setLogIndexBackfillPaused(network, parsed.backfillPaused)
-                settings.setLogIndexEnabled(network, parsed.enabled)
-                collecting = parsed.enabled
-                onLogIndexChanged()
+            val held = parsed != null && addresses.any { it.lowercase() in indexed.orEmpty() }
+            if (!pushes && !held) {
+                // This host never pushed a config, so it cannot have subscribed
+                // them, and the engine holds none of them: there is nothing to
+                // deliver. No marker — it would wait for a push it has no business
+                // in, and unwatch a contract that arrived by other means meanwhile.
+                edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.forget(acc, a) } }
+            } else {
+                edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.unwatch(acc, a) } }
+                // An index this host never configured (a snapshot dropped into the
+                // data dir, activated engine-side) gets no push — one would switch it
+                // off or start a backfill the user never asked for. Removing one of
+                // ITS contracts is the user taking it over, so record what the engine
+                // is doing as this host's settings first: the push then re-asserts
+                // exactly that state.
+                if (!pushes && parsed != null) {
+                    settings.setLogIndexMaxSpeed(network, parsed.maxSpeed)
+                    settings.setLogIndexBackfillPaused(network, parsed.backfillPaused)
+                    settings.setLogIndexEnabled(network, parsed.enabled)
+                    collecting = parsed.enabled
+                    onLogIndexChanged()
+                }
+                controller.applyLogIndex(network)
             }
-            controller.applyLogIndex(network)
         }
         // Removing deletes collected logs, which only a fresh backfill (or import)
         // brings back — so it is confirmed first, unless there is nothing to lose:
@@ -2315,16 +2321,23 @@ private fun IndexTab(
                     Column(Modifier.weight(1f)) {
                         Text(e.name ?: e.address)
                         Text(
-                            (if (e.name != null) "${e.address} · " else "") + "from block ${e.fromBlock}",
+                            (if (e.name != null) "${e.address} · " else "") + "from block ${e.fromBlock}" +
+                                (if (e.restricted) " · selected events only — cannot be listed" else ""),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    TextButton(onClick = {
-                        // The engine already indexes it: listing it changes nothing
-                        // there, so no push.
-                        edit { LogIndexWatch.watch(it, LogIndexWatch.Entry(e.address, e.fromBlock)) }
-                    }) { Text("Keep") }
+                    // Not for an entry indexed under a topic restriction: the list
+                    // carries no topics, so the next push would name it
+                    // unrestricted — a conflict the engine answers by replacing the
+                    // whole index.
+                    if (!e.restricted) {
+                        TextButton(onClick = {
+                            // The engine already indexes it: listing it changes
+                            // nothing there, so no push.
+                            edit { LogIndexWatch.watch(it, LogIndexWatch.Entry(e.address, e.fromBlock)) }
+                        }) { Text("Keep") }
+                    }
                     TextButton(onClick = { askToRemove(listOf(e.address)) }) { Text("Remove") }
                 }
             }
@@ -2351,9 +2364,23 @@ private fun IndexTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
+        // An address the engine indexes under a topic restriction cannot be added:
+        // the list carries no topics, so the push would name it unrestricted — a
+        // conflict the engine answers by replacing the whole index.
+        val addRestricted = parsed?.entries
+            ?.any { it.restricted && it.address == addAddress.lowercase() } == true
         val addValid = LogIndexWatch.isValidAddress(addAddress) &&
             addFrom.toLongOrNull() != null &&
-            addAddress.lowercase() !in listed
+            addAddress.lowercase() !in listed &&
+            !addRestricted
+        if (addRestricted) {
+            Text(
+                "This contract is already indexed for selected events only. Adding it here " +
+                    "would replace the whole index — remove it above first.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Button(
             enabled = addValid,
             onClick = {
@@ -2451,7 +2478,7 @@ private fun IndexTab(
                         // Importing is the opt-in — reflect the flag the host persisted,
                         // and the contracts it adopted into the watch list.
                         collecting = settings.logIndexEnabled(network)
-                        store = settings.logIndexWatchJson(network)
+                        storeRev++
                         onLogIndexChanged()
                     }
                     if (!started) importing = false

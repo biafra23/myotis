@@ -15,6 +15,11 @@ object LogIndexStatus {
         val coveredHigh: Long?,
         /** Display name (ENS reverse name or host label); null when unnamed. */
         val name: String? = null,
+        /** Indexed under a topic0 restriction (`"restricted":true`). A host's
+         *  watch list carries no topics, so listing such an entry there and
+         *  pushing it is a topic conflict — which makes the engine replace the
+         *  WHOLE index. It can be shown and removed, never listed. */
+        val restricted: Boolean = false,
     )
 
     data class Parsed(
@@ -42,6 +47,18 @@ object LogIndexStatus {
         val maxSpeed: Boolean = false,
     )
 
+    /**
+     * Whether [json] is a log-index status at all. A handle that is paused or
+     * still starting answers the (ungated) status probe with an error object,
+     * which [parse] reads as "disabled, no entries" — fine for display, wrong
+     * for any decision that takes "no entries" to mean the index holds
+     * nothing. Those ask here first, or use [parseOrNull].
+     */
+    fun isStatus(json: String): Boolean = json.contains("\"entries\"")
+
+    /** [parse], or null when [json] is not a status ([isStatus]). */
+    fun parseOrNull(json: String?): Parsed? = json?.takeIf(::isStatus)?.let(::parse)
+
     /** Structured parse of the engine's status JSON (regex over the fixed
      *  serializer shape — the same shape [format] reads). */
     fun parse(json: String): Parsed {
@@ -50,7 +67,8 @@ object LogIndexStatus {
         val entries = Regex(
             "\\{\"address\":\"(0x[0-9a-fA-F]{40})\",\"fromBlock\":(\\d+)" +
                 "(?:,\"name\":\"((?:[^\"\\\\]|\\\\.)*)\")?" +
-                "(?:,\"coveredLow\":(\\d+),\"coveredHigh\":(\\d+))?\\}"
+                "(?:,\"coveredLow\":(\\d+),\"coveredHigh\":(\\d+))?" +
+                "(,\"restricted\":true)?\\}"
         ).findAll(json).map { m ->
             Entry(
                 address = m.groupValues[1].lowercase(),
@@ -58,6 +76,7 @@ object LogIndexStatus {
                 coveredLow = m.groupValues[4].takeIf { it.isNotEmpty() }?.toLongOrNull(),
                 coveredHigh = m.groupValues[5].takeIf { it.isNotEmpty() }?.toLongOrNull(),
                 name = m.groupValues[3].takeIf { it.isNotEmpty() }?.let(::unescapeJson),
+                restricted = m.groupValues[6].isNotEmpty(),
             )
         }.toList()
         val backfillPaused = json.contains("\"backfillPaused\":true")

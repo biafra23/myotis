@@ -161,6 +161,22 @@ object LogIndexWatch {
     }
 
     /**
+     * The store with [address] gone entirely — no entry and no removal marker.
+     * For a removal with nothing to deliver: a host that never pushed a config
+     * cannot have subscribed the address, so a marker would only wait for a
+     * push it has no business in, and unwatch a contract that arrived by other
+     * means in the meantime.
+     */
+    @JvmStatic
+    fun forget(json: String, address: String): String {
+        val key = address.lowercase()
+        return serialize(
+            parse(json).filterNot { it.address.lowercase() == key },
+            unwatched(json).filterNot { it.lowercase() == key },
+        )
+    }
+
+    /**
      * The store after a successful snapshot import: every contract the import
      * BROUGHT IN joins the watched entries, so this list keeps describing what
      * the index holds and an imported subscription is not left looking like
@@ -174,6 +190,12 @@ object LogIndexWatch {
      * newer statement, and a marker left behind would have the very next push
      * delete what was just imported.
      *
+     * A topic-restricted entry ([LogIndexStatus.Entry.restricted]) is NOT
+     * listed: this store carries no topics, so the next push would name the
+     * address unrestricted — a topic conflict, on which the engine replaces
+     * the whole index. It stays among the contracts the Index tab shows as
+     * indexed but unlisted, where it can be removed.
+     *
      * [statusBefore] that is null, or is not a status at all (the probe failed
      * and returned an error object), leaves [json] untouched: with nothing to
      * subtract, every contract the engine holds would count as brought in —
@@ -183,14 +205,15 @@ object LogIndexWatch {
      */
     @JvmStatic
     fun adoptImported(json: String, statusBefore: String?, statusAfter: String): String {
-        if (statusBefore == null || !statusBefore.contains("\"entries\"")) return json
+        if (statusBefore == null || !LogIndexStatus.isStatus(statusBefore)) return json
         val before = LogIndexStatus.parse(statusBefore).entries.mapTo(HashSet()) { it.address }
         val brought = LogIndexStatus.parse(statusAfter).entries.filter { it.address !in before }
         val entries = parse(json)
         val listed = entries.mapTo(HashSet()) { it.address.lowercase() }
         val broughtKeys = brought.mapTo(HashSet()) { it.address }
         return serialize(
-            entries + brought.filter { it.address !in listed }.map { Entry(it.address, it.fromBlock) },
+            entries + brought.filter { it.address !in listed && !it.restricted }
+                .map { Entry(it.address, it.fromBlock) },
             unwatched(json).filterNot { it.lowercase() in broughtKeys },
         )
     }

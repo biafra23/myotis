@@ -191,9 +191,12 @@ class IosNodeController(
             settings.logIndexMaxSpeed(net),
             configured = settings.logIndexConfigured(net),
             backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
+        // No push lock here, unlike the JVM hosts: every caller — boot, the
+        // settings pokes, an import — runs on the single-threaded lifecycleLane,
+        // so pushes are built and applied one at a time, in order.
         if (RustEngine.setLogIndexConfig(handle, json)) {
-            // The engine took the push, the removals it named included: their
-            // markers have done their job (LogIndexWatch.delivered).
+            // The engine took the push, the removals it named included, and made
+            // them durable: their markers have done their job (LogIndexWatch.delivered).
             val now = settings.logIndexWatchJson(net)
             val left = io.myotis.ui.LogIndexWatch.delivered(now, json)
             if (left != now) settings.setLogIndexWatchJson(net, left)

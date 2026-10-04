@@ -269,8 +269,16 @@ void myotis_string_free(char *s);
  * address left out of it stays subscribed. `unwatch` (v37) is the unsubscribe
  * — each address it names leaves the index before the union, with its
  * coverage and its stored logs; the other entries keep theirs, and an address
- * the index does not watch is ignored. false for malformed JSON, an address
- * listed twice or under both keys, or a handle without a running EL reader. */
+ * the index does not watch is ignored. true means the unwatch is durable (its
+ * checkpoint is on disk). false for malformed JSON, an address listed twice
+ * or under both keys, a handle without a running EL reader, or an unwatch
+ * whose checkpoint could not be written — the entries are then dropped in
+ * memory only, the rest of the push is not applied, and repeating the push
+ * retries the write.
+ *
+ * The status JSON's entries are {"address","fromBlock","name"?,"coveredLow"?,
+ * "coveredHigh"?,"restricted"?}; "restricted":true (v37) marks an entry
+ * indexed under a topic0 restriction. */
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);

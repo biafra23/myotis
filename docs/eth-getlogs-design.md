@@ -604,7 +604,11 @@ on for them, and nothing descends for the dropped entry any more. Its
 `eth_getLogs` is refused as unwatched from then on, which is the honest answer
 (a query the index stopped following must not be served from what it had).
 The checkpoint is rewritten at once, so a restart's union finds nothing of the
-address to bring back.
+address to bring back — and the push answers `true` only once that write has
+landed. A write that fails (a full disk is the likely cause, and the likely
+moment to be removing a contract) leaves the entries dropped in memory and
+answers `false`; the unwatch is then owed a checkpoint, and a repeat with
+nothing left to drop retries the write instead of reporting nothing to do.
 
 Two rules keep it from going quietly wrong. An address the index does not
 watch is IGNORED, so the unwatch is idempotent and costs nothing when there is
@@ -627,15 +631,23 @@ then takes effect at the next start) or that the engine did not take, and the
 host drops it as soon as a push carrying it was taken
 (`LogIndexWatch.delivered`). Kept, it would unwatch the address again on every
 later push — also after something the host cannot see had subscribed it anew
-(a snapshot dropped into the data dir), deleting what was just supplied. The
-price is the other failure: a removal whose checkpoint write failed and whose
-process then died comes back with the old file — visibly, in the tab's list
-of unlisted contracts, where it can be removed again.
+(a snapshot dropped into the data dir), deleting what was just supplied.
+"Taken" includes durable (above), so a removal whose checkpoint could not be
+written keeps its marker and is sent again. On the JVM hosts each network's
+pushes and imports run under one lock, with the push built inside it: they
+are issued from several threads and wait at the engine's wake gate, and a
+push built before a removal must not be applied after the one that carried
+it (iOS runs them on a single-threaded lane).
 
 The hosts list an import's contracts in the watch store
 (`LogIndexWatch.adoptImported`: the engine's entries after the import minus
 those before it), which also clears a still-undelivered marker of a
 brought-in address, so the next push does not delete what was just imported.
+An entry indexed under a topic0 restriction is the exception: the hosts' list
+carries no topics, so pushing such an address from it would be a topic
+conflict, which replaces the whole index. The status marks those entries
+(`"restricted":true`) and the hosts neither adopt nor list them; they can be
+removed.
 The tab lists what the engine indexes that the store does not hold —
 contracts removed before removal reached the engine, or imported before
 imports were listed — with Keep and Remove, so nothing is indexed out of the

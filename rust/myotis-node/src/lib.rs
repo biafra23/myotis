@@ -818,8 +818,9 @@ pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> 
 /// and its stored logs. Resolves `{"ok":true}` when installed, `{"ok":false}`
 /// when refused — invalid JSON, a watch entry without `address` or a numeric
 /// `fromBlock`, an address listed twice or under both `watch` and `unwatch`,
-/// or a handle without a running EL reader; the engine logs the config
-/// refusals (drainLogs).
+/// a handle without a running EL reader, or an unwatch whose checkpoint could
+/// not be written (the entries are dropped in memory only; send it again);
+/// the engine logs the refusals (drainLogs).
 #[napi(ts_return_type = "Promise<string>")]
 pub fn set_log_index_config<'env>(env: &'env Env, handle: i64, config_json: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || match c_arg(&config_json) {
