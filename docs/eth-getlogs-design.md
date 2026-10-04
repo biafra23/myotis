@@ -378,11 +378,32 @@ on the same request, and the head catch-up closed ~190 blocks in 13 minutes.
 
 So a chunk that takes longer than `CHUNK_SLOW_AFTER` (5 s, a third of the
 timeout), or fails after waiting that long, is folded into the sizer as a short
-serve of however many blocks would have fit at that pace (`note_slow`). It gets
+serve of however many blocks would have fit at that pace (`note_pace`). It gets
 the truncation rules for free: at most a quarter per step, and the probe clock
-restarts. A timeout on 64 blocks retries at 21. Unlike a truncation, a slow
-chunk is evidence whichever chunk of a batch it was — a wider one can only be
-slower.
+restarts. A timeout on 64 blocks retries at 21.
+
+The hard part is that a timeout looks the same whether the link could not carry
+the chunk or the peer never answered, and only the first is about the width.
+Three rules keep a bad peer from narrowing it:
+
+- **Small chunks are no evidence.** A chunk counts only if it has at least four
+  blocks, or fills the width where that is narrower. Steady head-follow fetches
+  one to three candidates per tick; what happens to those — a silent peer, a
+  slow one, a peer one block behind the tip serving all but the last — is about
+  the peer. The same bar applies to truncation on the head side.
+- **Two in a row.** One slow chunk only arms; the second, with no chunk inside
+  the target between them, narrows. A silent peer at the front of the pool is
+  followed by one that answers; a slow link is slow for every peer. (A pending
+  probe is the exception: the probed width is a guess, and one slow chunk is the
+  guess failing.)
+- **Undo.** The width a run of slow chunks started from is remembered until a
+  chunk exercises the narrowed width. If that chunk's time, scaled up to the old
+  width, still fits the target, the old width is restored at once — the slow
+  chunks were peers that did not answer. The head side needs this because its
+  steady state cannot probe back up: tail chunks are far below the width and so
+  are no evidence.
+
+Where it applies:
 
 - **The head side has its own width.** The bridge and the tail used a fixed 64;
   they now read a `ChunkSizer` of their own (the head range and the backfill
@@ -391,11 +412,19 @@ slower.
   the cut.
 - **In the backfill, timing counts only at pipeline depth 1.** At depth 4 a
   request also waits behind the ones queued ahead of it, and the depth degrade
-  owns that case. A slow chunk ends the batch as a truncation does, so its
-  already-cut siblings do not each run up to the timeout. And a depth-1 batch
-  restores the pipeline only where four chunks in flight would still fit the
-  target (`pipeline_fits`): on a bandwidth-bound link they share the same bytes
-  per second, and restoring the depth there fails every other batch.
+  owns that case. A slow chunk that narrowed the width ends the batch as a
+  truncation does, so its already-cut siblings do not each run up to the
+  timeout. And a depth-1 batch restores the pipeline only where four chunks in
+  flight would still arrive (`pipeline_fits`: the slowest chunk times four
+  within two thirds of the timeout). On a round-trip-bound link a full chunk
+  takes a second or two alone and the pipeline comes back as before; on a
+  bandwidth-bound one four stacked chunks share the same bytes per second, and
+  restoring the depth there fails every other batch.
+
+**Not covered.** A link too slow for even four blocks inside the timeout gets no
+help from the width, since chunks that small are not evidence. And the head
+side's loops still try peers one at a time with the full timeout (#461), so a
+silent peer at the front costs 15 s per tick whatever the width.
 
 Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
 the limit-cycle bound and the floor are pinned by test. The width is *not*

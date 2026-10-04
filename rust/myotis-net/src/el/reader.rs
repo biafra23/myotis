@@ -3989,15 +3989,9 @@ impl ElReader {
             width,
             batch_candidates,
         );
-        let mut chunk = fetched.map_err(|e| e.message().to_string())?;
+        let chunk = fetched.map_err(|e| e.message().to_string())?;
         self.log_index_body_policy.note(&chunk);
-        Ok(known[..chunk.usable]
-            .iter()
-            .map(|vh| {
-                let n = vh.header.number;
-                (n, chunk.logs.remove(&n).unwrap_or_default())
-            })
-            .collect())
+        Ok(logs_by_processed_block(&known, chunk))
     }
 
     /// One backfill step: walk the verified header chain DOWNWARD from the
@@ -4551,7 +4545,7 @@ impl ElReader {
                     // peer it goes to. (Scoring this peer for it, below, is
                     // still right: unscored sorts first.)
                     if timing_is_evidence {
-                        self.log_index_chunk_sizer.note_slow(elapsed, chunk.len());
+                        self.log_index_chunk_sizer.note_pace(elapsed, chunk.len());
                     }
                     // Blame follows the same reasoning as the degrade above: at
                     // depth > 1 the failure may well be OUR prefetch racing the
@@ -4625,23 +4619,38 @@ impl ElReader {
                 break 'chunks;
             }
             slowest = slowest.max(elapsed);
-            // Complete, but slow (#545): the chunk arrived and what it holds is
-            // verified, so it is applied — but this batch's remaining chunks
-            // were cut at the same width and would each run as close to the
-            // request timeout, where one that tips over discards the whole
-            // batch. End the batch here like a truncation does, cut at the
-            // next chunk's first candidate; the next batch re-cuts narrower.
-            if timing_is_evidence && self.log_index_chunk_sizer.note_slow(elapsed, chunk.len()) {
-                slow = true;
-                tracing::debug!(
-                    blocks = chunk.len(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    next_chunk_len = self.log_index_chunk_sizer.width(),
-                    "backfill chunk slow; applying partial batch and narrowing the chunks"
-                );
-                if let Some(resume) = candidates.get((chunk_idx + 1).saturating_mul(chunk_len)) {
-                    stop_below = Some(resume.header.number);
-                    break 'chunks;
+            if timing_is_evidence {
+                match self.log_index_chunk_sizer.note_pace(elapsed, chunk.len()) {
+                    // A chunk inside the target that exercised a width slow
+                    // chunks had narrowed may show they were wrong.
+                    Pace::Fine => {
+                        self.log_index_chunk_sizer.undo_narrowing(elapsed, chunk.len(), chunk_len);
+                    }
+                    // Slow, but the width stays (the first of a streak, or
+                    // nothing narrower to try): the batch carries on. It is
+                    // still not a clean one.
+                    Pace::Slow => slow = true,
+                    // Slow, and the width is narrower for it (#545). The chunk
+                    // arrived and what it holds is verified, so it is applied —
+                    // but this batch's remaining chunks were cut at the old
+                    // width and would each run as close to the request
+                    // timeout, where one that tips over discards the whole
+                    // batch. End the batch here like a truncation does, cut at
+                    // the next chunk's first candidate; the next batch
+                    // re-cuts narrower.
+                    Pace::Narrowed => {
+                        slow = true;
+                        tracing::debug!(
+                            blocks = chunk.len(),
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            next_chunk_len = self.log_index_chunk_sizer.width(),
+                            "backfill chunk slow; applying partial batch and narrowing the chunks"
+                        );
+                        if let Some(resume) = next_chunk_start(&candidates, chunk_idx, chunk_len) {
+                            stop_below = Some(resume);
+                            break 'chunks;
+                        }
+                    }
                 }
             }
         }
@@ -8426,9 +8435,10 @@ struct CandidateChunk {
     /// logs built. Always at least one. Short of the chunk's length means the
     /// peer's byte budget cut a response; the caller resumes at this block.
     usable: usize,
-    /// Blocks whose receipts were verified (`>= usable`), and how many of them
-    /// hold a watched log: what [`BodyPolicy`] learns the hit rate from.
-    scanned: usize,
+    /// How many of those `usable` blocks hold a watched log: what
+    /// [`BodyPolicy`] learns the hit rate from. Blocks scanned past the usable
+    /// prefix are left out — the caller resumes at them, and they are counted
+    /// when that chunk processes them.
     hits: usize,
 }
 
@@ -8487,9 +8497,28 @@ fn finish_candidate_chunk<'b>(
     Ok(CandidateChunk {
         logs,
         usable,
-        scanned,
-        hits: scan.hits[..scanned].iter().filter(|h| h.is_some()).count(),
+        hits: scan.hits[..usable].iter().filter(|h| h.is_some()).count(),
     })
+}
+
+/// A chunk's logs in the shape the head bridge and the tail apply from: an
+/// entry for EVERY block of the chunk's usable prefix, empty when the block
+/// holds no watched log. Both read a missing entry as "not fetched yet" and
+/// stop applying there, which is what keeps coverage contiguous — so a block
+/// past the usable prefix must have none, and a processed false positive must
+/// have one.
+fn logs_by_processed_block(
+    headers: &[&crate::el::eth::messages::VerifiedHeader],
+    mut chunk: CandidateChunk,
+) -> std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>> {
+    headers
+        .iter()
+        .take(chunk.usable)
+        .map(|vh| {
+            let n = vh.header.number;
+            (n, chunk.logs.remove(&n).unwrap_or_default())
+        })
+        .collect()
 }
 
 /// Why a candidate chunk produced nothing. The split is whose fault it can be.
@@ -8509,6 +8538,40 @@ impl CandidateFetchError {
         match self {
             CandidateFetchError::Request(m) | CandidateFetchError::Answer(m) => m,
         }
+    }
+}
+
+/// The two requests a candidate fetch makes of a peer. A trait only so that
+/// [`fetch_candidate_logs`] — which request is made, for which blocks, and
+/// which served item belongs to which block — is tested against a scripted
+/// peer and not just through the pure pieces it calls. [`ManagedPeer`] is the
+/// one real implementation.
+trait CandidateSource: Sync {
+    fn receipts(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> impl std::future::Future<Output = Result<Vec<crate::el::eth::messages::BlockReceipts>, String>>
+           + Send;
+    fn bodies(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> impl std::future::Future<Output = Result<Vec<crate::el::eth::messages::BlockBody>, String>>
+           + Send;
+}
+
+impl CandidateSource for ManagedPeer {
+    async fn receipts(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<Vec<crate::el::eth::messages::BlockReceipts>, String> {
+        self.get_receipts(hashes).await
+    }
+
+    async fn bodies(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<Vec<crate::el::eth::messages::BlockBody>, String> {
+        self.get_block_bodies(hashes).await
     }
 }
 
@@ -8539,8 +8602,8 @@ type ChunkFetch<'a> =
 /// A failed body request fails the chunk even though its receipts verified.
 /// Keeping the body-less prefix would be correct, but it would report a
 /// transport failure to the chunk sizer as a byte-budget truncation.
-async fn fetch_candidate_logs(
-    peer: &ManagedPeer,
+async fn fetch_candidate_logs<P: CandidateSource>(
+    peer: &P,
     headers: &[&crate::el::eth::messages::VerifiedHeader],
     config: &crate::el::logindex::LogIndexConfig,
     eager_bodies: bool,
@@ -8552,20 +8615,20 @@ async fn fetch_candidate_logs(
     let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
     if eager_bodies {
         let (bodies, receipt_blocks) =
-            futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+            futures::future::join(peer.bodies(&hashes), peer.receipts(&hashes)).await;
         let (bodies, receipt_blocks) = (bodies.map_err(Request)?, receipt_blocks.map_err(Request)?);
         let scan = scan_candidate_receipts(headers, &receipt_blocks, config).map_err(Answer)?;
         // Bodies arrive in request order, so the i-th body is the i-th block's.
         return finish_candidate_chunk(headers, &scan, |i| bodies.get(i), config).map_err(Answer);
     }
-    let receipt_blocks = peer.get_receipts(&hashes).await.map_err(Request)?;
+    let receipt_blocks = peer.receipts(&hashes).await.map_err(Request)?;
     let scan = scan_candidate_receipts(headers, &receipt_blocks, config).map_err(Answer)?;
     let hit_positions = scan.hit_positions();
     let bodies = if hit_positions.is_empty() {
         Vec::new()
     } else {
         let hit_hashes: Vec<[u8; 32]> = hit_positions.iter().map(|&i| hashes[i]).collect();
-        peer.get_block_bodies(&hit_hashes).await.map_err(Request)?
+        peer.bodies(&hit_hashes).await.map_err(Request)?
     };
     finish_candidate_chunk(headers, &scan, |i| hit_body(&hit_positions, &bodies, i), config)
         .map_err(Answer)
@@ -8602,9 +8665,9 @@ fn bodies_should_be_eager(candidates: u32, hits: u32) -> bool {
 }
 
 /// Fold one chunk's scan into the decaying `(candidates, hits)` counts — pure.
-fn fold_body_policy(seen: (u32, u32), scanned: usize, hits: usize) -> (u32, u32) {
+fn fold_body_policy(seen: (u32, u32), processed: usize, hits: usize) -> (u32, u32) {
     let add = |a: u32, b: usize| a.saturating_add(u32::try_from(b).unwrap_or(u32::MAX));
-    let (mut candidates, mut hit) = (add(seen.0, scanned), add(seen.1, hits.min(scanned)));
+    let (mut candidates, mut hit) = (add(seen.0, processed), add(seen.1, hits.min(processed)));
     while candidates > BODY_POLICY_WINDOW {
         candidates /= 2;
         hit /= 2;
@@ -8620,7 +8683,7 @@ fn fold_body_policy(seen: (u32, u32), scanned: usize, hits: usize) -> (u32, u32)
 /// verified and stored does not depend on it.
 #[derive(Debug, Default)]
 struct BodyPolicy {
-    /// `(candidates scanned, of which held a watched log)`, decaying.
+    /// `(candidates processed, of which held a watched log)`, decaying.
     seen: std::sync::Mutex<(u32, u32)>,
 }
 
@@ -8631,7 +8694,7 @@ impl BodyPolicy {
 
     fn note(&self, chunk: &CandidateChunk) {
         if let Ok(mut seen) = self.seen.lock() {
-            *seen = fold_body_policy(*seen, chunk.scanned, chunk.hits);
+            *seen = fold_body_policy(*seen, chunk.usable, chunk.hits);
         }
     }
 }
@@ -11478,6 +11541,20 @@ fn truncation_plan(
     Some((usable, stop))
 }
 
+/// The block number of the first candidate of the chunk AFTER `chunk_idx`, when
+/// a batch's candidates (descending) are cut into chunks of `chunk_len` — where
+/// a batch that stops after that chunk must resume. `None` when it was the
+/// last chunk: the batch is complete.
+fn next_chunk_start(
+    candidates_desc: &[&crate::el::eth::messages::VerifiedHeader],
+    chunk_idx: usize,
+    chunk_len: usize,
+) -> Option<u64> {
+    candidates_desc
+        .get(chunk_idx.saturating_add(1).saturating_mul(chunk_len))
+        .map(|vh| vh.header.number)
+}
+
 /// Whether block `n` may be applied given the truncation cut: everything at
 /// or below the first unprocessed candidate is excluded — coverage must never
 /// claim a block whose candidate receipts were not verified.
@@ -11520,14 +11597,47 @@ const CHUNK_SHRINK_LIMIT: usize = 4;
 const CHUNK_SLOW_AFTER: Duration = Duration::from_secs(5);
 const _: () = assert!(CHUNK_SLOW_AFTER.as_secs() * 3 <= crate::el::peer::REQUEST_TIMEOUT.as_secs());
 
-/// Whether `depth` chunks in flight at once would still each finish inside
-/// [`CHUNK_SLOW_AFTER`], judged from the slowest chunk of a batch that ran them
+/// Smallest chunk whose fate says anything about the width. See
+/// [`ChunkSizer::is_evidence`].
+const CHUNK_EVIDENCE_MIN: usize = 4;
+
+/// Slow chunks in a row it takes to narrow the width. See
+/// [`ChunkSizer::note_pace`].
+const CHUNK_SLOW_STREAK: usize = 2;
+
+/// What a chunk's timing came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// Inside [`CHUNK_SLOW_AFTER`].
+    Fine,
+    /// Slow, and the width stayed where it was: too small a chunk to be
+    /// evidence, the first of a streak, or already at the floor.
+    Slow,
+    /// Slow, and the width is narrower for it.
+    Narrowed,
+}
+
+/// How much of the request timeout `depth` stacked chunks may be expected to
+/// use before the pipeline is not worth restoring: two thirds, leaving the
+/// rest for a chunk heavier than the batch's slowest.
+const PIPELINE_STACK_BUDGET: Duration = Duration::from_secs(10);
+const _: () = assert!(
+    PIPELINE_STACK_BUDGET.as_secs() * 3 <= crate::el::peer::REQUEST_TIMEOUT.as_secs() * 2
+);
+
+/// Whether `depth` chunks in flight at once would still each arrive inside
+/// the request timeout, judged from the slowest chunk of a batch that ran them
 /// one at a time — pure. Assumes the worst case, that the link and not the
 /// round trip set the pace: then `depth` requests share the same bytes per
-/// second and each takes `depth` times as long. Where round trips dominate a
-/// chunk is far inside this bound, and the pipeline is restored as before.
+/// second and each takes `depth` times as long. The test is against the
+/// TIMEOUT, not [`CHUNK_SLOW_AFTER`]: a stacked chunk that is merely slow
+/// costs nothing (the bytes per second are the same either way), one that
+/// times out discards the batch. On a round-trip-bound link a full chunk
+/// takes a second or two alone and the pipeline is restored as it always was;
+/// on a bandwidth-bound one the sizer holds chunks near five seconds, and four
+/// of those stacked would not arrive.
 fn pipeline_fits(slowest_alone: Duration, depth: usize) -> bool {
-    slowest_alone.saturating_mul(u32::try_from(depth).unwrap_or(u32::MAX)) <= CHUNK_SLOW_AFTER
+    slowest_alone.saturating_mul(u32::try_from(depth).unwrap_or(u32::MAX)) <= PIPELINE_STACK_BUDGET
 }
 
 /// How many of a chunk's `requested` blocks would have fit [`CHUNK_SLOW_AFTER`]
@@ -11660,7 +11770,7 @@ enum ChunkOutcome {
 /// Two things can make a chunk too wide, and the sizer learns from both: the
 /// PEER's byte budget, which cuts a response short ([`Self::note_truncated`]),
 /// and OUR link, which makes a response slow or lets it time out
-/// ([`Self::note_slow`], #545).
+/// ([`Self::note_pace`], #545).
 ///
 /// Policy is the pure [`next_chunk_len`] / [`fold_chunk_observation`]; this owns
 /// the state and — importantly — the two rules about WHICH observations count,
@@ -11708,6 +11818,13 @@ struct ChunkSizer {
     /// dies for an unrelated reason, one later truncation is misattributed to
     /// the probe and does not degrade the depth — one batch, self-healing.
     probing: std::sync::atomic::AtomicBool,
+    /// Consecutive slow chunks that were big enough to be evidence, with no
+    /// chunk inside the target between them. See [`Self::note_pace`].
+    slow_streak: std::sync::atomic::AtomicUsize,
+    /// The width a run of slow chunks started narrowing FROM, or 0. Held until
+    /// a chunk that exercises the narrowed width shows whether the wider one
+    /// would have fit after all. See [`Self::undo_narrowing`].
+    before_slow: std::sync::atomic::AtomicUsize,
 }
 
 impl ChunkSizer {
@@ -11716,6 +11833,8 @@ impl ChunkSizer {
             width: std::sync::atomic::AtomicUsize::new(CHUNK_LEN_MAX),
             clean_streak: std::sync::atomic::AtomicUsize::new(0),
             probing: std::sync::atomic::AtomicBool::new(false),
+            slow_streak: std::sync::atomic::AtomicUsize::new(0),
+            before_slow: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -11787,29 +11906,95 @@ impl ChunkSizer {
         !provoked
     }
 
-    /// A chunk fetch took `elapsed`, for `chunk_len` blocks. Returns whether
-    /// that was slow ([`CHUNK_SLOW_AFTER`]) and so moved the width.
+    /// Whether a chunk of `chunk_len` blocks is big enough to say anything
+    /// about a width of `width`: at least [`CHUNK_EVIDENCE_MIN`] blocks, or the
+    /// whole width where that is narrower. The head-follow tail fetches one to
+    /// three candidates per tick, and what happens to those is about the peer
+    /// (silent, slow, a block behind the tip), never about how many blocks a
+    /// request may carry.
+    fn is_evidence(chunk_len: usize, width: usize) -> bool {
+        chunk_len >= width.min(CHUNK_EVIDENCE_MIN)
+    }
+
+    /// A chunk fetch took `elapsed`, for `chunk_len` blocks: fold its pace into
+    /// the width (#545).
     ///
     /// Slowness is folded in as a short serve of however many blocks would
-    /// have fit the target at that pace, so it gets the truncation rules for
-    /// free: aim at what fit, never below a quarter of the current width in
-    /// one step, and restart the probe clock.
+    /// have fit [`CHUNK_SLOW_AFTER`] at that pace, so it gets the truncation
+    /// rules for free: aim at what fit, never below a quarter of the current
+    /// width in one step, and restart the probe clock.
     ///
-    /// Unlike a truncation it is evidence whichever chunk of a batch it was.
-    /// A truncated short tail chunk says "one fat block", which is why
-    /// [`Self::note_truncated`] ignores it; a SLOW chunk of any length says
-    /// the link moves fewer blocks per second than the width assumes, and a
-    /// wider chunk can only be slower. The caller owns the one case where it
-    /// is not evidence: a pipelined request also waits behind the ones queued
-    /// ahead of it, so the backfill only reports chunks fetched at depth 1.
-    fn note_slow(&self, elapsed: Duration, chunk_len: usize) -> bool {
+    /// The hard part is that a timeout looks the same whether the LINK could
+    /// not carry the chunk or the PEER never answered, and only the first is
+    /// about the width. Three rules keep a bad peer from narrowing it:
+    ///
+    /// - A chunk too small to be evidence ([`Self::is_evidence`]) moves nothing.
+    /// - One slow chunk only arms. It takes [`CHUNK_SLOW_STREAK`] in a row, with
+    ///   no chunk inside the target between them, to narrow: a silent peer at
+    ///   the front of the pool is followed by one that answers, a slow link is
+    ///   slow for every peer. (A pending probe is the exception — the width is
+    ///   a guess then, and one slow chunk is the guess failing.)
+    /// - What a run of slow chunks narrowed is undone if the narrower width
+    ///   then shows the wider one would have fit ([`Self::undo_narrowing`]).
+    ///
+    /// The caller owns the one case where timing is not evidence at all: a
+    /// pipelined request also waits behind the ones queued ahead of it, so the
+    /// backfill only reports chunks fetched at depth 1.
+    fn note_pace(&self, elapsed: Duration, chunk_len: usize) -> Pace {
+        use std::sync::atomic::Ordering::Relaxed;
         let Some(fit) = chunk_fit_within_target(chunk_len, elapsed) else {
-            return false;
+            self.slow_streak.store(0, Relaxed);
+            return Pace::Fine;
         };
+        let before = self.width();
+        if !Self::is_evidence(chunk_len, before) {
+            return Pace::Slow;
+        }
+        let streak = self.slow_streak.fetch_add(1, Relaxed).saturating_add(1);
+        let needed = if self.probing.load(Relaxed) { 1 } else { CHUNK_SLOW_STREAK };
+        if streak < needed {
+            return Pace::Slow;
+        }
         // The width was tested, whatever it says about a pending probe.
-        self.probing
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.probing.store(false, Relaxed);
         self.fold(fit, chunk_len);
+        if self.width() >= before {
+            return Pace::Slow; // already at the floor: nothing narrower to try
+        }
+        // Remember where this run of slow chunks started, once.
+        let _ = self.before_slow.compare_exchange(0, before, Relaxed, Relaxed);
+        Pace::Narrowed
+    }
+
+    /// Take back what slow chunks narrowed, if a chunk shows they were wrong.
+    /// Call for a chunk that came back COMPLETE and inside the target, with the
+    /// `width` it was cut at. Returns whether the width was restored.
+    ///
+    /// A chunk that exercised the narrowed width is the test: scale its time
+    /// up to the width the slow run started from, and if that still fits the
+    /// target, the link was never the problem — the slow chunks were peers
+    /// that did not answer. Restoring at once matters because the head side
+    /// cannot count on probes to climb back: its steady state is tail chunks
+    /// far below the width, which are no evidence, so a wrongly narrowed width
+    /// would greet the next catch-up as it is. Scaling by block count
+    /// overstates the wider chunk's time (the round trip does not scale), so
+    /// this errs toward staying narrow.
+    fn undo_narrowing(&self, elapsed: Duration, chunk_len: usize, width: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if chunk_len == 0 || chunk_len < width {
+            return false; // did not exercise the width: no verdict, keep waiting
+        }
+        let from = self.before_slow.swap(0, Relaxed);
+        if from <= self.width() {
+            return false; // nothing pending (or a probe already climbed past it)
+        }
+        let scaled = elapsed.as_millis().saturating_mul(from as u128) / chunk_len as u128;
+        if scaled > CHUNK_SLOW_AFTER.as_millis() {
+            return false; // the wider chunk really would have been slow
+        }
+        self.width.store(from, Relaxed);
+        self.clean_streak.store(0, Relaxed);
+        self.probing.store(false, Relaxed);
         true
     }
 
@@ -11826,25 +12011,33 @@ impl ChunkSizer {
         batch_candidates: usize,
     ) {
         match outcome {
-            // Cut short by a byte budget: `note_truncated`'s own rule decides
-            // whether this chunk was wide enough to be evidence.
+            // Cut short. On the backfill that is a byte budget, and
+            // `note_truncated`'s own rule decides whether the chunk was wide
+            // enough to count. Up here there is a second cause: the tail asks
+            // for blocks at the tip, and a peer one block behind serves all
+            // but the last. So the chunk must also be big enough to be
+            // evidence at all — a tail chunk of two or three never is.
             ChunkOutcome::Served { usable } if usable < requested => {
-                self.note_truncated(usable, requested, width, batch_candidates);
+                if Self::is_evidence(requested, width) {
+                    self.note_truncated(usable, requested, width, batch_candidates);
+                }
             }
             // Complete. Slow outranks clean: a chunk that arrived whole but
             // took most of the request timeout is a width to back away from,
             // not one to count toward the next probe.
             ChunkOutcome::Served { .. } => {
-                if !self.note_slow(elapsed, requested) {
+                if self.note_pace(elapsed, requested) == Pace::Fine
+                    && !self.undo_narrowing(elapsed, requested, width)
+                {
                     self.note_clean_batch(requested, width);
                 }
             }
             // A request that failed after a long wait is the slow link's
             // signature — a timeout is the limiting case — so the retry must
             // be narrower. One that failed fast (a disconnect) says nothing
-            // about the width, and `note_slow` leaves it alone.
+            // about the width, and `note_pace` leaves it alone.
             ChunkOutcome::RequestFailed => {
-                self.note_slow(elapsed, requested);
+                self.note_pace(elapsed, requested);
             }
             // An unusable answer is about the peer, not the width.
             ChunkOutcome::AnswerUnusable => {}
@@ -11860,6 +12053,10 @@ impl ChunkSizer {
     /// it would ratchet the width up on fabricated evidence and hand the next
     /// dense stretch a width it has to re-learn from a truncation.
     fn note_clean_batch(&self, candidates: usize, width: usize) {
+        // Clean is not slow, whatever the batch's size: a run of slow chunks
+        // ends here.
+        self.slow_streak
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         if candidates >= width {
             let grew = self.fold(width, width);
             self.probing
@@ -12656,9 +12853,11 @@ mod backfill_batch_error_tests {
 #[cfg(test)]
 mod candidate_chunk_tests {
     use super::{
-        bodies_should_be_eager, finish_candidate_chunk, fold_body_policy, hit_body,
-        receipts_hold_watched_log, scan_candidate_receipts, verify_receipts_alone, BodyPolicy,
-        CandidateChunk, BODY_POLICY_MIN_SAMPLES, BODY_POLICY_WINDOW, MIN_GAS_PER_TX,
+        bodies_should_be_eager, fetch_candidate_logs, finish_candidate_chunk, fold_body_policy,
+        hit_body, logs_by_processed_block, next_chunk_start, receipts_hold_watched_log,
+        scan_candidate_receipts, verify_receipts_alone, BodyPolicy, CandidateChunk,
+        CandidateFetchError, CandidateSource, BODY_POLICY_MIN_SAMPLES, BODY_POLICY_WINDOW,
+        MIN_GAS_PER_TX,
     };
     use crate::el::eth::messages::{BlockBody, BlockReceipts, RawList, VerifiedHeader};
     use crate::el::logindex::{LogIndexConfig, WatchEntry};
@@ -12791,8 +12990,10 @@ mod candidate_chunk_tests {
     }
 
     #[test]
-    fn eth69_receipts_are_bounded_then_verified_in_canonical_form() {
-        // eth/69 wire form: [txType, status, cumGas, logs] — no bloom.
+    fn eth69_receipts_are_bounded_before_they_are_expanded() {
+        // eth/69 wire form: [txType, status, cumGas, logs] — no bloom. (That
+        // the expansion yields the canonical encoding is messages.rs's test;
+        // the root here is built from it. This one is about the bound.)
         let wire = |cum_gas: u64, addresses: &[[u8; 20]]| {
             encode(&Item::List(vec![
                 Item::Bytes(vec![]),
@@ -12851,7 +13052,7 @@ mod candidate_chunk_tests {
     fn false_positives_are_complete_without_any_body() {
         let blocks = [miss(300), miss(299), miss(298)];
         let c = chunk(&blocks, 3, |_| None).unwrap();
-        assert_eq!((c.usable, c.scanned, c.hits), (3, 3, 0));
+        assert_eq!((c.usable, c.hits), (3, 0));
         assert!(c.logs.is_empty());
     }
 
@@ -12859,7 +13060,7 @@ mod candidate_chunk_tests {
     fn a_hit_is_built_from_its_verified_body() {
         let blocks = [miss(300), hit(299)];
         let c = chunk(&blocks, 2, |i| Some(&blocks[i].body)).unwrap();
-        assert_eq!((c.usable, c.scanned, c.hits), (2, 2, 1));
+        assert_eq!((c.usable, c.hits), (2, 1));
         // Only the watched log is kept, with the position and hash of its tx.
         let logs = &c.logs[&299];
         assert_eq!(logs.len(), 1);
@@ -12878,7 +13079,9 @@ mod candidate_chunk_tests {
         let hits = [1usize, 3];
         let bodies = [blocks[1].body.clone()];
         let c = chunk(&blocks, 4, |i| hit_body(&hits, &bodies, i)).unwrap();
-        assert_eq!((c.usable, c.scanned, c.hits), (3, 4, 2));
+        // The hit past the usable prefix is not counted: the caller resumes at
+        // it, and the chunk that processes it counts it then.
+        assert_eq!((c.usable, c.hits), (3, 1));
         assert!(c.logs.contains_key(&299) && !c.logs.contains_key(&297));
         // No body at all: only the leading false positive is done.
         let c = chunk(&blocks, 4, |_| None).unwrap();
@@ -12897,7 +13100,7 @@ mod candidate_chunk_tests {
     fn truncated_receipts_bound_the_chunk() {
         let blocks = [miss(300), miss(299), hit(298)];
         let c = chunk(&blocks, 2, |_| None).unwrap();
-        assert_eq!((c.usable, c.scanned, c.hits), (2, 2, 0));
+        assert_eq!((c.usable, c.hits), (2, 0));
         let err = chunk(&blocks, 0, |_| None).unwrap_err();
         assert!(err.contains("no receipts for candidate chunk starting at block 300"), "{err}");
     }
@@ -12977,8 +13180,200 @@ mod candidate_chunk_tests {
     fn the_policy_starts_receipts_first_and_learns_from_chunks() {
         let policy = BodyPolicy::default();
         assert!(!policy.eager());
-        policy.note(&CandidateChunk { usable: 16, scanned: 16, hits: 16, ..Default::default() });
+        policy.note(&CandidateChunk { usable: 16, hits: 16, ..Default::default() });
         assert!(policy.eager());
+    }
+
+    /// A peer that serves from a fixed set of blocks: an in-order prefix of
+    /// what was asked, up to a per-response budget, and remembers every
+    /// request. What the fetch asks for is half of what these tests are about.
+    #[derive(Default)]
+    struct ScriptedPeer {
+        blocks: Vec<Block>,
+        receipts_budget: Option<usize>,
+        bodies_budget: Option<usize>,
+        fail_receipts: bool,
+        fail_bodies: bool,
+        receipt_requests: std::sync::Mutex<Vec<Vec<[u8; 32]>>>,
+        body_requests: std::sync::Mutex<Vec<Vec<[u8; 32]>>>,
+    }
+
+    impl ScriptedPeer {
+        fn serving(blocks: Vec<Block>) -> Self {
+            ScriptedPeer { blocks, ..Default::default() }
+        }
+
+        fn block(&self, hash: &[u8; 32]) -> &Block {
+            self.blocks.iter().find(|b| b.vh.hash == *hash).expect("asked for an unknown block")
+        }
+
+        fn headers(&self) -> Vec<&VerifiedHeader> {
+            headers(&self.blocks)
+        }
+
+        fn body_requests(&self) -> Vec<Vec<[u8; 32]>> {
+            self.body_requests.lock().unwrap().clone()
+        }
+    }
+
+    impl CandidateSource for ScriptedPeer {
+        async fn receipts(&self, hashes: &[[u8; 32]]) -> Result<Vec<BlockReceipts>, String> {
+            self.receipt_requests.lock().unwrap().push(hashes.to_vec());
+            if self.fail_receipts {
+                return Err("timed out awaiting code 0x20".into());
+            }
+            let served = self.receipts_budget.unwrap_or(hashes.len());
+            Ok(hashes.iter().take(served).map(|h| self.block(h).receipts.clone()).collect())
+        }
+
+        async fn bodies(&self, hashes: &[[u8; 32]]) -> Result<Vec<BlockBody>, String> {
+            self.body_requests.lock().unwrap().push(hashes.to_vec());
+            if self.fail_bodies {
+                return Err("timed out awaiting code 0x16".into());
+            }
+            let served = self.bodies_budget.unwrap_or(hashes.len());
+            Ok(hashes.iter().take(served).map(|h| self.block(h).body.clone()).collect())
+        }
+    }
+
+    fn hash_of(number: u64) -> [u8; 32] {
+        [number as u8; 32]
+    }
+
+    #[tokio::test]
+    async fn receipts_first_asks_for_the_bodies_of_the_hits_and_no_others() {
+        let peer = ScriptedPeer::serving(vec![miss(300), hit(299), miss(298), hit(297), miss(296)]);
+        let c = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap();
+        assert_eq!((c.usable, c.hits), (5, 2));
+        assert_eq!(c.logs.len(), 2);
+        assert_eq!(c.logs[&299][0].tx_hash, keccak256(&[0x02, 299u64 as u8, 1]));
+        assert_eq!(c.logs[&297][0].block_hash, hash_of(297));
+        // One receipts request for the whole chunk, one body request naming
+        // exactly the two hits, in chunk order.
+        assert_eq!(peer.receipt_requests.lock().unwrap().len(), 1);
+        assert_eq!(peer.body_requests(), vec![vec![hash_of(299), hash_of(297)]]);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_of_false_positives_makes_no_body_request_at_all() {
+        let peer = ScriptedPeer::serving(vec![miss(300), miss(299), miss(298)]);
+        let c = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap();
+        assert_eq!((c.usable, c.hits), (3, 0));
+        assert!(c.logs.is_empty());
+        assert!(peer.body_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn eager_asks_for_every_body_and_builds_the_same_logs() {
+        let blocks = || vec![hit(300), miss(299), hit(298), miss(297)];
+        let (eager_peer, lazy_peer) = (ScriptedPeer::serving(blocks()), ScriptedPeer::serving(blocks()));
+        let eager =
+            fetch_candidate_logs(&eager_peer, &eager_peer.headers(), &config(), true).await.unwrap();
+        let lazy =
+            fetch_candidate_logs(&lazy_peer, &lazy_peer.headers(), &config(), false).await.unwrap();
+        assert_eq!(eager.logs, lazy.logs);
+        assert_eq!((eager.usable, eager.hits), (lazy.usable, lazy.hits));
+        let all: Vec<[u8; 32]> = [300, 299, 298, 297].map(hash_of).to_vec();
+        assert_eq!(eager_peer.body_requests(), vec![all]);
+        assert_eq!(lazy_peer.body_requests(), vec![vec![hash_of(300), hash_of(298)]]);
+    }
+
+    #[tokio::test]
+    async fn a_body_response_cut_short_ends_the_chunk_at_the_first_hit_without_one() {
+        // Three hits; the peer's budget fits two bodies.
+        let mut peer = ScriptedPeer::serving(vec![hit(300), miss(299), hit(298), miss(297), hit(296)]);
+        peer.bodies_budget = Some(2);
+        let c = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap();
+        // 300..297 are done (two hits built, two false positives); 296 is the
+        // hit without a body, where the caller resumes.
+        assert_eq!((c.usable, c.hits), (4, 2));
+        assert!(c.logs.contains_key(&300) && c.logs.contains_key(&298));
+        assert!(!c.logs.contains_key(&296));
+        // Eager, cut the same way: body 2 of 5 is block 299's, a false
+        // positive that needed none — so the chunk ends at 298, the first hit
+        // past what was served.
+        let mut peer = ScriptedPeer::serving(vec![hit(300), miss(299), hit(298), miss(297), hit(296)]);
+        peer.bodies_budget = Some(2);
+        let c = fetch_candidate_logs(&peer, &peer.headers(), &config(), true).await.unwrap();
+        assert_eq!((c.usable, c.hits), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_receipts_response_cut_short_bounds_the_body_request_too() {
+        let mut peer = ScriptedPeer::serving(vec![miss(300), hit(299), hit(298)]);
+        peer.receipts_budget = Some(2);
+        let c = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap();
+        assert_eq!((c.usable, c.hits), (2, 1));
+        // 298 was never scanned, so its body is not asked for.
+        assert_eq!(peer.body_requests(), vec![vec![hash_of(299)]]);
+    }
+
+    #[tokio::test]
+    async fn failures_are_split_by_whose_they_can_be() {
+        let blocks = || vec![hit(300), miss(299)];
+        // A request that failed: possibly ours (a pipelined timeout).
+        let mut peer = ScriptedPeer::serving(blocks());
+        peer.fail_receipts = true;
+        let err = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap_err();
+        assert!(matches!(err, CandidateFetchError::Request(_)), "{err:?}");
+        // The receipts verified, the body request failed: the chunk fails as a
+        // request failure, never as a truncation the sizer would learn from.
+        let mut peer = ScriptedPeer::serving(blocks());
+        peer.fail_bodies = true;
+        let err = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap_err();
+        assert!(matches!(err, CandidateFetchError::Request(_)), "{err:?}");
+        // The peer answered with nothing: its fault.
+        let mut peer = ScriptedPeer::serving(blocks());
+        peer.receipts_budget = Some(0);
+        let err = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap_err();
+        assert!(matches!(err, CandidateFetchError::Answer(_)), "{err:?}");
+        // ...or with no body for the hit the chunk starts on.
+        let mut peer = ScriptedPeer::serving(blocks());
+        peer.bodies_budget = Some(0);
+        let err = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap_err();
+        assert!(matches!(&err, CandidateFetchError::Answer(m) if m.contains("no body for block 300")), "{err:?}");
+        // ...or with receipts that are not the block's.
+        let mut peer = ScriptedPeer::serving(blocks());
+        peer.blocks[1].receipts = hit(1).receipts;
+        let err = fetch_candidate_logs(&peer, &peer.headers(), &config(), false).await.unwrap_err();
+        assert!(matches!(&err, CandidateFetchError::Answer(m) if m.contains("receiptsRoot")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_chunk_asks_nothing() {
+        let peer = ScriptedPeer::serving(Vec::new());
+        let c = fetch_candidate_logs(&peer, &[], &config(), false).await.unwrap();
+        assert_eq!(c.usable, 0);
+        assert!(peer.receipt_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_head_side_map_has_an_entry_for_every_processed_block_and_no_other() {
+        // The bridge and the tail stop applying at the first candidate without
+        // an entry. A processed false positive must therefore have one (empty),
+        // and a block past the usable prefix must not.
+        let blocks = [miss(300), hit(299), miss(298), hit(297)];
+        let hits = [1usize, 3];
+        let bodies = [blocks[1].body.clone()];
+        let c = chunk(&blocks, 4, |i| hit_body(&hits, &bodies, i)).unwrap();
+        let map = logs_by_processed_block(&headers(&blocks), c);
+        let mut processed: Vec<u64> = map.keys().copied().collect();
+        processed.sort_unstable();
+        assert_eq!(processed, vec![298, 299, 300]);
+        assert!(map[&300].is_empty() && map[&298].is_empty());
+        assert_eq!(map[&299].len(), 1);
+    }
+
+    #[test]
+    fn a_batch_cut_after_a_chunk_resumes_at_the_next_chunks_first_candidate() {
+        let blocks: Vec<Block> = (0..7).map(|i| miss(300 - i)).collect();
+        let candidates = headers(&blocks);
+        // Chunks of 3: [300,299,298] [297,296,295] [294].
+        assert_eq!(next_chunk_start(&candidates, 0, 3), Some(297));
+        assert_eq!(next_chunk_start(&candidates, 1, 3), Some(294));
+        // After the last chunk there is nothing to resume at.
+        assert_eq!(next_chunk_start(&candidates, 2, 3), None);
+        assert_eq!(next_chunk_start(&candidates, usize::MAX, 3), None);
     }
 }
 
@@ -13380,7 +13775,7 @@ mod backfill_chunk_sizing_tests {
 #[cfg(test)]
 mod chunk_timing_tests {
     use super::{
-        chunk_fit_within_target, pipeline_fits, ChunkOutcome, ChunkSizer, CHUNK_LEN_MAX,
+        chunk_fit_within_target, pipeline_fits, ChunkOutcome, ChunkSizer, Pace, CHUNK_LEN_MAX,
         CHUNK_PROBE_AFTER, CHUNK_SLOW_AFTER,
     };
     use crate::el::peer::REQUEST_TIMEOUT;
@@ -13388,6 +13783,15 @@ mod chunk_timing_tests {
 
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
+    }
+
+    /// A sizer narrowed to `width` (from the ceiling) by slow full-width chunks.
+    fn narrowed_to_about_a_third() -> ChunkSizer {
+        let sizer = ChunkSizer::new();
+        sizer.note_pace(REQUEST_TIMEOUT, 64);
+        assert_eq!(sizer.note_pace(REQUEST_TIMEOUT, 64), Pace::Narrowed);
+        assert_eq!(sizer.width(), 21);
+        sizer
     }
 
     #[test]
@@ -13410,44 +13814,108 @@ mod chunk_timing_tests {
     }
 
     #[test]
-    fn a_timeout_narrows_the_width_and_a_fast_chunk_does_not() {
+    fn one_slow_chunk_arms_and_the_second_in_a_row_narrows() {
         let sizer = ChunkSizer::new();
-        assert!(!sizer.note_slow(secs(1.0), 64));
+        assert_eq!(sizer.note_pace(secs(1.0), 64), Pace::Fine);
+        // One timeout cannot tell a slow link from a silent peer.
+        assert_eq!(sizer.note_pace(REQUEST_TIMEOUT, 64), Pace::Slow);
         assert_eq!(sizer.width(), CHUNK_LEN_MAX);
-        assert!(sizer.note_slow(REQUEST_TIMEOUT, 64));
+        // A second one, with nothing fast between: that is the link.
+        assert_eq!(sizer.note_pace(REQUEST_TIMEOUT, 64), Pace::Narrowed);
         assert_eq!(sizer.width(), 21);
     }
 
     #[test]
-    fn one_slow_chunk_cannot_cut_the_width_below_a_quarter() {
+    fn a_silent_peer_followed_by_one_that_answers_never_narrows() {
+        // The head side restarts at the front of the pool every tick, so a
+        // connected-but-silent peer there is met again and again. Each time
+        // the next peer answers at once.
         let sizer = ChunkSizer::new();
-        // A minute for 64 blocks says ~5 fit; one observation only gets to 16.
-        assert!(sizer.note_slow(secs(60.0), 64));
+        for _ in 0..50 {
+            sizer.note_chunk(ChunkOutcome::RequestFailed, REQUEST_TIMEOUT, 64, 64, 64);
+            sizer.note_chunk(ChunkOutcome::Served { usable: 64 }, secs(0.6), 64, 64, 64);
+        }
+        assert_eq!(sizer.width(), CHUNK_LEN_MAX);
+    }
+
+    #[test]
+    fn tail_sized_chunks_never_move_the_width() {
+        // Steady head-follow: one to three candidates per tick. Whatever
+        // happens to those is about the peer, not about how wide a request
+        // may be — and the width they would narrow is the catch-up's.
+        let sizer = ChunkSizer::new();
+        for _ in 0..20 {
+            // A silent peer...
+            sizer.note_chunk(ChunkOutcome::RequestFailed, REQUEST_TIMEOUT, 2, 64, 2);
+            // ...a slow one that does answer...
+            sizer.note_chunk(ChunkOutcome::Served { usable: 1 }, secs(7.0), 1, 64, 1);
+            // ...and one a block behind the tip, serving all but the last.
+            sizer.note_chunk(ChunkOutcome::Served { usable: 2 }, secs(0.3), 3, 64, 3);
+        }
+        assert_eq!(sizer.width(), CHUNK_LEN_MAX);
+    }
+
+    #[test]
+    fn a_narrowed_width_still_learns_from_chunks_that_fill_it() {
+        // Below the evidence minimum the width itself is the bar: at width 2 a
+        // 2-block chunk is a full-width chunk.
+        let sizer = ChunkSizer::new();
+        for _ in 0..3 {
+            sizer.note_chunk(ChunkOutcome::Served { usable: 1 }, secs(0.3), 64, 64, 64);
+        }
+        assert_eq!(sizer.width(), 1);
+        for _ in 0..CHUNK_PROBE_AFTER {
+            sizer.note_chunk(ChunkOutcome::Served { usable: 1 }, secs(0.3), 1, 1, 1);
+        }
+        assert_eq!(sizer.width(), 2);
+        sizer.note_chunk(ChunkOutcome::Served { usable: 1 }, secs(0.3), 2, 2, 2);
+        assert_eq!(sizer.width(), 1);
+    }
+
+    #[test]
+    fn one_slow_run_cannot_cut_the_width_below_a_quarter_per_step() {
+        let sizer = ChunkSizer::new();
+        // A minute for 64 blocks says ~5 fit; one step only gets to 16.
+        sizer.note_pace(secs(60.0), 64);
+        assert_eq!(sizer.note_pace(secs(60.0), 64), Pace::Narrowed);
         assert_eq!(sizer.width(), 16);
     }
 
     #[test]
-    fn the_same_slow_chunk_seen_again_does_not_shrink_twice() {
-        // A backfill batch cut at 64 keeps its width for every chunk, so the
-        // sizer can see several 64-block chunks at the same pace. Each says
-        // the same thing; the width must settle, not ratchet to the floor.
+    fn slow_chunks_of_the_old_width_settle_and_do_not_ratchet() {
+        // A backfill batch keeps the width it was cut at, so after the width
+        // narrows the sizer can still be shown chunks of the OLD width at the
+        // same pace. They say what the first ones said.
         let sizer = ChunkSizer::new();
-        for _ in 0..4 {
-            sizer.note_slow(secs(14.0), 64);
+        for _ in 0..5 {
+            sizer.note_pace(secs(14.0), 64);
         }
         assert_eq!(sizer.width(), 22);
     }
 
     #[test]
-    fn a_slow_chunk_restarts_the_probe_clock() {
+    fn at_the_floor_a_slow_chunk_is_slow_but_narrows_nothing() {
         let sizer = ChunkSizer::new();
-        sizer.note_slow(REQUEST_TIMEOUT, 64);
+        for _ in 0..6 {
+            sizer.note_pace(secs(120.0), sizer.width());
+        }
+        assert_eq!(sizer.width(), 1);
+        // Nothing narrower to try: the caller must not end its batch for it.
+        assert_eq!(sizer.note_pace(REQUEST_TIMEOUT, 1), Pace::Slow);
+        assert_eq!(sizer.width(), 1);
+    }
+
+    #[test]
+    fn a_slow_run_restarts_the_probe_clock() {
+        let sizer = narrowed_to_about_a_third();
         let narrowed = sizer.width();
         for _ in 0..CHUNK_PROBE_AFTER - 1 {
             sizer.note_clean_batch(narrowed, narrowed);
         }
-        // One short of a probe — and a slow chunk at the same pace: back to zero.
-        sizer.note_slow(CHUNK_SLOW_AFTER + Duration::from_millis(200), narrowed);
+        // One short of a probe — then two slow chunks narrow it again.
+        let slightly_slow = CHUNK_SLOW_AFTER + Duration::from_millis(500);
+        sizer.note_pace(slightly_slow, narrowed);
+        assert_eq!(sizer.note_pace(slightly_slow, narrowed), Pace::Narrowed);
         let after_slow = sizer.width();
         assert!(after_slow < narrowed);
         for _ in 0..CHUNK_PROBE_AFTER - 1 {
@@ -13456,6 +13924,53 @@ mod chunk_timing_tests {
         assert_eq!(sizer.width(), after_slow, "probed before a full clean run");
         sizer.note_clean_batch(after_slow, after_slow);
         assert!(sizer.width() > after_slow);
+    }
+
+    #[test]
+    fn a_probe_that_comes_back_slow_narrows_at_once() {
+        // The probed width is a guess; one slow chunk is the guess failing,
+        // and waiting for a second would cost another slow chunk per probe.
+        let sizer = narrowed_to_about_a_third();
+        let settled = sizer.width();
+        for _ in 0..CHUNK_PROBE_AFTER {
+            sizer.note_clean_batch(settled, settled);
+        }
+        let probed = sizer.width();
+        assert!(probed > settled);
+        assert_eq!(sizer.note_pace(CHUNK_SLOW_AFTER * 2, probed), Pace::Narrowed);
+        assert!(sizer.width() < probed);
+    }
+
+    #[test]
+    fn narrowing_is_undone_when_the_narrow_width_shows_the_wide_one_fit() {
+        // Two silent peers in a row look exactly like a slow link...
+        let sizer = narrowed_to_about_a_third();
+        // ...until the third answers 21 blocks in half a second: 64 would have
+        // taken about 1.5 s. The link was never the problem.
+        sizer.note_chunk(ChunkOutcome::Served { usable: 21 }, secs(0.5), 21, 21, 21);
+        assert_eq!(sizer.width(), CHUNK_LEN_MAX);
+        // One-shot: nothing is pending afterwards.
+        assert!(!sizer.undo_narrowing(secs(0.1), 64, 64));
+    }
+
+    #[test]
+    fn narrowing_stands_when_the_wide_width_really_was_too_slow() {
+        let sizer = narrowed_to_about_a_third();
+        // 21 blocks in 4.9 s: inside the target, but 64 would take ~15 s.
+        sizer.note_chunk(ChunkOutcome::Served { usable: 21 }, secs(4.9), 21, 21, 21);
+        assert_eq!(sizer.width(), 21);
+    }
+
+    #[test]
+    fn the_undo_waits_for_a_chunk_that_exercises_the_width() {
+        let sizer = narrowed_to_about_a_third();
+        // A fast tail chunk of two says nothing about 21 blocks, let alone 64:
+        // no verdict, and the question stays open.
+        sizer.note_chunk(ChunkOutcome::Served { usable: 2 }, secs(0.2), 2, 21, 2);
+        assert_eq!(sizer.width(), 21);
+        // The next catch-up's first full chunk answers it.
+        sizer.note_chunk(ChunkOutcome::Served { usable: 21 }, secs(0.5), 21, 21, 21);
+        assert_eq!(sizer.width(), CHUNK_LEN_MAX);
     }
 
     /// Fetch `width` blocks over a link that carries `blocks_per_sec`: how
@@ -13475,7 +13990,7 @@ mod chunk_timing_tests {
         // request timeout. Before #545 every peer in turn timed out on it.
         let sizer = ChunkSizer::new();
         let blocks_per_sec = 4.0; // 64 blocks = 16 s
-        let (mut timeouts, mut slow_chunks) = (0, 0);
+        let (mut timeouts, mut slow_chunks, mut working_width) = (0, 0, 0);
         for i in 0..200 {
             let width = sizer.width();
             let (outcome, elapsed) = fetch(width, blocks_per_sec);
@@ -13484,16 +13999,38 @@ mod chunk_timing_tests {
                 assert!(i < 2, "timed out again at chunk {i}, width {width}");
             } else if elapsed > CHUNK_SLOW_AFTER {
                 slow_chunks += 1;
+            } else {
+                working_width = width; // the loop may end on a probe
             }
             sizer.note_chunk(outcome, elapsed, width, width, width);
         }
-        assert_eq!(timeouts, 1);
-        // Probes overshoot by design — one slow (but complete) chunk per
-        // probe cycle, never a second timeout.
-        assert!(slow_chunks <= 200 / CHUNK_PROBE_AFTER, "{slow_chunks} slow chunks");
-        // It settles where a chunk takes about the target, not at the floor.
-        let settled = sizer.width() as f64 / blocks_per_sec;
-        assert!((2.5..=7.5).contains(&settled), "settled at {settled:.1} s per chunk");
+        // The two it takes to tell a slow link from a silent peer; no third.
+        assert_eq!(timeouts, 2);
+        // Probes overshoot by design — about one slow (but complete) chunk per
+        // probe cycle.
+        assert!(slow_chunks <= 2 + 200 / CHUNK_PROBE_AFTER, "{slow_chunks} slow chunks");
+        // It settles where a chunk takes about the target, not at the floor —
+        // and the undo never mistakes this link for a fast one.
+        let settled = working_width as f64 / blocks_per_sec;
+        assert!((2.5..=5.0).contains(&settled), "settled at {settled:.1} s per chunk");
+    }
+
+    #[test]
+    fn on_a_slow_link_a_sparse_catch_up_converges_too() {
+        // Chunks shorter than the width (a sparse watch-list, or the tick's
+        // apply budget) on the same slow link: 30 candidates at a time.
+        let sizer = ChunkSizer::new();
+        let blocks_per_sec = 1.5; // 30 blocks = 20 s
+        let mut timeouts = 0;
+        for _ in 0..40 {
+            let width = sizer.width();
+            let requested = width.min(30);
+            let (outcome, elapsed) = fetch(requested, blocks_per_sec);
+            timeouts += usize::from(matches!(outcome, ChunkOutcome::RequestFailed));
+            sizer.note_chunk(outcome, elapsed, requested, width, requested);
+        }
+        assert!(timeouts <= 4, "{timeouts} timeouts");
+        assert!(sizer.width() < 23, "width {} still asks for more than 15 s of blocks", sizer.width());
     }
 
     #[test]
@@ -13520,8 +14057,10 @@ mod chunk_timing_tests {
         assert_eq!(sizer.width(), CHUNK_LEN_MAX);
         // Nor does an answer that failed verification, however long it took.
         sizer.note_chunk(ChunkOutcome::AnswerUnusable, REQUEST_TIMEOUT, 64, 64, 64);
+        sizer.note_chunk(ChunkOutcome::AnswerUnusable, REQUEST_TIMEOUT, 64, 64, 64);
         assert_eq!(sizer.width(), CHUNK_LEN_MAX);
-        // A complete chunk that was slow narrows; it is not a clean one.
+        // Complete chunks that were slow narrow; they are not clean ones.
+        sizer.note_chunk(ChunkOutcome::Served { usable: 64 }, CHUNK_SLOW_AFTER * 2, 64, 64, 64);
         sizer.note_chunk(ChunkOutcome::Served { usable: 64 }, CHUNK_SLOW_AFTER * 2, 64, 64, 64);
         assert_eq!(sizer.width(), 32);
         // A truncated short TAIL chunk (the batch had more candidates than the
@@ -13532,16 +14071,18 @@ mod chunk_timing_tests {
     }
 
     #[test]
-    fn the_pipeline_is_restored_only_where_stacked_chunks_still_fit() {
-        // Round-trip-bound: a chunk takes a fraction of a second alone, and
-        // four in flight are still far inside the target.
-        assert!(pipeline_fits(secs(0.3), 4));
+    fn the_pipeline_is_restored_only_where_stacked_chunks_still_arrive() {
+        // Round-trip-bound: a full chunk takes a second or two alone, and four
+        // in flight are well inside the request timeout. Restored, as always.
         assert!(pipeline_fits(Duration::ZERO, 4));
-        // Bandwidth-bound: chunks the sizer tuned to a few seconds each would
-        // take four times as long stacked — past the request timeout.
-        assert!(!pipeline_fits(secs(4.0), 4));
-        assert!(pipeline_fits(CHUNK_SLOW_AFTER / 4, 4));
-        assert!(!pipeline_fits(CHUNK_SLOW_AFTER / 4 + Duration::from_millis(1), 4));
+        assert!(pipeline_fits(secs(0.3), 4));
+        assert!(pipeline_fits(secs(2.5), 4));
+        // Bandwidth-bound: the sizer holds chunks near the 5 s target, and
+        // four of those sharing the link would take 20 s each.
+        assert!(!pipeline_fits(secs(2.6), 4));
+        assert!(!pipeline_fits(CHUNK_SLOW_AFTER, 4));
+        // Whatever the depth, the stacked time stays inside the timeout.
+        assert!(secs(2.5) * 4 < REQUEST_TIMEOUT);
     }
 }
 
