@@ -46,6 +46,7 @@ class MyotisStatusRpcTest {
         /* readyPeers */ 3,
         /* snapPeers */ 2,
         /* snapServingPeers */ 1, // distinct from snapPeers: the mapping, not a copy, is pinned
+        /* snap2ServingPeers */ 7, // a value no other field has: a swapped or copied mapping fails
         /* discoveredPeers */ 5,
         /* backedOffPeers */ 1,
         /* blacklistedPeers */ 0,
@@ -112,7 +113,7 @@ class MyotisStatusRpcTest {
     @Test fun statusJson_mirrorsIpcStatusShape() {
         assertEquals(
             """{"ok":true,"state":"RUNNING","uptimeSeconds":42,"discoveredPeers":5,""" +
-                """"connectedPeers":4,"readyPeers":3,"snapPeers":2,"snapServingPeers":1,""" +
+                """"connectedPeers":4,"readyPeers":3,"snapPeers":2,"snapServingPeers":1,"snap2ServingPeers":7,""" +
                 """"backedOffPeers":1,""" +
                 """"blacklistedPeers":0,"pauseCount":7,"totalPausedMs":1000,""" +
                 """"lastPauseEpochMs":111,"lastResumeEpochMs":222,"lastWakeReason":"REQUEST"}""",

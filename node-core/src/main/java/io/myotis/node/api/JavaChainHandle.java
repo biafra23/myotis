@@ -144,7 +144,16 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
         // serving pool (activeSnapHandlers filters out serving-failed peers). Surfacing
         // both makes a serving-pool collapse visible — the live operational issue on
         // peer-scarce chains — so never feed one into the other.
-        int snapServing = conn != null ? conn.activeSnapHandlers().size() : 0;
+        // snap2Serving is the part of the serving pool on snap/2 (EIP-8189) — shown
+        // next to the serving count, never gated on (reads are the same on either).
+        int snapServing = 0;
+        int snap2Serving = 0;
+        if (conn != null) {
+            for (com.jaeckel.ethp2p.networking.eth.EthHandler h : conn.activeSnapHandlers()) {
+                snapServing++;
+                if (h.snapVersion() >= 2) snap2Serving++;
+            }
+        }
         long wallClockPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot());
         io.myotis.rpc.VerifiedRpcBackend backend = stack.rpcBackend();
 
@@ -157,6 +166,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 ready.size(),
                 snapNegotiated,
                 snapServing,
+                snap2Serving,
                 stack.discV4() != null ? stack.discV4().table().size() : 0,
                 stack.pruneAndCountActiveBackoff(),
                 stack.blacklistedNodeIds().size(),

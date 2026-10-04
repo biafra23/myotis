@@ -1805,6 +1805,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
     public boolean isSnapNegotiated() { return snapNegotiated; }
 
+    /** The snap version this connection runs (1, or 2 = EIP-8189); 0 when none is negotiated. */
+    public int snapVersion() { return snapVersion; }
+
     public boolean isSnapServingFailed() {
         long until = snapServingFailedUntilNs;
         // `now - until < 0` (not `now < until`) is the overflow-safe nanoTime comparison.

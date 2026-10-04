@@ -629,6 +629,7 @@ class DesktopNodeController(
             readyPeers = s.readyPeers(),
             snapPeers = s.snapPeers(),
             snapServingPeers = s.snapServingPeers(),
+            snap2ServingPeers = s.snap2ServingPeers(),
             clConnectedPeers = bs.connectedPeers(),
             clServedPeersLastMin = bs.servedPeersLastMinute(),
             clCachedPeers = clCache.total,

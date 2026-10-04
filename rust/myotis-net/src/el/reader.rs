@@ -4992,6 +4992,14 @@ impl ElReader {
         self.pool.snap_serving_count().await
     }
 
+    /// `(serving, serving on snap/2)` from one pass over the pool:
+    /// [`snap_serving_count`](Self::snap_serving_count) and the part of it
+    /// whose connection runs snap/2 (EIP-8189) — the hosts' `snapServingPeers`
+    /// and `snap2ServingPeers` (ABI ≥ 38; the latter shown, never gated on).
+    pub async fn snap_serving_counts(&self) -> (usize, usize) {
+        self.pool.snap_serving_counts().await
+    }
+
     /// EL pool/discovery counts for the host status snapshot.
     pub async fn attempted_count(&self) -> usize {
         self.pool.attempted_count().await

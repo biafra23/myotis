@@ -1106,7 +1106,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // peers, so the total IS the ready count).
         StatusRow(
             "EL peers",
-            "${s.readyPeers} · snap ${s.snapPeers} · serving ${s.snapServingPeers}",
+            elPeersValue(s.readyPeers, s.snapPeers, s.snapServingPeers, s.snap2ServingPeers),
             help = StatusHelp.EL_PEERS,
         )
         // Cache rows: confirmed-server counts predict how fast the NEXT cold
@@ -1854,6 +1854,17 @@ private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
 }
 
 /**
+ * The "EL peers" row's value: `ready · snap M · serving K`, with the number of
+ * serving peers connected over snap/2 (EIP-8189) in parentheses after K —
+ * "serving 8 (3)". No parentheses while none of them is on snap/2, so a pool that
+ * is all snap/1 reads exactly as it did before snap/2 existed.
+ */
+internal fun elPeersValue(ready: Int, snap: Int, serving: Int, snap2Serving: Int): String {
+    val snap2 = if (snap2Serving > 0) " ($snap2Serving)" else ""
+    return "$ready · snap $snap · serving $serving$snap2"
+}
+
+/**
  * Status-tab help text, one entry per on-screen item — the in-app twin of
  * docs/status-screen.md. **Keep both in sync**: a behavior change to
  * [StatusView]/[ReadinessStrip]/[StatusTab] that changes what a row means
@@ -1879,8 +1890,11 @@ private object StatusHelp {
         "request in the last 60s. \"con N\" = currently-connected CL peers — usually near 0, " +
         "since connections are short-lived."
     const val EL_PEERS = "\"N\" ready peers total, \"snap M\" negotiated snap (snap/1 or " +
-        "snap/2), \"serving K\" can answer a read right now. Reads gate on serving, not " +
-        "snap — a cold pool can show snap peers for hours before any of them can actually serve."
+        "snap/2), \"serving K\" can answer a read right now. A number in parentheses after it " +
+        "— \"serving 8 (3)\" — is how many of those serving peers are connected over snap/2, " +
+        "the newer protocol version; no parentheses means all of them are on snap/1. Reads work " +
+        "the same on both. Reads gate on serving, not snap — a cold pool can show snap peers " +
+        "for hours before any of them can actually serve."
     const val CL_CACHE = "Peers in the on-disk CL peer cache: total · ✓ proven light-client " +
         "servers · ✕ confirmed non-servers · ? untried. Predicts how fast the next cold start " +
         "finds servers."
