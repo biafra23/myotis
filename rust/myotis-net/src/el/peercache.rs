@@ -234,9 +234,9 @@ impl ElPeerCache {
                 // A peer past the connect-failure demote threshold reports
                 // Denied regardless of its learned serve quality: a
                 // currently-unreachable Confirmed peer must not outrank
-                // reachable candidates (or get the hunt's eager backoff
-                // bypass). The stored verdict is kept — one successful
-                // connect clears the streak and restores it (Java parity).
+                // reachable candidates in the dial order. The stored verdict
+                // is kept — one successful connect clears the streak and
+                // restores it (Java parity).
                 let quality = if e.fails >= CONNECT_FAILURE_DEMOTE {
                     SnapQuality::Denied
                 } else {

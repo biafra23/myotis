@@ -1967,8 +1967,9 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         if hunting && !inner.hunting.swap(true, Ordering::Relaxed) {
             tracing::info!(stall_secs = EL_HUNT_STALL.as_secs(),
                 "EL hunt engaged — serving pool empty past the stall window \
-                 (busy peers retry on the transient cadence; backoffs re-dial at the \
-                 inbound-throttle floor)");
+                 (busy peers retry on the transient cadence; below target, backoff \
+                 windows shrink with the shortfall — floors: 30 s transient/busy, \
+                 60 s lagging)");
         }
         // PINNED BOOT ENODES: maintained ABOVE the count gate (see
         // `pins_to_dial`). Below target, dial all — a dropped pin must reconnect
