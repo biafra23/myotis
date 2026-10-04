@@ -2384,6 +2384,10 @@ mod tests {
                 try_dial_verdict(&pool.inner, dead(1), pubkey).await,
                 DialVerdict::Dialed
             );
+            // (Only the verdict is asserted: under the paused clock the dial's
+            // own outcome — refused, or timed out when auto-advance jumps the
+            // handshake timeout before the loopback RST is polled — is
+            // timing-dependent. Either way it records a Transient backoff.)
             // …while a laggard backed off just now is still blocked, and a
             // wrong-chain peer stays blocked however empty the pool.
             assert_eq!(

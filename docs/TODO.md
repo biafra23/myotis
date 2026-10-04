@@ -155,6 +155,11 @@ complete on its own.
   inbound throttle, `PEER_INBOUND_THROTTLE`, which is also why the EL hunt no
   longer clears a confirmed server's transient backoff outright; #539),
   `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
+- Engine divergence (#539): the Rust EL hunt no longer clears a cache-confirmed
+  server's transient backoff outright — against geth's 30 s inbound throttle
+  that re-dial is a refusal and a cache strike — while the Java
+  `ChainStack.maintainSnapPeers` still does. Aligning the Java twin is the
+  owner's call.
 - A warm resume's first read can cost up to one maintainer tick (~10 s) on
   an eth/68-only pool, since proving a peer now needs a probe round-trip;
   eth/69 peers prove at the handshake.
