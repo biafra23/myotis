@@ -638,7 +638,7 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
-     * Fetch a single account from the snap/1 state trie via any active READY + snap peer.
+     * Fetch a single account from the snap state trie via any active READY + snap peer.
      * Automatically retries with the next snap peer if the first one fails.
      *
      * @param address 20-byte Ethereum address
@@ -688,7 +688,7 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
-     * Fetch storage slots for a contract via snap/1 from any active snap peer.
+     * Fetch storage slots for a contract via snap from any active snap peer.
      * Automatically retries with the next snap peer if the first one fails.
      *
      * @param contractAddress 20-byte contract address

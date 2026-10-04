@@ -1012,7 +1012,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             org.apache.tuweni.bytes.Bytes reqId = org.apache.tuweni.rlp.RLP.decodeList(
                     org.apache.tuweni.bytes.Bytes.wrap(msg.payload()),
                     reader -> reader.readValue());
-            if (reqId.size() > 8) return; // not a uint64 request id
+            if (reqId.size() > 8) { // not a uint64 request id
+                log.debug("[snap] GetBlockAccessLists with malformed reqId ({} bytes) — dropped", reqId.size());
+                return;
+            }
             byte[] emptyResponse = org.apache.tuweni.rlp.RLP.encodeList(w -> {
                 w.writeValue(reqId);
                 w.writeList(l -> { });
@@ -1223,7 +1226,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /**
      * Probe THIS peer for the header at its own current best-block hash.
      *
-     * <p>This is the right primitive to use before any snap/1 query: peers
+     * <p>This is the right primitive to use before any snap query: peers
      * prune state outside a ~128-block window, so the only stateRoot a peer
      * is reliably willing to serve is the one anchored at its own current
      * head. Callers should pair the returned header's {@code stateRoot} with
@@ -1397,7 +1400,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
-     * Fetch a single account from the snap/1 state trie.
+     * Fetch a single account from the snap state trie.
      *
      * Always fetches a fresh block header from this peer (using their best block hash)
      * to get a recent state root that the peer is guaranteed to have available.
@@ -1489,7 +1492,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     /**
      * Soft response-size cap for single-key snap proofs (GetAccountRange /
      * GetStorageRanges). We only ever need the boundary proof for one key, not a
-     * state-sync page. Per the snap/1 spec this is a soft limit on the account
+     * state-sync page. Per the snap spec this is a soft limit on the account
      * /slot data and the responder still returns at least one entry plus the
      * COMPLETE proof, so the proof we verify is never truncated. 4 KiB keeps the
      * discarded data page tiny (~30x smaller than the old 128 KiB), which is what
@@ -1528,7 +1531,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
-     * Fetch storage slots for a contract from the snap/1 storage trie.
+     * Fetch storage slots for a contract from the snap storage trie.
      *
      * <p>Fetches a fresh block header from this peer to get a non-pruned state root,
      * then sends GetStorageRanges for the given account and storage key.
@@ -1643,7 +1646,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     /**
-     * Fetch bytecode by code hash via snap/1 GetByteCodes.
+     * Fetch bytecode by code hash via snap GetByteCodes.
      *
      * <p>Bytecode is immutable, so this request does not need a state root —
      * the caller must verify the response by hashing each returned blob and
