@@ -341,15 +341,16 @@ const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 /// Kept EQUAL to peercache's snap FAILURE_THRESHOLD on purpose: when other
 /// peers exist the live strike here and the persisted cache strike increment
 /// in lockstep, so an evicted laggard flips to `Denied` in the same beat and
-/// the hunt's confirmed-peer backoff bypass won't instantly re-dial it. Drift
-/// between the two constants would silently reopen that re-admit churn.
+/// is dialed LAST once its backoff elapses, not first as a still-confirmed
+/// server. Drift between the two constants would silently reopen that
+/// re-admit churn.
 ///
 /// Since #465 the lockstep holds for WITNESSED failures only (see
 /// [`QualityOutcome`]): a failure no other peer contradicted still counts
 /// here, so the live pool rotates, but persists nothing — the peer it evicts
-/// is not flipped to `Denied`, and a hunt may re-dial it after one transient
-/// window. That re-dial costs one handshake and, while the hunt stays
-/// engaged, the few failed reads it takes to evict it again — the price of
+/// is not flipped to `Denied`, and the maintainer may re-dial it after one
+/// transient window. That re-dial costs one handshake and, while the hunt
+/// stays engaged, the few failed reads it takes to evict it again — the price of
 /// never poisoning the cache with a verdict nobody witnessed (14 of 27
 /// entries in #465's cold-start cache were such verdicts).
 const READ_FAILS_EVICT: u32 = 3;
