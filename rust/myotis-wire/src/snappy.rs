@@ -48,6 +48,111 @@ pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Framed format (eth2 req/resp): stream identifier, then chunks of
+// type(1) || len(3 LE) || masked CRC32C(4) || data.
+// ---------------------------------------------------------------------------
+
+/// Compress with the snappy FRAMING format. Without `std`, data goes out as
+/// uncompressed chunks (type 0x01) -- valid framed snappy every reader accepts.
+pub fn compress_framed(input: &[u8]) -> Vec<u8> {
+    #[cfg(feature = "std")]
+    {
+        use std::io::Write;
+        let mut enc = snap::write::FrameEncoder::new(Vec::new());
+        enc.write_all(input).expect("Vec write cannot fail");
+        enc.into_inner().expect("Vec flush cannot fail")
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        compress_framed_builtin(input)
+    }
+}
+
+/// Decompress a framed stream, producing at most `limit` bytes (the caller
+/// passes declared+1 to detect overrun). `None` on malformed input or a CRC
+/// mismatch.
+pub fn decompress_framed(input: &[u8], limit: usize) -> Option<Vec<u8>> {
+    #[cfg(feature = "std")]
+    {
+        use std::io::Read;
+        let mut out = Vec::new();
+        snap::read::FrameDecoder::new(input).take(limit as u64).read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        decompress_framed_builtin(input, limit)
+    }
+}
+
+const STREAM_ID: [u8; 10] = [0xff, 0x06, 0x00, 0x00, b's', b'N', b'a', b'P', b'p', b'Y'];
+
+/// CRC-32C (Castagnoli), bitwise. Payloads here are tens of KB, so a table
+/// buys nothing worth its 1 KiB.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82f6_3b78 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+fn masked_crc(data: &[u8]) -> u32 {
+    let c = crc32c(data);
+    c.rotate_right(15).wrapping_add(0xa282_ead8)
+}
+
+#[cfg_attr(feature = "std", allow(dead_code))]
+pub(crate) fn compress_framed_builtin(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + 10 + 8 * (input.len() / 65536 + 1));
+    out.extend_from_slice(&STREAM_ID);
+    for chunk in input.chunks(65536) {
+        let len = chunk.len() + 4;
+        out.push(0x01);
+        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+        out.extend_from_slice(&masked_crc(chunk).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+#[cfg_attr(feature = "std", allow(dead_code))]
+pub(crate) fn decompress_framed_builtin(input: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < input.len() && out.len() < limit {
+        let kind = input[pos];
+        let len = *input.get(pos + 1)? as usize | (*input.get(pos + 2)? as usize) << 8 | (*input.get(pos + 3)? as usize) << 16;
+        let body = input.get(pos + 4..pos + 4 + len)?;
+        pos += 4 + len;
+        match kind {
+            0xff => {
+                if body != &STREAM_ID[4..] {
+                    return None;
+                }
+            }
+            0x00 | 0x01 => {
+                if body.len() < 4 {
+                    return None;
+                }
+                let want = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let data = if kind == 0x00 { decompress_builtin(&body[4..])? } else { body[4..].to_vec() };
+                if masked_crc(&data) != want {
+                    return None;
+                }
+                out.extend_from_slice(&data);
+            }
+            0x80..=0xfe => {} // padding / skippable
+            _ => return None, // reserved unskippable
+        }
+    }
+    out.truncate(limit);
+    Some(out)
+}
+
 fn read_varint(b: &[u8]) -> Option<(usize, usize)> {
     let mut v: u64 = 0;
     for (i, byte) in b.iter().enumerate().take(5) {
@@ -177,6 +282,29 @@ mod tests {
             assert_eq!(snap::raw::Decoder::new().decompress_vec(&c).unwrap(), s);
             assert_eq!(decompress_builtin(&c).as_deref(), Some(&s[..]));
         }
+    }
+
+    #[test]
+    fn framed_builtin_and_snap_agree_both_ways() {
+        use std::io::{Read, Write};
+        for s in samples() {
+            let mut enc = snap::write::FrameEncoder::new(Vec::new());
+            enc.write_all(&s).unwrap();
+            let c = enc.into_inner().unwrap();
+            assert_eq!(decompress_framed_builtin(&c, s.len() + 1).as_deref(), Some(&s[..]));
+            let b = compress_framed_builtin(&s);
+            let mut out = Vec::new();
+            snap::read::FrameDecoder::new(&b[..]).read_to_end(&mut out).unwrap();
+            assert_eq!(out, s);
+        }
+    }
+
+    #[test]
+    fn framed_builtin_rejects_a_bad_crc() {
+        let mut b = compress_framed_builtin(b"hello world");
+        let n = b.len();
+        b[n - 1] ^= 1;
+        assert!(decompress_framed_builtin(&b, 100).is_none());
     }
 
     #[test]

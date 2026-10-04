@@ -16,12 +16,16 @@ license = "MIT OR Apache-2.0"
 # built-in codec is used (see `snappy`).
 [features]
 default = ["std"]
-std = ["myotis-core/std", "dep:snap"]
+std = ["myotis-core/std", "myotis-consensus/std", "tracing/std", "dep:snap"]
 # `SessionSecrets::test_pair` for other crates' tests (myotis-net's frame/session tests).
 test-util = []
 
 [dependencies]
 myotis-core = { path = "../myotis-core", default-features = false }
+# eth2 status/fork-digest SSZ helpers.
+myotis-consensus = { path = "../myotis-consensus", default-features = false }
+# Diagnostics in the eth2 multi-chunk decoder (I/O-free facade).
+tracing = { version = "=0.1.44", default-features = false }
 aes = { version = "=0.8.4", default-features = false }
 ctr = { version = "=0.9.2", default-features = false }
 cipher = { version = "=0.4.4", default-features = false }

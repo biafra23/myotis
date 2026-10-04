@@ -3234,11 +3234,13 @@ dependencies = [
  "cipher",
  "ctr",
  "hmac",
+ "myotis-consensus",
  "myotis-core",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "snap",
  "subtle",
+ "tracing",
 ]
 
 [[package]]
