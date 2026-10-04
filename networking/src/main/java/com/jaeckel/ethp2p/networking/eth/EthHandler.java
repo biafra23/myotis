@@ -84,8 +84,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private int snapByteCodes        = 0x26;
     private int snapGetTrieNodes     = 0x27;
     private int snapTrieNodes        = 0x28;
-    private int snapGetBlockAccessLists = 0x29;
-    private int snapBlockAccessLists    = 0x2a;
+    /** 0x10 + the negotiated eth protocol length; what the offsets above and below count from. */
+    private int snapBase             = 0x21;
+
+    // Offsets from snapBase of the pairs only ONE snap version has. Whether a
+    // code is such a message is decided by isSnap…(code, snapBase, snapVersion).
+    static final int SNAP_GET_TRIE_NODES         = 6; // snap/1 only
+    static final int SNAP_TRIE_NODES             = 7; // snap/1 only
+    static final int SNAP_GET_BLOCK_ACCESS_LISTS = 8; // snap/2 only (EIP-8189)
+    static final int SNAP_BLOCK_ACCESS_LISTS     = 9; // snap/2 only (EIP-8189)
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
@@ -436,17 +443,15 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             log.info("[eth] Negotiated eth/{}", negotiatedEthVersion);
             // eth/69 adds BlockRangeUpdate (0x11), making protocol length 18 instead of 17
             int ethProtocolLength = negotiatedEthVersion >= 69 ? 18 : 17;
-            int snapBase = 0x10 + ethProtocolLength; // p2p base (16) + eth length
+            snapBase = snapBaseFor(negotiatedEthVersion); // p2p base (16) + eth length
             snapGetAccountRange  = snapBase;
             snapAccountRange     = snapBase + 1;
             snapGetStorageRanges = snapBase + 2;
             snapStorageRanges    = snapBase + 3;
             snapGetByteCodes     = snapBase + 4;
             snapByteCodes        = snapBase + 5;
-            snapGetTrieNodes     = snapBase + 6;
-            snapTrieNodes        = snapBase + 7;
-            snapGetBlockAccessLists = snapBase + 8;
-            snapBlockAccessLists    = snapBase + 9;
+            snapGetTrieNodes     = snapBase + SNAP_GET_TRIE_NODES;
+            snapTrieNodes        = snapBase + SNAP_TRIE_NODES;
             log.info("[eth] snap base offset: 0x{} (eth length={})",
                 Integer.toHexString(snapBase), ethProtocolLength);
             snapVersion = negotiateSnapVersion(hello.capabilities);
@@ -793,13 +798,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     handleSnapByteCodes(msg);
                 } else if (msg.code() == snapGetByteCodes) {
                     handleSnapGetByteCodes(ctx, msg);
-                } else if (snapVersion == 1 && msg.code() == snapTrieNodes) {
+                } else if (isSnapTrieNodes(msg.code(), snapBase, snapVersion)) {
                     handleSnapTrieNodes(msg);
-                } else if (snapVersion == 1 && msg.code() == snapGetTrieNodes) {
+                } else if (isSnapGetTrieNodes(msg.code(), snapBase, snapVersion)) {
                     // snap/1 only: snap/2 (EIP-8189) retired the pair, so on a
                     // snap/2 connection the code is not a request and gets no answer.
                     handleSnapGetTrieNodes(ctx, msg);
-                } else if (snapVersion >= 2 && msg.code() == snapGetBlockAccessLists) {
+                } else if (isSnapGetBlockAccessLists(msg.code(), snapBase, snapVersion)) {
                     handleSnapGetBlockAccessLists(ctx, msg);
                 } else if ((msg.code() == ETH_TRANSACTIONS || msg.code() == NewPooledTransactionHashesMessage.CODE)
                         && isWatchingGossip()) {
@@ -1007,24 +1012,57 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         // need the request's hash list parsed and bounded, for an answer that
         // tells the peer the same thing.
         try {
-            // Echo the request id as raw RLP bytes — a readLong/writeLong round
-            // trip corrupts ids with bit 63 set (see the GetBlockHeaders case).
-            org.apache.tuweni.bytes.Bytes reqId = org.apache.tuweni.rlp.RLP.decodeList(
-                    org.apache.tuweni.bytes.Bytes.wrap(msg.payload()),
-                    reader -> reader.readValue());
-            if (reqId.size() > 8) { // not a uint64 request id
-                log.debug("[snap] GetBlockAccessLists with malformed reqId ({} bytes) — dropped", reqId.size());
+            byte[] emptyResponse = emptyBlockAccessLists(msg.payload());
+            if (emptyResponse == null) {
+                log.debug("[snap] GetBlockAccessLists with malformed reqId (over 8 bytes) — dropped");
                 return;
             }
-            byte[] emptyResponse = org.apache.tuweni.rlp.RLP.encodeList(w -> {
-                w.writeValue(reqId);
-                w.writeList(l -> { });
-            }).toArrayUnsafe();
-            rlpxHandler.sendMessage(ctx, snapBlockAccessLists, emptyResponse);
-            log.debug("[snap] Responded with empty BlockAccessLists (reqId={})", reqId.toShortHexString());
+            rlpxHandler.sendMessage(ctx, snapBase + SNAP_BLOCK_ACCESS_LISTS, emptyResponse);
+            log.debug("[snap] Responded with empty BlockAccessLists");
         } catch (Exception e) {
             log.debug("[snap] Failed to respond to GetBlockAccessLists: {}", e.getMessage());
         }
+    }
+
+    /**
+     * The empty {@code BlockAccessLists} answer {@code [reqId, []]} to a
+     * {@code GetBlockAccessLists} request, or {@code null} when the request's
+     * first element is not a uint64 request id (over 8 bytes). Throws when the
+     * payload is not an RLP list at all. Byte-identical to the Rust engine's
+     * {@code snap::encode_empty_codes}.
+     */
+    static byte[] emptyBlockAccessLists(byte[] requestPayload) {
+        // Echo the request id as raw RLP bytes — a readLong/writeLong round
+        // trip corrupts ids with bit 63 set (see the GetBlockHeaders case).
+        org.apache.tuweni.bytes.Bytes reqId = org.apache.tuweni.rlp.RLP.decodeList(
+                org.apache.tuweni.bytes.Bytes.wrap(requestPayload),
+                reader -> reader.readValue());
+        if (reqId.size() > 8) return null;
+        return org.apache.tuweni.rlp.RLP.encodeList(w -> {
+            w.writeValue(reqId);
+            w.writeList(l -> { });
+        }).toArrayUnsafe();
+    }
+
+    /** snap base = p2p base (0x10) + eth protocol length: 17 up to eth/68, 18 from eth/69 (BlockRangeUpdate). */
+    static int snapBaseFor(int ethVersion) {
+        return 0x10 + (ethVersion >= 69 ? 18 : 17);
+    }
+
+    // The version-specific snap pairs, as pure predicates over the negotiated
+    // (snapBase, snapVersion) — twin of the Rust engine's `empty_answer` gating.
+    // With no snap negotiated (version 0) none of them is a snap message.
+
+    static boolean isSnapGetTrieNodes(int code, int snapBase, int snapVersion) {
+        return snapVersion == 1 && code == snapBase + SNAP_GET_TRIE_NODES;
+    }
+
+    static boolean isSnapTrieNodes(int code, int snapBase, int snapVersion) {
+        return snapVersion == 1 && code == snapBase + SNAP_TRIE_NODES;
+    }
+
+    static boolean isSnapGetBlockAccessLists(int code, int snapBase, int snapVersion) {
+        return snapVersion >= 2 && code == snapBase + SNAP_GET_BLOCK_ACCESS_LISTS;
     }
 
     /** The snap versions we speak; must match the snap capabilities in {@code HelloMessage.encode}. */
