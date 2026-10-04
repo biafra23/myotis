@@ -31,7 +31,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 - [Privacy & Tor](docs/privacy-and-tor.md) — What the node leaks to peers today and the (feature-gated, experimental) Tor routing of account reads on the Rust engine.
 - [Glamsterdam readiness](docs/glamsterdam-plan.md) — How the Gloas light client and the Amsterdam EVM are handled (implemented for Sepolia, awaiting the fork).
 - [Dedicated light-client server](docs/lc-server-design.md) — The design behind [`rust/roost`](rust/roost/README.md), the light-client server that keeps a free slot for wallets.
-- Integrations and proofs of concept: [Bee (Swarm) on Myotis](docs/bee-rpc-service.md) ([short version](docs/bee-node-from-source.md)), the [RAILGUN PoC build](docs/railgun-poc.md), [React Native](docs/react-native.md) (design), [inbound connections](docs/inbound-connections.md) (design), [multichain](docs/multichain-design.md).
+- Integrations and proofs of concept: [Bee (Swarm) on Myotis](docs/bee-rpc-service.md) ([short version](docs/bee-node-from-source.md)), the [RAILGUN PoC build](docs/railgun-poc.md) (and [its seed on Android](docs/railgun-android.md)), [React Native](docs/react-native.md) (design), [inbound connections](docs/inbound-connections.md) (design), [multichain](docs/multichain-design.md).
 - Historical: [Optimisations & Limitations](OPTIMISATIONS_AND_LIMITATIONS.md) (the Java engine's Android tuning record), the [SOLID](SOLID_REVIEW.md) and [Clean Architecture](CLEAN_ARCHITECTURE_REVIEW.md) reviews of the original modules, and the review follow-ups in [docs/TODO.md](docs/TODO.md).
 
 ## Wallet API — verified JSON-RPC over HTTP

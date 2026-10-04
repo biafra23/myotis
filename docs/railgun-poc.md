@@ -13,6 +13,9 @@ shares all of its machinery — see `PocFlavour.kt`, with `BeePoc.kt` and
     -PrailgunSepoliaSeedDir="$HOME/myotis-node/railgun-sepolia"
 ```
 
+There is no Android flavour. The same seeds import into the Android app's log
+index by hand: see [railgun-android.md](railgun-android.md).
+
 **DEBUG / DEMO artefact, not a production path.** Each bundled index is a full
 node's `eth_getLogs` output framed by `scripts/synth_logindex.py`. It carries no
 receipt-root proof and the engine serves it indistinguishably from logs the
