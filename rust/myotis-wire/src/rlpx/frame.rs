@@ -377,7 +377,7 @@ mod tests {
         // falls back to the raw bytes, which the upper RLP layer then rejects.
         // bomb = varint(0xFFFFFFFF) ‖ 0x00 — a well-formed snappy header.
         let bomb = vec![0xffu8, 0xff, 0xff, 0xff, 0x0f, 0x00];
-        assert!(snap::raw::decompress_len(&bomb).map_or(false, |n| n > MAX_FRAME_BODY_SIZE));
+        assert!(crate::snappy::decompress_len(&bomb).map_or(false, |n| n > MAX_FRAME_BODY_SIZE));
 
         // Frame it by hand so the payload region is EXACTLY the bomb (encode_frame
         // would re-compress it). The initiator MACs it; the responder decodes.

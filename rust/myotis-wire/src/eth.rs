@@ -1291,7 +1291,7 @@ mod tests {
 
         // Transactions and uncles are mandatory, in a dropped body too.
         let short = rlp::encode(&Item::List(vec![Item::List(vec![])]));
-        let err = decode_block_bodies(&response(4, std::slice::from_ref(&short)), 1).unwrap_err();
+        let err = decode_block_bodies(&response(4, core::slice::from_ref(&short)), 1).unwrap_err();
         assert_eq!(err.0, "BlockBody: expected >= 2 fields, got 1");
         let surplus = response(4, &[body(0, None), body(0, None), short, vec![0x80]]);
         assert!(decode_block_bodies(&surplus, 1).is_err());

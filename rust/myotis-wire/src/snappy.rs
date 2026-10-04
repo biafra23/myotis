@@ -10,7 +10,7 @@
 //!   client sends are a few hundred bytes of requests, so the lost ratio is
 //!   irrelevant, and no match-finder means nothing to get wrong.
 
-use alloc::vec::Vec;
+use alloc::{format, string::{String, ToString}, vec::Vec};
 
 /// Compress `input`.
 pub fn compress(input: &[u8]) -> Vec<u8> {
@@ -44,9 +44,17 @@ pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
     }
     #[cfg(not(feature = "std"))]
     {
-        decompress_builtin(input)
+        decompress_builtin(input, MAX_RAW_LEN)
     }
 }
+
+/// Ceiling for one raw block decoded by the built-in codec. RLPx callers
+/// check the declared length against their own (smaller) frame limit first;
+/// this keeps the decoder itself from honouring an absurd declaration.
+#[cfg_attr(feature = "std", allow(dead_code))]
+const MAX_RAW_LEN: usize = 16 * 1024 * 1024;
+/// The framing format's own ceiling on one chunk's uncompressed data.
+const MAX_CHUNK_DATA: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // Framed format (eth2 req/resp): stream identifier, then chunks of
@@ -55,6 +63,7 @@ pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
 
 /// Compress with the snappy FRAMING format. Without `std`, data goes out as
 /// uncompressed chunks (type 0x01) -- valid framed snappy every reader accepts.
+/// Empty input encodes as nothing at all, exactly as `snap`'s encoder does.
 pub fn compress_framed(input: &[u8]) -> Vec<u8> {
     #[cfg(feature = "std")]
     {
@@ -70,15 +79,17 @@ pub fn compress_framed(input: &[u8]) -> Vec<u8> {
 }
 
 /// Decompress a framed stream, producing at most `limit` bytes (the caller
-/// passes declared+1 to detect overrun). `None` on malformed input or a CRC
-/// mismatch.
-pub fn decompress_framed(input: &[u8], limit: usize) -> Option<Vec<u8>> {
+/// passes declared+1 to detect overrun). The error carries the reason.
+pub fn decompress_framed(input: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     #[cfg(feature = "std")]
     {
         use std::io::Read;
-        let mut out = Vec::new();
-        snap::read::FrameDecoder::new(input).take(limit as u64).read_to_end(&mut out).ok()?;
-        Some(out)
+        let mut out = Vec::with_capacity(limit.min(1 << 20));
+        snap::read::FrameDecoder::new(input)
+            .take(limit as u64)
+            .read_to_end(&mut out)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
     }
     #[cfg(not(feature = "std"))]
     {
@@ -107,9 +118,12 @@ fn masked_crc(data: &[u8]) -> u32 {
 
 #[cfg_attr(feature = "std", allow(dead_code))]
 pub(crate) fn compress_framed_builtin(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() + 10 + 8 * (input.len() / 65536 + 1));
+    if input.is_empty() {
+        return Vec::new(); // as snap's FrameEncoder: no stream identifier either
+    }
+    let mut out = Vec::with_capacity(input.len() + 10 + 8 * (input.len() / MAX_CHUNK_DATA + 1));
     out.extend_from_slice(&STREAM_ID);
-    for chunk in input.chunks(65536) {
+    for chunk in input.chunks(MAX_CHUNK_DATA) {
         let len = chunk.len() + 4;
         out.push(0x01);
         out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
@@ -119,38 +133,56 @@ pub(crate) fn compress_framed_builtin(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Built-in framed decoder, with snap's acceptance rules: the stream must open
+/// with the stream identifier, each data chunk carries at most 64 KiB of
+/// uncompressed data (so no chunk can declare its way into a large
+/// allocation), CRCs must match, reserved unskippable chunk types are errors.
 #[cfg_attr(feature = "std", allow(dead_code))]
-pub(crate) fn decompress_framed_builtin(input: &[u8], limit: usize) -> Option<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::new();
+pub(crate) fn decompress_framed_builtin(input: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::with_capacity(limit.min(1 << 20));
     let mut pos = 0usize;
+    let mut seen_stream_id = false;
     while pos < input.len() && out.len() < limit {
-        let kind = input[pos];
-        let len = *input.get(pos + 1)? as usize | (*input.get(pos + 2)? as usize) << 8 | (*input.get(pos + 3)? as usize) << 16;
-        let body = input.get(pos + 4..pos + 4 + len)?;
-        pos += 4 + len;
+        let hdr = input.get(pos..pos + 4).ok_or("truncated chunk header")?;
+        let kind = hdr[0];
+        let len = hdr[1] as usize | (hdr[2] as usize) << 8 | (hdr[3] as usize) << 16;
+        let end = pos.checked_add(4 + len).ok_or("chunk length overflow")?;
+        let body = input.get(pos + 4..end).ok_or("truncated chunk")?;
+        pos = end;
+        if kind != 0xff && !seen_stream_id {
+            return Err(format!("stream does not start with the stream identifier (chunk type {kind:#04x})"));
+        }
         match kind {
             0xff => {
                 if body != &STREAM_ID[4..] {
-                    return None;
+                    return Err("bad stream identifier".into());
                 }
+                seen_stream_id = true;
             }
             0x00 | 0x01 => {
-                if body.len() < 4 {
-                    return None;
+                if body.len() < 4 || body.len() - 4 > MAX_CHUNK_DATA + MAX_CHUNK_DATA / 6 + 32 {
+                    return Err(format!("unsupported chunk length {}", body.len()));
                 }
                 let want = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let data = if kind == 0x00 { decompress_builtin(&body[4..])? } else { body[4..].to_vec() };
+                let data = if kind == 0x00 {
+                    decompress_builtin(&body[4..], MAX_CHUNK_DATA).ok_or("bad compressed chunk")?
+                } else {
+                    if body.len() - 4 > MAX_CHUNK_DATA {
+                        return Err(format!("unsupported chunk length {}", body.len()));
+                    }
+                    body[4..].to_vec()
+                };
                 if masked_crc(&data) != want {
-                    return None;
+                    return Err("chunk CRC mismatch".into());
                 }
                 out.extend_from_slice(&data);
             }
             0x80..=0xfe => {} // padding / skippable
-            _ => return None, // reserved unskippable
+            _ => return Err(format!("reserved unskippable chunk type {kind:#04x}")),
         }
     }
     out.truncate(limit);
-    Some(out)
+    Ok(out)
 }
 
 fn read_varint(b: &[u8]) -> Option<(usize, usize)> {
@@ -194,10 +226,14 @@ pub(crate) fn compress_literal(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Full raw-format decoder. Bounds every read and copy; never panics.
+/// Full raw-format decoder. Refuses a declared length above `max` before
+/// allocating; bounds every read and copy with checked arithmetic; never panics.
 #[cfg_attr(feature = "std", allow(dead_code))]
-pub(crate) fn decompress_builtin(input: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decompress_builtin(input: &[u8], max: usize) -> Option<Vec<u8>> {
     let (len, mut pos) = read_varint(input)?;
+    if len > max {
+        return None;
+    }
     let mut out: Vec<u8> = Vec::with_capacity(len);
     while pos < input.len() {
         let tag = input[pos];
@@ -207,13 +243,14 @@ pub(crate) fn decompress_builtin(input: &[u8]) -> Option<Vec<u8>> {
                 let mut l = (tag >> 2) as usize;
                 if l >= 60 {
                     let extra = l - 59;
-                    let b = input.get(pos..pos + extra)?;
+                    let b = input.get(pos..pos.checked_add(extra)?)?;
                     l = b.iter().rev().fold(0usize, |a, x| (a << 8) | *x as usize);
                     pos += extra;
                 }
-                let l = l + 1;
-                out.extend_from_slice(input.get(pos..pos + l)?);
-                pos += l;
+                let l = l.checked_add(1)?;
+                let end = pos.checked_add(l)?;
+                out.extend_from_slice(input.get(pos..end)?);
+                pos = end;
             }
             kind => {
                 let (l, off) = match kind {
@@ -223,17 +260,20 @@ pub(crate) fn decompress_builtin(input: &[u8]) -> Option<Vec<u8>> {
                         (4 + ((tag >> 2) & 0x07) as usize, (((tag >> 5) as usize) << 8) | b)
                     }
                     2 => {
-                        let b = input.get(pos..pos + 2)?;
+                        let b = input.get(pos..pos.checked_add(2)?)?;
                         pos += 2;
                         (1 + (tag >> 2) as usize, u16::from_le_bytes([b[0], b[1]]) as usize)
                     }
                     _ => {
-                        let b = input.get(pos..pos + 4)?;
+                        let b = input.get(pos..pos.checked_add(4)?)?;
                         pos += 4;
                         (1 + (tag >> 2) as usize, u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
                     }
                 };
                 if off == 0 || off > out.len() {
+                    return None;
+                }
+                if out.len().checked_add(l)? > len {
                     return None;
                 }
                 let start = out.len() - off;
@@ -271,7 +311,7 @@ mod tests {
     fn builtin_decoder_reads_what_snap_writes() {
         for s in samples() {
             let c = snap::raw::Encoder::new().compress_vec(&s).unwrap();
-            assert_eq!(decompress_builtin(&c).as_deref(), Some(&s[..]));
+            assert_eq!(decompress_builtin(&c, usize::MAX).as_deref(), Some(&s[..]));
         }
     }
 
@@ -280,7 +320,7 @@ mod tests {
         for s in samples() {
             let c = compress_literal(&s);
             assert_eq!(snap::raw::Decoder::new().decompress_vec(&c).unwrap(), s);
-            assert_eq!(decompress_builtin(&c).as_deref(), Some(&s[..]));
+            assert_eq!(decompress_builtin(&c, usize::MAX).as_deref(), Some(&s[..]));
         }
     }
 
@@ -291,7 +331,7 @@ mod tests {
             let mut enc = snap::write::FrameEncoder::new(Vec::new());
             enc.write_all(&s).unwrap();
             let c = enc.into_inner().unwrap();
-            assert_eq!(decompress_framed_builtin(&c, s.len() + 1).as_deref(), Some(&s[..]));
+            assert_eq!(decompress_framed_builtin(&c, s.len() + 1).as_deref(), Ok(&s[..]));
             let b = compress_framed_builtin(&s);
             let mut out = Vec::new();
             snap::read::FrameDecoder::new(&b[..]).read_to_end(&mut out).unwrap();
@@ -304,13 +344,54 @@ mod tests {
         let mut b = compress_framed_builtin(b"hello world");
         let n = b.len();
         b[n - 1] ^= 1;
-        assert!(decompress_framed_builtin(&b, 100).is_none());
+        assert!(decompress_framed_builtin(&b, 100).is_err());
+    }
+
+    #[test]
+    fn framed_builtin_matches_snap_on_empty_input() {
+        use std::io::Write;
+        let mut enc = snap::write::FrameEncoder::new(Vec::new());
+        enc.write_all(&[]).unwrap();
+        assert_eq!(compress_framed_builtin(&[]), enc.into_inner().unwrap());
+        assert!(compress_framed_builtin(&[]).is_empty());
+    }
+
+    #[test]
+    fn framed_builtin_requires_the_stream_identifier_like_snap() {
+        let data = b"hi";
+        let mut no_id = vec![0x01u8, 6, 0, 0];
+        no_id.extend_from_slice(&masked_crc(data).to_le_bytes());
+        no_id.extend_from_slice(data);
+        assert!(decompress_framed_builtin(&no_id, 100).is_err());
+        let mut out = Vec::new();
+        use std::io::Read;
+        assert!(snap::read::FrameDecoder::new(&no_id[..]).read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn framed_builtin_refuses_a_chunk_declaring_a_huge_length() {
+        // A compressed chunk whose raw varint declares ~4 GiB: refused before
+        // any allocation, as snap refuses chunks over 64 KiB.
+        let raw = [0xff, 0xff, 0xff, 0xff, 0x0f, 0x00];
+        let mut s = STREAM_ID.to_vec();
+        s.push(0x00);
+        s.extend_from_slice(&((raw.len() + 4) as u32).to_le_bytes()[..3]);
+        s.extend_from_slice(&[0, 0, 0, 0]);
+        s.extend_from_slice(&raw);
+        assert!(decompress_framed_builtin(&s, 101).is_err());
+    }
+
+    #[test]
+    fn raw_builtin_never_overflows_on_absurd_literal_lengths() {
+        // tag 0xfc: literal with a 4-byte length = u32::MAX.
+        let bad = [0x05u8, 0xfc, 0xff, 0xff, 0xff, 0xff, 0x00];
+        assert!(decompress_builtin(&bad, usize::MAX).is_none());
     }
 
     #[test]
     fn builtin_decoder_rejects_garbage_without_panicking() {
         for bad in [&[0x05u8, 0x01][..], &[0x0a, 0x09, 0x00][..], &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..], &[0x04, 0x0d, 0x05][..]] {
-            assert!(decompress_builtin(bad).is_none());
+            assert!(decompress_builtin(bad, usize::MAX).is_none());
         }
     }
 }

@@ -108,7 +108,7 @@ pub fn snappy_decompress(input: &[u8], declared_len: usize) -> Result<Vec<u8>, C
     // At most declared+1 bytes: a well-formed frame yields exactly `declared`;
     // anything longer trips the mismatch check below instead of allocating unbounded.
     let out = crate::snappy::decompress_framed(input, declared_len + 1)
-        .ok_or_else(|| CodecError(format!("snappy decompress failed")))?;
+        .map_err(|e| CodecError(format!("snappy decompress failed: {e}")))?;
     if out.len() != declared_len {
         return Err(CodecError(format!(
             "snappy output {} bytes != declared {declared_len}",
@@ -537,7 +537,14 @@ mod tests {
         let java_root_frame = hex("20ff060000734e61507059000a00000eb49f4d2000117a0100");
         let root = [0x11u8; 32];
         assert_eq!(parse_request_ssz(&java_root_frame).unwrap(), root);
+        // Byte-equality needs snap's compressor (std). The no_std encoder sends
+        // uncompressed chunks for compressible data -- different bytes, same
+        // payload -- so there it must round-trip instead. (The two vectors
+        // below are incompressible and match byte for byte either way.)
+        #[cfg(feature = "std")]
         assert_eq!(encode_request(&root), java_root_frame);
+        #[cfg(not(feature = "std"))]
+        assert_eq!(parse_request_ssz(&encode_request(&root)).unwrap(), root);
 
         // updates_by_range request body (startPeriod=1777, count=16): varint(16)
         // || uncompressed frame (16 LE bytes don't compress).

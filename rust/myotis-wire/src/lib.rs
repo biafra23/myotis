@@ -21,6 +21,7 @@ extern crate alloc;
 
 pub mod discv4;
 pub mod eth;
+#[cfg(feature = "eth2")]
 pub mod eth2;
 pub mod rlpx;
 pub mod snap;
