@@ -6,7 +6,7 @@ package io.myotis.api;
  *
  * @param remoteAddress "host:port" display string
  * @param state         connection state name (e.g. "AWAITING_STATUS", "READY")
- * @param snapSupported whether the peer negotiated snap/1
+ * @param snapSupported whether the peer negotiated snap (snap/1 or snap/2)
  * @param clientId      the peer's Hello client id, or null until received
  */
 public record ConnectedPeer(String remoteAddress, String state, boolean snapSupported, String clientId) {

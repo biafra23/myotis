@@ -13,7 +13,7 @@ import java.util.List;
  * @param beaconState           beacon light-client state (STARTING before first state)
  * @param connectedPeers        EL peers with an open RLPx session (incl. still handshaking)
  * @param readyPeers            EL peers past the eth handshake
- * @param snapPeers             peers that negotiated snap/1
+ * @param snapPeers             peers that negotiated snap (snap/1 or snap/2)
  * @param snapServingPeers      peers currently in the snap serving pool (drives readiness)
  * @param discoveredPeers       discv4 Kademlia table size
  * @param backedOffPeers        active (non-expired) dial-backoff entries, pruned on read

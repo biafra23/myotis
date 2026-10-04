@@ -1745,7 +1745,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (conn == null) throw new IllegalStateException("node not running");
         List<EthHandler> snapPeers = conn.activeSnapHandlers();
         if (snapPeers.isEmpty()) {
-            throw new IllegalStateException("No active peer with snap/1 support");
+            throw new IllegalStateException("No active peer with snap support");
         }
 
         io.myotis.evm.BlockContext blockCtx;

@@ -8,7 +8,7 @@
 //! Dial outcomes drive the bookkeeping the same way `ChainStack` does:
 //! * an **incompatible** peer (wrong network id / genesis) → blacklist its node
 //!   id + a long (10 min) address backoff,
-//! * any other failure, or a compatible peer that doesn't offer snap/1 → a short
+//! * any other failure, or a compatible peer that shares no snap version → a short
 //!   (30 s) address backoff,
 //! * a snap-capable peer → spawned as a `ManagedPeer` and held in the pool.
 //!
@@ -820,7 +820,12 @@ impl PoolInner {
                 // snap peer (bounded to ~target occurrences per run). Per-peer
                 // failures/non-snap stay at debug to avoid the discv4 cross-chain
                 // noise (most discovered peers are other networks or full).
-                tracing::info!(%addr, eth = session.eth_version, "el dial: snap peer connected");
+                tracing::info!(
+                    %addr,
+                    eth = session.eth_version,
+                    snap = session.snap_version.unwrap_or_default(),
+                    "el dial: snap peer connected"
+                );
                 // The cache's verdict on this peer from earlier runs, read in
                 // its own statement BEFORE the peers lock (never two pool locks
                 // at once — the maintainer takes them in the other order).
@@ -857,10 +862,10 @@ impl PoolInner {
                 cache.flush();
             }
             Ok(session) => {
-                // Compatible but no snap/1 — useless for verified reads. Cool the
+                // Compatible but no shared snap version — useless for verified reads. Cool the
                 // address off and free it from `attempted`. Still proof the
                 // address is alive: clear any connect-failure streak.
-                tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
+                tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap");
                 {
                     // Flush so a cleared persisted streak lands on disk now —
                     // this path may be the only cache event the peer ever gets.

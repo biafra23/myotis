@@ -1396,7 +1396,7 @@ public final class NodeService extends Service {
             int discoveredPeers,
             int connectedPeers,
             int readyPeers,
-            int snapPeers,            // peers that NEGOTIATED snap/1 (capability flag)
+            int snapPeers,            // peers that NEGOTIATED snap/1 or snap/2 (capability flag)
             int snapServingPeers,     // peers actually in the serving pool right now
                                       // (negotiated, READY, not benched by snapServingFailed) —
                                       // this is what head builds / heavy confirm screens use.

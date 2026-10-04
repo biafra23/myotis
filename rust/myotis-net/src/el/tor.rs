@@ -115,7 +115,7 @@ pub async fn open_snap_session(
         .await
         .map_err(|e| format!("tor eth handshake to {addr}: {e}"))?;
     if !session.snap {
-        return Err(format!("tor: peer {addr} did not negotiate snap/1"));
+        return Err(format!("tor: peer {addr} did not negotiate snap"));
     }
     Ok(session)
 }

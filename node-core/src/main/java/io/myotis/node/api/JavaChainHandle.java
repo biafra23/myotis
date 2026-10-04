@@ -140,7 +140,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
             readyRows.add(new PeerInfo(p.remoteAddress(), p.snapSupported(), p.clientId()));
         }
 
-        // Two DISTINCT counts: peers that negotiated snap/1 vs peers currently in the
+        // Two DISTINCT counts: peers that negotiated snap (1 or 2) vs peers currently in the
         // serving pool (activeSnapHandlers filters out serving-failed peers). Surfacing
         // both makes a serving-pool collapse visible — the live operational issue on
         // peer-scarce chains — so never feed one into the other.

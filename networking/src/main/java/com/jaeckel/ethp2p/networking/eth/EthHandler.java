@@ -64,15 +64,18 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_GET_RECEIPTS = 0x1f; // eth msg 0x0f + base 0x10
     private static final int ETH_RECEIPTS = 0x20;     // eth msg 0x10 + base 0x10
 
-    // snap/1 message codes depend on negotiated eth version:
+    // snap message codes depend on negotiated eth version:
     //   eth/67-68: protocol length 17, snap base = 0x10 + 17 = 0x21
     //   eth/69:    protocol length 18 (adds BlockRangeUpdate at 0x11), snap base = 0x10 + 18 = 0x22
     //
-    // Snap message ids (offsets from snapBase) per the snap/1 wire spec:
+    // Snap message ids (offsets from snapBase) per the snap wire spec. 0x00-0x05
+    // are identical in snap/1 and snap/2 (EIP-8189) — and are every request the
+    // verified reads send, so those work the same on either version:
     //   0x00 GetAccountRange / 0x01 AccountRange
     //   0x02 GetStorageRanges / 0x03 StorageRanges
     //   0x04 GetByteCodes    / 0x05 ByteCodes
-    //   0x06 GetTrieNodes    / 0x07 TrieNodes
+    //   0x06 GetTrieNodes    / 0x07 TrieNodes          (snap/1 only)
+    //   0x08 GetBlockAccessLists / 0x09 BlockAccessLists (snap/2 only)
     private int snapGetAccountRange  = 0x21; // updated after Hello negotiation
     private int snapAccountRange     = 0x22;
     private int snapGetStorageRanges = 0x23;
@@ -81,6 +84,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private int snapByteCodes        = 0x26;
     private int snapGetTrieNodes     = 0x27;
     private int snapTrieNodes        = 0x28;
+    private int snapGetBlockAccessLists = 0x29;
+    private int snapBlockAccessLists    = 0x2a;
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
@@ -94,6 +99,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile boolean peerBusy;
     private static final int DISC_TOO_MANY_PEERS = 0x04;
     private volatile boolean snapNegotiated = false;
+    /** The snap version this connection runs (1, or 2 = EIP-8189); 0 until/unless negotiated. */
+    private volatile int snapVersion = 0;
     private volatile String clientId;
     /** How long an empty snap response benches a peer from the serving pool. NOT permanent:
      *  an empty response usually means the peer's flat snapshot hadn't yet caught up to the
@@ -438,11 +445,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             snapByteCodes        = snapBase + 5;
             snapGetTrieNodes     = snapBase + 6;
             snapTrieNodes        = snapBase + 7;
+            snapGetBlockAccessLists = snapBase + 8;
+            snapBlockAccessLists    = snapBase + 9;
             log.info("[eth] snap base offset: 0x{} (eth length={})",
                 Integer.toHexString(snapBase), ethProtocolLength);
-            snapNegotiated = hello.capabilities.stream()
-                .anyMatch(c -> c.name().equals("snap") && c.version() == 1);
-            log.info("[eth] snap/1 {}", snapNegotiated ? "negotiated" : "NOT supported by peer");
+            snapVersion = negotiateSnapVersion(hello.capabilities);
+            snapNegotiated = snapVersion != 0;
+            if (snapNegotiated) log.info("[eth] snap/{} negotiated", snapVersion);
+            else log.info("[eth] snap NOT supported by peer");
             state = State.AWAITING_STATUS;
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
@@ -783,10 +793,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     handleSnapByteCodes(msg);
                 } else if (msg.code() == snapGetByteCodes) {
                     handleSnapGetByteCodes(ctx, msg);
-                } else if (msg.code() == snapTrieNodes) {
+                } else if (snapVersion == 1 && msg.code() == snapTrieNodes) {
                     handleSnapTrieNodes(msg);
-                } else if (msg.code() == snapGetTrieNodes) {
+                } else if (snapVersion == 1 && msg.code() == snapGetTrieNodes) {
+                    // snap/1 only: snap/2 (EIP-8189) retired the pair, so on a
+                    // snap/2 connection the code is not a request and gets no answer.
                     handleSnapGetTrieNodes(ctx, msg);
+                } else if (snapVersion >= 2 && msg.code() == snapGetBlockAccessLists) {
+                    handleSnapGetBlockAccessLists(ctx, msg);
                 } else if ((msg.code() == ETH_TRANSACTIONS || msg.code() == NewPooledTransactionHashesMessage.CODE)
                         && isWatchingGossip()) {
                     // Mempool gossip we'd normally drop — but a watcher (a node with an
@@ -983,6 +997,47 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         } catch (Exception e) {
             log.debug("[snap] Failed to respond to GetTrieNodes: {}", e.getMessage());
         }
+    }
+
+    private void handleSnapGetBlockAccessLists(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
+        // snap/2 (EIP-8189). We hold no block access lists, so answer
+        // [reqId, []] to keep the peer from timing out on us. That reads the
+        // spec's "may return fewer entries, truncating from the tail" as
+        // allowing zero; its per-position "unavailable" marker (0x80) would
+        // need the request's hash list parsed and bounded, for an answer that
+        // tells the peer the same thing.
+        try {
+            // Echo the request id as raw RLP bytes — a readLong/writeLong round
+            // trip corrupts ids with bit 63 set (see the GetBlockHeaders case).
+            org.apache.tuweni.bytes.Bytes reqId = org.apache.tuweni.rlp.RLP.decodeList(
+                    org.apache.tuweni.bytes.Bytes.wrap(msg.payload()),
+                    reader -> reader.readValue());
+            if (reqId.size() > 8) return; // not a uint64 request id
+            byte[] emptyResponse = org.apache.tuweni.rlp.RLP.encodeList(w -> {
+                w.writeValue(reqId);
+                w.writeList(l -> { });
+            }).toArrayUnsafe();
+            rlpxHandler.sendMessage(ctx, snapBlockAccessLists, emptyResponse);
+            log.debug("[snap] Responded with empty BlockAccessLists (reqId={})", reqId.toShortHexString());
+        } catch (Exception e) {
+            log.debug("[snap] Failed to respond to GetBlockAccessLists: {}", e.getMessage());
+        }
+    }
+
+    /** The snap versions we speak; must match the snap capabilities in {@code HelloMessage.encode}. */
+    private static final java.util.Set<Integer> OUR_SNAP_VERSIONS = java.util.Set.of(1, 2);
+
+    /**
+     * The snap version to run with a peer: the highest one both sides advertise,
+     * or 0 when none is shared. RLPx runs one version per capability name, so a
+     * peer offering snap/1 and snap/2 is a snap/2 connection, and a snap/2-only
+     * peer (reth implements no snap/1) is a snap peer rather than one without snap.
+     */
+    static int negotiateSnapVersion(java.util.List<HelloMessage.Capability> peerCapabilities) {
+        return peerCapabilities.stream()
+            .filter(c -> c.name().equals("snap") && OUR_SNAP_VERSIONS.contains(c.version()))
+            .mapToInt(HelloMessage.Capability::version)
+            .max().orElse(0);
     }
 
     // -------------------------------------------------------------------------
@@ -1360,7 +1415,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(address);
@@ -1375,7 +1430,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(address);
@@ -1488,7 +1543,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
@@ -1552,7 +1607,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
 
         org.apache.tuweni.bytes.Bytes32 accountHash =
             org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
@@ -1603,7 +1658,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
 
         long reqId = requestId.getAndIncrement();
         CompletableFuture<ByteCodesMessage.DecodeResult> future = new CompletableFuture<>();
@@ -1634,7 +1689,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
         return sendGetAccountRange(ctx, accountHash, stateRoot);
     }
 
@@ -1655,12 +1710,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
         return sendGetStorageRanges(ctx, accountHash, slotHash, stateRoot);
     }
 
     /**
-     * Fetch trie nodes via snap/1 GetTrieNodes for the given path sets.
+     * Fetch trie nodes via snap/1 GetTrieNodes for the given path sets. snap/1
+     * only: on a snap/2 connection (EIP-8189 removed the message) the call is
+     * refused rather than sent.
      *
      * <p>Each {@link GetTrieNodesMessage.PathSet} addresses one account in
      * the world state trie; subsequent storage paths within the set are
@@ -1685,7 +1742,12 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (ctx == null || state != State.READY) return Futures.failedFuture(
             new IllegalStateException("EthHandler not READY"));
         if (!snapNegotiated) return Futures.failedFuture(
-            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+            new UnsupportedOperationException("snap not negotiated with this peer"));
+        // Refused, never sent: snap/2 (EIP-8189) has no GetTrieNodes, so the
+        // peer would drop the frame (or us) and the caller would only time out.
+        if (snapVersion != 1) return Futures.failedFuture(
+            new UnsupportedOperationException(
+                "GetTrieNodes is snap/1 only; this peer negotiated snap/" + snapVersion));
 
         long reqId = requestId.getAndIncrement();
         CompletableFuture<TrieNodesMessage.DecodeResult> future = new CompletableFuture<>();

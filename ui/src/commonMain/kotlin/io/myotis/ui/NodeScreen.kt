@@ -1878,9 +1878,9 @@ private object StatusHelp {
     const val CL_PEERS = "\"served N/min\" = distinct peers that answered a light-client " +
         "request in the last 60s. \"con N\" = currently-connected CL peers — usually near 0, " +
         "since connections are short-lived."
-    const val EL_PEERS = "\"N\" ready peers total, \"snap M\" negotiated snap/1, \"serving K\" " +
-        "can answer a read right now. Reads gate on serving, not snap — a cold pool can show " +
-        "snap peers for hours before any of them can actually serve."
+    const val EL_PEERS = "\"N\" ready peers total, \"snap M\" negotiated snap (snap/1 or " +
+        "snap/2), \"serving K\" can answer a read right now. Reads gate on serving, not " +
+        "snap — a cold pool can show snap peers for hours before any of them can actually serve."
     const val CL_CACHE = "Peers in the on-disk CL peer cache: total · ✓ proven light-client " +
         "servers · ✕ confirmed non-servers · ? untried. Predicts how fast the next cold start " +
         "finds servers."

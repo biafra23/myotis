@@ -206,7 +206,7 @@ async fn query_over_tor(
         .await
         .map_err(|e| anyhow!("eth handshake: {e}"))?;
     if !session.snap {
-        bail!("peer negotiated eth/{} but no snap/1", session.eth_version);
+        bail!("peer negotiated eth/{} but no snap", session.eth_version);
     }
     let eth_ms = since();
 
@@ -328,7 +328,7 @@ async fn pick_working_peer<'a>(
             {
                 Ok(Ok(mut session)) => {
                     if !session.snap {
-                        println!("OK but no snap/1 — skipping");
+                        println!("OK but no snap — skipping");
                         break; // capability won't change on retry
                     }
                     let head = head_number(&mut session).await;

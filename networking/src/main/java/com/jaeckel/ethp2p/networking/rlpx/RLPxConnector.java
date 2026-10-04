@@ -53,7 +53,7 @@ public final class RLPxConnector implements AutoCloseable {
 
     /**
      * Callback when a peer reaches READY state. {@code snapSupported} reports
-     * whether the peer negotiated snap/1 (known by READY, since capabilities are
+     * whether the peer negotiated snap/1 or snap/2 (known by READY, since capabilities are
      * exchanged in Hello) — lets the peer cache record which cached peers can
      * serve state, so a restart can reconnect snap peers first.
      */
@@ -658,7 +658,7 @@ public final class RLPxConnector implements AutoCloseable {
         }
         if (snapPeers.isEmpty()) {
             return Futures.failedFuture(
-                new IllegalStateException("No active peer with snap/1 support"));
+                new IllegalStateException("No active peer with snap support"));
         }
         return trySnapPeer(address, stateRoot, snapPeers, 0);
     }
@@ -710,7 +710,7 @@ public final class RLPxConnector implements AutoCloseable {
         }
         if (snapPeers.isEmpty()) {
             return Futures.failedFuture(
-                new IllegalStateException("No active peer with snap/1 support"));
+                new IllegalStateException("No active peer with snap support"));
         }
         return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, snapPeers, 0);
     }
@@ -916,7 +916,7 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
-     * Snapshot of currently-active READY peers that have negotiated snap/1
+     * Snapshot of currently-active READY peers that have negotiated snap (snap/1 or snap/2)
      * and are not flagged as snap-serving-failed. Used by callers that need
      * to drive snap-protocol traffic directly through an {@link EthHandler}
      * (e.g. {@code :app}'s {@code resolve-ens} command, which builds the

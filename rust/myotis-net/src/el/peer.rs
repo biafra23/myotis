@@ -314,8 +314,10 @@ pub struct ManagedPeer {
 
     /// Negotiated eth version (66-69).
     pub eth_version: u64,
-    /// Whether the peer also advertised snap/1.
+    /// Whether a snap version is shared with the peer (`snap_version.is_some()`).
     pub snap: bool,
+    /// The snap version the session runs (1, or 2 = EIP-8189).
+    pub snap_version: Option<u64>,
     /// The peer's Status (head, fork id).
     pub peer_status: Status,
     /// The peer's Hello (client id, capabilities).
@@ -354,8 +356,8 @@ impl ManagedPeer {
     /// spawning the background read loop. From here the peer serves concurrent
     /// requests and answers Ping/Get\* on its own.
     pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
-        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None, None, None)
+        let (conn, eth_version, snap_version, peer_status, peer_hello) = session.into_parts();
+        Self::from_connection(conn, eth_version, snap_version, peer_status, peer_hello, addr, None, None, None)
     }
 
     /// As [`spawn`](Self::spawn), wiring the pool's shared serving surface so this
@@ -369,11 +371,11 @@ impl ManagedPeer {
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
-        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
+        let (conn, eth_version, snap_version, peer_status, peer_hello) = session.into_parts();
         Self::from_connection(
             conn,
             eth_version,
-            snap,
+            snap_version,
             peer_status,
             peer_hello,
             addr,
@@ -387,7 +389,7 @@ impl ManagedPeer {
     fn from_connection(
         conn: RlpxConnection,
         eth_version: u64,
-        snap: bool,
+        snap_version: Option<u64>,
         peer_status: Status,
         peer_hello: Hello,
         addr: SocketAddr,
@@ -396,7 +398,7 @@ impl ManagedPeer {
         anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
-        let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
+        let snap_codes = snap_version.map(|v| snap::SnapCodes::negotiated(eth_version, v));
         let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
@@ -437,7 +439,8 @@ impl ManagedPeer {
             last_response,
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
-            snap,
+            snap: snap_version.is_some(),
+            snap_version,
             peer_status,
             peer_hello,
             peer_pubkey,
@@ -729,7 +732,7 @@ impl ManagedPeer {
     }
 
     // -----------------------------------------------------------------------
-    // snap/1 verified state fetch (shares the eth peer's RLPx connection).
+    // snap verified state fetch, snap/1 or snap/2 (shares the eth peer's RLPx connection).
     // -----------------------------------------------------------------------
 
     fn snap_codes(&self) -> Option<snap::SnapCodes> {
@@ -744,7 +747,7 @@ impl ManagedPeer {
         state_root: &[u8; 32],
         address: &[u8; 20],
     ) -> Result<AccountOutcome, String> {
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let payload = self
             .request(codes.get_account_range, codes.account_range, |id| {
@@ -769,7 +772,7 @@ impl ManagedPeer {
         if account.storage_root == EMPTY_TRIE_ROOT {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let slot_hash = myotis_core::keccak::keccak256(slot);
         let payload = self
@@ -788,7 +791,7 @@ impl ManagedPeer {
         if code_hash == &EMPTY_CODE_HASH {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let payload = self
             .request(codes.get_byte_codes, codes.byte_codes, |id| {
                 snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024)
@@ -1079,8 +1082,14 @@ fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Opt
                 Some((c.storage_ranges, snap::encode_empty_range(id)))
             } else if code == c.get_byte_codes {
                 Some((c.byte_codes, snap::encode_empty_codes(id)))
-            } else if code == c.get_trie_nodes {
+            } else if c.snap_version == 1 && code == c.get_trie_nodes {
+                // snap/1 only: snap/2 (EIP-8189) retired the pair, so on a
+                // snap/2 session the code is not a request and gets no answer.
                 Some((c.trie_nodes, snap::encode_empty_codes(id)))
+            } else if c.snap_version >= 2 && code == c.get_block_access_lists {
+                // snap/2: we hold no block access lists — answered with zero
+                // entries (see `encode_empty_codes`).
+                Some((c.block_access_lists, snap::encode_empty_codes(id)))
             } else {
                 None
             }
@@ -1325,7 +1334,7 @@ mod tests {
 
     #[test]
     fn empty_answer_maps_snap_get_star() {
-        let codes = snap::SnapCodes::for_eth_version(68);
+        let codes = snap::SnapCodes::negotiated(68, 1);
         let (code, body) = empty_answer(codes.get_account_range, &Some(codes), 9).unwrap();
         assert_eq!(code, codes.account_range);
         assert_eq!(messages::leading_request_id(&body), Some(9));
@@ -1335,5 +1344,31 @@ mod tests {
 
         // Without snap negotiated, snap codes aren't answered.
         assert!(empty_answer(codes.get_account_range, &None, 9).is_none());
+    }
+
+    #[test]
+    fn empty_answer_follows_the_negotiated_snap_version() {
+        for eth in [68, 69] {
+            let v1 = snap::SnapCodes::negotiated(eth, 1);
+            let v2 = snap::SnapCodes::negotiated(eth, 2);
+
+            // The shared requests are answered on both versions.
+            for codes in [v1, v2] {
+                let (code, _) = empty_answer(codes.get_storage_ranges, &Some(codes), 9).unwrap();
+                assert_eq!(code, codes.storage_ranges);
+            }
+
+            // GetTrieNodes exists on snap/1 only (EIP-8189 removed it) …
+            let (code, body) = empty_answer(v1.get_trie_nodes, &Some(v1), 9).unwrap();
+            assert_eq!(code, v1.trie_nodes);
+            assert_eq!(messages::leading_request_id(&body), Some(9));
+            assert!(empty_answer(v2.get_trie_nodes, &Some(v2), 9).is_none());
+
+            // … and GetBlockAccessLists on snap/2 only.
+            let (code, body) = empty_answer(v2.get_block_access_lists, &Some(v2), 9).unwrap();
+            assert_eq!(code, v2.block_access_lists);
+            assert_eq!(body, snap::encode_empty_codes(9));
+            assert!(empty_answer(v1.get_block_access_lists, &Some(v1), 9).is_none());
+        }
     }
 }

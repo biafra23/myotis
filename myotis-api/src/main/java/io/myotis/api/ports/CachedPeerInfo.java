@@ -6,7 +6,7 @@ package io.myotis.api.ports;
  * @param host         IP literal or hostname
  * @param port         RLPx TCP port
  * @param publicKeyHex the peer's uncompressed secp256k1 public key (hex, no 0x04 prefix)
- * @param snap         whether the peer advertised snap/1
+ * @param snap         whether the peer advertised a snap version we speak (snap/1 or snap/2)
  * @param snapQuality  the learned snap-serving verdict
  */
 public record CachedPeerInfo(
