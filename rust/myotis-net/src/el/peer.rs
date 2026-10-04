@@ -342,8 +342,10 @@ pub struct ManagedPeer {
 impl ManagedPeer {
     /// Invalidate snapshots too: active oracle Arcs must not keep reads alive.
     pub async fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        // The reason before the flag: a reader that sees `closed` then asks
+        // why must never find nothing.
         set_close_reason(&self.close_reason, "closed by this node");
+        self.closed.store(true, Ordering::Release);
         let task = self.reader_task.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(task) = task { task.abort(); let _ = task.await; }
         self.pending.lock().await.clear();
@@ -1127,8 +1129,9 @@ async fn fail_all(
     reason: String,
 ) {
     let mut map = pending.lock().await;
-    closed.store(true, Ordering::SeqCst);
+    // The reason before the flag (see `ManagedPeer::close`).
     set_close_reason(close_reason, &reason);
+    closed.store(true, Ordering::SeqCst);
     for (_id, entry) in map.drain() {
         let _ = entry.tx.send(Err(reason.clone()));
     }
@@ -1169,6 +1172,16 @@ fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_close_reason_wins() {
+        // A write failure that follows the remote's Disconnect must not
+        // overwrite the Disconnect (#539).
+        let slot: super::SharedCloseReason = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::set_close_reason(&slot, "peer disconnected: reason=4");
+        super::set_close_reason(&slot, "peer write failure: broken pipe");
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("peer disconnected: reason=4"));
+    }
+
     use super::*;
     use myotis_core::rlp;
 

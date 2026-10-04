@@ -10,11 +10,16 @@
 //!   id + a long (10 min) address backoff,
 //! * any other failure, or a compatible peer that doesn't offer snap/1 → a short
 //!   (30 s) address backoff,
-//! * a snap-capable peer → spawned as a `ManagedPeer` and held in the pool.
+//! * a snap-capable peer → spawned as a `ManagedPeer` and held in the pool,
+//! * a pooled peer that closes within 30 s of its admission → a backoff for the
+//!   rest of those 30 s: geth refuses a second inbound connection from the same
+//!   IP inside that window (`PEER_INBOUND_THROTTLE`).
 //!
 //! A candidate is skipped while its node id is blacklisted, its address is in
 //! backoff, or it's already `attempted` (in-flight or connected). Once the pool
 //! holds `target_snap_peers`, further candidates are ignored until a peer drops.
+//! BELOW target the windows shrink with the shortfall and the maintainer also
+//! walks discovery's table (#539; `scarcity_floor`, `scarcity_budget`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -58,9 +63,11 @@ const BACKOFF_BUSY: Duration = Duration::from_secs(60);
 /// selects a backoff class — never a verified/known-good promotion.
 ///
 /// Known divergences from the Java twin (deliberate, scope): (1) Java also
-/// flags 0x04 on a READY peer's disconnect; here a serving peer's close
-/// reason isn't plumbed through `ManagedPeer`, so its address is simply
-/// freed by `prune_closed` with no backoff. (2) The Java hunt log reports a
+/// flags 0x04 on a READY peer's disconnect; here `prune_closed` logs the
+/// close reason (`ManagedPeer::close_reason`, #539) but gives every
+/// short-lived peer the same inbound-throttle wait rather than the busy class
+/// — classifying a pooled peer's Disconnect is a follow-up once the logged
+/// reasons show what the churn is. (2) The Java hunt log reports a
 /// rolling distinct-busy-peer count; the Rust hunt log doesn't (the per-dial
 /// `busy` debug field is the Rust-side signal).
 ///
@@ -73,23 +80,35 @@ pub(crate) fn is_busy_disconnect(e: &str) -> bool {
 /// (Java's `maintainSnapPeers` fixed delay).
 const MAINTAINER_INTERVAL: Duration = Duration::from_secs(10);
 
+/// go-ethereum's `inboundThrottleTime` (p2p/server.go): a second inbound
+/// connection from the same IP within 30 s of the last accept is closed on
+/// accept. Dialing a peer sooner than that after it closed, or after a failed
+/// dial, buys only a transport failure — and a connect-failure strike against
+/// the warm-start cache. So no re-dial window shrinks below this, and a pooled
+/// peer that closes within it waits out the remainder (`prune_closed`).
+const PEER_INBOUND_THROTTLE: Duration = Duration::from_secs(30);
+
 /// Scarcity (#539): while the pool is BELOW target, a backed-off peer's window
 /// shrinks in proportion to the shortfall — `window × live / target`, never
-/// below this floor (one maintainer tick) and never above the window — so a
-/// pool holding 2 of 8 re-dials a 10-minute laggard after 2.5 minutes, and an
-/// empty pool after one tick, while a full pool keeps every window whole.
+/// below its kind's floor ([`scarcity_floor`]) and never above the window — so
+/// a pool holding 2 of 8 re-dials a 10-minute laggard after 2.5 minutes and an
+/// empty pool after this floor, while a full pool keeps every window whole.
 /// Incompatible (wrong-chain) windows never shrink: no shortage makes a
-/// foreign node usable. Proportional rather than binary on purpose: the Java
-/// twin keys its hunt on an EMPTY serving pool because a below-target trigger
-/// would hunt forever on a chain whose target is unreachable (gnosis) —
-/// scaling gives such a chain shorter windows, not a treadmill. Owner ruling
+/// foreign node usable. A laggard was refused for lacking the anchored head
+/// and needs minutes to catch up, so it keeps a floor of its own; re-checking
+/// it every 30 s would re-handshake a peer that cannot serve yet. Proportional
+/// rather than binary on purpose: the Java twin keys its hunt on an EMPTY
+/// serving pool because a below-target trigger would hunt forever on a chain
+/// whose target is unreachable (gnosis) — scaling gives such a chain shorter
+/// windows and a smaller dial budget, not a treadmill. Owner ruling
 /// 2026-10-03: with so few active peers, every possible peer is dialed again.
-const SCARCITY_FLOOR: Duration = MAINTAINER_INTERVAL;
+const LAGGING_RECHECK_FLOOR: Duration = Duration::from_secs(60);
 
-/// Re-dials of discovery-known peers the maintainer launches per tick while
-/// below target (#539), on top of the cache and pin dials: bounded so a phone
-/// below target spends at most this many handshakes a tick, not its whole
-/// routing table.
+/// The MOST re-dials of discovery-known peers the maintainer launches per tick
+/// while below target (#539), on top of the cache and pin dials; scaled down
+/// by the shortfall ([`scarcity_budget`]: one at 7 of 8, all four at an empty
+/// pool), so a phone one peer short spends one handshake a tick on it, not
+/// its whole routing table.
 const SCARCITY_REDIALS_PER_TICK: usize = 4;
 
 /// How often the maintainer says it is re-dialing under shortened windows.
@@ -196,10 +215,9 @@ impl Backoff {
     /// Whether this entry still blocks a dial at `now` for a pool holding
     /// `live` of `target` peers ([`scaled_backoff`]; incompatible never shrinks).
     fn blocks(&self, live: usize, target: usize, now: Instant) -> bool {
-        let window = if self.kind == BackoffKind::Incompatible {
-            self.window
-        } else {
-            scaled_backoff(self.window, live, target)
+        let window = match scarcity_floor(self.kind) {
+            Some(floor) => scaled_backoff(self.window, live, target, floor),
+            None => self.window,
         };
         now < self.since + window
     }
@@ -225,32 +243,55 @@ fn backoff_window(kind: BackoffKind, hunting: bool) -> Duration {
     }
 }
 
+/// Pure: how far scarcity may shorten a window of this kind — the inbound
+/// throttle for transient and busy, a longer floor for a laggard, and `None`
+/// for a wrong-chain peer, whose window never shrinks.
+fn scarcity_floor(kind: BackoffKind) -> Option<Duration> {
+    match kind {
+        BackoffKind::Transient | BackoffKind::Busy => Some(PEER_INBOUND_THROTTLE),
+        BackoffKind::Lagging => Some(LAGGING_RECHECK_FLOOR),
+        BackoffKind::Incompatible => None,
+    }
+}
+
 /// Pure: `window` shortened by the pool's shortfall — `window × live / target`,
-/// clamped to `[SCARCITY_FLOOR, window]`. At or above target, or with no
-/// target, the window is whole.
-fn scaled_backoff(window: Duration, live: usize, target: usize) -> Duration {
+/// clamped to `[floor, window]`. At or above target, or with no target, the
+/// window is whole; a window already under the floor is never lengthened.
+fn scaled_backoff(window: Duration, live: usize, target: usize, floor: Duration) -> Duration {
     if target == 0 || live >= target {
         return window;
     }
     window
         .mul_f64(live as f64 / target as f64)
-        .max(SCARCITY_FLOOR)
+        .max(floor)
         .min(window)
 }
 
-/// Pure: `items` from `cursor` on, wrapping around — the order the scarcity
-/// re-dial walks discovery's table, so successive ticks continue where the
-/// last stopped instead of re-trying the same head of the list.
-fn rotate_from<T: Clone>(items: &[T], cursor: usize) -> Vec<T> {
-    if items.is_empty() {
-        return Vec::new();
+/// Pure: how many discovery-known peers the maintainer may re-dial this tick —
+/// [`SCARCITY_REDIALS_PER_TICK`] scaled by the shortfall, rounded up, so one
+/// peer short costs one dial a tick and an empty pool the whole budget.
+fn scarcity_budget(live: usize, target: usize) -> usize {
+    if target == 0 || live >= target {
+        return 0;
     }
-    let c = cursor % items.len();
-    items[c..]
-        .iter()
-        .chain(items[..c].iter())
-        .cloned()
-        .collect()
+    (SCARCITY_REDIALS_PER_TICK * (target - live)).div_ceil(target)
+}
+
+/// Pure: how long to wait before re-dialing a pooled peer that closed after
+/// living `lived` — the rest of the inbound throttle, or nothing once it has
+/// passed.
+fn redial_wait_after_close(lived: Duration) -> Option<Duration> {
+    (lived < PEER_INBOUND_THROTTLE).then(|| PEER_INBOUND_THROTTLE - lived)
+}
+
+/// Pure: the indices `0..len` starting at `cursor` and wrapping — the order the
+/// scarcity re-dial walks discovery's table, so a tick continues roughly where
+/// the last stopped. Roughly: the table's flattening shifts as buckets change
+/// between ticks, so an index cursor can skip or repeat an entry — harmless,
+/// every entry comes round again.
+fn rotated_indices(len: usize, cursor: usize) -> impl Iterator<Item = usize> {
+    let c = if len == 0 { 0 } else { cursor % len };
+    (c..len).chain(0..c)
 }
 
 /// Pure trigger: pool empty AND it has been empty past the stall window.
@@ -437,6 +478,8 @@ fn read_failure_verdict(fails_before: u32, pool_len: usize) -> (u32, bool) {
 /// than `BACKOFF_TRANSIENT`: the EL hunt's backoff bypass (`maintainer_loop`)
 /// clears only transient-length entries, so a hunt never re-dials a known
 /// laggard — it cannot serve, and the dial budget is better spent on discovery.
+/// Below target, scarcity shortens it in proportion to the shortfall, but
+/// never under [`LAGGING_RECHECK_FLOOR`] (#539).
 const BACKOFF_LAGGING: Duration = Duration::from_secs(10 * 60);
 
 /// Pure: may a verified-read FAILURE be persisted as a snap verdict against
@@ -768,9 +811,14 @@ impl PoolInner {
                 true
             }
         });
-        if !freed.is_empty() {
+        let live = peers.len();
+        drop(peers);
+        if freed.is_empty() {
+            return live;
+        }
+        {
             let mut attempted = self.attempted.lock().await;
-            for (addr, lived, reason) in freed {
+            for (addr, lived, reason) in &freed {
                 // INFO, one line per lost slot: a pool that churned through
                 // peers (#539: 236 admissions of 21 peers in 28 minutes) left
                 // no line saying why any of them went.
@@ -780,10 +828,20 @@ impl PoolInner {
                     reason = reason.as_deref().unwrap_or("unknown"),
                     "pooled snap peer closed"
                 );
-                attempted.remove(&addr);
+                attempted.remove(addr);
             }
         }
-        peers.len()
+        // A peer that closed within the inbound throttle of its accept is not
+        // worth a re-dial until that window has passed (`PEER_INBOUND_THROTTLE`):
+        // the next maintainer tick would only buy a transport failure and a
+        // connect-failure strike against the warm-start cache.
+        for (addr, lived, _) in freed {
+            if let Some(wait) = redial_wait_after_close(lived) {
+                self.record_backoff_window(addr, BackoffKind::Transient, wait, now)
+                    .await;
+            }
+        }
+        live
     }
 
     /// The beacon-anchored head `(number, hash)`, or `None` before the anchor
@@ -853,6 +911,18 @@ impl PoolInner {
     /// Record an address backoff for `window` (one of the BACKOFF_* consts).
     async fn record_backoff(&self, addr: SocketAddr, kind: BackoffKind, now: Instant) {
         let window = backoff_window(kind, self.hunting.load(Ordering::Relaxed));
+        self.record_backoff_window(addr, kind, window, now).await;
+    }
+
+    /// [`record_backoff`](Self::record_backoff) with an explicit window — the
+    /// remainder of the inbound throttle after a short-lived peer closed.
+    async fn record_backoff_window(
+        &self,
+        addr: SocketAddr,
+        kind: BackoffKind,
+        window: Duration,
+        now: Instant,
+    ) {
         let mut backoff = self.backoff.lock().await;
         // Entries are normally dropped when their address resurfaces as a
         // candidate, but an address that never comes back would linger forever.
@@ -1208,18 +1278,22 @@ impl PeerPool {
     }
 
     /// Count of ACTIVE backoffs — entries still blocking a dial at the pool's
-    /// current shortfall (#539) — pruning the rest as a side effect, matching
-    /// the `StatusSnapshot.backedOffPeers` "active, pruned on read" semantics
-    /// (and the Java `activeBackoffCount`). Pruning here also keeps the map
-    /// from lingering with dead entries.
+    /// current shortfall (#539) — matching the `StatusSnapshot.backedOffPeers`
+    /// "active, pruned on read" semantics (and the Java `activeBackoffCount`).
+    /// Pruned here are only entries whose FULL window has elapsed: an entry
+    /// that merely stopped blocking at a momentary shortfall stays, so a
+    /// status poll cannot change when a peer is dialed.
     pub async fn backoff_count(&self) -> usize {
         let now = Instant::now();
         // The live count before the backoff lock, never under it.
         let live = self.inner.peers.lock().await.len();
         let target = self.inner.pool_cfg.target_snap_peers;
         let mut backoff = self.inner.backoff.lock().await;
-        backoff.retain(|_, b| b.blocks(live, target, now));
-        backoff.len()
+        backoff.retain(|_, b| !b.elapsed(now));
+        backoff
+            .values()
+            .filter(|b| b.blocks(live, target, now))
+            .count()
     }
 
     /// A snap fetch against `addr` returned usable proof material — mark the
@@ -1934,10 +2008,7 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
             // intentional, bounded slot-farming (Java maintainSnapPeers twin
             // documents the same trade-off). Non-confirmed peers keep timers.
             let mut backoff = inner.backoff.lock().await;
-            for c in cached
-                .iter()
-                .filter(|c| c.quality == SnapQuality::Confirmed)
-            {
+            for c in cached.iter().filter(|c| c.quality == SnapQuality::Confirmed) {
                 if backoff
                     .get(&c.addr)
                     .is_some_and(|b| b.window <= BACKOFF_TRANSIENT)
@@ -1975,11 +2046,16 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
 }
 
 /// One tick of the below-target re-dial (#539): walk discovery's table from
-/// where the last tick stopped and launch at most [`SCARCITY_REDIALS_PER_TICK`]
-/// dials; blacklisted node ids, connected and in-flight addresses, and
-/// windows still blocking at the current shortfall are skipped as always.
-/// `false` when the pool is shutting down.
+/// where the last tick stopped and launch at most [`scarcity_budget`] dials;
+/// blacklisted node ids, connected and in-flight addresses, and windows still
+/// blocking at the current shortfall are skipped as always. `false` when the
+/// pool is shutting down.
 async fn scarcity_redial(inner: &Arc<PoolInner>) -> bool {
+    let target = inner.pool_cfg.target_snap_peers;
+    let budget = scarcity_budget(inner.peers.lock().await.len(), target);
+    if budget == 0 {
+        return true;
+    }
     let table: Vec<TableEntry> = {
         let handle = inner
             .discovery_table
@@ -1994,15 +2070,15 @@ async fn scarcity_redial(inner: &Arc<PoolInner>) -> bool {
     if table.is_empty() {
         return true;
     }
-    let target = inner.pool_cfg.target_snap_peers;
     let cursor = inner.scarcity_cursor.load(Ordering::Relaxed) % table.len();
     let mut dialed = 0usize;
     let mut consumed = 0usize;
-    for entry in rotate_from(&table, cursor) {
-        if dialed >= SCARCITY_REDIALS_PER_TICK || inner.peers.lock().await.len() >= target {
+    for i in rotated_indices(table.len(), cursor) {
+        if dialed >= budget || inner.peers.lock().await.len() >= target {
             break;
         }
         consumed += 1;
+        let entry = &table[i];
         let (Some(addr), Some(pubkey)) = (
             to_socket_addr(&entry.ip, entry.tcp_port),
             to_pubkey(&entry.node_id),
@@ -2030,6 +2106,7 @@ async fn scarcity_redial(inner: &Arc<PoolInner>) -> bool {
                 live,
                 target,
                 dialed,
+                budget,
                 known = table.len(),
                 "EL pool below target — re-dialing discovery-known peers under shortened backoffs"
             );
@@ -2095,48 +2172,93 @@ impl SnapQualitySink {
 
 #[cfg(test)]
 mod tests {
-    /// The below-target re-dial (#539): windows shrink with the shortfall,
-    /// never below the floor and never for a wrong-chain peer; busy keeps its
-    /// hunt-time cadence; the table walk rotates.
+    /// The below-target re-dial (#539): windows shrink with the shortfall, never
+    /// below their kind's floor and never for a wrong-chain peer; the budget
+    /// scales with the shortfall; a short-lived peer waits out the inbound
+    /// throttle; the table walk rotates; and the pool applies all of it.
     mod scarcity {
         use super::super::{
-            backoff_window, rotate_from, scaled_backoff, Backoff, BackoffKind, BACKOFF_BUSY,
-            BACKOFF_INCOMPATIBLE, BACKOFF_LAGGING, BACKOFF_TRANSIENT, SCARCITY_FLOOR,
+            backoff_window, redial_wait_after_close, rotated_indices, scaled_backoff,
+            scarcity_budget, scarcity_floor, scarcity_redial, try_dial_verdict, Backoff,
+            BackoffKind, DialVerdict, PeerPool, PoolConfig, BACKOFF_BUSY, BACKOFF_INCOMPATIBLE,
+            BACKOFF_LAGGING, BACKOFF_TRANSIENT, LAGGING_RECHECK_FLOOR, PEER_INBOUND_THROTTLE,
+            SCARCITY_REDIALS_PER_TICK,
         };
+        use crate::el::discv4::{KademliaTable, TableEntry};
+        use crate::el::eth::session::EthConfig;
+        use crate::el::peercache::ElPeerCache;
+        use myotis_core::nodekey::NodeKey;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
         use std::time::Duration;
+        use tokio::sync::mpsc;
         use tokio::time::Instant;
+
+        const THROTTLE: Duration = PEER_INBOUND_THROTTLE;
 
         #[test]
         fn a_full_pool_keeps_every_window_whole() {
             for live in [8, 9, 100] {
-                assert_eq!(scaled_backoff(BACKOFF_LAGGING, live, 8), BACKOFF_LAGGING);
+                assert_eq!(
+                    scaled_backoff(BACKOFF_LAGGING, live, 8, THROTTLE),
+                    BACKOFF_LAGGING
+                );
             }
             // target 0 = maintainer deliberately idle: nothing shrinks.
-            assert_eq!(scaled_backoff(BACKOFF_LAGGING, 0, 0), BACKOFF_LAGGING);
+            assert_eq!(
+                scaled_backoff(BACKOFF_LAGGING, 0, 0, THROTTLE),
+                BACKOFF_LAGGING
+            );
         }
 
         #[test]
         fn windows_shrink_in_proportion_to_the_shortfall() {
             // 2 of 8: a quarter of the window.
             assert_eq!(
-                scaled_backoff(BACKOFF_LAGGING, 2, 8),
+                scaled_backoff(BACKOFF_LAGGING, 2, 8, THROTTLE),
                 Duration::from_secs(150)
             );
-            assert_eq!(scaled_backoff(BACKOFF_BUSY, 4, 8), Duration::from_secs(30));
-            // An empty pool: the floor, one maintainer tick.
-            assert_eq!(scaled_backoff(BACKOFF_LAGGING, 0, 8), SCARCITY_FLOOR);
+            assert_eq!(
+                scaled_backoff(BACKOFF_BUSY, 4, 8, THROTTLE),
+                Duration::from_secs(30)
+            );
+            // An empty pool: the floor.
+            assert_eq!(scaled_backoff(BACKOFF_LAGGING, 0, 8, THROTTLE), THROTTLE);
         }
 
         #[test]
-        fn the_floor_holds_and_a_short_window_is_never_lengthened() {
-            // 30 s × 2/8 = 7.5 s, below the floor.
-            assert_eq!(scaled_backoff(BACKOFF_TRANSIENT, 2, 8), SCARCITY_FLOOR);
+        fn no_window_shrinks_under_the_inbound_throttle() {
+            // geth closes a second inbound connection from the same IP within
+            // 30 s of the last accept: the transient window is already the
+            // floor, so it never shrinks at any shortfall…
+            for live in 0..8 {
+                assert_eq!(
+                    scaled_backoff(BACKOFF_TRANSIENT, live, 8, THROTTLE),
+                    THROTTLE,
+                    "{live}"
+                );
+            }
+            // …and busy never drops below it either.
+            assert_eq!(scaled_backoff(BACKOFF_BUSY, 1, 8, THROTTLE), THROTTLE);
+            // A window already under the floor is never lengthened.
             let short = Duration::from_secs(3);
-            assert_eq!(scaled_backoff(short, 1, 8), short);
+            assert_eq!(scaled_backoff(short, 1, 8, THROTTLE), short);
         }
 
         #[test]
-        fn an_incompatible_backoff_never_shrinks_but_a_laggard_does() {
+        fn floors_by_kind() {
+            assert_eq!(scarcity_floor(BackoffKind::Transient), Some(THROTTLE));
+            assert_eq!(scarcity_floor(BackoffKind::Busy), Some(THROTTLE));
+            assert_eq!(
+                scarcity_floor(BackoffKind::Lagging),
+                Some(LAGGING_RECHECK_FLOOR)
+            );
+            assert_eq!(scarcity_floor(BackoffKind::Incompatible), None);
+            assert!(LAGGING_RECHECK_FLOOR > THROTTLE);
+        }
+
+        #[test]
+        fn an_incompatible_backoff_never_shrinks_but_a_laggard_does_to_its_floor() {
             let since = Instant::now();
             let foreign = Backoff {
                 since,
@@ -2150,8 +2272,9 @@ mod tests {
                 window: BACKOFF_LAGGING,
                 kind: BackoffKind::Lagging,
             };
-            // The same length, but an empty pool re-dials it after one tick…
-            assert!(!laggard.blocks(0, 8, since + SCARCITY_FLOOR));
+            // The same length, but an empty pool re-dials it after its floor…
+            assert!(laggard.blocks(0, 8, since + LAGGING_RECHECK_FLOOR - Duration::from_secs(1)));
+            assert!(!laggard.blocks(0, 8, since + LAGGING_RECHECK_FLOOR));
             // …and a full pool waits out the whole window.
             assert!(laggard.blocks(8, 8, since + BACKOFF_LAGGING / 2));
             assert!(!laggard.blocks(8, 8, since + BACKOFF_LAGGING));
@@ -2173,10 +2296,227 @@ mod tests {
         }
 
         #[test]
+        fn the_dial_budget_scales_with_the_shortfall() {
+            assert_eq!(scarcity_budget(8, 8), 0);
+            assert_eq!(scarcity_budget(9, 8), 0);
+            assert_eq!(scarcity_budget(7, 8), 1);
+            assert_eq!(scarcity_budget(6, 8), 1);
+            assert_eq!(scarcity_budget(4, 8), 2);
+            assert_eq!(scarcity_budget(2, 8), 3);
+            assert_eq!(scarcity_budget(0, 8), SCARCITY_REDIALS_PER_TICK);
+            // target 0 = maintainer idle: no walk.
+            assert_eq!(scarcity_budget(0, 0), 0);
+        }
+
+        #[test]
+        fn a_short_lived_peer_waits_out_the_rest_of_the_throttle() {
+            assert_eq!(redial_wait_after_close(Duration::ZERO), Some(THROTTLE));
+            assert_eq!(
+                redial_wait_after_close(Duration::from_secs(10)),
+                Some(Duration::from_secs(20))
+            );
+            assert_eq!(redial_wait_after_close(THROTTLE), None);
+            assert_eq!(redial_wait_after_close(Duration::from_secs(3600)), None);
+        }
+
+        #[test]
         fn the_table_walk_rotates_from_the_cursor_and_wraps() {
-            assert_eq!(rotate_from(&[1, 2, 3, 4], 2), vec![3, 4, 1, 2]);
-            assert_eq!(rotate_from(&[1, 2, 3, 4], 4), vec![1, 2, 3, 4]);
-            assert!(rotate_from::<u8>(&[], 3).is_empty());
+            assert_eq!(rotated_indices(4, 2).collect::<Vec<_>>(), vec![2, 3, 0, 1]);
+            assert_eq!(rotated_indices(4, 4).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+            assert_eq!(rotated_indices(0, 3).count(), 0);
+        }
+
+        /// An in-process pool with no network: no pins, no cache, target 8.
+        fn fixture(seed: &[u8]) -> PeerPool {
+            let key = Arc::new(
+                NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(seed)).unwrap(),
+            );
+            let cfg = Arc::new(EthConfig {
+                network_id: 1,
+                genesis_hash: [0u8; 32],
+                fork_id_hash: [0u8; 4],
+                fork_next: 0,
+                head_hash: [0u8; 32],
+                head_number: 0,
+                listen_port: 30303,
+                genesis_header_rlp: None,
+            });
+            let (_tx, rx) = mpsc::channel(4);
+            PeerPool::start(
+                Arc::clone(&key),
+                key.public_key_bytes(),
+                cfg,
+                PoolConfig::default(),
+                ElPeerCache::disabled(),
+                Vec::new(),
+                rx,
+                None,
+                None,
+                None,
+            )
+        }
+
+        /// A loopback address nothing listens on: a dial fails at TCP at once.
+        fn dead(port: u16) -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        #[tokio::test]
+        async fn try_dial_applies_the_shortened_window_on_a_thin_pool() {
+            let pool = fixture(b"scarcity-dial");
+            let now = Instant::now();
+            let pubkey = [3u8; 64];
+            // A laggard backed off 70 s ago: its 10-minute window has not
+            // elapsed, but at an empty pool it shrinks to its 60 s floor, so
+            // the dial goes through…
+            pool.inner.backoff.lock().await.insert(
+                dead(1),
+                Backoff {
+                    since: now - Duration::from_secs(70),
+                    window: BACKOFF_LAGGING,
+                    kind: BackoffKind::Lagging,
+                },
+            );
+            assert_eq!(
+                try_dial_verdict(&pool.inner, dead(1), pubkey).await,
+                DialVerdict::Dialed
+            );
+            // …while a laggard backed off just now is still blocked, and a
+            // wrong-chain peer stays blocked however old the entry and however
+            // empty the pool.
+            pool.inner.backoff.lock().await.insert(
+                dead(2),
+                Backoff {
+                    since: now,
+                    window: BACKOFF_LAGGING,
+                    kind: BackoffKind::Lagging,
+                },
+            );
+            pool.inner.backoff.lock().await.insert(
+                dead(3),
+                Backoff {
+                    since: now - Duration::from_secs(500),
+                    window: BACKOFF_INCOMPATIBLE,
+                    kind: BackoffKind::Incompatible,
+                },
+            );
+            assert_eq!(
+                try_dial_verdict(&pool.inner, dead(2), pubkey).await,
+                DialVerdict::Skipped
+            );
+            assert_eq!(
+                try_dial_verdict(&pool.inner, dead(3), pubkey).await,
+                DialVerdict::Skipped
+            );
+            pool.stop().await;
+        }
+
+        #[tokio::test]
+        async fn backoff_count_counts_what_blocks_but_prunes_only_the_elapsed() {
+            let pool = fixture(b"scarcity-count");
+            let now = Instant::now();
+            let mut map = pool.inner.backoff.lock().await;
+            // Not blocking at an empty pool (past its 60 s floor), not elapsed.
+            map.insert(
+                dead(1),
+                Backoff {
+                    since: now - Duration::from_secs(70),
+                    window: BACKOFF_LAGGING,
+                    kind: BackoffKind::Lagging,
+                },
+            );
+            // Blocking.
+            map.insert(
+                dead(2),
+                Backoff {
+                    since: now,
+                    window: BACKOFF_TRANSIENT,
+                    kind: BackoffKind::Transient,
+                },
+            );
+            // Elapsed in full: pruned.
+            map.insert(
+                dead(3),
+                Backoff {
+                    since: now - Duration::from_secs(700),
+                    window: BACKOFF_LAGGING,
+                    kind: BackoffKind::Lagging,
+                },
+            );
+            drop(map);
+            assert_eq!(pool.backoff_count().await, 1);
+            let map = pool.inner.backoff.lock().await;
+            assert!(
+                map.contains_key(&dead(1)),
+                "a window that merely stopped blocking stays"
+            );
+            assert!(map.contains_key(&dead(2)));
+            assert!(!map.contains_key(&dead(3)), "an elapsed window is pruned");
+            drop(map);
+            pool.stop().await;
+        }
+
+        /// Where the table walk will resume.
+        fn cursor(pool: &PeerPool) -> usize {
+            pool.inner
+                .scarcity_cursor
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Six discovery entries at dead loopback ports, with distinct 64-byte
+        /// node ids.
+        fn table(n: u16) -> Arc<std::sync::Mutex<KademliaTable>> {
+            let mut t = KademliaTable::new([0u8; 32]);
+            for i in 1..=n {
+                let mut node_id = vec![0u8; 64];
+                node_id[0] = i as u8;
+                node_id[63] = 0xa0 | (i as u8);
+                t.add(TableEntry {
+                    ip: vec![127, 0, 0, 1],
+                    udp_port: 30_300 + i,
+                    tcp_port: u32::from(i),
+                    node_id,
+                    last_seen_ms: 0,
+                });
+            }
+            assert_eq!(t.len(), usize::from(n));
+            Arc::new(std::sync::Mutex::new(t))
+        }
+
+        #[tokio::test]
+        async fn the_table_walk_spends_its_budget_and_moves_the_cursor() {
+            let pool = fixture(b"scarcity-walk");
+            pool.attach_discovery(table(6));
+            // Empty pool, target 8: the full budget of 4. The walk breaks at
+            // the 5th entry, so the cursor lands on it.
+            assert!(scarcity_redial(&pool.inner).await);
+            assert_eq!(cursor(&pool), 4);
+            // The next tick: entries 5 and 6 dial, then the walk wraps over the
+            // four already dialed — in flight or in the throttle backoff after
+            // their refused connect, skipped either way — and consumes them,
+            // so the cursor comes back round to the same entry.
+            assert!(scarcity_redial(&pool.inner).await);
+            assert_eq!(cursor(&pool), 4);
+            pool.stop().await;
+        }
+
+        #[tokio::test]
+        async fn an_all_blacklisted_table_dials_nothing_and_holds_the_cursor() {
+            let pool = fixture(b"scarcity-blacklist");
+            let t = table(6);
+            // Bound first: a `for` head's temporaries live for the whole loop,
+            // and the std guard must not be held across the await below.
+            let entries = t.lock().unwrap().all_peers();
+            for e in entries {
+                let mut id = [0u8; 64];
+                id.copy_from_slice(&e.node_id);
+                pool.inner.blacklist.lock().await.insert(id);
+            }
+            pool.attach_discovery(t);
+            assert!(scarcity_redial(&pool.inner).await);
+            assert_eq!(cursor(&pool), 0);
+            assert_eq!(pool.attempted_count().await, 0, "nothing was dialed");
+            pool.stop().await;
         }
     }
 
