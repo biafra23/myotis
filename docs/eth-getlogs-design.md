@@ -271,9 +271,50 @@ From the first anchored block downward to `min(watch.from_block)`:
 2. Per verified header: bloom-check against the watch-list (addresses +
    optional topic0s). Non-match ⇒ record coverage and discard the header.
 3. Match ⇒ `get_receipts([hash])` (`el/peer.rs:325`) + `verify_block_receipts`;
-   extract matching logs; store.
+   extract matching logs; store. The block's body is fetched only when its
+   receipts turn out to hold a watched log (see *What a candidate costs*).
 4. Checkpoint cursor + coverage after each batch; restart is idempotent from
    the checkpoint (any await may be the last).
+
+**What a candidate costs (receipts first, #544).** The header bloom is a
+coarse pre-filter. An address-only watch entry tests three bits of a 2048-bit
+bloom, and mainnet blooms are well filled, so most candidates hold no watched
+log at all. Measured on mainnet for the RAILGUN contract (200 blocks to
+26,111,000, sizes from chain data over a public RPC): 96 blocks were candidates
+and 6 of those held a RAILGUN log. Their bodies came to 19.4 MB and their
+receipts, in eth/69's bloomless form, to 25.0 MB.
+
+A block's receipts verify against `receiptsRoot` on their own. The body is
+needed for one thing — the transaction hash of a log that is actually stored —
+so `fetch_candidate_logs` (the one implementation behind the backfill, the head
+bridge and the tail) asks for the chunk's receipts first, verifies them, scans
+them for a log the watch-list would store, and asks for bodies only for the
+blocks that hold one. A candidate without one is complete with no body. On the
+sample above that is 26.2 MB where fetching both for every candidate is
+44.3 MB, 41% less. The saving shrinks as the hit rate rises, and on eth/68
+peers, whose receipts carry a 256-byte bloom each.
+
+- **The eth/69 bound without a body.** eth/69 receipts arrive without their
+  bloom, and recomputing it costs 256 bytes per receipt, so the expansion is
+  bounded before it runs. Every other caller takes the bound from the
+  `transactionsRoot`-verified body's transaction count (#454). Here it comes
+  from the same trusted place the body check takes its own: the header's
+  `gasUsed` cannot pay for more than `gasUsed / 1000` transactions
+  (`verify_receipts_alone`, `BlockReceipts::canonical_at_most`). That is a
+  ceiling; the `receiptsRoot` check pins the count, since a receipts trie is
+  keyed by index.
+- **The scan is as strict as the store.** A wrong-length address or topic in
+  verified receipts is an error, never a log that fails to match and lets
+  coverage advance past it.
+- **Dense watch-lists.** Where candidates mostly ARE hits, the second round
+  trip costs latency on every chunk and saves nothing. `BodyPolicy` keeps a
+  decaying count of candidates and hits and requests bodies together with the
+  receipts while at least three in four are hits. It only shapes requests: a
+  body is verified and used only for a block that holds a watched log, in
+  either shape.
+- **The usable prefix** of a chunk is "receipts verified, and a verified body
+  for every block in it that holds a watched log". The truncation cut and the
+  request sizing below work on that prefix.
 
 **Request sizing (adaptive).** Candidate blocks are fetched in chunks, and a
 peer answers `get_block_bodies`/`get_receipts` up to a soft BYTE budget — a
@@ -327,6 +368,34 @@ window from ~4 requests into ~1023, overrunning the walker's tick budget (only
 checked between rounds) and delaying the head-follow appender that shares the
 task. Self-heals over the probe ladder; a hard chunks-per-batch bound is the
 natural pairing for the width floor if it ever shows up in practice.
+
+**Time is evidence too (#545).** The byte budget above is the *peer's* limit.
+On a slow link the binding limit is ours: a response that fits the peer's
+budget still cannot cross the link inside the 15 s request timeout, so it never
+truncates — it just never arrives. Measured on a ~300 KB/s link (2026-10-01): a
+64-block chunk took about as long as the timeout, every peer in turn timed out
+on the same request, and the head catch-up closed ~190 blocks in 13 minutes.
+
+So a chunk that takes longer than `CHUNK_SLOW_AFTER` (5 s, a third of the
+timeout), or fails after waiting that long, is folded into the sizer as a short
+serve of however many blocks would have fit at that pace (`note_slow`). It gets
+the truncation rules for free: at most a quarter per step, and the probe clock
+restarts. A timeout on 64 blocks retries at 21. Unlike a truncation, a slow
+chunk is evidence whichever chunk of a batch it was — a wider one can only be
+slower.
+
+- **The head side has its own width.** The bridge and the tail used a fixed 64;
+  they now read a `ChunkSizer` of their own (the head range and the backfill
+  range differ in block size) and feed it per chunk. A slow failure re-cuts the
+  chunk before the next peer is tried, and the tail resumes a truncated chunk at
+  the cut.
+- **In the backfill, timing counts only at pipeline depth 1.** At depth 4 a
+  request also waits behind the ones queued ahead of it, and the depth degrade
+  owns that case. A slow chunk ends the batch as a truncation does, so its
+  already-cut siblings do not each run up to the timeout. And a depth-1 batch
+  restores the pipeline only where four chunks in flight would still fit the
+  target (`pipeline_fits`): on a bandwidth-bound link they share the same bytes
+  per second, and restoring the depth there fails every other batch.
 
 Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
 the limit-cycle bound and the floor are pinned by test. The width is *not*
