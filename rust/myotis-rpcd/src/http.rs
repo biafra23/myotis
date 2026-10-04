@@ -1,21 +1,27 @@
 //! The HTTP side: a blocking tiny_http server with two thread pools.
 //!
 //! - INTAKE ([`INTAKE_THREADS`]) accepts every request, checks its Host and
-//!   Content-Type, reads its body, and answers everything that cannot block on
-//!   the engine's readiness itself: `GET /`, `GET /logindex`, the config-only
-//!   methods and the status snapshot (and every malformed body). A health check
-//!   therefore answers while every read worker is held waiting for a verified
-//!   head.
+//!   Content-Type, and answers everything that cannot block on the engine's
+//!   readiness itself: `GET /`, `GET /logindex`, the config-only methods and
+//!   the status snapshot (and every malformed body). A health check therefore
+//!   answers while every read worker is held waiting for a verified head.
+//!   Intake only serves bodies tiny_http has already buffered (small ones);
+//!   a larger or chunked body is received on a body-reader thread of its own,
+//!   within `--http-body-timeout`, so a client that stalls mid-body never
+//!   holds an intake thread.
 //! - READ (`--workers`) takes the bodies that name a gated method and blocks in
-//!   the router for as long as it must. Its size bounds concurrent engine reads.
+//!   the router for as long as it must. Its size bounds concurrent engine reads;
+//!   at most `--http-queue` more wait for it, and the rest are refused `503`.
 //!
 //! An async server would only add a second runtime whose every handler is
 //! `spawn_blocking` around the same calls.
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::engine::{Engine, Readiness};
 use crate::rpc::{Body, Router};
@@ -102,6 +108,48 @@ pub fn json_content_type(v: Option<&str>) -> bool {
     .any(|t| media.eq_ignore_ascii_case(t))
 }
 
+/// How much the HTTP side holds at once (`--http-queue`, `--http-body-timeout`).
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Gated requests that may wait for a read worker beyond the ones the
+    /// workers hold (0: only an idle worker takes one). Past it a request is
+    /// refused at once with `503` and a `-32000` "server busy" error, never
+    /// queued: each would hold its parsed body.
+    pub queue: usize,
+    /// Total time to receive one request body that tiny_http has not already
+    /// buffered; past it the request is answered `408`.
+    pub body_timeout: Duration,
+}
+
+impl Limits {
+    /// Twice `--workers` waiting, 10 s per body.
+    pub fn new(workers: usize) -> Limits {
+        Limits {
+            queue: 2 * workers.max(1),
+            body_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Bodies received at once on body-reader threads. Past it a body is refused
+/// `503` without being read, so at most this many bodies (up to
+/// [`MAX_BODY_BYTES`] each) are in memory on the way in.
+pub const MAX_BODY_READS: usize = 32;
+
+/// tiny_http reads a body of at most this many bytes, with a Content-Length
+/// and no `Expect: 100-continue`, into memory before handing the request out
+/// (tiny_http 0.12 `request.rs`). Anything else still sits on the socket.
+const TINY_HTTP_BUFFERED: usize = 1024;
+
+/// What the intake and body-reader threads share.
+struct Shared<E: Engine> {
+    router: Arc<Router<E>>,
+    vhosts: VHosts,
+    reads: mpsc::SyncSender<(tiny_http::Request, Body)>,
+    body_timeout: Duration,
+    body_reads: AtomicUsize,
+}
+
 /// Start both pools on `server`. Returns how many threads wait in
 /// `server.recv()`: each needs its own `server.unblock()` at shutdown.
 pub fn spawn<E: Engine + 'static>(
@@ -109,8 +157,11 @@ pub fn spawn<E: Engine + 'static>(
     router: Arc<Router<E>>,
     vhosts: VHosts,
     workers: usize,
+    limits: Limits,
 ) -> usize {
-    let (tx, rx) = mpsc::channel::<(tiny_http::Request, Body)>();
+    // Bounded: a request that finds every worker busy and the queue full is
+    // refused, so a flood of gated reads cannot grow memory without limit.
+    let (tx, rx) = mpsc::sync_channel::<(tiny_http::Request, Body)>(limits.queue);
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..workers.max(1) {
         let (rx, router) = (rx.clone(), router.clone());
@@ -123,13 +174,18 @@ pub fn spawn<E: Engine + 'static>(
             let _ = req.respond(rpc_response(router.handle_parsed(body)));
         });
     }
-    let vhosts = Arc::new(vhosts);
+    let shared = Arc::new(Shared {
+        router,
+        vhosts,
+        reads: tx,
+        body_timeout: limits.body_timeout,
+        body_reads: AtomicUsize::new(0),
+    });
     for _ in 0..INTAKE_THREADS {
-        let (server, router, vhosts, tx) =
-            (server.clone(), router.clone(), vhosts.clone(), tx.clone());
+        let (server, shared) = (server.clone(), shared.clone());
         std::thread::spawn(move || {
             while let Ok(req) = server.recv() {
-                intake(req, &router, &vhosts, &tx);
+                intake(req, &shared);
             }
         });
     }
@@ -138,13 +194,52 @@ pub fn spawn<E: Engine + 'static>(
 
 type Reply = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
 
-fn intake<E: Engine>(
-    mut req: tiny_http::Request,
-    router: &Router<E>,
-    vhosts: &VHosts,
-    reads: &mpsc::Sender<(tiny_http::Request, Body)>,
-) {
-    let response = if !vhosts.allows(header(&req, "Host").as_deref()) {
+/// Answer a request whose body is already in memory; hand any other to a
+/// body-reader thread. Intake never reads from a client's socket: a client
+/// that stalls mid-body would hold the thread, and four of them would starve
+/// `GET /` and the status methods. Not even a refusal is sent from here for
+/// such a request, because tiny_http drains an unread body when the request is
+/// dropped — the same blocking read.
+fn intake<E: Engine + 'static>(req: tiny_http::Request, shared: &Arc<Shared<E>>) {
+    if body_in_memory(&req) {
+        return answer(req, shared, None);
+    }
+    let shared = shared.clone();
+    // One thread per such request is bounded by the open connections: tiny_http
+    // already runs one thread per connection, and parses a connection's next
+    // request only once this one is answered.
+    std::thread::spawn(move || {
+        let reading = shared.body_reads.fetch_add(1, Ordering::SeqCst);
+        if reading >= MAX_BODY_READS {
+            let _ = req.respond(busy(None));
+        } else {
+            let deadline = Instant::now() + shared.body_timeout;
+            answer(req, &shared, Some(deadline));
+        }
+        // After the respond, which also dropped (and drained) the request.
+        shared.body_reads.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+/// Whether tiny_http handed this request out with its whole body already read
+/// (or with none): then reading it here cannot block on the client.
+fn body_in_memory(req: &tiny_http::Request) -> bool {
+    let upgrade =
+        header(req, "Connection").is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
+    let chunked = header(req, "Transfer-Encoding").is_some();
+    match req.body_length() {
+        _ if upgrade => false,
+        None => !chunked,
+        Some(0) => true,
+        Some(n) => n <= TINY_HTTP_BUFFERED && header(req, "Expect").is_none(),
+    }
+}
+
+/// Serve one request. `deadline` bounds receiving its body (`None`: it is
+/// already in memory).
+fn answer<E: Engine>(mut req: tiny_http::Request, shared: &Shared<E>, deadline: Option<Instant>) {
+    let router = &shared.router;
+    let response = if !shared.vhosts.allows(header(&req, "Host").as_deref()) {
         text(403, "invalid host specified\n".into())
     } else {
         match req.method() {
@@ -163,16 +258,20 @@ fn intake<E: Engine>(
                     "invalid content type, only application/json is supported\n".into(),
                 )
             }
-            tiny_http::Method::Post => match read_body(&mut req) {
+            tiny_http::Method::Post => match read_body(&mut req, deadline) {
                 Err(r) => r,
                 Ok(body) => {
                     let body = Body::parse(&body);
                     if body.blocking() {
-                        // A read worker answers it; if none is left (shutdown),
-                        // say so rather than drop the connection.
-                        match reads.send((req, body)) {
+                        // A read worker answers it. A full queue is refused now,
+                        // and so is a closed one (shutdown) — never dropped.
+                        match shared.reads.try_send((req, body)) {
                             Ok(()) => return,
-                            Err(mpsc::SendError((req, _))) => {
+                            Err(mpsc::TrySendError::Full((req, body))) => {
+                                let _ = req.respond(busy(Some(&body)));
+                                return;
+                            }
+                            Err(mpsc::TrySendError::Disconnected((req, _))) => {
                                 let _ = req.respond(text(503, "shutting down\n".into()));
                                 return;
                             }
@@ -187,23 +286,73 @@ fn intake<E: Engine>(
     let _ = req.respond(response);
 }
 
-fn read_body(req: &mut tiny_http::Request) -> Result<String, Reply> {
+/// `503` with a JSON-RPC `-32000` "server busy" error for each request in
+/// `body` (one with a null id when the body was not read).
+fn busy(body: Option<&Body>) -> Reply {
+    let json = match body {
+        Some(b) => b.refusal(-32000, "server busy"),
+        None => Body::parse("").refusal(-32000, "server busy"),
+    };
+    tiny_http::Response::from_string(json)
+        .with_status_code(503)
+        .with_header(content_type("application/json"))
+}
+
+/// A body reader that gives up once `until` has passed. The check runs before
+/// each read, so it ends a body that trickles in; a client that stops sending
+/// altogether leaves the thread in a blocking read until the peer closes or
+/// sends again, since tiny_http 0.12 exposes no socket timeout (and a receive
+/// timeout set on the listener would also time out its accept loop, which then
+/// exits). That case holds a body-reader thread, never an intake thread.
+struct Deadline<R> {
+    inner: R,
+    until: Instant,
+}
+
+impl<R: Read> Read for Deadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.until {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.inner.read(buf)
+    }
+}
+
+fn read_body(req: &mut tiny_http::Request, deadline: Option<Instant>) -> Result<String, Reply> {
+    if req.body_length().is_some_and(|n| n as u64 > MAX_BODY_BYTES) {
+        return Err(too_large());
+    }
     let mut body = String::new();
-    if req
-        .as_reader()
-        .take(MAX_BODY_BYTES + 1)
-        .read_to_string(&mut body)
-        .is_err()
-    {
-        return Err(text(400, "request body is not UTF-8\n".into()));
+    let mut limited = req.as_reader().take(MAX_BODY_BYTES + 1);
+    let read = match deadline {
+        Some(until) => Deadline {
+            inner: limited,
+            until,
+        }
+        .read_to_string(&mut body),
+        None => limited.read_to_string(&mut body),
+    };
+    match read {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return Err(text(408, "request body not received in time\n".into()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(text(400, "request body is not UTF-8\n".into()))
+        }
+        Err(_) => return Err(text(400, "request body could not be read\n".into())),
     }
     if body.len() as u64 > MAX_BODY_BYTES {
-        return Err(text(
-            413,
-            format!("request body exceeds {MAX_BODY_BYTES} bytes\n"),
-        ));
+        return Err(too_large());
     }
     Ok(body)
+}
+
+fn too_large() -> Reply {
+    text(
+        413,
+        format!("request body exceeds {MAX_BODY_BYTES} bytes\n"),
+    )
 }
 
 fn header(req: &tiny_http::Request, name: &'static str) -> Option<String> {
@@ -362,7 +511,13 @@ mod tests {
         let mut f = Fake::new();
         f.status = r#"{"running":true,"beaconState":"CATCHING_UP","elReaderAvailable":true,"network":"gnosis"}"#.into();
         let router = Arc::new(Router::new(f).with_ready_wait(Duration::from_secs(4)));
-        spawn(server.clone(), router, VHosts::new(None, addr), 1);
+        spawn(
+            server.clone(),
+            router,
+            VHosts::new(None, addr),
+            1,
+            Limits::new(1),
+        );
 
         let held = std::thread::spawn(move || {
             let t0 = Instant::now();
@@ -413,7 +568,7 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let addr = server.server_addr().to_ip().unwrap();
         let router = Arc::new(Router::new(Fake::new()));
-        spawn(server, router, VHosts::new(None, addr), 1);
+        spawn(server, router, VHosts::new(None, addr), 1, Limits::new(1));
         let rpc = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#;
 
         let (code, _) = exchange(
@@ -434,5 +589,116 @@ mod tests {
         assert_eq!(code, 415, "a POST with no Content-Type");
         let (code, body) = post(addr, rpc);
         assert_eq!((code, body.contains("0x64")), (200, true), "{body}");
+    }
+
+    /// A node that never becomes ready, one read worker and a queue of one:
+    /// the worker holds the first gated read, the queue the second, and the
+    /// third is refused at once — while `GET /` still answers.
+    #[test]
+    fn a_full_read_queue_answers_503_and_health_still_answers() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_ip().unwrap();
+        let mut f = Fake::new();
+        f.status = r#"{"running":true,"beaconState":"CATCHING_UP","elReaderAvailable":true,"network":"gnosis"}"#.into();
+        let router = Arc::new(Router::new(f).with_ready_wait(Duration::from_secs(2)));
+        let limits = Limits {
+            queue: 1,
+            ..Limits::new(1)
+        };
+        spawn(server, router, VHosts::new(None, addr), 1, limits);
+
+        let gated = |id: u32| {
+            std::thread::spawn(move || {
+                post(
+                    addr,
+                    &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"eth_blockNumber"}}"#),
+                )
+            })
+        };
+        let held = gated(1);
+        std::thread::sleep(Duration::from_millis(300)); // the worker takes it
+        let queued = gated(2);
+        std::thread::sleep(Duration::from_millis(300)); // the queue takes it
+
+        let t0 = Instant::now();
+        let (code, body) = post(
+            addr,
+            r#"[{"jsonrpc":"2.0","id":3,"method":"eth_blockNumber"},
+                {"jsonrpc":"2.0","method":"eth_blockNumber"}]"#,
+        );
+        assert_eq!(code, 503, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([{"jsonrpc":"2.0","id":3,
+                "error":{"code":-32000,"message":"server busy"}}]),
+            "one error per request with an id; none for the notification"
+        );
+        let (code, body) = exchange(addr, "GET / HTTP/1.1\r\nHost: localhost", "");
+        assert_eq!(code, 200, "{body}");
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+
+        // Neither admitted read was dropped: each waited out its hold.
+        for h in [held, queued] {
+            let (code, body) = h.join().unwrap();
+            assert_eq!(code, 200);
+            assert!(body.contains(r#""result":"0x3e8""#), "{body}");
+        }
+    }
+
+    /// More clients than intake threads, each stalled mid-body: `GET /` and a
+    /// status POST still answer, and a body that resumes after the deadline is
+    /// answered 408.
+    #[test]
+    fn stalled_bodies_do_not_hold_intake_and_time_out() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_ip().unwrap();
+        let router = Arc::new(Router::new(Fake::new()));
+        let limits = Limits {
+            body_timeout: Duration::from_millis(500),
+            ..Limits::new(1)
+        };
+        spawn(server, router, VHosts::new(None, addr), 1, limits);
+
+        // Larger than tiny_http buffers itself, so the body is read from the
+        // socket; only half of it is sent.
+        let len = 4 * TINY_HTTP_BUFFERED;
+        let stalled: Vec<TcpStream> = (0..INTAKE_THREADS + 2)
+            .map(|_| {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                write!(
+                    s,
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                     Content-Length: {len}\r\nConnection: close\r\n\r\n{}",
+                    " ".repeat(len / 2)
+                )
+                .unwrap();
+                s
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200)); // every one is handed out
+
+        let t0 = Instant::now();
+        let (code, body) = exchange(addr, "GET / HTTP/1.1\r\nHost: localhost", "");
+        assert_eq!(code, 200, "{body}");
+        let (code, body) = post(addr, r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#);
+        assert_eq!((code, body.contains("0x64")), (200, true), "{body}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "health queued behind stalled bodies: {:?}",
+            t0.elapsed()
+        );
+
+        // Past the deadline the clients send more; the next read gives up.
+        std::thread::sleep(Duration::from_millis(600));
+        // (The connection then stays open while tiny_http drains the unread
+        // rest of the body, so only the status line is read here.)
+        for mut s in stalled {
+            s.write_all(b" ").unwrap();
+            let mut status = [0u8; 12];
+            s.read_exact(&mut status).unwrap();
+            assert_eq!(&status, b"HTTP/1.1 408");
+        }
     }
 }

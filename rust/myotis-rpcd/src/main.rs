@@ -65,6 +65,15 @@ struct Args {
     /// block (GET /, config methods, eth_syncing) never wait for one.
     #[arg(long, default_value_t = 16)]
     workers: usize,
+    /// Requests that may wait for a busy read worker; past it a request is
+    /// refused at once with HTTP 503 and a -32000 "server busy" error.
+    /// Default: twice --workers.
+    #[arg(long, value_name = "N")]
+    http_queue: Option<usize>,
+    /// Seconds to receive a request body; a client still sending after that
+    /// is answered 408.
+    #[arg(long, default_value_t = 10, value_name = "SECS")]
+    http_body_timeout: u64,
     /// Consent to sync forward from an embedded trust anchor older than the
     /// weak-subjectivity bound, for this run only. Without it a stale anchor
     /// parks the node (STALE_ANCHOR) and every read is refused. This is a trust
@@ -253,7 +262,18 @@ fn run(args: Args) -> Result<(), String> {
     if let Some(f) = call_log {
         router = router.with_call_log(Box::new(f));
     }
-    let receivers = http::spawn(server.clone(), Arc::new(router), vhosts, args.workers);
+    let mut limits = http::Limits::new(args.workers);
+    if let Some(q) = args.http_queue {
+        limits.queue = q;
+    }
+    limits.body_timeout = Duration::from_secs(args.http_body_timeout);
+    let receivers = http::spawn(
+        server.clone(),
+        Arc::new(router),
+        vhosts,
+        args.workers,
+        limits,
+    );
 
     // Graceful stop: stop accepting, shut the engine handle down (it persists
     // its sync state), flush the log ring. Workers still blocked in an engine

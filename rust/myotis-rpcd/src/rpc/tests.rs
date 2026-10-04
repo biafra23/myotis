@@ -38,6 +38,10 @@ pub(crate) struct Fake {
     calls: Mutex<Vec<String>>,
     /// How many times the status was read (the readiness hold polls it).
     status_reads: AtomicUsize,
+    /// Answer the transaction-object calls with the REAL engine entry points
+    /// on a handle that does not exist: their request checks run first, so a
+    /// refused request comes back exactly as the engine refuses it.
+    tx_through_engine: bool,
 }
 
 impl Fake {
@@ -49,6 +53,7 @@ impl Fake {
             overlay: -1,
             calls: Mutex::new(Vec::new()),
             status_reads: AtomicUsize::new(0),
+            tx_through_engine: false,
         }
     }
     fn reply(mut self, method: &'static str, json: &str) -> Self {
@@ -97,10 +102,23 @@ impl Engine for Fake {
         self.get("call_overrides", format!("{f},{t},{d},{v},{b},{o}"))
     }
     fn eth_call_tx(&self, tx: &str, b: &str, o: &str) -> String {
-        self.get("call_tx", format!("{tx}|{b}|{o}"))
+        let canned = self.get("call_tx", format!("{tx}|{b}|{o}"));
+        if self.tx_through_engine {
+            return myotis_engine::ffi::eth_call_tx_json(i64::MIN, tx.into(), b.into(), o.into());
+        }
+        canned
     }
     fn estimate_gas_tx(&self, tx: &str, b: &str, o: &str) -> String {
-        self.get("estimate_tx", format!("{tx}|{b}|{o}"))
+        let canned = self.get("estimate_tx", format!("{tx}|{b}|{o}"));
+        if self.tx_through_engine {
+            return myotis_engine::ffi::estimate_gas_tx_json(
+                i64::MIN,
+                tx.into(),
+                b.into(),
+                o.into(),
+            );
+        }
+        canned
     }
     fn block_by_number(&self, t: &str, f: bool) -> String {
         self.get("block", format!("{t},{f}"))
@@ -442,6 +460,67 @@ fn eth_call_paths_and_refusals() {
         json!([{"to": TOKEN}, format!("0x{}", "ab".repeat(32))]),
     ] {
         assert_eq!(error(&r, "eth_call", bad.clone()).0, -32602, "{bad}");
+    }
+}
+
+/// An explicit `type` alone is enough for the transaction-object call: the
+/// plain call has no type to pass and would drop it. Every value goes there,
+/// and the engine applies it or refuses it.
+#[test]
+fn eth_call_with_only_a_type_takes_the_transaction_object_path() {
+    let ok = r#"{"status":"ok","resultHex":"0x","blockNumber":1,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("call_tx", ok).reply("call", ok));
+    for t in ["0x0", "0x2"] {
+        result(&r, "eth_call", json!([{"to": TOKEN, "type": t}, "latest"]));
+    }
+    let seen = calls(&r);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for (c, t) in seen.iter().zip(["0x0", "0x2"]) {
+        assert!(
+            c.starts_with("call_tx(") && c.contains(&format!(r#""type":"{t}""#)),
+            "{c}"
+        );
+    }
+
+    // Type 0x4 without an authorizationList reaches the engine, which refuses
+    // it permanently in its own words — no longer a plain call that succeeds.
+    let mut f = Fake::new();
+    f.tx_through_engine = true;
+    let r = Router::new(f);
+    let (code, msg, _) = error(
+        &r,
+        "eth_call",
+        json!([{"to": TOKEN, "type": "0x4"}, "latest"]),
+    );
+    assert_eq!(code, -32602, "{msg}");
+    assert!(msg.contains("requires an authorizationList"), "{msg}");
+    assert!(calls(&r)[0].starts_with("call_tx("), "{:?}", calls(&r));
+    let (code, msg, _) = error(&r, "eth_estimateGas", json!([{"to": TOKEN, "type": "0x4"}]));
+    assert_eq!(code, -32602, "{msg}");
+    assert!(msg.contains("requires an authorizationList"), "{msg}");
+}
+
+#[test]
+fn refusal_answers_each_request_by_id() {
+    let one = Body::parse(r#"{"jsonrpc":"2.0","id":"a","method":"eth_blockNumber"}"#);
+    assert_eq!(
+        one.refusal(-32000, "server busy"),
+        r#"{"jsonrpc":"2.0","id":"a","error":{"code":-32000,"message":"server busy"}}"#
+    );
+    let batch = Body::parse(r#"[{"id":1,"method":"x"},{"method":"y"},{"id":true,"method":"z"}]"#);
+    let v: Value = serde_json::from_str(&batch.refusal(-32000, "server busy")).unwrap();
+    assert_eq!(v.as_array().map(|a| a.len()), Some(2), "{v}");
+    assert_eq!(
+        (v[0]["id"].clone(), v[1]["id"].clone()),
+        (json!(1), Value::Null)
+    );
+    for bad in ["", "{nope", "[]", r#"[{"method":"y"}]"#] {
+        let v: Value = serde_json::from_str(&Body::parse(bad).refusal(-32000, "m")).unwrap();
+        assert_eq!(
+            (v["id"].clone(), v["error"]["code"].clone()),
+            (Value::Null, json!(-32000)),
+            "{bad}"
+        );
     }
 }
 

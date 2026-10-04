@@ -40,6 +40,8 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
             [--accept-stale-anchor] [--ws-bound-periods N]
             [--log-calls FILE] [--access-log]
             [--ready-wait 90] [--workers 16]
+            [--http-queue N]                       # default 2 × --workers
+            [--http-body-timeout 10]               # seconds to receive a body
 ```
 
 - `POST /` takes a JSON-RPC request or a batch (up to 1000 requests, geth's
@@ -72,6 +74,18 @@ ready. Requests that never need the engine to be ready — `GET /`,
 `eth_accounts`, `net_listening`, `eth_syncing`, `myotis_status`, or a batch of
 only those — are answered by a separate small intake pool, so a health check
 answers even while every read worker is held.
+
+What waits is bounded. At most `--http-queue` gated requests (default twice
+`--workers`) wait for a busy worker; past that a request is refused at once
+with HTTP `503` and a `-32000` "server busy" error for each request in it, so
+a flood of reads cannot grow memory without limit. A body larger than 1 KiB
+(or chunked) is received on a thread of its own, never on the intake pool, and
+must arrive within `--http-body-timeout` seconds (default 10) or the request is
+answered `408`; at most 32 such bodies are received at once, and past that the
+request is refused `503` unread. tiny_http exposes no socket timeout, so a
+client that stops sending entirely holds its body thread until it closes the
+connection or sends again — but never an intake thread, so `GET /` and the
+status methods keep answering.
 
 ### The trust anchor
 
@@ -156,7 +170,7 @@ misbehaves against the node: what it asked, in what order, and what it got.
 | `eth_syncing` | verified | `false` once the beacon light client is SYNCED, else a zeros object. |
 | `eth_blockNumber` | verified | The beacon-anchored optimistic execution head. |
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | verified | Snap proof at the head or at `finalized`. A number pin is served from head state only within [head-64, head+16]. `pending` nonce adds the node's own broadcasts. |
-| `eth_call` | verified | revm over proven state. State overrides applied; `blockOverrides` refused. A tx object with gas/fee/list fields goes through the engine's transaction-object call. |
+| `eth_call` | verified | revm over proven state. State overrides applied; `blockOverrides` refused. A tx object with an explicit `type` or gas/fee/list fields goes through the engine's transaction-object call, which applies or refuses them. |
 | `eth_estimateGas` | verified | Full transaction object, state overrides. |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | verified | The engine's fee suggestion (see gaps). |
 | `eth_feeHistory` | verified | Newest block required. At most 1024 blocks and 100 percentiles. |

@@ -238,6 +238,32 @@ impl Body {
             _ => false,
         }
     }
+
+    /// The same error for every request in the body that expects an answer —
+    /// a lone object, or each batch element with an id — for a body refused
+    /// before it is routed (the server's queue is full). One error with a null
+    /// id when there is nothing to answer by id (malformed, or unread).
+    pub fn refusal(&self, code: i64, message: &str) -> String {
+        let one = |v: &Value| {
+            let id = v
+                .get("id")
+                .filter(|id| valid_id(id))
+                .unwrap_or(&Value::Null);
+            error_envelope(id, code, message, None)
+        };
+        match &self.root {
+            Some(v @ Value::Object(_)) => one(v),
+            Some(Value::Array(a)) if a.iter().any(|v| v.get("id").is_some()) => format!(
+                "[{}]",
+                a.iter()
+                    .filter(|v| v.get("id").is_some())
+                    .map(one)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            _ => error_envelope(&Value::Null, code, message, None),
+        }
+    }
 }
 
 /// What the call log records of a request's outcome (handed over as computed,
@@ -1567,9 +1593,18 @@ fn parse_tx(obj: &Map<String, Value>) -> Result<TxArgs, String> {
     }
     let access_list =
         field("accessList").is_some_and(|a| a.as_array().is_none_or(|a| !a.is_empty()));
-    let extended = ["gas", "gasPrice", "maxFeePerGas", "maxPriorityFeePerGas"]
-        .iter()
-        .any(|k| q.contains_key(k))
+    // An explicit `type` is extended too, whatever its value: the plain call
+    // has no type to pass, so it would drop it; the transaction-object call
+    // applies it or refuses it (type 0x4 without an authorizationList, …).
+    let extended = [
+        "type",
+        "gas",
+        "gasPrice",
+        "maxFeePerGas",
+        "maxPriorityFeePerGas",
+    ]
+    .iter()
+    .any(|k| q.contains_key(k))
         || access_list
         || field("authorizationList").is_some()
         || (to.is_none() && q.contains_key("nonce"));
