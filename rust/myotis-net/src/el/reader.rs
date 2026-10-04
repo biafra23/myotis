@@ -1542,6 +1542,9 @@ pub struct ElReader {
     /// How many candidate blocks to ask for per bodies/receipts request, sized
     /// to what peers in THIS range actually serve. See [`ChunkSizer`].
     log_index_chunk_sizer: ChunkSizer,
+    /// Whether candidate chunks fetch bodies with their receipts or only for
+    /// the blocks that hold a watched log. See [`BodyPolicy`].
+    log_index_body_policy: BodyPolicy,
     /// Rolling backfill throughput — see [`Self::log_index_rate_bps`]. The
     /// sample anchor is (instant, cursor) at the last PROGRESS observation, so
     /// the rate is measured against WALL CLOCK between progress points (idle
@@ -1775,6 +1778,7 @@ impl ElReader {
             log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
             log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
             log_index_chunk_sizer: ChunkSizer::new(),
+            log_index_body_policy: BodyPolicy::default(),
             log_index_path: cfg.log_index_path,
             log_index_task: std::sync::Mutex::new(None),
             log_index_drive: tokio::sync::Mutex::new(()),
@@ -3105,7 +3109,7 @@ impl ElReader {
                 let Some(peer) = peers.get(peer_idx) else {
                     break 'chunks; // pool exhausted; apply the prefix we have
                 };
-                match self.fetch_logs_for_known_headers(peer, chunk, &chunk_headers).await {
+                match self.fetch_logs_for_known_headers(peer, &chunk_headers).await {
                     Ok(map) => {
                         logs.extend(map);
                         break;
@@ -3856,9 +3860,9 @@ impl ElReader {
         }
     }
 
-    /// Fetch bodies+receipts for candidate blocks named by their TRUSTED
-    /// hashes (the plan's descent chained them to a beacon anchor) and return
-    /// their watch-list logs by block number.
+    /// Fetch what candidate blocks named by their TRUSTED hashes need (the
+    /// plan's descent chained them to a beacon anchor) and return their
+    /// watch-list logs by block number.
     ///
     /// Headers are re-fetched here by hash rather than cached in the plan: a
     /// header is self-verifying under a hash we already trust (`hash !=
@@ -3868,9 +3872,10 @@ impl ElReader {
     /// a phone. The fetches ride the multiplexed connection concurrently, so
     /// the extra round trip costs latency once per chunk, not per block.
     ///
-    /// Verification is the backfill's, block for block: transactions against
-    /// the header's `transactionsRoot`, receipts against its `receiptsRoot`,
-    /// so a peer cannot substitute a different block's data.
+    /// Verification is the backfill's, block for block: receipts against the
+    /// header's `receiptsRoot`, and for a block that holds a watched log its
+    /// transactions against `transactionsRoot`, so a peer cannot substitute a
+    /// different block's data.
     async fn bridge_fetch_logs(
         &self,
         peer: &ManagedPeer,
@@ -3889,63 +3894,51 @@ impl ElReader {
             (vh.hash == *h).then_some(vh)
         }))
         .await;
-        self.fetch_logs_for_known_headers(peer, hashes, &headers).await
+        self.fetch_logs_for_known_headers(peer, &headers).await
     }
 
     /// The verify core shared by the bridge and the tail: given TRUSTED
-    /// headers (chained to a beacon anchor by the caller), fetch each block's
-    /// body and receipts and return the watch-list logs by block number. The
-    /// tail passes the headers from the window it just verified rather than
-    /// re-fetching one per candidate every tick.
+    /// headers (chained to a beacon anchor by the caller), fetch what each
+    /// candidate block needs — its receipts, and its body only if it holds a
+    /// watched log ([`fetch_candidate_logs`]) — and return the watch-list logs
+    /// by block number. The tail passes the headers from the window it just
+    /// verified rather than re-fetching one per candidate every tick.
+    ///
+    /// The map has an entry for EVERY candidate that was fully processed,
+    /// empty when the block holds no watched log: both callers read a missing
+    /// entry as "not fetched yet" and stop applying there, so coverage stays
+    /// contiguous. A missing header ends the chunk rather than failing it — only
+    /// the leading run of known headers is requested, and the caller applies
+    /// what is contiguous.
     async fn fetch_logs_for_known_headers(
         &self,
         peer: &ManagedPeer,
-        hashes: &[[u8; 32]],
         headers: &[Option<crate::el::eth::messages::VerifiedHeader>],
     ) -> Result<std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>, String> {
-        let mut out = std::collections::HashMap::new();
-        if hashes.is_empty() {
-            return Ok(out);
+        let known: Vec<&crate::el::eth::messages::VerifiedHeader> =
+            headers.iter().map_while(|h| h.as_ref()).collect();
+        if known.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
-        let (bodies, receipt_blocks) =
-            futures::future::join(peer.get_block_bodies(hashes), peer.get_receipts(hashes)).await;
-        let (bodies, receipt_blocks) = (bodies?, receipt_blocks?);
-        // Honest byte-budget truncation: use the served prefix, leave the rest
-        // for the next round (the caller re-requests what it didn't get).
-        let usable = bodies.len().min(receipt_blocks.len()).min(hashes.len());
-        if usable == 0 {
-            return Err("peer served no bodies/receipts for bridge candidates".to_string());
-        }
-        for i in 0..usable {
-            // A missing/mismatched header ends the usable prefix rather than
-            // failing the chunk: the caller applies what is contiguous.
-            let Some(vh) = headers.get(i).and_then(|h| h.as_ref()) else {
-                break;
-            };
-            verify_body_transactions(&vh.header, &bodies[i])?;
-            if receipt_blocks[i].len() != bodies[i].transactions.len() {
-                return Err(format!(
-                    "block {}: {} receipts for {} transactions",
-                    vh.header.number,
-                    receipt_blocks[i].len(),
-                    bodies[i].transactions.len()
-                ));
-            }
-            let receipts = receipt_blocks[i]
-                .canonical(bodies[i].transactions.len())
-                .map_err(|e| format!("block {}: {}", vh.header.number, e.0))?;
-            verify_block_receipts(&vh.header, &receipts)?;
-            let built = build_block_receipts(&vh.header, vh.hash, &bodies[i], &receipts)?;
-            let stored =
-                stored_logs_for_block(&built).ok_or("malformed log field in verified receipts")?;
-            let watched: Vec<crate::el::logindex::StoredLog> = self
-                .with_log_index(|ix| {
-                    stored.iter().filter(|l| ix.config().watches(l)).cloned().collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            out.insert(vh.header.number, watched);
-        }
-        Ok(out)
+        // One snapshot for the chunk. Both callers re-check the config's
+        // fingerprint under the index lock before they apply anything, so logs
+        // filtered against a watch-list that was replaced meanwhile are dropped
+        // there, never stored.
+        let Some(config) = self.with_log_index(|ix| ix.config().clone()) else {
+            return Err("log index uninstalled".to_string());
+        };
+        let mut chunk =
+            fetch_candidate_logs(peer, &known, &config, self.log_index_body_policy.eager())
+                .await
+                .map_err(|e| e.message().to_string())?;
+        self.log_index_body_policy.note(&chunk);
+        Ok(known[..chunk.usable]
+            .iter()
+            .map(|vh| {
+                let n = vh.header.number;
+                (n, chunk.logs.remove(&n).unwrap_or_default())
+            })
+            .collect())
     }
 
     /// One backfill step: walk the verified header chain DOWNWARD from the
@@ -4440,28 +4433,29 @@ impl ElReader {
             1
         };
         let mut stop_below: Option<u64> = None;
-        // Owned per-chunk hash lists move into the fetch futures (borrowing
-        // the header slices across the stream trips Send inference in the
-        // spawned appender task); the consumer re-derives each chunk slice by
-        // index for verification.
-        let chunk_hashes: Vec<Vec<[u8; 32]>> = candidates
-            .chunks(chunk_len)
-            .map(|c| c.iter().map(|h| h.hash).collect())
-            .collect();
-        let mut fetches = futures::StreamExt::buffered(
-            futures::stream::iter(chunk_hashes.into_iter().enumerate().map(|(i, hashes)| {
-                async move {
-                    let (bodies, receipts) = futures::future::join(
-                        peer.get_block_bodies(&hashes),
-                        peer.get_receipts(&hashes),
-                    )
-                    .await;
-                    (i, bodies, receipts)
-                }
-            })),
-            depth,
-        );
-        'chunks: while let Some((chunk_idx, bodies, receipt_blocks)) =
+        // Receipts first, bodies only where a block holds a watched log — or
+        // both together while candidates mostly are hits (#544; the choice is
+        // read once so every chunk of the batch is fetched the same way).
+        // Each chunk is fetched AND verified inside its own future
+        // ([`fetch_candidate_logs`]): the body request depends on what the
+        // receipts turned out to hold.
+        let eager_bodies = self.log_index_body_policy.eager();
+        // Built with a plain loop into boxed futures, not `chunks().map(|..|
+        // async move {..})`: a closure returning a future that borrows the
+        // header slices is not general enough over their lifetime for the
+        // spawned appender task's `Send` bound. Nothing runs until `buffered`
+        // polls it, so building them all up front costs a box per chunk.
+        let mut chunk_fetches: Vec<
+            futures::future::BoxFuture<'_, (usize, Result<CandidateChunk, CandidateFetchError>)>,
+        > = Vec::new();
+        for (i, chunk) in candidates.chunks(chunk_len).enumerate() {
+            chunk_fetches.push(Box::pin(async move {
+                (i, fetch_candidate_logs(peer, chunk, config, eager_bodies).await)
+            }));
+        }
+        let mut fetches =
+            futures::StreamExt::buffered(futures::stream::iter(chunk_fetches), depth);
+        'chunks: while let Some((chunk_idx, fetched)) =
             futures::StreamExt::next(&mut fetches).await
         {
             // Ours (and unreachable: `chunk_idx` came from our own enumerate).
@@ -4469,9 +4463,9 @@ impl ElReader {
                 .chunks(chunk_len)
                 .nth(chunk_idx)
                 .ok_or_else(|| BackfillBatchError::ours("chunk index out of range"))?;
-            let (bodies, receipt_blocks) = match (bodies, receipt_blocks) {
-                (Ok(b), Ok(r)) => (b, r),
-                (b, r) => {
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(CandidateFetchError::Request(cause)) => {
                     // A failed chunk fetch may be a pipelining artifact: at
                     // depth 4 a tail request's 15s timer runs while the peer
                     // serves the full-budget responses queued ahead of it, so
@@ -4482,8 +4476,6 @@ impl ElReader {
                     // restores full depth.
                     self.log_index_pipeline_full
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    let cause = b.err().or(r.err());
-                    let cause = cause.unwrap_or_else(|| "chunk fetch failed".into());
                     // Blame follows the same reasoning as the degrade above: at
                     // depth > 1 the failure may well be OUR prefetch racing the
                     // peer's own serving queue, so charging the peer's score for
@@ -4498,14 +4490,8 @@ impl ElReader {
                         BackfillBatchError::peer(cause)
                     });
                 }
-            };
-            // Served items are an in-order prefix of the request (the per-block
-            // root verification below catches any peer that violates that).
-            let chunk_numbers: Vec<u64> = chunk.iter().map(|h| h.header.number).collect();
-            let Some((usable, chunk_stop)) =
-                truncation_plan(&chunk_numbers, bodies.len(), receipt_blocks.len())
-            else {
-                // Nothing served at all — a single block's receipts always fit
+                // The peer answered and the answer was unusable. Either it
+                // served nothing at all — a single block's receipts always fit
                 // a response budget, so this peer genuinely can't (or won't)
                 // serve the range (pruned history, not a byte budget); let the
                 // caller rotate to the next peer. DELIBERATE on later chunks
@@ -4513,39 +4499,28 @@ impl ElReader {
                 // an empty serve is a data-availability signal, and retrying
                 // the whole batch against a peer that HAS the range beats
                 // committing a shortened batch sourced from one that doesn't.
-                return Err(BackfillBatchError::peer(format!(
-                    "peer served no bodies/receipts for candidate chunk starting at block {}",
-                    chunk_numbers.first().copied().unwrap_or_default()
-                )));
+                // Or what it served failed verification. The peer's, either way.
+                Err(CandidateFetchError::Answer(cause)) => {
+                    return Err(BackfillBatchError::peer(cause));
+                }
             };
-            for ((vh, body), receipts) in
-                chunk[..usable].iter().zip(&bodies[..usable]).zip(&receipt_blocks[..usable]) {
-                verify_body_transactions(&vh.header, body)?;
-                if receipts.len() != body.transactions.len() {
-                    return Err(BackfillBatchError::peer(format!(
-                        "block {}: {} receipts for {} transactions",
-                        vh.header.number,
-                        receipts.len(),
-                        body.transactions.len()
-                    )));
-                }
-                let receipts = receipts
-                    .canonical(body.transactions.len())
-                    .map_err(|e| format!("block {}: {}", vh.header.number, e.0))?;
-                verify_block_receipts(&vh.header, &receipts)?;
-                let built = build_block_receipts(&vh.header, vh.hash, body, &receipts)?;
-                let stored = stored_logs_for_block(&built)
-                    .ok_or("malformed log field in verified receipts")?;
-                // Pre-filter: buffer only logs the captured watch-list will
-                // store (the fingerprint recheck below discards the batch if
-                // the config changed, so filtering against the snapshot is
-                // safe) — transient memory stays proportional to stored logs.
-                let watched: Vec<crate::el::logindex::StoredLog> =
-                    stored.into_iter().filter(|l| config.watches(l)).collect();
-                if !watched.is_empty() {
-                    logs_by_block.insert(vh.header.number, watched);
-                }
-            }
+            self.log_index_body_policy.note(&fetched);
+            // Served items are an in-order prefix of the request (the per-block
+            // root verification in the fetch catches any peer that violates
+            // that). `usable` is that prefix: receipts verified, and a verified
+            // body for every block in it that holds a watched log.
+            let chunk_numbers: Vec<u64> = chunk.iter().map(|h| h.header.number).collect();
+            let Some((usable, chunk_stop)) =
+                truncation_plan(&chunk_numbers, fetched.usable, fetched.usable)
+            else {
+                // Ours (and unreachable: a fetch that processed nothing is an
+                // `Answer` error above, never an empty success).
+                return Err(BackfillBatchError::ours("candidate chunk processed no block"));
+            };
+            // Only logs the captured watch-list will store are buffered (the
+            // fingerprint recheck below discards the batch if the config
+            // changed, so filtering against the snapshot is safe).
+            logs_by_block.extend(fetched.logs);
             if let Some(stop) = chunk_stop {
                 // The peer just told us roughly what its budget fits for THIS
                 // range; narrow toward it so the next batch's chunks come back
@@ -8224,6 +8199,330 @@ fn verify_block_receipts(
         ));
     }
     Ok(())
+}
+
+/// Verify one block's receipts against its anchored header WITHOUT the block's
+/// body (#544), and return the receipts-trie values.
+///
+/// Every other caller takes the receipt count from a `transactionsRoot`-verified
+/// body, which is what stops a peer making us recompute eth/69 blooms for more
+/// receipts than the block holds (#454). There is no body here, so the bound
+/// comes from the same trusted place the body check takes its own from: the
+/// header's `gasUsed` cannot pay for more than `gasUsed / MIN_GAS_PER_TX`
+/// transactions, so it cannot have more receipts either. That is only a
+/// ceiling; the `receiptsRoot` check is what pins the count — a receipts trie is
+/// keyed by index, so a list of any other length cannot rebuild the root.
+fn verify_receipts_alone<'r>(
+    header: &BlockHeader,
+    receipts: &'r crate::el::eth::messages::BlockReceipts,
+) -> Result<std::borrow::Cow<'r, crate::el::eth::messages::RawList>, String> {
+    let payable = usize::try_from(header.gas_used / MIN_GAS_PER_TX).unwrap_or(usize::MAX);
+    let canonical = receipts
+        .canonical_at_most(payable)
+        .map_err(|e| format!("block {}: {}", header.number, e.0))?;
+    verify_block_receipts(header, &canonical)?;
+    Ok(canonical)
+}
+
+/// What [`stored_logs_for_block`] reports for a wrong-length address or topic.
+/// Shared with the receipts-only scan so the two fail the same way.
+const MALFORMED_LOG_FIELD: &str = "malformed log field in verified receipts";
+
+/// Whether a block's VERIFIED receipts hold a log the watch-list would store
+/// (#544) — the question that decides whether the block's body is worth
+/// fetching at all. The header bloom only says "maybe": for an address-only
+/// watch entry on mainnet about nine candidates in ten are false positives.
+///
+/// Deliberately no early exit on the first match: every log of the block is
+/// length-checked, exactly as [`stored_logs_for_block`] checks every log of a
+/// block it converts. A wrong-length address or topic stays an error rather
+/// than a log that silently fails to match and advances coverage past itself.
+fn receipts_hold_watched_log(
+    block_number: u64,
+    receipts: &crate::el::eth::messages::RawList,
+    config: &crate::el::logindex::LogIndexConfig,
+) -> Result<bool, String> {
+    let mut hit = false;
+    for receipt in receipts {
+        let decoded = crate::el::receipt::decode(receipt)?;
+        for log in &decoded.logs {
+            let address: &[u8; 20] =
+                log.address.as_slice().try_into().map_err(|_| MALFORMED_LOG_FIELD)?;
+            let mut topic0: Option<&[u8; 32]> = None;
+            for (k, topic) in log.topics.iter().enumerate() {
+                let topic: &[u8; 32] =
+                    topic.as_slice().try_into().map_err(|_| MALFORMED_LOG_FIELD)?;
+                if k == 0 {
+                    topic0 = Some(topic);
+                }
+            }
+            hit |= config.watches_parts(block_number, address, topic0);
+        }
+    }
+    Ok(hit)
+}
+
+/// The receipts half of one candidate chunk: for each block the peer served
+/// receipts for, in request order, the verified receipts-trie values when the
+/// block holds a watched log and `None` when it does not (the receipts are
+/// dropped — nothing of that block will be stored).
+struct CandidateScan<'r> {
+    hits: Vec<Option<std::borrow::Cow<'r, crate::el::eth::messages::RawList>>>,
+}
+
+impl CandidateScan<'_> {
+    /// Blocks whose receipts were verified.
+    fn scanned(&self) -> usize {
+        self.hits.len()
+    }
+
+    /// Their positions in the chunk that hold a watched log, ascending.
+    fn hit_positions(&self) -> Vec<usize> {
+        self.hits.iter().enumerate().filter_map(|(i, h)| h.as_ref().map(|_| i)).collect()
+    }
+}
+
+/// Verify the served prefix of a candidate chunk's receipts and find the
+/// blocks that hold a watched log. `headers` are the chunk's TRUSTED headers in
+/// request order; a peer serves an in-order prefix (its byte budget cuts the
+/// tail), and a peer that serves anything else fails the root check here.
+/// Nothing served at all is an error: one block's receipts always fit a
+/// response budget, so that is a peer that cannot serve the range.
+fn scan_candidate_receipts<'r>(
+    headers: &[&crate::el::eth::messages::VerifiedHeader],
+    receipt_blocks: &'r [crate::el::eth::messages::BlockReceipts],
+    config: &crate::el::logindex::LogIndexConfig,
+) -> Result<CandidateScan<'r>, String> {
+    let served = receipt_blocks.len().min(headers.len());
+    if served == 0 {
+        return Err(format!(
+            "peer served no receipts for candidate chunk starting at block {}",
+            headers.first().map(|h| h.header.number).unwrap_or_default()
+        ));
+    }
+    let mut hits = Vec::with_capacity(served);
+    for (vh, receipts) in headers.iter().zip(receipt_blocks) {
+        let canonical = verify_receipts_alone(&vh.header, receipts)?;
+        let hit = receipts_hold_watched_log(vh.header.number, &canonical, config)?;
+        hits.push(hit.then_some(canonical));
+    }
+    Ok(CandidateScan { hits })
+}
+
+/// One candidate chunk, fetched and verified.
+#[derive(Debug, Default)]
+struct CandidateChunk {
+    /// The watch-list's logs by block number. Only blocks that have any: a
+    /// processed candidate without an entry is a bloom false positive.
+    logs: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>,
+    /// Leading blocks of the chunk that are fully processed — receipts
+    /// verified, and where they hold a watched log, the body verified and the
+    /// logs built. Always at least one. Short of the chunk's length means the
+    /// peer's byte budget cut a response; the caller resumes at this block.
+    usable: usize,
+    /// Blocks whose receipts were verified (`>= usable`), and how many of them
+    /// hold a watched log: what [`BodyPolicy`] learns the hit rate from.
+    scanned: usize,
+    hits: usize,
+}
+
+/// The body half of one candidate chunk — pure, so it is tested without a peer.
+///
+/// `body_of(i)` is the body the peer served for the chunk's `i`-th block, if
+/// any. A block WITHOUT a watched log needs none: its receipts were verified,
+/// nothing of it is stored, it is done. So the usable prefix ends at the first
+/// block that holds a watched log and has no body — and a chunk whose very
+/// first block is that one made no progress, which is an error (the caller
+/// rotates peers) rather than an empty success it would retry forever.
+///
+/// For a block that does hold one, the checks are the ones the log index has
+/// always made: the body against `transactionsRoot`, the receipt count against
+/// the transaction count, then the logs built with their transaction hashes.
+fn finish_candidate_chunk<'b>(
+    headers: &[&crate::el::eth::messages::VerifiedHeader],
+    scan: &CandidateScan<'_>,
+    body_of: impl Fn(usize) -> Option<&'b crate::el::eth::messages::BlockBody>,
+    config: &crate::el::logindex::LogIndexConfig,
+) -> Result<CandidateChunk, String> {
+    let scanned = scan.scanned().min(headers.len());
+    let usable = (0..scanned)
+        .find(|&i| scan.hits[i].is_some() && body_of(i).is_none())
+        .unwrap_or(scanned);
+    if usable == 0 {
+        return Err(format!(
+            "peer served no body for block {}",
+            headers.first().map(|h| h.header.number).unwrap_or_default()
+        ));
+    }
+    let mut logs = std::collections::HashMap::new();
+    for (i, vh) in headers.iter().enumerate().take(usable) {
+        let (Some(receipts), Some(body)) = (scan.hits[i].as_ref(), body_of(i)) else {
+            continue; // no watched log in this block: nothing to build
+        };
+        verify_body_transactions(&vh.header, body)?;
+        if receipts.len() != body.transactions.len() {
+            return Err(format!(
+                "block {}: {} receipts for {} transactions",
+                vh.header.number,
+                receipts.len(),
+                body.transactions.len()
+            ));
+        }
+        let built = build_block_receipts(&vh.header, vh.hash, body, receipts)?;
+        let stored = stored_logs_for_block(&built).ok_or(MALFORMED_LOG_FIELD)?;
+        // Buffer only what the captured watch-list will store, so transient
+        // memory stays proportional to stored logs.
+        let watched: Vec<crate::el::logindex::StoredLog> =
+            stored.into_iter().filter(|l| config.watches(l)).collect();
+        if !watched.is_empty() {
+            logs.insert(vh.header.number, watched);
+        }
+    }
+    Ok(CandidateChunk {
+        logs,
+        usable,
+        scanned,
+        hits: scan.hits[..scanned].iter().filter(|h| h.is_some()).count(),
+    })
+}
+
+/// Why a candidate chunk produced nothing. The split is whose fault it can be.
+#[derive(Debug)]
+enum CandidateFetchError {
+    /// A request itself failed: transport error, disconnect, timeout. Possibly
+    /// our own doing — a pipelined request waits behind the ones queued ahead
+    /// of it — so the backfill only blames the peer for it at depth 1.
+    Request(String),
+    /// The peer answered, and the answer was unusable: nothing served, or data
+    /// that failed verification. Always the peer's.
+    Answer(String),
+}
+
+impl CandidateFetchError {
+    fn message(&self) -> &str {
+        match self {
+            CandidateFetchError::Request(m) | CandidateFetchError::Answer(m) => m,
+        }
+    }
+}
+
+/// Fetch one chunk of bloom-candidate blocks and return the watch-list's logs
+/// in it. `headers` are TRUSTED (chained to a beacon anchor by the caller) and
+/// in request order. The one implementation behind the backfill, the head
+/// bridge and the tail.
+///
+/// RECEIPTS FIRST (#544). The header bloom is a coarse pre-filter, so most
+/// candidates hold no watched log at all, and for those the body — about half
+/// the bytes of a candidate — is pure waste: the receipts verify against
+/// `receiptsRoot` on their own, and the body is needed only for the transaction
+/// hash of a log that is actually stored. So: receipts for the chunk, then
+/// bodies for the blocks that hold a watched log, and nothing more.
+///
+/// `eager_bodies` is the other shape, for a watch-list where candidates mostly
+/// ARE hits: bodies requested together with the receipts, as before #544.
+/// There the second round trip would cost latency on every chunk and save
+/// nothing. [`BodyPolicy`] picks between the two from the measured hit rate.
+/// Either way a body is only VERIFIED and used for a block that holds a
+/// watched log.
+///
+/// A failed body request fails the chunk even though its receipts verified.
+/// Keeping the body-less prefix would be correct, but it would report a
+/// transport failure to the chunk sizer as a byte-budget truncation.
+async fn fetch_candidate_logs(
+    peer: &ManagedPeer,
+    headers: &[&crate::el::eth::messages::VerifiedHeader],
+    config: &crate::el::logindex::LogIndexConfig,
+    eager_bodies: bool,
+) -> Result<CandidateChunk, CandidateFetchError> {
+    use CandidateFetchError::{Answer, Request};
+    if headers.is_empty() {
+        return Ok(CandidateChunk::default());
+    }
+    let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
+    if eager_bodies {
+        let (bodies, receipt_blocks) =
+            futures::future::join(peer.get_block_bodies(&hashes), peer.get_receipts(&hashes)).await;
+        let (bodies, receipt_blocks) = (bodies.map_err(Request)?, receipt_blocks.map_err(Request)?);
+        let scan = scan_candidate_receipts(headers, &receipt_blocks, config).map_err(Answer)?;
+        // Bodies arrive in request order, so the i-th body is the i-th block's.
+        return finish_candidate_chunk(headers, &scan, |i| bodies.get(i), config).map_err(Answer);
+    }
+    let receipt_blocks = peer.get_receipts(&hashes).await.map_err(Request)?;
+    let scan = scan_candidate_receipts(headers, &receipt_blocks, config).map_err(Answer)?;
+    let hit_positions = scan.hit_positions();
+    let bodies = if hit_positions.is_empty() {
+        Vec::new()
+    } else {
+        let hit_hashes: Vec<[u8; 32]> = hit_positions.iter().map(|&i| hashes[i]).collect();
+        peer.get_block_bodies(&hit_hashes).await.map_err(Request)?
+    };
+    finish_candidate_chunk(headers, &scan, |i| hit_body(&hit_positions, &bodies, i), config)
+        .map_err(Answer)
+}
+
+/// The body served for the chunk's `i`-th block when bodies were requested
+/// for the hits ONLY: the request named the hits in order, so the k-th body
+/// served belongs to the k-th hit. `None` for a block that is not a hit (none
+/// was asked for) and for a hit past the end of what the peer served.
+fn hit_body<'b>(
+    hit_positions: &[usize],
+    bodies: &'b [crate::el::eth::messages::BlockBody],
+    i: usize,
+) -> Option<&'b crate::el::eth::messages::BlockBody> {
+    hit_positions.binary_search(&i).ok().and_then(|k| bodies.get(k))
+}
+
+/// Candidates remembered by [`BodyPolicy`] before the counts are halved: long
+/// enough to ride out one odd chunk, short enough to follow the walk into a
+/// range (or a watch-list) with a different hit rate within a few chunks.
+const BODY_POLICY_WINDOW: u32 = 256;
+/// Candidates [`BodyPolicy`] must have seen before it will choose eager bodies.
+/// Receipts-first is the safe default: guessing it wrong costs a round trip,
+/// guessing eager wrong costs a body per false positive.
+const BODY_POLICY_MIN_SAMPLES: u32 = 16;
+
+/// Whether the hit rate says bodies should ride along with the receipts — pure.
+/// Eager once at least three candidates in four held a watched log. The bar is
+/// high on purpose: at that rate eager wastes at most one body in four, about
+/// what the round trip it saves is worth on a small chunk, and below it the
+/// wasted bodies outweigh the round trip.
+fn bodies_should_be_eager(candidates: u32, hits: u32) -> bool {
+    candidates >= BODY_POLICY_MIN_SAMPLES && u64::from(hits) * 4 >= u64::from(candidates) * 3
+}
+
+/// Fold one chunk's scan into the decaying `(candidates, hits)` counts — pure.
+fn fold_body_policy(seen: (u32, u32), scanned: usize, hits: usize) -> (u32, u32) {
+    let add = |a: u32, b: usize| a.saturating_add(u32::try_from(b).unwrap_or(u32::MAX));
+    let (mut candidates, mut hit) = (add(seen.0, scanned), add(seen.1, hits.min(scanned)));
+    while candidates > BODY_POLICY_WINDOW {
+        candidates /= 2;
+        hit /= 2;
+    }
+    (candidates, hit)
+}
+
+/// Picks receipts-first or eager bodies for the next candidate chunk from the
+/// hit rate of recent ones (see [`fetch_candidate_logs`]). One instance for
+/// every log-index path: the rate is a property of the watch-list and the
+/// chain, and each path measures it the same way whichever shape it fetched
+/// in, so a wrong choice corrects itself. It only shapes requests — what is
+/// verified and stored does not depend on it.
+#[derive(Debug, Default)]
+struct BodyPolicy {
+    /// `(candidates scanned, of which held a watched log)`, decaying.
+    seen: std::sync::Mutex<(u32, u32)>,
+}
+
+impl BodyPolicy {
+    fn eager(&self) -> bool {
+        self.seen.lock().map(|s| bodies_should_be_eager(s.0, s.1)).unwrap_or(false)
+    }
+
+    fn note(&self, chunk: &CandidateChunk) {
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = fold_body_policy(*seen, chunk.scanned, chunk.hits);
+        }
+    }
 }
 
 /// Log what one EVM call cost (#532): its EVM runs, the state reads it waited
@@ -12122,6 +12421,335 @@ mod backfill_batch_error_tests {
             BackfillBatchError::ours("walk reset").to_string(),
             "walk reset"
         );
+    }
+}
+
+#[cfg(test)]
+mod candidate_chunk_tests {
+    use super::{
+        bodies_should_be_eager, finish_candidate_chunk, fold_body_policy, hit_body,
+        receipts_hold_watched_log, scan_candidate_receipts, verify_receipts_alone, BodyPolicy,
+        CandidateChunk, BODY_POLICY_MIN_SAMPLES, BODY_POLICY_WINDOW, MIN_GAS_PER_TX,
+    };
+    use crate::el::eth::messages::{BlockBody, BlockReceipts, RawList, VerifiedHeader};
+    use crate::el::logindex::{LogIndexConfig, WatchEntry};
+    use myotis_core::header::BlockHeader;
+    use myotis_core::keccak::keccak256;
+    use myotis_core::rlp::{encode, u64_to_minimal_be, Item};
+    use myotis_core::triehash;
+
+    const WATCHED: [u8; 20] = [0xaa; 20];
+    const OTHER: [u8; 20] = [0xbb; 20];
+    const TOPIC: [u8; 32] = [0x11; 32];
+
+    fn config() -> LogIndexConfig {
+        LogIndexConfig {
+            enabled: true,
+            watch: vec![WatchEntry {
+                address: WATCHED,
+                from_block: 100,
+                topic0s: Vec::new(),
+                name: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn log_item(address: &[u8], topics: &[&[u8]]) -> Item {
+        Item::List(vec![
+            Item::Bytes(address.to_vec()),
+            Item::List(topics.iter().map(|t| Item::Bytes(t.to_vec())).collect()),
+            Item::Bytes(vec![0xde, 0xad]),
+        ])
+    }
+
+    /// A canonical (eth/66-68) legacy receipt with one log per address given.
+    fn receipt(cum_gas: u64, log_addresses: &[[u8; 20]]) -> Vec<u8> {
+        encode(&Item::List(vec![
+            Item::Bytes(vec![1]),
+            Item::Bytes(u64_to_minimal_be(cum_gas)),
+            Item::Bytes(vec![0u8; 256]),
+            Item::List(log_addresses.iter().map(|a| log_item(a, &[&TOPIC])).collect()),
+        ]))
+    }
+
+    fn raw_list(items: &[Vec<u8>]) -> RawList {
+        let mut list = RawList::new();
+        for item in items {
+            list.push(item);
+        }
+        list
+    }
+
+    /// One synthetic block: a header whose roots commit to the given receipts
+    /// and to one distinct transaction per receipt, plus what a peer serves.
+    struct Block {
+        vh: VerifiedHeader,
+        receipts: BlockReceipts,
+        body: BlockBody,
+    }
+
+    fn block(number: u64, receipts: &[Vec<u8>]) -> Block {
+        let txs: Vec<Vec<u8>> =
+            (0..receipts.len()).map(|i| vec![0x02, number as u8, i as u8]).collect();
+        let (receipts, transactions) = (raw_list(receipts), raw_list(&txs));
+        let header = BlockHeader {
+            number,
+            gas_used: receipts.len() as u64 * 21_000,
+            receipts_root: triehash::ordered_trie_root(receipts.iter()),
+            transactions_root: triehash::ordered_trie_root(transactions.iter()),
+            ..Default::default()
+        };
+        Block {
+            vh: VerifiedHeader { hash: [number as u8; 32], raw_rlp: Vec::new(), header },
+            receipts: BlockReceipts::Canonical(receipts),
+            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 },
+        }
+    }
+
+    /// A block with a watched log in its second transaction.
+    fn hit(number: u64) -> Block {
+        block(number, &[receipt(21_000, &[OTHER]), receipt(42_000, &[OTHER, WATCHED])])
+    }
+
+    /// A bloom false positive: logs, none of them watched.
+    fn miss(number: u64) -> Block {
+        block(number, &[receipt(21_000, &[OTHER]), receipt(42_000, &[])])
+    }
+
+    fn headers(blocks: &[Block]) -> Vec<&VerifiedHeader> {
+        blocks.iter().map(|b| &b.vh).collect()
+    }
+
+    fn served(blocks: &[Block], count: usize) -> Vec<BlockReceipts> {
+        blocks.iter().take(count).map(|b| b.receipts.clone()).collect()
+    }
+
+    /// The chunk as [`super::fetch_candidate_logs`] would produce it from a peer
+    /// that served `receipts_served` receipt sets and the bodies `body_of` yields.
+    fn chunk<'b>(
+        blocks: &[Block],
+        receipts_served: usize,
+        body_of: impl Fn(usize) -> Option<&'b BlockBody>,
+    ) -> Result<CandidateChunk, String> {
+        let receipt_blocks = served(blocks, receipts_served);
+        let hs = headers(blocks);
+        let scan = scan_candidate_receipts(&hs, &receipt_blocks, &config())?;
+        finish_candidate_chunk(&hs, &scan, body_of, &config())
+    }
+
+    #[test]
+    fn receipts_verify_against_the_header_without_a_body() {
+        let b = hit(200);
+        let canonical = verify_receipts_alone(&b.vh.header, &b.receipts).unwrap();
+        assert_eq!(canonical.len(), 2);
+        // Another block's receipts under this header fail the root check.
+        let err = verify_receipts_alone(&b.vh.header, &miss(200).receipts).unwrap_err();
+        assert!(err.contains("receiptsRoot"), "{err}");
+    }
+
+    #[test]
+    fn more_receipts_than_the_gas_pays_for_are_refused_before_the_root() {
+        let mut b = hit(200);
+        // Two receipts, gas for one transaction: refused on the count. The
+        // root would have matched — the bound is what speaks here.
+        b.vh.header.gas_used = MIN_GAS_PER_TX;
+        let err = verify_receipts_alone(&b.vh.header, &b.receipts).unwrap_err();
+        assert!(err.contains("more than the 1 the block can hold"), "{err}");
+        // Exactly as many as the gas pays for: on to the root check.
+        b.vh.header.gas_used = 2 * MIN_GAS_PER_TX;
+        assert!(verify_receipts_alone(&b.vh.header, &b.receipts).is_ok());
+    }
+
+    #[test]
+    fn eth69_receipts_are_bounded_then_verified_in_canonical_form() {
+        // eth/69 wire form: [txType, status, cumGas, logs] — no bloom.
+        let wire = |cum_gas: u64, addresses: &[[u8; 20]]| {
+            encode(&Item::List(vec![
+                Item::Bytes(vec![]),
+                Item::Bytes(vec![1]),
+                Item::Bytes(u64_to_minimal_be(cum_gas)),
+                Item::List(addresses.iter().map(|a| log_item(a, &[&TOPIC])).collect()),
+            ]))
+        };
+        let receipts =
+            BlockReceipts::Eth69(raw_list(&[wire(21_000, &[OTHER]), wire(42_000, &[WATCHED])]));
+        let root = triehash::ordered_trie_root(receipts.canonical(2).unwrap().iter());
+        let mut header =
+            BlockHeader { number: 200, gas_used: 42_000, receipts_root: root, ..Default::default() };
+        let canonical = verify_receipts_alone(&header, &receipts).unwrap();
+        assert!(receipts_hold_watched_log(200, &canonical, &config()).unwrap());
+        header.gas_used = MIN_GAS_PER_TX;
+        assert!(verify_receipts_alone(&header, &receipts).unwrap_err().contains("more than"));
+    }
+
+    #[test]
+    fn the_scan_finds_a_watched_log_and_only_that() {
+        let cfg = config();
+        let holds = |b: &Block, n: u64, cfg: &LogIndexConfig| {
+            let canonical = verify_receipts_alone(&b.vh.header, &b.receipts).unwrap();
+            receipts_hold_watched_log(n, &canonical, cfg).unwrap()
+        };
+        assert!(holds(&hit(200), 200, &cfg));
+        assert!(!holds(&miss(200), 200, &cfg));
+        // Below the entry's from_block the same log is not watched.
+        assert!(!holds(&hit(99), 99, &cfg));
+        // A topic0 restriction applies to the scan as it does to the store.
+        let mut restricted = config();
+        restricted.watch[0].topic0s = vec![[0x22; 32]];
+        assert!(!holds(&hit(200), 200, &restricted));
+        restricted.watch[0].topic0s = vec![TOPIC];
+        assert!(holds(&hit(200), 200, &restricted));
+    }
+
+    #[test]
+    fn a_wrong_length_log_field_is_an_error_not_a_miss() {
+        let bad = |address: &[u8], topic: &[u8]| {
+            raw_list(&[encode(&Item::List(vec![
+                Item::Bytes(vec![1]),
+                Item::Bytes(u64_to_minimal_be(21_000)),
+                Item::Bytes(vec![0u8; 256]),
+                Item::List(vec![log_item(address, &[topic])]),
+            ]))])
+        };
+        for receipts in [bad(&[0xaa; 19], &TOPIC), bad(&OTHER, &[0x11; 31])] {
+            let err = receipts_hold_watched_log(200, &receipts, &config()).unwrap_err();
+            assert!(err.contains("malformed log field"), "{err}");
+        }
+    }
+
+    #[test]
+    fn false_positives_are_complete_without_any_body() {
+        let blocks = [miss(300), miss(299), miss(298)];
+        let c = chunk(&blocks, 3, |_| None).unwrap();
+        assert_eq!((c.usable, c.scanned, c.hits), (3, 3, 0));
+        assert!(c.logs.is_empty());
+    }
+
+    #[test]
+    fn a_hit_is_built_from_its_verified_body() {
+        let blocks = [miss(300), hit(299)];
+        let c = chunk(&blocks, 2, |i| Some(&blocks[i].body)).unwrap();
+        assert_eq!((c.usable, c.scanned, c.hits), (2, 2, 1));
+        // Only the watched log is kept, with the position and hash of its tx.
+        let logs = &c.logs[&299];
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].address, WATCHED);
+        assert_eq!(logs[0].tx_index, 1);
+        assert_eq!(logs[0].log_index, 2); // third log of the block
+        assert_eq!(logs[0].tx_hash, keccak256(&[0x02, 299u64 as u8, 1]));
+        assert_eq!(logs[0].block_hash, blocks[1].vh.hash);
+        assert!(!c.logs.contains_key(&300));
+    }
+
+    #[test]
+    fn the_usable_prefix_ends_at_the_first_hit_without_a_body() {
+        let blocks = [miss(300), hit(299), miss(298), hit(297)];
+        // Bodies for the hits only, and the peer served just the first one.
+        let hits = [1usize, 3];
+        let bodies = [blocks[1].body.clone()];
+        let c = chunk(&blocks, 4, |i| hit_body(&hits, &bodies, i)).unwrap();
+        assert_eq!((c.usable, c.scanned, c.hits), (3, 4, 2));
+        assert!(c.logs.contains_key(&299) && !c.logs.contains_key(&297));
+        // No body at all: only the leading false positive is done.
+        let c = chunk(&blocks, 4, |_| None).unwrap();
+        assert_eq!(c.usable, 1);
+        assert!(c.logs.is_empty());
+    }
+
+    #[test]
+    fn a_first_block_hit_without_a_body_is_an_error() {
+        let blocks = [hit(300), miss(299)];
+        let err = chunk(&blocks, 2, |_| None).unwrap_err();
+        assert!(err.contains("no body for block 300"), "{err}");
+    }
+
+    #[test]
+    fn truncated_receipts_bound_the_chunk() {
+        let blocks = [miss(300), miss(299), hit(298)];
+        let c = chunk(&blocks, 2, |_| None).unwrap();
+        assert_eq!((c.usable, c.scanned, c.hits), (2, 2, 0));
+        let err = chunk(&blocks, 0, |_| None).unwrap_err();
+        assert!(err.contains("no receipts for candidate chunk starting at block 300"), "{err}");
+    }
+
+    #[test]
+    fn a_body_that_is_not_the_blocks_fails_the_chunk() {
+        let blocks = [hit(300), hit(299)];
+        // The peer served block 299's body for block 300.
+        let err = chunk(&blocks, 2, |_| Some(&blocks[1].body)).unwrap_err();
+        assert!(err.contains("transactionsRoot"), "{err}");
+    }
+
+    #[test]
+    fn a_false_positives_body_is_never_checked() {
+        // Eager shape: a body rides along for every block. The one for a block
+        // without a watched log is not used, so a wrong one there cannot fail
+        // the chunk — and a right one is not required.
+        let blocks = [miss(300), hit(299)];
+        let c = chunk(&blocks, 2, |_| Some(&blocks[1].body)).unwrap();
+        assert_eq!(c.usable, 2);
+        assert_eq!(c.logs[&299].len(), 1);
+    }
+
+    #[test]
+    fn eager_and_receipts_first_build_the_same_logs() {
+        let blocks = [hit(300), miss(299), hit(298), miss(297)];
+        let eager = chunk(&blocks, 4, |i| Some(&blocks[i].body)).unwrap();
+        let hits = [0usize, 2];
+        let bodies = [blocks[0].body.clone(), blocks[2].body.clone()];
+        let lazy = chunk(&blocks, 4, |i| hit_body(&hits, &bodies, i)).unwrap();
+        assert_eq!(eager.logs, lazy.logs);
+        assert_eq!((eager.usable, eager.hits), (lazy.usable, lazy.hits));
+    }
+
+    #[test]
+    fn hit_bodies_map_by_position_among_the_hits() {
+        let bodies = [hit(1).body, hit(2).body];
+        let hits = [2usize, 5, 9];
+        assert!(hit_body(&hits, &bodies, 2).is_some_and(|b| *b == bodies[0]));
+        assert!(hit_body(&hits, &bodies, 5).is_some_and(|b| *b == bodies[1]));
+        assert!(hit_body(&hits, &bodies, 9).is_none()); // a hit the peer did not serve
+        assert!(hit_body(&hits, &bodies, 3).is_none()); // not a hit: none was asked for
+    }
+
+    #[test]
+    fn bodies_go_eager_only_on_a_measured_high_hit_rate() {
+        // Unmeasured, and measured-but-thin, stay receipts-first.
+        assert!(!bodies_should_be_eager(0, 0));
+        assert!(!bodies_should_be_eager(BODY_POLICY_MIN_SAMPLES - 1, BODY_POLICY_MIN_SAMPLES - 1));
+        // Three in four is the bar.
+        assert!(bodies_should_be_eager(16, 12));
+        assert!(!bodies_should_be_eager(16, 11));
+        // The mainnet RAILGUN shape: about one candidate in ten is a hit.
+        assert!(!bodies_should_be_eager(256, 26));
+    }
+
+    #[test]
+    fn the_hit_rate_decays_so_the_policy_follows_the_walk() {
+        let mut seen = (0, 0);
+        for _ in 0..20 {
+            seen = fold_body_policy(seen, 64, 64);
+        }
+        assert!(seen.0 <= BODY_POLICY_WINDOW);
+        assert!(bodies_should_be_eager(seen.0, seen.1));
+        // The walk enters a range of false positives: a few chunks flip it.
+        let mut chunks = 0;
+        while bodies_should_be_eager(seen.0, seen.1) {
+            seen = fold_body_policy(seen, 64, 0);
+            chunks += 1;
+        }
+        assert!(chunks <= 2, "took {chunks} chunks");
+        // Hits can never outnumber the candidates they were counted among.
+        assert_eq!(fold_body_policy((0, 0), 4, 9), (4, 4));
+    }
+
+    #[test]
+    fn the_policy_starts_receipts_first_and_learns_from_chunks() {
+        let policy = BodyPolicy::default();
+        assert!(!policy.eager());
+        policy.note(&CandidateChunk { usable: 16, scanned: 16, hits: 16, ..Default::default() });
+        assert!(policy.eager());
     }
 }
 
