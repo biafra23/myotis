@@ -116,7 +116,10 @@ public final class EnsResolver {
      * module pulls in Netty + discv5 transitively.
      *
      * @param chainId EVM chain id: 1 = mainnet, 11155111 = sepolia,
-     *                17000 = holesky
+     *                17000 = holesky — dead code: the EF retired the network in
+     *                Oct 2025, {@code NetworkConfig.byName} rejects it and
+     *                {@code NetworkConfig.hasEns} never admits it, so no production
+     *                caller reaches that branch
      */
     public static EnsResolver forChainId(EvmExecutor executor, long chainId) {
         // Java's switch statement only accepts int-promotable types, so a

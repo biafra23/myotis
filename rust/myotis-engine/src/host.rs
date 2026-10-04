@@ -187,9 +187,8 @@ fn engine() -> Option<&'static EngineState> {
         .as_ref()
 }
 
-/// Resolve a config for a canonical/alias network name. Hosted: mainnet +
-/// sepolia (gnosis is the remaining catalog network — its own beacon-chain
-/// parameters land with the gnosis slice).
+/// Resolve a config for a canonical/alias network name: every catalog network
+/// (mainnet, sepolia, gnosis) is hosted, so `None` means the name is unknown.
 fn config_for(network_name: &str) -> Option<ChainConfig> {
     match crate::catalog::canonical_network_name(network_name) {
         Some("mainnet") => Some(ChainConfig::mainnet()),

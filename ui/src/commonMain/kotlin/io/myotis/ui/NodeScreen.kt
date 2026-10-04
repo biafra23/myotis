@@ -654,10 +654,9 @@ private fun SettingsTab(
                     "only. On: force the original Java engine everywhere, giving up those " +
                     "features — currently the only way to use the Query tab's " +
                     "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                    "network is (re)started, not to already-running networks. Note: " +
-                    "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
-                    "regardless of the idle-sleep setting (the Status screen's Sleep row " +
-                    "says so per network).",
+                    "network is (re)started, not to already-running networks. On hosts with " +
+                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
+                    "Sleep row shows it per network.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -822,11 +821,15 @@ private fun StatusTab(
         // is worth that risk mid-run. The reasons they are unsafe differ, though, and the
         // difference is worth keeping written down.
         //
-        // `clearCaches` actually WORKS while running: it goes THROUGH the engine (clearPeerState
-        // plus the live cache instances), so a live stack cannot write the old peers back. Gating
-        // it therefore costs something real — handing discovery a fresh slate without a restart is
-        // a genuine debugging move — and that cost is accepted deliberately to make the accidental
-        // click impossible.
+        // `clearCaches` actually WORKS while running — on the Java engine: it goes THROUGH the
+        // engine (clearPeerState plus the live cache instances), so a live stack cannot write the
+        // old peers back. Gating it therefore costs something real — handing discovery a fresh
+        // slate without a restart is a genuine debugging move — and that cost is accepted
+        // deliberately to make the accidental click impossible. On the Rust engine the gate is
+        // load-bearing as well: clearPeerState is a no-op there (the engine exports no clear over
+        // the FFI), the host only deletes the cache files, and a running native pool rewrites
+        // them from memory on its next flush — stopped is the one window where the delete sticks
+        // (RustChainHandle.clearPeerState).
         //
         // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
         // STICKS while the chain runs depends on the engine and on what it is doing — which is

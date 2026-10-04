@@ -7,18 +7,19 @@
 //! implementing I/O crate.
 //!
 //! This is the Rust twin of the Java `io.myotis.evm` module (see
-//! `docs/reimplementation/03` and the Milestone-C section of `…/07`). It is built
-//! up over several PRs:
+//! `docs/reimplementation/03` and the Milestone-C section of `…/07`). What it holds:
 //!
 //! * the foundation ([`SnapStateOracle`] + [`FixtureSnapStateOracle`], the
 //!   [`StateProofCache`]/[`BytecodeCache`] tiers, and [`OracleDatabase`] — the
 //!   `revm` `DatabaseRef` adapter);
-//! * **EL-C-2 (this slice)**: the [`EvmExecutor`] — `eth_call` view calls over
-//!   verified state — and the mainnet [`fork`] table mapping
-//!   `(block_number, timestamp)` to a revm `SpecId`.
-//!
-//! The async prefetch loop, `estimateGas`, and ENS/CCIP-Read arrive in the
-//! following slices.
+//! * the [`EvmExecutor`] — `eth_call` view calls over verified state (with the
+//!   speculative prefetch loop that discovers a call's reads in waves), state
+//!   overrides ([`overrides`]), and `eth_estimateGas` over the whole transaction
+//!   object ([`tx`]: geth's search for the lowest working gas limit, EIP-7702
+//!   authorization lists, access lists, fees, nonce, creation);
+//! * the per-chain [`fork`] table (mainnet, Sepolia, Gnosis) mapping
+//!   `(block_number, timestamp)` to a revm `SpecId`;
+//! * ENS resolution and the CCIP-Read re-entry ([`ens`]).
 //!
 //! ## Running a view call
 //!

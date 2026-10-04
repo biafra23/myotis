@@ -27,12 +27,12 @@ public interface EvmExecutor {
      * <p>State writes performed during execution are journalled in memory and
      * discarded once the call completes; this method never mutates the chain.
      *
-     * <p>ERC-3668 CCIP-Read handling is a Phase 4 deliverable. Until that
-     * lands, a target that reverts with {@code OffchainLookup} surfaces as
-     * {@link EvmExecutionError.Reverted} and the caller cannot resolve it
-     * without an explicit gateway round trip. The Phase 4 commit will catch
-     * the revert in this implementation and re-enter the EVM with the
-     * gateway response transparently.
+     * <p>ERC-3668 CCIP-Read is handled by the {@code CcipReadEvmExecutor}
+     * decorator, which catches a target's {@code OffchainLookup} revert, performs
+     * the gateway round trip and re-enters the EVM with the gateway response
+     * transparently. On a bare executor (no decorator) such a revert surfaces as
+     * {@link EvmExecutionError.Reverted} and the caller cannot resolve it without
+     * an explicit gateway round trip.
      */
     CompletableFuture<byte[]> callView(Address target, byte[] calldata, BlockContext blockContext);
 

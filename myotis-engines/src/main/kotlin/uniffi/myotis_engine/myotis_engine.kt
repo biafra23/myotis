@@ -977,7 +977,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_myotis_engine_checksum_func_canonical_network_name() != 21726) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_create_handle() != 39066) {
+    if (lib.uniffi_myotis_engine_checksum_func_create_handle() != 44197) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_drain_logs() != 44503) {
@@ -1386,7 +1386,8 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Allocate a not-yet-started handle for `network` (R1: mainnet only).
+         * Allocate a not-yet-started handle for `network` (`mainnet`, `sepolia` or `gnosis`
+         * — the catalog's canonical names; an alias is canonicalised first).
          */ fun `createHandle`(`network`: kotlin.String, `dataDir`: kotlin.String): kotlin.Long {
             return FfiConverterLong.lift(
     uniffiRustCall() { _status ->

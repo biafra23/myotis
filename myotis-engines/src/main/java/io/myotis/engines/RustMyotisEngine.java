@@ -19,13 +19,14 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * The Rust engine behind the {@link MyotisEngine} contract, via {@link RustEngineNative}.
  *
- * <p>R1 (current stage): the network CATALOG is answered from Rust
- * ({@link #availableNetworks()}, {@link #canonicalNetworkName}) AND the engine can HOST
- * mainnet — {@link #create} returns a {@link RustChainHandle} driving the Rust
- * light-client sync loop. R1 is CL-only + mainnet-only: any other (still-canonical)
- * network is rejected with a named {@link EngineException}, on which the selector's
- * {@code auto} mode falls back to the Java engine. The EL surface (verified reads,
- * proofs) lands later.
+ * <p>The network CATALOG is answered from Rust ({@link #availableNetworks()},
+ * {@link #canonicalNetworkName}) and the engine HOSTS mainnet, Sepolia and Gnosis —
+ * {@link #create} returns a {@link RustChainHandle} driving the Rust light-client sync
+ * loop and EL reader, with the verified reads, the EVM, ENS, the log index and the
+ * rest of the engine surface behind it. A network the Rust catalog does not know is
+ * rejected with a named {@link EngineException}, on which the selector's {@code auto}
+ * mode falls back to the Java engine; the one thing this engine refuses by design is
+ * resuming a data dir bound to a caller-supplied checkpoint ({@link AnchorMismatchException}).
  */
 public final class RustMyotisEngine implements MyotisEngine {
 

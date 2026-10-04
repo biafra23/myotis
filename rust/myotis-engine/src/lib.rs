@@ -4,12 +4,14 @@
 //! docs/reimplementation/05). The old hand-JNI shims are gone; the iOS hosts keep
 //! consuming the plain C ABI in `capi`.
 //!
-//! R1 (this stage): the network CATALOG is answered from Rust (`engine_init` ABI
-//! handshake, `available_networks_json`, `canonical_network_name`) AND the
-//! engine can HOST mainnet — `create_handle`/`start_handle`/`status_json`/
-//! `stop_handle` drive a `myotis_net::SyncHandle` (the light-client sync loop) on a
-//! tokio runtime this crate owns (see `host`). R1 is CL-only + mainnet-only; Gnosis
-//! and the EL surface land later.
+//! The network CATALOG is answered from Rust (`engine_init` ABI handshake,
+//! `available_networks_json`, `canonical_network_name`) and the engine HOSTS
+//! mainnet, Sepolia and Gnosis — `create_handle`/`start_handle`/`status_json`/
+//! `stop_handle` drive a `myotis_net::SyncHandle` (the light-client sync loop) and
+//! the EL reader on a tokio runtime this crate owns (see `host`). The verified
+//! reads, the EVM (`eth_call`/`eth_estimateGas`), ENS, the fee reads, transaction
+//! broadcast, the log index, read-stats and Tor are exported beside them (`ffi`,
+//! `capi`); the per-function history is the ABI table in `rust/include/myotis_engine.h`.
 
 // Public: the plain C ABI doubles as the in-process seam for Rust hosts (the
 // napi-rs Node binding in `myotis-node` calls these by Rust path — linking the

@@ -315,7 +315,16 @@ object LogIndexWatch {
         "mainnet" -> serialize(listOf(
             Entry("0xB20c66C4DE72433F3cE747b58B86830c459CA911", 14_173_395), // tornado instance registry
             Entry("0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2", 14_173_129), // tornado relayer registry
-            Entry("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9", 14_693_013), // railgun proxy
+            // railgun proxy. 14_693_013 circulates as "the RAILGUN deployment block"
+            // and is WRONG for a from_block: the contract's first log is at 14_737_691
+            // and nothing exists below it (docs/railgun-poc.md, "The deployment block
+            // is load-bearing"). It is kept here as it shipped only because from_block
+            // is part of the index config's fingerprint and changing it would re-key a
+            // migrated user's index. The cost: the walker must also cover the 44,678
+            // empty blocks below the deployment before a query into that span is
+            // answered (until then it is refused as out of coverage). A new watch or
+            // seed must use 14_737_691.
+            Entry("0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9", 14_693_013),
             Entry("0x6818809EefCe719E480a7526D76bD3e561526b46", 22_153_713), // privacy-pools entrypoint
         ))
         "sepolia" -> serialize(listOf(
