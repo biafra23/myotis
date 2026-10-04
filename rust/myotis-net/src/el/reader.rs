@@ -8602,6 +8602,15 @@ type ChunkFetch<'a> =
 /// A failed body request fails the chunk even though its receipts verified.
 /// Keeping the body-less prefix would be correct, but it would report a
 /// transport failure to the chunk sizer as a byte-budget truncation.
+///
+/// Timing: the callers time this whole call for [`ChunkSizer::note_pace`], and
+/// in the receipts-first shape a chunk with a hit is two round trips in
+/// series. The pace rule therefore cannot tell latency from bandwidth. That is
+/// harmless at ordinary round-trip times, but where two round trips approach
+/// [`CHUNK_SLOW_AFTER`] (sustained RTT above ~2.5 s — peers behind Tor would
+/// do it) a narrower chunk is no faster and the width narrows for nothing.
+/// Timing the two legs separately, or taking a latency floor off the elapsed
+/// time, is the fix if that ever becomes a real path.
 async fn fetch_candidate_logs<P: CandidateSource>(
     peer: &P,
     headers: &[&crate::el::eth::messages::VerifiedHeader],
@@ -11902,6 +11911,11 @@ impl ChunkSizer {
         if chunk_len >= width.min(candidates) {
             self.probing.store(false, Relaxed);
             self.fold(served, chunk_len);
+            // A byte-budget cut is fresh, direct evidence about the width, and
+            // it supersedes what a slow run remembered: the undo must not jump
+            // back above it on the strength of a fast chunk, because fast says
+            // nothing about how many bytes a peer will serve.
+            self.before_slow.store(0, Relaxed);
         }
         !provoked
     }
@@ -13959,6 +13973,18 @@ mod chunk_timing_tests {
         // 21 blocks in 4.9 s: inside the target, but 64 would take ~15 s.
         sizer.note_chunk(ChunkOutcome::Served { usable: 21 }, secs(4.9), 21, 21, 21);
         assert_eq!(sizer.width(), 21);
+    }
+
+    #[test]
+    fn a_truncation_after_a_slow_run_leaves_nothing_to_undo() {
+        // Slow chunks narrow 64 -> 21, then a peer's BYTE budget cuts a full
+        // chunk at 8. A fast full-width chunk at 8 says the link is fine — it
+        // says nothing about bytes, so the width must not jump back to 64.
+        let sizer = narrowed_to_about_a_third();
+        sizer.note_chunk(ChunkOutcome::Served { usable: 8 }, secs(0.4), 21, 21, 21);
+        assert_eq!(sizer.width(), 8);
+        sizer.note_chunk(ChunkOutcome::Served { usable: 8 }, secs(0.2), 8, 8, 8);
+        assert_eq!(sizer.width(), 8);
     }
 
     #[test]

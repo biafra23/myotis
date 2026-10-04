@@ -421,8 +421,15 @@ Where it applies:
   bandwidth-bound one four stacked chunks share the same bytes per second, and
   restoring the depth there fails every other batch.
 
+A byte-budget truncation clears what a slow run remembered: it is fresh, direct
+evidence about the width, and a fast chunk afterwards says nothing about bytes.
+
 **Not covered.** A link too slow for even four blocks inside the timeout gets no
-help from the width, since chunks that small are not evidence. And the head
+help from the width, since chunks that small are not evidence. The pace rule
+times a whole chunk fetch, which in the receipts-first shape is two round trips
+in series when the chunk holds a hit, so it cannot tell latency from bandwidth:
+where two round trips approach the 5 s target (peers behind Tor would do it) the
+width narrows without anything getting faster. And the head
 side's loops still try peers one at a time with the full timeout (#461), so a
 silent peer at the front costs 15 s per tick whatever the width.
 
