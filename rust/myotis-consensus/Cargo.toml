@@ -27,7 +27,7 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 # it. `std` (default) keeps every existing consumer unchanged.
 [features]
 default = ["std"]
-std = ["sha2/std", "tracing/std"]
+std = ["sha2/std", "tracing/std", "myotis-bls/std"]
 
 [dev-dependencies]
 # Signing side of BLS for the synthetic fork-boundary test (tests/fork_boundary.rs).
