@@ -368,6 +368,10 @@ class DesktopNodeController(
                 // Under the push lock (see logIndexLock): a push built before this
                 // import must not be applied after it.
                 val result = synchronized(logIndexLock(canonical)) {
+                    // Push first: a removal still waiting for delivery reaches the
+                    // engine BEFORE the import, so it cannot delete afterwards what
+                    // the import merged into that address.
+                    pushLogIndexConfig(canonical, handle)
                     // What the index subscribed BEFORE the import, to tell what
                     // the import brought in (LogIndexWatch.adoptImported).
                     val before = runCatching { handle.logIndexStatusJson() }.getOrNull()

@@ -643,6 +643,12 @@ The hosts list an import's contracts in the watch store
 (`LogIndexWatch.adoptImported`: the engine's entries after the import minus
 those before it), which also clears a still-undelivered marker of a
 brought-in address, so the next push does not delete what was just imported.
+After-minus-before cannot see a snapshot naming an address the engine already
+held, so the hosts push before they import: a removal still waiting is
+delivered first and cannot delete afterwards what the import merged into that
+address. (What is left is that push being refused and the import after it
+succeeding; closing that would take an import result that lists the
+snapshot's own addresses.)
 An entry indexed under a topic0 restriction is the exception: the hosts' list
 carries no topics, so pushing such an address from it would be a topic
 conflict, which replaces the whole index. The status marks those entries

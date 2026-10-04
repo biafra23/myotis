@@ -66,6 +66,11 @@ class LogIndexStatusTest {
         assertFalse(LogIndexStatus.isStatus("{\"error\":\"handle is paused\"}"))
         assertEquals(null, LogIndexStatus.parseOrNull("{\"error\":\"handle is paused\"}"))
         assertEquals(null, LogIndexStatus.parseOrNull(null))
+        // Nor is one that merely mentions the key, or carries it as something
+        // other than the entry array.
+        assertFalse(LogIndexStatus.isStatus("{\"error\":\"missing \\\"entries\\\" key\"}"))
+        assertFalse(LogIndexStatus.isStatus("{\"error\":\"x\",\"entries\":7}"))
+        // The engine's "no index" default and the Java engine's are statuses.
         assertTrue(LogIndexStatus.isStatus("{\"enabled\":false,\"logCount\":0,\"entries\":[]}"))
         assertEquals(2, LogIndexStatus.parseOrNull(withSpans)!!.entries.size)
     }

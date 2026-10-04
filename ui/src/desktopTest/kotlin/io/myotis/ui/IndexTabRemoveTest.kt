@@ -254,6 +254,32 @@ class IndexTabRemoveTest {
     }
 
     @Test
+    fun `taking an index over pushes the rest of the list with it`() {
+        // c was typed in while this host had nothing configured, so it was never
+        // pushed. Taking the engine's index over records collection as on — and
+        // from then on the list IS what is collected, so c goes out in the same
+        // push (the next start's push would send it anyway). The engine's own
+        // runtime bits are re-asserted, not changed.
+        val settings = IndexSettings(store(c), enabled = false)
+        val engine = Engine(listOf(a, b), backfillPaused = true)
+        open(engine, settings)
+        assertEquals(null, settings.push())
+
+        // Row order: c (listed), then the unlisted a and b.
+        rule.onAllNodesWithText("Remove")[1].performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithTag(INDEX_REMOVE_CONFIRM_TAG).performClick()
+        pumpFrames()
+
+        assertEquals(1, engine.applied)
+        assertEquals(
+            """{"enabled":true,"maxSpeed":false,"backfillPaused":true,""" +
+                """"watch":[{"address":"$c","fromBlock":100}],"unwatch":["$a"]}""",
+            settings.push(),
+        )
+    }
+
+    @Test
     fun `removing a contract the engine does not hold takes nothing over`() {
         // Same untouched host, but the contract being removed was only ever typed
         // in — the engine indexes b, not a. Nothing has to reach the engine, so

@@ -2221,7 +2221,12 @@ private fun IndexTab(
                 // off or start a backfill the user never asked for. Removing one of
                 // ITS contracts is the user taking it over, so record what the engine
                 // is doing as this host's settings first: the push then re-asserts
-                // exactly that state.
+                // the engine's own runtime bits instead of changing them.
+                // It is still a FULL push. With collection now recorded as on,
+                // whatever else the list holds — contracts typed in while this
+                // host had nothing configured — is subscribed with it, as the
+                // next start's push would do anyway. Holding them back would
+                // leave a list that reads as collected and is not.
                 if (!pushes && parsed != null) {
                     settings.setLogIndexMaxSpeed(network, parsed.maxSpeed)
                     settings.setLogIndexBackfillPaused(network, parsed.backfillPaused)

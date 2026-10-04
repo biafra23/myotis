@@ -190,6 +190,15 @@ object LogIndexWatch {
      * newer statement, and a marker left behind would have the very next push
      * delete what was just imported.
      *
+     * What this cannot see is a snapshot naming an address the engine ALREADY
+     * held: after-minus-before is empty for it, so a removal of that address
+     * still waiting for delivery keeps its marker, and the next push drops the
+     * entry — whatever the import merged into it included. The hosts therefore
+     * push BEFORE they import, which delivers pending removals first and
+     * leaves nothing waiting; the case is left only when that push is refused
+     * and the import that follows it succeeds. Closing it entirely would take
+     * an import result that lists the snapshot's own addresses.
+     *
      * A topic-restricted entry ([LogIndexStatus.Entry.restricted]) is NOT
      * listed: this store carries no topics, so the next push would name the
      * address unrestricted — a topic conflict, on which the engine replaces

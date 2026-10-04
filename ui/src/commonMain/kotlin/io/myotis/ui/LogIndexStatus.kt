@@ -53,8 +53,14 @@ object LogIndexStatus {
      * which [parse] reads as "disabled, no entries" — fine for display, wrong
      * for any decision that takes "no entries" to mean the index holds
      * nothing. Those ask here first, or use [parseOrNull].
+     *
+     * Anchored on the key WITH its array: every status the engine writes (the
+     * "no index" default and the Java engine's included) and every import
+     * result carries `"entries":[` literally, and nothing else may pass — a
+     * false positive here reads as "a status with no entries", the very
+     * state this exists to rule out.
      */
-    fun isStatus(json: String): Boolean = json.contains("\"entries\"")
+    fun isStatus(json: String): Boolean = json.contains("\"entries\":[")
 
     /** [parse], or null when [json] is not a status ([isStatus]). */
     fun parseOrNull(json: String?): Parsed? = json?.takeIf(::isStatus)?.let(::parse)

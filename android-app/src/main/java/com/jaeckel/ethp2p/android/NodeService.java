@@ -387,6 +387,10 @@ public final class NodeService extends Service {
         // Under the push lock (see logIndexLock): a push built before this import
         // must not be applied after it.
         synchronized (logIndexLock(net)) {
+            // Push first: a removal still waiting for delivery reaches the engine
+            // BEFORE the import, so it cannot delete afterwards what the import
+            // merged into that address (LogIndexWatch.adoptImported).
+            pushLogIndexConfig(net, handle);
             // What the index subscribed before the import, to tell what it brought in.
             // A probe that fails must not cost the import; adoptImported then leaves
             // the list alone rather than guess.

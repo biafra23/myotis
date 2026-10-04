@@ -226,6 +226,10 @@ class IosNodeController(
                 val pathsJson = paths.joinToString(",", "[", "]") {
                     "\"${it.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                 }
+                // Push first: a removal still waiting for delivery reaches the
+                // engine BEFORE the import, so it cannot delete afterwards what
+                // the import merged into that address.
+                pushLogIndexConfig(net, handle)
                 // What the index subscribed BEFORE the import, to tell what the
                 // import brought in (LogIndexWatch.adoptImported).
                 val before = RustEngine.logIndexStatusJson(handle)
