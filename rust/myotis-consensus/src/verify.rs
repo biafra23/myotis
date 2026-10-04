@@ -2,6 +2,8 @@
 //! `SyncCommitteeVerifier` + `ForkData.computeDomain`, over the shared
 //! [`myotis_bls::fast_aggregate_verify`] core (production POP DST).
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use crate::spec;
 use crate::ssz::{self, Root};
 use crate::types::{BeaconBlockHeader, SyncAggregate, SyncCommittee, PUBKEY_SIZE};

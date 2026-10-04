@@ -3,6 +3,8 @@
 //! clock input (the slot estimate behind `force_rotate_if_past_period`) is a
 //! plain parameter, exactly as the conformance corpus records it.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use crate::fork::{ForkSchedule, LcFork};
 use crate::spec;
 use crate::ssz::{self, Root};
@@ -525,8 +527,8 @@ pub enum BootstrapReject {
     ExecutionBranch,
 }
 
-impl std::fmt::Display for BootstrapReject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for BootstrapReject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             BootstrapReject::ShapeNotItsForks => "wire shape is not its slot's fork's",
             BootstrapReject::SyncCommitteeBranch => "sync committee branch invalid",
