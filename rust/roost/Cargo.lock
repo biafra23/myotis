@@ -3216,6 +3216,7 @@ dependencies = [
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",
+ "myotis-wire",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "snap",
@@ -3223,6 +3224,21 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "myotis-wire"
+version = "0.1.13"
+dependencies = [
+ "aes",
+ "cipher",
+ "ctr",
+ "hmac",
+ "myotis-core",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "snap",
+ "subtle",
 ]
 
 [[package]]
