@@ -191,7 +191,13 @@ class IosNodeController(
             settings.logIndexMaxSpeed(net),
             configured = settings.logIndexConfigured(net),
             backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
-        if (!RustEngine.setLogIndexConfig(handle, json) && settings.logIndexEnabled(net)) {
+        if (RustEngine.setLogIndexConfig(handle, json)) {
+            // The engine took the push, the removals it named included: their
+            // markers have done their job (LogIndexWatch.delivered).
+            val now = settings.logIndexWatchJson(net)
+            val left = io.myotis.ui.LogIndexWatch.delivered(now, json)
+            if (left != now) settings.setLogIndexWatchJson(net, left)
+        } else if (settings.logIndexEnabled(net)) {
             logs.append("WARN log index config rejected for $net")
         }
     }

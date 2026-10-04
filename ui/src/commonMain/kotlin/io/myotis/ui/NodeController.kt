@@ -305,10 +305,11 @@ interface Settings {
      * the engine config. The array also carries a marker per REMOVED address
      * (`{"address":"0x…","unwatched":true}`): the engine's config union never
      * drops a subscription a push merely leaves out, so a removal has to be
-     * named to it, and the marker is what makes every later push do that. A
-     * host stores and returns the value verbatim — or through
-     * [LogIndexWatch.normalize], never through parse-and-serialize, which
-     * would drop the markers.
+     * named to it, and the marker is what makes the next push do that — the
+     * host that pushes drops it once the engine took the push
+     * ([LogIndexWatch.delivered]). A host stores and returns the value
+     * verbatim — or through [LogIndexWatch.normalize], never through
+     * parse-and-serialize, which would drop the markers.
      * Defaults keep hosts without the feature compiling.
      */
     fun logIndexWatchJson(network: String): String = "[]"

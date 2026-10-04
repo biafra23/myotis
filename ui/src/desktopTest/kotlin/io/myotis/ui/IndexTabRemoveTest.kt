@@ -97,6 +97,10 @@ class IndexTabRemoveTest {
         // the tab says what is happening to it rather than offering it again.
         rule.onNodeWithText("removing…").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Indexed, but not in your list").assertDoesNotExist()
+        // A push the engine did not take is not repeated on its own.
+        rule.onNodeWithText("Retry").performScrollTo().performClick()
+        pumpFrames()
+        assertEquals(2, engine.applied)
     }
 
     @Test
@@ -186,6 +190,23 @@ class IndexTabRemoveTest {
             """{"enabled":true,"maxSpeed":false,"backfillPaused":true,"watch":[],"unwatch":["$a"]}""",
             settings.push(),
         )
+    }
+
+    @Test
+    fun `removing a contract the engine does not hold takes nothing over`() {
+        // Same untouched host, but the contract being removed was only ever typed
+        // in — the engine indexes b, not a. Nothing has to reach the engine, so
+        // collection must not be switched on for the rest of the list.
+        val settings = IndexSettings(store(a, c), enabled = false)
+        val engine = Engine(listOf(b), backfillPaused = true)
+        open(engine, settings)
+
+        rule.onAllNodesWithText("Remove")[0].performScrollTo().performClick()
+        pumpFrames()
+        rule.onNodeWithText("Remove this contract?").assertDoesNotExist()
+        assertEquals(listOf(LogIndexWatch.Entry(c, 100)), LogIndexWatch.parse(settings.watchJson))
+        assertEquals(false, settings.logIndexEnabled("mainnet"))
+        assertEquals("an untouched host must still have nothing to push", null, settings.push())
     }
 
     private fun open(controller: NodeController, settings: Settings) {

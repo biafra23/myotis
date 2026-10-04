@@ -2005,16 +2005,9 @@ impl ElReader {
                 }
             };
             let installed_is_empty = fresh.log_count() == 0;
-            // A restart claim vouches for coverage, so it survives exactly as
-            // far as the coverage did: a merge keeps it, a fresh index has
-            // nothing for it to vouch for.
-            let high = fresh.append_edge().map(|edge| edge.saturating_sub(1));
-            if let Ok(mut claim) = self.log_index_claim.lock() {
-                let kept = high.map_or(0, |h| claim.vouched.min(h));
-                if kept != claim.vouched {
-                    *claim = RestartClaimState { vouched: kept, first_finality: 0 };
-                }
-            }
+            // A merge keeps the restart claim; a fresh index has nothing for
+            // it to vouch for.
+            self.keep_restart_claim_within(fresh.append_edge().map(|edge| edge.saturating_sub(1)));
             *slot = Some(fresh);
             // The checkpoint above put a full-size file on disk, so it starts
             // an interval — without one the next appender tick would rewrite
@@ -2253,14 +2246,8 @@ impl ElReader {
                     t.clear();
                 }
             }
-            // A restart claim vouches for coverage, so it survives exactly as
-            // far as the coverage did — untouched while an entry is covered.
-            if let Ok(mut claim) = self.log_index_claim.lock() {
-                let kept = high.map_or(0, |h| claim.vouched.min(h));
-                if kept != claim.vouched {
-                    *claim = RestartClaimState { vouched: kept, first_finality: 0 };
-                }
-            }
+            // Untouched while an entry is still covered.
+            self.keep_restart_claim_within(high);
             tracing::info!(
                 dropped,
                 remaining = ix.config().watch.len(),
@@ -2752,7 +2739,9 @@ impl ElReader {
         if *since_persist >= 64 && self.persist_log_index(self.finalized_block_number(), true) {
             *since_persist = 0;
         }
-        let enabled = self.with_log_index(|ix| ix.config().enabled).unwrap_or(false);
+        // Off, or on with nothing watched (every contract unwatched): either way
+        // there is no coverage to advance — see `LogIndex::follows_head`.
+        let enabled = self.with_log_index(|ix| ix.follows_head()).unwrap_or(false);
         if !enabled {
             self.clear_log_index_bridge(); // don't park a mapped gap while off
             self.retire_tail_record();
@@ -3452,6 +3441,21 @@ impl ElReader {
     /// The vouched top of the current restart claim (0: none).
     fn vouched_now(&self) -> u64 {
         self.log_index_claim.lock().map(|c| c.vouched).unwrap_or(0)
+    }
+
+    /// A restart claim vouches for coverage, so it survives exactly as far as
+    /// the coverage did. `high` is the covered top of the index now installed
+    /// (`None`: nothing covered): the claim is cut back to it, and one that
+    /// had to be cut starts over unweighed. Call it under the index lock, with
+    /// the index it describes — the order every path that replaces or shrinks
+    /// the installed index uses.
+    fn keep_restart_claim_within(&self, high: Option<u64>) {
+        if let Ok(mut claim) = self.log_index_claim.lock() {
+            let kept = high.map_or(0, |h| claim.vouched.min(h));
+            if kept != claim.vouched {
+                *claim = RestartClaimState { vouched: kept, first_finality: 0 };
+            }
+        }
     }
 
     /// Write one checkpoint of this node's OWN index — bytes

@@ -385,13 +385,13 @@ public final class NodeService extends Service {
             return "{\"error\":\"" + net + " is not running\"}";
         }
         // What the index subscribed before the import, to tell what it brought in.
-        // A probe that fails must not cost the import: with nothing to compare
-        // against, everything the result lists counts as brought in.
+        // A probe that fails must not cost the import; adoptImported then leaves
+        // the list alone rather than guess.
         String before;
         try {
             before = handle.logIndexStatusJson();
         } catch (RuntimeException e) {
-            before = "";
+            before = null;
         }
         try {
             String r = handle.importLogIndexFiles(pathsJson);
@@ -435,6 +435,15 @@ public final class NodeService extends Service {
             return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
         }
         boolean ok = handle.setLogIndexConfig(json);
+        if (ok) {
+            // The engine took the push, the removals it named included: their
+            // markers have done their job (LogIndexWatch.delivered).
+            String now = logIndexWatchJson(this, net);
+            String left = io.myotis.ui.LogIndexWatch.delivered(now, json);
+            if (!left.equals(now)) {
+                setLogIndexWatchJson(this, net, left);
+            }
+        }
         if (enabled && !ok) {
             // LogBuffer so the rejection shows in the in-app log view like
             // every other boot-path message.

@@ -620,23 +620,34 @@ answerable at all. Keeping a frozen history would take per-entry frontiers.
 
 Host side, the hosts' Index tab is where this is used (`LogIndexWatch`). A
 removed contract stays in the persisted watch store as a marker
-(`{"address":"0x…","unwatched":true}`) and every push names it under
-`unwatch`. The marker is deliberately NOT dropped once the engine acted on it:
-re-sending is free, and it is what repairs a removal the engine never received
-(the network was stopped — the removal then takes effect at the next start) or
-lost (a crash before its checkpoint). It goes when the address is subscribed
-again: added by hand, or brought in by an import — the hosts list an import's
-contracts in the watch store (`LogIndexWatch.adoptImported`: the engine's
-entries after the import minus those before it), which also clears a
-brought-in address's marker so the next push does not delete what was just
-imported. The tab also lists what the engine indexes that the store does not
-hold — contracts removed before removal reached the engine, or imported
-before imports were listed — with Keep and Remove, so nothing is indexed out
-of the user's sight. A host that never configured the index sends no push at
-all (a dropped-in snapshot must not be switched off by an untouched settings
-store); removing one of its contracts first records the engine's own runtime
+(`{"address":"0x…","unwatched":true}`) and the push names it under `unwatch`.
+The marker is a removal waiting to be DELIVERED, not a standing ban: it
+survives a push that never happened (the network was stopped — the removal
+then takes effect at the next start) or that the engine did not take, and the
+host drops it as soon as a push carrying it was taken
+(`LogIndexWatch.delivered`). Kept, it would unwatch the address again on every
+later push — also after something the host cannot see had subscribed it anew
+(a snapshot dropped into the data dir), deleting what was just supplied. The
+price is the other failure: a removal whose checkpoint write failed and whose
+process then died comes back with the old file — visibly, in the tab's list
+of unlisted contracts, where it can be removed again.
+
+The hosts list an import's contracts in the watch store
+(`LogIndexWatch.adoptImported`: the engine's entries after the import minus
+those before it), which also clears a still-undelivered marker of a
+brought-in address, so the next push does not delete what was just imported.
+The tab lists what the engine indexes that the store does not hold —
+contracts removed before removal reached the engine, or imported before
+imports were listed — with Keep and Remove, so nothing is indexed out of the
+user's sight. A host that never configured the index sends no push at all (a
+dropped-in snapshot must not be switched off by an untouched settings store);
+removing one of that index's contracts first records the engine's own runtime
 bits as the host's settings, so the push that carries the removal re-asserts
 exactly what the engine was already doing.
+
+An enabled index that watches nothing (every contract removed, collection
+left on) is idle: the appender does not follow the head for it
+(`LogIndex::follows_head`).
 
 **Merge rules** (`LogIndex::merge`): watch union (same address requires equal
 topic0 sets — a span's meaning includes the restriction it was indexed under;

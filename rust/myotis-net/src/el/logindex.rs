@@ -427,6 +427,16 @@ impl LogIndex {
         self.config.watch.iter().any(|w| &w.address == address)
     }
 
+    /// Whether there is anything to follow the head FOR: the index is enabled
+    /// and watches at least one address. An enabled index with an empty
+    /// watch-list — every contract unwatched, collection left on — covers
+    /// nothing whatever is fetched for it: `append_block` has no entry to
+    /// extend, so the append edge never forms and the appender would read the
+    /// finalized block's receipts again on every tick, for nothing.
+    pub fn follows_head(&self) -> bool {
+        self.config.enabled && !self.config.watch.is_empty()
+    }
+
     /// Flip the backfill pacing bit without touching accumulated state (same
     /// fingerprint-unchanged re-apply path as [`Self::set_enabled`]).
     pub fn set_max_speed(&mut self, max_speed: bool) {
@@ -2632,11 +2642,14 @@ mod tests {
         assert_eq!(ix.cursor, Some((600, [6; 32])));
         assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((600, 600)));
 
-        // Unwatching everything leaves a valid, empty index.
+        // Unwatching everything leaves a valid, empty index — one the appender
+        // has nothing to follow the head for, enabled or not.
+        assert!(ix.follows_head());
         assert_eq!(ix.unwatch(&[addr(2)]), 1);
         assert!(ix.config().watch.is_empty());
         assert_eq!(ix.log_count(), 0);
         assert_eq!(ix.cursor, None);
+        assert!(ix.config().enabled && !ix.follows_head());
     }
 
     /// Drive the (simulated) appender + walker over `ix` to completion,

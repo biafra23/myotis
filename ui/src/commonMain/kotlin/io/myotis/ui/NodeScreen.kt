@@ -2179,9 +2179,13 @@ private fun IndexTab(
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
         // The persisted watch store as this tab last read or wrote it. Every edit
         // goes through `edit`, which starts from the store's CURRENT value rather
-        // than from this copy: a host adds an import's contracts to it from its own
-        // thread (LogIndexWatch.adoptImported), and writing a stale copy back would
-        // drop them again.
+        // than from this copy: a host changes it from its own thread (an import's
+        // contracts are added, a delivered removal's marker dropped — see
+        // LogIndexWatch), and writing a stale copy back would undo that.
+        // The copy is deliberately NOT refreshed when a marker is dropped: until
+        // the engine's next status no longer lists the contract, the marker here
+        // is what keeps its row reading "removing…" instead of the contract
+        // showing up below as one nobody listed.
         var store by remember(network) { mutableStateOf(settings.logIndexWatchJson(network)) }
         val watch = remember(store) { LogIndexWatch.parse(store) }
         val unwatched = remember(store) {
@@ -2193,6 +2197,9 @@ private fun IndexTab(
             store = next
         }
         val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
+        // The addresses the engine's index holds, as far as it says: null without
+        // a status (the network is not running).
+        val indexed = parsed?.entries?.mapTo(HashSet()) { it.address }
         // Whether this host has a config push to send at all (LogIndexWatch.configJson
         // sends none for an index it never configured). A removal travels in that
         // push, so without one it is not on its way anywhere.
@@ -2205,10 +2212,12 @@ private fun IndexTab(
             edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.unwatch(acc, a) } }
             // An index this host never configured (a snapshot dropped into the data
             // dir, activated engine-side) gets no push — one would switch it off or
-            // start a backfill the user never asked for. Acting on its contracts is
-            // the user taking it over, so record what the engine is doing as this
-            // host's settings first: the push then re-asserts exactly that state.
-            if (!pushes && parsed != null && parsed.entries.isNotEmpty()) {
+            // start a backfill the user never asked for. Removing one of ITS
+            // contracts is the user taking it over, so record what the engine is
+            // doing as this host's settings first: the push then re-asserts exactly
+            // that state. Only then — a contract the engine does not hold needs no
+            // push, and must not turn collection on for the rest of the list.
+            if (!pushes && parsed != null && addresses.any { it.lowercase() in indexed.orEmpty() }) {
                 settings.setLogIndexMaxSpeed(network, parsed.maxSpeed)
                 settings.setLogIndexBackfillPaused(network, parsed.backfillPaused)
                 settings.setLogIndexEnabled(network, parsed.enabled)
@@ -2222,9 +2231,8 @@ private fun IndexTab(
         // the engine holds none of the addresses (typed in, never collected).
         var confirmRemoval by remember(network) { mutableStateOf<List<String>?>(null) }
         val askToRemove: (List<String>) -> Unit = { addresses ->
-            val held = parsed?.entries?.mapTo(HashSet()) { it.address }
             val mayHoldLogs =
-                if (held != null) addresses.any { it.lowercase() in held } else pushes
+                if (indexed != null) addresses.any { it.lowercase() in indexed } else pushes
             if (mayHoldLogs) confirmRemoval = addresses else remove(addresses)
         }
         confirmRemoval?.let { addresses ->
@@ -2474,8 +2482,20 @@ private fun IndexTab(
                         Text(label)
                         if (pushes && e.address in unwatched) {
                             // Removed above; gone from here once the engine has
-                            // taken the push that names it.
-                            Text("removing…")
+                            // taken the push that names it. A push the engine did
+                            // not take (asleep past the wake gate's patience) is
+                            // not repeated on its own before the next start, so
+                            // it can be sent again from here.
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("removing…")
+                                TextButton(onClick = { controller.applyLogIndex(network) }) {
+                                    Text("Retry")
+                                }
+                            }
                         } else if (low == null || high == null) {
                             Text("waiting — target block ${e.fromBlock}")
                             LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())

@@ -20,18 +20,33 @@ import kotlin.jvm.JvmStatic
  * config push is additive (it unions with what the index already subscribes),
  * so an address that merely disappeared from this list would stay indexed
  * forever. A removed address stays in the store as an `unwatched` marker —
- * `{"address":"0x…","unwatched":true}`, no `fromBlock` — and every push names
+ * `{"address":"0x…","unwatched":true}`, no `fromBlock` — and the push names
  * it under the config's `unwatch`, which is what makes the engine drop the
- * entry with its coverage and its logs (engine ABI ≥ 37). The marker is kept
- * after the engine acted on it: an unwatch of an address the index no longer
- * holds costs nothing, and re-sending it is what repairs a removal the engine
- * never got (the network was stopped) or lost (a crash before its checkpoint).
- * It goes when the address is subscribed again — added by hand ([watch]) or
- * brought in by an import ([adoptImported]).
+ * entry with its coverage and its logs (engine ABI ≥ 37).
+ *
+ * A marker is a removal WAITING TO BE DELIVERED, not a standing ban. It
+ * survives a push that never happened (the network was stopped: the removal
+ * takes effect at the next start) and one the engine did not take, and it goes
+ * as soon as a push that carried it was taken ([delivered]). Left in place it
+ * would unwatch the address again on every later push — also after something
+ * this host cannot see had subscribed it anew (a snapshot dropped into the data
+ * dir), deleting what was just supplied. It also goes when the address is
+ * subscribed again before delivery: added by hand ([watch]) or brought in by an
+ * import ([adoptImported]).
  */
 object LogIndexWatch {
 
     data class Entry(val address: String, val fromBlock: Long)
+
+    // One object of the store's array, and the fields read out of it. Shared by
+    // the entry parser and the marker reader so both see the store the same way.
+    private val OBJECT = Regex("""\{[^{}]*\}""")
+    private val ADDRESS = Regex(""""address"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+    private val FROM_BLOCK = Regex(""""fromBlock"\s*:\s*(\d+)""")
+    private val UNWATCHED = Regex(""""unwatched"\s*:\s*true""")
+
+    // The `unwatch` array of a config push, exactly as [configJson] writes it.
+    private val PUSHED_UNWATCH = Regex(""""unwatch":\[([^\]]*)\]""")
 
     /** A 0x-prefixed 20-byte hex address — the only shape the engine accepts. */
     @JvmStatic
@@ -69,13 +84,11 @@ object LogIndexWatch {
      */
     @JvmStatic
     fun parse(json: String): List<Entry> {
-        val addrRe = Regex(""""address"\s*:\s*"((?:[^"\\]|\\.)*)"""")
-        val fromRe = Regex(""""fromBlock"\s*:\s*(\d+)""")
         val seen = HashSet<String>()
-        return Regex("""\{[^{}]*\}""").findAll(json)
+        return OBJECT.findAll(json)
             .mapNotNull { obj ->
-                val addr = addrRe.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
-                val from = fromRe.find(obj.value)?.groupValues?.get(1)?.toLongOrNull()
+                val addr = ADDRESS.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
+                val from = FROM_BLOCK.find(obj.value)?.groupValues?.get(1)?.toLongOrNull()
                     ?: return@mapNotNull null
                 if (isValidAddress(addr) && seen.add(addr.lowercase())) Entry(addr, from) else null
             }
@@ -93,14 +106,12 @@ object LogIndexWatch {
      */
     @JvmStatic
     fun unwatched(json: String): List<String> {
-        val addrRe = Regex(""""address"\s*:\s*"((?:[^"\\]|\\.)*)"""")
-        val markRe = Regex(""""unwatched"\s*:\s*true""")
         val watched = parse(json).mapTo(HashSet()) { it.address.lowercase() }
         val seen = HashSet<String>()
-        return Regex("""\{[^{}]*\}""").findAll(json)
+        return OBJECT.findAll(json)
             .mapNotNull { obj ->
-                if (!markRe.containsMatchIn(obj.value)) return@mapNotNull null
-                val addr = addrRe.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
+                if (!UNWATCHED.containsMatchIn(obj.value)) return@mapNotNull null
+                val addr = ADDRESS.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
                 val key = addr.lowercase()
                 if (isValidAddress(addr) && key !in watched && seen.add(key)) addr else null
             }
@@ -134,7 +145,8 @@ object LogIndexWatch {
     /**
      * The store after the user removed [address]: its entry is gone and the
      * address is marked removed, so the next config push tells the engine to
-     * drop it. Marked even when no entry was there — that is how a contract
+     * drop it ([delivered] takes the marker out again once one has). Marked
+     * even when no entry was there — that is how a contract
      * the engine indexes but this list never held (an imported snapshot's, or
      * one removed before removal reached the engine) is unsubscribed.
      */
@@ -161,9 +173,17 @@ object LogIndexWatch {
      * A brought-in address also loses its removal marker. Importing it is the
      * newer statement, and a marker left behind would have the very next push
      * delete what was just imported.
+     *
+     * [statusBefore] that is null, or is not a status at all (the probe failed
+     * and returned an error object), leaves [json] untouched: with nothing to
+     * subtract, every contract the engine holds would count as brought in —
+     * including ones whose removal is still waiting to be delivered, which
+     * would be listed again and lose their marker. The Index tab shows the
+     * unlisted contracts instead, and the user decides.
      */
     @JvmStatic
-    fun adoptImported(json: String, statusBefore: String, statusAfter: String): String {
+    fun adoptImported(json: String, statusBefore: String?, statusAfter: String): String {
+        if (statusBefore == null || !statusBefore.contains("\"entries\"")) return json
         val before = LogIndexStatus.parse(statusBefore).entries.mapTo(HashSet()) { it.address }
         val brought = LogIndexStatus.parse(statusAfter).entries.filter { it.address !in before }
         val entries = parse(json)
@@ -173,6 +193,27 @@ object LogIndexWatch {
             entries + brought.filter { it.address !in listed }.map { Entry(it.address, it.fromBlock) },
             unwatched(json).filterNot { it.lowercase() in broughtKeys },
         )
+    }
+
+    /**
+     * The store after the engine TOOK the config push [pushedConfig] (what
+     * [configJson] built, and `setLogIndexConfig` answered true for): the
+     * removal markers that push carried are dropped — see the class doc for
+     * why a delivered marker must not stay. [json] is the store as it is NOW,
+     * which may have been edited since the push was built, so only an address
+     * that is still marked goes: one re-added in between is no marker any
+     * more, and one removed in between was not in the push and waits for the
+     * next. Returns [json] itself when there is nothing to drop, so a host can
+     * skip the write.
+     */
+    @JvmStatic
+    fun delivered(json: String, pushedConfig: String): String {
+        val sent = PUSHED_UNWATCH.find(pushedConfig)?.groupValues?.get(1)
+            ?.split(',')?.mapTo(HashSet()) { it.trim().trim('"').lowercase() }
+            ?: return json
+        val marked = unwatched(json)
+        val left = marked.filterNot { it.lowercase() in sent }
+        return if (left.size == marked.size) json else serialize(parse(json), left)
     }
 
     /**
@@ -199,8 +240,10 @@ object LogIndexWatch {
      * reverse lookup in its naming pass), never entered here.
      *
      * Removed addresses ride along as `unwatch` (see the class doc), on
-     * exactly the pushes that go out anyway. A null push needs none: nothing
-     * this host ever sent can have subscribed them.
+     * exactly the pushes that go out anyway; a host that got `true` for the
+     * push hands it to [delivered]. A null push carries none — the Index tab
+     * makes sure a removal that has to reach the engine is not stuck behind
+     * one (it records the engine's own state as this host's settings first).
      */
     @JvmStatic
     @JvmOverloads

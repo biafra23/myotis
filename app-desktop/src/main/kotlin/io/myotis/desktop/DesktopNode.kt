@@ -285,6 +285,13 @@ class DesktopNodeController(
         // its boot-time activate-from-disk re-enables an imported index.
         val json = logIndexConfigJson(settings, network) ?: return
         val ok = handle.setLogIndexConfig(json)
+        if (ok) {
+            // The engine took the push, the removals it named included: their
+            // markers have done their job (LogIndexWatch.delivered).
+            val now = settings.logIndexWatchJson(network)
+            val left = LogIndexWatch.delivered(now, json)
+            if (left != now) settings.setLogIndexWatchJson(network, left)
+        }
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
         } else if (enabled && backfillPaused) {
@@ -343,7 +350,7 @@ class DesktopNodeController(
                 }
                 // What the index subscribed BEFORE the import, to tell what the
                 // import brought in (LogIndexWatch.adoptImported).
-                val before = runCatching { handle.logIndexStatusJson() }.getOrDefault("")
+                val before = runCatching { handle.logIndexStatusJson() }.getOrNull()
                 val result = runCatching { handle.importLogIndexFiles(pathsJson) }
                     .getOrElse { "{\"error\":\"${it.message}\"}" }
                 if (result.startsWith("{\"ok\":true")) {
