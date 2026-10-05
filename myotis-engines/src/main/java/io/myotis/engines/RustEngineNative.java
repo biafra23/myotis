@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 36; // 36: send_raw_transaction_json may answer "rejected" (#531)
+    static final int EXPECTED_ABI_VERSION = 37; // 37: set_log_index_config applies "unwatch" (the Index tab's Remove)
 
     private static final boolean AVAILABLE = load();
 

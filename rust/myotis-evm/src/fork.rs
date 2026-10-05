@@ -1,6 +1,7 @@
-//! The mainnet fork table: `(block_number, timestamp) → revm SpecId`.
+//! The per-chain fork tables — mainnet, Sepolia and Gnosis, selected by chain id
+//! in [`spec_for`]: `(block_number, timestamp) → revm SpecId`.
 //!
-//! Mirrors the Java `EvmFactory` cascade verbatim. Pre-merge forks activate by
+//! Each cascade mirrors the Java `EvmFactory` one verbatim. Pre-merge forks activate by
 //! block number, post-merge forks by timestamp, so the cascade checks timestamp
 //! first (a post-merge block is always at/after the merge block) and falls back
 //! to block number. Everything below London throws — the engine has no local

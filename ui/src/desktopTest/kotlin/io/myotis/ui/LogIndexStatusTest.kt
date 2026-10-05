@@ -35,10 +35,44 @@ class LogIndexStatusTest {
             "\"coveredLow\":6100000,\"coveredHigh\":6200000}]}"
         val p = LogIndexStatus.parse(json)
         assertTrue("backfillPaused must parse", p.backfillPaused)
+        // The pacing bit parses beside it: the Index tab records both as the
+        // host's settings when it takes over an index it never configured.
+        assertFalse(p.maxSpeed)
+        assertTrue(LogIndexStatus.parse(withSpans).maxSpeed)
         val line = LogIndexStatus.progressLine(p)!!
         assertTrue(line, line.contains("paused"))
         assertTrue(line, line.contains("refused"))
         assertFalse("no ETA while paused: $line", line.contains("remaining ("))
+    }
+
+    @Test
+    fun a_topic_restricted_entry_is_marked_and_the_others_are_not() {
+        val json = "{\"enabled\":true,\"logCount\":1,\"entries\":[" +
+            "{\"address\":\"0x4e69fd587118dfb64957d18654e3894118e9b1bf\",\"fromBlock\":5," +
+            "\"coveredLow\":6,\"coveredHigh\":7,\"restricted\":true}," +
+            "{\"address\":\"0x34a2068192b1297f2a7f85d7d8cde66f8f0921cb\",\"fromBlock\":5,\"restricted\":true}," +
+            "{\"address\":\"0x58e8dcc13be9780fc42e8723d8ead4cf46943df2\",\"fromBlock\":5," +
+            "\"coveredLow\":6,\"coveredHigh\":7}]}"
+        val entries = LogIndexStatus.parse(json).entries
+        assertEquals(listOf(true, true, false), entries.map { it.restricted })
+        assertEquals(7L, entries[0].coveredHigh)
+        assertEquals(null, entries[1].coveredHigh)
+    }
+
+    @Test
+    fun an_error_object_is_not_a_status() {
+        // A paused handle answers the ungated probe with one; reading it as "an
+        // index with no entries" is what must not happen.
+        assertFalse(LogIndexStatus.isStatus("{\"error\":\"handle is paused\"}"))
+        assertEquals(null, LogIndexStatus.parseOrNull("{\"error\":\"handle is paused\"}"))
+        assertEquals(null, LogIndexStatus.parseOrNull(null))
+        // Nor is one that merely mentions the key, or carries it as something
+        // other than the entry array.
+        assertFalse(LogIndexStatus.isStatus("{\"error\":\"missing \\\"entries\\\" key\"}"))
+        assertFalse(LogIndexStatus.isStatus("{\"error\":\"x\",\"entries\":7}"))
+        // The engine's "no index" default and the Java engine's are statuses.
+        assertTrue(LogIndexStatus.isStatus("{\"enabled\":false,\"logCount\":0,\"entries\":[]}"))
+        assertEquals(2, LogIndexStatus.parseOrNull(withSpans)!!.entries.size)
     }
 
     @Test

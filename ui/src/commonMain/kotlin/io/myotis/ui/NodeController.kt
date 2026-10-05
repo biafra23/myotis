@@ -107,8 +107,9 @@ interface NodeController {
     val supportsTor: Boolean get() = false
 
     /** Push the (persisted) log-index preference for [network] down to the
-     *  engine — called from the settings toggle and at network (re)start.
-     *  Default no-op for hosts without the Rust engine's log index. */
+     *  engine — called from the settings toggle, when a contract is removed
+     *  on the Index tab (the push names it under `unwatch`), and at network
+     *  (re)start. Default no-op for hosts without the Rust engine's log index. */
     fun applyLogIndex(network: String) {}
 
     /**
@@ -301,8 +302,14 @@ interface Settings {
      * The user's watched contracts for [network]'s log index, as the JSON array
      * [LogIndexWatch] serializes (`[{"address":"0x…","fromBlock":N},…]`). The
      * Index tab edits this list; [NodeController.applyLogIndex] turns it into
-     * the engine config. Removing an entry only stops FUTURE subscriptions —
-     * the engine's config union never drops a live one (the Index tab says so).
+     * the engine config. The array also carries a marker per REMOVED address
+     * (`{"address":"0x…","unwatched":true}`): the engine's config union never
+     * drops a subscription a push merely leaves out, so a removal has to be
+     * named to it, and the marker is what makes the next push do that — the
+     * host that pushes drops it once the engine took the push
+     * ([LogIndexWatch.delivered]). A host stores and returns the value
+     * verbatim — or through [LogIndexWatch.normalize], never through
+     * parse-and-serialize, which would drop the markers.
      * Defaults keep hosts without the feature compiling.
      */
     fun logIndexWatchJson(network: String): String = "[]"

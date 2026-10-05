@@ -13,6 +13,9 @@ shares all of its machinery — see `PocFlavour.kt`, with `BeePoc.kt` and
     -PrailgunSepoliaSeedDir="$HOME/myotis-node/railgun-sepolia"
 ```
 
+There is no Android flavour. The same seeds import into the Android app's log
+index by hand: see [railgun-android.md](railgun-android.md).
+
 **DEBUG / DEMO artefact, not a production path.** Each bundled index is a full
 node's `eth_getLogs` output framed by `scripts/synth_logindex.py`. It carries no
 receipt-root proof and the engine serves it indistinguishably from logs the
@@ -212,7 +215,9 @@ usable until; rebuild the app with a fresh fetch after that.
   and the stored watch list is replaced by the seed's entry (whether Sepolia is
   on is left as it was). Contracts you had
   added stay subscribed (the engine unions every pushed watch list with what it
-  already indexes), but the other two are worth re-checking after the update.
+  already indexes) and show on the Index tab under "Indexed, but not in your
+  list", where each can be kept or removed; the other two are worth
+  re-checking after the update.
 - The Index tab states what each seed covers and that it is unverified.
 
 ### Why 8555 and 8557, not 8545 and 8547

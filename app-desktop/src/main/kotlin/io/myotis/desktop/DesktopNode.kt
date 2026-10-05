@@ -276,15 +276,39 @@ class DesktopNodeController(
         }, "log-index-apply-$network").apply { isDaemon = true }.start()
     }
 
-    private fun pushLogIndexConfig(network: String, handle: ChainHandle) {
+    /**
+     * One lock per network around everything that sends the engine a log-index
+     * config or changes what the index subscribes: BUILD the push from the
+     * settings, hand it over, record what it delivered — and an import with its
+     * adoption. Pushes run on their own threads (the boot thread, one per
+     * settings change) and each waits at the engine's wake gate for up to its
+     * ~90 s cap, so without this they are applied in whatever order the gate
+     * releases them: a push built BEFORE the user removed a contract could land
+     * AFTER the one that unwatched it and subscribe it again, with the removal's
+     * marker already dropped. Built under the lock, a push describes the
+     * settings as they are when it is its turn.
+     */
+    private val logIndexLocks = ConcurrentHashMap<String, Any>()
+
+    private fun logIndexLock(network: String): Any =
+        logIndexLocks.computeIfAbsent(engine.canonicalNetworkName(network)) { Any() }
+
+    private fun pushLogIndexConfig(network: String, handle: ChainHandle) = synchronized(logIndexLock(network)) {
         val enabled = settings.logIndexEnabled(network)
         val backfillPaused = settings.logIndexBackfillPaused(network)
         // Nothing to say (no watched contracts, never configured) -> never push;
         // the engine keeps eth_getLogs in its honest not-configured state. A
         // CONFIGURED network always pushes — a disable must reach the engine or
         // its boot-time activate-from-disk re-enables an imported index.
-        val json = logIndexConfigJson(settings, network) ?: return
+        val json = logIndexConfigJson(settings, network) ?: return@synchronized
         val ok = handle.setLogIndexConfig(json)
+        if (ok) {
+            // The engine took the push, the removals it named included, and made
+            // them durable: their markers have done their job (LogIndexWatch.delivered).
+            val now = settings.logIndexWatchJson(network)
+            val left = LogIndexWatch.delivered(now, json)
+            if (left != now) settings.setLogIndexWatchJson(network, left)
+        }
         if (enabled && !ok) {
             log.warn("[desktop] log index config rejected for {} (Java engine, or engine gate down)", network)
         } else if (enabled && backfillPaused) {
@@ -341,12 +365,34 @@ class DesktopNodeController(
                 val pathsJson = files.joinToString(",", "[", "]") {
                     "\"${it.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")}\""
                 }
-                val result = runCatching { handle.importLogIndexFiles(pathsJson) }
-                    .getOrElse { "{\"error\":\"${it.message}\"}" }
+                // Under the push lock (see logIndexLock): a push built before this
+                // import must not be applied after it.
+                val result = synchronized(logIndexLock(canonical)) {
+                    // Push first: a removal still waiting for delivery reaches the
+                    // engine BEFORE the import, so it cannot delete afterwards what
+                    // the import merged into that address.
+                    pushLogIndexConfig(canonical, handle)
+                    // What the index subscribed BEFORE the import, to tell what
+                    // the import brought in (LogIndexWatch.adoptImported).
+                    val before = runCatching { handle.logIndexStatusJson() }.getOrNull()
+                    val r = runCatching { handle.importLogIndexFiles(pathsJson) }
+                        .getOrElse { "{\"error\":\"${it.message}\"}" }
+                    if (r.startsWith("{\"ok\":true")) {
+                        // Importing is the opt-in: persist the flag so the next
+                        // start's config push keeps the index enabled.
+                        settings.setLogIndexEnabled(canonical, true)
+                        // …and list the imported contracts, so the Index tab's
+                        // watch list keeps describing what the index holds (and a
+                        // removal still waiting for delivery does not delete what
+                        // was just imported).
+                        settings.setLogIndexWatchJson(
+                            canonical,
+                            LogIndexWatch.adoptImported(settings.logIndexWatchJson(canonical), before, r),
+                        )
+                    }
+                    r
+                }
                 if (result.startsWith("{\"ok\":true")) {
-                    // Importing is the opt-in: persist the flag so the next
-                    // start's config push keeps the index enabled.
-                    settings.setLogIndexEnabled(canonical, true)
                     onResult("Imported ${files.size} snapshot${if (files.size == 1) "" else "s"} — catch-up started.")
                 } else {
                     val err = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(result)
@@ -823,10 +869,12 @@ class DesktopSettings(
         }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_WATCH_PREFIX) }.forEach { k ->
             // Round-trip through the parser so a hand-edited value degrades to the
-            // entries that do parse rather than reaching the engine raw.
+            // entries that do parse rather than reaching the engine raw. normalize,
+            // not parse+serialize: the store also carries the removed-address markers,
+            // and dropping those here would lose every removal still waiting for the
+            // network to start.
             p.getProperty(k)?.let {
-                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] =
-                    LogIndexWatch.serialize(LogIndexWatch.parse(it))
+                logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] = LogIndexWatch.normalize(it)
             }
         }
         p.stringPropertyNames()

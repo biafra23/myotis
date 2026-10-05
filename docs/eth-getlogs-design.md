@@ -271,9 +271,50 @@ From the first anchored block downward to `min(watch.from_block)`:
 2. Per verified header: bloom-check against the watch-list (addresses +
    optional topic0s). Non-match ⇒ record coverage and discard the header.
 3. Match ⇒ `get_receipts([hash])` (`el/peer.rs:325`) + `verify_block_receipts`;
-   extract matching logs; store.
+   extract matching logs; store. The block's body is fetched only when its
+   receipts turn out to hold a watched log (see *What a candidate costs*).
 4. Checkpoint cursor + coverage after each batch; restart is idempotent from
    the checkpoint (any await may be the last).
+
+**What a candidate costs (receipts first, #544).** The header bloom is a
+coarse pre-filter. An address-only watch entry tests three bits of a 2048-bit
+bloom, and mainnet blooms are well filled, so most candidates hold no watched
+log at all. Measured on mainnet for the RAILGUN contract (200 blocks to
+26,111,000, sizes from chain data over a public RPC): 96 blocks were candidates
+and 6 of those held a RAILGUN log. Their bodies came to 19.4 MB and their
+receipts, in eth/69's bloomless form, to 25.0 MB.
+
+A block's receipts verify against `receiptsRoot` on their own. The body is
+needed for one thing — the transaction hash of a log that is actually stored —
+so `fetch_candidate_logs` (the one implementation behind the backfill, the head
+bridge and the tail) asks for the chunk's receipts first, verifies them, scans
+them for a log the watch-list would store, and asks for bodies only for the
+blocks that hold one. A candidate without one is complete with no body. On the
+sample above that is 26.2 MB where fetching both for every candidate is
+44.3 MB, 41% less. The saving shrinks as the hit rate rises, and on eth/68
+peers, whose receipts carry a 256-byte bloom each.
+
+- **The eth/69 bound without a body.** eth/69 receipts arrive without their
+  bloom, and recomputing it costs 256 bytes per receipt, so the expansion is
+  bounded before it runs. Every other caller takes the bound from the
+  `transactionsRoot`-verified body's transaction count (#454). Here it comes
+  from the same trusted place the body check takes its own: the header's
+  `gasUsed` cannot pay for more than `gasUsed / 1000` transactions
+  (`verify_receipts_alone`, `BlockReceipts::canonical_at_most`). That is a
+  ceiling; the `receiptsRoot` check pins the count, since a receipts trie is
+  keyed by index.
+- **The scan is as strict as the store.** A wrong-length address or topic in
+  verified receipts is an error, never a log that fails to match and lets
+  coverage advance past it.
+- **Dense watch-lists.** Where candidates mostly ARE hits, the second round
+  trip costs latency on every chunk and saves nothing. `BodyPolicy` keeps a
+  decaying count of candidates and hits and requests bodies together with the
+  receipts while at least three in four are hits. It only shapes requests: a
+  body is verified and used only for a block that holds a watched log, in
+  either shape.
+- **The usable prefix** of a chunk is "receipts verified, and a verified body
+  for every block in it that holds a watched log". The truncation cut and the
+  request sizing below work on that prefix.
 
 **Request sizing (adaptive).** Candidate blocks are fetched in chunks, and a
 peer answers `get_block_bodies`/`get_receipts` up to a soft BYTE budget — a
@@ -327,6 +368,70 @@ window from ~4 requests into ~1023, overrunning the walker's tick budget (only
 checked between rounds) and delaying the head-follow appender that shares the
 task. Self-heals over the probe ladder; a hard chunks-per-batch bound is the
 natural pairing for the width floor if it ever shows up in practice.
+
+**Time is evidence too (#545).** The byte budget above is the *peer's* limit.
+On a slow link the binding limit is ours: a response that fits the peer's
+budget still cannot cross the link inside the 15 s request timeout, so it never
+truncates — it just never arrives. Measured on a ~300 KB/s link (2026-10-01): a
+64-block chunk took about as long as the timeout, every peer in turn timed out
+on the same request, and the head catch-up closed ~190 blocks in 13 minutes.
+
+So a chunk that takes longer than `CHUNK_SLOW_AFTER` (5 s, a third of the
+timeout), or fails after waiting that long, is folded into the sizer as a short
+serve of however many blocks would have fit at that pace (`note_pace`). It gets
+the truncation rules for free: at most a quarter per step, and the probe clock
+restarts. A timeout on 64 blocks retries at 21.
+
+The hard part is that a timeout looks the same whether the link could not carry
+the chunk or the peer never answered, and only the first is about the width.
+Three rules keep a bad peer from narrowing it:
+
+- **Small chunks are no evidence.** A chunk counts only if it has at least four
+  blocks, or fills the width where that is narrower. Steady head-follow fetches
+  one to three candidates per tick; what happens to those — a silent peer, a
+  slow one, a peer one block behind the tip serving all but the last — is about
+  the peer. The same bar applies to truncation on the head side.
+- **Two in a row.** One slow chunk only arms; the second, with no chunk inside
+  the target between them, narrows. A silent peer at the front of the pool is
+  followed by one that answers; a slow link is slow for every peer. (A pending
+  probe is the exception: the probed width is a guess, and one slow chunk is the
+  guess failing.)
+- **Undo.** The width a run of slow chunks started from is remembered until a
+  chunk exercises the narrowed width. If that chunk's time, scaled up to the old
+  width, still fits the target, the old width is restored at once — the slow
+  chunks were peers that did not answer. The head side needs this because its
+  steady state cannot probe back up: tail chunks are far below the width and so
+  are no evidence.
+
+Where it applies:
+
+- **The head side has its own width.** The bridge and the tail used a fixed 64;
+  they now read a `ChunkSizer` of their own (the head range and the backfill
+  range differ in block size) and feed it per chunk. A slow failure re-cuts the
+  chunk before the next peer is tried, and the tail resumes a truncated chunk at
+  the cut.
+- **In the backfill, timing counts only at pipeline depth 1.** At depth 4 a
+  request also waits behind the ones queued ahead of it, and the depth degrade
+  owns that case. A slow chunk that narrowed the width ends the batch as a
+  truncation does, so its already-cut siblings do not each run up to the
+  timeout. And a depth-1 batch restores the pipeline only where four chunks in
+  flight would still arrive (`pipeline_fits`: the slowest chunk times four
+  within two thirds of the timeout). On a round-trip-bound link a full chunk
+  takes a second or two alone and the pipeline comes back as before; on a
+  bandwidth-bound one four stacked chunks share the same bytes per second, and
+  restoring the depth there fails every other batch.
+
+A byte-budget truncation clears what a slow run remembered: it is fresh, direct
+evidence about the width, and a fast chunk afterwards says nothing about bytes.
+
+**Not covered.** A link too slow for even four blocks inside the timeout gets no
+help from the width, since chunks that small are not evidence. The pace rule
+times a whole chunk fetch, which in the receipts-first shape is two round trips
+in series when the chunk holds a hit, so it cannot tell latency from bandwidth:
+where two round trips approach the 5 s target (peers behind Tor would do it) the
+width narrows without anything getting faster. And the head
+side's loops still try peers one at a time with the full timeout (#461), so a
+silent peer at the front costs 15 s per tick whatever the width.
 
 Policy is pure (`next_chunk_len` / `fold_chunk_observation`, `el/reader.rs`);
 the limit-cycle bound and the floor are pinned by test. The width is *not*
@@ -467,10 +572,12 @@ post-create call rather than a `create_handle` signature break:
   (`capi.rs` + `rust/include/myotis_engine.h`), `ABI_VERSION` bump with a
   changelog line (`lib.rs:34`).
 - Config JSON: `{ "enabled": bool, "watch": [{"address": "0x…",
-  "fromBlock": n, "topic0s": ["0x…", …]? }, …] }`. Watch lists live host-side
-  as data, not in the engine — originally a built-in preset (the kohaku
-  contract set per network), since 2026-08-20 the user's own entries
-  (`LogIndexWatch`, entered on the Index tab and persisted per network).
+  "fromBlock": n, "topic0s": ["0x…", …]? }, …], "unwatch": ["0x…", …]? }`.
+  Watch lists live host-side as data, not in the engine — originally a
+  built-in preset (the kohaku contract set per network), since 2026-08-20 the
+  user's own entries (`LogIndexWatch`, entered on the Index tab and persisted
+  per network). `watch` is additive and `unwatch` is the unsubscribe — see
+  §Import, *Unsubscribe*.
 - Hosts: `NodeController` gains logIndex getters/setters next to
   `servedBlockWindow` (`ui/.../NodeController.kt:158`); persisted by each
   host's `Settings` actual; applied on (re)start via `RustChainHandle` right
@@ -519,9 +626,10 @@ router/API changes in this design already accommodate it.
 6. Generic build / import / export — DONE (2026-08-14), see §Import below.
 7. Follow-ups (separate): Unchained-Index-assisted discovery, JVM twin,
    `watch`-channel head notifications, EIP-7745 alignment, per-entry
-   frontiers (see §Import, canonical-shape note), snapshot provenance
-   (imported-coverage marker / signed snapshots) and an explicit
-   unsubscribe surface (see §Import, trust notes). The production answer
+   frontiers (see §Import, canonical-shape note) and snapshot provenance
+   (imported-coverage marker / signed snapshots). The explicit unsubscribe
+   surface that used to be listed here is DONE (2026-10-04, ABI 37 — see
+   §Import, *Unsubscribe*). The production answer
    to "download a history instead of walking it" is NOT a trusted
    snapshot but a bundle of block data the walker verifies itself —
    [logindex-verified-bundle-design.md](logindex-verified-bundle-design.md)
@@ -585,11 +693,84 @@ the hosts, never something fetched. Two properties to state plainly
 imported coverage (a provenance marker in the status JSON, or a signed
 snapshot format, is tracked follow-up hardening — and a precondition for
 serving a seeded history as a production path under the 2026-09-25
-carve-out, docs/seeded-log-histories.md); and subscriptions are
-currently ADD-ONLY — config pushes union and imports merge, so an address
-can only leave the index via a topic-conflict replace or a cache wipe. An
-explicit unsubscribe/replace surface is follow-up work; until then, note
-that an imported subscription is sticky.
+carve-out, docs/seeded-log-histories.md); and config pushes union and imports
+merge, so an address never leaves the index by being left out of either — only
+by an explicit unwatch (below), a topic-conflict replace or a cache wipe. An
+imported subscription is therefore sticky until someone removes it.
+
+**Unsubscribe (2026-10-04, ABI 37):** the config JSON's `unwatch` is a list of
+addresses the host no longer wants indexed. Each one the index watches is
+dropped BEFORE the push's union (`ElReader::unwatch_log_index` →
+`LogIndex::unwatch`): its watch entry, its coverage and every log stored for
+it. Nothing else moves — spans are per entry and a stored log names its own
+address, so the other entries keep their coverage, their logs, the tail record
+above finality and the restart claim under it; head-follow and the walk carry
+on for them, and nothing descends for the dropped entry any more. Its
+`eth_getLogs` is refused as unwatched from then on, which is the honest answer
+(a query the index stopped following must not be served from what it had).
+The checkpoint is rewritten at once, so a restart's union finds nothing of the
+address to bring back — and the push answers `true` only once that write has
+landed. A write that fails (a full disk is the likely cause, and the likely
+moment to be removing a contract) leaves the entries dropped in memory and
+answers `false`; the unwatch is then owed a checkpoint, and a repeat with
+nothing left to drop retries the write instead of reporting nothing to do.
+
+Two rules keep it from going quietly wrong. An address the index does not
+watch is IGNORED, so the unwatch is idempotent and costs nothing when there is
+nothing to drop; and an address named under both `watch` and `unwatch` REFUSES
+the push, since applying either half would silently discard the other
+(CLAUDE.md §Trust — applied or refused).
+
+Why data is deleted rather than kept and frozen: the canonical shape (below)
+needs every covered entry to share one high, so an entry that stopped
+advancing would wedge the appender for all of them, and logs kept without
+their entry are unreachable — a query needs the entry's coverage to be
+answerable at all. Keeping a frozen history would take per-entry frontiers.
+
+Host side, the hosts' Index tab is where this is used (`LogIndexWatch`). A
+removed contract stays in the persisted watch store as a marker
+(`{"address":"0x…","unwatched":true}`) and the push names it under `unwatch`.
+The marker is a removal waiting to be DELIVERED, not a standing ban: it
+survives a push that never happened (the network was stopped — the removal
+then takes effect at the next start) or that the engine did not take, and the
+host drops it as soon as a push carrying it was taken
+(`LogIndexWatch.delivered`). Kept, it would unwatch the address again on every
+later push — also after something the host cannot see had subscribed it anew
+(a snapshot dropped into the data dir), deleting what was just supplied.
+"Taken" includes durable (above), so a removal whose checkpoint could not be
+written keeps its marker and is sent again. On the JVM hosts each network's
+pushes and imports run under one lock, with the push built inside it: they
+are issued from several threads and wait at the engine's wake gate, and a
+push built before a removal must not be applied after the one that carried
+it (iOS runs them on a single-threaded lane).
+
+The hosts list an import's contracts in the watch store
+(`LogIndexWatch.adoptImported`: the engine's entries after the import minus
+those before it), which also clears a still-undelivered marker of a
+brought-in address, so the next push does not delete what was just imported.
+After-minus-before cannot see a snapshot naming an address the engine already
+held, so the hosts push before they import: a removal still waiting is
+delivered first and cannot delete afterwards what the import merged into that
+address. (What is left is that push being refused and the import after it
+succeeding; closing that would take an import result that lists the
+snapshot's own addresses.)
+An entry indexed under a topic0 restriction is the exception: the hosts' list
+carries no topics, so pushing such an address from it would be a topic
+conflict, which replaces the whole index. The status marks those entries
+(`"restricted":true`) and the hosts neither adopt nor list them; they can be
+removed.
+The tab lists what the engine indexes that the store does not hold —
+contracts removed before removal reached the engine, or imported before
+imports were listed — with Keep and Remove, so nothing is indexed out of the
+user's sight. A host that never configured the index sends no push at all (a
+dropped-in snapshot must not be switched off by an untouched settings store);
+removing one of that index's contracts first records the engine's own runtime
+bits as the host's settings, so the push that carries the removal re-asserts
+exactly what the engine was already doing.
+
+An enabled index that watches nothing (every contract removed, collection
+left on) is idle: the appender does not follow the head for it
+(`LogIndex::follows_head`).
 
 **Merge rules** (`LogIndex::merge`): watch union (same address requires equal
 topic0 sets — a span's meaning includes the restriction it was indexed under;
@@ -615,9 +796,9 @@ per-entry frontiers) is the tracked follow-up that would make merges lossless;
 it needs append/bridge machinery per entry.
 
 **Additive config (behavior change in v23):** `set_log_index_config` unions
-the pushed config with the already-subscribed set (live index, or on boot the
-portable snapshot's own watch-table). Without this, every host restart's
-preset push would fingerprint-mismatch an imported index into a full
+the pushed config's `watch` with the already-subscribed set (live index, or on
+boot the portable snapshot's own watch-table). Without this, every host
+restart's preset push would fingerprint-mismatch an imported index into a full
 re-index. Coverage survives bit flips, renames, LOWERED from_blocks (the
 cursor drops when the new hole sits above it — the walk re-descends), and
 even genuinely NEW addresses (the push merges with the existing index as a

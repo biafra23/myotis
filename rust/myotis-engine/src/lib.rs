@@ -4,12 +4,14 @@
 //! docs/reimplementation/05). The old hand-JNI shims are gone; the iOS hosts keep
 //! consuming the plain C ABI in `capi`.
 //!
-//! R1 (this stage): the network CATALOG is answered from Rust (`engine_init` ABI
-//! handshake, `available_networks_json`, `canonical_network_name`) AND the
-//! engine can HOST mainnet — `create_handle`/`start_handle`/`status_json`/
-//! `stop_handle` drive a `myotis_net::SyncHandle` (the light-client sync loop) on a
-//! tokio runtime this crate owns (see `host`). R1 is CL-only + mainnet-only; Gnosis
-//! and the EL surface land later.
+//! The network CATALOG is answered from Rust (`engine_init` ABI handshake,
+//! `available_networks_json`, `canonical_network_name`) and the engine HOSTS
+//! mainnet, Sepolia and Gnosis — `create_handle`/`start_handle`/`status_json`/
+//! `stop_handle` drive a `myotis_net::SyncHandle` (the light-client sync loop) and
+//! the EL reader on a tokio runtime this crate owns (see `host`). The verified
+//! reads, the EVM (`eth_call`/`eth_estimateGas`), ENS, the fee reads, transaction
+//! broadcast, the log index, read-stats and Tor are exported beside them (`ffi`,
+//! `capi`); the per-function history is the ABI table in `rust/include/myotis_engine.h`.
 
 // Public: the plain C ABI doubles as the in-process seam for Rust hosts (the
 // napi-rs Node binding in `myotis-node` calls these by Rust path — linking the
@@ -180,7 +182,24 @@ uniffi::setup_scaffolding!();
 ///      sends as before. No signature change; the JVM `RustChainHandle` and
 ///      the iOS `IosRpcBackend` read the new shape, and the Node addon passes
 ///      it through.
-pub const ABI_VERSION: i32 = 36;
+/// v37: set_log_index_config's JSON gained `unwatch`, an array of addresses:
+///      the explicit unsubscribe the additive union (v24) never had. Each
+///      address it names leaves the index BEFORE the union — its watch entry,
+///      its coverage and its stored logs — while every other entry keeps its
+///      own; an address the index does not watch is ignored, and one the same
+///      push also lists under `watch` refuses the push. A payload extension,
+///      no signature change — bumped because an older engine would take the
+///      key and silently ignore it, which is the one thing a host must not be
+///      able to pair with. `true` now also means the unwatch is DURABLE:
+///      a push whose unwatch could not write its checkpoint answers `false`
+///      (the entries are dropped in memory, the rest of the push is not
+///      applied, and repeating the push retries the write). The status JSON
+///      marks an entry indexed under a topic0 restriction with a trailing
+///      `"restricted":true` (other entries keep their shape). The hosts'
+///      Index tab sends `unwatch` for a removed contract
+///      (`LogIndexWatch.configJson`); the Node addon and the iOS wrapper pass
+///      the JSON through unchanged.
+pub const ABI_VERSION: i32 = 37;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

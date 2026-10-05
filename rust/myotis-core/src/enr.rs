@@ -3,7 +3,10 @@
 //! Wire form `RLP([signature, seq, k, v, k, v, …])`; the text form is
 //! `enr:` + base64url (no padding). Matching the Java decoder
 //! (docs/reimplementation/02 §1.3): the SIGNATURE IS NOT VERIFIED on this
-//! path (it is verified in the EIP-1459 DNS path, EL-A8); simple
+//! path — nor on the Java twin's (`Enr.decode` skips it too; the Java EIP-1459
+//! DNS walk verifies only the tree's ROOT record against the tree pubkey, and
+//! this engine has no DNS walk at all). Nothing here relies on the signature:
+//! these records seed dials and are never a trust input; simple
 //! bytes-valued pairs are kept, list-valued pairs (`eth`, `attnets`, …) are
 //! skipped in the generic map and re-parsed on demand.
 

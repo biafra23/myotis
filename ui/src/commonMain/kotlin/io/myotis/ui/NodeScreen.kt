@@ -654,10 +654,9 @@ private fun SettingsTab(
                     "only. On: force the original Java engine everywhere, giving up those " +
                     "features — currently the only way to use the Query tab's " +
                     "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                    "network is (re)started, not to already-running networks. Note: " +
-                    "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
-                    "regardless of the idle-sleep setting (the Status screen's Sleep row " +
-                    "says so per network).",
+                    "network is (re)started, not to already-running networks. On hosts with " +
+                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
+                    "Sleep row shows it per network.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -822,11 +821,15 @@ private fun StatusTab(
         // is worth that risk mid-run. The reasons they are unsafe differ, though, and the
         // difference is worth keeping written down.
         //
-        // `clearCaches` actually WORKS while running: it goes THROUGH the engine (clearPeerState
-        // plus the live cache instances), so a live stack cannot write the old peers back. Gating
-        // it therefore costs something real — handing discovery a fresh slate without a restart is
-        // a genuine debugging move — and that cost is accepted deliberately to make the accidental
-        // click impossible.
+        // `clearCaches` actually WORKS while running — on the Java engine: it goes THROUGH the
+        // engine (clearPeerState plus the live cache instances), so a live stack cannot write the
+        // old peers back. Gating it therefore costs something real — handing discovery a fresh
+        // slate without a restart is a genuine debugging move — and that cost is accepted
+        // deliberately to make the accidental click impossible. On the Rust engine the gate is
+        // load-bearing as well: clearPeerState is a no-op there (the engine exports no clear over
+        // the FFI), the host only deletes the cache files, and a running native pool rewrites
+        // them from memory on its next flush — stopped is the one window where the delete sticks
+        // (RustChainHandle.clearPeerState).
         //
         // `resetSyncState` only deletes `sync-state*.snapshot*` from disk, and whether that
         // STICKS while the chain runs depends on the engine and on what it is doing — which is
@@ -2153,6 +2156,9 @@ private fun formatLogTime(ms: Long, tz: TimeZone): String {
 }
 
 
+/** The confirm button of the Index tab's remove dialog — every row's own button reads "Remove" too. */
+internal const val INDEX_REMOVE_CONFIRM_TAG = "index-remove-confirm"
+
 /**
  * The log-index tab: the feature's home. Enter the contracts to watch (address +
  * the block to index back to), toggle collection per network, import portable
@@ -2174,8 +2180,102 @@ private fun IndexTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
-        var watch by remember(network) {
-            mutableStateOf(LogIndexWatch.parse(settings.logIndexWatchJson(network)))
+        // The persisted watch store. The tab is not its only writer — a host
+        // changes it from its own thread (an import's contracts are added, a
+        // delivered removal's marker dropped; see LogIndexWatch) — so it is
+        // re-read with every status snapshot as well as after every edit here,
+        // and an edit starts from the store's CURRENT value, never from this copy.
+        var storeRev by remember(network) { mutableStateOf(0) }
+        val store = remember(network, storeRev, snapshot) { settings.logIndexWatchJson(network) }
+        val watch = remember(store) { LogIndexWatch.parse(store) }
+        val unwatched = remember(store) {
+            LogIndexWatch.unwatched(store).mapTo(HashSet()) { it.lowercase() }
+        }
+        val edit: ((String) -> String) -> Unit = { change ->
+            settings.setLogIndexWatchJson(network, change(settings.logIndexWatchJson(network)))
+            storeRev++
+        }
+        // Null while the engine gives no status — the network is stopped, or its
+        // handle is paused or still starting and answers the probe with an error
+        // object. That is "unknown", never "the index holds nothing".
+        val parsed = LogIndexStatus.parseOrNull(snapshot?.logIndexJson)
+        // The addresses the engine's index holds; null while that is unknown.
+        val indexed = parsed?.entries?.mapTo(HashSet()) { it.address }
+        // Whether this host has a config push to send at all (LogIndexWatch.configJson
+        // sends none for an index it never configured). A removal travels in that
+        // push, so without one it is not on its way anywhere.
+        val pushes = collecting || settings.logIndexConfigured(network)
+        // Removing has to REACH the engine: its config push is additive, so a
+        // contract that merely left this list would stay indexed. The store keeps
+        // the address marked removed and the push names it under `unwatch` — at
+        // once while the network runs, on its next start otherwise.
+        val remove: (List<String>) -> Unit = { addresses ->
+            val held = parsed != null && addresses.any { it.lowercase() in indexed.orEmpty() }
+            if (!pushes && !held) {
+                // This host never pushed a config, so it cannot have subscribed
+                // them, and the engine holds none of them: there is nothing to
+                // deliver. No marker — it would wait for a push it has no business
+                // in, and unwatch a contract that arrived by other means meanwhile.
+                edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.forget(acc, a) } }
+            } else {
+                edit { json -> addresses.fold(json) { acc, a -> LogIndexWatch.unwatch(acc, a) } }
+                // An index this host never configured (a snapshot dropped into the
+                // data dir, activated engine-side) gets no push — one would switch it
+                // off or start a backfill the user never asked for. Removing one of
+                // ITS contracts is the user taking it over, so record what the engine
+                // is doing as this host's settings first: the push then re-asserts
+                // the engine's own runtime bits instead of changing them.
+                // It is still a FULL push. With collection now recorded as on,
+                // whatever else the list holds — contracts typed in while this
+                // host had nothing configured — is subscribed with it, as the
+                // next start's push would do anyway. Holding them back would
+                // leave a list that reads as collected and is not.
+                if (!pushes && parsed != null) {
+                    settings.setLogIndexMaxSpeed(network, parsed.maxSpeed)
+                    settings.setLogIndexBackfillPaused(network, parsed.backfillPaused)
+                    settings.setLogIndexEnabled(network, parsed.enabled)
+                    collecting = parsed.enabled
+                    onLogIndexChanged()
+                }
+                controller.applyLogIndex(network)
+            }
+        }
+        // Removing deletes collected logs, which only a fresh backfill (or import)
+        // brings back — so it is confirmed first, unless there is nothing to lose:
+        // the engine holds none of the addresses (typed in, never collected).
+        var confirmRemoval by remember(network) { mutableStateOf<List<String>?>(null) }
+        val askToRemove: (List<String>) -> Unit = { addresses ->
+            val mayHoldLogs =
+                if (indexed != null) addresses.any { it.lowercase() in indexed } else pushes
+            if (mayHoldLogs) confirmRemoval = addresses else remove(addresses)
+        }
+        confirmRemoval?.let { addresses ->
+            val one = addresses.size == 1
+            AlertDialog(
+                onDismissRequest = { confirmRemoval = null },
+                title = {
+                    Text(if (one) "Remove this contract?" else "Remove ${addresses.size} contracts?")
+                },
+                text = {
+                    Text(
+                        (if (one) "${addresses.first()}\n\nThe logs collected for it"
+                        else "The logs collected for them") +
+                            " on $network are deleted and indexing stops. Adding " +
+                            (if (one) "it" else "one") + " again starts its backfill over. " +
+                            "The other contracts keep their logs.",
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            confirmRemoval = null
+                            remove(addresses)
+                        },
+                        modifier = Modifier.testTag(INDEX_REMOVE_CONFIRM_TAG),
+                    ) { Text("Remove") }
+                },
+                dismissButton = { TextButton(onClick = { confirmRemoval = null }) { Text("Cancel") } },
+            )
         }
         Text(
             "Index and serve eth_getLogs for contracts you choose — every log verified " +
@@ -2198,13 +2298,61 @@ private fun IndexTab(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                TextButton(onClick = {
-                    watch = watch.filterNot { it.address == entry.address }
-                    settings.setLogIndexWatchJson(network, LogIndexWatch.serialize(watch))
-                    // No config push: the engine's config union never drops a live
-                    // subscription — removal only stops FUTURE sessions from
-                    // re-subscribing it (the hint below says so).
-                }) { Text("Remove") }
+                TextButton(onClick = { askToRemove(listOf(entry.address)) }) { Text("Remove") }
+            }
+        }
+        // ---- Contracts the engine indexes that the list above does not hold. ----
+        // An imported snapshot's contracts from before imports were adopted into
+        // the list, or ones removed here back when Remove only edited the list and
+        // never reached the engine. Shown so nothing is indexed out of sight, and
+        // so those earlier removals can be finished. An address already marked
+        // removed is left out while a push is carrying its removal to the engine.
+        val listed = remember(watch) { watch.mapTo(HashSet()) { it.address.lowercase() } }
+        val unlisted = parsed?.entries.orEmpty()
+            .filter { it.address !in listed && !(pushes && it.address in unwatched) }
+        if (unlisted.isNotEmpty()) {
+            Text("Indexed, but not in your list", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "The engine indexes these on $network although they are not listed above: " +
+                    "they came with an imported snapshot, or were removed here before " +
+                    "removing reached the engine. Keep adds one to your list. Remove " +
+                    "deletes its collected logs and stops indexing it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            unlisted.forEach { e ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(e.name ?: e.address)
+                        Text(
+                            (if (e.name != null) "${e.address} · " else "") + "from block ${e.fromBlock}" +
+                                (if (e.restricted) " · selected events only — cannot be listed" else ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    // Not for an entry indexed under a topic restriction: the list
+                    // carries no topics, so the next push would name it
+                    // unrestricted — a conflict the engine answers by replacing the
+                    // whole index.
+                    if (!e.restricted) {
+                        TextButton(onClick = {
+                            // The engine already indexes it: listing it changes
+                            // nothing there, so no push.
+                            edit { LogIndexWatch.watch(it, LogIndexWatch.Entry(e.address, e.fromBlock)) }
+                        }) { Text("Keep") }
+                    }
+                    TextButton(onClick = { askToRemove(listOf(e.address)) }) { Text("Remove") }
+                }
+            }
+            if (unlisted.size > 1) {
+                OutlinedButton(onClick = { askToRemove(unlisted.map { it.address }) }) {
+                    Text("Remove all ${unlisted.size}")
+                }
             }
         }
         var addAddress by remember(network) { mutableStateOf("") }
@@ -2224,14 +2372,28 @@ private fun IndexTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
+        // An address the engine indexes under a topic restriction cannot be added:
+        // the list carries no topics, so the push would name it unrestricted — a
+        // conflict the engine answers by replacing the whole index.
+        val addRestricted = parsed?.entries
+            ?.any { it.restricted && it.address == addAddress.lowercase() } == true
         val addValid = LogIndexWatch.isValidAddress(addAddress) &&
             addFrom.toLongOrNull() != null &&
-            watch.none { it.address.lowercase() == addAddress.lowercase() }
+            addAddress.lowercase() !in listed &&
+            !addRestricted
+        if (addRestricted) {
+            Text(
+                "This contract is already indexed for selected events only. Adding it here " +
+                    "would replace the whole index — remove it above first.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Button(
             enabled = addValid,
             onClick = {
-                watch = watch + LogIndexWatch.Entry(addAddress, addFrom.toLong())
-                settings.setLogIndexWatchJson(network, LogIndexWatch.serialize(watch))
+                val entry = LogIndexWatch.Entry(addAddress, addFrom.toLong())
+                edit { LogIndexWatch.watch(it, entry) }
                 addAddress = ""
                 addFrom = ""
                 if (collecting) controller.applyLogIndex(network)
@@ -2242,10 +2404,9 @@ private fun IndexTab(
             "Earlier is safer for the from-block: the index only answers queries for " +
                 "ranges it has covered, so a from-block AFTER the real deployment silently " +
                 "hides the earlier events, while an earlier one merely walks further. " +
-                "Removing a contract here does NOT unsubscribe an existing index — the " +
-                "engine keeps every subscription its index file names. It only stops the " +
-                "entry from being added where no index exists yet; to truly drop a " +
-                "contract, turn collection off and delete the network's index file.",
+                "Removing a contract deletes the logs collected for it and stops indexing " +
+                "it; the other contracts keep theirs. If $network is not running, the " +
+                "removal takes effect when it next starts.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2322,8 +2483,10 @@ private fun IndexTab(
                     val started = controller.importLogIndexSnapshots(network) { line ->
                         importResult = line
                         importing = false
-                        // Importing is the opt-in — reflect the flag the host persisted.
+                        // Importing is the opt-in — reflect the flag the host persisted,
+                        // and the contracts it adopted into the watch list.
                         collecting = settings.logIndexEnabled(network)
+                        storeRev++
                         onLogIndexChanged()
                     }
                     if (!started) importing = false
@@ -2336,7 +2499,6 @@ private fun IndexTab(
         // coverage is shown, and only while the engine's index is actually on
         // (an install that did not reach the engine must not look seeded).
         val seededNotice = remember(network) { controller.seededIndexNotice(network) }
-        val parsed = snapshot?.logIndexJson?.let { LogIndexStatus.parse(it) }
         when {
             parsed?.enabled == true -> {
                 seededNotice?.let { Text(it) }
@@ -2353,7 +2515,23 @@ private fun IndexTab(
                     val high = e.coveredHigh
                     Column {
                         Text(label)
-                        if (low == null || high == null) {
+                        if (pushes && e.address in unwatched) {
+                            // Removed above; gone from here once the engine has
+                            // taken the push that names it. A push the engine did
+                            // not take (asleep past the wake gate's patience) is
+                            // not repeated on its own before the next start, so
+                            // it can be sent again from here.
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("removing…")
+                                TextButton(onClick = { controller.applyLogIndex(network) }) {
+                                    Text("Retry")
+                                }
+                            }
+                        } else if (low == null || high == null) {
                             Text("waiting — target block ${e.fromBlock}")
                             LinearProgressIndicator(progress = { 0f }, modifier = Modifier.fillMaxWidth())
                         } else {

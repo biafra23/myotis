@@ -30,25 +30,30 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * The Rust engine's {@link ChainHandle}: one hosted mainnet network backed by a
- * {@code myotis_net::SyncHandle} (the light-client sync loop) running on the tokio
- * runtime the native engine owns. Lifecycle + status cross the JNI boundary via
- * {@link RustEngineNative}; compound status is a JSON object (the hand-JNI + JSON
- * decision, pinned by golden tests on both sides).
+ * The Rust engine's {@link ChainHandle}: one hosted network — mainnet, Sepolia or
+ * Gnosis, whichever {@link RustMyotisEngine#create} was asked for — backed by a
+ * {@code myotis_net::SyncHandle} (the light-client sync loop) and the Rust
+ * {@code ElReader} (discv4 + peer pool + the CL-fed execution anchor), running on the
+ * tokio runtime the native engine owns. Lifecycle + status cross the FFI boundary via
+ * {@link RustEngineNative} (the UniFFI bindings); compound status is a JSON object
+ * (the FFI + JSON decision, pinned by golden tests on both sides).
  *
- * <p>Mainnet-only. The beacon fields of the status snapshot are real (finalized
- * slot, sync period, peer count, beacon state); some EL-side status fields
- * (snap-peer counts, RPC head age) are still zero. The verified-read
- * {@link #requestAccount}/{@link #getStorageProof} queries ARE live — they cross
- * to the Rust {@code ElReader} (discovery + peer pool + the CL-fed execution
- * anchor) and return the same proof/verdict records as the Java engine. The
- * remaining EL queries ({@link #getHeaders}/{@link #getBlockVerified}/
- * {@link #dialPeer}) throw {@link EngineException} until those surfaces land.
+ * <p>The status snapshot is real on both sides: the beacon fields (finalized slot,
+ * sync period, peer count, beacon state) and the EL fields (snap-peer and
+ * snap-serving counts, discovered / backed-off / blacklisted peers, attempted dials)
+ * are parsed from the native status JSON, and the verified-head age is tracked here
+ * from the optimistic head's advance. The verified-read queries —
+ * {@link #requestAccount}/{@link #getStorageProof} and the whole {@link VerifiedReads}
+ * surface behind {@link #reads()} — cross to the Rust {@code ElReader} and return the
+ * same proof/verdict records as the Java engine. The three operator queries
+ * ({@link #getHeaders}/{@link #getBlockVerified}/{@link #dialPeer}) throw
+ * {@link EngineException} by design ({@code NOT_AVAILABLE} below): block reads go
+ * through {@link VerifiedReads}, and the engine dials from its own pool.
  *
- * <p>{@link #reads()} now serves the verified JSON-RPC endpoint (EL-B): on
- * {@link #start()} this handle self-starts the shared {@code jsonrpc-server} on
- * {@code 127.0.0.1:rpcPort} backed by {@link RustVerifiedReads}, mirroring how the
- * Java engine self-starts it inside {@code ChainStack}.
+ * <p>{@link #reads()} serves the verified JSON-RPC endpoint: on {@link #start()} this
+ * handle self-starts the shared {@code jsonrpc-server} on {@code 127.0.0.1:rpcPort}
+ * backed by {@link RustVerifiedReads}, mirroring how the Java engine self-starts it
+ * inside {@code ChainStack}.
  *
  * <p>Idle sleep is REAL on this engine (the Java engine's behaviour, mirrored for
  * Android): {@link #pause()} tears the native networking down while the handle and
@@ -61,8 +66,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     private static final Logger log = LoggerFactory.getLogger(RustChainHandle.class);
 
-    /** Message for the queries the CL-only R1 engine can't answer yet. */
-    private static final String NOT_AVAILABLE = "not available on the R1 Rust engine (CL-only)";
+    /** Message for the operator queries only the Java engine serves — {@code get-headers},
+     *  {@code get-block} and {@code dial}. The Rust engine's block reads go through
+     *  {@link io.myotis.api.VerifiedReads} instead, and it dials from its own pool. */
+    private static final String NOT_AVAILABLE =
+            "not available on the Rust engine (a Java-engine operator query: get-headers, get-block, dial)";
 
     private final long handle;
     private final String networkName;
@@ -687,14 +695,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 List.<ClPeerInfo>of());
     }
 
-    // ---- verified-read surface (EL-B) ----
+    // ---- verified-read surface ----
     //
     // reads() returns the RustVerifiedReads adapter — the JSON-RPC read surface the
     // shared jsonrpc-server serves on 127.0.0.1:rpcPort (started in startRpc()). It
-    // answers the beacon-anchored reads a wallet needs to build a plain-ETH send
-    // (chainId/getBalance/getTransactionCount/syncState) from the same proof-verified
-    // account query as requestAccount below; the rest of VerifiedReads returns null
-    // ("can't answer verified") until later EL-B / EL-C slices land.
+    // answers the whole VerifiedReads surface from the native engine: the
+    // beacon-anchored account / storage / code reads from the same proof-verified
+    // queries as requestAccount below, eth_call and estimateGas (state overrides
+    // included), block, transaction, receipt and fee reads, eth_getLogs over the log
+    // index, and sendRawTransaction. A null from one of its methods means "can't
+    // answer verified" for THAT request (an unservable block pin, malformed input, no
+    // proof at the anchor) — not an unimplemented method.
     //
     // Per the ChainHandle contract, reads() is null "while the RPC backend isn't
     // started (e.g. the RPC port was unavailable at start())". The adapter is itself
@@ -704,15 +715,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // to decide whether verified RPC is available. So: null before start(), when
     // rpcPort<=0, or on a bind failure; non-null once serving.
     //
-    // ens() serves forward resolution via the native resolver (EL-C-5-1); the
-    // Rust engine is mainnet-only and mainnet has ENS, so it is always non-null.
-    // Unimplemented record types report a graceful error RESULT per the EnsApi
-    // contract (see RustEnsApi). The EL QUERY methods further down
-    // (getHeaders/getBlockVerified/dialPeer) still throw EngineException: the
-    // contract reserves exceptions for malformed input / not running, and an
-    // unimplemented EL surface is a capability error (no verification to report
-    // a failReason for) — a failReason record would misrepresent "we can't" as
-    // "we tried and failed".
+    // ens() serves every EnsApi record type via the native resolver, and is non-null
+    // only on ENS-capable networks: mainnet and Sepolia have a registry, gnosis has
+    // none, so hasEns is false there and ens() returns null per the ChainHandle
+    // contract. Every failure — a resolver fault, an offchain name CCIP could not be
+    // driven for, bad arguments, even not-running — lands in the record's error
+    // field (RustEnsApi's documented divergence from JavaEnsApi, which throws for the
+    // last two). The operator queries further down (getHeaders/getBlockVerified/
+    // dialPeer) throw EngineException (NOT_AVAILABLE): the contract reserves
+    // exceptions for malformed input / not running, and a surface this engine does
+    // not serve is a capability error (no verification to report a failReason for)
+    // — a failReason record would misrepresent "we don't" as "we tried and failed".
 
     @Override public VerifiedReads reads() { return rpcServer != null ? verifiedReads : null; }
 
@@ -731,7 +744,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public void setTargetSnapPeers(int target) {
-        log.debug("[engines] setTargetSnapPeers({}) is a no-op on the R1 Rust engine (CL-only)",
+        // The Rust engine sizes its own snap pool (see myotis-net's PoolConfig) and
+        // exports no target knob over the FFI, so the Settings value has nothing to
+        // reach; the Java engine's maintainer is the only consumer of it.
+        log.debug("[engines] setTargetSnapPeers({}) is a no-op on the Rust engine (it sizes its own pool)",
                 target);
     }
 
@@ -765,7 +781,15 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public void clearPeerState() {
-        log.debug("[engines] clearPeerState is a no-op on the R1 Rust engine (CL-only)");
+        // The Rust engine owns its peer caches as files under the data dir and exports
+        // no clear over the FFI, so there is nothing to forward: the hosts' "Clear peer
+        // caches" action deletes the files itself. That sticks only while the network
+        // is stopped — a running pool rewrites the file from memory on its next flush.
+        // The UI offers the action only while stopped anyway (a mis-click guard — owner
+        // ruling, 2026-09-16; NodeScreen's maintenance block has the reasoning), which
+        // on this engine is also the only window where the delete sticks; a live-handle
+        // clear would need a new FFI export.
+        log.debug("[engines] clearPeerState is a no-op on the Rust engine (the hosts delete its cache files)");
     }
 
     @Override
@@ -1220,7 +1244,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return gated(() -> RustEngineNative.nativeGetLogsJson(handle, filterJson));
     }
 
-    /** Install the log-index config; false = invalid config or gate down. */
+    /** Install the log-index config (and apply its {@code unwatch} list); false = invalid config or gate down. */
     @Override
     public boolean setLogIndexConfig(String configJson) {
         try {
