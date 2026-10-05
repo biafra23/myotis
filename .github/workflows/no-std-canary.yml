@@ -1,8 +1,9 @@
 # no_std canary for myotis-core (its Cargo.toml `std` feature, PR #478), and for
 # the crates made no_std-capable after it: myotis-wire, myotis-consensus and
 # myotis-bls (#505). `aes` (myotis-wire's RLPx) can only be steered off its
-# AES-NI code by a cfg, not a feature, so those builds set
-# RUSTFLAGS="--cfg aes_force_soft" -- the same flag an embedder needs.
+# AES-NI code by a cfg, not a feature: rust/.cargo/config.toml sets
+# `--cfg aes_force_soft` for the bare-metal targets, the same flag an embedder
+# outside this workspace needs.
 #
 # `cargo build -p myotis-core --no-default-features` for x86_64-unknown-none, a
 # tier-2 target that ships NO std: a `std::` import, a HashMap, or a dependency
@@ -86,8 +87,6 @@ jobs:
         run: cargo test -p myotis-core --no-default-features
       - name: myotis-wire (execution layer only) — x86_64-unknown-none and UEFI
         working-directory: rust
-        env:
-          RUSTFLAGS: --cfg aes_force_soft
         run: |
           cargo build -p myotis-wire --no-default-features --target x86_64-unknown-none
           cargo build -p myotis-wire --no-default-features --target x86_64-unknown-uefi
@@ -95,8 +94,6 @@ jobs:
       # a panic handler there. UEFI drops the cdylib, and is the embedding anyway.
       - name: myotis-wire with eth2, myotis-consensus, myotis-bls — UEFI
         working-directory: rust
-        env:
-          RUSTFLAGS: --cfg aes_force_soft
         run: cargo build -p myotis-wire -p myotis-consensus -p myotis-bls --no-default-features --features myotis-wire/eth2 --target x86_64-unknown-uefi
       - name: host, myotis-wire's tests in its no_std configurations
         working-directory: rust

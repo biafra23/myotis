@@ -248,6 +248,9 @@ pub(crate) fn decompress_builtin(input: &[u8], max: usize) -> Option<Vec<u8>> {
                     pos += extra;
                 }
                 let l = l.checked_add(1)?;
+                if out.len().checked_add(l)? > len {
+                    return None;
+                }
                 let end = pos.checked_add(l)?;
                 out.extend_from_slice(input.get(pos..end)?);
                 pos = end;
@@ -386,6 +389,50 @@ mod tests {
         // tag 0xfc: literal with a 4-byte length = u32::MAX.
         let bad = [0x05u8, 0xfc, 0xff, 0xff, 0xff, 0xff, 0x00];
         assert!(decompress_builtin(&bad, usize::MAX).is_none());
+    }
+
+    /// Property: on ANY input the built-in raw decoder either returns exactly
+    /// what snap's decoder returns, or None -- never a different success,
+    /// never a panic. Random bytes plus mutated snap encodings, deterministic
+    /// xorshift so a failure reproduces.
+    #[test]
+    fn builtin_raw_decoder_agrees_with_snap_or_refuses() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut corpus: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..3000 {
+            let n = (next() % 300) as usize;
+            corpus.push((0..n).map(|_| next() as u8).collect());
+        }
+        for s in samples() {
+            let enc = snap::raw::Encoder::new().compress_vec(&s).unwrap();
+            for _ in 0..200 {
+                let mut m = enc.clone();
+                if m.is_empty() {
+                    break;
+                }
+                for _ in 0..(1 + next() % 4) {
+                    let i = (next() as usize) % m.len();
+                    m[i] = next() as u8;
+                }
+                if next() % 4 == 0 {
+                    m.truncate((next() as usize) % m.len());
+                }
+                corpus.push(m);
+            }
+        }
+        for input in &corpus {
+            let ours = decompress_builtin(input, 1 << 20);
+            let theirs = snap::raw::Decoder::new().decompress_vec(input).ok();
+            if let Some(o) = &ours {
+                assert_eq!(Some(o), theirs.as_ref(), "built-in decoder accepted what snap decodes differently: {input:02x?}");
+            }
+        }
     }
 
     #[test]

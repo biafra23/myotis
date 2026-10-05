@@ -12,10 +12,10 @@
 //! so we `uncompress` them without the per-key subgroup check (same trade-off the Java
 //! path makes); the attacker-controlled signature IS subgroup-checked.
 
-// no_std + alloc when built without the `std` feature (and without the JNI
-// shim, which needs std): the verify core is pure, and firmware links it via
-// myotis-consensus with default-features = false.
-#![cfg_attr(not(any(feature = "std", feature = "jni")), no_std)]
+// no_std + alloc when built without the `std` feature (`jni` implies `std`):
+// the verify core is pure, and firmware links it via myotis-consensus with
+// default-features = false.
+#![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 

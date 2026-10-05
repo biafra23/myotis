@@ -650,13 +650,13 @@ val wasmTargetInstalled = "wasm32-unknown-unknown" in installedRustupTargets
 val clangAvailable = rustAvailable && probeTool("clang", "--version").isNotEmpty()
 val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     group = "rust"
-    description = "cargo check -p myotis-consensus -p myotis-core for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
+    description = "cargo check -p myotis-consensus -p myotis-core -p myotis-wire for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
     onlyIf { rustAvailable && wasmTargetInstalled && clangAvailable }
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         rustTool("cargo"), "check", "--target", "wasm32-unknown-unknown",
-        "-p", "myotis-consensus", "-p", "myotis-core",
+        "-p", "myotis-consensus", "-p", "myotis-core", "-p", "myotis-wire",
     )
     // No declared outputs, same rationale as cargoTest: cargo's own
     // incrementalism makes a no-change rerun cheap.
@@ -676,13 +676,13 @@ tasks.named("check") { dependsOn(cargoCheckWasm) }
 val noStdTargetInstalled = "x86_64-unknown-none" in installedRustupTargets
 val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
     group = "rust"
-    description = "cargo build -p myotis-core --no-default-features for x86_64-unknown-none — the no_std canary (self-skips without cargo + the rustup target)"
+    description = "cargo build -p myotis-core -p myotis-wire --no-default-features for x86_64-unknown-none — the no_std canary (self-skips without cargo + the rustup target)"
     onlyIf { rustAvailable && noStdTargetInstalled }
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         rustTool("cargo"), "build", "--target", "x86_64-unknown-none",
-        "-p", "myotis-core", "--no-default-features",
+        "-p", "myotis-core", "-p", "myotis-wire", "--no-default-features",
     )
     // No declared outputs, same rationale as cargoTest.
 }

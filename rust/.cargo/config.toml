@@ -18,3 +18,19 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
 
 [target.armv7-linux-androideabi]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+# aes (myotis-wire's RLPx) enables its AES-NI code per function with
+# #[target_feature], which the soft-float bare-metal targets cannot codegen
+# ("Do not know how to split the result of this operator!"), and aes 0.8 has no
+# Cargo feature to turn that off -- only this cfg. Per-target here rather than
+# RUSTFLAGS in CI, so every cargo invocation on these targets gets it (the
+# no_std canary, `./gradlew cargoBuildNoStd`, an embedder building in-tree)
+# and the env never changes the rustc fingerprint for other builds.
+[target.x86_64-unknown-none]
+rustflags = ["--cfg", "aes_force_soft"]
+
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", "aes_force_soft"]
+
+[target.aarch64-unknown-uefi]
+rustflags = ["--cfg", "aes_force_soft"]

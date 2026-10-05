@@ -37,18 +37,8 @@ async-trait = "=0.1.89"
 # FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
 socket2 = "=0.5.10"
 getrandom = "=0.2.17"
-# RLPx (el::rlpx): ECIES (AES-128-CTR + HMAC-SHA256 + concat-KDF over SHA-256)
-# and the framed transport (AES-256-CTR + AES-256-ECB MAC + streaming Keccak-256).
-# All RustCrypto, pure Rust, cargo-ndk-clean. snap (snappy) is already in-tree.
-aes = "=0.8.4"
-ctr = "=0.9.2"
-cipher = "=0.4.4"
-hmac = "=0.12.1"
-sha2 = "=0.10.9"
-sha3 = "=0.10.9"
-# Audited constant-time equality for the ECIES + frame MAC comparisons (a
-# hand-rolled loop risks LLVM lowering it to an early-exit branch).
-subtle = "=2.6.1"
+# RLPx's crypto (ECIES, the frame codec's AES/HMAC/Keccak, constant-time MAC
+# compare) moved to myotis-wire with the code that uses it (#505).
 
 # Tor (docs/privacy-and-tor.md) — OPTIONAL, off by default. Only a host that
 # builds with `--features tor` (today: the desktop engine dylib) pulls the Arti
