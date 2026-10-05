@@ -330,6 +330,13 @@ impl KademliaTable {
         bucket.push(entry);
     }
 
+    /// Forget a node — the fork-id filter placed it on another chain (#539),
+    /// and the pool's below-target walk reads this table.
+    pub fn remove(&mut self, node_id: &[u8]) {
+        let idx = self.bucket_index(node_id);
+        self.buckets[idx].retain(|e| e.node_id != node_id);
+    }
+
     /// The k entries closest (XOR) to `target` (64-byte pubkey or 32-byte id).
     pub fn closest_peers(&self, target: &[u8], k: usize) -> Vec<TableEntry> {
         let target_id = to_node_id(target);
@@ -438,11 +445,13 @@ pub struct Discv4Config {
     /// `None` = every discovered node is handed over at once, as before.
     pub fork_filter: Option<ForkFilter>,
     /// The pool's "below target" flag, set each maintainer tick. While it is
-    /// set, discovered nodes are judged before they are handed over and the
+    /// set, every discovered node is judged before it is handed over and the
     /// first refreshes ask three times as many table peers for neighbours
-    /// ([`WIDE_REFRESHES_MAX`]); while the pool is at target nothing is
-    /// judged — it dials nothing then, and the exchange would only spend
-    /// datagrams. `None` = always judge (tests).
+    /// ([`WIDE_REFRESHES_MAX`]). While the pool is at target — it dials
+    /// nothing then — only nodes already bonding with us are judged (one
+    /// request and response each); nodes learned second-hand from NEIGHBORS go
+    /// over unjudged, as before, rather than be pinged for a verdict nobody
+    /// needs yet. `None` = always judge (tests).
     pub pool_below_target: Option<Arc<AtomicBool>>,
 }
 
@@ -690,21 +699,32 @@ const PING_PENDING_MAX: usize = 4096;
 /// times the FindNode traffic — and three times the ENR exchanges the replies
 /// start — for the life of the process. Eight refreshes are two minutes.
 pub const WIDE_REFRESHES_MAX: u8 = 8;
+/// A new episode's budget is granted at most this often: a pool flapping
+/// around its target every few minutes must not re-earn two wide minutes per
+/// dip.
+pub const WIDE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// The wide fan-out's state: granted anew each time the pool drops below
-/// target, spent one refresh at a time.
+/// The wide fan-out's state: a budget granted when the pool drops below
+/// target — once per [`WIDE_COOLDOWN`] — and spent one refresh at a time.
 #[derive(Debug, Default)]
 struct WideState {
     was_below: bool,
     budget: u8,
+    last_grant: Option<tokio::time::Instant>,
 }
 
 /// Pure: table peers to ask for neighbours this refresh, given the pool's
 /// below-target flag (`None` = no pool hint: the narrow fan-out).
-fn fan_out(state: &mut WideState, below_target: Option<bool>) -> usize {
+fn fan_out(state: &mut WideState, below_target: Option<bool>, now: tokio::time::Instant) -> usize {
     let below = below_target.unwrap_or(false);
     if below && !state.was_below {
-        state.budget = WIDE_REFRESHES_MAX;
+        let cooled = state
+            .last_grant
+            .is_none_or(|t| now.duration_since(t) >= WIDE_COOLDOWN);
+        if cooled {
+            state.budget = WIDE_REFRESHES_MAX;
+            state.last_grant = Some(now);
+        }
     }
     state.was_below = below;
     if below && state.budget > 0 {
@@ -981,8 +1001,18 @@ impl ServiceLoop {
         let Ok(ping_hash) = decode_pong_ping_hash(&p.data) else {
             return;
         };
-        match self.pending_pings.remove(&sender) {
-            Some(expected) if expected.hash == ping_hash => {
+        // Compare before removing: a pong for a ping this entry no longer
+        // records (a refresh or probe ping overwrote it) must not discard the
+        // bond in flight for the newer one.
+        let verified = self
+            .pending_pings
+            .get(&sender)
+            .is_some_and(|p| p.hash == ping_hash);
+        match verified
+            .then(|| self.pending_pings.remove(&sender))
+            .flatten()
+        {
+            Some(_) => {
                 tracing::debug!(%sender, "discv4 pong verified");
                 // NOTE (Java parity): no FindNode here — go-ethereum requires
                 // OUR pong to the bootnode's return Ping before it answers
@@ -1045,18 +1075,25 @@ impl ServiceLoop {
             return self.emit(entry).await;
         };
         match enr.verdicts.get(&entry.node_id) {
-            Some(Verdict::Foreign) => return enr.skip_foreign(),
+            Some(Verdict::Foreign) => {
+                enr.skip_foreign();
+                // It may have entered the table unjudged earlier (see the gate
+                // below); the pool's below-target walk reads the table.
+                return self.forget(&entry.node_id);
+            }
             Some(_) => return self.emit(entry).await,
             None => {}
         }
-        // At target the pool dials nothing, so a judgement now would only
-        // spend datagrams; the node goes over as before and is judged when it
-        // is next seen while the pool wants candidates.
+        // At target the pool dials nothing. A node already bonding with us is
+        // judged anyway — one request and one response — but a node learned
+        // second-hand from NEIGHBORS is not pinged for a verdict nobody needs
+        // yet: it goes over as before, and is judged when it is next seen
+        // while the pool wants candidates.
         let pool_wants = self
             .pool_below_target
             .as_ref()
             .is_none_or(|f| f.load(Ordering::Relaxed));
-        if !pool_wants {
+        if !pool_wants && !bonded {
             return self.emit(entry).await;
         }
         let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
@@ -1178,6 +1215,7 @@ impl ServiceLoop {
                     "discv4: node on another chain (ENR fork id), not handed to the pool"
                 );
                 enr.skip_foreign();
+                self.forget(&pending.entry.node_id);
             }
             Verdict::Compatible => {
                 enr.counts.compatible.fetch_add(1, Ordering::Relaxed);
@@ -1194,6 +1232,8 @@ impl ServiceLoop {
     /// and say how many foreign nodes were kept from the pool.
     async fn sweep_enr(&mut self) {
         let now = tokio::time::Instant::now();
+        // Filter or no filter: pings whose pong is not coming must not pile up.
+        self.prune_pending_pings(now);
         let Some(enr) = self.enr.as_mut() else {
             return;
         };
@@ -1216,9 +1256,15 @@ impl ServiceLoop {
                 .retain(|_, b| now.duration_since(b.since) < BOND_TTL);
         }
         enr.maybe_log(now);
-        self.prune_pending_pings(now);
         for entry in unjudged {
             self.emit(entry).await;
+        }
+    }
+
+    /// Drop a node the filter placed on another chain from the routing table.
+    fn forget(&self, node_id: &[u8]) {
+        if let Ok(mut table) = self.table.lock() {
+            table.remove(node_id);
         }
     }
 
@@ -1294,7 +1340,9 @@ impl ServiceLoop {
         }
         self.probed.insert(addr, now);
         tracing::debug!(%addr, "probing proven peer endpoint");
-        self.send_ping(addr).await;
+        if !self.fresh_ping_pending(addr, now) {
+            self.send_ping(addr).await;
+        }
         let self_target = self.key.public_key_bytes().to_vec();
         self.send_find_node(addr, &self_target).await;
     }
@@ -1327,14 +1375,19 @@ impl ServiceLoop {
             .pool_below_target
             .as_ref()
             .map(|f| f.load(Ordering::Relaxed));
-        let fan_out = fan_out(&mut self.wide, below);
+        let fan_out = fan_out(&mut self.wide, below, tokio::time::Instant::now());
         let mut random_target = [0u8; 64];
         let _ = getrandom::getrandom(&mut random_target);
+        let now = tokio::time::Instant::now();
         for entry in sample(&peers, fan_out) {
             let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
                 continue;
             };
-            self.send_ping(addr).await;
+            // Never over a bond in flight: a second ping would make the first
+            // pong unverifiable.
+            if !self.fresh_ping_pending(addr, now) {
+                self.send_ping(addr).await;
+            }
             self.send_find_node(addr, &random_target).await;
         }
     }
@@ -1512,17 +1565,43 @@ mod tests {
     #[test]
     fn the_wide_fan_out_is_granted_per_below_target_episode_and_runs_out() {
         let mut state = WideState::default();
+        let t0 = tokio::time::Instant::now();
         // No pool hint: narrow.
-        assert_eq!(fan_out(&mut state, None), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, None, t0), REFRESH_SAMPLE);
         // Below target: wide for WIDE_REFRESHES_MAX refreshes, then narrow.
         for _ in 0..WIDE_REFRESHES_MAX {
-            assert_eq!(fan_out(&mut state, Some(true)), REFRESH_SAMPLE_WIDE);
+            assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE_WIDE);
         }
-        assert_eq!(fan_out(&mut state, Some(true)), REFRESH_SAMPLE);
-        assert_eq!(fan_out(&mut state, Some(true)), REFRESH_SAMPLE);
-        // Back at target, then below again: a fresh budget.
-        assert_eq!(fan_out(&mut state, Some(false)), REFRESH_SAMPLE);
-        assert_eq!(fan_out(&mut state, Some(true)), REFRESH_SAMPLE_WIDE);
+        assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE);
+        // Back at target, then below again within the cooldown: no new budget.
+        let soon = t0 + std::time::Duration::from_secs(5 * 60);
+        assert_eq!(fan_out(&mut state, Some(false), soon), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), soon), REFRESH_SAMPLE);
+        // After the cooldown, a dip earns a fresh budget.
+        let later = t0 + WIDE_COOLDOWN;
+        assert_eq!(fan_out(&mut state, Some(false), later), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), later), REFRESH_SAMPLE_WIDE);
+    }
+
+    #[test]
+    fn the_table_forgets_a_node() {
+        let local = key(6);
+        let mut table = KademliaTable::new(local.node_id());
+        let entry = |n: u8| TableEntry {
+            ip: vec![10, 0, 0, n],
+            udp_port: 30303,
+            tcp_port: 30303,
+            node_id: vec![n; 64],
+            last_seen_ms: 0,
+        };
+        table.add(entry(1));
+        table.add(entry(2));
+        table.remove(&[1u8; 64]);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.all_peers()[0].node_id, vec![2u8; 64]);
+        table.remove(&[9u8; 64]); // unknown: a no-op
+        assert_eq!(table.len(), 1);
     }
 
     /// Two services on loopback: the one that bootstraps from the other is
@@ -1632,7 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_enr_request_from_an_unbonded_node_gets_no_answer() {
+    async fn enr_requests_are_answered_for_the_bonded_signer_only() {
         let a_key = Arc::new(key(14));
         let (a_tx, _a_rx) = tokio::sync::mpsc::channel(16);
         let a = Discv4Service::start(
@@ -1647,14 +1726,13 @@ mod tests {
         )
         .await
         .unwrap();
-        // A stranger, never bonded: a valid, unexpired request from it.
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
         let stranger = key(15);
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let request = encode_enr_request(&stranger, expiry_now()).unwrap();
-        sock.send_to(&request, SocketAddr::from(([127, 0, 0, 1], a.local_port())))
-            .await
-            .unwrap();
         let mut buf = [0u8; 2048];
+        // 1. Never bonded: a valid, unexpired request gets no answer.
+        let request = encode_enr_request(&stranger, expiry_now()).unwrap();
+        sock.send_to(&request, a_addr).await.unwrap();
         let answered = tokio::time::timeout(
             std::time::Duration::from_millis(1500),
             sock.recv_from(&mut buf),
@@ -1664,6 +1742,82 @@ mod tests {
             answered.is_err(),
             "an unbonded ENRRequest must get no answer (amplification)"
         );
+        // 2. Bond: ping A; A pongs and pings back; pong that ping. A now holds
+        //    our pong under the stranger's key, and answers our request.
+        let ping = encode_ping(
+            &stranger,
+            &[0, 0, 0, 0],
+            30303,
+            &[127, 0, 0, 1],
+            a.local_port(),
+            expiry_now(),
+        )
+        .unwrap();
+        sock.send_to(&ping, a_addr).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut bonded = false;
+        let mut answered_enr = false;
+        while tokio::time::Instant::now() < deadline && !answered_enr {
+            let Ok(Ok((n, from))) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), sock.recv_from(&mut buf))
+                    .await
+            else {
+                continue;
+            };
+            let Ok(p) = parse(&buf[..n]) else { continue };
+            match p.packet_type {
+                TYPE_PING => {
+                    let pong = encode_pong(
+                        &stranger,
+                        &[127, 0, 0, 1],
+                        from.port(),
+                        &p.hash,
+                        expiry_now(),
+                    )
+                    .unwrap();
+                    sock.send_to(&pong, from).await.unwrap();
+                    bonded = true;
+                    let request = encode_enr_request(&stranger, expiry_now()).unwrap();
+                    sock.send_to(&request, from).await.unwrap();
+                }
+                TYPE_ENR_RESPONSE => {
+                    let (_, raw) = decode_enr_response(&p.data).unwrap();
+                    assert!(
+                        decode_enr(&raw, &a_key.public_key_bytes()).is_ok(),
+                        "A's own record"
+                    );
+                    answered_enr = true;
+                }
+                _ => {} // A's pong, and its ENRRequest to us
+            }
+        }
+        assert!(bonded, "A should ping back a node that pinged it");
+        assert!(
+            answered_enr,
+            "A should answer the bonded signer's ENRRequest"
+        );
+        // 3. The same address, another key: a spoofed source cannot borrow the
+        //    bond (geth checkBond(id, ip)).
+        let impostor = key(16);
+        let request = encode_enr_request(&impostor, expiry_now()).unwrap();
+        sock.send_to(&request, a_addr).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok((n, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                sock.recv_from(&mut buf),
+            )
+            .await
+            else {
+                continue;
+            };
+            if let Ok(p) = parse(&buf[..n]) {
+                assert_ne!(
+                    p.packet_type, TYPE_ENR_RESPONSE,
+                    "another key must not borrow the bond"
+                );
+            }
+        }
         a.stop().await;
     }
 

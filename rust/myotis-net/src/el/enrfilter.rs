@@ -26,8 +26,12 @@
 //! watch's lookback and horizon — is UNKNOWN, not foreign. Another chain's hash
 //! places at a random `T`, so it passes only by the chance a 32-bit value lands
 //! on an epoch boundary inside an 800-day window (about one in 25,000 with the
-//! grid; about one in 60 without it). A node a fork BEHIND is still judged
-//! foreign — `peer::refusing_lag` would refuse it at admission anyway. A node
+//! grid; about one in 60 without it). The placement starts from every hash we
+//! may announce — the pin and its successor — so a pinned fork the network
+//! rescheduled, whose live nodes stay on the pin past the pinned time and
+//! then fork from it, is placed too. A node two or more forks BEHIND is still
+//! judged foreign — `peer::refusing_lag` would refuse it at admission anyway
+//! (one behind the successor is the pin, which is accepted). A node
 //! with no `eth` entry, or one that does not parse, is UNKNOWN and dialed as
 //! before: the filter only ever skips a node it has positively placed on
 //! another chain, and the eth Status check stays the authority.
@@ -105,14 +109,23 @@ impl ForkFilter {
         }
     }
 
-    /// Whether `hash` could be our chain a fork AHEAD of the pin: the one
-    /// activation that turns the hash we announce at `now` into it is a
+    /// Whether `hash` could be our chain a fork AHEAD of what we announce: the
+    /// one activation that turns one of our accepted hashes into it is a
     /// plausible fork time — at or past EIP-2124's timestamp threshold, within
     /// the fork watch's lookback and horizon, and on the beacon epoch grid when
-    /// one is configured.
+    /// one is configured. Placed from the pin AND its successor, as the fork
+    /// watch judges from both baselines: past the pinned time we announce the
+    /// successor, but a network that rescheduled that fork keeps its nodes on
+    /// the pin, and their next fork follows the pin.
     pub fn plausible_successor(&self, hash: [u8; 4], now: u64) -> bool {
-        let (ours, _) = forkid::fork_id_at(u32::from_be_bytes(self.pinned), self.next, now);
-        let t = forkid::activation_of(ours, u32::from_be_bytes(hash));
+        let hash = u32::from_be_bytes(hash);
+        self.accepted
+            .iter()
+            .map(|ours| forkid::activation_of(u32::from_be_bytes(*ours), hash))
+            .any(|t| self.plausible_time(t, now))
+    }
+
+    fn plausible_time(&self, t: u64, now: u64) -> bool {
         if t < forkid::TIMESTAMP_THRESHOLD
             || t < now.saturating_sub(LOOKBACK_SECONDS)
             || t > now.saturating_add(MAX_HORIZON_SECONDS)
@@ -325,6 +338,31 @@ mod tests {
         assert_eq!(
             f.verdict(Some(&eth_entry_rlp(beyond, 0)), next + 1),
             Verdict::Unknown
+        );
+    }
+
+    #[test]
+    fn a_rescheduled_pinned_fork_is_placed_from_the_pin() {
+        // The build pins (pin, T); the network moves the fork to T' ten epochs
+        // later. Past T we announce successor(pin, T), a hash no live node has;
+        // after T' the nodes announce successor(pin, T') — placed from the
+        // PIN, that is plausible, so they stay dialable.
+        let pin = forkid::SEPOLIA_FORK_ID_HASH;
+        let t = forkid::SEPOLIA_FORK_NEXT;
+        let f = ForkFilter::for_chain(pin, t).with_epoch_grid(SEPOLIA_GENESIS, EPOCH);
+        let moved = t + 10 * EPOCH;
+        let after_move = forkid::successor(u32::from_be_bytes(pin), moved).to_be_bytes();
+        let now = moved + 1;
+        assert_eq!(
+            f.verdict(Some(&eth_entry_rlp(after_move, 0)), now),
+            Verdict::Unknown
+        );
+        // Two forks ahead of anything we announce: not placed.
+        let twice =
+            forkid::successor(u32::from_be_bytes(after_move), moved + 100 * EPOCH).to_be_bytes();
+        assert_eq!(
+            f.verdict(Some(&eth_entry_rlp(twice, 0)), now),
+            Verdict::Foreign
         );
     }
 
