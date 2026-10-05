@@ -1740,6 +1740,8 @@ impl ElReader {
         // Gloas: the light client proves only execution block hashes; the pool
         // fetches their headers for the anchor to verify and adopt.
         pool.start_anchor_resolver(Arc::clone(&anchor));
+        // #539: while below target the pool re-offers discovery's whole table.
+        pool.attach_discovery(discovery.table_handle());
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),

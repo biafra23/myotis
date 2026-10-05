@@ -287,6 +287,12 @@ fn anchored_head_number(anchor: &Option<AnchorSource>) -> Option<u64> {
 /// a served proof says where the peer WAS, and so does its next announcement.
 type SharedKnownHead = Arc<std::sync::Mutex<Option<KnownHead>>>;
 
+/// Why the read loop stopped, set once by whichever exit path fired first
+/// (`fail_all`) or by [`ManagedPeer::close`]: the operator-visible reason the
+/// pool logs when it prunes the peer (#539 — a pool that churned through
+/// peers left no line saying why any of them went).
+type SharedCloseReason = Arc<std::sync::Mutex<Option<String>>>;
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
     writer: SharedWriter,
@@ -295,6 +301,8 @@ pub struct ManagedPeer {
     /// Set once the read loop terminates (disconnect / read error); requests
     /// short-circuit instead of hanging until timeout.
     closed: Arc<AtomicBool>,
+    /// Why (see [`SharedCloseReason`]); `None` while open.
+    close_reason: SharedCloseReason,
     /// Consecutive request timeouts with no answer in between — the log
     /// throttle: the first of a silent streak is a WARN naming the peer, the
     /// rest are DEBUG (an EVM prefetch has dozens of requests in flight
@@ -334,6 +342,9 @@ pub struct ManagedPeer {
 impl ManagedPeer {
     /// Invalidate snapshots too: active oracle Arcs must not keep reads alive.
     pub async fn close(&self) {
+        // The reason before the flag: a reader that sees `closed` then asks
+        // why must never find nothing.
+        set_close_reason(&self.close_reason, "closed by this node");
         self.closed.store(true, Ordering::Release);
         let task = self.reader_task.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(task) = task { task.abort(); let _ = task.await; }
@@ -397,6 +408,7 @@ impl ManagedPeer {
         let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        let close_reason: SharedCloseReason = Arc::new(std::sync::Mutex::new(None));
         // eth/69 Status carries the peer's head, judged against our anchored
         // head as of now; eth/68 carries none (only a best hash), so such a
         // peer starts with no known head until it serves or the pool probes it.
@@ -417,6 +429,7 @@ impl ManagedPeer {
             Arc::clone(&pending),
             Arc::clone(&last_response),
             Arc::clone(&closed),
+            Arc::clone(&close_reason),
             snap_codes,
             serve.clone(),
             tx_watch,
@@ -430,6 +443,7 @@ impl ManagedPeer {
             pending,
             next_id: AtomicU64::new(1),
             closed,
+            close_reason,
             timeout_streak: AtomicU64::new(0),
             last_response,
             reader_task: std::sync::Mutex::new(Some(reader_task)),
@@ -458,6 +472,16 @@ impl ManagedPeer {
     /// error); the peer serves no further requests.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Why the peer closed — the remote's Disconnect reason, the read or write
+    /// error, or "closed by this node" — once [`is_closed`](Self::is_closed);
+    /// `None` while open.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The peer's last known head — announced (eth/69 Status /
@@ -521,7 +545,7 @@ impl ManagedPeer {
         // entry inserted above is then drained by that `fail_all`, or by the
         // discarded late response — either way it stays bounded.)
         if let Err(e) = send_frame(&self.writer, send_code, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
             guard.armed = false; // fail_all drained the map
             return Err(e);
         }
@@ -579,7 +603,7 @@ impl ManagedPeer {
         // advanced (see write_frame), so the writer must not be reused — close
         // the peer like every other send path does.
         if let Err(e) = send_frame(&self.writer, messages::BLOCK_RANGE_UPDATE, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
         }
     }
 
@@ -591,7 +615,7 @@ impl ManagedPeer {
     pub async fn send_transaction(&self, raw_tx: &[u8]) -> Result<(), String> {
         let body = messages::encode_transactions(raw_tx);
         if let Err(e) = send_frame(&self.writer, messages::TRANSACTIONS, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
             return Err(e);
         }
         Ok(())
@@ -909,6 +933,7 @@ async fn read_loop(
     pending: PendingMap,
     last_response: SharedLastResponse,
     closed: Arc<AtomicBool>,
+    close_reason: SharedCloseReason,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
@@ -920,7 +945,7 @@ async fn read_loop(
         let frame = match reader.recv().await {
             Ok(f) => f,
             Err(e) => {
-                fail_all(&pending, &closed, format!("peer read loop ended: {e}")).await;
+                fail_all(&pending, &closed, &close_reason, format!("peer read loop ended: {e}")).await;
                 break;
             }
         };
@@ -995,7 +1020,7 @@ async fn read_loop(
             // connection where reads still succeed) means the peer is dead — fail
             // in-flight requests and stop, rather than spin on a zombie.
             if let Err(e) = send_frame(&writer, P2P_PONG, &[0xc0]).await {
-                fail_all(&pending, &closed, format!("peer write failure on Pong: {e}")).await;
+                fail_all(&pending, &closed, &close_reason, format!("peer write failure on Pong: {e}")).await;
                 break;
             }
             continue;
@@ -1004,6 +1029,7 @@ async fn read_loop(
             fail_all(
                 &pending,
                 &closed,
+                &close_reason,
                 format!("peer disconnected: {}", describe_disconnect(&frame.payload)),
             )
             .await;
@@ -1018,7 +1044,7 @@ async fn read_loop(
                 ctx.stats.header_asked();
                 if let Some(resp) = serve_headers(ctx, &frame.payload) {
                     if let Err(e) = send_frame(&writer, messages::BLOCK_HEADERS, &resp).await {
-                        fail_all(&pending, &closed, format!("peer write failure on served headers: {e}"))
+                        fail_all(&pending, &closed, &close_reason, format!("peer write failure on served headers: {e}"))
                             .await;
                         break;
                     }
@@ -1038,7 +1064,7 @@ async fn read_loop(
         // An inbound Get* request we answer with an empty response.
         if let Some((resp_code, empty)) = request_id.and_then(|id| empty_answer(code, &snap_codes, id)) {
             if let Err(e) = send_frame(&writer, resp_code, &empty).await {
-                fail_all(&pending, &closed, format!("peer write failure on empty response: {e}"))
+                fail_all(&pending, &closed, &close_reason, format!("peer write failure on empty response: {e}"))
                     .await;
                 break;
             }
@@ -1053,6 +1079,7 @@ async fn read_loop(
     }
     // Backstop: every break above already set `closed` via `fail_all`, but keep
     // this so any future exit path can't leave the peer looking open.
+    set_close_reason(&close_reason, "peer read loop exited");
     closed.store(true, Ordering::SeqCst);
 }
 
@@ -1095,11 +1122,27 @@ fn requested(max_headers: u64) -> usize {
 /// the peer closed under the pending lock (before draining) so a concurrent
 /// [`ManagedPeer::request`] either inserted before the drain — and gets its Err
 /// here — or observes `closed` and bails, never hanging on a dead connection.
-async fn fail_all(pending: &PendingMap, closed: &Arc<AtomicBool>, reason: String) {
+async fn fail_all(
+    pending: &PendingMap,
+    closed: &Arc<AtomicBool>,
+    close_reason: &SharedCloseReason,
+    reason: String,
+) {
     let mut map = pending.lock().await;
+    // The reason before the flag (see `ManagedPeer::close`).
+    set_close_reason(close_reason, &reason);
     closed.store(true, Ordering::SeqCst);
     for (_id, entry) in map.drain() {
         let _ = entry.tx.send(Err(reason.clone()));
+    }
+}
+
+/// Record why the peer closed. The first reason wins: a write failure that
+/// follows the remote's Disconnect must not overwrite the Disconnect.
+fn set_close_reason(slot: &SharedCloseReason, reason: &str) {
+    let mut r = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if r.is_none() {
+        *r = Some(reason.to_string());
     }
 }
 
@@ -1129,6 +1172,16 @@ fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_close_reason_wins() {
+        // A write failure that follows the remote's Disconnect must not
+        // overwrite the Disconnect (#539).
+        let slot: super::SharedCloseReason = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::set_close_reason(&slot, "peer disconnected: reason=4");
+        super::set_close_reason(&slot, "peer write failure: broken pipe");
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("peer disconnected: reason=4"));
+    }
+
     use super::*;
     use myotis_core::rlp;
 

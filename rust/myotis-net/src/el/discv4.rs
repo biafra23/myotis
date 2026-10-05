@@ -441,6 +441,12 @@ impl Discv4Service {
         self.probe_tx.clone()
     }
 
+    /// The routing table itself, shared with the EL pool's below-target
+    /// re-dial (#539), which walks it for peers to re-offer.
+    pub fn table_handle(&self) -> Arc<Mutex<KademliaTable>> {
+        Arc::clone(&self.table)
+    }
+
     pub fn table_size(&self) -> usize {
         self.table.lock().map(|t| t.len()).unwrap_or(0)
     }
