@@ -3204,24 +3204,17 @@ dependencies = [
 name = "myotis-net"
 version = "0.1.13"
 dependencies = [
- "aes",
  "async-trait",
- "cipher",
- "ctr",
  "discv5",
  "futures",
  "getrandom 0.2.17",
- "hmac",
  "libp2p",
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",
  "myotis-wire",
- "sha2 0.10.9",
- "sha3 0.10.9",
  "snap",
  "socket2 0.5.10",
- "subtle",
  "tokio",
  "tracing",
 ]
