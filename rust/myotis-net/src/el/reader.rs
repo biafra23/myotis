@@ -170,9 +170,13 @@ impl ElConfig {
         // geth lists the NodeOps nodes as ENRs; the entries here are each
         // record's `ip` and `udp` fields, which is all discv4 needs — it pings
         // a bare address cold and learns the node id from the Pong. Mind the
-        // ports: they are per record, not 30303 across the board. The records
-        // carry no `tcp` key (discovery-only nodes), so they are no RLPx dial
-        // targets, and their `ip6`/`udp6` fields are not used.
+        // ports: they are per record, not 30303 across the board. Their
+        // `ip6`/`udp6` fields are not used. The records carry no `tcp` key:
+        // these are discovery-only nodes, and a TCP connect to them times out.
+        // The pool does not know that yet — discv4 admits a bonded node with
+        // its UDP port as the TCP port (`handle_pong`), so below target each
+        // one costs a dial that runs into the handshake timeout and a backoff
+        // (#539: asking a node for its ENR before dialing is what ends this).
         //
         // History: the 2026-09-02 re-sync replaced two addresses geth had
         // dropped (18.188.214.86, 3.219.208.172). With no pinned mainnet

@@ -1,6 +1,6 @@
 //! Live-network integration tests for EL-A3 discv4: bond with a network's
-//! real bootnodes and receive Neighbors, and a per-bootnode census of the
-//! shipped seed list.
+//! real bootnodes and learn nodes beyond them, and a per-bootnode census of
+//! the shipped seed list.
 //!
 //! Ignored by default (needs outbound UDP to the bootnodes). Run with:
 //!
@@ -13,25 +13,32 @@
 //! `params/bootnodes.go`: it says which entries answered from this host. A
 //! silent entry is a statement about this host's path to it as much as about
 //! the node — confirm from a second network before pruning one.
+//!
+//! What the census cannot see: discv4 carries no network id, so an entry
+//! pinned with ANOTHER network's port (the EF NodeOps hosts run one bootnode
+//! per network, on neighbouring ports) answers and hands out neighbours all
+//! the same. Only decoding the upstream ENR catches that; the pin tests in
+//! `el/reader.rs` hold the decoded values.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use myotis_core::keccak::keccak256;
 use myotis_core::nodekey::NodeKey;
-use myotis_net::el::discv4::{Discv4Config, Discv4Service};
+use myotis_net::el::discv4::{Discv4Config, Discv4Service, TableEntry};
 use myotis_net::el::reader::ElConfig;
 
 /// How long one bootnode gets to answer the cold ping and hand out Neighbors.
-/// A healthy one bonds in well under a second; the rest of the window covers
-/// the endpoint proof and the first refresh (10 s after start).
+/// A healthy one bonds in well under a second; Neighbors can only follow the
+/// first refresh (10 s after start), which is when the FindNode goes out, and
+/// the second (25 s) covers a lost datagram.
 const CENSUS_WINDOW: Duration = Duration::from_secs(30);
 
-/// Bootnodes that must answer for discovery to count as seedable. A floor, not
-/// a clean sweep: these are third-party hosts, and geth itself keeps entries
-/// it is phasing out.
-const MIN_ANSWERING: usize = 2;
+/// Bootnodes that must SEED — bond and hand out at least one neighbour — for
+/// discovery to count as seedable. A floor, not a clean sweep: these are
+/// third-party hosts, and geth itself keeps entries it is phasing out.
+const MIN_SEEDING: usize = 2;
 
 /// The network under test and its shipped discv4 seed list — the engine
 /// config, one source of truth (pinned by `mainnet_config_pins_known_values`
@@ -69,7 +76,7 @@ async fn bonds_and_discovers_on_live_network() {
         key,
         Discv4Config {
             bind_port: 0, // ephemeral
-            bootnodes,
+            bootnodes: bootnodes.clone(),
         },
         tx,
     )
@@ -78,10 +85,16 @@ async fn bonds_and_discovers_on_live_network() {
 
     // Neighbors arrive only after the endpoint proof completes (they PING us
     // back, we PONG, they answer FindNode) — allow a couple of refresh cycles.
+    // A bootnode's own bond is an event too (its Pong, then its return Ping),
+    // and a list of five answering seeds would reach the count on those alone
+    // before any FindNode went out: only nodes BEYOND the seed list count.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut discovered = 0usize;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(peer)) if is_bootnode(&bootnodes, &peer) => {
+                eprintln!("[live_discv4] bonded with bootnode {:?}:{}", peer.ip, peer.udp_port);
+            }
             Ok(Some(peer)) => {
                 discovered += 1;
                 eprintln!(
@@ -101,20 +114,33 @@ async fn bonds_and_discovers_on_live_network() {
     service.stop().await;
     assert!(
         discovered > 0,
-        "discovered no peers from the {net} bootnodes within 60s"
+        "learned no node beyond the {net} bootnodes within 60s"
     );
 }
 
+/// Whether a discovery event is one of the configured seeds itself (matched on
+/// its UDP endpoint) rather than a node learned through them.
+fn is_bootnode(bootnodes: &[SocketAddr], entry: &TableEntry) -> bool {
+    let ip = match entry.ip.len() {
+        4 => <[u8; 4]>::try_from(&entry.ip[..]).ok().map(IpAddr::from),
+        16 => <[u8; 16]>::try_from(&entry.ip[..]).ok().map(IpAddr::from),
+        _ => None,
+    };
+    ip.is_some_and(|ip| bootnodes.contains(&SocketAddr::new(ip.to_canonical(), entry.udp_port)))
+}
+
 /// One bootnode's census row: when it first answered (the bond's Pong) and how
-/// far a table seeded from it ALONE got within the window.
+/// many OTHER nodes a table seeded from it alone held at the end of the window.
 struct Census {
     addr: SocketAddr,
     answered_after: Option<Duration>,
-    table: usize,
+    neighbours: usize,
 }
 
-/// Seed a discv4 service from a single bootnode, so whatever lands in its
-/// table can only have come from that node.
+/// Seed a discv4 service from a single bootnode. Its table then starts from
+/// that node's Neighbors alone; within the window the refresh also asks up to
+/// ten of those for theirs, so the count is "reachable through this seed",
+/// not "handed out by it".
 async fn census_one(index: usize, addr: SocketAddr) -> Census {
     // A key per probe: every service is its own node, so one bootnode's bond
     // says nothing about another's.
@@ -128,15 +154,21 @@ async fn census_one(index: usize, addr: SocketAddr) -> Census {
     let start = tokio::time::Instant::now();
     let mut answered_after = None;
     while start.elapsed() < CENSUS_WINDOW {
-        // Keep draining for the whole window: the first event is the bond,
-        // the later ones are the Neighbors that fill the table.
-        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-            answered_after.get_or_insert(start.elapsed());
+        // Keep draining for the whole window: the first event is the bond
+        // (the bootnode's return Ping is a second one for the same node), the
+        // later ones are the Neighbors that fill the table.
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(_)) => {
+                answered_after.get_or_insert(start.elapsed());
+            }
+            Ok(None) => break, // service gone: nothing more can arrive
+            Err(_) => {}
         }
     }
-    let table = service.table_size();
+    // The table holds the bootnode itself once it has bonded.
+    let neighbours = service.table_size().saturating_sub(usize::from(answered_after.is_some()));
     service.stop().await;
-    Census { addr, answered_after, table }
+    Census { addr, answered_after, neighbours }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -151,26 +183,32 @@ async fn each_bootnode_census() {
         .enumerate()
         .map(|(i, addr)| tokio::spawn(census_one(i, *addr)))
         .collect();
-    let mut answering = 0usize;
+    let (mut answering, mut seeding) = (0usize, 0usize);
     for probe in probes {
         let row = probe.await.expect("census task");
         match row.answered_after {
             Some(after) => {
                 answering += 1;
+                seeding += usize::from(row.neighbours > 0);
                 eprintln!(
-                    "[census {net}] {} ANSWERED after {after:.0?}, table seeded from it alone: {}",
-                    row.addr, row.table
+                    "[census {net}] {} ANSWERED after {after:.0?}, other nodes in a table seeded \
+                     from it alone: {}",
+                    row.addr, row.neighbours
                 );
             }
             None => eprintln!("[census {net}] {} SILENT for {CENSUS_WINDOW:?}", row.addr),
         }
     }
-    eprintln!("[census {net}] {answering} of {} bootnodes answered", bootnodes.len());
+    eprintln!(
+        "[census {net}] {answering} of {} bootnodes answered, {seeding} handed out neighbours",
+        bootnodes.len()
+    );
     assert!(
-        answering >= MIN_ANSWERING,
-        "only {answering} of {} {net} discv4 bootnodes answered (want >= {MIN_ANSWERING}) — a \
-         fresh profile cannot seed EL discovery; re-sync the list from go-ethereum's \
-         params/bootnodes.go, or check whether this host is the outlier",
+        seeding >= MIN_SEEDING,
+        "only {seeding} of {} {net} discv4 bootnodes handed out neighbours ({answering} \
+         answered; want >= {MIN_SEEDING} seeding) — a fresh profile cannot seed EL discovery; \
+         re-sync the list from go-ethereum's params/bootnodes.go, or check whether this host \
+         is the outlier",
         bootnodes.len()
     );
 }

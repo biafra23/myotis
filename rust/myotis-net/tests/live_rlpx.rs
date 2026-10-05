@@ -8,6 +8,7 @@
 //! cargo test -p myotis-net --test live_rlpx -- --ignored --nocapture
 //! ```
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +35,7 @@ async fn dials_a_mainnet_peer_to_framed() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
     let discovery = Discv4Service::start(
         Arc::clone(&key),
-        Discv4Config { bind_port: 0, bootnodes },
+        Discv4Config { bind_port: 0, bootnodes: bootnodes.clone() },
         tx,
     )
     .await
@@ -45,6 +46,11 @@ async fn dials_a_mainnet_peer_to_framed() {
     let overall = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut attempts = 0usize;
     let mut framed = false;
+    // Dials run one at a time, so each address gets one try, and the
+    // bootnodes none: a bonded bootnode arrives as an event with its UDP port
+    // for a TCP port, and the EF NodeOps ones are discovery-only — every dial
+    // to one would spend the 10 s handshake timeout out of this test's 90 s.
+    let mut tried: HashSet<SocketAddr> = bootnodes.iter().copied().collect();
     while tokio::time::Instant::now() < overall && !framed {
         let entry = match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
             Ok(Some(e)) => e,
@@ -56,6 +62,9 @@ async fn dials_a_mainnet_peer_to_framed() {
         let Some(tcp_addr) = to_v4(&entry.ip, entry.tcp_port) else {
             continue;
         };
+        if !tried.insert(tcp_addr) {
+            continue;
+        }
         let mut peer_pubkey = [0u8; 64];
         peer_pubkey.copy_from_slice(&entry.node_id);
 
