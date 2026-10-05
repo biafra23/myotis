@@ -431,11 +431,34 @@ pub struct Discv4Config {
 
 /// Handle to a running discv4 service. Dropping it does NOT stop the task;
 /// call [`Discv4Service::stop`].
+/// How the fork-id filter (#539) judged the nodes it saw this run.
+#[derive(Debug, Default)]
+pub struct EnrCounts {
+    /// Handed to the pool on a matching `eth` entry.
+    pub compatible: AtomicU64,
+    /// Kept from the pool: another chain's fork hash. Counted per skip, so a
+    /// node re-learned from NEIGHBORS counts again.
+    pub foreign: AtomicU64,
+    /// Handed to the pool unjudged: no `eth` entry, or no ENR within the
+    /// timeout.
+    pub unjudged: AtomicU64,
+}
+
+impl EnrCounts {
+    /// A plain snapshot `(compatible, foreign, unjudged)`.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.compatible.load(Ordering::Relaxed),
+            self.foreign.load(Ordering::Relaxed),
+            self.unjudged.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct Discv4Service {
     table: Arc<Mutex<KademliaTable>>,
-    /// Nodes the fork-id filter kept from the pool (#539), for the hosts' logs
-    /// and tests.
-    foreign_skipped: Arc<AtomicU64>,
+    /// The fork-id filter's tallies (#539), for the hosts' logs and tests.
+    enr_counts: Arc<EnrCounts>,
     local_port: u16,
     stop_tx: tokio::sync::watch::Sender<bool>,
     /// Probe requests into the service loop (see [`Discv4Service::probe_sender`]).
@@ -461,13 +484,9 @@ impl Discv4Service {
         let table = Arc::new(Mutex::new(KademliaTable::new(key.node_id())));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (probe_tx, probe_rx) = tokio::sync::mpsc::channel(64);
-        let foreign_skipped = Arc::new(AtomicU64::new(0));
+        let enr_counts = Arc::new(EnrCounts::default());
         let enr = match cfg.fork_filter {
-            Some(filter) => Some(EnrExchange::new(
-                &key,
-                filter,
-                Arc::clone(&foreign_skipped),
-            )?),
+            Some(filter) => Some(EnrExchange::new(&key, filter, Arc::clone(&enr_counts))?),
             None => None,
         };
         let loop_state = ServiceLoop {
@@ -488,7 +507,7 @@ impl Discv4Service {
         let task = tokio::spawn(loop_state.run(stop_rx));
         Ok(Discv4Service {
             table,
-            foreign_skipped,
+            enr_counts,
             local_port,
             stop_tx,
             probe_tx,
@@ -515,7 +534,12 @@ impl Discv4Service {
     /// Nodes the fork-id filter placed on another chain and kept from the
     /// pool, this run (#539).
     pub fn foreign_skipped(&self) -> u64 {
-        self.foreign_skipped.load(Ordering::Relaxed)
+        self.enr_counts.foreign.load(Ordering::Relaxed)
+    }
+
+    /// Every verdict the fork-id filter reached this run (#539).
+    pub fn enr_counts(&self) -> &EnrCounts {
+        &self.enr_counts
     }
 
     pub fn table_size(&self) -> usize {
@@ -669,7 +693,7 @@ struct EnrExchange {
     /// Endpoints whose pong we verified, and when: the bond that lets them
     /// ask for our ENR.
     bonded: HashMap<SocketAddr, tokio::time::Instant>,
-    foreign_skipped: Arc<AtomicU64>,
+    counts: Arc<EnrCounts>,
     logged_skipped: u64,
     last_log: tokio::time::Instant,
 }
@@ -678,7 +702,7 @@ impl EnrExchange {
     fn new(
         key: &NodeKey,
         filter: ForkFilter,
-        foreign_skipped: Arc<AtomicU64>,
+        counts: Arc<EnrCounts>,
     ) -> Result<EnrExchange, String> {
         let local_eth = filter.local_eth_entry(expiry_now().saturating_sub(EXPIRY_SECONDS));
         let local = local_enr_rlp(key, 1, &local_eth)?;
@@ -690,7 +714,7 @@ impl EnrExchange {
             pending: HashMap::new(),
             verdicts: HashMap::new(),
             bonded: HashMap::new(),
-            foreign_skipped,
+            counts,
             logged_skipped: 0,
             last_log: tokio::time::Instant::now(),
         })
@@ -742,7 +766,7 @@ impl EnrExchange {
     }
 
     fn skip_foreign(&self) {
-        self.foreign_skipped.fetch_add(1, Ordering::Relaxed);
+        self.counts.foreign.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The periodic summary line, when there is something new to say.
@@ -750,7 +774,7 @@ impl EnrExchange {
         if now.duration_since(self.last_log) < FILTER_LOG_INTERVAL {
             return;
         }
-        let total = self.foreign_skipped.load(Ordering::Relaxed);
+        let (compatible, total, unjudged) = self.counts.snapshot();
         if total > self.logged_skipped {
             let known_foreign = self
                 .verdicts
@@ -761,6 +785,8 @@ impl EnrExchange {
                 skipped = total - self.logged_skipped,
                 total,
                 known_foreign,
+                compatible,
+                unjudged,
                 "discv4: nodes on other chains kept from the pool before any dial (ENR fork id)"
             );
             self.logged_skipped = total;
@@ -957,6 +983,7 @@ impl ServiceLoop {
             None => {
                 if enr.pending.len() >= ENR_PENDING_MAX {
                     // Fail open under load: the pool's Status check still rules.
+                    enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
                     return self.emit(entry).await;
                 }
                 enr.pending.insert(
@@ -1049,7 +1076,14 @@ impl ServiceLoop {
                 );
                 enr.skip_foreign();
             }
-            Verdict::Compatible | Verdict::Unknown => self.emit(pending.entry).await,
+            Verdict::Compatible => {
+                enr.counts.compatible.fetch_add(1, Ordering::Relaxed);
+                self.emit(pending.entry).await;
+            }
+            Verdict::Unknown => {
+                enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                self.emit(pending.entry).await;
+            }
         }
     }
 
@@ -1070,6 +1104,7 @@ impl ServiceLoop {
         for addr in expired {
             if let Some(p) = enr.pending.remove(&addr) {
                 enr.record(p.entry.node_id.clone(), Verdict::Unknown);
+                enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
                 unjudged.push(p.entry);
             }
         }
