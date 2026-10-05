@@ -895,8 +895,11 @@ impl ServiceLoop {
     async fn run(mut self, mut stop_rx: tokio::sync::watch::Receiver<bool>) {
         tracing::info!(port = self.local_port, "discv4 listening");
         // Bootstrap: ping all bootnodes; then refresh every 15 s (first at 10 s).
+        let now = tokio::time::Instant::now();
         for bootnode in self.bootnodes.clone() {
-            self.send_ping(bootnode).await;
+            if !self.fresh_ping_pending(bootnode, now) {
+                self.send_ping(bootnode).await;
+            }
         }
         let mut refresh = tokio::time::interval_at(
             tokio::time::Instant::now() + std::time::Duration::from_secs(10),
@@ -1357,8 +1360,13 @@ impl ServiceLoop {
             .unwrap_or_default();
         tracing::debug!(table = peers.len(), "discv4 refresh");
         if peers.is_empty() {
+            let now = tokio::time::Instant::now();
             for bootnode in self.bootnodes.clone() {
-                self.send_ping(bootnode).await;
+                // Not over a bond in flight (the previous refresh's ping is
+                // inside its 20 s expiry when the next one fires).
+                if !self.fresh_ping_pending(bootnode, now) {
+                    self.send_ping(bootnode).await;
+                }
             }
             return;
         }

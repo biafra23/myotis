@@ -25,8 +25,9 @@
 //! it) is a plausible fork time — on the beacon epoch grid, within the fork
 //! watch's lookback and horizon — is UNKNOWN, not foreign. Another chain's hash
 //! places at a random `T`, so it passes only by the chance a 32-bit value lands
-//! on an epoch boundary inside an 800-day window (about one in 25,000 with the
-//! grid; about one in 60 without it). The placement starts from every hash we
+//! on an epoch boundary inside an 800-day window: about one in 25,000 with the
+//! grid and one in 60 without it per baseline, twice that where a pinned
+//! `next` gives two. The placement starts from every hash we
 //! may announce — the pin and its successor — so a pinned fork the network
 //! rescheduled, whose live nodes stay on the pin past the pinned time and
 //! then fork from it, is placed too. A node two or more forks BEHIND is still
