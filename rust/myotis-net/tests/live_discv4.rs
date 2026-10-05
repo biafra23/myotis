@@ -20,6 +20,7 @@
 //! the same. Only decoding the upstream ENR catches that; the pin tests in
 //! `el/reader.rs` hold the decoded values.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +74,7 @@ async fn bonds_and_discovers_on_live_network() {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let service = Discv4Service::start(
-        key,
+        Arc::clone(&key),
         Discv4Config {
             bind_port: 0, // ephemeral
             bootnodes: bootnodes.clone(),
@@ -88,15 +89,25 @@ async fn bonds_and_discovers_on_live_network() {
     // A bootnode's own bond is an event too (its Pong, then its return Ping),
     // and a list of five answering seeds would reach the count on those alone
     // before any FindNode went out: only nodes BEYOND the seed list count.
+    // Nor does our own record: the refresh asks each bootnode for the nodes
+    // closest to US, and a bootnode that just bonded with us tends to answer
+    // with us, which `handle_neighbors` passes through unfiltered. Distinct
+    // node ids, so a re-bond re-emitting the same peer is not a second find.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut discovered = 0usize;
+    let mut discovered: HashSet<Vec<u8>> = HashSet::new();
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
             Ok(Some(peer)) if is_bootnode(&bootnodes, &peer) => {
                 eprintln!("[live_discv4] bonded with bootnode {:?}:{}", peer.ip, peer.udp_port);
             }
+            Ok(Some(peer)) if is_self(&key, &peer) => {
+                eprintln!("[live_discv4] a bootnode echoed our own record");
+            }
             Ok(Some(peer)) => {
-                discovered += 1;
+                if !discovered.insert(peer.node_id.clone()) {
+                    continue;
+                }
+                let discovered = discovered.len();
                 eprintln!(
                     "[live_discv4] peer #{discovered}: {:?}:{} table={}",
                     peer.ip,
@@ -113,9 +124,15 @@ async fn bonds_and_discovers_on_live_network() {
 
     service.stop().await;
     assert!(
-        discovered > 0,
-        "learned no node beyond the {net} bootnodes within 60s"
+        !discovered.is_empty(),
+        "learned no node beyond the {net} bootnodes (and ourselves) within 60s"
     );
+}
+
+/// Whether a discovery event is this probe's own record, echoed back by a
+/// bootnode answering FindNode(self).
+fn is_self(key: &NodeKey, entry: &TableEntry) -> bool {
+    entry.node_id == key.public_key_bytes()
 }
 
 /// Whether a discovery event is one of the configured seeds itself (matched on
@@ -130,45 +147,55 @@ fn is_bootnode(bootnodes: &[SocketAddr], entry: &TableEntry) -> bool {
 }
 
 /// One bootnode's census row: when it first answered (the bond's Pong) and how
-/// many OTHER nodes a table seeded from it alone held at the end of the window.
+/// many OTHER nodes a service seeded from it alone learned within the window.
 struct Census {
     addr: SocketAddr,
     answered_after: Option<Duration>,
     neighbours: usize,
 }
 
-/// Seed a discv4 service from a single bootnode. Its table then starts from
-/// that node's Neighbors alone; within the window the refresh also asks up to
-/// ten of those for theirs, so the count is "reachable through this seed",
-/// not "handed out by it".
+/// Seed a discv4 service from a single bootnode. What it learns then starts
+/// from that node's Neighbors alone; within the window the refresh also asks
+/// up to ten of those for theirs, so the count is "reachable through this
+/// seed", not "handed out by it". Counted as distinct node ids from the
+/// events, minus the bootnode itself and minus our own record (a bootnode
+/// answering FindNode(self) tends to include the asker) — not from the table,
+/// whose size also moves with bucket eviction.
 async fn census_one(index: usize, addr: SocketAddr) -> Census {
     // A key per probe: every service is its own node, so one bootnode's bond
     // says nothing about another's.
     let seed = keccak256(format!("myotis-live-discv4-census-{index}").as_bytes());
     let key = Arc::new(NodeKey::from_secret_bytes(&seed).unwrap());
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-    let service = Discv4Service::start(key, Discv4Config { bind_port: 0, bootnodes: vec![addr] }, tx)
-        .await
-        .expect("discv4 start");
+    let service = Discv4Service::start(
+        Arc::clone(&key),
+        Discv4Config { bind_port: 0, bootnodes: vec![addr] },
+        tx,
+    )
+    .await
+    .expect("discv4 start");
 
     let start = tokio::time::Instant::now();
     let mut answered_after = None;
+    let mut others: HashSet<Vec<u8>> = HashSet::new();
     while start.elapsed() < CENSUS_WINDOW {
         // Keep draining for the whole window: the first event is the bond
         // (the bootnode's return Ping is a second one for the same node), the
-        // later ones are the Neighbors that fill the table.
+        // later ones are the Neighbors.
         match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Some(_)) => {
+            Ok(Some(entry)) if is_bootnode(&[addr], &entry) => {
                 answered_after.get_or_insert(start.elapsed());
+            }
+            Ok(Some(entry)) if is_self(&key, &entry) => {}
+            Ok(Some(entry)) => {
+                others.insert(entry.node_id);
             }
             Ok(None) => break, // service gone: nothing more can arrive
             Err(_) => {}
         }
     }
-    // The table holds the bootnode itself once it has bonded.
-    let neighbours = service.table_size().saturating_sub(usize::from(answered_after.is_some()));
     service.stop().await;
-    Census { addr, answered_after, neighbours }
+    Census { addr, answered_after, neighbours: others.len() }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -191,8 +218,8 @@ async fn each_bootnode_census() {
                 answering += 1;
                 seeding += usize::from(row.neighbours > 0);
                 eprintln!(
-                    "[census {net}] {} ANSWERED after {after:.0?}, other nodes in a table seeded \
-                     from it alone: {}",
+                    "[census {net}] {} ANSWERED after {after:.0?}, other nodes learned through \
+                     it alone: {}",
                     row.addr, row.neighbours
                 );
             }
