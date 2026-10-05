@@ -991,6 +991,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **app-ios** -- the iOS host: a Kotlin/Native framework (`MyotisKit`) bundling `:ui` with iOS seam actuals over the Rust engine's plain C ABI; the Xcode shell lives in `ios-app/` (the JVM engine never runs on iOS)
 - **android-app** -- the Android wallet node (`NodeService` foreground service). Runs the full devp2p + libp2p stack, the local EVM, and the JSON-RPC server on-device, with Android-native peer/snapshot caching and a Compose UI; persists the sync snapshot, the known-state-root window, and light-client-capable peers for fast warm restarts (~10 s vs. a cold checkpoint bootstrap).
 - **rust/myotis-node** (Cargo, not Gradle) -- the Node.js (napi-rs) addon over the engine's C ABI, for Electron/Node hosts — the embedding the Freedom browser's experimental Myotis tier consumes
+- **rust/myotis-rpcd** (Cargo, not Gradle) -- a standalone JSON-RPC daemon over the Rust engine's verified reads, for hosts that can't or won't run the JVM (servers, containers, a Bee node's RPC endpoint) — see [rust/myotis-rpcd/README.md](rust/myotis-rpcd/README.md)
 
 ### Protocol flow
 

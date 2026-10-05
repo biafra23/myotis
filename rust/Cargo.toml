@@ -21,6 +21,11 @@
 #   myotis-engine    — the Rust implementation of the io.myotis.api engine contract
 #                      (libmyotis_engine): UniFFI exports for the JVM hosts (ffi.rs)
 #                      plus the plain C ABI for iOS/Rust hosts (capi.rs).
+#   myotis-rpcd      — a standalone JSON-RPC daemon over myotis-engine's verified
+#                      reads, for hosts that can't or won't run the JVM. A
+#                      member, unlike roost: it links the engine in-process (so
+#                      `panic = "abort"` is the contract it already lives under)
+#                      and adds only a blocking HTTP server and clap.
 #   uniffi-bindgen   — the pinned uniffi-bindgen CLI (Gradle `uniffiGenerateKotlin`
 #                      regenerates :myotis-engines' committed Kotlin bindings with it).
 #
@@ -29,7 +34,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "uniffi-bindgen"]
+members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "myotis-rpcd", "uniffi-bindgen"]
 # tor-poc (docs/privacy-and-tor.md §3 proof-of-concept) is a STANDALONE crate,
 # excluded on purpose: it pulls the whole Arti dependency tree, which must never
 # burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
