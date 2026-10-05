@@ -9,7 +9,9 @@ Reference modules: `core/` and `networking/` (`com.jaeckel.ethp2p.core`, `…net
 
 > **Scope note.** The reference is a **client/dialer only**: it dials peers but never listens; it
 > sends discv4 Ping/FindNode but does **not** respond to FindNode and does **not** implement
-> ENRRequest/ENRResponse; it answers inbound `eth`/`snap` requests with **empty** responses (so
+> ENRRequest/ENRResponse (the Rust engine does implement the latter since #539 — it asks a
+> discovered node for its ENR to judge its chain before dialing, and answers bonded requesters);
+> it answers inbound `eth`/`snap` requests with **empty** responses (so
 > peers don't time out and disconnect). A re-implementation that also *serves* would need the
 > responder halves. For a wallet engine, client-only is correct and far simpler.
 
@@ -74,7 +76,7 @@ Types & bodies (`VERSION = 4`, `expiry = now + 20 s`; endpoint = `[ip(4|16), udp
 | FindNode | `0x03` | `[target(64-byte pubkey), expiry]` |
 | Neighbors | `0x04` | `[[ip, udp, tcp, nodeId], …], expiry]` (decode only) |
 
-(ENRRequest/ENRResponse `0x05/0x06` are not implemented.)
+(ENRRequest/ENRResponse `0x05/0x06`: not implemented in the Java reference; the Rust engine, since #539, sends ENRRequest `[expiration]` to bonded nodes and answers bonded requesters with ENRResponse `[request-hash, ENR]` — `rust/myotis-net/src/el/discv4.rs`, `enrfilter.rs`.)
 
 ### 2.2 Kademlia table
 

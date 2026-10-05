@@ -43,7 +43,7 @@ async fn the_filter_judges_live_nodes() {
             bind_port: 0,
             bootnodes: cfg.bootnodes.clone(),
             fork_filter: filter_on.then(|| ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next)),
-            wide_refresh: None,
+            pool_below_target: None,
         },
         tx,
     )
