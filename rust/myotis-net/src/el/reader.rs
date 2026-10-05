@@ -1712,9 +1712,21 @@ impl ElReader {
         read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
+        let below_target = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let discovery = Discv4Service::start(
             Arc::clone(&key),
-            Discv4Config { bind_port: cfg.discv4_port, bootnodes: cfg.bootnodes.clone() },
+            Discv4Config {
+                bind_port: cfg.discv4_port,
+                bootnodes: cfg.bootnodes.clone(),
+                // #539: a node whose ENR places it on another chain never
+                // reaches the pool; the pool's below-target hint widens the
+                // refresh fan-out.
+                fork_filter: Some(crate::el::enrfilter::ForkFilter::for_chain(
+                    cfg.fork_id_hash,
+                    cfg.fork_next,
+                )),
+                wide_refresh: Some(Arc::clone(&below_target)),
+            },
             tx,
         )
         .await?;
@@ -1770,7 +1782,7 @@ impl ElReader {
         // fetches their headers for the anchor to verify and adopt.
         pool.start_anchor_resolver(Arc::clone(&anchor));
         // #539: while below target the pool re-offers discovery's whole table.
-        pool.attach_discovery(discovery.table_handle());
+        pool.attach_discovery(discovery.table_handle(), below_target);
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),

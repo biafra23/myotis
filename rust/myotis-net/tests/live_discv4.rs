@@ -37,6 +37,7 @@ async fn bonds_and_discovers_on_live_mainnet() {
         Discv4Config {
             bind_port: 0, // ephemeral
             bootnodes,
+            ..Default::default()
         },
         tx,
     )

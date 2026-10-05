@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myotis_core::keccak::{keccak256, keccak256_concat};
@@ -25,10 +26,15 @@ use myotis_core::nodekey::{recover_public_key, NodeKey};
 use myotis_core::rlp::{self, Item};
 use myotis_core::CoreError;
 
+use crate::el::enrfilter::{decode_enr, local_enr_rlp, ForkFilter, Verdict};
+
 pub const TYPE_PING: u8 = 0x01;
 pub const TYPE_PONG: u8 = 0x02;
 pub const TYPE_FIND_NODE: u8 = 0x03;
 pub const TYPE_NEIGHBORS: u8 = 0x04;
+/// EIP-868: ask a bonded node for its ENR; the reply echoes the request hash.
+pub const TYPE_ENR_REQUEST: u8 = 0x05;
+pub const TYPE_ENR_RESPONSE: u8 = 0x06;
 
 /// Ping/Pong protocol version.
 const VERSION: u64 = 4;
@@ -91,6 +97,41 @@ pub fn encode_find_node(key: &NodeKey, target: &[u8], expiry: u64) -> Result<Vec
 }
 
 /// Endpoint: `[ip(4|16), udpPort, tcpPort]`.
+/// EIP-868 ENRRequest: `[expiration]`.
+pub fn encode_enr_request(key: &NodeKey, expiry: u64) -> Result<Vec<u8>, CoreError> {
+    let payload = rlp::encode_u64(expiry);
+    encode_packet(key, TYPE_ENR_REQUEST, &rlp::encode_list_payload(&payload))
+}
+
+/// EIP-868 ENRResponse: `[request-hash, ENR]`, the ENR spliced in as the RLP
+/// list it already is.
+pub fn encode_enr_response(
+    key: &NodeKey,
+    request_hash: &[u8; 32],
+    enr_rlp: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    let mut payload = rlp::encode_bytes(request_hash);
+    payload.extend_from_slice(enr_rlp);
+    encode_packet(key, TYPE_ENR_RESPONSE, &rlp::encode_list_payload(&payload))
+}
+
+/// The request hash and the ENR (re-encoded from the parsed list — canonical
+/// RLP, which is what an ENR signature covers) of an ENRResponse.
+pub fn decode_enr_response(data: &[u8]) -> Result<([u8; 32], Vec<u8>), CoreError> {
+    let top = decode_lenient(data)?;
+    let items = top.as_list()?;
+    let hash_item = items
+        .first()
+        .ok_or_else(|| CoreError("ENRResponse: missing request hash".into()))?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(hash_item.as_fixed_bytes(32)?);
+    let enr = items
+        .get(1)
+        .filter(|e| e.is_list())
+        .ok_or_else(|| CoreError("ENRResponse: missing ENR".into()))?;
+    Ok((hash, rlp::encode(enr)))
+}
+
 fn encode_endpoint(ip: &[u8], udp_port: u16, tcp_port: u16) -> Vec<u8> {
     let mut payload = rlp::encode_bytes(ip);
     payload.extend_from_slice(&rlp::encode_u64(u64::from(udp_port)));
@@ -372,17 +413,29 @@ impl PingRateLimiter {
 // ---------------------------------------------------------------------------
 
 /// Configuration for [`Discv4Service::start`].
+#[derive(Default)]
 pub struct Discv4Config {
     /// UDP bind port (0 = ephemeral, for tests).
     pub bind_port: u16,
     /// Bootnode `ip:port` addresses (bare, no keys — discv4 pings them cold).
     pub bootnodes: Vec<SocketAddr>,
+    /// EIP-2124 fork-id pre-filter (#539): a node whose ENR places it on
+    /// another chain is never handed to the pool, and a node whose ENR is
+    /// still unknown waits for it (at most [`ENR_TIMEOUT`]) before it is.
+    /// `None` = every discovered node is handed over at once, as before.
+    pub fork_filter: Option<ForkFilter>,
+    /// Set by the pool while it is below target: `refresh` then asks three
+    /// times as many table peers for neighbours.
+    pub wide_refresh: Option<Arc<AtomicBool>>,
 }
 
 /// Handle to a running discv4 service. Dropping it does NOT stop the task;
 /// call [`Discv4Service::stop`].
 pub struct Discv4Service {
     table: Arc<Mutex<KademliaTable>>,
+    /// Nodes the fork-id filter kept from the pool (#539), for the hosts' logs
+    /// and tests.
+    foreign_skipped: Arc<AtomicU64>,
     local_port: u16,
     stop_tx: tokio::sync::watch::Sender<bool>,
     /// Probe requests into the service loop (see [`Discv4Service::probe_sender`]).
@@ -408,6 +461,15 @@ impl Discv4Service {
         let table = Arc::new(Mutex::new(KademliaTable::new(key.node_id())));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (probe_tx, probe_rx) = tokio::sync::mpsc::channel(64);
+        let foreign_skipped = Arc::new(AtomicU64::new(0));
+        let enr = match cfg.fork_filter {
+            Some(filter) => Some(EnrExchange::new(
+                &key,
+                filter,
+                Arc::clone(&foreign_skipped),
+            )?),
+            None => None,
+        };
         let loop_state = ServiceLoop {
             key,
             socket,
@@ -420,10 +482,13 @@ impl Discv4Service {
             limiter: PingRateLimiter::default(),
             probe_rx,
             probed: HashMap::new(),
+            enr,
+            wide_refresh: cfg.wide_refresh,
         };
         let task = tokio::spawn(loop_state.run(stop_rx));
         Ok(Discv4Service {
             table,
+            foreign_skipped,
             local_port,
             stop_tx,
             probe_tx,
@@ -445,6 +510,12 @@ impl Discv4Service {
     /// re-dial (#539), which walks it for peers to re-offer.
     pub fn table_handle(&self) -> Arc<Mutex<KademliaTable>> {
         Arc::clone(&self.table)
+    }
+
+    /// Nodes the fork-id filter placed on another chain and kept from the
+    /// pool, this run (#539).
+    pub fn foreign_skipped(&self) -> u64 {
+        self.foreign_skipped.load(Ordering::Relaxed)
     }
 
     pub fn table_size(&self) -> usize {
@@ -547,6 +618,155 @@ struct ServiceLoop {
     probe_rx: tokio::sync::mpsc::Receiver<SocketAddr>,
     /// Endpoint → last probe instant (1 h per-endpoint dedup, bounded).
     probed: HashMap<SocketAddr, tokio::time::Instant>,
+    /// The EIP-868 exchange behind the fork-id filter (#539); `None` = no
+    /// filter, every node is handed to the pool at once.
+    enr: Option<EnrExchange>,
+    /// The pool's below-target hint: a wider FindNode fan-out per refresh.
+    wide_refresh: Option<Arc<AtomicBool>>,
+}
+
+/// How long a node may stay unjudged before it is handed to the pool anyway:
+/// a node that never answers an ENRRequest (an old client, a lost datagram)
+/// costs this much delay once and is then dialed as before — the filter fails
+/// open.
+pub const ENR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// ENRRequests per pending node: one when its pong arrives, one more when its
+/// ping does (whichever of the two the remote counts as our bond).
+const ENR_REQUESTS_MAX: u8 = 2;
+/// Nodes awaiting an ENR at once; beyond it a node is handed over unjudged.
+const ENR_PENDING_MAX: usize = 512;
+/// Remembered verdicts (by node id); cleared wholesale when full.
+const ENR_VERDICTS_MAX: usize = 4096;
+/// How long a verified pong counts as a bond for answering ENRRequests, and
+/// the cap on remembered bonds.
+const BOND_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const BONDED_MAX: usize = 4096;
+/// How often the exchange says how many foreign nodes it kept from the pool.
+const FILTER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Table peers asked for neighbours per refresh, and the wider fan-out while
+/// the pool is below target.
+const REFRESH_SAMPLE: usize = 10;
+const REFRESH_SAMPLE_WIDE: usize = 30;
+
+/// A discovered node waiting for its ENR before it is handed to the pool.
+struct PendingEnr {
+    entry: TableEntry,
+    /// Hashes of the ENRRequests sent, newest last (at most ENR_REQUESTS_MAX).
+    hashes: Vec<[u8; 32]>,
+    since: tokio::time::Instant,
+}
+
+/// The EIP-868 ENR exchange that feeds the fork-id filter (#539).
+struct EnrExchange {
+    filter: ForkFilter,
+    /// Our own record, as RLP, and the fork id it carries.
+    local: Vec<u8>,
+    local_seq: u64,
+    local_eth: Vec<u8>,
+    pending: HashMap<SocketAddr, PendingEnr>,
+    /// node id → verdict, for the run (bounded).
+    verdicts: HashMap<Vec<u8>, Verdict>,
+    /// Endpoints whose pong we verified, and when: the bond that lets them
+    /// ask for our ENR.
+    bonded: HashMap<SocketAddr, tokio::time::Instant>,
+    foreign_skipped: Arc<AtomicU64>,
+    logged_skipped: u64,
+    last_log: tokio::time::Instant,
+}
+
+impl EnrExchange {
+    fn new(
+        key: &NodeKey,
+        filter: ForkFilter,
+        foreign_skipped: Arc<AtomicU64>,
+    ) -> Result<EnrExchange, String> {
+        let local_eth = filter.local_eth_entry(expiry_now().saturating_sub(EXPIRY_SECONDS));
+        let local = local_enr_rlp(key, 1, &local_eth)?;
+        Ok(EnrExchange {
+            filter,
+            local,
+            local_seq: 1,
+            local_eth,
+            pending: HashMap::new(),
+            verdicts: HashMap::new(),
+            bonded: HashMap::new(),
+            foreign_skipped,
+            logged_skipped: 0,
+            last_log: tokio::time::Instant::now(),
+        })
+    }
+
+    /// Re-sign our record when the fork schedule moved its `eth` entry.
+    fn refresh_local(&mut self, key: &NodeKey) {
+        let eth = self
+            .filter
+            .local_eth_entry(expiry_now().saturating_sub(EXPIRY_SECONDS));
+        if eth == self.local_eth {
+            return;
+        }
+        match local_enr_rlp(key, self.local_seq + 1, &eth) {
+            Ok(local) => {
+                self.local = local;
+                self.local_seq += 1;
+                self.local_eth = eth;
+                tracing::info!(
+                    seq = self.local_seq,
+                    "discv4: our ENR follows the fork schedule"
+                );
+            }
+            Err(e) => tracing::debug!("discv4: could not re-sign our ENR: {e}"),
+        }
+    }
+
+    fn is_bonded(&self, addr: SocketAddr, now: tokio::time::Instant) -> bool {
+        self.bonded
+            .get(&addr)
+            .is_some_and(|t| now.duration_since(*t) < BOND_TTL)
+    }
+
+    fn mark_bonded(&mut self, addr: SocketAddr, now: tokio::time::Instant) {
+        if self.bonded.len() >= BONDED_MAX {
+            self.bonded.retain(|_, t| now.duration_since(*t) < BOND_TTL);
+            if self.bonded.len() >= BONDED_MAX {
+                self.bonded.clear();
+            }
+        }
+        self.bonded.insert(addr, now);
+    }
+
+    fn record(&mut self, node_id: Vec<u8>, verdict: Verdict) {
+        if self.verdicts.len() >= ENR_VERDICTS_MAX {
+            self.verdicts.clear();
+        }
+        self.verdicts.insert(node_id, verdict);
+    }
+
+    fn skip_foreign(&self) {
+        self.foreign_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The periodic summary line, when there is something new to say.
+    fn maybe_log(&mut self, now: tokio::time::Instant) {
+        if now.duration_since(self.last_log) < FILTER_LOG_INTERVAL {
+            return;
+        }
+        let total = self.foreign_skipped.load(Ordering::Relaxed);
+        if total > self.logged_skipped {
+            let known_foreign = self
+                .verdicts
+                .values()
+                .filter(|v| **v == Verdict::Foreign)
+                .count();
+            tracing::info!(
+                skipped = total - self.logged_skipped,
+                total,
+                known_foreign,
+                "discv4: nodes on other chains kept from the pool before any dial (ENR fork id)"
+            );
+            self.logged_skipped = total;
+        }
+        self.last_log = now;
+    }
 }
 
 impl ServiceLoop {
@@ -563,6 +783,9 @@ impl ServiceLoop {
         // After a stall/sleep, catch up with ONE tick, not a burst of them —
         // otherwise we'd flood peers with a storm of FindNodes on wakeup.
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The ENR exchange's timeout sweep (a no-op without a filter).
+        let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = vec![0u8; RECV_BUF];
         loop {
             tokio::select! {
@@ -571,6 +794,7 @@ impl ServiceLoop {
                     return;
                 }
                 _ = refresh.tick() => self.refresh().await,
+                _ = sweep.tick() => self.sweep_enr().await,
                 // `Some(addr) =` disables this branch once all senders drop
                 // (recv() → None fails the pattern) — no busy-loop at shutdown.
                 Some(addr) = self.probe_rx.recv() => self.probe(addr).await,
@@ -603,6 +827,8 @@ impl ServiceLoop {
             TYPE_PING => self.handle_ping(p, sender).await,
             TYPE_PONG => self.handle_pong(p, sender).await,
             TYPE_NEIGHBORS => self.handle_neighbors(p, sender).await,
+            TYPE_ENR_REQUEST => self.handle_enr_request(p, sender).await,
+            TYPE_ENR_RESPONSE => self.handle_enr_response(p, sender).await,
             // FindNode inbound: deliberately unanswered (client-only stack).
             other => tracing::trace!(?other, %sender, "discv4 ignoring packet type"),
         }
@@ -631,7 +857,21 @@ impl ServiceLoop {
             Ok((_, tcp)) if (1..=i32::MAX as u32).contains(&tcp) => tcp,
             _ => u32::from(sender.port()),
         };
-        self.admit(sender, tcp_port, p.sender_pubkey.to_vec()).await;
+        // Bond back when we have not (geth does): a node answers an
+        // ENRRequest only from a node whose pong it holds — and so do we — so
+        // the exchange needs the bond in both directions.
+        let bond_back = self
+            .enr
+            .as_ref()
+            .is_some_and(|e| !e.is_bonded(sender, tokio::time::Instant::now()))
+            && !self.pending_pings.contains_key(&sender);
+        if bond_back {
+            self.send_ping(sender).await;
+        }
+        // Its ping is in hand, so our pong is on its way: an ENRRequest now
+        // meets a node that counts us as bonded.
+        self.admit(sender, tcp_port, p.sender_pubkey.to_vec(), true)
+            .await;
     }
 
     async fn handle_pong(&mut self, p: Parsed, sender: SocketAddr) {
@@ -644,8 +884,16 @@ impl ServiceLoop {
                 // NOTE (Java parity): no FindNode here — go-ethereum requires
                 // OUR pong to the bootnode's return Ping before it answers
                 // FindNode; the refresh loop issues FindNodes later.
-                self.admit(sender, u32::from(sender.port()), p.sender_pubkey.to_vec())
-                    .await;
+                if let Some(enr) = self.enr.as_mut() {
+                    enr.mark_bonded(sender, tokio::time::Instant::now());
+                }
+                self.admit(
+                    sender,
+                    u32::from(sender.port()),
+                    p.sender_pubkey.to_vec(),
+                    true,
+                )
+                .await;
             }
             _ => tracing::debug!(%sender, "discv4 unsolicited/mismatched pong"),
         }
@@ -667,12 +915,14 @@ impl ServiceLoop {
                 node_id: peer.node_id,
                 last_seen_ms: now_ms(),
             };
-            self.emit(entry).await;
+            // Learned second-hand: no bond yet, so the exchange pings first.
+            self.consider(entry, false).await;
         }
     }
 
     /// Table-add + discovered-peer event for a directly-bonded sender.
-    async fn admit(&mut self, sender: SocketAddr, tcp_port: u32, node_id: Vec<u8>) {
+    /// `bonded`: the remote holds our pong (see `consider`).
+    async fn admit(&mut self, sender: SocketAddr, tcp_port: u32, node_id: Vec<u8>, bonded: bool) {
         let entry = TableEntry {
             ip: ip_bytes(sender.ip()),
             udp_port: sender.port(),
@@ -680,7 +930,156 @@ impl ServiceLoop {
             node_id,
             last_seen_ms: now_ms(),
         };
-        self.emit(entry).await;
+        self.consider(entry, bonded).await;
+    }
+
+    /// Hand a discovered node to the pool — at once without a filter or with a
+    /// verdict in hand; otherwise after its ENR (or [`ENR_TIMEOUT`]).
+    /// `bonded`: the remote has our pong (its ping or pong just arrived), so an
+    /// ENRRequest goes out now; else we ping first and ask when it answers.
+    async fn consider(&mut self, entry: TableEntry, bonded: bool) {
+        let Some(enr) = self.enr.as_mut() else {
+            return self.emit(entry).await;
+        };
+        match enr.verdicts.get(&entry.node_id) {
+            Some(Verdict::Foreign) => return enr.skip_foreign(),
+            Some(_) => return self.emit(entry).await,
+            None => {}
+        }
+        let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
+            return;
+        };
+        let ask = match enr.pending.get_mut(&addr) {
+            Some(p) => {
+                p.entry = entry; // the newest ports
+                bonded && p.hashes.len() < usize::from(ENR_REQUESTS_MAX)
+            }
+            None => {
+                if enr.pending.len() >= ENR_PENDING_MAX {
+                    // Fail open under load: the pool's Status check still rules.
+                    return self.emit(entry).await;
+                }
+                enr.pending.insert(
+                    addr,
+                    PendingEnr {
+                        entry,
+                        hashes: Vec::new(),
+                        since: tokio::time::Instant::now(),
+                    },
+                );
+                if !bonded && !self.pending_pings.contains_key(&addr) {
+                    self.send_ping(addr).await;
+                }
+                bonded
+            }
+        };
+        if ask {
+            self.send_enr_request(addr).await;
+        }
+    }
+
+    async fn send_enr_request(&mut self, to: SocketAddr) {
+        let Ok(packet) = encode_enr_request(&self.key, expiry_now()) else {
+            return;
+        };
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&packet[..32]);
+        if let Some(p) = self.enr.as_mut().and_then(|e| e.pending.get_mut(&to)) {
+            if p.hashes.len() >= usize::from(ENR_REQUESTS_MAX) {
+                p.hashes.remove(0);
+            }
+            p.hashes.push(hash);
+        }
+        let _ = self.send_to(&packet, to).await;
+    }
+
+    /// Answer with our record, to a node whose pong we hold: without the bond
+    /// check we would amplify a spoofed source's traffic (geth `checkBond`).
+    async fn handle_enr_request(&mut self, p: Parsed, sender: SocketAddr) {
+        let now = tokio::time::Instant::now();
+        let Some(local) = self
+            .enr
+            .as_ref()
+            .filter(|e| e.is_bonded(sender, now))
+            .map(|e| e.local.clone())
+        else {
+            tracing::trace!(%sender, "discv4 ENRRequest from an unbonded node, ignored");
+            return;
+        };
+        if let Ok(packet) = encode_enr_response(&self.key, &p.hash, &local) {
+            let _ = self.send_to(&packet, sender).await;
+        }
+    }
+
+    async fn handle_enr_response(&mut self, p: Parsed, sender: SocketAddr) {
+        let Ok((request_hash, raw)) = decode_enr_response(&p.data) else {
+            return;
+        };
+        let Some(enr) = self.enr.as_mut() else {
+            return;
+        };
+        let Some(pending) = enr.pending.get(&sender) else {
+            tracing::trace!(%sender, "discv4 unsolicited ENRResponse");
+            return;
+        };
+        if !pending.hashes.contains(&request_hash) {
+            tracing::trace!(%sender, "discv4 ENRResponse to an unknown request");
+            return;
+        }
+        let remote = match decode_enr(&raw, &p.sender_pubkey) {
+            Ok(r) => r,
+            Err(e) => {
+                // Not ours to judge: the node stays pending and times out into
+                // the pool unjudged.
+                tracing::debug!(%sender, "discv4 ENRResponse not usable: {e}");
+                return;
+            }
+        };
+        let Some(pending) = enr.pending.remove(&sender) else {
+            return;
+        };
+        let verdict = enr.filter.verdict(remote.eth.as_deref());
+        enr.record(pending.entry.node_id.clone(), verdict);
+        match verdict {
+            Verdict::Foreign => {
+                tracing::debug!(
+                    %sender,
+                    seq = remote.seq,
+                    "discv4: node on another chain (ENR fork id), not handed to the pool"
+                );
+                enr.skip_foreign();
+            }
+            Verdict::Compatible | Verdict::Unknown => self.emit(pending.entry).await,
+        }
+    }
+
+    /// Hand over nodes whose ENR never came (fail open), forget stale bonds,
+    /// and say how many foreign nodes were kept from the pool.
+    async fn sweep_enr(&mut self) {
+        let now = tokio::time::Instant::now();
+        let Some(enr) = self.enr.as_mut() else {
+            return;
+        };
+        let expired: Vec<SocketAddr> = enr
+            .pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.since) >= ENR_TIMEOUT)
+            .map(|(a, _)| *a)
+            .collect();
+        let mut unjudged = Vec::with_capacity(expired.len());
+        for addr in expired {
+            if let Some(p) = enr.pending.remove(&addr) {
+                enr.record(p.entry.node_id.clone(), Verdict::Unknown);
+                unjudged.push(p.entry);
+            }
+        }
+        if enr.bonded.len() > BONDED_MAX / 2 {
+            enr.bonded.retain(|_, t| now.duration_since(*t) < BOND_TTL);
+        }
+        enr.maybe_log(now);
+        for entry in unjudged {
+            self.emit(entry).await;
+        }
     }
 
     async fn emit(&mut self, entry: TableEntry) {
@@ -762,9 +1161,23 @@ impl ServiceLoop {
         for bootnode in self.bootnodes.clone() {
             self.send_find_node(bootnode, &self_target).await;
         }
+        if let Some(enr) = self.enr.as_mut() {
+            enr.refresh_local(&self.key);
+        }
+        // Below target the pool wants candidates faster than ten peers' worth
+        // of neighbours per 15 s (#539).
+        let wide = self
+            .wide_refresh
+            .as_ref()
+            .is_some_and(|w| w.load(Ordering::Relaxed));
+        let fan_out = if wide {
+            REFRESH_SAMPLE_WIDE
+        } else {
+            REFRESH_SAMPLE
+        };
         let mut random_target = [0u8; 64];
         let _ = getrandom::getrandom(&mut random_target);
-        for entry in sample(&peers, 10) {
+        for entry in sample(&peers, fan_out) {
             let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
                 continue;
             };
@@ -910,6 +1323,110 @@ mod tests {
         let parsed = parse(&pong).unwrap();
         assert_eq!(parsed.packet_type, TYPE_PONG);
         assert_eq!(decode_pong_ping_hash(&parsed.data).unwrap(), ping_hash);
+    }
+
+    #[test]
+    fn enr_request_and_response_round_trip() {
+        use crate::el::enrfilter::{eth_entry_rlp, local_enr_rlp};
+        let k = key(5);
+        let request = encode_enr_request(&k, 100).unwrap();
+        let parsed = parse(&request).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_ENR_REQUEST);
+        assert_eq!(parsed.sender_pubkey, k.public_key_bytes());
+        let enr = local_enr_rlp(&k, 3, &eth_entry_rlp([1, 2, 3, 4], 0)).unwrap();
+        let response = encode_enr_response(&k, &parsed.hash, &enr).unwrap();
+        let parsed_response = parse(&response).unwrap();
+        assert_eq!(parsed_response.packet_type, TYPE_ENR_RESPONSE);
+        let (hash, raw) = decode_enr_response(&parsed_response.data).unwrap();
+        assert_eq!(hash, parsed.hash);
+        // The ENR comes back byte for byte: an ENR is canonical RLP.
+        assert_eq!(raw, enr);
+        assert!(decode_enr(&raw, &k.public_key_bytes()).is_ok());
+        // A response whose second item is not a list carries no ENR.
+        let bogus = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![0u8; 32]),
+            Item::Bytes(vec![1, 2, 3]),
+        ]));
+        assert!(decode_enr_response(&bogus).is_err());
+    }
+
+    /// Two services on loopback: the one that bootstraps from the other is
+    /// handed over only once its ENR says it is on the same chain.
+    async fn loopback_pair(
+        a_filter: ForkFilter,
+        b_filter: ForkFilter,
+    ) -> (
+        Discv4Service,
+        Discv4Service,
+        tokio::sync::mpsc::Receiver<TableEntry>,
+        [u8; 64],
+    ) {
+        let a_key = Arc::new(key(11));
+        let b_key = Arc::new(key(12));
+        let (a_tx, a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(a_filter),
+                wide_refresh: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::channel(16);
+        let b = Discv4Service::start(
+            Arc::clone(&b_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: vec![SocketAddr::from(([127, 0, 0, 1], a.local_port()))],
+                fork_filter: Some(b_filter),
+                wide_refresh: None,
+            },
+            b_tx,
+        )
+        .await
+        .unwrap();
+        (a, b, a_rx, b_key.public_key_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_node_on_our_chain_is_handed_over_after_its_enr() {
+        let same = || ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0);
+        let (a, b, mut a_rx, b_id) = loopback_pair(same(), same()).await;
+        // B pings A at start; A pongs, bonds back and asks for B's ENR; B
+        // answers once A's pong has bonded it; A judges B compatible and emits.
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A should hand B over within the ENR timeout")
+            .unwrap();
+        assert_eq!(entry.node_id, b_id.to_vec());
+        assert_eq!(a.foreign_skipped(), 0);
+        a.stop().await;
+        b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_node_on_another_chain_is_kept_from_the_pool() {
+        let (a, b, mut a_rx, _) = loopback_pair(
+            ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0),
+            ForkFilter::for_chain([0x01, 0x02, 0x03, 0x04], 0),
+        )
+        .await;
+        // Past the fail-open timeout and then some: nothing was emitted, and
+        // the skip was counted.
+        let got =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(2), a_rx.recv())
+                .await;
+        assert!(
+            got.is_err(),
+            "a foreign node must not reach the pool: {got:?}"
+        );
+        assert!(a.foreign_skipped() >= 1, "the skip is counted");
+        a.stop().await;
+        b.stop().await;
     }
 
     #[test]

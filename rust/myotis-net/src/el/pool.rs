@@ -626,6 +626,9 @@ struct PoolInner {
     /// ([`PeerPool::attach_discovery`]): what the below-target re-dial (#539)
     /// walks. `None` for pools without discovery (tests).
     discovery_table: std::sync::Mutex<Option<Arc<std::sync::Mutex<KademliaTable>>>>,
+    /// Discovery's below-target hint ([`PeerPool::attach_discovery`]): set
+    /// each maintainer tick, read by discv4's refresh for a wider fan-out.
+    below_target: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     /// Where the last below-target walk of the table stopped.
     scarcity_cursor: std::sync::atomic::AtomicUsize,
     /// When the maintainer last logged a below-target re-dial.
@@ -1162,6 +1165,7 @@ impl PeerPool {
             attempted: Mutex::new(HashSet::new()),
             backoff: Mutex::new(HashMap::new()),
             discovery_table: std::sync::Mutex::new(None),
+            below_target: std::sync::Mutex::new(None),
             scarcity_cursor: std::sync::atomic::AtomicUsize::new(0),
             last_scarcity_log: Mutex::new(None),
             blacklist: Mutex::new(HashSet::new()),
@@ -1367,13 +1371,24 @@ impl PeerPool {
     }
 
     /// Hand the pool discovery's routing table, so the below-target re-dial
-    /// (#539) can re-offer every peer discovery knows, not only the cache's.
-    pub fn attach_discovery(&self, table: Arc<std::sync::Mutex<KademliaTable>>) {
+    /// (#539) can re-offer every peer discovery knows, not only the cache's,
+    /// and the flag discovery reads for a wider refresh while the pool is
+    /// below target (`Discv4Config::wide_refresh`).
+    pub fn attach_discovery(
+        &self,
+        table: Arc<std::sync::Mutex<KademliaTable>>,
+        below_target: Arc<AtomicBool>,
+    ) {
         *self
             .inner
             .discovery_table
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(table);
+        *self
+            .inner
+            .below_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(below_target);
     }
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
@@ -1922,6 +1937,15 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // Discovery's below-target hint (#539): a wider FindNode fan-out.
+        if let Some(flag) = inner
+            .below_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            flag.store(live < inner.pool_cfg.target_snap_peers, Ordering::Relaxed);
+        }
         // Keep the fork watch's evidence from the peers we still hold fresh: a
         // full pool dials nobody new, and their word is exactly what matters
         // across a fork (Java twin: ChainStack.touchForkWatch).
@@ -2485,7 +2509,7 @@ mod tests {
         #[tokio::test]
         async fn the_table_walk_spends_its_budget_and_moves_the_cursor() {
             let pool = fixture(b"scarcity-walk");
-            pool.attach_discovery(table(6));
+            pool.attach_discovery(table(6), Arc::new(std::sync::atomic::AtomicBool::new(false)));
             // Empty pool, target 8: the full budget of 4. The walk breaks at
             // the 5th entry, so the cursor lands on it.
             assert!(scarcity_redial(&pool.inner).await);
@@ -2511,7 +2535,7 @@ mod tests {
                 id.copy_from_slice(&e.node_id);
                 pool.inner.blacklist.lock().await.insert(id);
             }
-            pool.attach_discovery(t);
+            pool.attach_discovery(t, Arc::new(std::sync::atomic::AtomicBool::new(false)));
             assert!(scarcity_redial(&pool.inner).await);
             assert_eq!(cursor(&pool), 0);
             assert_eq!(pool.attempted_count().await, 0, "nothing was dialed");
