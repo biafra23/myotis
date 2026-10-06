@@ -190,3 +190,14 @@ complete on its own.
 - On an address the network also pins, the host's key wins; DNS names and
   unspecified addresses are refused, not resolved or dropped.
 - A missing `snapServingPeers` key reads as 0 on the JVM and iOS hosts.
+
+## From the v0.1.14 release (2026-10-06, Glamsterdam day)
+
+- [ ] **Sepolia has one Gloas-capable light-client server (roost).** The
+  release's cold-start pin check stopped at 1 of 4 — both Lighthouse pins
+  stopped serving light-client data at the fork and a 91-peer census found
+  no other Gloas-era server — and the owner released anyway. Tracked in
+  #566: until a second server exists, every Sepolia `cold-start regression`
+  dispatch stops red at the pin check and 3b/3c never run there. Whether
+  CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
+  floor unmet for an upstream reason is the owner's decision.
