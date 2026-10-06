@@ -111,6 +111,9 @@ public class BeaconP2PService implements AutoCloseable {
     }
 
     private volatile Host host;
+    /** Told every decoded peer Status: {@code (remote multiaddr, fork_digest)} — the
+     *  CL fork watch's feed. Null = nobody listening. */
+    private volatile java.util.function.BiConsumer<String, byte[]> onPeerStatus;
     private Identify identifyBinding;
 
     /** One binding per protocol, registered once at startup. */
@@ -255,6 +258,17 @@ public class BeaconP2PService implements AutoCloseable {
 
     public BeaconP2PService(Supplier<StatusMessage> localStatusSupplier) {
         this.localStatusSupplier = localStatusSupplier;
+    }
+
+    /**
+     * Listen to every peer Status reply to this host's auto-Status (sent on each new
+     * connection, so every connected peer answers once): {@code (remote multiaddr,
+     * fork_digest)}. The CL fork watch's feed — a digest this build cannot produce is
+     * evidence of a fork it does not know. A Status a peer initiates (the responder
+     * path) is not reported: it arrives with a peer id but no address to vote as.
+     */
+    public void setOnPeerStatus(java.util.function.BiConsumer<String, byte[]> listener) {
+        this.onPeerStatus = listener;
     }
 
     // -------------------------------------------------------------------------
@@ -792,6 +806,14 @@ public class BeaconP2PService implements AutoCloseable {
                         ? StatusMessage.decode(decoded.sszPayload())
                         : StatusMessage.decodeV1(decoded.sszPayload());
                 peerEarliestSlot.put(pid, peer.earliestAvailableSlot());
+                java.util.function.BiConsumer<String, byte[]> listener = onPeerStatus;
+                if (listener != null) {
+                    try {
+                        listener.accept(conn.remoteAddress().toString(), peer.forkDigest());
+                    } catch (RuntimeException listenerFailure) {
+                        log.debug("[beacon-p2p] peer-Status listener failed: {}", listenerFailure.toString());
+                    }
+                }
                 log.info("[beacon-p2p] auto-Status({}) with {} (agent={}): earliestSlot={} peer={}",
                         v2 ? "v2" : "v1", pid,
                         peerAgentVersions.getOrDefault(pid, "?"), peer.earliestAvailableSlot(), peer);

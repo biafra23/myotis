@@ -864,6 +864,9 @@ pub struct HostConfig {
     /// Present ⇒ serve the light-client protocols, and advertise
     /// `updates_by_range` inbound.
     pub lc_responder: Option<Arc<dyn LcResponder>>,
+    /// Fed every peer's Status `fork_digest` (with the peer's source address),
+    /// so a fork this build does not know surfaces as an upgrade advisory.
+    pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
 impl Default for HostConfig {
@@ -873,6 +876,7 @@ impl Default for HostConfig {
             max_established_incoming: Some(64),
             keypair: None,
             lc_responder: None,
+            cl_fork_watch: None,
         }
     }
 }
@@ -986,7 +990,13 @@ pub fn start_host_with(
     tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
 
     let (tx, rx) = mpsc::channel(256);
-    let task = tokio::spawn(run_swarm(swarm, rx, local_status, config.lc_responder));
+    let task = tokio::spawn(run_swarm(
+        swarm,
+        rx,
+        local_status,
+        config.lc_responder,
+        config.cl_fork_watch,
+    ));
     Ok((ReqRespClient { tx, last_resolved: Arc::default() }, peer_id, task))
 }
 
@@ -1059,11 +1069,18 @@ struct SwarmCtx {
     /// Source address per peer plus whether THEY dialed US, learned at
     /// connection time and needed before their Identify arrives.
     peer_source_ips: HashMap<PeerId, (IpAddr, bool)>,
+    /// The CL fork watch every decoded peer Status is reported to.
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
 impl SwarmCtx {
-    fn new(local_status: Arc<LocalStatus>, lc: Option<Arc<dyn LcResponder>>) -> Self {
+    fn new(
+        local_status: Arc<LocalStatus>,
+        lc: Option<Arc<dyn LcResponder>>,
+        cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    ) -> Self {
         Self {
+            cl_fork_watch,
             pending: HashMap::new(),
             connected: HashSet::new(),
             dns_dials: HashMap::new(),
@@ -1087,8 +1104,9 @@ async fn run_swarm(
     mut rx: mpsc::Receiver<Command>,
     local_status: Arc<LocalStatus>,
     lc: Option<Arc<dyn LcResponder>>,
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 ) {
-    let mut ctx = SwarmCtx::new(local_status, lc);
+    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch);
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -1483,9 +1501,7 @@ fn complete(
         }
         Some(Pending::AutoStatusV2(peer_id)) => match result {
             Ok(raw) => {
-                if let Some(earliest) = log_peer_status("v2", peer_id, &raw) {
-                    ctx.peer_earliest.insert(peer_id, earliest);
-                }
+                note_peer_status(ctx, "v2", peer_id, &raw);
                 mark_status_done(swarm, ctx, peer_id);
             }
             Err(RequestError::UnsupportedProtocol) => {
@@ -1504,11 +1520,7 @@ fn complete(
         },
         Some(Pending::AutoStatusV1(peer_id)) => {
             match result {
-                Ok(raw) => {
-                    if let Some(earliest) = log_peer_status("v1", peer_id, &raw) {
-                        ctx.peer_earliest.insert(peer_id, earliest);
-                    }
-                }
+                Ok(raw) => note_peer_status(ctx, "v1", peer_id, &raw),
                 Err(e) => tracing::debug!(peer = %peer_id, error = %e, "auto-status v1 failed"),
             }
             mark_status_done(swarm, ctx, peer_id);
@@ -1520,9 +1532,23 @@ fn complete(
     }
 }
 
+/// Record what a peer's auto-Status reply says: its `earliest_available_slot`
+/// for request routing, and its `fork_digest` for the CL fork watch (keyed by
+/// the connection's source address — one vote per source network).
+fn note_peer_status(ctx: &mut SwarmCtx, version: &str, peer_id: PeerId, raw: &[u8]) {
+    let Some((earliest, fork_digest)) = log_peer_status(version, peer_id, raw) else {
+        return;
+    };
+    ctx.peer_earliest.insert(peer_id, earliest);
+    if let (Some(watch), Some((ip, _))) = (&ctx.cl_fork_watch, ctx.peer_source_ips.get(&peer_id)) {
+        watch.observe_status(&crate::cl_fork_watch::source_of(*ip), fork_digest);
+    }
+}
+
 /// Logs a peer's auto-Status reply and returns its `earliest_available_slot`
-/// (None on a decode/frame error). v1 peers report 0 — genesis history.
-fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) -> Option<u64> {
+/// and `fork_digest` (None on a decode/frame error). v1 peers report an
+/// earliest slot of 0 — genesis history.
+fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) -> Option<(u64, [u8; 4])> {
     match codec::decode_response(raw, false) {
         Ok(d) => {
             let decoded = if version == "v2" {
@@ -1536,7 +1562,7 @@ fn log_peer_status(version: &str, peer: PeerId, raw: &[u8]) -> Option<u64> {
                         fork_digest = %hex4(&s.fork_digest),
                         finalized_epoch = s.finalized_epoch, head_slot = s.head_slot,
                         earliest = s.earliest_available_slot, "auto-status ok");
-                    Some(s.earliest_available_slot)
+                    Some((s.earliest_available_slot, s.fork_digest))
                 }
                 Err(e) => {
                     tracing::debug!(peer = %peer, version, error = %e,
@@ -2155,7 +2181,7 @@ mod pending_request_tests {
     fn host() -> (Swarm<Behaviour>, SwarmCtx) {
         let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
             .expect("swarm");
-        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None))
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None))
     }
 
     fn peer() -> PeerId {

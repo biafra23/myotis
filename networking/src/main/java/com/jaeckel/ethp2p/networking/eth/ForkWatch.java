@@ -71,10 +71,10 @@ public final class ForkWatch {
 
     /** Distinct source networks that must agree before an advisory is raised. */
     public static final int MIN_PEERS = 3;
-    static final int OBSERVATION_TTL_HOURS = 24;
+    public static final int OBSERVATION_TTL_HOURS = 24;
     /** A source's last presented fork id stops counting this long after the source was
      *  last seen connected (observed, or {@link #touch touched}). */
-    static final long OBSERVATION_TTL_SECONDS = OBSERVATION_TTL_HOURS * 3600L;
+    public static final long OBSERVATION_TTL_SECONDS = OBSERVATION_TTL_HOURS * 3600L;
     /**
      * A passed announcement of {@code T} keeps counting this long past {@code T}: bridges
      * the rollover from "forkNext = T" to the successor hash, and ages out a rescheduled
@@ -82,14 +82,14 @@ public final class ForkWatch {
      * source still seen connected after it — that peer passed {@code T} with the fork
      * configured, so it keeps counting for as long as it stays fresh.
      */
-    static final long ACTIVATION_GRACE_SECONDS = 6L * 3600;
+    public static final long ACTIVATION_GRACE_SECONDS = 6L * 3600;
     /** Announcements further out than this are treated as garbage. */
-    static final long MAX_HORIZON_SECONDS = 400L * 24 * 3600;
+    public static final long MAX_HORIZON_SECONDS = 400L * 24 * 3600;
     static final int LOOKBACK_DAYS = 400;
     /** How far back a placed activation that was never announced may lie. */
     static final long LOOKBACK_SECONDS = LOOKBACK_DAYS * 24L * 3600;
     /** Bound on tracked sources; the least recently seen is evicted. */
-    static final int MAX_TRACKED = 512;
+    public static final int MAX_TRACKED = 512;
 
     /**
      * Networks the watch runs on. Staged rollout: Sepolia first — its Glamsterdam

@@ -994,7 +994,10 @@ private fun upgradeCutOff(s: NodeSnapshot): Boolean =
 @Composable
 private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
     val tz = remember { TimeZone.currentSystemDefault() }
-    val at = formatDateTime(u.activationEpochSec * 1000, tz)
+    // 0 = unknown: peers are seen on the fork but nobody announced its time (a
+    // consensus fork digest does not encode it).
+    val at = if (u.activationEpochSec == 0L) "an unknown date"
+        else formatDateTime(u.activationEpochSec * 1000, tz)
     val alarm = u.active && cutOff
     val container = if (alarm) MaterialTheme.colorScheme.errorContainer
         else MaterialTheme.colorScheme.tertiaryContainer
@@ -1031,7 +1034,10 @@ private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
             color = onContainer,
         )
         Text(
-            "Reported by peers in ${u.observedPeers} distinct networks · fork id ${u.forkId}",
+            // "0x00000000" = unknown: a blob-parameter-only fork rotates to a digest
+            // this version cannot compute (see UpgradeNotice.forkId).
+            "Reported by peers in ${u.observedPeers} distinct networks · fork id " +
+                (if (u.forkId == "0x00000000") "unknown" else u.forkId),
             fontSize = 11.sp,
             color = onContainer,
         )
