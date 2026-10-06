@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use myotis_consensus::spec;
 use myotis_consensus::ssz;
 use myotis_consensus::fork::ForkSchedule;
-use myotis_consensus::store::{LightClientProcessor, LightClientStore};
+use myotis_consensus::store::{FinalityOutcome, LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
     LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate,
 };
@@ -141,11 +141,24 @@ fn replay_reproduces_recorded_verdicts() {
         .collect();
     finality_files.sort();
     actual.insert("finality.count".into(), finality_files.len().to_string());
+    let mut last_applied: Option<LightClientFinalityUpdate> = None;
     for (i, name) in finality_files.iter().enumerate() {
         let update = LightClientFinalityUpdate::decode(&fs::read(dir.join(name)).unwrap())
             .unwrap_or_else(|e| panic!("{name} decodes: {e}"));
         let applied = processor.process_finality_update(&update);
         actual.insert(format!("finality.{i}.applied"), applied.to_string());
+        if applied {
+            last_applied = Some(update);
+        }
+    }
+    // A server re-serving an update the store already holds verifies but moves
+    // nothing: the outcome the finality poll must not count as a win.
+    if let Some(update) = &last_applied {
+        assert_eq!(
+            processor.apply_finality_update(update),
+            FinalityOutcome::Stale,
+            "re-applying the last applied finality update is Stale, not Advanced"
+        );
     }
 
     actual.insert(

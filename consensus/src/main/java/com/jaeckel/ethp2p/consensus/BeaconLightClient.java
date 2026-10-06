@@ -2425,7 +2425,11 @@ public class BeaconLightClient implements AutoCloseable {
         // moved on, skipping updateSyncState/persistSnapshot — and re-polling the
         // same update reports "no advance", so the lag would otherwise persist
         // until a NEW update publishes.
-        if (store.isInitialized() && store.getFinalizedSlot() > syncState.getFinalizedSlot()) {
+        // Both heads: a late win can advance only the optimistic header, and
+        // re-polling it is "no advance" now — nothing else would push it.
+        if (store.isInitialized()
+                && (store.getFinalizedSlot() > syncState.getFinalizedSlot()
+                    || store.getOptimisticSlot() > syncState.getOptimisticSlot())) {
             updateSyncState();
             persistSnapshot();
         }
@@ -2450,6 +2454,9 @@ public class BeaconLightClient implements AutoCloseable {
         // never struck while rounds keep winning — the recency sort in
         // orderByLightClient demotes it instead.
         final java.util.Queue<String> roundFailures = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // Whether any response VERIFIED this round, advanced or not: strikes are for a
+        // round that found no server, and a stale-but-verified reply is a server.
+        final java.util.concurrent.atomic.AtomicBoolean verifiedAny = new java.util.concurrent.atomic.AtomicBoolean();
         // Classification harvest — independent of the round outcome and of the
         // strike buffer above. With few proven servers the fan-out fills with
         // UNTRIED cache candidates anyway; record what each dial teaches us so
@@ -2510,8 +2517,21 @@ public class BeaconLightClient implements AutoCloseable {
                                 // stale next committee. Two same-round appliers also serialize here;
                                 // the second usually reports no-advance and simply doesn't win.
                                 synchronized (catchUpApplyLock) {
-                                    finalityApplied = store.isInitialized()
+                                    // A win is a verified apply that ADVANCED the store. An update
+                                    // the store already holds verifies too (the processor's duplicate
+                                    // memo answers true for it), but it is a server that stopped
+                                    // producing updates, not news — counting it let a stalled server
+                                    // outrun a current one every round (Sepolia, Glamsterdam day:
+                                    // every Lighthouse light-client server stopped at the fork and
+                                    // kept answering first). Rust twin: FinalityOutcome::Stale.
+                                    long finalizedBefore = store.getFinalizedSlot();
+                                    long optimisticBefore = store.getOptimisticSlot();
+                                    boolean verified = store.isInitialized()
                                             && processor.processFinalityUpdate(update);
+                                    if (verified) verifiedAny.set(true);
+                                    finalityApplied = verified
+                                            && (store.getFinalizedSlot() > finalizedBefore
+                                                || store.getOptimisticSlot() > optimisticBefore);
                                 }
                                 if (finalityApplied) {
                                     winner.complete(new FinalityPollWin(
@@ -2572,7 +2592,12 @@ public class BeaconLightClient implements AutoCloseable {
             // are skipped; the store already advanced and the store-ahead check
             // at the top of the next poll heals BeaconSyncState/snapshot.
             boolean lateWin = winner.isDone() && !winner.isCompletedExceptionally();
-            if (!lateWin) {
+            // A verified-but-stale reply is a server too: the losers raced it (a
+            // stalled network would otherwise strike every busy proven server).
+            // Known gap, same as lateWin's: a first-seen stale update whose verify
+            // outlasts the deadline (ART) is still in flight here, so that one round
+            // strikes; from the next round the memo answers inside the window.
+            if (!lateWin && !verifiedAny.get()) {
                 for (String p : roundFailures) notifyPeerFailure(p);
             }
             recordLcVerdicts(lcConfirmed, lcDenied);
