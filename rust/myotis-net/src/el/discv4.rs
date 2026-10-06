@@ -475,8 +475,6 @@ pub struct Discv4Config {
     pub pool_below_target: Option<Arc<AtomicBool>>,
 }
 
-/// Handle to a running discv4 service. Dropping it does NOT stop the task;
-/// call [`Discv4Service::stop`].
 /// How the fork-id filter (#539) judged the nodes it saw this run.
 #[derive(Debug, Default)]
 pub struct EnrCounts {
@@ -501,6 +499,8 @@ impl EnrCounts {
     }
 }
 
+/// Handle to a running discv4 service. Dropping it does NOT stop the task;
+/// call [`Discv4Service::stop`].
 pub struct Discv4Service {
     table: Arc<Mutex<KademliaTable>>,
     /// The fork-id filter's tallies (#539), for the hosts' logs and tests.
@@ -773,6 +773,11 @@ const ENR_REQUESTS_MAX: u8 = 2;
 const ENR_PENDING_MAX: usize = 1024;
 /// Remembered verdicts (by node id); cleared wholesale when full.
 const ENR_VERDICTS_MAX: usize = 4096;
+/// How long an `Unknown` verdict stands before the node is judged again. A
+/// lost datagram, a response a shade past the timeout or an old client must
+/// not mean blind dials for the rest of the run — only until the next sighting
+/// after this; `Compatible` and `Foreign` stand for the run.
+const UNKNOWN_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// How long a verified pong counts as a bond for answering ENRRequests, and
 /// the cap on remembered bonds.
 const BOND_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
@@ -798,6 +803,36 @@ struct PendingEnr {
     since: tokio::time::Instant,
 }
 
+/// What the exchange concluded about a node, kept by node id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Judgement {
+    verdict: Verdict,
+    /// The TCP port the node's own record named (`0`: an address but no TCP
+    /// port — never dialed), or `None` when the record named no address or
+    /// never came. It outlives the sighting: a relayer's hearsay must not put a
+    /// discovery-only node back on the dial list, or a known port back to a
+    /// guess.
+    tcp_port: Option<u32>,
+    at: tokio::time::Instant,
+}
+
+impl Judgement {
+    /// An `Unknown` past [`UNKNOWN_VERDICT_TTL`] no longer stands.
+    fn expired(&self, now: tokio::time::Instant) -> bool {
+        self.verdict == Verdict::Unknown && now.duration_since(self.at) >= UNKNOWN_VERDICT_TTL
+    }
+}
+
+/// What `consider` finds on file for a sighted node.
+enum Seen {
+    Foreign,
+    /// Judged, with the port its record named (if any): handed over as is.
+    Judged(Option<u32>),
+    /// An expired `Unknown`: judged again.
+    Stale,
+    New,
+}
+
 /// The EIP-868 ENR exchange that feeds the fork-id filter (#539).
 struct EnrExchange {
     filter: ForkFilter,
@@ -806,8 +841,8 @@ struct EnrExchange {
     local_seq: u64,
     local_eth: Vec<u8>,
     pending: HashMap<SocketAddr, PendingEnr>,
-    /// node id → verdict, for the run (bounded).
-    verdicts: HashMap<Vec<u8>, Verdict>,
+    /// node id → what the exchange concluded about it (bounded).
+    verdicts: HashMap<Vec<u8>, Judgement>,
     /// Endpoints whose pong we verified — with the key that signed it and
     /// when: the bond that lets THAT node ask for our ENR. Keyed by address
     /// and checked against the signer, as geth's `checkBond(id, ip)`: a bond
@@ -879,11 +914,24 @@ impl EnrExchange {
         self.bonded.insert(addr, Bond { pubkey, since: now });
     }
 
-    fn record(&mut self, node_id: Vec<u8>, verdict: Verdict) {
+    fn record(
+        &mut self,
+        node_id: Vec<u8>,
+        verdict: Verdict,
+        tcp_port: Option<u32>,
+        now: tokio::time::Instant,
+    ) {
         if self.verdicts.len() >= ENR_VERDICTS_MAX {
             self.verdicts.clear();
         }
-        self.verdicts.insert(node_id, verdict);
+        self.verdicts.insert(
+            node_id,
+            Judgement {
+                verdict,
+                tcp_port,
+                at: now,
+            },
+        );
     }
 
     fn skip_foreign(&self) {
@@ -900,7 +948,7 @@ impl EnrExchange {
             let known_foreign = self
                 .verdicts
                 .values()
-                .filter(|v| **v == Verdict::Foreign)
+                .filter(|j| j.verdict == Verdict::Foreign)
                 .count();
             tracing::info!(
                 skipped = total - self.logged_skipped,
@@ -1126,15 +1174,34 @@ impl ServiceLoop {
         let Some(enr) = self.enr.as_mut() else {
             return self.emit(entry).await;
         };
-        match enr.verdicts.get(&entry.node_id) {
-            Some(Verdict::Foreign) => {
+        let now = tokio::time::Instant::now();
+        let seen = match enr.verdicts.get(&entry.node_id) {
+            Some(j) if j.verdict == Verdict::Foreign => Seen::Foreign,
+            Some(j) if j.expired(now) => Seen::Stale,
+            Some(j) => Seen::Judged(j.tcp_port),
+            None => Seen::New,
+        };
+        match seen {
+            Seen::Foreign => {
                 enr.skip_foreign();
                 // It may have entered the table unjudged earlier (see the gate
                 // below); the pool's below-target walk reads the table.
                 return self.forget(&entry.node_id);
             }
-            Some(_) => return self.emit(entry).await,
-            None => {}
+            Seen::Judged(record_port) => {
+                // The record's own word on its port outlives the sighting
+                // (see `Judgement::tcp_port`); the sighting's hearsay stands
+                // only where the record said nothing.
+                let mut entry = entry;
+                if let Some(port) = record_port {
+                    entry.tcp_port = port;
+                }
+                return self.emit(entry).await;
+            }
+            Seen::Stale => {
+                enr.verdicts.remove(&entry.node_id); // judged again below
+            }
+            Seen::New => {}
         }
         // At target the pool dials nothing. A node already bonding with us is
         // judged anyway — one request and one response — but a node learned
@@ -1275,13 +1342,21 @@ impl ServiceLoop {
         // bootnodes): it stays in the table as a source of neighbours and is
         // never dialed — the pool refuses port 0, as geth refuses such a node
         // (`errNoPort`). A record naming no address says nothing.
-        match remote.tcp_port_for(&pending.entry.ip) {
-            Some(tcp) => pending.entry.tcp_port = u32::from(tcp),
-            None if remote.has_ip => pending.entry.tcp_port = 0,
-            None => {}
+        let record_port = match remote.tcp_port_for(&pending.entry.ip) {
+            Some(tcp) => Some(u32::from(tcp)),
+            None if remote.has_ip => Some(0),
+            None => None,
+        };
+        if let Some(port) = record_port {
+            pending.entry.tcp_port = port;
         }
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
-        enr.record(pending.entry.node_id.clone(), verdict);
+        enr.record(
+            pending.entry.node_id.clone(),
+            verdict,
+            record_port,
+            tokio::time::Instant::now(),
+        );
         match verdict {
             Verdict::Foreign => {
                 tracing::debug!(
@@ -1321,7 +1396,9 @@ impl ServiceLoop {
         let mut unjudged = Vec::with_capacity(expired.len());
         for addr in expired {
             if let Some(p) = enr.pending.remove(&addr) {
-                enr.record(p.entry.node_id.clone(), Verdict::Unknown);
+                // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node is
+                // asked again at its first sighting after that.
+                enr.record(p.entry.node_id.clone(), Verdict::Unknown, None, now);
                 enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
                 unjudged.push(p.entry);
             }
@@ -1423,7 +1500,8 @@ impl ServiceLoop {
     }
 
     /// 15 s refresh: empty table → re-ping bootnodes; else FindNode-self to
-    /// bootnodes + ping-then-FindNode(random target) to ≤ 10 random peers.
+    /// bootnodes + ping-then-FindNode(random target) to 10 random peers — 30
+    /// while the pool is below target, for a bounded run (`fan_out`).
     async fn refresh(&mut self) {
         let peers = self
             .table
@@ -2025,7 +2103,96 @@ mod tests {
         let entry = raw_node_round(&a, &mut a_rx, &discovery_only, 40404, Some(0)).await;
         assert_eq!(entry.node_id, discovery_only.public_key_bytes().to_vec());
         assert_eq!(entry.tcp_port, 0, "a record with an address and no TCP port is never dialed");
+        // Re-learned from a relayer's NEIGHBORS with other ports: the record's
+        // word outlives the sighting — the discovery-only node stays at port
+        // 0, the outspoken one at its record's port; only the node whose
+        // record named no address takes the hearsay.
+        let entry = reannounce(&a, &mut a_rx, &discovery_only, 30303).await;
+        assert_eq!(entry.tcp_port, 0, "hearsay must not put a discovery-only node back on the dial list");
+        let entry = reannounce(&a, &mut a_rx, &outspoken, 30303).await;
+        assert_eq!(entry.tcp_port, 50505, "hearsay must not replace the port the record named");
+        let entry = reannounce(&a, &mut a_rx, &quiet, 41414).await;
+        assert_eq!(entry.tcp_port, 41414, "a record that named no address leaves the port to the sighting");
         a.stop().await;
+    }
+
+    /// Announce `node` to `a` again — a relayer's NEIGHBORS from a fresh
+    /// socket, claiming `advertised_tcp` — and return what A hands over.
+    async fn reannounce(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        advertised_tcp: u32,
+    ) -> TableEntry {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let data = rlp::encode(&Item::List(vec![
+            Item::List(vec![Item::List(vec![
+                Item::Bytes(vec![127, 0, 0, 1]),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(sock.local_addr().unwrap().port()))),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
+                Item::Bytes(node.public_key_bytes().to_vec()),
+            ])]),
+            Item::Bytes(rlp::u64_to_minimal_be(expiry_now())),
+        ]));
+        let relayer = key(99);
+        let packet = encode_packet(&relayer, TYPE_NEIGHBORS, &data).unwrap();
+        sock.send_to(&packet, a_addr).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands a judged node over at once")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_pool_gate_judges_second_hand_nodes_below_target_only() {
+        // The pool's flag (part 1's maintainer sets it each tick): at target a
+        // node learned from NEIGHBORS goes over unjudged, without a ping;
+        // below target it is judged first.
+        let below_target = Arc::new(AtomicBool::new(false));
+        let a_key = Arc::new(key(21));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: Some(Arc::clone(&below_target)),
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // At target: handed over at once with the hearsay port, nothing judged.
+        let at_target = key(22);
+        let entry = raw_node_round(&a, &mut a_rx, &at_target, 40404, Some(50505)).await;
+        assert_eq!(entry.node_id, at_target.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 40404, "at target the sighting goes over as it came");
+        assert_eq!(a.enr_counts().snapshot(), (0, 0, 0), "nothing was judged at target");
+        // Below target: pinged, asked, judged — the record's port arrives.
+        below_target.store(true, Ordering::Relaxed);
+        let wanted = key(23);
+        let entry = raw_node_round(&a, &mut a_rx, &wanted, 40404, Some(50505)).await;
+        assert_eq!(entry.node_id, wanted.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 50505, "below target the record is asked for first");
+        assert_eq!(a.enr_counts().snapshot(), (1, 0, 0));
+        a.stop().await;
+    }
+
+    #[test]
+    fn an_unknown_verdict_expires_but_the_others_stand() {
+        let t0 = tokio::time::Instant::now();
+        let j = |verdict: Verdict| Judgement {
+            verdict,
+            tcp_port: None,
+            at: t0,
+        };
+        let later = t0 + UNKNOWN_VERDICT_TTL;
+        assert!(!j(Verdict::Unknown).expired(t0 + UNKNOWN_VERDICT_TTL / 2));
+        assert!(j(Verdict::Unknown).expired(later));
+        assert!(!j(Verdict::Compatible).expired(later));
+        assert!(!j(Verdict::Foreign).expired(later));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! The EL peer pool (EL-A7b): consume the discv4 candidate stream, dial peers
 //! (bounded concurrency), run the eth+snap handshake, and keep a live set of
 //! snap-capable [`ManagedPeer`]s for verified reads. Twin of the Java
-//! `ChainStack` dial bookkeeping (`attempted` / `backoff` / `blacklist`), minus
-//! the cache- and DNS-seeded dials, which arrive with the engine-owned peer
-//! cache in EL-A8.
+//! `ChainStack` dial bookkeeping (`attempted` / `backoff` / `blacklist`),
+//! including the cache-seeded dials (the engine-owned peer cache) and, since
+//! #539, the DNS-seeded ones (`el::dnsdisco`).
 //!
 //! Dial outcomes drive the bookkeeping the same way `ChainStack` does:
 //! * an **incompatible** peer (wrong network id / genesis) → blacklist its node

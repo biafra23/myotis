@@ -97,8 +97,9 @@ The table is behind a single lock.
 - The service binds a UDP socket with a **fixed 4096-byte receive buffer + 1 MB SO_RCVBUF**
   (NEIGHBORS packets are ~1.2 KB and default allocators truncate them on some stacks — notably
   Android/ART). Refresh every 15 s: if the table is empty re-ping bootnodes; else FindNode to
-  bootnodes (target = our own pubkey) and ping-then-FindNode to ≤10 random peers with a random
-  64-byte target to spread across the keyspace.
+  bootnodes (target = our own pubkey) and ping-then-FindNode to 10 random peers with a random
+  64-byte target to spread across the keyspace — 30 in the Rust engine for the first eight
+  refreshes of a below-target episode, once per 30 minutes (#539).
 
 ---
 
