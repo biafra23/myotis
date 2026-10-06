@@ -157,6 +157,28 @@ fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
     enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
+/// The discv4 fork-id filter for `cfg`'s chain (#539): the pinned fork id, on
+/// the chain's beacon epoch grid when this crate knows it (`sync::ChainConfig`,
+/// the same grid the fork watch places with; none for a chain it does not).
+/// Public so the live test (`tests/live_enr_filter.rs`) measures the filter
+/// as the reader ships it.
+pub fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
+    let filter = crate::el::enrfilter::ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next);
+    let chain = match cfg.network_id {
+        1 => Some(crate::sync::ChainConfig::mainnet()),
+        11_155_111 => Some(crate::sync::ChainConfig::sepolia()),
+        100 => Some(crate::sync::ChainConfig::gnosis()),
+        _ => None,
+    };
+    match chain {
+        Some(c) => filter.with_epoch_grid(
+            c.genesis_time,
+            c.slots_per_epoch.saturating_mul(c.seconds_per_slot),
+        ),
+        None => filter,
+    }
+}
+
 impl ElConfig {
     /// Mainnet EL parameters (the values the live tests pin). The fork-id is the
     /// pinned hash the Java engine also carries; a hard fork would need a bump
@@ -1712,9 +1734,20 @@ impl ElReader {
         read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
+        // Below target until the maintainer's first tick says otherwise — a
+        // fresh start is the one moment the pool is surely short of peers.
+        let below_target = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let discovery = Discv4Service::start(
             Arc::clone(&key),
-            Discv4Config { bind_port: cfg.discv4_port, bootnodes: cfg.bootnodes.clone() },
+            Discv4Config {
+                bind_port: cfg.discv4_port,
+                bootnodes: cfg.bootnodes.clone(),
+                // #539: a node whose ENR places it on another chain never
+                // reaches the pool; the pool's below-target hint gates the
+                // judging and widens the refresh fan-out.
+                fork_filter: Some(fork_filter_for(&cfg)),
+                pool_below_target: Some(Arc::clone(&below_target)),
+            },
             tx,
         )
         .await?;
@@ -1770,7 +1803,7 @@ impl ElReader {
         // fetches their headers for the anchor to verify and adopt.
         pool.start_anchor_resolver(Arc::clone(&anchor));
         // #539: while below target the pool re-offers discovery's whole table.
-        pool.attach_discovery(discovery.table_handle());
+        pool.attach_discovery(discovery.table_handle(), below_target);
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),

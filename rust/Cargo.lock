@@ -4216,6 +4216,7 @@ name = "myotis-net"
 version = "0.1.13"
 dependencies = [
  "aes",
+ "alloy-rlp",
  "arti-client",
  "async-trait",
  "cipher",
