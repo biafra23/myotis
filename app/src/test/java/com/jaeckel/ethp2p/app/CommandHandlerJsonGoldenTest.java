@@ -365,4 +365,15 @@ class CommandHandlerJsonGoldenTest {
                 CommandHandler.buildUpgradeAdvisoryJson(
                         new UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3)));
     }
+
+    @Test
+    void upgradeAdvisoryActiveWithUnknownTime() {
+        // The CL watch placing peers on Gloas by its digest alone: nobody announced the
+        // epoch, so activationTime is 0 and the message says so instead of printing 1970.
+        assertEquals("{\"phase\":\"ACTIVE\",\"activationTime\":0,\"forkId\":\"0x669e6c11\","
+                        + "\"observedPeers\":3,\"message\":\"peers report the network upgraded at an unknown time"
+                        + " to rules this build does not support - update required\"}",
+                CommandHandler.buildUpgradeAdvisoryJson(
+                        new UpgradeAdvisory(UpgradePhase.ACTIVE, 0L, "0x669e6c11", 3)));
+    }
 }

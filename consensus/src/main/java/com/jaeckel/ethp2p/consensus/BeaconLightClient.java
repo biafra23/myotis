@@ -354,6 +354,14 @@ public class BeaconLightClient implements AutoCloseable {
         syncState.setWsBoundPeriods(effectiveWsBound());
     }
 
+    /**
+     * Listen to every peer Status the libp2p host decodes: {@code (remote multiaddr,
+     * fork_digest)}. The stack feeds it to the CL fork watch (upgrade advisory).
+     */
+    public void setOnPeerStatus(java.util.function.BiConsumer<String, byte[]> listener) {
+        p2pService.setOnPeerStatus(listener);
+    }
+
     /** User consent to sync forward from a stale anchor (this run only). */
     public void acceptStaleAnchor() {
         this.staleAnchorAccepted = true;

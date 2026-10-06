@@ -1,0 +1,18 @@
+# The CL fork watch's rule constants and Sepolia vectors, pinned identically by
+# BOTH engines' tests: Java ClForkWatchTest.constantsMatchTheSharedTwinPins and
+# Rust cl_fork_watch::tests::constants_match_the_shared_twin_pins. The rule
+# constants are the EL watch's (rust/testdata/el/fork_watch/params.txt) — one
+# vote, one majority, one freshness for both detectors. Change a value here AND
+# in both engines, or a suite fails.
+min_peers=3
+observation_ttl_seconds=86400
+activation_grace_seconds=21600
+max_horizon_seconds=34560000
+max_tracked=512
+# The CL watch runs on every network (the EL watch is still staged).
+enabled_networks=mainnet,sepolia,gnosis
+# Sepolia: the Fulu digest with BPO2 folded in (live wire value), the Gloas
+# digest the same blob params yield, and Glamsterdam's activation (epoch 353024).
+sepolia_fulu_digest=0x74d01459
+sepolia_gloas_digest=0x669e6c11
+sepolia_gloas_activation=1791294816

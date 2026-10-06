@@ -99,6 +99,7 @@ async fn main() {
             // A census enumerates the whole DHT; targeted rounds toward the
             // pinned servers would only skew the sample toward nodes we run.
             pinned_peer_ids: vec![],
+            cl_fork_watch: None,
         },
         disc_tx,
     )

@@ -365,9 +365,14 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 - **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
   `{ phase, activationTime, forkId, observedPeers }` when peers announce
   (`"SCHEDULED"`, `activationTime` ahead) or have already activated
-  (`"ACTIVE"`) a network upgrade this engine build does not support (EIP-2124
-  stale-software detection over the peers' eth Status; enabled on Sepolia for
-  now). Tell the user an update is required, with the date while it is
+  (`"ACTIVE"`) a network upgrade this engine build does not support. Two
+  detectors feed it: EIP-2124 stale-software detection over the peers' eth
+  Status (enabled on Sepolia for now), and its consensus-layer twin over
+  discv5 ENR `eth2` fields and peers' libp2p Status fork digests (every
+  network) — `forkId` is the EL fork hash or the CL fork digest accordingly,
+  and `activationTime` is `0` when unknown (peers seen on the fork, its epoch
+  never announced: say "at an unknown time", not 1970). Tell the user an
+  update is required, with the date while it is
   SCHEDULED. It is advisory only: derived from what peers announce
   (unverified; `observedPeers` counts distinct peer networks, and a minority
   can't outvote the peers it contradicts), never from anything verification

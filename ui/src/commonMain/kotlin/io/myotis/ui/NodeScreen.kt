@@ -994,7 +994,10 @@ private fun upgradeCutOff(s: NodeSnapshot): Boolean =
 @Composable
 private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
     val tz = remember { TimeZone.currentSystemDefault() }
-    val at = formatDateTime(u.activationEpochSec * 1000, tz)
+    // 0 = unknown: peers are seen on the fork but nobody announced its time (a
+    // consensus fork digest does not encode it).
+    val at = if (u.activationEpochSec == 0L) "an unknown date"
+        else formatDateTime(u.activationEpochSec * 1000, tz)
     val alarm = u.active && cutOff
     val container = if (alarm) MaterialTheme.colorScheme.errorContainer
         else MaterialTheme.colorScheme.tertiaryContainer

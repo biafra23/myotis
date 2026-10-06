@@ -108,6 +108,10 @@ pub struct DiscoveryConfig {
     /// the chain is starved of light-client servers. Cleared by the sync loop
     /// the moment finality flows again.
     pub hunt_boost: Arc<AtomicBool>,
+    /// Told every ENR's `eth2` field BEFORE the digest filter — a fork this
+    /// build does not know is exactly what the filter would drop. None = no
+    /// detector (tools, tests).
+    pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
@@ -173,6 +177,7 @@ pub async fn spawn(
         Arc::clone(&table_size),
         config.hunt_boost,
         tx,
+        config.cl_fork_watch,
     ));
     Ok((task, table_size))
 }
@@ -231,6 +236,7 @@ async fn run_lookups(
     table_size: Arc<AtomicUsize>,
     hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 ) {
     // Once-ever emission set, SHARED with the Discovered-event consumer so a
     // re-seed (which clears it) refills the pool from both paths.
@@ -268,6 +274,7 @@ async fn run_lookups(
         pinned_targets.clone(),
         Arc::clone(&seen),
         tx.clone(),
+        cl_fork_watch.clone(),
     ));
     loop {
         // The FIRST rounds walk toward each pinned server id in turn — that is
@@ -292,6 +299,7 @@ async fn run_lookups(
         match discv5.find_node(target).await {
             Ok(enrs) => {
                 for enr in enrs {
+                    note_enr(&cl_fork_watch, &enr);
                     if pinned_targets.contains(&enr.node_id()) {
                         // Pinned ids bypass the once-ever dedup, but only on a
                         // record NEWER than the last one emitted.
@@ -415,10 +423,14 @@ async fn consume_discovered(
     pinned_targets: Vec<NodeId>,
     seen: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     tx: mpsc::Sender<DiscoveredPeer>,
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 ) {
     let mut last_digests: Vec<[u8; 4]> = accepted_digests.current();
     while let Some(event) = events.recv().await {
         let Event::Discovered(enr) = event else { continue };
+        // Evidence first, independent of the pool having room: a dropped
+        // candidate is heard again, but the watch wants every hearing.
+        note_enr(&cl_fork_watch, &enr);
         // A full channel drops the node unmarked (see below), so deciding
         // anything about it now — the key decode behind filter_candidate and
         // its debug line — would only be repeated on the next hearing. On
@@ -519,6 +531,35 @@ fn enr_eth2_fork_digest(enr: &Enr) -> Option<[u8; 4]> {
         return None;
     }
     Some(payload[..4].try_into().expect("length checked"))
+}
+
+/// The whole `ENRForkID`: `(fork_digest, next_fork_version, next_fork_epoch)`.
+/// None when the field is absent or shorter than the 16 bytes the spec fixes
+/// (a digest-only field is malformed, and says nothing about what is ahead).
+fn enr_eth2_fork_id(enr: &Enr) -> Option<([u8; 4], [u8; 4], u64)> {
+    let raw = enr.get_raw_rlp(b"eth2")?;
+    let payload = rlp_short_string_payload(raw)?;
+    if payload.len() < 16 {
+        return None;
+    }
+    Some((
+        payload[..4].try_into().expect("length checked"),
+        payload[4..8].try_into().expect("length checked"),
+        u64::from_le_bytes(payload[8..16].try_into().expect("length checked")),
+    ))
+}
+
+/// Report one heard ENR to the CL fork watch (its `eth2` field, keyed by the
+/// record's address). A record without an address has no source to vote as.
+fn note_enr(watch: &Option<Arc<crate::cl_fork_watch::ClForkWatch>>, enr: &Enr) {
+    let Some(watch) = watch else { return };
+    let Some((digest, next_version, next_epoch)) = enr_eth2_fork_id(enr) else { return };
+    let ip: IpAddr = match (enr.ip4(), enr.ip6()) {
+        (Some(ip4), _) => IpAddr::V4(ip4),
+        (None, Some(ip6)) => IpAddr::V6(ip6),
+        (None, None) => return,
+    };
+    watch.observe_enr(&crate::cl_fork_watch::source_of(ip), digest, next_version, next_epoch);
 }
 
 /// Decode a single RLP short string (the only shape an `eth2` field takes).
