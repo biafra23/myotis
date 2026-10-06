@@ -162,10 +162,11 @@ complete on its own.
   owner's call.
 - EIP-1459 in the Rust engine (#539 part 3, `el/dnsdisco.rs`) is desktop-first:
   the walk runs over the system resolver where a host switched it on
-  (`myotis_set_dns_discovery`: the JVM desktop and daemon) and never under Tor.
-  Open: a `DnsServers`-style port taking explicit server IPs would bring it to
-  Android (hickory's `builder_with_config`), and whether a phone should spend
-  the lookups at all; the walk's lookups are sequential (~330 records per 15 s
+  (`myotis_set_dns_discovery`: the JVM desktop and daemon, `myotis-rpcd`) and
+  never under Tor. Open: a `DnsServers`-style port taking explicit server IPs
+  would bring it to Android (hickory's `builder_with_config`), and whether a
+  phone should spend the lookups at all; the Node addon exposes no
+  `setDnsDiscovery` yet (nor a Tor switch), so Electron/Node hosts stay off; the walk's lookups are sequential (~330 records per 15 s
   walk on the dev host, of trees with far more — random order spreads the
   walks); the seeder restarts with the reader on resume, where the Java twin
   keeps its DNS pool across pause; the Java twin's public DNS fallbacks

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 38; // 38: status JSON carries snap2ServingPeers (serving peers on snap/2)
+    static final int EXPECTED_ABI_VERSION = 39; // 39: set_dns_discovery (the EIP-1459 DNS discovery switch, #539)
 
     private static final boolean AVAILABLE = load();
 

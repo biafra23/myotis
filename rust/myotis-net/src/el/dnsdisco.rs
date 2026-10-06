@@ -211,15 +211,24 @@ pub fn parse_root(txt: &str, pubkey: &[u8; 64]) -> Result<Root, String> {
     let (signed, sig) = txt
         .rsplit_once(" sig=")
         .ok_or_else(|| "root record without a sig= field".to_string())?;
+    // `signed` may be shorter than the prefix when ` sig=` followed it at once
+    // (`enrtree-root:v1 sig=…`): a malformed record, never a slice past the end
+    // — a zone or a resolver must not be able to panic the host.
+    let Some(body) = signed.strip_prefix(ROOT_PREFIX) else {
+        return Err(format!("root record without fields: {}", truncate(txt, 60)));
+    };
     let (mut enr_root, mut link_root, mut seq) = (None, None, None);
-    for token in signed[ROOT_PREFIX.len()..].split(' ') {
+    for token in body.split(' ') {
         match token.split_once('=') {
             Some(("e", v)) => enr_root = Some(v.to_string()),
             Some(("l", v)) => link_root = Some(v.to_string()),
             Some(("seq", v)) => {
                 seq = Some(v.parse::<u64>().map_err(|_| format!("root seq is not a number: {v}"))?)
             }
-            _ => {} // unknown fields are ignored, as geth does
+            // Unknown fields and any order are tolerated (the Java twin's
+            // leniency; geth scans a fixed layout). Harmless: the signature
+            // covers the received text.
+            _ => {}
         }
     }
     let (Some(enr_root), Some(link_root), Some(seq)) = (enr_root, link_root, seq) else {
@@ -336,13 +345,16 @@ fn truncate(s: &str, n: usize) -> &str {
 // The walk.
 // ---------------------------------------------------------------------------
 
-/// The TXT lookups a walk makes: one name → the record's text, `None` when the
-/// name has no TXT record. Production: [`SystemResolver`]; tests: a map.
+/// The TXT lookups a walk makes: one name → the texts of its TXT records
+/// (empty when it has none). A name in a tree carries one tree record, but a
+/// zone apex may carry others (SPF, a verification token), so the walk picks
+/// the record it recognises rather than the first one served — as geth does.
+/// Production: [`SystemResolver`]; tests: a map.
 pub trait TxtLookup: Send + Sync {
     fn txt<'a>(
         &'a self,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>>;
 }
 
 /// How a walk is bounded: TXT lookups below the root, tree depth, wall time.
@@ -402,12 +414,17 @@ pub async fn walk(
     now_secs: u64,
 ) -> Result<WalkReport, String> {
     let started = tokio::time::Instant::now();
-    let root_txt = resolver
+    let records = resolver
         .txt(&url.domain)
         .await
-        .map_err(|e| format!("{}: root lookup failed: {e}", url.domain))?
-        .ok_or_else(|| format!("{}: no root TXT record", url.domain))?;
-    let root = parse_root(&root_txt, &url.pubkey).map_err(|e| format!("{}: {e}", url.domain))?;
+        .map_err(|e| format!("{}: root lookup failed: {e}", url.domain))?;
+    // The apex may carry other TXT records: the root is the one that says so.
+    let root_txt = records
+        .iter()
+        .map(|r| r.trim())
+        .find(|r| r.starts_with(ROOT_PREFIX))
+        .ok_or_else(|| format!("{}: no enrtree-root TXT record", url.domain))?;
+    let root = parse_root(root_txt, &url.pubkey).map_err(|e| format!("{}: {e}", url.domain))?;
     let mut report = WalkReport {
         seq: root.seq,
         ..WalkReport::default()
@@ -422,34 +439,38 @@ pub async fn walk(
         if report.lookups >= limits.max_lookups {
             break;
         }
-        // Loop protection first: a label met twice is never fetched twice.
-        if !visited.insert(label.to_ascii_uppercase()) {
-            continue;
-        }
         if depth > limits.max_depth {
+            continue; // not resolved, so not visited: a shallower path may reach it
+        }
+        // Loop protection: a label resolved once is never fetched twice.
+        if !visited.insert(label.to_ascii_uppercase()) {
             continue;
         }
         report.lookups += 1;
         let name = format!("{label}.{}", url.domain);
-        let txt = match resolver.txt(&name).await {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                tracing::debug!(%name, "dns tree: no record");
-                continue;
-            }
+        let records = match resolver.txt(&name).await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::debug!(%name, "dns tree: lookup failed: {e}");
                 continue;
             }
         };
-        let txt = txt.trim();
-        // The label is the record's hash: a record that does not hash to it
-        // was not published under this root.
-        if !label_of(txt).eq_ignore_ascii_case(&label) {
-            report.mismatched += 1;
-            tracing::debug!(%name, "dns tree: record does not hash to its label");
+        if records.is_empty() {
+            tracing::debug!(%name, "dns tree: no record");
             continue;
         }
+        // The label is the record's hash: the record that hashes to it is the
+        // tree's; a name serving only others was not published under this
+        // root (or the zone was altered in flight).
+        let Some(txt) = records
+            .iter()
+            .map(|r| r.trim())
+            .find(|r| label_of(r).eq_ignore_ascii_case(&label))
+        else {
+            report.mismatched += 1;
+            tracing::debug!(%name, "dns tree: no record hashes to the label");
+            continue;
+        };
         match parse_entry(txt) {
             Ok(Entry::Branch(mut children)) => {
                 shuffle(&mut children);
@@ -536,20 +557,23 @@ impl TxtLookup for SystemResolver {
     fn txt<'a>(
         &'a self,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
         Box::pin(async move {
             // Fully qualified: no search-list suffixing, one query.
             let fqdn = format!("{name}.");
             match self.inner.txt_lookup(fqdn).await {
-                // One record per name in a tree; its segments concatenate
-                // (TXT strings are at most 255 bytes, a long ENR is split).
-                Ok(lookup) => Ok(lookup.iter().next().map(|txt| {
-                    txt.txt_data()
-                        .iter()
-                        .map(|seg| String::from_utf8_lossy(seg))
-                        .collect::<String>()
-                })),
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(None),
+                // A record's segments concatenate (TXT strings are at most 255
+                // bytes, a long ENR is split over several).
+                Ok(lookup) => Ok(lookup
+                    .iter()
+                    .map(|txt| {
+                        txt.txt_data()
+                            .iter()
+                            .map(|seg| String::from_utf8_lossy(seg))
+                            .collect::<String>()
+                    })
+                    .collect()),
+                Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
                 Err(e) => Err(e.to_string()),
             }
         })
@@ -660,13 +684,12 @@ impl DnsSeeder {
     /// Walk every tree once, merge the candidates into the pool (newest first,
     /// deduplicated by address, at most [`DNS_POOL_MAX`]), and offer up to
     /// [`DNS_PROBE_MAX`] UDP endpoints to discv4 through `probe`. Returns the
-    /// candidates added. Clears the claim [`begin_walk_if_due`](Self::begin_walk_if_due) took.
+    /// dial candidates the walks found (held before or not). Clears the claim
+    /// [`begin_walk_if_due`](Self::begin_walk_if_due) took — also when the
+    /// task is cancelled or unwinds mid-walk, so no claim outlives its walk.
     pub async fn walk_once(&self, probe: Option<&tokio::sync::mpsc::Sender<SocketAddr>>) -> usize {
-        let added = self.walk_all(probe).await;
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.walking = false;
-        st.last_walk = Some(tokio::time::Instant::now());
-        added
+        let _claim = WalkClaim(self);
+        self.walk_all(probe).await
     }
 
     async fn walk_all(&self, probe: Option<&tokio::sync::mpsc::Sender<SocketAddr>>) -> usize {
@@ -692,7 +715,7 @@ impl DnsSeeder {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut added = 0usize;
+        let mut found = 0usize;
         let mut endpoints: Vec<SocketAddr> = Vec::new();
         for url in &self.urls {
             let report = match walk(resolver, url, self.limits, &self.filter, now_secs).await {
@@ -710,7 +733,7 @@ impl DnsSeeder {
             endpoints.extend(report.candidates.iter().filter_map(DnsNode::udp_addr));
             endpoints.extend(report.discovery_only.iter().copied());
             let (pool_len, new) = self.merge(&fresh);
-            added += new;
+            found += fresh.len();
             tracing::info!(
                 domain = %url.domain,
                 seq = report.seq,
@@ -735,7 +758,7 @@ impl DnsSeeder {
                 }
             }
         }
-        added
+        found
     }
 
     /// Merge fresh candidates in front of the held ones, deduplicated by
@@ -766,6 +789,19 @@ impl DnsSeeder {
     /// Candidates held.
     pub fn pool_len(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).pool.len()
+    }
+}
+
+/// Releases a walk's claim when the walk ends — by returning, by the task
+/// being cancelled (the pool stopping) or by an unwind — so `walking` can
+/// never stay set without a walk behind it.
+struct WalkClaim<'a>(&'a DnsSeeder);
+
+impl Drop for WalkClaim<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.walking = false;
+        st.last_walk = Some(tokio::time::Instant::now());
     }
 }
 
@@ -902,6 +938,11 @@ mod tests {
         )
         .is_err()); // no l=
         assert!(parse_root("enrtree-root:v1 e=A l=B seq=x sig=AAAA", &url.pubkey).is_err());
+        // ` sig=` right after the prefix: the text before it is shorter than
+        // the prefix — an error, not a slice past the end (the host must not
+        // panic on a zone's or a resolver's text).
+        assert!(parse_root("enrtree-root:v1 sig=AAAA", &url.pubkey).is_err());
+        assert!(parse_root("enrtree-root:v1 ", &url.pubkey).is_err());
     }
 
     fn base64url_nopad(bytes: &[u8]) -> String {
@@ -1045,12 +1086,18 @@ mod tests {
         fn txt<'a>(
             &'a self,
             name: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
             Box::pin(async move {
                 if name.starts_with("LOOKUPFAILS") {
                     return Err("servfail".to_string());
                 }
-                Ok(self.0.get(name).cloned())
+                // Every name also serves an unrelated record first, as a zone
+                // apex with an SPF record would: the walk must pick the tree's.
+                Ok(self
+                    .0
+                    .get(name)
+                    .map(|r| vec!["v=spf1 -all".to_string(), r.clone()])
+                    .unwrap_or_default())
             })
         }
     }
@@ -1234,8 +1281,8 @@ mod tests {
         .unwrap();
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(8);
         assert!(seeder.begin_walk_if_due(tokio::time::Instant::now(), true, true));
-        let added = seeder.walk_once(Some(&probe_tx)).await;
-        assert_eq!(added, 1, "one node names a TCP port");
+        let found = seeder.walk_once(Some(&probe_tx)).await;
+        assert_eq!(found, 1, "one node names a TCP port");
         assert_eq!(seeder.take_batch(5), vec![("10.0.0.41:30303".parse().unwrap(), key(41).public_key_bytes())]);
         let mut probed = Vec::new();
         while let Ok(addr) = probe_rx.try_recv() {
@@ -1244,8 +1291,58 @@ mod tests {
         probed.sort();
         assert_eq!(probed, vec!["10.0.0.41:30303".parse().unwrap(), "10.0.0.42:30304".parse().unwrap()]);
         // The claim is released and the walk time set.
-        let st = seeder.state.lock().unwrap();
-        assert!(!st.walking);
-        assert!(st.last_walk.is_some());
+        {
+            let st = seeder.state.lock().unwrap();
+            assert!(!st.walking);
+            assert!(st.last_walk.is_some());
+        }
+    }
+
+    /// A resolver that never answers, and says when it was asked.
+    struct Stall(Arc<std::sync::atomic::AtomicBool>);
+
+    impl TxtLookup for Stall {
+        fn txt<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_walk_cut_short_releases_its_claim() {
+        // The pool stopping aborts a walk in flight: the claim must go with
+        // it, or a seeder outliving the task could never walk again.
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seeder = Arc::new(
+            DnsSeeder::with_source(
+                &[SPEC_ZONE_URL.to_string()],
+                filter(),
+                ResolverSource::Fixed(Arc::new(Stall(Arc::clone(&asked)))),
+                WalkLimits::default(),
+            )
+            .unwrap(),
+        );
+        let t0 = tokio::time::Instant::now();
+        assert!(seeder.begin_walk_if_due(t0, true, true));
+        let task = tokio::spawn({
+            let s = Arc::clone(&seeder);
+            async move {
+                s.walk_once(None).await;
+            }
+        });
+        while !asked.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(seeder.state.lock().unwrap().walking, "the walk is in flight");
+        task.abort();
+        let _ = task.await;
+        assert!(!seeder.state.lock().unwrap().walking, "an aborted walk releases its claim");
+        // The guard stamped the walk time at the abort, so the next walk is
+        // due an interval from NOW, not from t0.
+        let later = tokio::time::Instant::now() + DNS_REFRESH_INTERVAL;
+        assert!(seeder.begin_walk_if_due(later, true, true));
     }
 }

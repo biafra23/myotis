@@ -135,6 +135,10 @@ fn run(args: Args) -> Result<(), String> {
             myotis_engine::ABI_VERSION
         ));
     }
+    // EIP-1459 DNS discovery (#539): this daemon resolves through the system
+    // resolver, as the JVM daemon does, so the EL pool may walk the network's
+    // node list for peers. Off until a host says so; this one does.
+    ffi::set_dns_discovery(true);
     let network = ffi::canonical_network_name(args.network.clone())
         .ok_or_else(|| format!("unknown network '{}'", args.network))?;
     let chain_id = chain_id_of(&network)?;
