@@ -56,7 +56,10 @@ import java.util.function.LongSupplier;
  * <p>A Status carrying one of our digests says nothing about what lies ahead, so it is
  * neither support nor dissent — otherwise every exchange before the fork would outvote the
  * announcements. The activation time of a fork known only from placement is unknown
- * (reported as 0): the digest is a truncated hash and does not encode the epoch.
+ * (reported as 0): the digest is a truncated hash and does not encode the epoch. A
+ * blob-parameter-only fork is announced under OUR version (only the digest rotates, to a
+ * value this build cannot compute), so its fork id is reported as 0; once it passes, only
+ * the EL watch can still place peers (their new digest reproduces from nothing we know).
  *
  * <p>One instance per network stack, shared across pause/resume rebuilds (like
  * {@link ForkWatch}). Thread-safe: observed from the discv5 and libp2p threads, read by
@@ -91,6 +94,8 @@ public final class ClForkWatch {
     private final long genesisTime;
     private final long secondsPerSlot;
     private final LongSupplier clock;
+    /** Every digest the schedule can produce — "ours" — computed once. */
+    private final List<byte[]> knownDigests;
 
     /** Latest observation per source, access-ordered so the LRU bound drops the stalest. */
     private final LinkedHashMap<String, EnrObservation> enrBySource = new LinkedHashMap<>(16, 0.75f, true) {
@@ -125,6 +130,9 @@ public final class ClForkWatch {
         this.genesisTime = genesisTime;
         this.secondsPerSlot = secondsPerSlot;
         this.clock = clock;
+        List<byte[]> known = new ArrayList<>(schedule.forks().size());
+        for (ForkSchedule.Fork f : schedule.forks()) known.add(digestOf(f.versionBytes()));
+        this.knownDigests = List.copyOf(known);
     }
 
     /** A watch over {@code net}'s schedule, on the system wall clock. Every network. */
@@ -170,7 +178,7 @@ public final class ClForkWatch {
     private static long rank(ForkWatch.Advisory a) {
         return (a.phase() == ForkWatch.Phase.ACTIVE ? 1L << 62 : 0)
                 + (a.activationTime() != 0 ? 1L << 61 : 0)
-                + Math.min(a.peers(), Integer.MAX_VALUE);
+                + a.peers();
     }
 
     /** The digest a fork {@code version} yields on this chain (blob params folded in). */
@@ -269,13 +277,11 @@ public final class ClForkWatch {
 
         // Every digest this schedule can produce is "ours": a peer on an older scheduled
         // fork is behind, not news.
-        List<byte[]> knownDigests = new ArrayList<>();
-        for (ForkSchedule.Fork f : schedule.forks()) knownDigests.add(digestOf(f.versionBytes()));
         int currentVersion = ForkIds.toInt(schedule.versionAtEpoch(wallEpoch(now)));
 
         // Pass 1: ENR evidence — the only kind that names the fork ahead.
         Map<String, Vote> votes = new HashMap<>();
-        List<Integer> announcedVersions = new ArrayList<>();
+        List<Integer> versionsInPlay = new ArrayList<>();
         for (Map.Entry<String, EnrObservation> e : enrBySource.entrySet()) {
             EnrObservation o = e.getValue();
             boolean onOurs = contains(knownDigests, o.digest());
@@ -286,35 +292,43 @@ public final class ClForkWatch {
             } else if (o.nextEpoch() == FAR_FUTURE_EPOCH) {
                 if (onOurs) {
                     vote = new Vote(Vote.Kind.DISSENT, 0, 0);
-                } else if (Arrays.equals(digestOf(o.nextVersion()), o.digest())
-                        && Integer.compareUnsigned(nextVersion, currentVersion) > 0) {
+                } else if (newerSelfConsistent(o, currentVersion)) {
                     vote = new Vote(Vote.Kind.PLACED, nextVersion, 0);
                 }
-            } else {
+            } else if (onOurs) {
                 long t = activationTime(o.nextEpoch(), now);
-                if (t >= 0 && onOurs && (t > now || now - t < ACTIVATION_GRACE_SECONDS)) {
-                    if (!announcedVersions.contains(nextVersion)) announcedVersions.add(nextVersion);
+                if (t >= 0 && (t > now || now - t < ACTIVATION_GRACE_SECONDS)) {
                     vote = new Vote(Vote.Kind.ANNOUNCED, nextVersion, o.nextEpoch());
                 }
-                // A foreign digest announcing a further fork: placeable only against a
-                // version someone announced (pass 2).
+            } else if (newerSelfConsistent(o, currentVersion)) {
+                vote = new Vote(Vote.Kind.PLACED, nextVersion, 0);
             }
-            if (vote != null) votes.put(e.getKey(), vote);
+            // else: a foreign digest announcing a further fork — placeable only against a
+            // version someone announced (pass 2).
+            if (vote != null) {
+                if (vote.kind() != Vote.Kind.DISSENT && !versionsInPlay.contains(vote.version())) {
+                    versionsInPlay.add(vote.version());
+                }
+                votes.put(e.getKey(), vote);
+            }
         }
+        // Deterministic order: a tie must resolve the same way on every evaluate and in
+        // both engines.
+        versionsInPlay.sort(Integer::compareUnsigned);
+        List<byte[]> inPlayDigests = new ArrayList<>(versionsInPlay.size());
+        for (int v : versionsInPlay) inPlayDigests.add(digestOf(versionBytes(v)));
         // Pass 2: digests alone (a Status, or an ENR that was not placeable above) place
-        // against the versions in play.
-        List<Integer> versionsInPlay = new ArrayList<>(announcedVersions);
-        for (Vote v : votes.values()) {
-            if (v.kind() == Vote.Kind.PLACED && !versionsInPlay.contains(v.version())) versionsInPlay.add(v.version());
-        }
+        // against the versions in play. A digest this schedule produces is never placed —
+        // it is ours (an announced blob-parameter fork keeps OUR version in play; peers on
+        // our digest are not on it).
         for (Map.Entry<String, EnrObservation> e : enrBySource.entrySet()) {
             if (votes.containsKey(e.getKey())) continue;
-            Integer v = place(versionsInPlay, e.getValue().digest());
+            Integer v = place(versionsInPlay, inPlayDigests, e.getValue().digest());
             if (v != null) votes.put(e.getKey(), new Vote(Vote.Kind.PLACED, v, 0));
         }
         for (Map.Entry<String, StatusObservation> e : statusBySource.entrySet()) {
-            if (votes.containsKey(e.getKey()) || contains(knownDigests, e.getValue().digest())) continue;
-            Integer v = place(versionsInPlay, e.getValue().digest());
+            if (votes.containsKey(e.getKey())) continue;
+            Integer v = place(versionsInPlay, inPlayDigests, e.getValue().digest());
             if (v != null) votes.put(e.getKey(), new Vote(Vote.Kind.PLACED, v, 0));
         }
 
@@ -348,6 +362,8 @@ public final class ClForkWatch {
             }
             Claim c = new Claim(version, bestEpoch, bestCount, placed.getOrDefault(version, 0));
             if (c.total() < MIN_PEERS || c.total() <= dissent) continue;
+            // Most-backed fork; ties → more placed, a known epoch, the earliest epoch, then
+            // the lowest version (versionsInPlay is ascending, so "first wins" does it).
             if (best == null || c.total() > best.total()
                     || (c.total() == best.total() && (c.placed() > best.placed()
                         || (c.placed() == best.placed() && (c.epoch() >= 0 && best.epoch() < 0
@@ -359,13 +375,28 @@ public final class ClForkWatch {
         long activation = best.epoch() >= 0 ? Math.max(0, activationTime(best.epoch(), now)) : 0;
         ForkWatch.Phase phase = (activation != 0 && activation <= now) || best.placed() >= MIN_PEERS
                 ? ForkWatch.Phase.ACTIVE : ForkWatch.Phase.SCHEDULED;
-        return new ForkWatch.Advisory(phase, activation,
-                ForkIds.toInt(digestOf(versionBytes(best.version()))), best.total());
+        // A fork announced under OUR version is a blob-parameter-only fork: it rotates the
+        // digest to a value this build cannot compute (the new blob params are not on the
+        // wire), so the fork id is unknown (0).
+        int forkId = best.version() == currentVersion ? 0 : ForkIds.toInt(digestOf(versionBytes(best.version())));
+        return new ForkWatch.Advisory(phase, activation, forkId, best.total());
     }
 
-    private Integer place(List<Integer> versionsInPlay, byte[] digest) {
-        for (int v : versionsInPlay) {
-            if (Arrays.equals(digestOf(versionBytes(v)), digest)) return v;
+    /**
+     * A record whose {@code next_fork_version} is newer than ours AND reproduces its own
+     * digest: a peer on a later fork of THIS chain (with nothing further scheduled it
+     * publishes its current version there; with a blob-parameter fork scheduled, still
+     * its current version).
+     */
+    private boolean newerSelfConsistent(EnrObservation o, int currentVersion) {
+        return Integer.compareUnsigned(ForkIds.toInt(o.nextVersion()), currentVersion) > 0
+                && Arrays.equals(digestOf(o.nextVersion()), o.digest());
+    }
+
+    private Integer place(List<Integer> versionsInPlay, List<byte[]> inPlayDigests, byte[] digest) {
+        if (contains(knownDigests, digest)) return null;
+        for (int i = 0; i < versionsInPlay.size(); i++) {
+            if (Arrays.equals(inPlayDigests.get(i), digest)) return versionsInPlay.get(i);
         }
         return null;
     }

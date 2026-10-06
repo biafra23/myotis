@@ -1004,11 +1004,6 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.discV5 = new DiscV5Service(nodeKey, network.clDiscv5Bootnodes(), pinnedNodeIds, enr -> {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
-            // Evidence for the CL fork watch BEFORE the digest filter: a fork this
-            // build does not know is exactly what the filter drops.
-            enr.udpAddress().or(enr::tcpAddress).ifPresent(addr -> clForkWatch.observeEnr(
-                    ForkWatch.sourceOf(addr.getAddress()), eth2.get().forkDigest(),
-                    eth2.get().nextForkVersion(), eth2.get().nextForkEpoch()));
             byte[] peerDigest = eth2.get().forkDigest();
             List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
             int matchIdx = -1;
@@ -1033,6 +1028,14 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                         mi == 0 ? "current" : "prior", liveAdded ? " → live pool" : "");
             });
         });
+        // Evidence for the CL fork watch: every record heard, every time, BEFORE the
+        // digest filter above (a fork this build does not know is exactly what the
+        // filter drops) and before the once-ever dedup (the watch's evidence ages
+        // out a day after it was last heard).
+        discV5.setOnEnrHeard(enr -> enr.eth2().ifPresent(eth2 ->
+                enr.udpAddress().or(enr::tcpAddress).ifPresent(addr -> clForkWatch.observeEnr(
+                        ForkWatch.sourceOf(addr.getAddress()), eth2.forkDigest(),
+                        eth2.nextForkVersion(), eth2.nextForkEpoch()))));
         try {
             discV5.start(ports.discv5Port());
         } catch (Throwable t) {

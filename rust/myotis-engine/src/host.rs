@@ -793,6 +793,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 if let Ok(mut watches) = engine.fork_watches.lock() {
                     watches.remove(&handle);
                 }
+                if let Ok(mut watches) = engine.cl_fork_watches.lock() {
+                    watches.remove(&handle);
+                }
             }
             shutdown(engine, sync, reader);
             false

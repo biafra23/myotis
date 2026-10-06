@@ -283,6 +283,54 @@ class ClForkWatchTest {
     }
 
     @Test
+    void aForkWithAFurtherTransitionScheduledStillPlaces() {
+        // Clients on Gloas with a blob-parameter fork scheduled after it publish
+        // (gloas_digest, gloas_version, bpo_epoch) — the normal post-fork shape on a chain
+        // that ships BPOs — and must place like the FAR_FUTURE form.
+        ClForkWatch w = preGloasSepolia();
+        clock.set(AFTER);
+        for (int i = 0; i < 3; i++) w.observeEnr("u" + i, GLOAS_DIGEST, GLOAS_VERSION, 400_000L);
+        ForkWatch.Advisory a = w.advisory();
+        assertEquals(ForkWatch.Phase.ACTIVE, a.phase());
+        assertEquals(0, a.activationTime());
+        assertEquals("0x669e6c11", a.forkHashHex());
+        assertEquals(3, a.peers());
+    }
+
+    @Test
+    void aBlobParameterForkAnnouncesUnderOurVersionWithNoForkId() {
+        // A BPO-only fork: announced under OUR version at an epoch we do not know. It is an
+        // upgrade (the digest rotates), but to a digest this build cannot compute, so the
+        // fork id is 0.
+        ClForkWatch w = preGloasSepolia();
+        for (int i = 0; i < 3; i++) w.observeEnr("b" + i, FULU_DIGEST, FULU_VERSION, 400_000L);
+        ForkWatch.Advisory a = w.advisory();
+        assertEquals(ForkWatch.Phase.SCHEDULED, a.phase());
+        assertEquals(SEPOLIA.clGenesisTime() + 400_000L * 32 * 12, a.activationTime());
+        assertEquals(0, a.forkHash(), "the post-BPO digest is not computable");
+        assertEquals(3, a.peers());
+        // Our version is in play, but peers on OUR digest are never placed on it.
+        for (int i = 0; i < 4; i++) w.observeEnr("g" + i, FULU_DIGEST, FULU_VERSION, 1L);
+        for (int i = 0; i < 4; i++) w.observeStatus("s" + i, FULU_DIGEST);
+        assertEquals(3, w.advisory().peers());
+    }
+
+    @Test
+    void aTieBetweenPlacedVersionsResolvesToTheLowestAndStaysPut() {
+        ClForkWatch w = preGloasSepolia();
+        clock.set(AFTER);
+        byte[] higher = {(byte) 0x90, 0, 0, 0x77};
+        byte[] higherDigest = w.digestOf(higher);
+        for (int i = 0; i < 3; i++) w.observeEnr("h" + i, higherDigest, higher, ClForkWatch.FAR_FUTURE_EPOCH);
+        upgraded(w, "u", 3);
+        for (int i = 0; i < 5; i++) {
+            ForkWatch.Advisory a = w.advisory();
+            assertEquals("0x669e6c11", a.forkHashHex(), "the lower version, every time");
+            assertEquals(3, a.peers());
+        }
+    }
+
+    @Test
     void trackedSourcesAreBounded() {
         ClForkWatch w = preGloasSepolia();
         for (int i = 0; i < ClForkWatch.MAX_TRACKED + 50; i++) {

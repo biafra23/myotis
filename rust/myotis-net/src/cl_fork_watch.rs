@@ -37,12 +37,16 @@
 //! so it is neither support nor dissent — otherwise every exchange before the
 //! fork would outvote the announcements. The activation time of a fork known
 //! only from placement is unknown (reported as 0): the digest is a truncated
-//! hash and does not encode the epoch.
+//! hash and does not encode the epoch. A blob-parameter-only fork is announced
+//! under OUR version (only the digest rotates, to a value this build cannot
+//! compute), so its fork id is reported as 0; once it passes, only the EL
+//! watch can still place peers (their new digest reproduces from nothing we
+//! know).
 //!
 //! One instance per HANDLE, owned by the engine host so it survives
 //! pause/resume (the Java twin is ChainStack-owned for the same reason).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Mutex;
 
@@ -61,15 +65,6 @@ pub const FAR_FUTURE_EPOCH: u64 = u64::MAX;
 /// records are the same source in both detectors.
 pub fn source_of(ip: IpAddr) -> String {
     fork_watch::source_of(ip)
-}
-
-/// The IP a libp2p multiaddr names (`/ip4/…` or `/ip6/…`), if any.
-pub fn multiaddr_ip(addr: &libp2p::Multiaddr) -> Option<IpAddr> {
-    addr.iter().find_map(|p| match p {
-        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
-        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
-        _ => None,
-    })
 }
 
 /// The one advisory a host reports when both detectors have one: ACTIVE over
@@ -124,6 +119,8 @@ pub struct ClForkWatch {
     blob_params_max_blobs: u64,
     genesis_time: u64,
     seconds_per_slot: u64,
+    /// Every digest the schedule can produce — "ours" — computed once.
+    known_digests: Vec<[u8; 4]>,
     inner: Mutex<Inner>,
 }
 
@@ -149,6 +146,18 @@ impl ClForkWatch {
         genesis_time: u64,
         seconds_per_slot: u64,
     ) -> ClForkWatch {
+        let known_digests = schedule
+            .forks()
+            .iter()
+            .map(|(_, v)| {
+                fork_digest_bpo(
+                    *v,
+                    genesis_validators_root,
+                    blob_params_epoch,
+                    blob_params_max_blobs,
+                )
+            })
+            .collect();
         ClForkWatch {
             label,
             schedule,
@@ -157,6 +166,7 @@ impl ClForkWatch {
             blob_params_max_blobs,
             genesis_time,
             seconds_per_slot,
+            known_digests,
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -326,18 +336,23 @@ impl ClForkWatch {
 
         // Every digest this schedule can produce is "ours": a peer on an older
         // scheduled fork is behind, not news.
-        let known_digests: Vec<[u8; 4]> = self
-            .schedule
-            .forks()
-            .iter()
-            .map(|(_, v)| self.digest_of(*v))
-            .collect();
+        let known_digests = &self.known_digests;
         let current_version =
             u32::from_be_bytes(self.schedule.version_at_epoch(self.wall_epoch(now)));
+        // A record whose `next_fork_version` is newer than ours AND reproduces
+        // its own digest: a peer on a later fork of THIS chain (with nothing
+        // further scheduled it publishes its current version there; with a
+        // blob-parameter fork scheduled, still its current version).
+        let newer_self_consistent = |o: &EnrObservation| {
+            u32::from_be_bytes(o.next_version) > current_version
+                && self.digest_of(o.next_version) == o.digest
+        };
 
         // Pass 1: ENR evidence — the only kind that names the fork ahead.
-        let mut votes: HashMap<&str, Vote> = HashMap::new();
-        let mut announced_versions: Vec<[u8; 4]> = Vec::new();
+        // Deterministic containers throughout (BTreeMap, sorted versions): a
+        // tie must resolve the same way on every evaluate and in both engines.
+        let mut votes: BTreeMap<&str, Vote> = BTreeMap::new();
+        let mut versions_in_play: Vec<[u8; 4]> = Vec::new();
         for (source, o) in &inner.enr_by_source {
             let on_ours = known_digests.contains(&o.digest);
             let vote = if self.known_transition(o.next_epoch) {
@@ -345,50 +360,55 @@ impl ClForkWatch {
             } else if o.next_epoch == FAR_FUTURE_EPOCH {
                 if on_ours {
                     Some(Vote::Dissent)
-                } else if self.digest_of(o.next_version) == o.digest
-                    && u32::from_be_bytes(o.next_version) > current_version
-                {
+                } else if newer_self_consistent(o) {
                     Some(Vote::Placed {
                         version: o.next_version,
                     })
                 } else {
                     None
                 }
-            } else {
+            } else if on_ours {
                 match self.activation_time(o.next_epoch, now) {
-                    Some(t) if on_ours && (t > now || now - t < ACTIVATION_GRACE_SECONDS) => {
-                        if !announced_versions.contains(&o.next_version) {
-                            announced_versions.push(o.next_version);
-                        }
+                    Some(t) if t > now || now - t < ACTIVATION_GRACE_SECONDS => {
                         Some(Vote::Announced {
                             version: o.next_version,
                             epoch: o.next_epoch,
                         })
                     }
-                    // A foreign digest announcing a further fork: placeable
-                    // only against a version someone announced (pass 2).
                     _ => None,
                 }
+            } else if newer_self_consistent(o) {
+                Some(Vote::Placed {
+                    version: o.next_version,
+                })
+            } else {
+                // A foreign digest announcing a further fork: placeable only
+                // against a version someone announced (pass 2).
+                None
             };
             if let Some(v) = vote {
+                if let Vote::Announced { version, .. } | Vote::Placed { version } = &v {
+                    if !versions_in_play.contains(version) {
+                        versions_in_play.push(*version);
+                    }
+                }
                 votes.insert(source.as_str(), v);
             }
         }
+        versions_in_play.sort_unstable();
+        let in_play: Vec<([u8; 4], [u8; 4])> = versions_in_play
+            .iter()
+            .map(|v| (*v, self.digest_of(*v)))
+            .collect();
         // Pass 2: digests alone (a Status, or an ENR that was not placeable
-        // above) place against the versions in play.
-        let mut versions_in_play: Vec<[u8; 4]> = announced_versions.clone();
-        for v in votes.values() {
-            if let Vote::Placed { version } = v {
-                if !versions_in_play.contains(version) {
-                    versions_in_play.push(*version);
-                }
-            }
-        }
+        // above) place against the versions in play. A digest this schedule
+        // produces is never placed — it is ours (an announced blob-parameter
+        // fork keeps OUR version in play; peers on our digest are not on it).
         let place = |digest: [u8; 4]| -> Option<[u8; 4]> {
-            versions_in_play
-                .iter()
-                .copied()
-                .find(|v| self.digest_of(*v) == digest)
+            if known_digests.contains(&digest) {
+                return None;
+            }
+            in_play.iter().find(|(_, d)| *d == digest).map(|(v, _)| *v)
         };
         for (source, o) in &inner.enr_by_source {
             if votes.contains_key(source.as_str()) {
@@ -399,7 +419,7 @@ impl ClForkWatch {
             }
         }
         for (source, o) in &inner.status_by_source {
-            if votes.contains_key(source.as_str()) || known_digests.contains(&o.digest) {
+            if votes.contains_key(source.as_str()) {
                 continue;
             }
             if let Some(version) = place(o.digest) {
@@ -410,8 +430,8 @@ impl ClForkWatch {
         // Tally per version; the activation epoch is the most-announced one
         // (ties → earliest), unknown when nobody announced it.
         let mut dissent = 0usize;
-        let mut announced: HashMap<([u8; 4], u64), usize> = HashMap::new();
-        let mut placed: HashMap<[u8; 4], usize> = HashMap::new();
+        let mut announced: BTreeMap<([u8; 4], u64), usize> = BTreeMap::new();
+        let mut placed: BTreeMap<[u8; 4], usize> = BTreeMap::new();
         for v in votes.values() {
             match v {
                 Vote::Dissent => dissent += 1,
@@ -449,29 +469,25 @@ impl ClForkWatch {
                 placed: placed.get(version).copied().unwrap_or(0),
             });
         }
+        // Most-backed fork; ties → more placed, a known epoch, the earliest
+        // epoch, then the lowest version. Must clear both the absolute floor
+        // and the dissent: a minority can't outvote the peers it contradicts.
         let total = |c: &Claim| c.announced + c.placed;
+        let rank = |c: &Claim| {
+            (
+                total(c),
+                c.placed,
+                c.epoch.is_some(),
+                std::cmp::Reverse(c.epoch.unwrap_or(u64::MAX)),
+                std::cmp::Reverse(u32::from_be_bytes(c.version)),
+            )
+        };
         let mut best: Option<&Claim> = None;
         for c in &claims {
             if total(c) < MIN_PEERS || total(c) <= dissent {
                 continue;
             }
-            let better = match best {
-                None => true,
-                Some(b) => {
-                    (
-                        total(c),
-                        c.placed,
-                        c.epoch.is_some(),
-                        std::cmp::Reverse(c.epoch.unwrap_or(u64::MAX)),
-                    ) > (
-                        total(b),
-                        b.placed,
-                        b.epoch.is_some(),
-                        std::cmp::Reverse(b.epoch.unwrap_or(u64::MAX)),
-                    )
-                }
-            };
-            if better {
+            if best.is_none_or(|b| rank(c) > rank(b)) {
                 best = Some(c);
             }
         }
@@ -486,10 +502,18 @@ impl ClForkWatch {
         } else {
             Phase::Scheduled
         };
+        // A fork announced under OUR version is a blob-parameter-only fork: it
+        // rotates the digest to a value this build cannot compute (the new
+        // blob params are not on the wire), so the fork id is unknown (0).
+        let fork_hash = if u32::from_be_bytes(best.version) == current_version {
+            0
+        } else {
+            u32::from_be_bytes(self.digest_of(best.version))
+        };
         Some(Advisory {
             phase,
             activation_time,
-            fork_hash: u32::from_be_bytes(self.digest_of(best.version)),
+            fork_hash,
             peers: total(best),
         })
     }
@@ -879,6 +903,79 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_with_a_further_transition_scheduled_still_places() {
+        // Clients on Gloas with a blob-parameter fork scheduled after it publish
+        // (gloas_digest, gloas_version, bpo_epoch) — the normal post-fork shape
+        // on a chain that ships BPOs — and must place like the FAR_FUTURE form.
+        let w = pre_gloas_sepolia();
+        for i in 0..3 {
+            w.observe_enr_at(
+                &format!("u{i}"),
+                GLOAS_DIGEST,
+                GLOAS_VERSION,
+                400_000,
+                AFTER,
+            );
+        }
+        let a = w.evaluate(AFTER).expect("advisory");
+        assert_eq!((a.phase, a.activation_time, a.peers), (Phase::Active, 0, 3));
+        assert_eq!(a.fork_hash_hex(), "0x669e6c11");
+    }
+
+    #[test]
+    fn a_blob_parameter_fork_announces_under_our_version_with_no_fork_id() {
+        // A BPO-only fork: announced under OUR version at an epoch we do not
+        // know. It is an upgrade (the digest rotates), but to a digest this
+        // build cannot compute, so the fork id is 0.
+        let w = pre_gloas_sepolia();
+        for i in 0..3 {
+            w.observe_enr_at(&format!("b{i}"), FULU_DIGEST, FULU_VERSION, 400_000, BEFORE);
+        }
+        let a = w.evaluate(BEFORE).expect("advisory");
+        assert_eq!(a.phase, Phase::Scheduled);
+        assert_eq!(
+            a.activation_time,
+            w.activation_time(400_000, BEFORE).unwrap()
+        );
+        assert_eq!(a.fork_hash, 0, "the post-BPO digest is not computable");
+        assert_eq!(a.peers, 3);
+        // Our version is in play, but peers on OUR digest are never placed on it.
+        for i in 0..4 {
+            w.observe_enr_at(&format!("g{i}"), FULU_DIGEST, FULU_VERSION, 1, BEFORE);
+        }
+        for i in 0..4 {
+            w.observe_status_at(&format!("s{i}"), FULU_DIGEST, BEFORE);
+        }
+        assert_eq!(w.evaluate(BEFORE).map(|a| a.peers), Some(3));
+    }
+
+    #[test]
+    fn a_tie_between_placed_versions_resolves_to_the_lowest_and_stays_put() {
+        let w = pre_gloas_sepolia();
+        let higher = [0x90, 0x00, 0x00, 0x77];
+        let higher_digest = w.digest_of(higher);
+        for i in 0..3 {
+            w.observe_enr_at(
+                &format!("h{i}"),
+                higher_digest,
+                higher,
+                FAR_FUTURE_EPOCH,
+                AFTER,
+            );
+        }
+        upgraded(&w, "u", 3, AFTER);
+        for _ in 0..5 {
+            let a = w.evaluate(AFTER).expect("advisory");
+            assert_eq!(
+                a.fork_hash_hex(),
+                "0x669e6c11",
+                "the lower version, every time"
+            );
+            assert_eq!(a.peers, 3);
+        }
+    }
+
+    #[test]
     fn tracked_sources_are_bounded() {
         let w = pre_gloas_sepolia();
         for i in 0..(MAX_TRACKED + 50) {
@@ -946,15 +1043,5 @@ mod tests {
             Some(0x6c1d_9423),
             "a full tie goes to the EL"
         );
-    }
-
-    #[test]
-    fn multiaddr_ip_reads_ip4_and_ip6() {
-        let a: libp2p::Multiaddr = "/ip4/1.2.3.4/tcp/9000".parse().unwrap();
-        assert_eq!(multiaddr_ip(&a), Some("1.2.3.4".parse().unwrap()));
-        let b: libp2p::Multiaddr = "/ip6/2001:db8::1/tcp/9000".parse().unwrap();
-        assert_eq!(multiaddr_ip(&b), Some("2001:db8::1".parse().unwrap()));
-        let c: libp2p::Multiaddr = "/dns4/example.org/tcp/9000".parse().unwrap();
-        assert_eq!(multiaddr_ip(&c), None);
     }
 }

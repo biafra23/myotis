@@ -261,9 +261,11 @@ public class BeaconP2PService implements AutoCloseable {
     }
 
     /**
-     * Listen to every peer Status this host decodes (the auto-Status on each new
-     * connection): {@code (remote multiaddr, fork_digest)}. The CL fork watch's feed —
-     * a digest this build cannot produce is evidence of a fork it does not know.
+     * Listen to every peer Status reply to this host's auto-Status (sent on each new
+     * connection, so every connected peer answers once): {@code (remote multiaddr,
+     * fork_digest)}. The CL fork watch's feed — a digest this build cannot produce is
+     * evidence of a fork it does not know. A Status a peer initiates (the responder
+     * path) is not reported: it arrives with a peer id but no address to vote as.
      */
     public void setOnPeerStatus(java.util.function.BiConsumer<String, byte[]> listener) {
         this.onPeerStatus = listener;

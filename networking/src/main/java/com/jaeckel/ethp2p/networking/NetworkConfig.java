@@ -602,11 +602,6 @@ public record NetworkConfig(
         return out;
     }
 
-    /** Same as {@link #forkDigestFor} but returns the full 32-byte fork_data_root. */
-    private byte[] forkDigestFor32(byte[] forkVersion) {
-        return forkDataRoot(forkVersion, genesisValidatorsRoot());
-    }
-
     /** {@code compute_fork_data_root}: {@code sha256(pad32(fork_version) || genesis_validators_root)}. */
     private static byte[] forkDataRoot(byte[] forkVersion, byte[] genesisValidatorsRoot) {
         try {

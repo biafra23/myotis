@@ -25,7 +25,9 @@ package io.myotis.api;
  *                       its epoch (a consensus fork digest does not encode it)
  * @param forkId         the fork identifier upgraded peers use once it is active —
  *                       the EIP-2124 fork hash, or the consensus fork digest —
- *                       {@code 0x} + 8 lowercase hex digits
+ *                       {@code 0x} + 8 lowercase hex digits; {@code 0x00000000} when
+ *                       unknown (a blob-parameter-only fork rotates the consensus digest
+ *                       to a value this build cannot compute)
  * @param observedPeers  distinct peer networks (IPv4 /24, IPv6 /48) backing it — at least
  *                       the detector's threshold, and more than the peers contradicting it
  */

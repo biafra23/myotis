@@ -460,7 +460,11 @@ data class UpgradeNotice(
     val phase: String,              // SCHEDULED (activation ahead) / ACTIVE (already passed)
     val activationEpochSec: Long,   // unix seconds of the activation; 0 = unknown (peers seen
                                     // on the fork, its time never announced)
-    val forkId: String,             // EIP-2124 fork hash upgraded peers use, "0x…"
+    val forkId: String,             // the fork identifier upgraded peers use, "0x…": the
+                                    // EIP-2124 fork hash (EL watch) or the consensus fork
+                                    // digest (CL watch); "0x00000000" = unknown (a
+                                    // blob-parameter-only fork rotates to a digest this
+                                    // build cannot compute)
     val observedPeers: Int,         // distinct peer networks (IPv4 /24, IPv6 /48) backing it
 ) {
     val active: Boolean get() = phase == "ACTIVE"

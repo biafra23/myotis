@@ -229,6 +229,14 @@ verification), but the liveness failure is mute.
   fork was only placed (a digest does not encode its epoch). The API
   (`UpgradeAdvisory.activationTime`), the daemon message, the UI banner and
   the Node.js README all say "unknown" for 0 instead of printing 1970.
+  Likewise `forkId` is `0x00000000` for a blob-parameter-only fork: it is
+  announced under our own version and rotates the digest to a value the
+  build cannot compute (the new blob params are not on the wire); once it
+  passes, only the EL watch can still place peers.
+- *Freshness:* no `touch` — evidence is re-heard instead. Java
+  `DiscV5Service.setOnEnrHeard` reports every live table entry on every poll
+  tick (before the once-ever dedup), the Rust lookup loop re-hears its
+  results every round; a Status is observed once per connection.
 - *Merge:* the host reports ONE advisory — `ClForkWatch.merge` /
   `cl_fork_watch::merge_advisories`: ACTIVE over SCHEDULED, then a known time,
   then more sources, then the EL's. `JavaChainHandle.upgradeAdvisory(el, cl)`;

@@ -58,6 +58,13 @@ public final class DiscV5Service implements AutoCloseable {
      *  search rounds (set by the host when the beacon light client is starved
      *  of LC servers — see BeaconLightClient.setHuntBoostListener). */
     private volatile boolean huntBoost;
+    /** Told EVERY record heard, every time — live table entries on each poll
+     *  tick, walker finds as they arrive — BEFORE the once-ever dedup that
+     *  gates {@link #onPeerDiscovered}. The CL fork watch's feed: its evidence
+     *  ages out a day after it was last heard, so a node seen once at startup
+     *  must be re-heard while it stays in the table (the Rust discovery loop
+     *  re-hears its lookup results every round the same way). Null = nobody. */
+    private volatile Consumer<Enr> onEnrHeard;
 
     /** Flip the hunt boost (idempotent; safe from any thread). */
     public void setHuntBoost(boolean on) {
@@ -95,6 +102,25 @@ public final class DiscV5Service implements AutoCloseable {
         this.bootnodeEnrs = bootnodeEnrs;
         this.pinnedNodeIds = List.copyOf(pinnedNodeIds);
         this.onPeerDiscovered = onPeerDiscovered;
+    }
+
+    /** See {@link #onEnrHeard}. Set before {@link #start}. */
+    public void setOnEnrHeard(Consumer<Enr> listener) {
+        this.onEnrHeard = listener;
+    }
+
+    /** Parse one heard record for {@link #onEnrHeard}; null (and a debug line) if
+     *  malformed — the discovery path logs its own warning when it gets there. */
+    private Enr hear(String enrStr) {
+        Consumer<Enr> heard = onEnrHeard;
+        if (heard == null) return null;
+        try {
+            Enr parsed = Enr.fromEnrString(enrStr);
+            heard.accept(parsed);
+            return parsed;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -596,11 +622,12 @@ public final class DiscV5Service implements AutoCloseable {
         }
         try {
             s.execute(() -> {
+                Enr heard = hear(enrStr);
                 if (!seenEnrs.add(enrStr)) {
                     return; // same record already surfaced (poll or earlier walk)
                 }
                 try {
-                    Enr parsed = Enr.fromEnrString(enrStr);
+                    Enr parsed = heard != null ? heard : Enr.fromEnrString(enrStr);
                     onPeerDiscovered.accept(parsed);
                 } catch (Exception e) {
                     log.warn("[discv5] failed to parse walked ENR: {}", e.getMessage());
@@ -624,10 +651,11 @@ public final class DiscV5Service implements AutoCloseable {
             system.streamLiveNodes().forEach(nr -> {
                 live[0]++;
                 String enrStr = nr.asEnr();
+                Enr heard = hear(enrStr);
                 if (seenEnrs.add(enrStr)) {
                     newThisTick[0]++;
                     try {
-                        Enr parsed = Enr.fromEnrString(enrStr);
+                        Enr parsed = heard != null ? heard : Enr.fromEnrString(enrStr);
                         if (parsed.eth2().isPresent()) withEth2[0]++;
                         onPeerDiscovered.accept(parsed);
                     } catch (Exception e) {
