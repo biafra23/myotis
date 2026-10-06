@@ -311,7 +311,7 @@ asset workflow and a stronger action than the merge this file already forbids.
    one of the current addresses before and after the edit until zero copies
    of the old ones remain. Since #414 the `myotis-net` live tests read
    `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
-   four strings, so a partial re-sync fails in the fast lib test.
+   list as strings, so a partial re-sync fails in the fast lib test.
    Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
    fallback (the Java engine has one), so a fresh profile with a stale list
    never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).

@@ -245,10 +245,11 @@ handshake timeout that closes the connection if READY isn't reached.
 ### 6.2 Capability negotiation (Hello)
 
 Hello RLP: `[protocolVersion(5), clientId, [[capName, capVersion], …], listenPort, nodeId(64)]`.
-Advertise `eth/66, eth/67, eth/68, eth/69, snap/1` (capabilities ascending). Negotiate the highest
+Advertise `eth/66, eth/67, eth/68, eth/69, snap/1, snap/2` (capabilities ascending). Negotiate the highest
 mutually supported eth version (`{66,67,68}` floor 66 — it introduced request-ids and shares the
-Status/snap layout with 67/68; ≤65 rejected; 69 supported). `snap/1` negotiated if the peer
-advertises it.
+Status/snap layout with 67/68; ≤65 rejected; 69 supported). snap is negotiated the same way: the
+connection runs the highest snap version both sides advertise (RLPx runs one version per
+capability name), so a peer offering only `snap/1` or only `snap/2` is a snap peer either way.
 
 ### 6.3 Message codes (absolute, p2p base 0x10)
 
@@ -296,7 +297,15 @@ filters"**)** receipts are *bloomless* and
 
 ---
 
-## 7. The `snap` sub-protocol (snap/1)
+## 7. The `snap` sub-protocol (snap/1 and snap/2)
+
+snap/2 ([EIP-8189](https://eips.ethereum.org/EIPS/eip-8189)) keeps message ids `0x00`–`0x05` —
+every request below — byte-for-byte as in snap/1, so the verified reads do not care which version
+a connection runs. It retires `GetTrieNodes`/`TrieNodes` (`0x06`/`0x07`) and adds
+`GetBlockAccessLists`/`BlockAccessLists` (`0x08`/`0x09`) for BAL-based healing, which only a
+syncing full node needs: an inbound `GetBlockAccessLists` gets the well-behaved empty answer
+(`[reqId, []]`), like every other inbound snap request, and on a snap/2 connection `GetTrieNodes`
+is neither answered nor sent (the Java engine's `requestTrieNodesAsync` refuses).
 
 No separate handler — dispatched inside the `eth` handler. **Use `GetAccountRange` /
 `GetStorageRanges` (they return full root-to-leaf Merkle proofs), not `GetTrieNodes`** (geth's
@@ -308,7 +317,9 @@ from a state root).
 snap base = `0x10 + eth-protocol-length`. eth/67–68 length 17 → base `0x21`; eth/69 length 18
 (adds BlockRangeUpdate `0x11`) → base `0x22`. Offsets from base:
 `0x00 GetAccountRange / 0x01 AccountRange, 0x02 GetStorageRanges / 0x03 StorageRanges,
-0x04 GetByteCodes / 0x05 ByteCodes, 0x06 GetTrieNodes / 0x07 TrieNodes`.
+0x04 GetByteCodes / 0x05 ByteCodes, 0x06 GetTrieNodes / 0x07 TrieNodes` (snap/1 only),
+`0x08 GetBlockAccessLists / 0x09 BlockAccessLists` (snap/2 only). snap/2's capability is 10
+messages long instead of 8; snap sorts last among the shared capabilities, so no other offset moves.
 
 ### 7.2 Wire formats
 

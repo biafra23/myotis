@@ -533,6 +533,8 @@ class IosNodeController(
         // Absent → 0, fail closed (the ABI gate is exact, so the linked engine
         // always emits it) — never the pooled count.
         val snapServingPeers = o.engineInt("snapServingPeers")
+        // ABI >= 38: the part of those on snap/2 (EIP-8189). Shown, never gated on.
+        val snap2ServingPeers = o.engineInt("snap2ServingPeers")
         val currentPeriod = o.engineLong("currentPeriod", 0L)
         // Older-native fallback: a missing targetPeriod parses as 0 — keep the
         // target >= current invariant.
@@ -576,6 +578,7 @@ class IosNodeController(
             readyPeers = snapPeers,                      // EL pool holds only snap-ready
             snapPeers = snapPeers,
             snapServingPeers = snapServingPeers,         // ABI >= 31
+            snap2ServingPeers = snap2ServingPeers,       // ABI >= 38
             clConnectedPeers = o.engineInt("peerCount"),
             clServedPeersLastMin = o.engineInt("servedPeersLastMinute"),
             clCachedPeers = clCache.total,

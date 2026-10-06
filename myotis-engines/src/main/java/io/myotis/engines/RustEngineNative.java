@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 37; // 37: set_log_index_config applies "unwatch" (the Index tab's Remove)
+    static final int EXPECTED_ABI_VERSION = 38; // 38: status JSON carries snap2ServingPeers (serving peers on snap/2)
 
     private static final boolean AVAILABLE = load();
 

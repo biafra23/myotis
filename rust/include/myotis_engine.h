@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 37
+#define MYOTIS_ABI_VERSION 38
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -317,7 +317,10 @@ char *myotis_export_log_index(int64_t handle, const char *path);
  * v31 also adds "snapServingPeers" to myotis_status_json: the pooled peers
  * that can answer a read at the anchored head NOW — gate reads on it rather
  * than on "snapPeers", which a pool of still-syncing peers satisfies for
- * hours while every read fails. */
+ * hours while every read fails.
+ * v38 adds "snap2ServingPeers": the part of "snapServingPeers" whose
+ * connection runs snap/2 (EIP-8189). Informational only — never gate on it;
+ * reads are the same on snap/1 and snap/2. */
 bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
 
 #ifdef __cplusplus

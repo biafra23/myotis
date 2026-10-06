@@ -379,8 +379,9 @@ data class NodeSnapshot(
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
     val readyPeers: Int,
-    val snapPeers: Int,             // peers that negotiated snap/1 (capability)
+    val snapPeers: Int,             // peers that negotiated snap/1 or snap/2 (capability)
     val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
+    val snap2ServingPeers: Int,     // of those, the ones on snap/2 (EIP-8189); shown as "serving N (M)"
     val clConnectedPeers: Int,      // connected CL libp2p peers (usually 0 — connections are short-lived)
     val clServedPeersLastMin: Int,  // distinct peers that served a light-client response in the last 60s
     val clCachedPeers: Int,         // CL peers in cl-peers[-net].cache (live file count)

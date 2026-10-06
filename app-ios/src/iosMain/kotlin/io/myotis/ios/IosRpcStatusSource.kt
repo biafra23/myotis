@@ -49,6 +49,8 @@ class IosRpcStatusSource(
             // ABI >= 31: the pooled peers that can answer at the anchored head
             // now — what a wallet gates its first read on (#465).
             put("snapServingPeers", o.engineLong("snapServingPeers"))
+            // ABI >= 38: the part of snapServingPeers on snap/2 (EIP-8189).
+            put("snap2ServingPeers", o.engineLong("snap2ServingPeers"))
             put("backedOffPeers", o.engineLong("backedOffPeers"))
             put("blacklistedPeers", o.engineLong("blacklistedPeers"))
             // Idle-sleep isn't wired on iOS yet — metrics report the JVM shape's zeros.

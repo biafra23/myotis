@@ -13,8 +13,9 @@ before a fresh deployment much later.
 
 ### EL: patched Geth (Erigon is not an option)
 
-Myotis syncs state over **snap/1** (`GetAccountRange` / `GetStorageRanges` /
-`GetTrieNodes`, all proof-carrying) as a regular devp2p peer — not JSON-RPC.
+Myotis reads state over **snap** (`GetAccountRange` / `GetStorageRanges` /
+`GetByteCodes` — the proof-carrying range messages, identical in snap/1 and
+snap/2) as a regular devp2p peer — not JSON-RPC.
 That dictates the EL choice:
 
 | Client | Serves snap/1? | Notes |
@@ -23,7 +24,7 @@ That dictates the EL choice:
 | Nethermind | Yes (halfpath/FlatDb layouts) | `Sync.SnapServingEnabled`, auto-on with the modern layout — credible fallback |
 | Besu | Opt-in | `--snapsync-server-enabled` (GA since 25.7.0, off by default) |
 | **Erigon 2/3** | **No** | Does not implement the snap capability at all; p2p speaks only eth/6x (state ships via BitTorrent snapshots) |
-| Reth | No snap/1 | Only an experimental default-off **snap/2** server (EIP-8189 — drops GetTrieNodes, so useless for myotis healing) |
+| Reth | No snap/1 | Implements only **snap/2** (EIP-8189), advertised only when the operator enables it. Myotis speaks snap/2 too — it drops `GetTrieNodes`, which myotis never sends — so a reth node with snap/2 on counts as a snap peer; whether it then serves the ranges is judged per peer, like any other |
 
 So despite Erigon's small footprint reputation, an Erigon node could serve
 myotis headers but never state. **Geth is the only zero-config, battle-tested

@@ -31,14 +31,14 @@ import java.util.concurrent.TimeUnit;
  * (tab-separated, UTF-8). Tabs can't appear in
  * {@link java.net.InetAddress#getHostAddress()} output, so the format stays
  * unambiguous for IPv6 literals. The trailing {@code snap} flag ("1"/"0")
- * records snap/1 <em>capability</em> and is optional, so pre-existing cache
+ * records snap <em>capability</em> and is optional, so pre-existing cache
  * files load unchanged (missing flag → not snap-capable). An optional
  * {@code snapok}/{@code snapbad} token after it records snap-serving
  * <em>quality</em> — whether the peer actually returned usable proofs
  * ({@link SnapQuality}).
  *
  * <p><b>Capability vs quality.</b> The {@code snap} flag means the peer
- * negotiated snap/1 during Hello; it says nothing about whether the peer
+ * negotiated snap (snap/1 or snap/2) during Hello; it says nothing about whether the peer
  * actually serves the state trie for a given root. Many advertised snap peers
  * hang or return empty proofs. {@link #recordSnapServed} /
  * {@link #recordSnapFailure} layer a learned quality verdict on top — analogous
