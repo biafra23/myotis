@@ -31,6 +31,7 @@
 // surface.
 pub use libp2p::{identity, multiaddr, Multiaddr, PeerId};
 
+pub mod cl_fork_watch;
 pub mod clcache;
 pub mod codec;
 pub mod discovery;

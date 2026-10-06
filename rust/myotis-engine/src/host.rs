@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
+use myotis_net::cl_fork_watch::{self, ClForkWatch};
 use myotis_net::el::fork_watch::{self, ForkWatch};
 use myotis_net::el::pool::Enode;
 use myotis_net::el::reader::{parse_enode, ElReader};
@@ -133,6 +134,11 @@ struct EngineState {
     /// last seen connected: a long sleep re-derives it from the peers dialed on
     /// wake. Only for networks the watch is enabled on. Dies with the handle.
     fork_watches: Mutex<HashMap<i64, Arc<ForkWatch>>>,
+    /// The consensus-layer twin, per handle, on EVERY network: fed discv5 ENR
+    /// `eth2` fields and peer Status digests by the sync loop it is handed to
+    /// at each spin-up (`ChainConfig::cl_fork_watch`). Same lifetime as
+    /// `fork_watches`; the two advisories are merged at status time.
+    cl_fork_watches: Mutex<HashMap<i64, Arc<ClForkWatch>>>,
     /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
     /// anchor-marker read/write, registration). Every guard in those paths is
     /// check-then-act against the filesystem and the handle map; without one
@@ -178,6 +184,7 @@ fn engine() -> Option<&'static EngineState> {
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
                     fork_watches: Mutex::new(HashMap::new()),
+                    cl_fork_watches: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
                 }),
@@ -653,9 +660,16 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             _ => return false, // unknown id, or not in the expected state
         }
     };
+    // The handle's CL fork watch rides into the loop on its config: created on
+    // the first spin-up, reused (evidence intact) on every resume.
+    let cl_watch = cl_fork_watch_for(engine, handle, &config);
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
     // The one deep ChainConfig clone: SyncHandle::start takes it by value.
-    let sync = match engine.rt.block_on(async { SyncHandle::start((*config).clone()) }) {
+    let sync = match engine.rt.block_on(async {
+        let mut cfg = (*config).clone();
+        cfg.cl_fork_watch = cl_watch;
+        SyncHandle::start(cfg)
+    }) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -777,6 +791,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             drop(map);
             if gone {
                 if let Ok(mut watches) = engine.fork_watches.lock() {
+                    watches.remove(&handle);
+                }
+                if let Ok(mut watches) = engine.cl_fork_watches.lock() {
                     watches.remove(&handle);
                 }
             }
@@ -923,14 +940,22 @@ pub fn status_json(handle: i64) -> String {
             None => Snap::Unknown,
         }
     };
-    // The handle's fork-watch advisory, read in every lifecycle state (the watch
-    // is handle-owned, not torn down with the pool on pause).
-    let upgrade_advisory = engine
+    // The handle's fork-watch advisories (EL and CL), read in every lifecycle
+    // state (the watches are handle-owned, not torn down with the pool on
+    // pause), merged into the one the status carries.
+    let el_advisory = engine
         .fork_watches
         .lock()
         .ok()
         .and_then(|m| m.get(&handle).cloned())
         .and_then(|w| w.advisory());
+    let cl_advisory = engine
+        .cl_fork_watches
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&handle).cloned())
+        .and_then(|w| w.advisory());
+    let upgrade_advisory = cl_fork_watch::merge_advisories(el_advisory, cl_advisory);
     match snap {
         Snap::Created(network, wall) => status_object(
             Lifecycle::NotStarted,
@@ -1052,6 +1077,27 @@ fn fork_watch_for(
     Some(Arc::clone(watch))
 }
 
+/// The handle's CL fork watch — created on its first spin-up from the chain's
+/// fork schedule, genesis root, blob params and slot timing, then reused
+/// across pause/resume. On every network (no staged rollout: the CL signal
+/// needs no EL peer, and a false advisory is a banner, never a wrong answer).
+/// None only if the registry mutex is poisoned.
+fn cl_fork_watch_for(engine: &EngineState, handle: i64, config: &ChainConfig) -> Option<Arc<ClForkWatch>> {
+    let mut map = engine.cl_fork_watches.lock().ok()?;
+    let watch = map.entry(handle).or_insert_with(|| {
+        Arc::new(ClForkWatch::new(
+            config.name,
+            config.fork_schedule.clone(),
+            config.genesis_validators_root,
+            config.blob_params_epoch,
+            config.blob_params_max_blobs,
+            config.genesis_time,
+            config.seconds_per_slot,
+        ))
+    });
+    Some(Arc::clone(watch))
+}
+
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
 pub fn stop(handle: i64) {
     let Some(engine) = engine() else {
@@ -1088,6 +1134,9 @@ pub fn stop(handle: i64) {
         bits.remove(&handle);
     }
     if let Ok(mut watches) = engine.fork_watches.lock() {
+        watches.remove(&handle);
+    }
+    if let Ok(mut watches) = engine.cl_fork_watches.lock() {
         watches.remove(&handle);
     }
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
@@ -3643,6 +3692,23 @@ mod tests {
         assert!(fork_watch_for(engine, 9_000_002, &ChainConfig::mainnet(), pin).is_none());
         stop(9_000_001); // not in the handle map, but its watch must still die
         assert!(engine.fork_watches.lock().unwrap().get(&9_000_001).is_none());
+    }
+
+    #[test]
+    fn cl_fork_watch_is_per_handle_reused_and_on_every_network() {
+        let engine = engine().expect("engine");
+        for (i, config) in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()]
+            .iter()
+            .enumerate()
+        {
+            let handle = 9_100_001 + i as i64;
+            let a = cl_fork_watch_for(engine, handle, config).expect("every network has one");
+            let b = cl_fork_watch_for(engine, handle, config).expect("still there");
+            assert!(Arc::ptr_eq(&a, &b), "a resume must reuse the handle's watch ({})", config.name);
+            assert_eq!(a.advisory(), None, "no evidence yet ({})", config.name);
+            stop(handle); // not in the handle map, but its watch must still die
+            assert!(engine.cl_fork_watches.lock().unwrap().get(&handle).is_none());
+        }
     }
 
     #[test]

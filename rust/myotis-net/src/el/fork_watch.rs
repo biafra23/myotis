@@ -125,9 +125,11 @@ impl Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Advisory {
     pub phase: Phase,
-    /// Unix seconds of the fork's activation.
+    /// Unix seconds of the fork's activation; 0 = unknown (the CL watch places
+    /// peers on a fork nobody announced — a digest does not encode its epoch).
     pub activation_time: u64,
-    /// The fork hash upgraded peers use once it is active.
+    /// The fork identifier upgraded peers use once it is active: the EIP-2124
+    /// fork hash here, the fork digest from the CL watch (`cl_fork_watch`).
     pub fork_hash: u32,
     /// Distinct source networks backing it.
     pub peers: usize,
