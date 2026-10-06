@@ -143,8 +143,8 @@ candidate pool the snap-peer maintainer dials from. Chains with no DNS tree (Gno
 a list of full `enode://pubkey@host:port` constants for direct RLPx dialing.
 
 **Rust engine** (`rust/myotis-net/src/el/dnsdisco.rs`, #539 part 3): the same root verification
-and `e=` walk with the same caps (512 lookups, depth 16, 15 s), plus two checks the Java walk
-lacks — every record must hash to its label (base32 of `keccak256(text)[..16]`), and each leaf's
+and `e=` walk with the same lookup and depth caps (512 / 16) under a 15 s deadline (the Java
+twin's 10 s plus its 5 s grace), plus two checks the Java walk lacks — every record must hash to its label (base32 of `keccak256(text)[..16]`), and each leaf's
 own signature is verified (the `enr` crate's decoder). Leaves go through the discv4 fork-id filter
 (`enrfilter.rs`) first; a leaf naming no TCP port is a discv4 seed, never a dial candidate (geth
 `errNoPort`). Children are walked in random order (EIP-1459's advice), so a tree larger than one

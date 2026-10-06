@@ -73,8 +73,9 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
 }
 
-/// Whether a walk may run now: a host allowed DNS, and Tor is not on. Read at
-/// every walk, not once: both switches are live.
+/// Whether a walk may run now: a host allowed DNS, and Tor is not on. Read when
+/// a walk is claimed and again before each of its lookups: both switches are
+/// live, and a walk in flight stops when they turn against it.
 pub fn allowed() -> bool {
     is_enabled() && !tor_enabled()
 }
@@ -400,18 +401,24 @@ pub struct WalkReport {
     pub links: usize,
     /// The deadline cut the walk short.
     pub timed_out: bool,
+    /// `abort_if` cut the walk short: the policy turned against it mid-walk.
+    pub cut_short: bool,
 }
 
 /// Walk `url`'s `e=` subtree depth-first in random order within `limits`,
-/// judging each leaf's `eth` entry with `filter` at `now_secs`. Fails only
-/// when the root is missing or does not verify — a tree with no verified root
-/// is no tree; everything below is best-effort and counted.
+/// judging each leaf's `eth` entry with `filter` at `now_secs`, and stop
+/// early once `abort_if` says so — the policy turning against the walk (Tor
+/// switched on while it runs) must not leave it querying the clearnet
+/// resolver for the rest of the deadline. Fails only when the root is missing
+/// or does not verify — a tree with no verified root is no tree; everything
+/// below is best-effort and counted.
 pub async fn walk(
     resolver: &dyn TxtLookup,
     url: &EnrTreeUrl,
     limits: WalkLimits,
     filter: &ForkFilter,
     now_secs: u64,
+    abort_if: &(dyn Fn() -> bool + Sync),
 ) -> Result<WalkReport, String> {
     let started = tokio::time::Instant::now();
     let records = resolver
@@ -434,6 +441,10 @@ pub async fn walk(
     while let Some((label, depth)) = stack.pop() {
         if started.elapsed() >= limits.deadline {
             report.timed_out = true;
+            break;
+        }
+        if abort_if() {
+            report.cut_short = true;
             break;
         }
         if report.lookups >= limits.max_lookups {
@@ -620,13 +631,22 @@ pub struct DnsSeeder {
     filter: ForkFilter,
     source: ResolverSource,
     limits: WalkLimits,
+    /// Whether a walk may run now: read when a walk is claimed and again
+    /// before each of its lookups. Production: [`allowed`]; tests inject.
+    policy: Box<dyn Fn() -> bool + Send + Sync>,
     state: Mutex<SeedState>,
 }
 
 impl DnsSeeder {
     /// `None` when no URL parses (a network without a tree passes none).
     pub fn new(urls: &[String], filter: ForkFilter) -> Option<DnsSeeder> {
-        Self::with_source(urls, filter, ResolverSource::System, WalkLimits::default())
+        Self::with_source(
+            urls,
+            filter,
+            ResolverSource::System,
+            WalkLimits::default(),
+            Box::new(allowed),
+        )
     }
 
     pub fn with_source(
@@ -634,6 +654,7 @@ impl DnsSeeder {
         filter: ForkFilter,
         source: ResolverSource,
         limits: WalkLimits,
+        policy: Box<dyn Fn() -> bool + Send + Sync>,
     ) -> Option<DnsSeeder> {
         let parsed: Vec<EnrTreeUrl> = urls
             .iter()
@@ -653,6 +674,7 @@ impl DnsSeeder {
             filter,
             source,
             limits,
+            policy,
             state: Mutex::new(SeedState::default()),
         })
     }
@@ -661,14 +683,12 @@ impl DnsSeeder {
     /// policy forbids it, the first at once, later ones only while the pool
     /// is below target and [`DNS_REFRESH_INTERVAL`] has passed. The caller
     /// that gets `true` must run [`walk_once`](Self::walk_once).
-    pub fn begin_walk_if_due(
-        &self,
-        now: tokio::time::Instant,
-        below_target: bool,
-        allowed: bool,
-    ) -> bool {
+    pub fn begin_walk_if_due(&self, now: tokio::time::Instant, below_target: bool) -> bool {
+        if !(self.policy)() {
+            return false;
+        }
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.walking || !allowed {
+        if st.walking {
             return false;
         }
         let due = match st.last_walk {
@@ -718,7 +738,10 @@ impl DnsSeeder {
         let mut found = 0usize;
         let mut endpoints: Vec<SocketAddr> = Vec::new();
         for url in &self.urls {
-            let report = match walk(resolver, url, self.limits, &self.filter, now_secs).await {
+            // The policy is read again before every lookup: a walk that Tor
+            // (or the host) overtakes stops there, with what it has.
+            let forbidden = || !(self.policy)();
+            let report = match walk(resolver, url, self.limits, &self.filter, now_secs, &forbidden).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("dns tree: {e}");
@@ -746,9 +769,14 @@ impl DnsSeeder {
                 unusable = report.unusable,
                 mismatched = report.mismatched,
                 timed_out = report.timed_out,
+                cut_short = report.cut_short,
                 pool = pool_len,
                 "dns tree walked (EIP-1459)"
             );
+            if report.cut_short {
+                tracing::info!("dns tree walk stopped: the policy changed while it ran");
+                break;
+            }
         }
         if let Some(probe) = probe {
             shuffle(&mut endpoints);
@@ -1140,7 +1168,7 @@ mod tests {
         );
         let records = [leaves[0], leaves[1], leaves[2], leaves[3], lower.as_str(), upper.as_str(), SPEC_LINK];
         let (zone, url) = make_zone(&signer, "tree.test", &label_of(&upper), &records);
-        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000).await.unwrap();
+        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000, &|| false).await.unwrap();
         assert_eq!(report.seq, 9);
         assert_eq!(report.lookups, 7, "every record fetched once: {report:?}");
         assert_eq!(report.leaves, 4);
@@ -1172,7 +1200,7 @@ mod tests {
         );
         let (mut zone, url) = make_zone(&signer, "tree.test", &label_of(&top), &[good.as_str(), sub.as_str(), top.as_str()]);
         zone.0.insert("FORGEDLABEL00000000000000.tree.test".into(), forged);
-        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000).await.unwrap();
+        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000, &|| false).await.unwrap();
         assert_eq!(report.candidates.len(), 1, "{report:?}");
         assert_eq!(report.mismatched, 1, "the forged record is dropped");
         // top + good + sub + forged + missing + failing: six lookups, the leaf
@@ -1197,20 +1225,31 @@ mod tests {
         let refs: Vec<&str> = records.iter().map(String::as_str).collect();
         let (zone, url) = make_zone(&signer, "deep.test", &child, &refs);
         let shallow = WalkLimits { max_depth: 5, ..WalkLimits::default() };
-        let report = walk(&zone, &url, shallow, &filter(), 1_700_000_000).await.unwrap();
+        let report = walk(&zone, &url, shallow, &filter(), 1_700_000_000, &|| false).await.unwrap();
         assert_eq!(report.candidates.len(), 0, "the leaf sits below the depth cap");
         assert_eq!(report.lookups, 6, "depths 0..=5 are fetched");
         let few = WalkLimits { max_lookups: 3, ..WalkLimits::default() };
-        let report = walk(&zone, &url, few, &filter(), 1_700_000_000).await.unwrap();
+        let report = walk(&zone, &url, few, &filter(), 1_700_000_000, &|| false).await.unwrap();
         assert_eq!(report.lookups, 3);
-        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000).await.unwrap();
+        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000, &|| false).await.unwrap();
         assert_eq!(report.candidates.len(), 1);
+        // The policy turning against the walk stops it before its next lookup,
+        // with what it has (the pool stopping aborts the task; this is Tor
+        // switched on, or the host withdrawing DNS, while a walk runs).
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let after_two = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000, &after_two)
+            .await
+            .unwrap();
+        assert!(report.cut_short);
+        assert_eq!(report.lookups, 2);
+        assert!(!report.timed_out);
         // No root, or a root under another key: no walk at all.
         let (zone, _) = make_zone(&signer, "other.test", &child, &refs);
         let wrong = EnrTreeUrl { domain: "other.test".into(), pubkey: key(1).public_key_bytes() };
-        assert!(walk(&zone, &wrong, WalkLimits::default(), &filter(), 0).await.is_err());
+        assert!(walk(&zone, &wrong, WalkLimits::default(), &filter(), 0, &|| false).await.is_err());
         let missing = EnrTreeUrl { domain: "nowhere.test".into(), pubkey: url.pubkey };
-        assert!(walk(&zone, &missing, WalkLimits::default(), &filter(), 0).await.is_err());
+        assert!(walk(&zone, &missing, WalkLimits::default(), &filter(), 0, &|| false).await.is_err());
     }
 
     #[test]
@@ -1227,29 +1266,35 @@ mod tests {
 
     #[test]
     fn the_seeder_schedules_walks_and_hands_out_batches_round_robin() {
+        let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seeder = DnsSeeder::with_source(
             &[SPEC_URL.to_string(), "garbage".to_string()],
             filter(),
             ResolverSource::Fixed(Arc::new(Zone(HashMap::new()))),
             WalkLimits::default(),
+            Box::new({
+                let allow = Arc::clone(&allow);
+                move || allow.load(std::sync::atomic::Ordering::SeqCst)
+            }),
         )
         .unwrap();
         assert_eq!(seeder.urls.len(), 1, "an unparsable URL is skipped");
         let t0 = tokio::time::Instant::now();
         // Forbidden: never due. Allowed: the first walk is due at once, and
         // claimed exactly once.
-        assert!(!seeder.begin_walk_if_due(t0, true, false));
-        assert!(seeder.begin_walk_if_due(t0, false, true));
-        assert!(!seeder.begin_walk_if_due(t0, true, true), "one walk at a time");
+        assert!(!seeder.begin_walk_if_due(t0, true));
+        allow.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(seeder.begin_walk_if_due(t0, false));
+        assert!(!seeder.begin_walk_if_due(t0, true), "one walk at a time");
         {
             let mut st = seeder.state.lock().unwrap();
             st.walking = false;
             st.last_walk = Some(t0);
         }
         // Then only below target, and only after the interval.
-        assert!(!seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL, false, true));
-        assert!(!seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL / 2, true, true));
-        assert!(seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL, true, true));
+        assert!(!seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL, false));
+        assert!(!seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL / 2, true));
+        assert!(seeder.begin_walk_if_due(t0 + DNS_REFRESH_INTERVAL, true));
         // Batches rotate through the pool and wrap.
         let e = |n: u16| -> Enode { (SocketAddr::from(([10, 0, 0, 2], n)), [n as u8; 64]) };
         seeder.merge(&[e(1), e(2), e(3)]);
@@ -1277,10 +1322,11 @@ mod tests {
             filter(),
             ResolverSource::Fixed(Arc::new(zone)),
             WalkLimits::default(),
+            Box::new(|| true),
         )
         .unwrap();
         let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(8);
-        assert!(seeder.begin_walk_if_due(tokio::time::Instant::now(), true, true));
+        assert!(seeder.begin_walk_if_due(tokio::time::Instant::now(), true));
         let found = seeder.walk_once(Some(&probe_tx)).await;
         assert_eq!(found, 1, "one node names a TCP port");
         assert_eq!(seeder.take_batch(5), vec![("10.0.0.41:30303".parse().unwrap(), key(41).public_key_bytes())]);
@@ -1322,11 +1368,12 @@ mod tests {
                 filter(),
                 ResolverSource::Fixed(Arc::new(Stall(Arc::clone(&asked)))),
                 WalkLimits::default(),
+                Box::new(|| true),
             )
             .unwrap(),
         );
         let t0 = tokio::time::Instant::now();
-        assert!(seeder.begin_walk_if_due(t0, true, true));
+        assert!(seeder.begin_walk_if_due(t0, true));
         let task = tokio::spawn({
             let s = Arc::clone(&seeder);
             async move {
@@ -1343,6 +1390,6 @@ mod tests {
         // The guard stamped the walk time at the abort, so the next walk is
         // due an interval from NOW, not from t0.
         let later = tokio::time::Instant::now() + DNS_REFRESH_INTERVAL;
-        assert!(seeder.begin_walk_if_due(later, true, true));
+        assert!(seeder.begin_walk_if_due(later, true));
     }
 }

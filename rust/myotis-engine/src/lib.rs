@@ -208,6 +208,15 @@ uniffi::setup_scaffolding!();
 ///      paired with an engine that cannot report it (an absent key would read
 ///      as "no snap/2 peers"). `RustChainHandle`, the iOS wrapper's status
 ///      reader and the Node addon's `statusJson()` carry it.
+/// v39: added set_dns_discovery / myotis_set_dns_discovery (#539, part 3): a
+///      process-global switch (not per-handle) allowing the EIP-1459 DNS tree
+///      walk (`el/dnsdisco.rs`) on hosts that resolve through the system
+///      resolver; off by default, never used while Tor is enabled, and the
+///      last caller wins for every network in the process. An additive
+///      function — bumped so a JVM host that switches it on is never paired
+///      with an engine that silently lacks it. The JVM desktop and daemon
+///      (`RustMyotisEngine.create`, when the host passes no DnsServers port)
+///      and myotis-rpcd call it; iOS and the Node addon do not yet.
 pub const ABI_VERSION: i32 = 39;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the

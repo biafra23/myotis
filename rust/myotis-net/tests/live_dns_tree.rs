@@ -42,7 +42,7 @@ async fn the_tree_walk_yields_dial_candidates() {
     for url in &cfg.enr_tree_urls {
         let url = EnrTreeUrl::parse(url).unwrap();
         let started = std::time::Instant::now();
-        let report = walk(&resolver, &url, WalkLimits::default(), &filter, now)
+        let report = walk(&resolver, &url, WalkLimits::default(), &filter, now, &|| false)
             .await
             .expect("the root record resolves and verifies under the pinned key");
         eprintln!(

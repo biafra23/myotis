@@ -1433,9 +1433,10 @@ impl PeerPool {
     }
 
     /// Hand the pool the network's EIP-1459 DNS trees (#539, part 3). The
-    /// first walk starts at once where the policy allows it (a fresh install
-    /// with dead bootnodes has nothing else); the maintainer repeats it while
-    /// the pool stays below target and dials the candidates in batches.
+    /// first walk starts at once where the seeder's policy allows it (a fresh
+    /// install with dead bootnodes has nothing else); the maintainer repeats
+    /// it while the pool stays below target and dials the candidates in
+    /// batches.
     pub fn attach_dns_seeder(&self, seeder: Arc<DnsSeeder>) {
         *self
             .inner
@@ -1443,7 +1444,7 @@ impl PeerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&seeder));
         let now = Instant::now();
-        if seeder.begin_walk_if_due(now, true, dnsdisco::allowed()) {
+        if seeder.begin_walk_if_due(now, true) {
             spawn_dns_walk(&self.inner, seeder);
         }
     }
@@ -2148,7 +2149,7 @@ async fn dns_seed_tick(inner: &Arc<PoolInner>) -> bool {
     let Some(seeder) = seeder else {
         return true;
     };
-    if seeder.begin_walk_if_due(Instant::now(), true, dnsdisco::allowed()) {
+    if seeder.begin_walk_if_due(Instant::now(), true) {
         spawn_dns_walk(inner, Arc::clone(&seeder));
     }
     for (addr, pubkey) in seeder.take_batch(dnsdisco::DNS_DIAL_BATCH) {
@@ -2675,6 +2676,7 @@ mod tests {
                     ForkFilter::for_chain([0u8; 4], 0),
                     ResolverSource::Fixed(Arc::new(NoZone)),
                     WalkLimits::default(),
+                    Box::new(|| false), // the policy forbids: no walk, only the held batch
                 )
                 .unwrap(),
             );
@@ -2684,8 +2686,8 @@ mod tests {
                 .map(|n| (SocketAddr::from(([127, 0, 0, 1], n)), [n as u8; 64]))
                 .collect();
             seeder.merge(&candidates);
-            // The policy is off in tests, so attaching starts no walk, and
-            // nothing is dialed until a tick.
+            // The policy forbids, so attaching starts no walk, and nothing is
+            // dialed until a tick.
             pool.attach_dns_seeder(Arc::clone(&seeder));
             assert_eq!(pool.attempted_count().await, 0);
             assert!(pool.inner.backoff.lock().await.is_empty());
