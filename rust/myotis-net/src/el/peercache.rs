@@ -7,7 +7,7 @@
 //!
 //! **Record format** (tab-separated, UTF-8), one peer per line:
 //! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N]`
-//! — the trailing `{1|0}` is snap/1 CAPABILITY; the optional `snapok`/`snapbad`
+//! — the trailing `{1|0}` is snap CAPABILITY (snap/1 or snap/2); the optional `snapok`/`snapbad`
 //! token records learned snap-serving QUALITY. `publicKeyHex` is the peer's
 //! 64-byte node id as `0x`-prefixed hex (Java `Bytes.toHexString()`). Tabs
 //! can't appear in an IP literal, so IPv6 stays unambiguous. Lines in the
@@ -15,7 +15,7 @@
 //! so an existing daemon cache migrates in place on the first rewrite.
 //!
 //! **Capability vs quality** (Java parity): the snap flag means the peer
-//! negotiated snap/1 in Hello; it says nothing about whether it actually serves
+//! negotiated snap in Hello; it says nothing about whether it actually serves
 //! the state trie. [`record_snap_served`](ElPeerCache::record_snap_served) /
 //! [`record_snap_failure`](ElPeerCache::record_snap_failure) layer a learned
 //! verdict on top — a peer needs [`FAILURE_THRESHOLD`] consecutive failures (no

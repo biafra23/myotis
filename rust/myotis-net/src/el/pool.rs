@@ -8,7 +8,7 @@
 //! Dial outcomes drive the bookkeeping the same way `ChainStack` does:
 //! * an **incompatible** peer (wrong network id / genesis) → blacklist its node
 //!   id + a long (10 min) address backoff,
-//! * any other failure, or a compatible peer that doesn't offer snap/1 → a short
+//! * any other failure, or a compatible peer that shares no snap version → a short
 //!   (30 s) address backoff,
 //! * a snap-capable peer → spawned as a `ManagedPeer` and held in the pool.
 //!
@@ -355,6 +355,14 @@ fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
 /// point: #465's hosts gated on a count that was true while every read failed.
 fn is_serving(benched: bool, cov: Coverage) -> bool {
     !benched && matches!(cov, Coverage::Covers | Coverage::Near)
+}
+
+/// Pure: is a pooled peer one of the SERVING peers that run snap/2 (the
+/// `snap2ServingPeers` status key, ABI ≥ 38)? A subset of `is_serving` by
+/// construction; `snap_serving_counts` evaluates both on the same reading of
+/// each peer, so the hosts' "serving N (M)" never shows M above N.
+fn counts_as_snap2_serving(snap_version: Option<u64>, benched: bool, cov: Coverage) -> bool {
+    snap_version.is_some_and(|v| v >= 2) && is_serving(benched, cov)
 }
 
 /// Pure: does a pooled peer count toward the EL hunt's "somebody could
@@ -820,7 +828,12 @@ impl PoolInner {
                 // snap peer (bounded to ~target occurrences per run). Per-peer
                 // failures/non-snap stay at debug to avoid the discv4 cross-chain
                 // noise (most discovered peers are other networks or full).
-                tracing::info!(%addr, eth = session.eth_version, "el dial: snap peer connected");
+                tracing::info!(
+                    %addr,
+                    eth = session.eth_version,
+                    snap = session.snap_version.unwrap_or_default(),
+                    "el dial: snap peer connected"
+                );
                 // The cache's verdict on this peer from earlier runs, read in
                 // its own statement BEFORE the peers lock (never two pool locks
                 // at once — the maintainer takes them in the other order).
@@ -857,10 +870,10 @@ impl PoolInner {
                 cache.flush();
             }
             Ok(session) => {
-                // Compatible but no snap/1 — useless for verified reads. Cool the
+                // Compatible but no shared snap version — useless for verified reads. Cool the
                 // address off and free it from `attempted`. Still proof the
                 // address is alive: clear any connect-failure streak.
-                tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap/1");
+                tracing::debug!(%addr, eth = session.eth_version, "el dial: connected but no snap");
                 {
                     // Flush so a cleared persisted streak lands on disk now —
                     // this path may be the only cache event the peer ever gets.
@@ -1016,6 +1029,27 @@ impl PeerPool {
     pub async fn snap_serving_count(&self) -> usize {
         self.inner.prune_closed().await;
         self.inner.count_where(is_serving).await
+    }
+
+    /// `(serving, serving on snap/2)`: [`snap_serving_count`](Self::snap_serving_count)
+    /// together with the part of it whose connection runs snap/2 (EIP-8189) —
+    /// the hosts' `snapServingPeers` and `snap2ServingPeers`. The second is
+    /// purely informational (reads are the same on either version). Both are
+    /// counted in ONE pass — one prune, one lock, one clock reading, each
+    /// peer judged once — so the second can never exceed the first: two
+    /// separate counts could straddle a bench expiring or a peer's head word
+    /// arriving, and a host would show "serving 0 (1)".
+    pub async fn snap_serving_counts(&self) -> (usize, usize) {
+        self.inner.prune_closed().await;
+        let now = Instant::now();
+        let peers = self.inner.peers.lock().await;
+        let (mut serving, mut snap2) = (0, 0);
+        for p in peers.iter() {
+            let (benched, cov) = (p.is_benched(now), p.peer.coverage());
+            serving += usize::from(is_serving(benched, cov));
+            snap2 += usize::from(counts_as_snap2_serving(p.peer.snap_version, benched, cov));
+        }
+        (serving, snap2)
     }
 
     /// Replace the HOST's seed pins (`myotis_set_boot_enodes`, #465). Set
@@ -1981,7 +2015,9 @@ mod tests {
     /// verdicts and the two serving tallies (the admission/eviction bar lives
     /// with `peer::coverage`).
     mod head_policy {
-        use super::super::{counts_for_hunt, is_serving, persist_verdict, Coverage};
+        use super::super::{
+            counts_as_snap2_serving, counts_for_hunt, is_serving, persist_verdict, Coverage,
+        };
 
         #[test]
         fn a_whole_pool_failure_persists_nothing_against_anyone() {
@@ -2014,6 +2050,23 @@ mod tests {
             // Said it lacks the head: neither.
             assert!(!is_serving(false, Coverage::Behind));
             assert!(!counts_for_hunt(false, Coverage::Behind));
+        }
+
+        #[test]
+        fn the_snap2_serving_count_is_a_subset_of_the_serving_count() {
+            let coverages = [Coverage::Covers, Coverage::Near, Coverage::Unknown, Coverage::Behind];
+            for benched in [false, true] {
+                for cov in coverages {
+                    // A snap/2 connection counts exactly when it serves …
+                    assert_eq!(
+                        counts_as_snap2_serving(Some(2), benched, cov),
+                        is_serving(benched, cov)
+                    );
+                    // … and a snap/1 one never does, serving or not.
+                    assert!(!counts_as_snap2_serving(Some(1), benched, cov));
+                    assert!(!counts_as_snap2_serving(None, benched, cov));
+                }
+            }
         }
     }
 

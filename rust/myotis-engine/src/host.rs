@@ -944,10 +944,13 @@ pub fn status_json(handle: i64) -> String {
                 Some(r) => engine.rt.block_on(async {
                     {
                         let (h_asked, h_served, b_asked, b_served) = r.serve_stats();
+                        // One pass for both, so snap2_serving <= snap_serving.
+                        let (snap_serving, snap2_serving) = r.snap_serving_counts().await;
                         ElCounts {
                             reader_available: true,
                             snap_peers: r.snap_peer_count().await,
-                            snap_serving: r.snap_serving_count().await,
+                            snap_serving,
+                            snap2_serving,
                             discovered: r.discovered_count(),
                             attempted: r.attempted_count().await,
                             backed_off: r.backoff_count().await,
@@ -996,6 +999,10 @@ struct ElCounts {
     /// gate readiness on since ABI 31 — a pool of peers still syncing keeps
     /// `snap_peers` positive for hours while every read fails (#465).
     snap_serving: usize,
+    /// The subset of `snap_serving` whose connection runs snap/2 (EIP-8189;
+    /// `ElReader::snap_serving_counts`). Informational — the hosts show it in
+    /// parentheses after the serving count and gate on nothing (ABI 38).
+    snap2_serving: usize,
     discovered: usize,
     attempted: usize,
     backed_off: usize,
@@ -2972,12 +2979,14 @@ fn status_object(
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers —
     // both count POOLED peers. snapServingPeers (ABI >= 31) is the subset that
     // can answer a read at the anchored head now; it is what the hosts gate
-    // on (#465). elReaderAvailable distinguishes "EL warming up" from "EL
-    // reader failed to start" (the CL-only degraded mode) — the wake gate
-    // fast-fails the latter.
+    // on (#465). snap2ServingPeers (ABI >= 38) is the subset of THAT whose
+    // connection runs snap/2 — shown, never gated on. elReaderAvailable
+    // distinguishes "EL warming up" from "EL reader failed to start" (the
+    // CL-only degraded mode) — the wake gate fast-fails the latter.
     obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
     obj.insert("snapServingPeers".into(), el.snap_serving.into());
+    obj.insert("snap2ServingPeers".into(), el.snap2_serving.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
     obj.insert("attemptedDials".into(), el.attempted.into());
@@ -3026,7 +3035,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
-    r#""snapPeers":0,"snapServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""snapPeers":0,"snapServingPeers":0,"snap2ServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
@@ -3587,7 +3596,7 @@ mod tests {
         assert_eq!(v["elReaderAvailable"], false);
         assert!(v["upgradeAdvisory"].is_null(), "no advisory before any peer was seen");
         // EL counts are zero for a not-started handle.
-        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+        for k in ["snapPeers", "snapServingPeers", "snap2ServingPeers", "readyPeers", "discoveredPeers",
                   "attemptedDials", "backedOffPeers", "blacklistedPeers",
                   "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
@@ -3678,6 +3687,7 @@ mod tests {
             reader_available: true,
             snap_peers: 5,
             snap_serving: 3,
+            snap2_serving: 1,
             discovered: 240,
             attempted: 14,
             backed_off: 30,
@@ -3719,10 +3729,12 @@ mod tests {
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
         // readyPeers, since the pool holds only snap-capable READY peers;
-        // snapServingPeers is its own count — the peers that can answer now).
+        // snapServingPeers is its own count — the peers that can answer now —
+        // and snap2ServingPeers the part of it on snap/2).
         assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
         assert_eq!(synced["snapServingPeers"], 3);
+        assert_eq!(synced["snap2ServingPeers"], 1);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
         assert_eq!(synced["attemptedDials"], 14);
@@ -3784,7 +3796,7 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 14_560_000);
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1795);
-        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+        for k in ["snapPeers", "snapServingPeers", "snap2ServingPeers", "readyPeers", "discoveredPeers",
                   "attemptedDials", "backedOffPeers", "blacklistedPeers",
                   "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");

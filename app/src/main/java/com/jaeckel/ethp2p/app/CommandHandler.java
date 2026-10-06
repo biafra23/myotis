@@ -173,6 +173,8 @@ public class CommandHandler {
                 // The snap peers that can answer a verified read at the anchored head
                 // now (#465) — the readiness signal; snapPeers alone is not one.
                 + ",\"snapServingPeers\":" + s.snapServingPeers()
+                // The part of snapServingPeers whose connection runs snap/2 (EIP-8189).
+                + ",\"snap2ServingPeers\":" + s.snap2ServingPeers()
                 + ",\"backedOffPeers\":" + s.backedOffPeers()
                 + ",\"blacklistedPeers\":" + s.blacklistedPeers()
                 + ",\"peerHeaderRequests\":" + s.peerHeaderRequests()

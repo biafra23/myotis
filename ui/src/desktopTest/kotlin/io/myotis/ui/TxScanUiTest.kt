@@ -167,7 +167,8 @@ class TxScanUiTest {
         fun runningMainnetSnapshot() = NodeSnapshot(
             running = true, lifecycle = "RUNNING", network = "mainnet", engine = "java",
             beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
-            snapServingPeers = 2, clConnectedPeers = 0, clServedPeersLastMin = 2,
+            snapServingPeers = 2, snap2ServingPeers = 0,
+            clConnectedPeers = 0, clServedPeersLastMin = 2,
             clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
             elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
             blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,

@@ -74,8 +74,13 @@ pub struct EthSession<S = TcpStream> {
     conn: RlpxConnection<S>,
     /// Negotiated eth version (66-69).
     pub eth_version: u64,
-    /// Whether the peer also advertised snap/1 (drives EL-A6).
+    /// Whether a snap version is shared with the peer (drives EL-A6) — i.e.
+    /// `snap_version.is_some()`.
     pub snap: bool,
+    /// The snap version this session runs: the highest one both sides
+    /// advertised (1, or 2 = EIP-8189). The verified reads use only the
+    /// messages the two versions share, so they work the same on either.
+    pub snap_version: Option<u64>,
     /// The peer's Status (its head, fork id).
     pub peer_status: Status,
     /// The peer's Hello (client id, capabilities).
@@ -110,7 +115,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                 return Err(format!("expected Hello, got code 0x{:02x}", first.message_code));
             }
             let peer_hello = decode_hello(&first.payload)?;
-            let (eth_version, snap) = negotiate(&peer_hello)
+            let (eth_version, snap_version) = negotiate(&peer_hello)
                 .ok_or_else(|| format!("no common eth version with {:?}", peer_hello.client_id))?;
 
             // Send our Status in the negotiated version, with the fork id in
@@ -191,7 +196,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             Ok(EthSession {
                 conn,
                 eth_version,
-                snap,
+                snap: snap_version.is_some(),
+                snap_version,
                 peer_status,
                 peer_hello,
                 next_request_id: 1,
@@ -303,19 +309,19 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
     /// Consume the negotiated session, handing the framed connection and the
     /// negotiated metadata to the [`ManagedPeer`](crate::el::peer::ManagedPeer)
     /// actor, which drives it from a background read loop.
-    pub fn into_parts(self) -> (RlpxConnection<S>, u64, bool, Status, Hello) {
-        (self.conn, self.eth_version, self.snap, self.peer_status, self.peer_hello)
+    pub fn into_parts(self) -> (RlpxConnection<S>, u64, Option<u64>, Status, Hello) {
+        (self.conn, self.eth_version, self.snap_version, self.peer_status, self.peer_hello)
     }
 
     // -----------------------------------------------------------------------
-    // snap/1 verified state fetch (EL-A6). These share the eth peer's RLPx
-    // connection, multiplexed by the dynamic snap message codes.
+    // snap verified state fetch (EL-A6), on snap/1 or snap/2 alike. These share
+    // the eth peer's RLPx connection, multiplexed by the dynamic snap message codes.
     // -----------------------------------------------------------------------
 
-    /// The snap message codes for the negotiated eth version (`None` if the
-    /// peer didn't advertise snap/1).
+    /// The snap message codes for the negotiated eth version (`None` if no
+    /// snap version is shared with the peer).
     fn snap_codes(&self) -> Option<snap::SnapCodes> {
-        self.snap.then(|| snap::SnapCodes::for_eth_version(self.eth_version))
+        self.snap_version.map(|v| snap::SnapCodes::negotiated(self.eth_version, v))
     }
 
     /// Fetch and verify one account at `state_root`. `state_root` must be a
@@ -328,7 +334,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         state_root: &[u8; 32],
         address: &[u8; 20],
     ) -> Result<AccountOutcome, String> {
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let id = self.next_id();
         let account_hash = myotis_core::keccak::keccak256(address);
         // Full [origin, 0xff…ff] range + a small responseBytes cap: the peer
@@ -358,7 +364,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         if account.storage_root == EMPTY_TRIE_ROOT {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let id = self.next_id();
         let account_hash = myotis_core::keccak::keccak256(address);
         let slot_hash = myotis_core::keccak::keccak256(slot);
@@ -378,7 +384,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         if code_hash == &EMPTY_CODE_HASH {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let id = self.next_id();
         let req = snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024);
         self.conn.send(codes.get_byte_codes, &req).await?;
@@ -504,16 +510,20 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
     }
 }
 
-/// Highest common eth version (floor 66) + whether snap/1 is offered.
-fn negotiate(hello: &Hello) -> Option<(u64, bool)> {
+/// Highest common eth version (floor 66) + the highest common snap version
+/// (`None` when the peer offers neither snap/1 nor snap/2). RLPx runs one
+/// version per capability name — the highest both sides advertise — so a peer
+/// offering snap/1 and snap/2 is a snap/2 session, and a snap/2-only peer (reth
+/// implements no snap/1) is no longer mistaken for one without snap.
+fn negotiate(hello: &Hello) -> Option<(u64, Option<u64>)> {
     let mut best: Option<u64> = None;
-    let mut snap = false;
+    let mut snap: Option<u64> = None;
     for cap in &hello.capabilities {
         if cap.name == "eth" && OUR_ETH_VERSIONS.contains(&cap.version) && cap.version >= MIN_ETH_VERSION {
             best = Some(best.map_or(cap.version, |b| b.max(cap.version)));
         }
-        if cap.name == "snap" && cap.version == 1 {
-            snap = true;
+        if cap.name == "snap" && snap::OUR_SNAP_VERSIONS.contains(&cap.version) {
+            snap = Some(snap.map_or(cap.version, |b| b.max(cap.version)));
         }
     }
     best.map(|v| (v, snap))
@@ -598,13 +608,35 @@ mod tests {
     fn negotiate_highest_common_and_snap() {
         assert_eq!(
             negotiate(&hello_with(vec![("eth", 66), ("eth", 68), ("snap", 1)])),
-            Some((68, true))
+            Some((68, Some(1)))
         );
-        assert_eq!(negotiate(&hello_with(vec![("eth", 69)])), Some((69, false)));
+        assert_eq!(negotiate(&hello_with(vec![("eth", 69)])), Some((69, None)));
         // eth/65 is below the floor; no common version.
         assert_eq!(negotiate(&hello_with(vec![("eth", 65), ("les", 4)])), None);
         // Unknown-to-us high version is ignored; falls back to the common one.
-        assert_eq!(negotiate(&hello_with(vec![("eth", 67), ("eth", 99)])), Some((67, false)));
+        assert_eq!(negotiate(&hello_with(vec![("eth", 67), ("eth", 99)])), Some((67, None)));
+    }
+
+    #[test]
+    fn negotiate_snap_runs_the_highest_shared_version() {
+        // A snap/2-only peer (EIP-8189) is a snap peer, on snap/2.
+        assert_eq!(negotiate(&hello_with(vec![("eth", 69), ("snap", 2)])), Some((69, Some(2))));
+        // Both offered: RLPx runs the highest shared one, whatever the order.
+        assert_eq!(
+            negotiate(&hello_with(vec![("eth", 69), ("snap", 2), ("snap", 1)])),
+            Some((69, Some(2)))
+        );
+        assert_eq!(
+            negotiate(&hello_with(vec![("eth", 69), ("snap", 1), ("snap", 2)])),
+            Some((69, Some(2)))
+        );
+        // A version we don't speak is not shared: fall back to the one we do,
+        // or to no snap at all.
+        assert_eq!(
+            negotiate(&hello_with(vec![("eth", 69), ("snap", 1), ("snap", 3)])),
+            Some((69, Some(1)))
+        );
+        assert_eq!(negotiate(&hello_with(vec![("eth", 69), ("snap", 3)])), Some((69, None)));
     }
 
     #[test]
@@ -662,12 +694,12 @@ mod tests {
     }
 
     /// Run our handshake against a peer that answers our Hello with its own
-    /// (eth/66-69 + snap/1, so eth/69 is negotiated) and sends `script` once our
-    /// Status arrives. Returns our outcome (negotiated version, snap, the peer's
+    /// (eth/66-69 + snap/1-2, so eth/69 and snap/2 are negotiated) and sends `script` once our
+    /// Status arrives. Returns our outcome (negotiated eth and snap versions, the peer's
     /// Status) and the codes of every frame we sent after our Status.
     async fn handshake_against(
         script: Vec<(u64, Vec<u8>)>,
-    ) -> (Result<(u64, bool, Status), String>, Vec<u64>) {
+    ) -> (Result<(u64, Option<u64>, Status), String>, Vec<u64>) {
         let (ours, mut peer) = framed_pair();
         let peer_side = tokio::spawn(async move {
             assert_eq!(peer.recv().await.unwrap().message_code, P2P_HELLO);
@@ -703,7 +735,7 @@ mod tests {
         let (outcome, answered) =
             handshake_against(vec![(P2P_PING, vec![0xc0]), (messages::STATUS, status)]).await;
         let (eth_version, snap, peer_status) = outcome.expect("handshake completes");
-        assert_eq!((eth_version, snap), (69, true));
+        assert_eq!((eth_version, snap), (69, Some(2)));
         assert_eq!(peer_status.network_id, NETWORK_ID);
         assert_eq!(peer_status.latest_block, Some(100));
         assert_eq!(answered, vec![P2P_PONG]);

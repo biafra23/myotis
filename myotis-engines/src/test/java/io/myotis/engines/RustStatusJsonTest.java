@@ -40,7 +40,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":0,\"syncStartPeriod\":-1,\"lcHunting\":false,\"wsBoundPeriods\":0,"
             + "\"finalizedRootHex\":\"0000000000000000000000000000000000000000000000000000000000000000\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"snap2ServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
             + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,\"elHunting\":false,"
             + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
@@ -54,7 +54,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":7,\"syncStartPeriod\":1777,\"lcHunting\":true,\"elHunting\":true,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":true,"
-            + "\"snapPeers\":6,\"snapServingPeers\":4,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
+            + "\"snapPeers\":6,\"snapServingPeers\":4,\"snap2ServingPeers\":1,\"readyPeers\":6,\"discoveredPeers\":240,\"attemptedDials\":14,"
             + "\"backedOffPeers\":30,\"blacklistedPeers\":66,"
             + "\"optimisticBlockNumber\":21000010,\"finalizedBlockNumber\":20999000,"
             + "\"executionBlockNumber\":20999000,"
@@ -75,7 +75,7 @@ class RustStatusJsonTest {
             + "\"discv5TableSize\":0,\"syncStartPeriod\":1777,"
             + "\"finalizedRootHex\":\"58cb432571912a434ab7fb83317bb60d09632cce53839fc2541417710465b42e\","
             + "\"elReaderAvailable\":false,"
-            + "\"snapPeers\":0,\"snapServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
+            + "\"snapPeers\":0,\"snapServingPeers\":0,\"snap2ServingPeers\":0,\"readyPeers\":0,\"discoveredPeers\":0,\"attemptedDials\":0,"
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,"
             + "\"optimisticBlockNumber\":0,\"finalizedBlockNumber\":0,\"executionBlockNumber\":0}";
 
@@ -177,6 +177,8 @@ class RustStatusJsonTest {
         assertEquals(6, s.snapPeers());
         assertEquals(6, s.readyPeers());
         assertEquals(4, s.snapServingPeers());
+        // The part of those on snap/2 (ABI >= 38) — its own key, shown in the UI.
+        assertEquals(1, s.snap2ServingPeers());
         assertEquals(240, s.discoveredPeers());
         assertEquals(14, s.attemptedDials());
         assertEquals(30, s.backedOffPeers());
