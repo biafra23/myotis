@@ -47,6 +47,9 @@ internal object StatusJson {
         // of peers still syncing themselves keeps snapPeers positive for hours
         // while every read fails. Same position as the IPC shape.
         put("snapServingPeers", s.snapServingPeers())
+        // The part of snapServingPeers whose connection runs snap/2 (EIP-8189) —
+        // informational; reads are the same on snap/1 and snap/2.
+        put("snap2ServingPeers", s.snap2ServingPeers())
         put("backedOffPeers", s.backedOffPeers())
         put("blacklistedPeers", s.blacklistedPeers())
         put("pauseCount", s.pauseCount())

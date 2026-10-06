@@ -73,6 +73,12 @@ public final class HelloMessage {
                     cap.writeString("snap");
                     cap.writeInt(1);
                 });
+                // snap/2 (EIP-8189) — offered next to snap/1 so the session runs
+                // whichever the peer has; see EthHandler.negotiateSnapVersion.
+                capWriter.writeList(cap -> {
+                    cap.writeString("snap");
+                    cap.writeInt(2);
+                });
             });
             writer.writeInt(tcpPort);
             writer.writeValue(nodePublicKey); // 64-byte uncompressed public key

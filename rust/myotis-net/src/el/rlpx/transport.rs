@@ -327,7 +327,9 @@ fn random_padding() -> Vec<u8> {
 }
 
 /// Build a p2p Hello body: `[protocolVersion, clientId, [[cap,ver]…], listenPort, nodeId]`.
-/// Advertises eth/66-69 + snap/1 (ascending), matching the Java `HelloMessage`.
+/// Advertises eth/66-69 + snap/1 + snap/2 (ascending), matching the Java
+/// `HelloMessage`. Both snap versions are offered so the session runs whichever
+/// one the peer has — the highest shared (see `eth::session::negotiate`).
 pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     use myotis_core::rlp::{self, Item};
     let cap = |name: &str, ver: u64| {
@@ -349,6 +351,7 @@ pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
             cap("eth", 68),
             cap("eth", 69),
             cap("snap", 1),
+            cap("snap", 2),
         ]),
         Item::Bytes(rlp::u64_to_minimal_be(u64::from(listen_port))),
         Item::Bytes(node_pubkey.to_vec()),
@@ -427,9 +430,10 @@ mod tests {
         assert_eq!(hello.client_id, concat!("myotis/", env!("CARGO_PKG_VERSION")));
         assert_eq!(hello.listen_port, 30303);
         assert_eq!(hello.node_id, pubkey.to_vec());
-        assert_eq!(hello.capabilities.len(), 5);
+        assert_eq!(hello.capabilities.len(), 6);
         assert_eq!(hello.capabilities[3], Capability { name: "eth".into(), version: 69 });
         assert_eq!(hello.capabilities[4], Capability { name: "snap".into(), version: 1 });
+        assert_eq!(hello.capabilities[5], Capability { name: "snap".into(), version: 2 });
     }
 
     #[test]

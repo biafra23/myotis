@@ -199,7 +199,16 @@ uniffi::setup_scaffolding!();
 ///      Index tab sends `unwatch` for a removed contract
 ///      (`LogIndexWatch.configJson`); the Node addon and the iOS wrapper pass
 ///      the JSON through unchanged.
-pub const ABI_VERSION: i32 = 37;
+/// v38: the status JSON gained `snap2ServingPeers`: the part of
+///      `snapServingPeers` whose connection runs snap/2 (EIP-8189), which the
+///      engine now speaks next to snap/1. Informational — the hosts show it in
+///      parentheses after the serving count ("serving 8 (3)") and gate on nothing;
+///      reads are the same on either version. A payload extension, no
+///      signature change — bumped so a host showing the number is never
+///      paired with an engine that cannot report it (an absent key would read
+///      as "no snap/2 peers"). `RustChainHandle`, the iOS wrapper's status
+///      reader and the Node addon's `statusJson()` carry it.
+pub const ABI_VERSION: i32 = 38;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

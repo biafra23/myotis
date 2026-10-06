@@ -451,6 +451,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             long syncStartPeriod,
             int snapPeers,
             int snapServingPeers,
+            int snap2ServingPeers,
             int discoveredPeers,
             int attemptedDials,
             int backedOffPeers,
@@ -503,6 +504,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         // CLOSED, never the pooled count: the ABI gate is exact, so a
                         // native this wrapper loads always emits it.
                         o.getInt("snapServingPeers", 0),
+                        // ABI >= 38: the part of snapServingPeers on snap/2 (EIP-8189).
+                        // Shown, never gated on.
+                        o.getInt("snap2ServingPeers", 0),
                         o.getInt("discoveredPeers", 0),
                         o.getInt("attemptedDials", 0),
                         o.getInt("backedOffPeers", 0),
@@ -526,7 +530,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null);
         }
 
         /** The optional nested {@code upgradeAdvisory} object → the API record. Absent
@@ -621,6 +625,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 s.snapPeers(),         // readyPeers (EL — pool holds only snap-ready)
                 s.snapPeers(),         // snapPeers
                 s.snapServingPeers(),  // snapServingPeers (ABI >= 31)
+                s.snap2ServingPeers(), // snap2ServingPeers (ABI >= 38)
                 s.discoveredPeers(),   // discoveredPeers (discv4)
                 s.backedOffPeers(),    // backedOffPeers
                 s.blacklistedPeers(),  // blacklistedPeers
