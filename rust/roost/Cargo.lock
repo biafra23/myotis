@@ -3212,6 +3212,7 @@ dependencies = [
  "discv5",
  "futures",
  "getrandom 0.2.17",
+ "hickory-resolver",
  "hmac",
  "libp2p",
  "myotis-consensus",

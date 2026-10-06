@@ -176,6 +176,10 @@ pub struct RemoteEnr {
     /// where it listens, which beats a NEIGHBORS entry's hearsay.
     pub tcp4: Option<u16>,
     pub tcp6: Option<u16>,
+    /// Whether the record names an address at all (`ip` or `ip6`): one that
+    /// does, and names no TCP port, is a discovery-only node; one that names
+    /// neither says nothing about its endpoint (our own record is like that).
+    pub has_ip: bool,
 }
 
 impl RemoteEnr {
@@ -207,6 +211,7 @@ pub fn decode_enr(raw: &[u8], signer: &[u8; 64]) -> Result<RemoteEnr, String> {
         eth: enr.get_raw_rlp("eth").map(<[u8]>::to_vec),
         tcp4: enr.tcp4(),
         tcp6: enr.tcp6(),
+        has_ip: enr.ip4().is_some() || enr.ip6().is_some(),
     })
 }
 
@@ -442,7 +447,7 @@ mod tests {
             if let Some(p) = tcp6 {
                 b.tcp6(p);
             }
-            let raw = alloy_rlp::encode(&b.build(&signing).unwrap());
+            let raw = alloy_rlp::encode(b.build(&signing).unwrap());
             decode_enr(&raw, &k.public_key_bytes()).unwrap()
         };
         let v4 = [10, 0, 0, 1];
@@ -458,5 +463,13 @@ mod tests {
         assert_eq!(build(None, None).tcp_port_for(&v4), None);
         assert_eq!(build(Some(0), None).tcp_port_for(&v4), None);
         assert!(build(None, None).eth.is_none());
+        // These records name no address; one that does is marked.
+        assert!(!build(Some(30303), None).has_ip);
+        let mut b = Enr::<CombinedKey>::builder();
+        b.seq(1).ip4([10, 0, 0, 1].into()).udp4(30303);
+        let raw = alloy_rlp::encode(b.build(&signing).unwrap());
+        let discovery_only = decode_enr(&raw, &k.public_key_bytes()).unwrap();
+        assert!(discovery_only.has_ip);
+        assert_eq!(discovery_only.tcp_port_for(&v4), None);
     }
 }

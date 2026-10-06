@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 38
+#define MYOTIS_ABI_VERSION 39
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -88,6 +88,14 @@ bool myotis_set_tor_enabled(bool on);
 /* Tor status bitmask: bit0 compiled-in, bit1 enabled, bit2 bootstrapped.
  * 0 = this build has no Tor support. */
 int32_t myotis_tor_status(void);
+
+/* Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
+ * system resolver — for every network this process runs. Off by default: a
+ * host that resolves through the system resolver (desktop, daemon) switches it
+ * on; a host that supplies its own DNS servers has no port for them in this
+ * engine yet and leaves it off (mobile). Never used while Tor is enabled.
+ * Returns the state now in force. Process-global, not per-handle. */
+bool myotis_set_dns_discovery(bool on);
 
 /* Status JSON object (camelCase keys), or "{}" for an unknown handle. */
 char *myotis_status_json(int64_t handle);

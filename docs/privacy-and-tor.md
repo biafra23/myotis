@@ -60,7 +60,7 @@ Tor carries **TCP streams only**. Myotis' transports:
 | CL libp2p req/resp (port 9000) | TCP | Yes — but content-benign, may not need it |
 | discv4 (EL discovery) | UDP | **No** |
 | discv5 (CL discovery) | UDP | **No** |
-| EIP-1459 ENR trees | DNS TXT (dnsjava) | Not directly; needs DoH over a Tor stream |
+| EIP-1459 ENR trees | DNS TXT (dnsjava; hickory in the Rust engine) | Not directly; needs DoH over a Tor stream. The Rust engine's walk is **skipped while Tor is enabled** (#539): a system-resolver query for `all.mainnet.ethdisco.net` tells the local resolver which network this node is on |
 | CCIP-Read gateways | HTTPS | Yes (standard) |
 
 Myotis is effectively **outbound-only** (a light client that dials), which is
@@ -157,7 +157,10 @@ Route by sensitivity, not wholesale:
 **Stays clearnet (real IP):**
 
 1. **Discovery** — discv4/discv5 are UDP and can't cross Tor anyway; they reveal
-   only "this IP runs a client."
+   only "this IP runs a client." The EIP-1459 DNS walk is the exception that
+   does NOT stay on: the Rust engine skips it while Tor is enabled, since a
+   clearnet TXT query for a network's tree names the network to the local
+   resolver (open question 8, DoH over Tor, is what would bring it back).
 2. **Snap capability/quality validation** — probing a discovered peer with
    `GetAccountRange` at **random** account hashes / random ranges reveals nothing
    about the wallet and looks like ordinary state-sync traffic. This feeds the

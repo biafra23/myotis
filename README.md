@@ -1016,7 +1016,7 @@ On the **Java engine**, both discv4 (EL) and libp2p (CL) get their initial peer 
 
 DNS resolution is best-effort: on timeout, missing TXT records, or signature mismatch the daemon logs a warning and starts up with whatever the hardcoded + cached sources provide. Per-tree deadline defaults to 10 s.
 
-The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the same on-disk caches (byte-identical formats, so switching engines keeps them), plus discv4/discv5 and, for the EL, any `enode://` seed pins a host hands it (`myotis_set_boot_enodes`, ABI ≥ 31). It has **no EIP-1459 DNS walk**: on mainnet — which pins no enodes — a stale bootnode list therefore never seeds EL discovery on a fresh profile, which is why the release checklist re-syncs the bootnodes from go-ethereum (CLAUDE.md §Releases).
+The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the same on-disk caches (byte-identical formats, so switching engines keeps them), plus discv4/discv5 and, for the EL, any `enode://` seed pins a host hands it (`myotis_set_boot_enodes`, ABI ≥ 31). Since #539 it walks the same EIP-1459 EL trees too (`rust/myotis-net/src/el/dnsdisco.rs`) — but only on hosts that allow DNS (`myotis_set_dns_discovery`, ABI ≥ 39: the desktop app, the daemon and `myotis-rpcd`, through the system resolver; not Android or iOS, until the engine takes a host's DNS servers, and not yet the Node addon) and never while Tor is enabled. Its walk also checks that every record hashes to its DNS label and verifies each leaf's signature, and the leaves pass the same fork-id filter as discv4's candidates before the pool dials them. Where DNS is off — mobile, Tor — a stale bootnode list still never seeds EL discovery on a fresh mainnet profile (no pinned enodes), which is why the release checklist re-syncs the bootnodes from go-ethereum (CLAUDE.md §Releases).
 
 ### Key dependencies
 
@@ -1024,7 +1024,7 @@ The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the sa
 - **Netty 4.2.x** (upstream) -- NIO transport. (The earlier Kotlin-transpiled tuweni/netty forks existed to explore a Kotlin-Multiplatform engine; multiplatform now comes from the Rust engine, so the forks were retired.)
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
-- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
+- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver`, already part of its libp2p stack)
 
 ## License
 

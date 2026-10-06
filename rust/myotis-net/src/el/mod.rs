@@ -8,6 +8,7 @@
 
 pub mod anchor;
 pub mod discv4;
+pub mod dnsdisco;
 pub mod enrfilter;
 pub mod eth;
 mod feecache;
