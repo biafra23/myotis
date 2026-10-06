@@ -102,7 +102,7 @@ proof?" has the answer: there is none.
 
 | anchor | trusts | fits CLAUDE.md §Trust? |
 |---|---|---|
-| ZK proof verified on L1 | the SP1 verifier and its trusted setup | yes — cryptographic, but **not posted in practice** |
+| ZK proof verified on L1 | the SP1 verifier and its trusted setup, plus the root the proof starts from (§3.3) | yes — cryptographic, but **not posted in practice** |
 | TEE proposal | AWS Nitro attestation + Base's TEE allowlist (Coordinator multisig) | no — a new, documented exception at best, like the seeded log histories |
 | resolved game (5 days, unchallenged) | 1-of-N honest challenger; today the only challenger is Base's own, and nobody posts ZK proofs | no — "unchallenged" means Base did not dispute itself |
 | sequencer signature | Coinbase's sequencer key | no — peer trusted |
@@ -123,13 +123,24 @@ that is 4.5 h, after Denim's 200 ms blocks 27 minutes — the bound would have
 to become time-based, per network.
 
 Which anchor sits at the start of the walk decides whether the walk exists at
-all. From an **unresolved TEE proposal** (32–52 min old) the head is within
-reach. From the anchors §3.2 rates as fitting the trust model — a resolved
-game, or a ZK-backed one, both **≥ 5 days old**, ~216,000 Base blocks — no
-header chain reaches the head, and reads would be served at the anchor's
-height only, five days behind. The "anchor → `headerChain` → head" design of
-this section therefore presupposes accepting the TEE proposal as anchor; with
-only the rule-conforming anchors, Base reads are five-day-old reads.
+all. Today there is no rule-conforming anchor (§3.2), so the cases are:
+
+- **Unresolved TEE proposal** (rated no): 32–52 min old, head within reach.
+  This is what the "anchor → `headerChain` → head" design of this section
+  runs on today, and it presupposes accepting TEE trust.
+- **Resolved game** (rated no): ≥ 5 days old (1 day on the dual-proof path),
+  ~216,000 Base blocks — no header chain reaches the head; reads would be
+  served at the anchor's height only.
+- **Posted ZK proof** (rated yes, hypothetical today): L1-verified the moment
+  the `verifyProposalProof` call lands, so proposal-aged and within
+  header-chain reach. This is the payoff behind open decision 1 in §8. One
+  caveat belongs on §3.2's "yes": a game's proof covers the 600-block
+  transition from the **parent claim's** root to its own, so a lone ZK proof
+  on an otherwise TEE-only chain of games still inherits TEE trust for its
+  starting root. Rule-conforming all the way down needs an unbroken run of
+  ZK-backed games back to a root the client already holds (a previously
+  accepted ZK anchor, or a resolved one — which, with ZK on every game, is
+  the 1-day path and a cryptographic chain rather than "unchallenged").
 
 ## 4. Weaker evidence inside the 32–52 minute window
 
@@ -190,16 +201,19 @@ and what Myotis already has for it.
    (`NetworkConfig`), so blobs are no longer served whole:
    `blob_sidecars_by_range` is gone, blobs travel as 128 **data columns**
    (`/eth2/beacon_chain/req/data_column_sidecars_by_range/1/` and
-   `…_by_root/1/`). Any 64 of the 128 columns reconstruct a blob by
-   Reed–Solomon recovery over the BLS12-381 scalar field; the code is
-   systematic, so the right half of the columns should yield the original
-   data without any decoding (to verify against the spec before relying on
-   it). Each column sidecar carries that column's cell of **every** blob in
-   the block, so fetching 64 columns downloads half of all blob data of
-   that L1 block, other rollups included: with ~6.7 blobs per block on
-   average (September 2026) that is ~430 KiB of cell data per L1 block
-   touched, plus each sidecar's KZG cell proofs (48 B per blob per column),
-   the block's commitments and the inclusion proof — a few percent on top.
+   `…_by_root/1/`). A cell is 64 field elements, 2048 B; any 64 of the
+   128 columns reconstruct a blob by Reed–Solomon recovery over the
+   BLS12-381 scalar field, and the code is systematic: under the spec's
+   bit-reversed evaluation order the **first 64 columns (indices 0–63)**
+   are the original blob, so when peers serve those no decoding is needed.
+   Each column sidecar carries that column's cell of **every** blob in the
+   block, so 64 columns are 64 × 2048 B = 128 KiB per blob — the full
+   original volume of every blob in that L1 block, other rollups included
+   ("half" holds only against the 2× extended data). With ~6.7 blobs per
+   block on average (September 2026) that is ~858 KiB of cell data per L1
+   block touched, plus each sidecar's KZG cell proofs (48 B per blob per
+   column), the block's commitments and the inclusion proof — a few percent
+   on top.
    Have: libp2p, req/resp framing, snappy, SSZ. Missing: the two protocols,
    the `DataColumnSidecar` SSZ type, column→blob assembly, optional RS
    recovery (field arithmetic + FFT; `blst` has the field, not the FFT).
@@ -237,8 +251,8 @@ and what Myotis already has for it.
 
 | | estimate |
 |---|---|
-| download | 0.5–2 MiB (64 columns × the 1–3 L1 blocks a channel spans) |
-| compute | one 4096-point MSM per blob (hundreds of ms on a phone with `blst`), Brotli of ≤ ~750 KiB, span-batch decode; RS recovery only when the systematic half is unavailable |
+| download | ~0.9–2.6 MiB (64 columns ≈ 858 KiB × the 1–3 L1 blocks a channel spans) |
+| compute | one 4096-point MSM per blob (hundreds of ms on a phone with `blst`), Brotli of ≤ ~750 KiB, span-batch decode; RS recovery only when columns 0–63 are unavailable |
 | latency after the Base block | the batcher's posting cadence — minutes typically, up to the 12 h sequencing window |
 | new code | two CL req/resp protocols + SSZ; column assembly; KZG commitment; frames/channel/Brotli/span-batch decoder with derivation rules; Base chain parameters; a new `ChainHandle` read (e.g. `sequencingStatus(txHash)`) on both FFI shapes with golden tests |
 | engines | Rust only (like Tor); the Java engine never gets it |
