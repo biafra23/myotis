@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use myotis_consensus::fork::{ForkSchedule, LcFork};
 use myotis_consensus::spec;
-use myotis_consensus::store::{LightClientProcessor, LightClientStore};
+use myotis_consensus::store::{FinalityOutcome, LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
     HeaderExecution, LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate,
 };
@@ -3422,12 +3422,13 @@ async fn poll_finality(
             }
         };
         match LightClientFinalityUpdate::decode_for(fork, &ssz_payload) {
-            Ok(update) => {
-                if processor.process_finality_update(&update) {
-                    // Success is a VERIFIED apply (Java notifies its cache
-                    // only after processUpdate succeeds, never on mere decode
-                    // — a peer serving decodable-but-unverifiable updates
-                    // must not earn tier-1 status or cache streak resets).
+            Ok(update) => match processor.apply_finality_update(&update) {
+                FinalityOutcome::Advanced => {
+                    // Success is a VERIFIED apply that ADVANCED the store
+                    // (Java notifies its cache only after processUpdate
+                    // succeeds, never on mere decode — a peer serving
+                    // decodable-but-unverifiable updates must not earn
+                    // tier-1 status or cache streak resets).
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
@@ -3439,10 +3440,18 @@ async fn poll_finality(
                     applied = true;
                     break; // stragglers are speculative losers — spare them
                 }
-                tracing::debug!(peer = %peer.id,
+                // Verified but behind what the store holds: not a win (the
+                // round keeps reading — a current server may still answer),
+                // not a strike, and not "served" either, so a pool of stalled
+                // servers reads as starvation and engages the LC hunt.
+                FinalityOutcome::Stale => tracing::debug!(peer = %peer.id,
+                    attested_slot = update.attested_header.beacon.slot,
                     finalized_slot = update.finalized_header.beacon.slot,
-                    "finality update did not advance state");
-            }
+                    "finality update verified but did not advance state"),
+                FinalityOutcome::Rejected => tracing::debug!(peer = %peer.id,
+                    finalized_slot = update.finalized_header.beacon.slot,
+                    "finality update rejected"),
+            },
             Err(e) => {
                 pool.note_failure(peer.id);
                 round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
@@ -3557,9 +3566,12 @@ async fn hunt_round(
                 // to harvest the lc confirm above. Stragglers stay
                 // lc-confirmed, not proven — the same speculative-loser rule
                 // as poll_finality's early break.
-                if !applied && processor.process_finality_update(&update) {
-                    // Verified apply — the same full-win treatment as a
-                    // poll_finality winner.
+                if !applied
+                    && processor.apply_finality_update(&update) == FinalityOutcome::Advanced
+                {
+                    // Verified apply that ADVANCED the store — the same
+                    // full-win treatment as a poll_finality winner (a stale
+                    // one is lc-confirmed above, nothing more).
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&addr);

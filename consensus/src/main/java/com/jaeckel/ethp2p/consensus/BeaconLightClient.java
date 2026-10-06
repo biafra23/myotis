@@ -2502,8 +2502,19 @@ public class BeaconLightClient implements AutoCloseable {
                                 // stale next committee. Two same-round appliers also serialize here;
                                 // the second usually reports no-advance and simply doesn't win.
                                 synchronized (catchUpApplyLock) {
+                                    // A win is a verified apply that ADVANCED the store. An update
+                                    // the store already holds verifies too (the processor's duplicate
+                                    // memo answers true for it), but it is a server that stopped
+                                    // producing updates, not news — counting it let a stalled server
+                                    // outrun a current one every round (Sepolia, Glamsterdam day:
+                                    // every Lighthouse light-client server stopped at the fork and
+                                    // kept answering first). Rust twin: FinalityOutcome::Stale.
+                                    long finalizedBefore = store.getFinalizedSlot();
+                                    long optimisticBefore = store.getOptimisticSlot();
                                     finalityApplied = store.isInitialized()
-                                            && processor.processFinalityUpdate(update);
+                                            && processor.processFinalityUpdate(update)
+                                            && (store.getFinalizedSlot() > finalizedBefore
+                                                || store.getOptimisticSlot() > optimisticBefore);
                                 }
                                 if (finalityApplied) {
                                     winner.complete(new FinalityPollWin(
