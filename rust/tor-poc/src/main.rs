@@ -108,10 +108,15 @@ fn cache_peers() -> Vec<Peer> {
         .collect()
 }
 
-/// The current go-ethereum `MainnetBootnodes` (params/bootnodes.go): popular,
-/// known to every client — the "Tor-usable on day one, zero aging" bootstrap
-/// set the design calls out (§5). NB these are usually discovery-only daemons
-/// that don't serve eth, so they're a last-resort fallback here.
+/// The `enode://` entries of go-ethereum's `MainnetBootnodes`
+/// (params/bootnodes.go): popular, known to every client — the "Tor-usable on
+/// day one, zero aging" bootstrap set the design calls out (§5). NB these are
+/// usually discovery-only daemons that don't serve eth, so they're a
+/// last-resort fallback here. Since ethereum/go-ethereum#35682 (2026-09-29)
+/// geth calls these four "legacy, being phased out" and leads with five EF
+/// NodeOps nodes given as ENRs; those records carry no `tcp` key, so there is
+/// nothing in them this TCP-over-Tor dialer could connect to. When geth drops
+/// the legacy four, this fallback has no upstream list left to mirror.
 fn mainnet_bootnodes() -> Vec<Peer> {
     let mk = |name: &str, pk_hex: &str, ip: &str| Peer {
         name: name.to_string(),

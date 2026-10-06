@@ -105,11 +105,20 @@ public record NetworkConfig(
             new byte[]{(byte) 0x07, (byte) 0xc9, (byte) 0x46, (byte) 0x2e}, // post-BPO2 (Fusaka)
             0L,
             // discv4 bootnodes = go-ethereum params/bootnodes.go MainnetBootnodes
-            // (labels are geth's), re-synced 2026-09-02: two stale entries replaced
-            // by the Hetzner pair. Keep in lockstep with the Rust twin
-            // (rust/myotis-net/src/el/reader.rs, ElConfig::mainnet), which
-            // documents the incident.
+            // (labels and order are geth's), re-synced 2026-10-04 after
+            // ethereum/go-ethereum#35682 put five EF NodeOps nodes ahead of the
+            // four "legacy" ones. geth lists the NodeOps nodes as ENRs; these are
+            // each record's ip and udp fields — mind the per-record ports. Keep in
+            // lockstep with the Rust twin (rust/myotis-net/src/el/reader.rs,
+            // ElConfig::mainnet), which documents the details and the history.
             List.of(
+                    // EF NodeOps bootnodes
+                    new InetSocketAddress("212.99.218.66", 20151),   // nodeops-bootnode-dcl1-01
+                    new InetSocketAddress("129.212.166.61", 30303),  // nodeops-bootnode-sfo3-01
+                    new InetSocketAddress("144.126.252.24", 30303),  // nodeops-bootnode-blr1-01
+                    new InetSocketAddress("178.156.215.140", 30303), // nodeops-bootnode-ash-01
+                    new InetSocketAddress("5.223.94.81", 30303),     // nodeops-bootnode-sin-01
+                    // Legacy EF bootnodes, being phased out in favour of the ones above.
                     new InetSocketAddress("18.138.108.67", 30303), // bootnode-aws-ap-southeast-1-001
                     new InetSocketAddress("3.209.45.79", 30303),   // bootnode-aws-us-east-1-001
                     new InetSocketAddress("65.108.70.101", 30303), // bootnode-hetzner-hel
@@ -241,12 +250,24 @@ public record NetworkConfig(
             // (ethereum/pm#2205). Announced until then; afterwards the fork id is
             // successor(0x268956b6, it) = 0x6c1d9423 — see forkIdAt.
             1_791_294_816L,
+            // discv4 bootnodes = go-ethereum params/bootnodes.go SepoliaBootnodes
+            // (labels and order are geth's), re-synced 2026-10-04: the five EF
+            // NodeOps nodes (each ENR's ip and udp fields) ahead of the legacy
+            // five, which were silent that day. Keep in lockstep with the Rust
+            // twin (ElConfig::sepolia), which documents the details.
             List.of(
-                    new InetSocketAddress("138.197.51.181", 30303),
-                    new InetSocketAddress("146.190.1.103", 30303),
-                    new InetSocketAddress("170.64.250.88", 30303),
-                    new InetSocketAddress("139.59.49.206", 30303),
-                    new InetSocketAddress("138.68.123.152", 30303)
+                    // EF NodeOps bootnodes
+                    new InetSocketAddress("212.99.218.66", 20152),   // nodeops-bootnode-dcl1-01
+                    new InetSocketAddress("129.212.166.61", 30403),  // nodeops-bootnode-sfo3-01
+                    new InetSocketAddress("144.126.252.24", 30403),  // nodeops-bootnode-blr1-01
+                    new InetSocketAddress("178.156.215.140", 30403), // nodeops-bootnode-ash-01
+                    new InetSocketAddress("5.223.94.81", 30403),     // nodeops-bootnode-sin-01
+                    // Legacy EF bootnodes, being phased out in favour of the ones above.
+                    new InetSocketAddress("138.197.51.181", 30303), // sepolia-bootnode-1-nyc3
+                    new InetSocketAddress("146.190.1.103", 30303),  // sepolia-bootnode-1-sfo3
+                    new InetSocketAddress("170.64.250.88", 30303),  // sepolia-bootnode-1-syd1
+                    new InetSocketAddress("139.59.49.206", 30303),  // sepolia-bootnode-1-blr1
+                    new InetSocketAddress("138.68.123.152", 30303)  // sepolia-bootnode-1-ams3
             ),
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),

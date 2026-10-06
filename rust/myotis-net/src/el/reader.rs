@@ -163,16 +163,38 @@ impl ElConfig {
     /// here (tracked as the EL-A7 fork-id item).
     pub fn mainnet() -> ElConfig {
         // discv4 bootnodes = go-ethereum `params/bootnodes.go` MainnetBootnodes
-        // (labels are geth's), re-synced 2026-09-02. The previous list carried
-        // two addresses that are not in geth's current list (18.188.214.86,
-        // 3.219.208.172); observed from one vantage point that day, none of the
-        // old four answered a ping while both Hetzner entries did. With no
-        // pinned mainnet enodes and no EIP-1459 DNS fallback, an embedder's
-        // fresh profile (no EL peer cache) then never seeds discovery and never
-        // holds a snap peer. Mirror any change into the Java
-        // `NetworkConfig.MAINNET`, the live tests under `tests/` (they pin this
-        // list verbatim) and `rust/tor-poc/src/main.rs` (carries the pubkeys).
+        // (labels and order are geth's), re-synced 2026-10-04 after
+        // ethereum/go-ethereum#35682 ("params: replace EF bootnodes with
+        // NodeOps fleet", 2026-09-29) put five EF NodeOps nodes ahead of the
+        // four older ones, which geth now calls "legacy, being phased out".
+        // geth lists the NodeOps nodes as ENRs; the entries here are each
+        // record's `ip` and `udp` fields, which is all discv4 needs — it pings
+        // a bare address cold and learns the node id from the Pong. Mind the
+        // ports: they are per record, not 30303 across the board. Their
+        // `ip6`/`udp6` fields are not used. The records carry no `tcp` key:
+        // these are discovery-only nodes, and a TCP connect to them times out.
+        // The pool does not know that yet — discv4 admits a bonded node with
+        // its UDP port as the TCP port (`handle_pong`), so below target each
+        // one costs a dial that runs into the handshake timeout and a backoff
+        // (#539: asking a node for its ENR before dialing is what ends this).
+        //
+        // History: the 2026-09-02 re-sync replaced two addresses geth had
+        // dropped (18.188.214.86, 3.219.208.172). With no pinned mainnet
+        // enodes and no EIP-1459 DNS fallback, an embedder's fresh profile (no
+        // EL peer cache) on a dead list never seeds discovery and never holds
+        // a snap peer. Mirror any change into the Java `NetworkConfig.MAINNET`
+        // and the pin test below; the live tests under `tests/` read this
+        // list, and `rust/tor-poc/src/main.rs` carries the legacy four with
+        // their pubkeys (it dials over TCP, so the NodeOps records are no use
+        // to it).
         const MAINNET_BOOTNODES: &[&str] = &[
+            // EF NodeOps bootnodes
+            "212.99.218.66:20151",   // nodeops-bootnode-dcl1-01
+            "129.212.166.61:30303",  // nodeops-bootnode-sfo3-01
+            "144.126.252.24:30303",  // nodeops-bootnode-blr1-01
+            "178.156.215.140:30303", // nodeops-bootnode-ash-01
+            "5.223.94.81:30303",     // nodeops-bootnode-sin-01
+            // Legacy EF bootnodes, being phased out in favour of the ones above.
             "18.138.108.67:30303", // bootnode-aws-ap-southeast-1-001
             "3.209.45.79:30303",   // bootnode-aws-us-east-1-001
             "65.108.70.101:30303", // bootnode-hetzner-hel
@@ -199,12 +221,29 @@ impl ElConfig {
     /// `NetworkConfig.SEPOLIA` (fork-id is the post-BPO2/Fusaka pinned hash the
     /// Java engine also carries; a hard fork needs a bump here, same as mainnet).
     pub fn sepolia() -> ElConfig {
+        // discv4 bootnodes = go-ethereum `params/bootnodes.go` SepoliaBootnodes
+        // (labels and order are geth's), re-synced 2026-10-04 — see
+        // `ElConfig::mainnet` for the upstream change and for how the NodeOps
+        // ENRs become `ip:udp` entries (the same five hosts as mainnet, on
+        // their Sepolia ports). The legacy five were this network's whole list
+        // until then, and on 2026-10-04 none of them answered a discv4 ping
+        // from the one vantage point that tried (three runs), while all five
+        // NodeOps nodes did: the engine sat at `discv4 refresh table=0`. They
+        // stay only because geth still lists them and a second vantage point
+        // has not confirmed them dead; drop them when geth does.
         const SEPOLIA_BOOTNODES: &[&str] = &[
-            "138.197.51.181:30303",
-            "146.190.1.103:30303",
-            "170.64.250.88:30303",
-            "139.59.49.206:30303",
-            "138.68.123.152:30303",
+            // EF NodeOps bootnodes
+            "212.99.218.66:20152",   // nodeops-bootnode-dcl1-01
+            "129.212.166.61:30403",  // nodeops-bootnode-sfo3-01
+            "144.126.252.24:30403",  // nodeops-bootnode-blr1-01
+            "178.156.215.140:30403", // nodeops-bootnode-ash-01
+            "5.223.94.81:30403",     // nodeops-bootnode-sin-01
+            // Legacy EF bootnodes, being phased out in favour of the ones above.
+            "138.197.51.181:30303", // sepolia-bootnode-1-nyc3
+            "146.190.1.103:30303",  // sepolia-bootnode-1-sfo3
+            "170.64.250.88:30303",  // sepolia-bootnode-1-syd1
+            "139.59.49.206:30303",  // sepolia-bootnode-1-blr1
+            "138.68.123.152:30303", // sepolia-bootnode-1-ams3
         ];
         ElConfig {
             network_id: 11_155_111,
@@ -10979,13 +11018,19 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        // The four discv4 seeds, pinned as strings: this const is the anchor
-        // the live tests build from and the Java NetworkConfig.MAINNET mirrors,
-        // so a partial re-sync fails here in a fast lib test.
+        // The discv4 seeds, pinned as strings: this const is the anchor the
+        // live tests build from and the Java NetworkConfig.MAINNET mirrors
+        // (twin: NetworkConfigGnosisTest#elBootnodesMatchGoEthereum), so a
+        // partial re-sync fails here in a fast lib test.
         let bootnodes: Vec<String> = c.bootnodes.iter().map(|a| a.to_string()).collect();
         assert_eq!(
             bootnodes,
             [
+                "212.99.218.66:20151",
+                "129.212.166.61:30303",
+                "144.126.252.24:30303",
+                "178.156.215.140:30303",
+                "5.223.94.81:30303",
                 "18.138.108.67:30303",
                 "3.209.45.79:30303",
                 "65.108.70.101:30303",
@@ -11102,7 +11147,27 @@ mod tests {
         );
         assert_eq!(cfg.fork_id_hash, [0x26, 0x89, 0x56, 0xb6]);
         assert_eq!(cfg.fork_next, 1_791_294_816, "Amsterdam, announced ahead");
-        assert_eq!(cfg.bootnodes.len(), 5, "all five sepolia bootnodes must parse");
+        // The discv4 seeds as strings, like mainnet's: a malformed entry would
+        // be dropped silently by the `filter_map` parse, and a one-engine
+        // re-sync would leave the Java twin
+        // (NetworkConfigGnosisTest#elBootnodesMatchGoEthereum) behind.
+        let bootnodes: Vec<String> = cfg.bootnodes.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            bootnodes,
+            [
+                "212.99.218.66:20152",
+                "129.212.166.61:30403",
+                "144.126.252.24:30403",
+                "178.156.215.140:30403",
+                "5.223.94.81:30403",
+                "138.197.51.181:30303",
+                "146.190.1.103:30303",
+                "170.64.250.88:30303",
+                "139.59.49.206:30303",
+                "138.68.123.152:30303",
+            ],
+            "sepolia discv4 bootnodes = go-ethereum SepoliaBootnodes (see ElConfig::sepolia)"
+        );
         assert_eq!(cfg.listen_port, 30305);
         assert_eq!(cfg.min_suggested_tip_wei, 100_000_000);
     }
