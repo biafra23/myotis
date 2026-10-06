@@ -455,7 +455,7 @@ The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC 
 | HTTPS     | IPFS gateway (content-addressed, CID-checked) | TrueBlocks index chunks (debug-only history scan, Java engine) |
 | discv5    | UDP DHT  | Consensus layer peer discovery              |
 | discv4    | UDP DHT  | Execution layer peer discovery              |
-| DNS       | TXT      | Bootstrap peer lists (EIP-1459; Java engine only) |
+| DNS       | TXT      | Bootstrap peer lists (EIP-1459; Java engine everywhere, Rust engine on desktop and daemon hosts, never under Tor — #539) |
 | Tor       | Arti, optional (`-PtorEngine`, Rust engine) | Account reads over isolated circuits — see [privacy-and-tor.md](privacy-and-tor.md) |
 | HTTP      | JSON-RPC | Verified wallet API served to MetaMask (strict, no proxy) |
 

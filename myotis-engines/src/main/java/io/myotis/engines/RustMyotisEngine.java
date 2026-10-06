@@ -147,6 +147,14 @@ public final class RustMyotisEngine implements MyotisEngine {
             throw new EngineException("the Rust engine could not initialize the runtime"
                     + " or create the dataDir for " + canonical);
         }
+        // EIP-1459 DNS discovery (#539, part 3). The DnsServers port's contract is
+        // "no port → the resolver's default", and the system resolver is what the
+        // Rust walk uses, so a host without the port (desktop, daemon) gets DNS
+        // discovery. A host that supplies servers (Android, the active network's)
+        // wants THOSE used, and the Rust engine has no port for them yet — it
+        // stays off there, as on iOS, which never calls this. The engine skips the
+        // walk under Tor on its own.
+        RustEngineNative.nativeSetDnsDiscovery(ports == null || ports.dnsServers() == null);
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
         // network's catalog default (mainnet 8545, sepolia 8547, ...).
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();

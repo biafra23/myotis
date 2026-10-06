@@ -142,6 +142,19 @@ The engine refreshes the resolved ENR pool periodically (rate-capped) and fork-f
 candidate pool the snap-peer maintainer dials from. Chains with no DNS tree (Gnosis) instead carry
 a list of full `enode://pubkey@host:port` constants for direct RLPx dialing.
 
+**Rust engine** (`rust/myotis-net/src/el/dnsdisco.rs`, #539 part 3): the same root verification
+and `e=` walk with the same caps (512 lookups, depth 16, 15 s), plus two checks the Java walk
+lacks — every record must hash to its label (base32 of `keccak256(text)[..16]`), and each leaf's
+own signature is verified (the `enr` crate's decoder). Leaves go through the discv4 fork-id filter
+(`enrfilter.rs`) first; a leaf naming no TCP port is a discv4 seed, never a dial candidate (geth
+`errNoPort`). Children are walked in random order (EIP-1459's advice), so a tree larger than one
+walk's budget is seen in a different part each walk. Transport: the system resolver through
+`hickory-resolver` (already in the lock via libp2p), 2 s per lookup, one attempt; no host-supplied
+server IPs and no public fallbacks yet, so the walk runs only where a host allows it
+(`myotis_set_dns_discovery`: desktop and daemon) and never while Tor is enabled. The pool dials
+the candidates 10 per maintainer tick (10 s) while below target, re-walks every 4 min while still
+short, and nudges up to 32 of the tree's UDP endpoints into discv4 as DHT seeds.
+
 ---
 
 ## 5. RLPx — TCP transport (ECIES/EIP-8 handshake → AES-CTR framed channel)

@@ -1270,9 +1270,15 @@ impl ServiceLoop {
             pending.entry.node_id = p.sender_pubkey.to_vec();
         }
         // The record is the node's own word on where it listens: it beats the
-        // NEIGHBORS entry's hearsay and any port `admit` fell back to.
-        if let Some(tcp) = remote.tcp_port_for(&pending.entry.ip) {
-            pending.entry.tcp_port = u32::from(tcp);
+        // NEIGHBORS entry's hearsay and any port `admit` fell back to. An
+        // address without a TCP port is a discovery-only node (the EF NodeOps
+        // bootnodes): it stays in the table as a source of neighbours and is
+        // never dialed — the pool refuses port 0, as geth refuses such a node
+        // (`errNoPort`). A record naming no address says nothing.
+        match remote.tcp_port_for(&pending.entry.ip) {
+            Some(tcp) => pending.entry.tcp_port = u32::from(tcp),
+            None if remote.has_ip => pending.entry.tcp_port = 0,
+            None => {}
         }
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
         enr.record(pending.entry.node_id.clone(), verdict);
@@ -1900,7 +1906,8 @@ mod tests {
     /// Play a node for `a` over a raw socket: announce ourselves to A in a
     /// NEIGHBORS packet as listening on `advertised_tcp`, pong A's ping, and
     /// answer A's ENRRequest with a record on A's chain that names `enr_tcp`
-    /// as our port, or no port. Returns the entry A hands to its pool.
+    /// as our port, no port and no address (`None`), or an address with a UDP
+    /// port and no TCP port (`Some(0)`). Returns the entry A hands to its pool.
     async fn raw_node_round(
         a: &Discv4Service,
         a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
@@ -1920,10 +1927,17 @@ mod tests {
             "eth",
             alloy_rlp::Bytes::from(eth_entry_rlp([0xaa, 0xbb, 0xcc, 0xdd], 0)),
         );
-        if let Some(tcp) = enr_tcp {
-            builder.tcp4(tcp);
+        match enr_tcp {
+            Some(0) => {
+                // The discovery-only shape: an address, a UDP port, no TCP.
+                builder.ip4([127, 0, 0, 1].into()).udp4(our_udp);
+            }
+            Some(tcp) => {
+                builder.tcp4(tcp);
+            }
+            None => {}
         }
-        let record = alloy_rlp::encode(&builder.build(&signing).unwrap());
+        let record = alloy_rlp::encode(builder.build(&signing).unwrap());
         // 1. NEIGHBORS, unsolicited (A takes any): "this node, at our UDP
         //    port, listens on advertised_tcp".
         let data = rlp::encode(&Item::List(vec![
@@ -2004,6 +2018,13 @@ mod tests {
             entry.tcp_port, 50505,
             "the node's own record names the port to dial"
         );
+        // A node whose record names an address and a UDP port but no TCP port
+        // is discovery-only: handed over at port 0, which the pool refuses,
+        // whatever NEIGHBORS claimed.
+        let discovery_only = key(20);
+        let entry = raw_node_round(&a, &mut a_rx, &discovery_only, 40404, Some(0)).await;
+        assert_eq!(entry.node_id, discovery_only.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 0, "a record with an address and no TCP port is never dialed");
         a.stop().await;
     }
 

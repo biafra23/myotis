@@ -208,7 +208,7 @@ uniffi::setup_scaffolding!();
 ///      paired with an engine that cannot report it (an absent key would read
 ///      as "no snap/2 peers"). `RustChainHandle`, the iOS wrapper's status
 ///      reader and the Node addon's `statusJson()` carry it.
-pub const ABI_VERSION: i32 = 38;
+pub const ABI_VERSION: i32 = 39;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

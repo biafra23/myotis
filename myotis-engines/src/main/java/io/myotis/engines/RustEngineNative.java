@@ -186,6 +186,16 @@ final class RustEngineNative {
         return Myotis_engineKt.torStatus();
     }
 
+    /**
+     * Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
+     * system resolver (#539) — for every network this process runs. Off until a
+     * host switches it on; never used while Tor is enabled. Returns the state now
+     * in force. Process-global, not per-handle.
+     */
+    static boolean nativeSetDnsDiscovery(boolean on) {
+        return Myotis_engineKt.setDnsDiscovery(on);
+    }
+
     /** One handle's status as a JSON object, or {@code "{}"} for an unknown handle. */
     static String nativeStatusJson(long handle) {
         return Myotis_engineKt.statusJson(handle);

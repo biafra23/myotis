@@ -34,6 +34,7 @@ use myotis_core::nodekey::NodeKey;
 
 use crate::el::anchor::ExecAnchor;
 use crate::el::discv4::{KademliaTable, TableEntry};
+use crate::el::dnsdisco::{self, DnsSeeder};
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::fork_watch::{self, ForkWatch};
 use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
@@ -637,6 +638,11 @@ struct PoolInner {
     /// Discovery's below-target hint ([`PeerPool::attach_discovery`]): set
     /// each maintainer tick, read by discv4's refresh for a wider fan-out.
     below_target: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// The network's EIP-1459 DNS trees ([`PeerPool::attach_dns_seeder`],
+    /// #539): walked by the maintainer while below target, their candidates
+    /// dialed in batches. `None` for networks without a tree and for pools
+    /// without discovery (tests).
+    dns_seeder: std::sync::Mutex<Option<Arc<DnsSeeder>>>,
     /// Where the last below-target walk of the table stopped.
     scarcity_cursor: std::sync::atomic::AtomicUsize,
     /// When the maintainer last logged a below-target re-dial.
@@ -1179,6 +1185,7 @@ impl PeerPool {
             backoff: Mutex::new(HashMap::new()),
             discovery_table: std::sync::Mutex::new(None),
             below_target: std::sync::Mutex::new(None),
+            dns_seeder: std::sync::Mutex::new(None),
             scarcity_cursor: std::sync::atomic::AtomicUsize::new(0),
             last_scarcity_log: Mutex::new(None),
             blacklist: Mutex::new(HashSet::new()),
@@ -1423,6 +1430,22 @@ impl PeerPool {
             .below_target
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(below_target);
+    }
+
+    /// Hand the pool the network's EIP-1459 DNS trees (#539, part 3). The
+    /// first walk starts at once where the policy allows it (a fresh install
+    /// with dead bootnodes has nothing else); the maintainer repeats it while
+    /// the pool stays below target and dials the candidates in batches.
+    pub fn attach_dns_seeder(&self, seeder: Arc<DnsSeeder>) {
+        *self
+            .inner
+            .dns_seeder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&seeder));
+        let now = Instant::now();
+        if seeder.begin_walk_if_due(now, true, dnsdisco::allowed()) {
+            spawn_dns_walk(&self.inner, seeder);
+        }
     }
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
@@ -2087,7 +2110,58 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         if !scarcity_redial(&inner).await {
             return; // pool shutting down
         }
+        // The DNS trees (#539, part 3): a dial source and a DHT seed that owe
+        // nothing to the bootnodes, walked again while the pool stays short.
+        if !dns_seed_tick(&inner, live < inner.pool_cfg.target_snap_peers).await {
+            return; // pool shutting down
+        }
     }
+}
+
+/// Run one DNS walk off the maintainer; a non-empty result is an online
+/// signal (as discovery's candidates are), since it proves the network is
+/// reachable — the Java twin keys the same on its last DNS success.
+fn spawn_dns_walk(inner: &Arc<PoolInner>, seeder: Arc<DnsSeeder>) {
+    let inner = Arc::clone(inner);
+    inner.tasks.spawn({
+        let inner = Arc::clone(&inner);
+        async move {
+            let probe = inner.probe.clone();
+            if seeder.walk_once(probe.as_ref()).await > 0 {
+                inner.note_online().await;
+            }
+        }
+    });
+}
+
+/// One tick of the DNS seeding (#539, part 3): start a walk when one is due
+/// (the policy is read now — both switches are live), and while below target
+/// offer the next [`dnsdisco::DNS_DIAL_BATCH`] candidates to the dialer under
+/// the usual eligibility checks. `false` when the pool is shutting down.
+async fn dns_seed_tick(inner: &Arc<PoolInner>, below_target: bool) -> bool {
+    let seeder = inner
+        .dns_seeder
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(seeder) = seeder else {
+        return true;
+    };
+    if seeder.begin_walk_if_due(Instant::now(), below_target, dnsdisco::allowed()) {
+        spawn_dns_walk(inner, Arc::clone(&seeder));
+    }
+    if !below_target {
+        return true;
+    }
+    for (addr, pubkey) in seeder.take_batch(dnsdisco::DNS_DIAL_BATCH) {
+        if inner.peers.lock().await.len() >= inner.pool_cfg.target_snap_peers {
+            break;
+        }
+        if matches!(try_dial_verdict(inner, addr, pubkey).await, DialVerdict::Shutdown) {
+            return false;
+        }
+    }
+    true
 }
 
 /// One tick of the below-target re-dial (#539): walk discovery's table from
@@ -2573,6 +2647,60 @@ mod tests {
             assert!(scarcity_redial(&pool.inner).await);
             assert_eq!(cursor(&pool), 0);
             assert_eq!(pool.attempted_count().await, 0, "nothing was dialed");
+            pool.stop().await;
+        }
+
+        /// The DNS seeder's batch (#539, part 3): below target one tick offers
+        /// its held candidates to the dialer; at target it offers none.
+        #[tokio::test]
+        async fn the_dns_batch_is_offered_below_target_only() {
+            use super::super::{dns_seed_tick, Enode};
+            use crate::el::dnsdisco::{DnsSeeder, ResolverSource, TxtLookup, WalkLimits};
+            use crate::el::enrfilter::ForkFilter;
+            /// A resolver that knows nothing: the pool is seeded by hand.
+            struct NoZone;
+            impl TxtLookup for NoZone {
+                fn txt<'a>(
+                    &'a self,
+                    _name: &'a str,
+                ) -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+                > {
+                    Box::pin(async { Ok(None) })
+                }
+            }
+            let pool = fixture(b"dns-batch");
+            let seeder = Arc::new(
+                DnsSeeder::with_source(
+                    &["enrtree://AKPYQIUQIL7PSIACI32J7FGZW56E5FKHEFCCOFHILBIMW3M6LWXS2@nodes.example.org"
+                        .to_string()],
+                    ForkFilter::for_chain([0u8; 4], 0),
+                    ResolverSource::Fixed(Arc::new(NoZone)),
+                    WalkLimits::default(),
+                )
+                .unwrap(),
+            );
+            // As a walk would have left them: three loopback ports nobody
+            // listens on.
+            let candidates: Vec<Enode> = (1..=3u16)
+                .map(|n| (SocketAddr::from(([127, 0, 0, 1], n)), [n as u8; 64]))
+                .collect();
+            seeder.merge(&candidates);
+            // The policy is off in tests, so attaching starts no walk.
+            pool.attach_dns_seeder(Arc::clone(&seeder));
+            // At target: nothing is offered and the cursor does not move.
+            assert!(dns_seed_tick(&pool.inner, false).await);
+            assert_eq!(pool.attempted_count().await, 0);
+            assert!(pool.inner.backoff.lock().await.is_empty());
+            assert_eq!(seeder.take_batch(1), vec![candidates[0]]);
+            // Below target: every candidate is offered — in flight, or already
+            // in backoff after its refused connect.
+            assert!(dns_seed_tick(&pool.inner, true).await);
+            for (addr, _) in &candidates {
+                let attempted = pool.inner.attempted.lock().await.contains(addr);
+                let backed_off = pool.inner.backoff.lock().await.contains_key(addr);
+                assert!(attempted || backed_off, "{addr} was offered to the dialer");
+            }
             pool.stop().await;
         }
     }

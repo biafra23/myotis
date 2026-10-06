@@ -312,9 +312,11 @@ asset workflow and a stronger action than the merge this file already forbids.
    of the old ones remain. Since #414 the `myotis-net` live tests read
    `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
    list as strings, so a partial re-sync fails in the fast lib test.
-   Mainnet has no pinned enodes and, in the Rust engine, no EIP-1459 DNS
-   fallback (the Java engine has one), so a fresh profile with a stale list
-   never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
+   Mainnet has no pinned enodes and, in the Rust engine, an EIP-1459 DNS
+   fallback only where the host allows DNS (desktop and daemon since #539;
+   not mobile, not under Tor — the Java engine has one everywhere), so a
+   fresh profile with a stale list never seeds EL discovery and never holds
+   a snap peer there (#414, 2026-09-02).
    Warm profiles and the dispatched smoke job hide this because they dial
    their peer cache directly.
 3. **Run the cold-start checks?** (owner ruling, 2026-09-11.) Three live

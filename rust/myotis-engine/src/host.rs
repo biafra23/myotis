@@ -236,6 +236,17 @@ pub fn tor_status() -> i32 {
     }
 }
 
+/// `nativeSetDnsDiscovery`: allow or forbid the EIP-1459 DNS tree walk (#539,
+/// `el::dnsdisco`) for every network this process runs. Off until a host
+/// switches it on: the hosts that resolve through the system resolver do
+/// (desktop, daemon); a host that supplies its own DNS servers has no port for
+/// them in this engine yet and leaves it off (mobile). The walk never runs
+/// while Tor is enabled, whatever this says. Returns the state now in force.
+pub fn set_dns_discovery(on: bool) -> bool {
+    myotis_net::el::dnsdisco::set_enabled(on);
+    myotis_net::el::dnsdisco::is_enabled()
+}
+
 /// `nativeCreate`: allocate a handle for a hosted network (mainnet, gnosis,
 /// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet, `CREATE_FAILED` (-1) for an unknown
