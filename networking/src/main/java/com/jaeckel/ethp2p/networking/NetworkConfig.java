@@ -183,7 +183,7 @@ public record NetworkConfig(
                     // 57.129.130.18 served; a third close in a row would be grounds to prune.
                     // Re-verified 2026-09-21 at the then-shipped period-1863 anchor,
                     // run 35616056243: 5 of 5 — 91.189.182.90 served in full.
-                    // Re-verified 2026-09-24 at the anchor v0.1.13 shipped (period
+                    // Re-verified 2026-09-24 at the anchor v0.1.12 shipped (period
                     // 1865), run 35988133216: 5 of 5 again.
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
@@ -342,7 +342,7 @@ public record NetworkConfig(
             // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the then-shipped
             // period-1361 anchor, run 35065049320: 4 of 4 again; 2026-09-21 at the
             // then-shipped period-1365 anchor, run 35616060242: 4 of 4 again;
-            // 2026-09-24 at the anchor v0.1.13 shipped (period 1368), run
+            // 2026-09-24 at the anchor v0.1.12 shipped (period 1368), run
             // 35989152817: 4 of 4 again. Re-run it after every checkpoint refresh,
             // since a census against a superseded root says nothing about the
             // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
@@ -469,7 +469,7 @@ public record NetworkConfig(
                     // run 35065032444: 8 of 8 again.
                     // Re-verified 2026-09-21 at the then-shipped period-3686 anchor,
                     // run 35616052466: 8 of 8 again.
-                    // Re-verified 2026-09-24 at the anchor v0.1.13 shipped (period
+                    // Re-verified 2026-09-24 at the anchor v0.1.12 shipped (period
                     // 3692), run 35988128286: 6 of 8 — both :9500 pins (134.65.194.144,
                     // 164.152.161.131) failed to dial from the runner. One run from one
                     // vantage point, and the pair has timed out on a runner before

@@ -597,7 +597,7 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
     // from the recorded period-1323 anchor (42 periods behind) reached SYNCED
     // in 21 s.
-    // Re-verified 2026-09-24 against the anchor v0.1.13 shipped (period
+    // Re-verified 2026-09-24 against the anchor v0.1.12 shipped (period
     // 1368): live_pins_alive run 35989152817 on a GitHub-hosted runner, 4 of 4
     // again; the bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
     // from the recorded period-1323 anchor (45 periods behind) reached SYNCED
@@ -690,7 +690,7 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // again, both :9500 pins included; the bootnodes seeded discv5 (21
     // entries, SYNCED), and a cold start from the recorded period-3596 anchor
     // (90 periods behind) reached SYNCED in 76 s.
-    // Re-verified 2026-09-24 against the anchor v0.1.13 shipped (period
+    // Re-verified 2026-09-24 against the anchor v0.1.12 shipped (period
     // 3692): live_pins_alive run 35988128286 on a GitHub-hosted runner, 6 of 8
     // — both :9500 pins (134.65.194.144, 164.152.161.131) failed to dial from
     // the runner. One run from one vantage point, and the pair has timed out
@@ -824,7 +824,7 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // a row. The bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
     // from the recorded period-1825 anchor (38 periods behind) reached SYNCED
     // in 26 s.
-    // Re-verified 2026-09-24 against the anchor v0.1.13 shipped (period
+    // Re-verified 2026-09-24 against the anchor v0.1.12 shipped (period
     // 1865): live_pins_alive run 35988133216 on a GitHub-hosted runner, 5 of 5
     // again; the bootnodes seeded discv5 (32 entries), and a cold start from
     // the recorded period-1825 anchor (40 periods behind) reached SYNCED in
