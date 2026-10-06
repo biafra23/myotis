@@ -210,12 +210,18 @@ verification), but the liveness failure is mute.
   Judged against the build's `ForkSchedule` (plus the configured
   blob-parameter epoch): a peer announcing a transition the schedule carries
   is dissent, so a build that ships the fork says nothing.
-- *Evidence:* every discv5 ENR's full `eth2` field, observed BEFORE the
-  accepted-digest filter drops it (Java `ChainStack`'s discv5 callback; Rust
-  `discovery` — both the lookup path and the Discovered-event consumer), and
-  every peer Status the libp2p host decodes (Java `BeaconP2PService`
-  auto-Status → `setOnPeerStatus`; Rust `reqresp::note_peer_status`, keyed by
-  the connection's source address).
+- *Evidence:* the full `eth2` field of every discv5 ROUTING-TABLE record,
+  unfiltered by digest (a fork this build does not know is exactly what the
+  accepted-digest filter drops) but session-verified — Java's ping-checked
+  live table on every poll tick (`DiscV5Service.setOnEnrHeard`), Rust's
+  `table_entries_enr()` once per lookup round. Never a record merely relayed
+  in a NODES response: those are self-declared, keys are free, and one peer
+  could mint records claiming any number of source networks, making the
+  three-source floor free (review of #561). Plus every peer Status the
+  libp2p host's auto-Status gets answered with (Java `BeaconP2PService`
+  `setOnPeerStatus`; Rust `reqresp::note_peer_status`), keyed by the
+  connection's real source address. Known limit: Java's `Enr` reads the
+  `ip` key only, so IPv6-only records cast no vote in that engine.
   - *announced*: an ENR on one of our digests with an unknown
     `next_fork_epoch` → SCHEDULED at that epoch's wall-clock time;
   - *placed*: an ENR on a digest we cannot produce whose `next_fork_version`
@@ -235,8 +241,8 @@ verification), but the liveness failure is mute.
   passes, only the EL watch can still place peers.
 - *Freshness:* no `touch` — evidence is re-heard instead. Java
   `DiscV5Service.setOnEnrHeard` reports every live table entry on every poll
-  tick (before the once-ever dedup), the Rust lookup loop re-hears its
-  results every round; a Status is observed once per connection.
+  tick (before the once-ever dedup), the Rust lookup loop re-reads its
+  routing table every round; a Status is observed once per connection.
 - *Merge:* the host reports ONE advisory — `ClForkWatch.merge` /
   `cl_fork_watch::merge_advisories`: ACTIVE over SCHEDULED, then a known time,
   then more sources, then the EL's. `JavaChainHandle.upgradeAdvisory(el, cl)`;

@@ -109,18 +109,25 @@ public final class DiscV5Service implements AutoCloseable {
         this.onEnrHeard = listener;
     }
 
-    /** Parse one heard record for {@link #onEnrHeard}; null (and a debug line) if
-     *  malformed — the discovery path logs its own warning when it gets there. */
+    /** Parse one heard record for {@link #onEnrHeard}; null if malformed (silently —
+     *  the discovery path logs its own warning when it gets there). A listener that
+     *  throws is logged, not conflated with a malformed record: a bug in the watch-side
+     *  lambda must not silently starve the CL fork watch of its evidence. */
     private Enr hear(String enrStr) {
         Consumer<Enr> heard = onEnrHeard;
         if (heard == null) return null;
+        Enr parsed;
         try {
-            Enr parsed = Enr.fromEnrString(enrStr);
-            heard.accept(parsed);
-            return parsed;
-        } catch (Exception e) {
+            parsed = Enr.fromEnrString(enrStr);
+        } catch (Exception malformed) {
             return null;
         }
+        try {
+            heard.accept(parsed);
+        } catch (RuntimeException listenerFailure) {
+            log.debug("[discv5] ENR-heard listener failed: {}", listenerFailure.toString());
+        }
+        return parsed;
     }
 
     /**

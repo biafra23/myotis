@@ -61,6 +61,13 @@ import java.util.function.LongSupplier;
  * value this build cannot compute), so its fork id is reported as 0; once it passes, only
  * the EL watch can still place peers (their new digest reproduces from nothing we know).
  *
+ * <p>ENR evidence is the discv5 LIVE table's (ping-checked entries, re-heard on every
+ * poll tick — {@code DiscV5Service.setOnEnrHeard}), never records merely relayed in a
+ * NODES response: those are self-declared, and node keys are free, so they would make
+ * the source floor free too. Known limit of this engine: {@code core.enr.Enr} reads the
+ * {@code ip} key only, so an IPv6-only record casts no vote here (the Rust twin reads
+ * {@code ip6} as well) — an undercount, never a wrong vote.
+ *
  * <p>One instance per network stack, shared across pause/resume rebuilds (like
  * {@link ForkWatch}). Thread-safe: observed from the discv5 and libp2p threads, read by
  * status surfaces.

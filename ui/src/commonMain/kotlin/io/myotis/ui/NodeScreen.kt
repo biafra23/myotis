@@ -1034,7 +1034,10 @@ private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
             color = onContainer,
         )
         Text(
-            "Reported by peers in ${u.observedPeers} distinct networks · fork id ${u.forkId}",
+            // "0x00000000" = unknown: a blob-parameter-only fork rotates to a digest
+            // this version cannot compute (see UpgradeNotice.forkId).
+            "Reported by peers in ${u.observedPeers} distinct networks · fork id " +
+                (if (u.forkId == "0x00000000") "unknown" else u.forkId),
             fontSize = 11.sp,
             color = onContainer,
         )

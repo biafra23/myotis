@@ -8,7 +8,9 @@
 //! needs only a discv5 table and a Status exchange, so it also fires on a
 //! network where the wallet holds no EL peer yet, and on a CL-only fork.
 //!
-//! Evidence:
+//! Evidence (ENRs are the discv5 ROUTING TABLE's, re-heard every lookup
+//! round — records that held a session with us, not records relayed in NODES
+//! responses, which are self-declared and would make the source floor free):
 //! - **Announced** — a discv5 ENR whose `eth2` field (SSZ `ENRForkID`:
 //!   `fork_digest || next_fork_version || next_fork_epoch`) carries one of OUR
 //!   digests with a `next_fork_epoch` this schedule does not know. Upgraded
@@ -250,8 +252,10 @@ impl ClForkWatch {
 
     /// Tracked sources (ENR + Status) — for tests of the [`MAX_TRACKED`] bound.
     pub fn tracked(&self) -> usize {
-        let inner = self.inner.lock().expect("cl fork watch");
-        inner.enr_by_source.len() + inner.status_by_source.len()
+        self.inner
+            .lock()
+            .map(|inner| inner.enr_by_source.len() + inner.status_by_source.len())
+            .unwrap_or(0)
     }
 
     /// The current advisory on the wall clock, or None.
@@ -259,15 +263,19 @@ impl ClForkWatch {
         self.evaluate(fork_watch::wall_clock_secs())
     }
 
-    /// The advisory as of `now` (unix seconds), or None.
+    /// The advisory as of `now` (unix seconds), or None — also on a poisoned
+    /// lock: a status read must never be what kills the host (the EL twin
+    /// degrades the same way).
     pub fn evaluate(&self, now: u64) -> Option<Advisory> {
-        let mut inner = self.inner.lock().expect("cl fork watch");
+        let mut inner = self.inner.lock().ok()?;
         self.evaluate_locked(&mut inner, now)
     }
 
     fn update(&self, now: u64, mutation: impl FnOnce(&mut Inner)) {
         let current = {
-            let mut inner = self.inner.lock().expect("cl fork watch");
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
             mutation(&mut inner);
             let current = self.evaluate_locked(&mut inner, now);
             if same_fork(inner.last_logged.as_ref(), current.as_ref()) {

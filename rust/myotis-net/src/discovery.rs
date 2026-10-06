@@ -108,9 +108,11 @@ pub struct DiscoveryConfig {
     /// the chain is starved of light-client servers. Cleared by the sync loop
     /// the moment finality flows again.
     pub hunt_boost: Arc<AtomicBool>,
-    /// Told every ENR's `eth2` field BEFORE the digest filter — a fork this
-    /// build does not know is exactly what the filter would drop. None = no
-    /// detector (tools, tests).
+    /// Told the `eth2` field of every ROUTING-TABLE record once per lookup
+    /// round — unfiltered by digest (a fork this build does not know is
+    /// exactly what the filter drops) but session-verified (a relayed NODES
+    /// record is self-declared and would make the watch's source floor free).
+    /// None = no detector (tools, tests).
     pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
@@ -274,7 +276,6 @@ async fn run_lookups(
         pinned_targets.clone(),
         Arc::clone(&seen),
         tx.clone(),
-        cl_fork_watch.clone(),
     ));
     loop {
         // The FIRST rounds walk toward each pinned server id in turn — that is
@@ -299,7 +300,6 @@ async fn run_lookups(
         match discv5.find_node(target).await {
             Ok(enrs) => {
                 for enr in enrs {
-                    note_enr(&cl_fork_watch, &enr);
                     if pinned_targets.contains(&enr.node_id()) {
                         // Pinned ids bypass the once-ever dedup, but only on a
                         // record NEWER than the last one emitted.
@@ -331,6 +331,18 @@ async fn run_lookups(
         // The re-seed trigger below deliberately uses the stricter
         // connected_peers() == 0 — the Java twin keys on live==0 the same way.
         table_size.store(discv5.table_entries_id().len(), Ordering::Relaxed);
+        // CL fork-watch evidence: the ROUTING TABLE, once per round. A record
+        // relayed in a NODES response is self-declared — keys are free, so one
+        // peer could mint records claiming any number of source networks and
+        // the watch's three-source floor would cost it nothing. A table entry
+        // held a session with us at its address. Re-heard every round so the
+        // evidence stays fresh (the Java twin polls its live table every tick
+        // the same way).
+        if cl_fork_watch.is_some() {
+            for enr in discv5.table_entries_enr() {
+                note_enr(&cl_fork_watch, &enr);
+            }
+        }
         let live = discv5.connected_peers();
         if reseed_due(&mut empty_rounds, live, bootnodes.len()) {
             let readded = reseed(&discv5, &bootnodes);
@@ -423,14 +435,10 @@ async fn consume_discovered(
     pinned_targets: Vec<NodeId>,
     seen: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     tx: mpsc::Sender<DiscoveredPeer>,
-    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 ) {
     let mut last_digests: Vec<[u8; 4]> = accepted_digests.current();
     while let Some(event) = events.recv().await {
         let Event::Discovered(enr) = event else { continue };
-        // Evidence first, independent of the pool having room: a dropped
-        // candidate is heard again, but the watch wants every hearing.
-        note_enr(&cl_fork_watch, &enr);
         // A full channel drops the node unmarked (see below), so deciding
         // anything about it now — the key decode behind filter_candidate and
         // its debug line — would only be repeated on the next hearing. On
@@ -549,8 +557,9 @@ fn enr_eth2_fork_id(enr: &Enr) -> Option<([u8; 4], [u8; 4], u64)> {
     ))
 }
 
-/// Report one heard ENR to the CL fork watch (its `eth2` field, keyed by the
-/// record's address). A record without an address has no source to vote as.
+/// Report one routing-table ENR to the CL fork watch (its `eth2` field, keyed
+/// by the record's address). A record without an address has no source to
+/// vote as.
 fn note_enr(watch: &Option<Arc<crate::cl_fork_watch::ClForkWatch>>, enr: &Enr) {
     let Some(watch) = watch else { return };
     let Some((digest, next_version, next_epoch)) = enr_eth2_fork_id(enr) else { return };
