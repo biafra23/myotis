@@ -172,6 +172,23 @@ pub struct RemoteEnr {
     pub seq: u64,
     /// The raw RLP of the `eth` entry, if any.
     pub eth: Option<Vec<u8>>,
+    /// The record's `tcp` and `tcp6` ports, if any: the node's own word on
+    /// where it listens, which beats a NEIGHBORS entry's hearsay.
+    pub tcp4: Option<u16>,
+    pub tcp6: Option<u16>,
+}
+
+impl RemoteEnr {
+    /// The TCP port to dial a node reached at `ip` (4 or 16 bytes): the
+    /// family's own entry first, the other as a fallback; never 0.
+    pub fn tcp_port_for(&self, ip: &[u8]) -> Option<u16> {
+        let (own, other) = if ip.len() == 16 {
+            (self.tcp6, self.tcp4)
+        } else {
+            (self.tcp4, self.tcp6)
+        };
+        own.or(other).filter(|&p| p != 0)
+    }
 }
 
 /// Decode a remote ENR from its RLP, check its signature (the `enr` crate
@@ -188,6 +205,8 @@ pub fn decode_enr(raw: &[u8], signer: &[u8; 64]) -> Result<RemoteEnr, String> {
     Ok(RemoteEnr {
         seq: enr.seq(),
         eth: enr.get_raw_rlp("eth").map(<[u8]>::to_vec),
+        tcp4: enr.tcp4(),
+        tcp6: enr.tcp6(),
     })
 }
 
@@ -398,6 +417,7 @@ mod tests {
         let remote = decode_enr(&raw, &k.public_key_bytes()).unwrap();
         assert_eq!(remote.seq, 7);
         assert_eq!(remote.eth.as_deref(), Some(&eth[..]));
+        assert_eq!(remote.tcp_port_for(&[127, 0, 0, 1]), None, "our record names no endpoint");
         // Carried in a packet another node signed: refused.
         assert!(decode_enr(&raw, &key(2).public_key_bytes()).is_err());
         // Tampered: the signature no longer verifies.
@@ -406,5 +426,37 @@ mod tests {
         tampered[last] ^= 0x01;
         assert!(decode_enr(&tampered, &k.public_key_bytes()).is_err());
         assert!(decode_enr(b"", &k.public_key_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_records_tcp_port_is_read_by_address_family() {
+        let k = key(3);
+        let mut secret = k.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let build = |tcp4: Option<u16>, tcp6: Option<u16>| {
+            let mut b = Enr::<CombinedKey>::builder();
+            b.seq(1);
+            if let Some(p) = tcp4 {
+                b.tcp4(p);
+            }
+            if let Some(p) = tcp6 {
+                b.tcp6(p);
+            }
+            let raw = alloy_rlp::encode(&b.build(&signing).unwrap());
+            decode_enr(&raw, &k.public_key_bytes()).unwrap()
+        };
+        let v4 = [10, 0, 0, 1];
+        let v6 = [0u8; 16];
+        // Both named: each family its own.
+        let both = build(Some(30303), Some(30306));
+        assert_eq!(both.tcp_port_for(&v4), Some(30303));
+        assert_eq!(both.tcp_port_for(&v6), Some(30306));
+        // One named: the other family falls back to it.
+        assert_eq!(build(Some(30303), None).tcp_port_for(&v6), Some(30303));
+        assert_eq!(build(None, Some(30306)).tcp_port_for(&v4), Some(30306));
+        // None named, or 0: no port to dial — the caller keeps what it has.
+        assert_eq!(build(None, None).tcp_port_for(&v4), None);
+        assert_eq!(build(Some(0), None).tcp_port_for(&v4), None);
+        assert!(build(None, None).eth.is_none());
     }
 }

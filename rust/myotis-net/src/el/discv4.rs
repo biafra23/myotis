@@ -13,12 +13,12 @@
 //! Neighbors, we never answer FindNode and never send Neighbors (inbound
 //! Pings get a Pong so bonds form). Two deliberate departures from the Java
 //! twin since #539: we ping back a node that pings us while we hold no pong
-//! from it, and we answer ENRRequest (EIP-868) from a node whose pong we hold
-//! — both so the fork-id pre-filter (`enrfilter.rs`) can read a node's ENR
-//! before the pool dials it. The packet codec, Kademlia table, and rate
-//! limiter are pure (clock values are parameters) and pinned by the
-//! `rust/testdata/el/discv4/` cross-language corpus; only [`Discv4Service`]
-//! touches sockets.
+//! from it, and we answer ENRRequest (EIP-868) from a node whose pong we hold,
+//! under the same per-IP rate limit as Pings — both so the fork-id pre-filter
+//! (`enrfilter.rs`) can read a node's ENR before the pool dials it. The packet
+//! codec, Kademlia table, and rate limiter are pure (clock values are
+//! parameters) and pinned by the `rust/testdata/el/discv4/` cross-language
+//! corpus; only [`Discv4Service`] touches sockets.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -337,6 +337,12 @@ impl KademliaTable {
         self.buckets[idx].retain(|e| e.node_id != node_id);
     }
 
+    /// The entry under `node_id`, if the table holds one.
+    pub fn get(&self, node_id: &[u8]) -> Option<&TableEntry> {
+        let idx = self.bucket_index(node_id);
+        self.buckets[idx].iter().find(|e| e.node_id == node_id)
+    }
+
     /// The k entries closest (XOR) to `target` (64-byte pubkey or 32-byte id).
     pub fn closest_peers(&self, target: &[u8], k: usize) -> Vec<TableEntry> {
         let target_id = to_node_id(target);
@@ -399,17 +405,31 @@ fn leading_zeros(b: &[u8; 32]) -> usize {
 
 const PING_RATE_LIMIT: usize = 5;
 const PING_RATE_WINDOW_MS: u64 = 10_000;
+/// Source IPs remembered at once. Beyond it, the rings no packet touched within
+/// the window go — they count nothing, so nothing is lost — and if every ring is
+/// live, all of them (fail open): a flood of spoofed sources, which costs the
+/// flooder one address per packet, must not grow the map.
+const RATE_LIMIT_IPS_MAX: usize = 4096;
 
-/// Sliding-window ring of the last [`PING_RATE_LIMIT`] ping timestamps per IP
-/// (twin of the Java handler's limiter).
+/// Sliding-window ring of the last [`PING_RATE_LIMIT`] packet timestamps per
+/// IP (twin of the Java handler's limiter), bounded by [`RATE_LIMIT_IPS_MAX`].
 #[derive(Default)]
 pub struct PingRateLimiter {
     rings: HashMap<IpAddr, [u64; PING_RATE_LIMIT]>,
 }
 
 impl PingRateLimiter {
-    /// True when `addr` has exceeded the limit; records the ping otherwise.
+    /// True when `addr` has exceeded the limit; records the packet otherwise.
     pub fn is_limited(&mut self, addr: IpAddr, now_ms: u64) -> bool {
+        if self.rings.len() >= RATE_LIMIT_IPS_MAX && !self.rings.contains_key(&addr) {
+            self.rings.retain(|_, ring| {
+                ring.iter()
+                    .any(|&t| now_ms.saturating_sub(t) < PING_RATE_WINDOW_MS)
+            });
+            if self.rings.len() >= RATE_LIMIT_IPS_MAX {
+                self.rings.clear();
+            }
+        }
         let ring = self.rings.entry(addr).or_insert([0; PING_RATE_LIMIT]);
         let mut recent = 0usize;
         let mut oldest = 0usize;
@@ -525,6 +545,7 @@ impl Discv4Service {
             events,
             pending_pings: HashMap::new(),
             limiter: PingRateLimiter::default(),
+            enr_limiter: PingRateLimiter::default(),
             probe_rx,
             probed: HashMap::new(),
             enr,
@@ -669,6 +690,10 @@ struct ServiceLoop {
     /// them and the map is capped ([`PING_PENDING_MAX`]).
     pending_pings: HashMap<SocketAddr, PendingPing>,
     limiter: PingRateLimiter,
+    /// The same limit on the ENRRequests we answer: each answer is a signature
+    /// and a reflected record, so a bonded node gets a Ping's budget, not line
+    /// rate for its bond's hour.
+    enr_limiter: PingRateLimiter,
     /// Probe requests from the pool (proven-peer UDP endpoints to bond with).
     probe_rx: tokio::sync::mpsc::Receiver<SocketAddr>,
     /// Endpoint → last probe instant (1 h per-endpoint dedup, bounded).
@@ -977,10 +1002,11 @@ impl ServiceLoop {
         // The sender's advertised TCP port rides the Ping's FROM endpoint.
         // Java's Tuweni readInt is SIGNED: a 4-byte port with the high bit set
         // reads negative there and fails its `> 0` check, falling back to the
-        // UDP port — mirror that by accepting only 1..=i32::MAX.
+        // UDP port — mirror that by accepting only 1..=i32::MAX; otherwise the
+        // packet claims no port and `admit` falls back the same way.
         let tcp_port = match decode_ping_from_ports(&p.data) {
-            Ok((_, tcp)) if (1..=i32::MAX as u32).contains(&tcp) => tcp,
-            _ => u32::from(sender.port()),
+            Ok((_, tcp)) if (1..=i32::MAX as u32).contains(&tcp) => Some(tcp),
+            _ => None,
         };
         // Bond back when we have not (geth does): a node answers an
         // ENRRequest only from a node whose pong it holds — and so do we — so
@@ -1023,13 +1049,9 @@ impl ServiceLoop {
                 if let Some(enr) = self.enr.as_mut() {
                     enr.mark_bonded(sender, p.sender_pubkey, tokio::time::Instant::now());
                 }
-                self.admit(
-                    sender,
-                    u32::from(sender.port()),
-                    p.sender_pubkey.to_vec(),
-                    true,
-                )
-                .await;
+                // A pong carries no TCP port: `admit` uses the one on file.
+                self.admit(sender, None, p.sender_pubkey.to_vec(), true)
+                    .await;
             }
             _ => tracing::debug!(%sender, "discv4 unsolicited/mismatched pong"),
         }
@@ -1057,8 +1079,23 @@ impl ServiceLoop {
     }
 
     /// Table-add + discovered-peer event for a directly-bonded sender.
+    /// `tcp_port`: the port the packet itself claims (a Ping's FROM endpoint),
+    /// or `None` when it claims nothing (a Pong): then the port on file for the
+    /// node — its NEIGHBORS entry's or its record's — and the UDP port only as
+    /// the last resort (Java parity). Before #539 a Pong's guess was one more
+    /// event beside the advertised one; with the exchange the pool sees one
+    /// entry per node, so a guess would replace the advertised port for good.
     /// `bonded`: the remote holds our pong (see `consider`).
-    async fn admit(&mut self, sender: SocketAddr, tcp_port: u32, node_id: Vec<u8>, bonded: bool) {
+    async fn admit(
+        &mut self,
+        sender: SocketAddr,
+        tcp_port: Option<u32>,
+        node_id: Vec<u8>,
+        bonded: bool,
+    ) {
+        let tcp_port = tcp_port
+            .or_else(|| self.known_tcp_port(sender, &node_id))
+            .unwrap_or_else(|| u32::from(sender.port()));
         let entry = TableEntry {
             ip: ip_bytes(sender.ip()),
             udp_port: sender.port(),
@@ -1067,6 +1104,18 @@ impl ServiceLoop {
             last_seen_ms: now_ms(),
         };
         self.consider(entry, bonded).await;
+    }
+
+    /// The TCP port on file for the node at `addr`: its pending entry's (a
+    /// NEIGHBORS port or its own Ping's), else its routing-table entry's.
+    fn known_tcp_port(&self, addr: SocketAddr, node_id: &[u8]) -> Option<u32> {
+        if let Some(p) = self.enr.as_ref().and_then(|e| e.pending.get(&addr)) {
+            return Some(p.entry.tcp_port);
+        }
+        self.table
+            .lock()
+            .ok()
+            .and_then(|t| t.get(node_id).map(|e| e.tcp_port))
     }
 
     /// Hand a discovered node to the pool — at once without a filter or with a
@@ -1104,7 +1153,10 @@ impl ServiceLoop {
         };
         let ask = match enr.pending.get_mut(&addr) {
             Some(p) => {
-                p.entry = entry; // the newest ports
+                // The newest sighting: its node id, its time, and its TCP port
+                // — a Ping's own claim, or the port already on file (`admit`
+                // never guesses over a known port).
+                p.entry = entry;
                 bonded && p.hashes.len() < usize::from(ENR_REQUESTS_MAX)
             }
             None => {
@@ -1147,8 +1199,9 @@ impl ServiceLoop {
         let _ = self.send_to(&packet, to).await;
     }
 
-    /// Answer with our record, to a node whose pong we hold: without the bond
-    /// check we would amplify a spoofed source's traffic (geth `checkBond`).
+    /// Answer with our record, to a node whose pong we hold — without the bond
+    /// check we would amplify a spoofed source's traffic (geth `checkBond`) —
+    /// and no more often than we answer its Pings.
     async fn handle_enr_request(&mut self, p: Parsed, sender: SocketAddr) {
         // Expired requests are ignored (geth `errExpired`): a captured one must
         // not be replayable for the bond's whole hour.
@@ -1166,6 +1219,14 @@ impl ServiceLoop {
             tracing::trace!(%sender, "discv4 ENRRequest from an unbonded node, ignored");
             return;
         };
+        // Each answer is a signature and a reflected record: a bonded node gets
+        // the Ping budget (5 per 10 s per IP), not line rate for its bond's
+        // hour. After the bond check, so unbonded noise from an address cannot
+        // spend the budget of the node bonded there.
+        if self.enr_limiter.is_limited(sender.ip(), now_ms()) {
+            tracing::debug!(%sender, "discv4 rate-limited ENRRequest");
+            return;
+        }
         if let Ok(packet) = encode_enr_response(&self.key, &p.hash, &local) {
             let _ = self.send_to(&packet, sender).await;
         }
@@ -1207,6 +1268,11 @@ impl ServiceLoop {
         if pending.entry.node_id != p.sender_pubkey {
             tracing::debug!(%sender, "discv4: ENR signer differs from the advertised node id; using the signer");
             pending.entry.node_id = p.sender_pubkey.to_vec();
+        }
+        // The record is the node's own word on where it listens: it beats the
+        // NEIGHBORS entry's hearsay and any port `admit` fell back to.
+        if let Some(tcp) = remote.tcp_port_for(&pending.entry.ip) {
+            pending.entry.tcp_port = u32::from(tcp);
         }
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
         enr.record(pending.entry.node_id.clone(), verdict);
@@ -1605,9 +1671,11 @@ mod tests {
         };
         table.add(entry(1));
         table.add(entry(2));
+        assert_eq!(table.get(&[1u8; 64]).map(|e| e.tcp_port), Some(30303));
         table.remove(&[1u8; 64]);
         assert_eq!(table.len(), 1);
         assert_eq!(table.all_peers()[0].node_id, vec![2u8; 64]);
+        assert!(table.get(&[1u8; 64]).is_none());
         table.remove(&[9u8; 64]); // unknown: a no-op
         assert_eq!(table.len(), 1);
     }
@@ -1829,6 +1897,116 @@ mod tests {
         a.stop().await;
     }
 
+    /// Play a node for `a` over a raw socket: announce ourselves to A in a
+    /// NEIGHBORS packet as listening on `advertised_tcp`, pong A's ping, and
+    /// answer A's ENRRequest with a record on A's chain that names `enr_tcp`
+    /// as our port, or no port. Returns the entry A hands to its pool.
+    async fn raw_node_round(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        advertised_tcp: u32,
+        enr_tcp: Option<u16>,
+    ) -> TableEntry {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let our_udp = sock.local_addr().unwrap().port();
+        let mut secret = node.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let mut builder = Enr::<CombinedKey>::builder();
+        builder.seq(1).add_value_rlp(
+            "eth",
+            alloy_rlp::Bytes::from(eth_entry_rlp([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+        );
+        if let Some(tcp) = enr_tcp {
+            builder.tcp4(tcp);
+        }
+        let record = alloy_rlp::encode(&builder.build(&signing).unwrap());
+        // 1. NEIGHBORS, unsolicited (A takes any): "this node, at our UDP
+        //    port, listens on advertised_tcp".
+        let data = rlp::encode(&Item::List(vec![
+            Item::List(vec![Item::List(vec![
+                Item::Bytes(vec![127, 0, 0, 1]),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(our_udp))),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
+                Item::Bytes(node.public_key_bytes().to_vec()),
+            ])]),
+            Item::Bytes(rlp::u64_to_minimal_be(expiry_now())),
+        ]));
+        let neighbors = encode_packet(node, TYPE_NEIGHBORS, &data).unwrap();
+        sock.send_to(&neighbors, a_addr).await.unwrap();
+        // 2. A pings first (we are second-hand); pong it. Bonded, A asks for
+        //    our record; answer it. A judges us compatible and hands us over.
+        let mut buf = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                got = a_rx.recv() => return got.expect("A's event channel"),
+                recv = tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)) => {
+                    let (n, from) = recv.expect("A handed nothing over within 5 s").unwrap();
+                    let Ok(p) = parse(&buf[..n]) else { continue };
+                    match p.packet_type {
+                        TYPE_PING => {
+                            let pong = encode_pong(
+                                node,
+                                &[127, 0, 0, 1],
+                                from.port(),
+                                &p.hash,
+                                expiry_now(),
+                            )
+                            .unwrap();
+                            sock.send_to(&pong, from).await.unwrap();
+                        }
+                        TYPE_ENR_REQUEST => {
+                            let response = encode_enr_response(node, &p.hash, &record).unwrap();
+                            sock.send_to(&response, from).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pong_keeps_the_advertised_tcp_port_and_the_record_overrides_it() {
+        let a_key = Arc::new(key(17));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // A node whose record names no port: the port its NEIGHBORS entry
+        // advertised survives its pong — which carries none — to the pool.
+        let quiet = key(18);
+        let entry = raw_node_round(&a, &mut a_rx, &quiet, 40404, None).await;
+        assert_eq!(entry.node_id, quiet.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 40404,
+            "a pong must not replace the advertised TCP port with the UDP port"
+        );
+        // A node whose record names its port: the signed record beats the
+        // NEIGHBORS hearsay.
+        let outspoken = key(19);
+        let entry = raw_node_round(&a, &mut a_rx, &outspoken, 40404, Some(50505)).await;
+        assert_eq!(entry.node_id, outspoken.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 50505,
+            "the node's own record names the port to dial"
+        );
+        a.stop().await;
+    }
+
     #[test]
     fn parse_rejects_tampering() {
         let k = key(3);
@@ -1904,5 +2082,32 @@ mod tests {
         assert!(!limiter.is_limited(ip, T0 + 11_000)); // window expired
         let other: IpAddr = "10.1.2.4".parse().unwrap();
         assert!(!limiter.is_limited(other, T0 + 10)); // per-IP isolation
+    }
+
+    #[test]
+    fn rate_limiter_is_bounded() {
+        const T0: u64 = 1_700_000_000_000;
+        let mut limiter = PingRateLimiter::default();
+        let ip = |n: u32| IpAddr::from(Ipv4Addr::from(n));
+        for n in 0..RATE_LIMIT_IPS_MAX as u32 {
+            assert!(!limiter.is_limited(ip(n), T0));
+        }
+        assert_eq!(limiter.rings.len(), RATE_LIMIT_IPS_MAX);
+        // A known source at the cap is still judged, not evicted around.
+        assert!(!limiter.is_limited(ip(0), T0 + 1));
+        assert_eq!(limiter.rings.len(), RATE_LIMIT_IPS_MAX);
+        // Once the window has passed every ring, a new source evicts the idle
+        // rings — which count nothing any more — rather than growing the map.
+        let later = T0 + PING_RATE_WINDOW_MS + 1;
+        assert!(!limiter.is_limited(ip(u32::MAX), later));
+        assert_eq!(limiter.rings.len(), 1);
+        // A flood of sources all live within the window is forgotten
+        // wholesale (fail open) instead of growing it.
+        for n in 0..RATE_LIMIT_IPS_MAX as u32 {
+            limiter.is_limited(ip(n), later);
+        }
+        assert!(limiter.rings.len() <= RATE_LIMIT_IPS_MAX);
+        assert!(!limiter.is_limited(ip(u32::MAX - 1), later));
+        assert!(limiter.rings.len() <= RATE_LIMIT_IPS_MAX);
     }
 }

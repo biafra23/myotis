@@ -160,7 +160,9 @@ fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
 /// The discv4 fork-id filter for `cfg`'s chain (#539): the pinned fork id, on
 /// the chain's beacon epoch grid when this crate knows it (`sync::ChainConfig`,
 /// the same grid the fork watch places with; none for a chain it does not).
-fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
+/// Public so the live test (`tests/live_enr_filter.rs`) measures the filter
+/// as the reader ships it.
+pub fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
     let filter = crate::el::enrfilter::ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next);
     let chain = match cfg.network_id {
         1 => Some(crate::sync::ChainConfig::mainnet()),

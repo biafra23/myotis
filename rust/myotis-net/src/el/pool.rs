@@ -1373,7 +1373,7 @@ impl PeerPool {
     /// Hand the pool discovery's routing table, so the below-target re-dial
     /// (#539) can re-offer every peer discovery knows, not only the cache's,
     /// and the flag discovery reads for a wider refresh while the pool is
-    /// below target (`Discv4Config::wide_refresh`).
+    /// below target (`Discv4Config::pool_below_target`).
     pub fn attach_discovery(
         &self,
         table: Arc<std::sync::Mutex<KademliaTable>>,

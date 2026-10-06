@@ -229,8 +229,9 @@ Today we advertise almost nothing, and what we advertise is wrong:
   Rust CL discv5 record is built with a throwaway key and no address fields).
 - We answer no FindNode — a deliberate "client-only" stance, documented in
   `rust/.../el/discv4.rs`. Since #539 the Rust engine does answer ENRRequest,
-  but only from a node whose pong it holds, and with a record carrying only
-  identity, seq and the `eth` fork id — no address, so it advertises nothing.
+  but only from a node whose pong it holds, under the same per-IP rate limit
+  as Pings, and with a record carrying only identity, seq and the `eth` fork
+  id — no address, so it advertises nothing.
 
 Minimum viable advertisement, in order:
 

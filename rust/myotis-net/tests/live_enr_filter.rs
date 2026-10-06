@@ -1,7 +1,8 @@
 //! Live-network test for the discv4 ENR fork-id filter (#539): run against a
 //! network's bootnodes for a minute and report how the nodes it met were
 //! judged — handed over on a matching `eth` entry, kept from the pool as
-//! another chain's, or handed over unjudged.
+//! another chain's, or handed over unjudged. The filter is the one the reader
+//! ships (`fork_filter_for`), the network's epoch grid included.
 //!
 //! Ignored by default (outbound UDP to the network's bootnodes). Run with:
 //!
@@ -16,8 +17,7 @@ use std::time::Duration;
 use myotis_core::keccak::keccak256;
 use myotis_core::nodekey::NodeKey;
 use myotis_net::el::discv4::{Discv4Config, Discv4Service};
-use myotis_net::el::enrfilter::ForkFilter;
-use myotis_net::el::reader::ElConfig;
+use myotis_net::el::reader::{fork_filter_for, ElConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live network test: pings a network's discv4 bootnodes over UDP"]
@@ -42,7 +42,7 @@ async fn the_filter_judges_live_nodes() {
         Discv4Config {
             bind_port: 0,
             bootnodes: cfg.bootnodes.clone(),
-            fork_filter: filter_on.then(|| ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next)),
+            fork_filter: filter_on.then(|| fork_filter_for(&cfg)),
             pool_below_target: None,
         },
         tx,
