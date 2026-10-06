@@ -3589,18 +3589,22 @@ async fn hunt_round(
                 // to harvest the lc confirm above. Stragglers stay
                 // lc-confirmed, not proven — the same speculative-loser rule
                 // as poll_finality's early break.
-                // One BLS verify per round at most: once any response
-                // verified (advanced or stale), the rest stay lc-confirmed —
-                // a stalled pool must not cost HUNT_FANOUT verifies on ART.
-                let outcome = if verified_any {
-                    FinalityOutcome::Rejected
+                // At most one SUCCESSFUL verify per round: once any response
+                // verified (advanced or stale), the rest are not attempted and
+                // stay lc-confirmed (None below — not "rejected": nothing was
+                // checked). A response that fails verification does not stop
+                // the next one from being tried. A stalled pool must not cost
+                // HUNT_FANOUT verifies (blst here; the Java engine's ART cost
+                // is the figure quoted above).
+                let outcome: Option<FinalityOutcome> = if verified_any {
+                    None
                 } else {
-                    processor.apply_finality_update(&update)
+                    Some(processor.apply_finality_update(&update))
                 };
-                if outcome != FinalityOutcome::Rejected {
+                if matches!(outcome, Some(FinalityOutcome::Advanced | FinalityOutcome::Stale)) {
                     verified_any = true;
                 }
-                if outcome == FinalityOutcome::Advanced {
+                if outcome == Some(FinalityOutcome::Advanced) {
                     // Verified apply that ADVANCED the store — the same
                     // full-win treatment as a poll_finality winner (a stale
                     // one is lc-confirmed above, nothing more).

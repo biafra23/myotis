@@ -85,6 +85,14 @@ class LightClientProcessorTest {
         assertTrue(processor.processFinalityUpdate(stale));
         assertEquals(300L, store.getFinalizedSlot(), "a stale re-send never moves the store back");
         assertEquals(301L, store.getOptimisticSlot());
+
+        // LRU, not FIFO: a staller re-served every round outlives any number of advancing
+        // rounds. Interleave more current updates than the memo is wide.
+        for (long slot = 400L; slot < 400L + 2L * LightClientProcessor.VERIFIED_FINALITY_MEMO * 100L; slot += 100L) {
+            assertTrue(processor.processFinalityUpdate(buildValidFinalityUpdate(slot, slot + 1)));
+            assertTrue(processor.processFinalityUpdate(stale), "re-served between advances");
+        }
+        assertTrue(processor.isMemoizedFinality(stale), "the staller is still memoized");
     }
 
     @Test

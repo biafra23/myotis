@@ -59,12 +59,22 @@ public class LightClientProcessor {
     }
 
     /** Whether {@code update} is memoized as already verified (test seam for the memo's
-     *  width: a stale and a current update must both stay memoized). */
+     *  width: a stale and a current update must both stay memoized). A hit moves the entry
+     *  to the back (LRU, not FIFO): a server re-serving the same stale update every round
+     *  keeps it memoized through any number of advancing rounds, so a persistent staller
+     *  costs exactly one verify, ever — with plain FIFO it would be evicted every
+     *  {@link #VERIFIED_FINALITY_MEMO} applies and re-verified (~18 s on ART) each time. */
     boolean isMemoizedFinality(LightClientFinalityUpdate update) {
         byte[] sig = update.syncAggregate().syncCommitteeSignature();
         synchronized (verifiedFinalityMemo) {
-            for (VerifiedFinality v : verifiedFinalityMemo) {
-                if (v.matches(sig, update.signatureSlot())) return true;
+            java.util.Iterator<VerifiedFinality> it = verifiedFinalityMemo.iterator();
+            while (it.hasNext()) {
+                VerifiedFinality v = it.next();
+                if (v.matches(sig, update.signatureSlot())) {
+                    it.remove();
+                    verifiedFinalityMemo.addLast(v);
+                    return true;
+                }
             }
         }
         return false;

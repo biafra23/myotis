@@ -2586,6 +2586,9 @@ public class BeaconLightClient implements AutoCloseable {
             boolean lateWin = winner.isDone() && !winner.isCompletedExceptionally();
             // A verified-but-stale reply is a server too: the losers raced it (a
             // stalled network would otherwise strike every busy proven server).
+            // Known gap, same as lateWin's: a first-seen stale update whose verify
+            // outlasts the deadline (ART) is still in flight here, so that one round
+            // strikes; from the next round the memo answers inside the window.
             if (!lateWin && !verifiedAny.get()) {
                 for (String p : roundFailures) notifyPeerFailure(p);
             }
