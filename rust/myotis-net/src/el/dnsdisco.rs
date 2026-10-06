@@ -388,8 +388,9 @@ pub struct WalkReport {
     pub leaves: usize,
     /// Leaves on our chain (or not placed on another) that name a TCP port.
     pub candidates: Vec<DnsNode>,
-    /// Compatible leaves that name a UDP port but no TCP port: discv4 seeds,
-    /// never dial candidates.
+    /// Leaves not placed on another chain (compatible, or unknown — the EF
+    /// NodeOps records carry no `eth` entry) that name a UDP port but no TCP
+    /// port: discv4 seeds, never dial candidates.
     pub discovery_only: Vec<SocketAddr>,
     /// Leaves the fork filter placed on another chain.
     pub foreign: usize,
