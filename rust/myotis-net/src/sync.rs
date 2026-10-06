@@ -850,7 +850,7 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // Re-verified 2026-10-06 against the anchor v0.1.14 ships (period 1876):
     // live_pins_alive run 37500516886 on a GitHub-hosted runner, 4 of 5 —
     // 57.129.130.18 closed the connection from the runner again (its first
-    // close since it served the three runs above; not a row yet). The
+    // close since it served the four runs above; not a row yet). The
     // bootnodes seeded discv5 (32 entries, SYNCED), a cold start with every
     // pin unreachable reached SYNCED in 25 s, and one from the recorded
     // period-1825 anchor (51 periods behind) in 35 s.

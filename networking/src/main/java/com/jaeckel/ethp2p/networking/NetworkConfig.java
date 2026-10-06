@@ -188,7 +188,7 @@ public record NetworkConfig(
                     // Re-verified 2026-10-06 at the anchor v0.1.14 ships (period
                     // 1876), run 37500516886: 4 of 5 — 57.129.130.18 closed the
                     // connection from the runner again (first close since it served
-                    // the three runs above; not a row yet).
+                    // the four runs above; not a row yet).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
