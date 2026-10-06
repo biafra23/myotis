@@ -32,13 +32,15 @@ public class LightClientProcessor {
     private final ForkSchedule forkSchedule;
     private final byte[] genesisValidatorsRoot;
 
-    /** Aggregate signature of the last successfully applied finality update. The
-     *  signature commits to the attested header root (whose state root in turn commits
-     *  the finality branch), so a byte-identical signature is the same already-applied
-     *  update: any variant with different contents would fail verification anyway.
-     *  Lets the 12s poll loop skip re-verifying an unchanged head — each BLS verify
-     *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
-     *  core re-proving the same update. */
+    /** The {@link #VERIFIED_FINALITY_MEMO} most recently verified finality updates, by
+     *  aggregate signature and signature slot, least recently hit first. The signature
+     *  commits to the attested header root (whose state root in turn commits the finality
+     *  branch), so a byte-identical signature under the same slot is the same
+     *  already-verified update: any variant with different contents would fail
+     *  verification anyway, and the store never moves backwards, so a memo hit is
+     *  "verified, no advance". Lets the 12 s poll loop skip re-verifying an unchanged head
+     *  — each BLS verify costs ~18 s on Android/ART, so without this the steady-state
+     *  loop burns a full core re-proving the same update. Guarded by its own monitor. */
     private final java.util.ArrayDeque<VerifiedFinality> verifiedFinalityMemo = new java.util.ArrayDeque<>();
     /** How many recently verified finality updates the memo holds. More than one so that a
      *  server stalled at a fork — re-serving the same old update first every round, while
