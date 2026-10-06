@@ -108,6 +108,12 @@ pub struct DiscoveryConfig {
     /// the chain is starved of light-client servers. Cleared by the sync loop
     /// the moment finality flows again.
     pub hunt_boost: Arc<AtomicBool>,
+    /// Told the `eth2` field of every ROUTING-TABLE record once per lookup
+    /// round — unfiltered by digest (a fork this build does not know is
+    /// exactly what the filter drops) but session-verified (a relayed NODES
+    /// record is self-declared and would make the watch's source floor free).
+    /// None = no detector (tools, tests).
+    pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
@@ -173,6 +179,7 @@ pub async fn spawn(
         Arc::clone(&table_size),
         config.hunt_boost,
         tx,
+        config.cl_fork_watch,
     ));
     Ok((task, table_size))
 }
@@ -231,6 +238,7 @@ async fn run_lookups(
     table_size: Arc<AtomicUsize>,
     hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
+    cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 ) {
     // Once-ever emission set, SHARED with the Discovered-event consumer so a
     // re-seed (which clears it) refills the pool from both paths.
@@ -323,6 +331,18 @@ async fn run_lookups(
         // The re-seed trigger below deliberately uses the stricter
         // connected_peers() == 0 — the Java twin keys on live==0 the same way.
         table_size.store(discv5.table_entries_id().len(), Ordering::Relaxed);
+        // CL fork-watch evidence: the ROUTING TABLE, once per round. A record
+        // relayed in a NODES response is self-declared — keys are free, so one
+        // peer could mint records claiming any number of source networks and
+        // the watch's three-source floor would cost it nothing. A table entry
+        // held a session with us at its address. Re-heard every round so the
+        // evidence stays fresh (the Java twin polls its live table every tick
+        // the same way).
+        if cl_fork_watch.is_some() {
+            for enr in discv5.table_entries_enr() {
+                note_enr(&cl_fork_watch, &enr);
+            }
+        }
         let live = discv5.connected_peers();
         if reseed_due(&mut empty_rounds, live, bootnodes.len()) {
             let readded = reseed(&discv5, &bootnodes);
@@ -519,6 +539,36 @@ fn enr_eth2_fork_digest(enr: &Enr) -> Option<[u8; 4]> {
         return None;
     }
     Some(payload[..4].try_into().expect("length checked"))
+}
+
+/// The whole `ENRForkID`: `(fork_digest, next_fork_version, next_fork_epoch)`.
+/// None when the field is absent or shorter than the 16 bytes the spec fixes
+/// (a digest-only field is malformed, and says nothing about what is ahead).
+fn enr_eth2_fork_id(enr: &Enr) -> Option<([u8; 4], [u8; 4], u64)> {
+    let raw = enr.get_raw_rlp(b"eth2")?;
+    let payload = rlp_short_string_payload(raw)?;
+    if payload.len() < 16 {
+        return None;
+    }
+    Some((
+        payload[..4].try_into().expect("length checked"),
+        payload[4..8].try_into().expect("length checked"),
+        u64::from_le_bytes(payload[8..16].try_into().expect("length checked")),
+    ))
+}
+
+/// Report one routing-table ENR to the CL fork watch (its `eth2` field, keyed
+/// by the record's address). A record without an address has no source to
+/// vote as.
+fn note_enr(watch: &Option<Arc<crate::cl_fork_watch::ClForkWatch>>, enr: &Enr) {
+    let Some(watch) = watch else { return };
+    let Some((digest, next_version, next_epoch)) = enr_eth2_fork_id(enr) else { return };
+    let ip: IpAddr = match (enr.ip4(), enr.ip6()) {
+        (Some(ip4), _) => IpAddr::V4(ip4),
+        (None, Some(ip6)) => IpAddr::V6(ip6),
+        (None, None) => return,
+    };
+    watch.observe_enr(&crate::cl_fork_watch::source_of(ip), digest, next_version, next_epoch);
 }
 
 /// Decode a single RLP short string (the only shape an `eth2` field takes).

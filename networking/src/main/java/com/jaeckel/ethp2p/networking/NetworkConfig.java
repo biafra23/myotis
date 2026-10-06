@@ -565,16 +565,32 @@ public record NetworkConfig(
      * Rust twin: {@code ChainConfig::fork_digest_at_epoch}.
      */
     public byte[] forkDigestAtEpoch(long epoch) {
-        byte[] base = forkDigestFor32(forkVersionAtEpoch(epoch));
-        if (activeBlobParamsEpoch == 0) {
+        return forkDigest(forkVersionAtEpoch(epoch), genesisValidatorsRoot(),
+                activeBlobParamsEpoch, activeBlobParamsMaxBlobs);
+    }
+
+    /**
+     * {@link #forkDigestAtEpoch}'s arithmetic for an arbitrary fork version and chain:
+     * the EIP-7892 digest of {@code forkVersion} on the chain with
+     * {@code genesisValidatorsRoot}, with the blob-parameter entry
+     * {@code (blobParamsEpoch, blobParamsMaxBlobs)} folded in ({@code blobParamsEpoch == 0}
+     * = no BPO active, the pre-Fulu formula). What the fork watch uses to judge a version
+     * peers advertise. Rust twin: {@code status::fork_digest_bpo}.
+     */
+    public static byte[] forkDigest(byte[] forkVersion, byte[] genesisValidatorsRoot,
+                                    long blobParamsEpoch, long blobParamsMaxBlobs) {
+        if (forkVersion == null || forkVersion.length != 4)
+            throw new IllegalArgumentException("forkVersion must be 4 bytes");
+        byte[] base = forkDataRoot(forkVersion, genesisValidatorsRoot);
+        if (blobParamsEpoch == 0) {
             byte[] out = new byte[4];
             System.arraycopy(base, 0, out, 0, 4);
             return out;
         }
         byte[] bpInput = new byte[16];
         // SSZ uint64 is little-endian
-        longToLeBytes(activeBlobParamsEpoch, bpInput, 0);
-        longToLeBytes(activeBlobParamsMaxBlobs, bpInput, 8);
+        longToLeBytes(blobParamsEpoch, bpInput, 0);
+        longToLeBytes(blobParamsMaxBlobs, bpInput, 8);
         byte[] bpHash;
         try {
             bpHash = java.security.MessageDigest.getInstance("SHA-256").digest(bpInput);
@@ -586,9 +602,8 @@ public record NetworkConfig(
         return out;
     }
 
-    /** Same as {@link #forkDigestFor} but returns the full 32-byte fork_data_root. */
-    private byte[] forkDigestFor32(byte[] forkVersion) {
-        byte[] genesisValidatorsRoot = genesisValidatorsRoot();
+    /** {@code compute_fork_data_root}: {@code sha256(pad32(fork_version) || genesis_validators_root)}. */
+    private static byte[] forkDataRoot(byte[] forkVersion, byte[] genesisValidatorsRoot) {
         try {
             byte[] buf = new byte[64];
             System.arraycopy(forkVersion, 0, buf, 0, 4);

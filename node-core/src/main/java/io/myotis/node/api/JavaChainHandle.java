@@ -3,6 +3,7 @@ package io.myotis.node.api;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
+import com.jaeckel.ethp2p.networking.discv5.ClForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.AccountProofResult;
@@ -202,15 +203,18 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.elHunting(),
                 stack.rpcListenPort(),
                 stack.rpcServing(),
-                upgradeAdvisory(stack.forkWatch()));
+                upgradeAdvisory(stack.forkWatch(), stack.clForkWatch()));
     }
 
-    /** The fork watch's current advisory as the API shape; null when there is none or the
-     *  watch isn't enabled on this network. The watch is stack-owned, so a pause keeps its
-     *  evidence — which still ages out a day after its sources were last seen connected; a
-     *  long sleep re-derives it from the peers dialed on resume. */
-    static UpgradeAdvisory upgradeAdvisory(ForkWatch watch) {
-        ForkWatch.Advisory a = watch != null ? watch.advisory() : null;
+    /** The fork watches' current advisory as the API shape — the EL and CL detectors'
+     *  merged by {@link ClForkWatch#merge}; null when neither has one (the EL watch is
+     *  also null where it isn't enabled). The watches are stack-owned, so a pause keeps
+     *  their evidence — which still ages out a day after it was presented; a long sleep
+     *  re-derives it from the peers dialed on resume. */
+    static UpgradeAdvisory upgradeAdvisory(ForkWatch elWatch, ClForkWatch clWatch) {
+        ForkWatch.Advisory a = ClForkWatch.merge(
+                elWatch != null ? elWatch.advisory() : null,
+                clWatch != null ? clWatch.advisory() : null);
         if (a == null) return null;
         return new UpgradeAdvisory(UpgradePhase.valueOf(a.phase().name()), a.activationTime(),
                 a.forkHashHex(), a.peers());

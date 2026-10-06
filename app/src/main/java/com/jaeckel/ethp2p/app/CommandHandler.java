@@ -314,7 +314,10 @@ public class CommandHandler {
      */
     static String buildUpgradeAdvisoryJson(UpgradeAdvisory a) {
         if (a == null) return "null";
-        String when = java.time.Instant.ofEpochSecond(a.activationTime()).toString();
+        // 0 = unknown: peers are seen on the fork but nobody announced its time (a
+        // consensus fork digest does not encode it).
+        String when = a.activationTime() == 0 ? "an unknown time"
+                : java.time.Instant.ofEpochSecond(a.activationTime()).toString();
         // Attributed to peers: the advisory is unverified peer data (see ForkWatch).
         String message = switch (a.phase()) {
             case SCHEDULED -> "peers announce a network upgrade at " + when

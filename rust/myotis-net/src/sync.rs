@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use myotis_consensus::fork::{ForkSchedule, LcFork};
 use myotis_consensus::spec;
-use myotis_consensus::store::{LightClientProcessor, LightClientStore};
+use myotis_consensus::store::{FinalityOutcome, LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
     HeaderExecution, LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate,
 };
@@ -123,6 +123,11 @@ pub struct ChainConfig {
     /// Live host overrides for the bound + the stale-anchor consent (see
     /// [`WsPolicy`]). Shared across config clones.
     pub ws_policy: Arc<WsPolicy>,
+    /// The consensus-layer fork watch this loop feeds — every discv5 ENR's
+    /// `eth2` field and every peer Status (`cl_fork_watch`). Handle-owned by
+    /// the engine host so its evidence survives pause/resume; None (the
+    /// network constructors' default) runs without the detector.
+    pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
 }
 
 impl ChainConfig {
@@ -247,6 +252,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
             ws_policy: Arc::new(WsPolicy::default()),
+            cl_fork_watch: None,
         }
         .with_env_overrides()
     }
@@ -312,6 +318,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
             ws_policy: Arc::new(WsPolicy::default()),
+            cl_fork_watch: None,
         }
         .with_env_overrides()
     }
@@ -381,6 +388,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
             ws_policy: Arc::new(WsPolicy::default()),
+            cl_fork_watch: None,
         }
         .with_env_overrides()
     }
@@ -985,7 +993,16 @@ impl SyncHandle {
             earliest_available_slot: 0,
         });
 
-        let client = reqresp::start_host(Arc::clone(&local_status))?;
+        // The host feeds every peer Status to the CL fork watch (the same
+        // instance discovery feeds ENRs to).
+        let client = reqresp::start_host_with(
+            Arc::clone(&local_status),
+            reqresp::HostConfig {
+                cl_fork_watch: config.cl_fork_watch.clone(),
+                ..reqresp::HostConfig::default()
+            },
+        )
+        .map(|(client, _, _)| client)?;
 
         let discovery_cfg = DiscoveryConfig {
             bootstrap_enrs: config.bootstrap_enrs.clone(),
@@ -1000,6 +1017,9 @@ impl SyncHandle {
             // Shared with run_sync's hunt trigger; discovery re-spawns reuse
             // the same flag, so a boost survives a discv5 restart.
             hunt_boost: Arc::new(AtomicBool::new(false)),
+            // Every ENR heard — accepted or not — is evidence for the CL fork
+            // watch; it must see them BEFORE the digest filter drops them.
+            cl_fork_watch: config.cl_fork_watch.clone(),
             // The pinned CL peers, for targeted lookups: discovery walks toward
             // their derived discv5 ids so a stale pinned address (roost behind
             // a rotated residential IP) heals from third-party tables in
@@ -2068,14 +2088,16 @@ async fn run_sync(
         }
 
         in_catchup = false; // reaching here means the committee is current
-        let applied =
+        let poll =
             poll_finality(&config, &client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
                 .await;
-        if applied {
+        if poll.verified {
             // A finality update verified against the (possibly restored)
-            // committee — the snapshot is genuine.
+            // committee — the snapshot is genuine. A stale one proves that
+            // just as well as one that advanced.
             resume.confirm();
-        } else if hunt.hunting {
+        }
+        if !poll.advanced && hunt.hunting {
             // Starved and the proven/preferred tiers came up dry — burst-probe
             // the unproven pool tail for new LC servers.
             hunt_round(&config, &client, &mut pool, &mut processor, &mut clcache,
@@ -3346,7 +3368,7 @@ async fn poll_finality(
     processor: &mut LightClientProcessor,
     clcache: &mut crate::clcache::ClPeerCache,
     hunt_confirmed: &HashSet<PeerId>,
-) -> bool {
+) -> FinalityPoll {
     let mut lc_servers = client.lc_update_servers().await;
     // Reverse any stale nolc verdict for peers whose LIVE Identify now advertises
     // updates_by_range, and persist the reversal to the shared cache — before
@@ -3391,6 +3413,7 @@ async fn poll_finality(
     // the live fan-out.
     let mut round_failures: Vec<String> = Vec::new();
     let mut applied = false;
+    let mut verified = false;
     while let Some((peer, res)) = in_flight.next().await {
         let raw = match res {
             Ok(raw) => raw,
@@ -3422,12 +3445,13 @@ async fn poll_finality(
             }
         };
         match LightClientFinalityUpdate::decode_for(fork, &ssz_payload) {
-            Ok(update) => {
-                if processor.process_finality_update(&update) {
-                    // Success is a VERIFIED apply (Java notifies its cache
-                    // only after processUpdate succeeds, never on mere decode
-                    // — a peer serving decodable-but-unverifiable updates
-                    // must not earn tier-1 status or cache streak resets).
+            Ok(update) => match processor.apply_finality_update(&update) {
+                FinalityOutcome::Advanced => {
+                    // Success is a VERIFIED apply that ADVANCED the store
+                    // (Java notifies its cache only after processUpdate
+                    // succeeds, never on mere decode — a peer serving
+                    // decodable-but-unverifiable updates must not earn
+                    // tier-1 status or cache streak resets).
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
@@ -3437,12 +3461,26 @@ async fn poll_finality(
                         period = processor.store.current_period(),
                         "finality update applied");
                     applied = true;
+                    verified = true;
                     break; // stragglers are speculative losers — spare them
                 }
-                tracing::debug!(peer = %peer.id,
+                // Verified but behind what the store holds: not a win — the
+                // round keeps reading, since a current server may still
+                // answer — and not a strike. Returning "no advance" is what
+                // lets a hunting loop burst-probe for new servers this cycle
+                // (a stale win used to short-circuit that), and the store's
+                // own age is what drops SYNCED and engages the hunt.
+                FinalityOutcome::Stale => {
+                    verified = true;
+                    tracing::debug!(peer = %peer.id,
+                        attested_slot = update.attested_header.beacon.slot,
+                        finalized_slot = update.finalized_header.beacon.slot,
+                        "finality update verified but did not advance state");
+                }
+                FinalityOutcome::Rejected => tracing::debug!(peer = %peer.id,
                     finalized_slot = update.finalized_header.beacon.slot,
-                    "finality update did not advance state");
-            }
+                    "finality update rejected"),
+            },
             Err(e) => {
                 pool.note_failure(peer.id);
                 round_failures.push(format!("{}/p2p/{}", peer.addr, peer.id));
@@ -3450,12 +3488,25 @@ async fn poll_finality(
             }
         }
     }
-    if !applied {
+    // Strikes are for a round that found NO server: a response that verified
+    // — stale or not — means the losers raced a real one (a stalled network
+    // would otherwise evict every proven-but-busy server in three rounds).
+    if !verified {
         for addr in &round_failures {
             clcache.mark_failure(addr);
         }
     }
-    applied
+    FinalityPoll { advanced: applied, verified }
+}
+
+/// What one finality-poll round found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalityPoll {
+    /// A response verified AND advanced the store (the round's winner).
+    advanced: bool,
+    /// At least one response verified against the held committee — enough to
+    /// confirm a restored snapshot and to spare the round's losers a strike.
+    verified: bool,
 }
 
 /// One LC-hunt burst: probe up to [`HUNT_FANOUT`] UNPROVEN pool peers with a
@@ -3508,6 +3559,7 @@ async fn hunt_round(
         })
         .collect();
     let mut applied = false;
+    let mut verified_any = false;
     let mut newly_confirmed = 0usize;
     let mut nolc = 0usize;
     while let Some((peer, res)) = in_flight.next().await {
@@ -3557,9 +3609,25 @@ async fn hunt_round(
                 // to harvest the lc confirm above. Stragglers stay
                 // lc-confirmed, not proven — the same speculative-loser rule
                 // as poll_finality's early break.
-                if !applied && processor.process_finality_update(&update) {
-                    // Verified apply — the same full-win treatment as a
-                    // poll_finality winner.
+                // At most one SUCCESSFUL verify per round: once any response
+                // verified (advanced or stale), the rest are not attempted and
+                // stay lc-confirmed (None below — not "rejected": nothing was
+                // checked). A response that fails verification does not stop
+                // the next one from being tried. A stalled pool must not cost
+                // HUNT_FANOUT verifies (blst here; the Java engine's ART cost
+                // is the figure quoted above).
+                let outcome: Option<FinalityOutcome> = if verified_any {
+                    None
+                } else {
+                    Some(processor.apply_finality_update(&update))
+                };
+                if matches!(outcome, Some(FinalityOutcome::Advanced | FinalityOutcome::Stale)) {
+                    verified_any = true;
+                }
+                if outcome == Some(FinalityOutcome::Advanced) {
+                    // Verified apply that ADVANCED the store — the same
+                    // full-win treatment as a poll_finality winner (a stale
+                    // one is lc-confirmed above, nothing more).
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&addr);
