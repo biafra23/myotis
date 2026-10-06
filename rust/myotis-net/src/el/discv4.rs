@@ -813,21 +813,29 @@ struct PendingEnr {
 struct Judgement {
     verdict: Verdict,
     /// The TCP port by the node's own word: its record's (`0`: an address but
-    /// no TCP port — never dialed), updated by a later Ping's FROM endpoint,
-    /// which the node signed too and is fresher; `None` when the record named
-    /// no address or never came. It outlives the sighting: a relayer's hearsay
-    /// must not put a discovery-only node back on the dial list, or a known
-    /// port back to a guess — only the node itself moves its port here.
+    /// no TCP port — never dialed); when the record named no address, the port
+    /// the node's own Ping claimed, if it pinged us; updated by a later Ping's
+    /// FROM endpoint, which the node signed too and is fresher. `None` when
+    /// the node said nothing about its port (a record naming no address and
+    /// no Ping of its own, or no record at all). It outlives the sighting: a
+    /// relayer's hearsay must not put a discovery-only node back on the dial
+    /// list, or a known port back to a guess — only the node itself moves its
+    /// port here. A `Some` also keeps an `Unknown` verdict for the run (see
+    /// [`Judgement::expired`]).
     tcp_port: Option<u32>,
     at: tokio::time::Instant,
 }
 
 impl Judgement {
-    /// An `Unknown` that holds no record — a lost datagram, a response a shade
-    /// past the timeout — no longer stands past [`UNKNOWN_VERDICT_TTL`]; one
-    /// with a record in hand (an address but no `eth` entry: the EF NodeOps
-    /// bootnodes) stands for the run, as every verdict with a record does, so
-    /// the port it pinned is never forgotten with it.
+    /// An `Unknown` that pins no port — a lost datagram, a response a shade
+    /// past the timeout, a record naming no address from a node that never
+    /// pinged us — no longer stands past [`UNKNOWN_VERDICT_TTL`]; one that
+    /// pins a port stands for the run, so the pin is never forgotten with it:
+    /// a record with an address but no `eth` entry (the EF NodeOps
+    /// bootnodes), or a record naming no address from a node whose own Ping
+    /// claimed its port (an expiring pin would reopen the hearsay hole it
+    /// closes). Its fork id is then not re-checked this run — the eth Status
+    /// check at the handshake still is.
     fn expired(&self, now: tokio::time::Instant) -> bool {
         self.verdict == Verdict::Unknown
             && self.tcp_port.is_none()
@@ -838,7 +846,8 @@ impl Judgement {
 /// What `consider` finds on file for a sighted node.
 enum Seen {
     Foreign,
-    /// Judged, with the port its record named (if any): handed over as is.
+    /// Judged, with the port by the node's own word (its record's, or its
+    /// Ping's claim; see [`Judgement::tcp_port`]), if any: handed over as is.
     Judged(Option<u32>),
     /// An expired `Unknown`: judged again.
     Stale,
