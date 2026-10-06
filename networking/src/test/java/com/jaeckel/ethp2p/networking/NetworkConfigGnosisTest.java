@@ -226,7 +226,6 @@ class NetworkConfigGnosisTest {
         assertEquals(List.of(
                         "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                         "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-                        "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
                         "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"),
                 NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
                 "roost first, then the census-verified public servers, same list as the Rust twin");
