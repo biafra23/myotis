@@ -59,6 +59,34 @@ class LightClientProcessorTest {
         assertEquals(200L, store.getFinalizedSlot());
     }
 
+    /**
+     * The poll's "advanced" predicate (BeaconLightClient.pollFinalityUpdate): a re-served
+     * update verifies — true — but moves neither slot. And the duplicate memo must keep
+     * BOTH a stale and a current update free of re-verification: on a network whose
+     * servers stalled at a fork, a stale reply arrives first every round, and if it
+     * evicted the current one from the memo each reply would cost a full BLS verify.
+     */
+    @Test
+    void reservedUpdateVerifiesWithoutAdvancingAndStaysMemoized() {
+        LightClientFinalityUpdate stale = buildValidFinalityUpdate(200L, 201L);
+        assertTrue(processor.processFinalityUpdate(stale));
+        long finalized = store.getFinalizedSlot();
+        long optimistic = store.getOptimisticSlot();
+        assertTrue(processor.processFinalityUpdate(stale), "a re-served update still verifies");
+        assertEquals(finalized, store.getFinalizedSlot());
+        assertEquals(optimistic, store.getOptimisticSlot());
+
+        LightClientFinalityUpdate current = buildValidFinalityUpdate(300L, 301L);
+        assertTrue(processor.processFinalityUpdate(current));
+        assertEquals(300L, store.getFinalizedSlot());
+        // Both are memoized now: neither re-verifies, neither moves the store.
+        assertTrue(processor.isMemoizedFinality(stale), "the stale update stays memoized");
+        assertTrue(processor.isMemoizedFinality(current));
+        assertTrue(processor.processFinalityUpdate(stale));
+        assertEquals(300L, store.getFinalizedSlot(), "a stale re-send never moves the store back");
+        assertEquals(301L, store.getOptimisticSlot());
+    }
+
     @Test
     void rejectsInvalidBls() {
         LightClientFinalityUpdate valid = buildValidFinalityUpdate(300L, 301L);

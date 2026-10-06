@@ -2068,14 +2068,16 @@ async fn run_sync(
         }
 
         in_catchup = false; // reaching here means the committee is current
-        let applied =
+        let poll =
             poll_finality(&config, &client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
                 .await;
-        if applied {
+        if poll.verified {
             // A finality update verified against the (possibly restored)
-            // committee — the snapshot is genuine.
+            // committee — the snapshot is genuine. A stale one proves that
+            // just as well as one that advanced.
             resume.confirm();
-        } else if hunt.hunting {
+        }
+        if !poll.advanced && hunt.hunting {
             // Starved and the proven/preferred tiers came up dry — burst-probe
             // the unproven pool tail for new LC servers.
             hunt_round(&config, &client, &mut pool, &mut processor, &mut clcache,
@@ -3346,7 +3348,7 @@ async fn poll_finality(
     processor: &mut LightClientProcessor,
     clcache: &mut crate::clcache::ClPeerCache,
     hunt_confirmed: &HashSet<PeerId>,
-) -> bool {
+) -> FinalityPoll {
     let mut lc_servers = client.lc_update_servers().await;
     // Reverse any stale nolc verdict for peers whose LIVE Identify now advertises
     // updates_by_range, and persist the reversal to the shared cache — before
@@ -3391,6 +3393,7 @@ async fn poll_finality(
     // the live fan-out.
     let mut round_failures: Vec<String> = Vec::new();
     let mut applied = false;
+    let mut verified = false;
     while let Some((peer, res)) = in_flight.next().await {
         let raw = match res {
             Ok(raw) => raw,
@@ -3438,16 +3441,22 @@ async fn poll_finality(
                         period = processor.store.current_period(),
                         "finality update applied");
                     applied = true;
+                    verified = true;
                     break; // stragglers are speculative losers — spare them
                 }
-                // Verified but behind what the store holds: not a win (the
-                // round keeps reading — a current server may still answer),
-                // not a strike, and not "served" either, so a pool of stalled
-                // servers reads as starvation and engages the LC hunt.
-                FinalityOutcome::Stale => tracing::debug!(peer = %peer.id,
-                    attested_slot = update.attested_header.beacon.slot,
-                    finalized_slot = update.finalized_header.beacon.slot,
-                    "finality update verified but did not advance state"),
+                // Verified but behind what the store holds: not a win — the
+                // round keeps reading, since a current server may still
+                // answer — and not a strike. Returning "no advance" is what
+                // lets a hunting loop burst-probe for new servers this cycle
+                // (a stale win used to short-circuit that), and the store's
+                // own age is what drops SYNCED and engages the hunt.
+                FinalityOutcome::Stale => {
+                    verified = true;
+                    tracing::debug!(peer = %peer.id,
+                        attested_slot = update.attested_header.beacon.slot,
+                        finalized_slot = update.finalized_header.beacon.slot,
+                        "finality update verified but did not advance state");
+                }
                 FinalityOutcome::Rejected => tracing::debug!(peer = %peer.id,
                     finalized_slot = update.finalized_header.beacon.slot,
                     "finality update rejected"),
@@ -3459,12 +3468,25 @@ async fn poll_finality(
             }
         }
     }
-    if !applied {
+    // Strikes are for a round that found NO server: a response that verified
+    // — stale or not — means the losers raced a real one (a stalled network
+    // would otherwise evict every proven-but-busy server in three rounds).
+    if !verified {
         for addr in &round_failures {
             clcache.mark_failure(addr);
         }
     }
-    applied
+    FinalityPoll { advanced: applied, verified }
+}
+
+/// What one finality-poll round found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalityPoll {
+    /// A response verified AND advanced the store (the round's winner).
+    advanced: bool,
+    /// At least one response verified against the held committee — enough to
+    /// confirm a restored snapshot and to spare the round's losers a strike.
+    verified: bool,
 }
 
 /// One LC-hunt burst: probe up to [`HUNT_FANOUT`] UNPROVEN pool peers with a
@@ -3517,6 +3539,7 @@ async fn hunt_round(
         })
         .collect();
     let mut applied = false;
+    let mut verified_any = false;
     let mut newly_confirmed = 0usize;
     let mut nolc = 0usize;
     while let Some((peer, res)) = in_flight.next().await {
@@ -3566,9 +3589,18 @@ async fn hunt_round(
                 // to harvest the lc confirm above. Stragglers stay
                 // lc-confirmed, not proven — the same speculative-loser rule
                 // as poll_finality's early break.
-                if !applied
-                    && processor.apply_finality_update(&update) == FinalityOutcome::Advanced
-                {
+                // One BLS verify per round at most: once any response
+                // verified (advanced or stale), the rest stay lc-confirmed —
+                // a stalled pool must not cost HUNT_FANOUT verifies on ART.
+                let outcome = if verified_any {
+                    FinalityOutcome::Rejected
+                } else {
+                    processor.apply_finality_update(&update)
+                };
+                if outcome != FinalityOutcome::Rejected {
+                    verified_any = true;
+                }
+                if outcome == FinalityOutcome::Advanced {
                     // Verified apply that ADVANCED the store — the same
                     // full-win treatment as a poll_finality winner (a stale
                     // one is lc-confirmed above, nothing more).
