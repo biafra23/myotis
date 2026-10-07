@@ -374,6 +374,18 @@ pub fn decode_multi_chunk_response_with_digests(
     Ok(items)
 }
 
+/// The error a response OPENS with: its result code and best-effort message
+/// (decoded as [`decode_multi_chunk_response_with_digests`] logs it). `None`
+/// for an empty response or one whose first chunk is a success. Diagnostics
+/// only — it is what lets a census tell "the server answered ServerError:
+/// Database error" apart from "the server sent bytes that do not decode".
+pub fn leading_error(raw: &[u8]) -> Option<(u8, String)> {
+    match raw.first() {
+        Some(&code) if code != RESULT_SUCCESS => Some((code, decode_error_chunk_message(raw, 1))),
+        _ => None,
+    }
+}
+
 /// Best-effort decode of an error chunk's message: `varint(len) || snappy(msg)`,
 /// falling back to raw UTF-8 when the snappy frame is missing/corrupt.
 fn decode_error_chunk_message(raw: &[u8], err_start: usize) -> String {
@@ -596,6 +608,30 @@ mod tests {
         let wire = encode_error_response(RESULT_RESOURCE_UNAVAILABLE, "pruned");
         let e = decode_response(&wire, true).unwrap_err();
         assert!(e.0.contains("ResourceUnavailable"), "{e}");
+    }
+
+    /// The bytes a Lighthouse v8.3.0-rc.0 Sepolia node answered to
+    /// updates_by_range(1379, 1) after the Gloas fork (2026-10-06): code 2,
+    /// varint 14, then a snappy stream identifier and one uncompressed frame.
+    #[test]
+    fn leading_error_reads_a_real_server_error() {
+        let mut wire = vec![
+            0x02, 0x0e, 0xff, 0x06, 0x00, 0x00, 0x73, 0x4e, 0x61, 0x50, 0x70, 0x59, 0x01, 0x12,
+            0x00, 0x00, 0xd0, 0xfe, 0x5d, 0x49,
+        ];
+        wire.extend_from_slice(b"Database error");
+        assert_eq!(
+            leading_error(&wire),
+            Some((RESULT_SERVER_ERROR, "Database error".to_string()))
+        );
+        let ours = encode_error_response(RESULT_RESOURCE_UNAVAILABLE, "no more");
+        assert_eq!(
+            leading_error(&ours),
+            Some((RESULT_RESOURCE_UNAVAILABLE, "no more".to_string()))
+        );
+        // A success chunk and an empty answer carry no error.
+        assert_eq!(leading_error(&encode_success_response(&[1; 8], Some([0; 4]))), None);
+        assert_eq!(leading_error(&[]), None);
     }
 
     /// A range response can span a fork: each chunk keeps ITS context bytes,
