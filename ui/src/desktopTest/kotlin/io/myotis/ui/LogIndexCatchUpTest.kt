@@ -65,6 +65,30 @@ class LogIndexCatchUpTest {
     }
 
     @Test
+    fun headCaughtUpIsTheServingSlack() {
+        assertTrue(LogIndexStatus.headCaughtUp(status(0)))
+        assertTrue(LogIndexStatus.headCaughtUp(status(4)))
+        assertFalse(LogIndexStatus.headCaughtUp(status(5)))
+        assertFalse(LogIndexStatus.headCaughtUp(status(3800)))
+    }
+
+    @Test
+    fun headCaughtUpWithNothingToCloseOrBeyondTheBridge() {
+        assertTrue(LogIndexStatus.headCaughtUp(status(3800, enabled = false)))
+        assertTrue(LogIndexStatus.headCaughtUp(status(null, entries = "")))
+        // Past the bridge limit the engine holds coverage on purpose: nothing will close it.
+        assertFalse(LogIndexStatus.headCaughtUp(status(LogIndexStatus.BRIDGE_MAX_GAP)))
+        assertTrue(LogIndexStatus.headCaughtUp(status(LogIndexStatus.BRIDGE_MAX_GAP + 1)))
+    }
+
+    @Test
+    fun headCaughtUpTreatsUnknownAsNotCaughtUp() {
+        assertFalse(LogIndexStatus.headCaughtUp(null))
+        assertFalse(LogIndexStatus.headCaughtUp(status(null)))
+        assertFalse(LogIndexStatus.headCaughtUp("{\"error\":\"engine stopped\"}"))
+    }
+
+    @Test
     fun progressIsMeasuredFromTheLargestGapOfTheCatchUp() {
         val t = LogIndexCatchUp()
         assertEquals(CatchUpProgress(3000, 3000), t.observe("mainnet", 3000))

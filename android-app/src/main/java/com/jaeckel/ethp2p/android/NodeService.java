@@ -1100,12 +1100,18 @@ public final class NodeService extends Service {
      *  "synced + warm head" bar the daily catch-up waits for before pausing again. */
     private static boolean isSyncedWarm(ChainHandle h) {
         try {
-            StatusSnapshot s = h.status();
-            return s.beaconState() == BeaconState.SYNCED
-                    && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
+            return syncedWarmOrThrow(h);
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** {@link #isSyncedWarm} for the background passes, which stop waiting on a
+     *  stack whose status() throws instead of reading it as "not yet". */
+    private static boolean syncedWarmOrThrow(ChainHandle h) {
+        StatusSnapshot s = h.status();
+        return s.beaconState() == BeaconState.SYNCED
+                && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
     }
 
     /** True once a still-unsynced stack has been running past {@link #SYNC_RUN_CEILING_MS}, measured
@@ -1123,8 +1129,13 @@ public final class NodeService extends Service {
      *  can't be read, so a transient query error doesn't wrongly let the idle tick pause a
      *  still-syncing stack. */
     private boolean networkAvailable() {
+        return networkAvailable(this);
+    }
+
+    /** {@link #networkAvailable()} for callers without a service instance (the workers). */
+    static boolean networkAvailable(android.content.Context c) {
         try {
-            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
             if (cm == null) return true;
             Network net = cm.getActiveNetwork();
             if (net == null) return false;
@@ -1142,8 +1153,13 @@ public final class NodeService extends Service {
      *  when plugged in but momentarily discharging under load. Fail-safe to false so a read error
      *  never blocks a pause. */
     private boolean isCharging() {
+        return isCharging(this);
+    }
+
+    /** {@link #isCharging()} for callers without a service instance (the workers). */
+    static boolean isCharging(android.content.Context c) {
         try {
-            android.content.Intent i = registerReceiver(null,
+            android.content.Intent i = c.registerReceiver(null,
                     new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
             if (i != null
                     && i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0) {
@@ -1153,7 +1169,7 @@ public final class NodeService extends Service {
             // fall through to the charge-state check
         }
         try {
-            android.os.BatteryManager bm = getSystemService(android.os.BatteryManager.class);
+            android.os.BatteryManager bm = c.getSystemService(android.os.BatteryManager.class);
             return bm != null && bm.isCharging();
         } catch (Throwable t) {
             return false;
@@ -1178,7 +1194,8 @@ public final class NodeService extends Service {
      * The daily maintenance pass ({@link CatchUpWorker}): for each idle-PAUSED stack,
      * resume, wait until the beacon client is SYNCED and the verified head is warm (or
      * the per-network budget slice runs out), and pause again — but only if no real
-     * activity arrived meanwhile (then the idle controller owns the stack again).
+     * activity arrived meanwhile and "stay awake while charging" does not apply (then
+     * the idle controller owns the stack again; see {@link #catchUpPass}).
      *
      * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
      * activity clock ({@code lastActivityEpochMillis}), so the "did real activity
@@ -1191,36 +1208,101 @@ public final class NodeService extends Service {
      * <p>Static: the Worker has no binder; ENGINE / BOOT_LOCKS / the idle stamps are
      * all process-global.
      */
-    public static void dailyCatchUp(long budgetMs) {
-        List<String> hosted = ENGINE.hostedNetworks();
-        if (hosted.isEmpty()) return;
-        long sliceMs = Math.max(30_000L, budgetMs / hosted.size());
-        for (String n : hosted) {
+    public static void dailyCatchUp(android.content.Context c, long budgetMs) {
+        catchUpPass(c, "daily catch-up", budgetMs, NodeService::syncedWarmOrThrow);
+    }
+
+    /**
+     * The charging + unmetered pass ({@link ChargingCatchUpWorker}): the daily pass's
+     * resume → wait → pause, but the wait also covers the LOG INDEX — it lasts until
+     * head-follow has closed the gap the paused hours opened
+     * ({@code LogIndexStatus.headCaughtUp}), not just until the beacon is SYNCED.
+     * Without it a phone that paused in the evening and charged all night woke up
+     * thousands of blocks behind, because "stay awake while charging" only keeps a
+     * RUNNING stack from pausing — it never wakes a paused one.
+     */
+    public static void chargingCatchUp(android.content.Context c, long budgetMs) {
+        catchUpPass(c, "charging catch-up", budgetMs,
+                h -> syncedWarmOrThrow(h) && logIndexAtHead(h));
+    }
+
+    /** The log index has nothing left for head-follow to close (or no index at all).
+     *  Throws like {@link #syncedWarmOrThrow}: a handle that cannot answer ends the wait. */
+    private static boolean logIndexAtHead(ChainHandle h) {
+        return io.myotis.ui.LogIndexStatus.headCaughtUp(h.logIndexStatusJson());
+    }
+
+    /** The idle controller's "stay awake while charging" rule, evaluated outside it: the
+     *  setting is on, the device is plugged in, and a network is up. While it holds, the
+     *  idle ticker never pauses a RUNNING stack, so a background pass must not either. */
+    private static boolean stayAwakeApplies(android.content.Context c) {
+        return stayAwakeWhileCharging(c) && isCharging(c) && networkAvailable(c);
+    }
+
+    /** Below this much remaining pass budget a resume is not worth starting: it would be
+     *  paused again before it had time to sync anything. Also the per-stack floor. */
+    private static final long MIN_SLICE_MS = 30_000L;
+
+    /**
+     * Shared body of the background passes. For each idle-PAUSED stack: resume it, then
+     * <ul>
+     *   <li>if {@link #stayAwakeApplies} — leave it running. The idle controller now keeps
+     *       it awake and following the head while the device stays plugged in, and pauses
+     *       it on the ordinary idle rules once unplugged; pausing it here would undo the
+     *       user's setting until the next pass;</li>
+     *   <li>otherwise wait until {@code caughtUp} holds (or its budget slice runs out, or
+     *       it throws — a stack that cannot report status is not worth the rest of the
+     *       slice), and pause again unless real activity arrived meanwhile.</li>
+     * </ul>
+     * The slices share one pass deadline: a stack that catches up early hands its unused
+     * time to the stacks after it, and no slice runs past the deadline.
+     */
+    private static void catchUpPass(android.content.Context c, String label, long budgetMs,
+                                    java.util.function.Predicate<ChainHandle> caughtUp) {
+        List<String> paused = new ArrayList<>();
+        for (String n : ENGINE.hostedNetworks()) {
+            ChainHandle h = ENGINE.get(n);
+            if (h != null && h.lifecycle() == io.myotis.api.LifecycleState.PAUSED) paused.add(n);
+        }
+        // Monotonic deadlines (nanoTime, overflow-safe compare) so an NTP/wall-clock
+        // step can't cut the pass short or hang it.
+        long passEndNano = System.nanoTime() + budgetMs * 1_000_000L;
+        for (int i = 0; i < paused.size(); i++) {
+            String n = paused.get(i);
             ChainHandle h = ENGINE.get(n);
             if (h == null || h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
+            boolean stayAwake = stayAwakeApplies(c);
+            long remainingMs = (passEndNano - System.nanoTime()) / 1_000_000L;
+            if (!stayAwake && remainingMs < MIN_SLICE_MS) {
+                LogBuffer.i(TAG, label + ": budget spent; leaving the remaining stacks paused");
+                return;
+            }
+            long sliceMs = Math.min(remainingMs,
+                    Math.max(MIN_SLICE_MS, remainingMs / (paused.size() - i)));
             long activityBefore = h.lastActivityEpochMillis();
-            LogBuffer.i(TAG, "[" + n + "] daily catch-up: resuming");
+            LogBuffer.i(TAG, "[" + n + "] " + label + ": resuming");
             boolean resumed;
             synchronized (bootLock(n)) {
+                // Re-check under the lock, like every other wake path: a stop or a disable
+                // may have raced the worker, and must not get its stack restarted.
+                if (!RUNNING.get() || ENGINE.get(n) != h || !isNetworkEnabled(c, n)) continue;
                 // Hold the grace stamp BEFORE resume returns RUNNING, so the idle ticker
                 // can't pause the stack in the window between resume() and the loop.
                 lastResumeMs.put(n, System.currentTimeMillis());
                 resumed = h.resume(io.myotis.api.WakeReason.CATCH_UP);
             }
-            if (!resumed) continue; // stays paused; next daily run retries
-            // Monotonic deadline (nanoTime, overflow-safe compare) so an NTP/wall-clock
-            // step can't cut the pass short or hang it.
+            if (!resumed) continue; // stays paused; the next run retries
+            if (stayAwake) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+                continue;
+            }
             long deadlineNano = System.nanoTime() + sliceMs * 1_000_000L;
             while (System.nanoTime() - deadlineNano < 0) {
                 // Refresh the grace stamp each iteration: keeps now-lastResumeMs well under
                 // any idle window (min 60s) so the 30s idle ticker never pauses us mid-pass.
                 lastResumeMs.put(n, System.currentTimeMillis());
                 try {
-                    StatusSnapshot s = h.status();
-                    if (s.beaconState() == BeaconState.SYNCED
-                            && s.verifiedHeadAgeMs() != Long.MAX_VALUE) {
-                        break;
-                    }
+                    if (caughtUp.test(h)) break;
                     Thread.sleep(5_000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -1229,16 +1311,18 @@ public final class NodeService extends Service {
                     break;
                 }
             }
-            // Real user/RPC activity arrived mid-catch-up → leave the stack to the
-            // idle controller; otherwise go straight back to sleep (pause persists
-            // the freshly-caught-up snapshot).
-            if (h.lastActivityEpochMillis() == activityBefore) {
+            // Real user/RPC activity arrived mid-catch-up, or the device went on the charger
+            // meanwhile → leave the stack to the idle controller; otherwise go straight back
+            // to sleep (pause persists the freshly-caught-up snapshot).
+            if (h.lastActivityEpochMillis() != activityBefore) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": activity arrived; staying awake");
+            } else if (stayAwakeApplies(c)) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+            } else {
                 synchronized (bootLock(n)) {
                     try { h.pause(); } catch (Throwable ignored) {}
                 }
-                LogBuffer.i(TAG, "[" + n + "] daily catch-up done; paused again");
-            } else {
-                LogBuffer.i(TAG, "[" + n + "] daily catch-up: activity arrived; staying awake");
+                LogBuffer.i(TAG, "[" + n + "] " + label + " done; paused again");
             }
         }
     }
