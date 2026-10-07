@@ -25,6 +25,14 @@ myotis-evm = { path = "../myotis-evm" }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
 discv5 = "=0.11.0"
+# The ENR wire codec, for the discv4 fork-id pre-filter (#539): the `enr` crate
+# itself arrives through discv5, alloy-rlp is the codec it implements. Already
+# in the lock via enr — no new download.
+alloy-rlp = "=0.3.16"
+# The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
+# resolver. Already in every lock through libp2p's `dns` transport with these
+# same features — no new download.
+hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
 tracing = "=0.1.44"
 futures = "=0.3.32"

@@ -227,17 +227,22 @@ Today we advertise almost nothing, and what we advertise is wrong:
   with `tcp = udp = elPort`.
 - We never build or sign our own ENR (`core/.../Enr.java` is decode-only; the
   Rust CL discv5 record is built with a throwaway key and no address fields).
-- We answer neither FindNode nor ENRRequest — a deliberate "client-only"
-  stance, documented in `rust/.../el/discv4.rs`.
+- We answer no FindNode — a deliberate "client-only" stance, documented in
+  `rust/.../el/discv4.rs`. Since #539 the Rust engine does answer ENRRequest,
+  but only from a node whose pong it holds, under the same per-IP rate limit
+  as Pings, and with a record carrying only identity, seq and the `eth` fork
+  id — no address, so it advertises nothing.
 
 Minimum viable advertisement, in order:
 
 1. **Truthful Ping `from`**: real reflected IP (Gap C) + genuinely-bound TCP
    port. This alone makes us dialable by every peer that processes ping
    endpoints — no ENR required for discv4-level reachability.
-2. **Own signed ENR + ENRRequest answers** (later): needed for discv5/ENR-first
-   clients and DNS trees. Requires an ENR encoder/signer (new in both
-   engines) and sequence-number persistence.
+2. **Own signed ENR + ENRRequest answers** (partly done: the Rust engine signs
+   a record and answers bonded requesters since #539, without address fields
+   and with a per-process seq): the address fields, sequence-number
+   persistence and the Java twin remain for discv5/ENR-first clients and DNS
+   trees.
 3. **Answering FindNode** (later, explicit policy decision): ends the
    client-only posture — we would join the DHT as a first-class citizen,
    which improves our discoverability but makes the wallet node enumerable

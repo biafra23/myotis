@@ -4216,6 +4216,7 @@ name = "myotis-net"
 version = "0.1.14"
 dependencies = [
  "aes",
+ "alloy-rlp",
  "arti-client",
  "async-trait",
  "cipher",
@@ -4223,6 +4224,7 @@ dependencies = [
  "discv5",
  "futures",
  "getrandom 0.2.17",
+ "hickory-resolver",
  "hmac",
  "libp2p",
  "myotis-consensus",

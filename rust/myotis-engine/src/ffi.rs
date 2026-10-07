@@ -87,6 +87,15 @@ pub fn tor_status() -> i32 {
     crate::host::tor_status()
 }
 
+/// Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
+/// system resolver (#539) — for every network this process runs. Off until a
+/// host switches it on; never used while Tor is enabled. Returns the state now
+/// in force. Process-global, not per-handle.
+#[uniffi::export]
+pub fn set_dns_discovery(on: bool) -> bool {
+    crate::host::set_dns_discovery(on)
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle.
 #[uniffi::export]
 pub fn status_json(handle: i64) -> String {

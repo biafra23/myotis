@@ -15,6 +15,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The Rust engine behind the {@link MyotisEngine} contract, via {@link RustEngineNative}.
@@ -29,6 +32,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * resuming a data dir bound to a caller-supplied checkpoint ({@link AnchorMismatchException}).
  */
 public final class RustMyotisEngine implements MyotisEngine {
+    private static final Logger log = LoggerFactory.getLogger(RustMyotisEngine.class);
+
+    /** The DNS-discovery value the last {@code create} pushed: -1 none yet, 0 off, 1 on. */
+    private static final AtomicInteger DNS_DISCOVERY = new AtomicInteger(-1);
+
 
     /** A create() refused because the dataDir belongs to a caller-supplied checkpoint
      *  generation (native {@code ANCHOR_MISMATCH}). Distinct from a generic
@@ -147,6 +155,24 @@ public final class RustMyotisEngine implements MyotisEngine {
             throw new EngineException("the Rust engine could not initialize the runtime"
                     + " or create the dataDir for " + canonical);
         }
+        // EIP-1459 DNS discovery (#539, part 3). The DnsServers port's contract is
+        // "no port → the resolver's default", and the system resolver is what the
+        // Rust walk uses, so a host without the port (desktop, daemon) gets DNS
+        // discovery. A host that supplies servers (Android, the active network's)
+        // wants THOSE used, and the Rust engine has no port for them yet — it
+        // stays off there, as on iOS, which never calls this. The engine skips the
+        // walk under Tor on its own. The switch is PROCESS-GLOBAL and the last
+        // create wins for every network already running, so a host must hand the
+        // same kind of ports to each network it hosts (today's hosts do); a create
+        // that flips an already-set value is logged rather than guessed about.
+        boolean dnsDiscovery = ports == null || ports.dnsServers() == null;
+        int previous = DNS_DISCOVERY.getAndSet(dnsDiscovery ? 1 : 0);
+        if (previous >= 0 && (previous == 1) != dnsDiscovery) {
+            log.warn("[engines] the create of {} switched EIP-1459 DNS discovery {} for every"
+                    + " hosted network: the switch is process-global and the last create wins",
+                    canonical, dnsDiscovery ? "on" : "off");
+        }
+        RustEngineNative.nativeSetDnsDiscovery(dnsDiscovery);
         // Mirror JavaMyotisEngine: honour a host-supplied RPC port, else the
         // network's catalog default (mainnet 8545, sepolia 8547, ...).
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();

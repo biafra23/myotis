@@ -11,13 +11,18 @@
 //!
 //! Client-only, like the Java reference: we ping / find-node and consume
 //! Neighbors, we never answer FindNode and never send Neighbors (inbound
-//! Pings get a Pong so bonds form). The packet codec, Kademlia table, and
-//! rate limiter are pure (clock values are parameters) and pinned by the
-//! `rust/testdata/el/discv4/` cross-language corpus; only [`Discv4Service`]
-//! touches sockets.
+//! Pings get a Pong so bonds form). Two deliberate departures from the Java
+//! twin since #539: we ping back a node that pings us while we hold no pong
+//! from it, and we answer ENRRequest (EIP-868) from a node whose pong we hold,
+//! under the same per-IP rate limit as Pings — both so the fork-id pre-filter
+//! (`enrfilter.rs`) can read a node's ENR before the pool dials it. The packet
+//! codec, Kademlia table, and rate limiter are pure (clock values are
+//! parameters) and pinned by the `rust/testdata/el/discv4/` cross-language
+//! corpus; only [`Discv4Service`] touches sockets.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myotis_core::keccak::{keccak256, keccak256_concat};
@@ -25,10 +30,15 @@ use myotis_core::nodekey::{recover_public_key, NodeKey};
 use myotis_core::rlp::{self, Item};
 use myotis_core::CoreError;
 
+use crate::el::enrfilter::{decode_enr, local_enr_rlp, ForkFilter, Verdict};
+
 pub const TYPE_PING: u8 = 0x01;
 pub const TYPE_PONG: u8 = 0x02;
 pub const TYPE_FIND_NODE: u8 = 0x03;
 pub const TYPE_NEIGHBORS: u8 = 0x04;
+/// EIP-868: ask a bonded node for its ENR; the reply echoes the request hash.
+pub const TYPE_ENR_REQUEST: u8 = 0x05;
+pub const TYPE_ENR_RESPONSE: u8 = 0x06;
 
 /// Ping/Pong protocol version.
 const VERSION: u64 = 4;
@@ -88,6 +98,50 @@ pub fn encode_find_node(key: &NodeKey, target: &[u8], expiry: u64) -> Result<Vec
     let mut payload = rlp::encode_bytes(target);
     payload.extend_from_slice(&rlp::encode_u64(expiry));
     encode_packet(key, TYPE_FIND_NODE, &rlp::encode_list_payload(&payload))
+}
+
+/// EIP-868 ENRRequest: `[expiration]`.
+pub fn encode_enr_request(key: &NodeKey, expiry: u64) -> Result<Vec<u8>, CoreError> {
+    let payload = rlp::encode_u64(expiry);
+    encode_packet(key, TYPE_ENR_REQUEST, &rlp::encode_list_payload(&payload))
+}
+
+/// The expiration of an ENRRequest.
+pub fn decode_enr_request_expiry(data: &[u8]) -> Result<u64, CoreError> {
+    decode_lenient(data)?
+        .as_list()?
+        .first()
+        .ok_or_else(|| CoreError("ENRRequest: missing expiration".into()))?
+        .as_u64()
+}
+
+/// EIP-868 ENRResponse: `[request-hash, ENR]`, the ENR spliced in as the RLP
+/// list it already is.
+pub fn encode_enr_response(
+    key: &NodeKey,
+    request_hash: &[u8; 32],
+    enr_rlp: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    let mut payload = rlp::encode_bytes(request_hash);
+    payload.extend_from_slice(enr_rlp);
+    encode_packet(key, TYPE_ENR_RESPONSE, &rlp::encode_list_payload(&payload))
+}
+
+/// The request hash and the ENR (re-encoded from the parsed list — canonical
+/// RLP, which is what an ENR signature covers) of an ENRResponse.
+pub fn decode_enr_response(data: &[u8]) -> Result<([u8; 32], Vec<u8>), CoreError> {
+    let top = decode_lenient(data)?;
+    let items = top.as_list()?;
+    let hash_item = items
+        .first()
+        .ok_or_else(|| CoreError("ENRResponse: missing request hash".into()))?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(hash_item.as_fixed_bytes(32)?);
+    let enr = items
+        .get(1)
+        .filter(|e| e.is_list())
+        .ok_or_else(|| CoreError("ENRResponse: missing ENR".into()))?;
+    Ok((hash, rlp::encode(enr)))
 }
 
 /// Endpoint: `[ip(4|16), udpPort, tcpPort]`.
@@ -276,6 +330,19 @@ impl KademliaTable {
         bucket.push(entry);
     }
 
+    /// Forget a node — the fork-id filter placed it on another chain (#539),
+    /// and the pool's below-target walk reads this table.
+    pub fn remove(&mut self, node_id: &[u8]) {
+        let idx = self.bucket_index(node_id);
+        self.buckets[idx].retain(|e| e.node_id != node_id);
+    }
+
+    /// The entry under `node_id`, if the table holds one.
+    pub fn get(&self, node_id: &[u8]) -> Option<&TableEntry> {
+        let idx = self.bucket_index(node_id);
+        self.buckets[idx].iter().find(|e| e.node_id == node_id)
+    }
+
     /// The k entries closest (XOR) to `target` (64-byte pubkey or 32-byte id).
     pub fn closest_peers(&self, target: &[u8], k: usize) -> Vec<TableEntry> {
         let target_id = to_node_id(target);
@@ -338,17 +405,31 @@ fn leading_zeros(b: &[u8; 32]) -> usize {
 
 const PING_RATE_LIMIT: usize = 5;
 const PING_RATE_WINDOW_MS: u64 = 10_000;
+/// Source IPs remembered at once. Beyond it, the rings no packet touched within
+/// the window go — they count nothing, so nothing is lost — and if every ring is
+/// live, all of them (fail open): a flood of spoofed sources, which costs the
+/// flooder one address per packet, must not grow the map.
+const RATE_LIMIT_IPS_MAX: usize = 4096;
 
-/// Sliding-window ring of the last [`PING_RATE_LIMIT`] ping timestamps per IP
-/// (twin of the Java handler's limiter).
+/// Sliding-window ring of the last [`PING_RATE_LIMIT`] packet timestamps per
+/// IP (twin of the Java handler's limiter), bounded by [`RATE_LIMIT_IPS_MAX`].
 #[derive(Default)]
 pub struct PingRateLimiter {
     rings: HashMap<IpAddr, [u64; PING_RATE_LIMIT]>,
 }
 
 impl PingRateLimiter {
-    /// True when `addr` has exceeded the limit; records the ping otherwise.
+    /// True when `addr` has exceeded the limit; records the packet otherwise.
     pub fn is_limited(&mut self, addr: IpAddr, now_ms: u64) -> bool {
+        if self.rings.len() >= RATE_LIMIT_IPS_MAX && !self.rings.contains_key(&addr) {
+            self.rings.retain(|_, ring| {
+                ring.iter()
+                    .any(|&t| now_ms.saturating_sub(t) < PING_RATE_WINDOW_MS)
+            });
+            if self.rings.len() >= RATE_LIMIT_IPS_MAX {
+                self.rings.clear();
+            }
+        }
         let ring = self.rings.entry(addr).or_insert([0; PING_RATE_LIMIT]);
         let mut recent = 0usize;
         let mut oldest = 0usize;
@@ -372,17 +453,58 @@ impl PingRateLimiter {
 // ---------------------------------------------------------------------------
 
 /// Configuration for [`Discv4Service::start`].
+#[derive(Default)]
 pub struct Discv4Config {
     /// UDP bind port (0 = ephemeral, for tests).
     pub bind_port: u16,
     /// Bootnode `ip:port` addresses (bare, no keys — discv4 pings them cold).
     pub bootnodes: Vec<SocketAddr>,
+    /// EIP-2124 fork-id pre-filter (#539): a node whose ENR places it on
+    /// another chain is never handed to the pool, and a node whose ENR is
+    /// still unknown waits for it (at most [`ENR_TIMEOUT`]) before it is.
+    /// `None` = every discovered node is handed over at once, as before.
+    pub fork_filter: Option<ForkFilter>,
+    /// The pool's "below target" flag, set each maintainer tick. While it is
+    /// set, every discovered node is judged before it is handed over and the
+    /// first refreshes ask three times as many table peers for neighbours
+    /// ([`WIDE_REFRESHES_MAX`]). While the pool is at target — it dials
+    /// nothing then — only nodes already bonding with us are judged (one
+    /// request and response each); nodes learned second-hand from NEIGHBORS go
+    /// over unjudged, as before, rather than be pinged for a verdict nobody
+    /// needs yet. `None` = always judge (tests).
+    pub pool_below_target: Option<Arc<AtomicBool>>,
+}
+
+/// How the fork-id filter (#539) judged the nodes it saw this run.
+#[derive(Debug, Default)]
+pub struct EnrCounts {
+    /// Handed to the pool on a matching `eth` entry.
+    pub compatible: AtomicU64,
+    /// Kept from the pool: another chain's fork hash. Counted per skip, so a
+    /// node re-learned from NEIGHBORS counts again.
+    pub foreign: AtomicU64,
+    /// Handed to the pool unjudged: no `eth` entry, or no ENR within the
+    /// timeout.
+    pub unjudged: AtomicU64,
+}
+
+impl EnrCounts {
+    /// A plain snapshot `(compatible, foreign, unjudged)`.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.compatible.load(Ordering::Relaxed),
+            self.foreign.load(Ordering::Relaxed),
+            self.unjudged.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Handle to a running discv4 service. Dropping it does NOT stop the task;
 /// call [`Discv4Service::stop`].
 pub struct Discv4Service {
     table: Arc<Mutex<KademliaTable>>,
+    /// The fork-id filter's tallies (#539), for the hosts' logs and tests.
+    enr_counts: Arc<EnrCounts>,
     local_port: u16,
     stop_tx: tokio::sync::watch::Sender<bool>,
     /// Probe requests into the service loop (see [`Discv4Service::probe_sender`]).
@@ -408,6 +530,11 @@ impl Discv4Service {
         let table = Arc::new(Mutex::new(KademliaTable::new(key.node_id())));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (probe_tx, probe_rx) = tokio::sync::mpsc::channel(64);
+        let enr_counts = Arc::new(EnrCounts::default());
+        let enr = match cfg.fork_filter {
+            Some(filter) => Some(EnrExchange::new(&key, filter, Arc::clone(&enr_counts))?),
+            None => None,
+        };
         let loop_state = ServiceLoop {
             key,
             socket,
@@ -418,12 +545,17 @@ impl Discv4Service {
             events,
             pending_pings: HashMap::new(),
             limiter: PingRateLimiter::default(),
+            enr_limiter: PingRateLimiter::default(),
             probe_rx,
             probed: HashMap::new(),
+            enr,
+            pool_below_target: cfg.pool_below_target,
+            wide: WideState::default(),
         };
         let task = tokio::spawn(loop_state.run(stop_rx));
         Ok(Discv4Service {
             table,
+            enr_counts,
             local_port,
             stop_tx,
             probe_tx,
@@ -439,6 +571,24 @@ impl Discv4Service {
     /// probe — it's a nudge, not bookkeeping).
     pub fn probe_sender(&self) -> tokio::sync::mpsc::Sender<SocketAddr> {
         self.probe_tx.clone()
+    }
+
+    /// The routing table itself, shared with the EL pool's below-target
+    /// re-dial (#539), which walks it for peers to re-offer.
+    pub fn table_handle(&self) -> Arc<Mutex<KademliaTable>> {
+        Arc::clone(&self.table)
+    }
+
+    /// Sightings of nodes the fork-id filter placed on another chain and kept
+    /// from the pool, this run (#539): a node re-learned from NEIGHBORS counts
+    /// again. The five-minute summary's `known_foreign` is the node count.
+    pub fn foreign_skipped(&self) -> u64 {
+        self.enr_counts.foreign.load(Ordering::Relaxed)
+    }
+
+    /// Every verdict the fork-id filter reached this run (#539).
+    pub fn enr_counts(&self) -> &EnrCounts {
+        &self.enr_counts
     }
 
     pub fn table_size(&self) -> usize {
@@ -534,21 +684,327 @@ struct ServiceLoop {
     bootnodes: Vec<SocketAddr>,
     table: Arc<Mutex<KademliaTable>>,
     events: tokio::sync::mpsc::Sender<TableEntry>,
-    /// ping target → expected echo hash (the bond in flight).
-    pending_pings: HashMap<SocketAddr, [u8; 32]>,
+    /// ping target → the bond in flight: the expected echo hash and when it
+    /// was sent. An entry older than [`PING_PENDING_TTL`] is stale — the pong
+    /// is not coming — and is pinged over, not waited on; the sweep prunes
+    /// them and the map is capped ([`PING_PENDING_MAX`]).
+    pending_pings: HashMap<SocketAddr, PendingPing>,
     limiter: PingRateLimiter,
+    /// The same limit on the ENRRequests we answer: each answer is a signature
+    /// and a reflected record, so a bonded node gets a Ping's budget, not line
+    /// rate for its bond's hour.
+    enr_limiter: PingRateLimiter,
     /// Probe requests from the pool (proven-peer UDP endpoints to bond with).
     probe_rx: tokio::sync::mpsc::Receiver<SocketAddr>,
     /// Endpoint → last probe instant (1 h per-endpoint dedup, bounded).
     probed: HashMap<SocketAddr, tokio::time::Instant>,
+    /// The EIP-868 exchange behind the fork-id filter (#539); `None` = no
+    /// filter, every node is handed to the pool at once.
+    enr: Option<EnrExchange>,
+    /// The pool's below-target hint (see `Discv4Config::pool_below_target`).
+    pool_below_target: Option<Arc<AtomicBool>>,
+    /// The wide fan-out's per-episode budget.
+    wide: WideState,
+}
+
+/// A ping awaiting its pong.
+struct PendingPing {
+    hash: [u8; 32],
+    since: tokio::time::Instant,
+}
+
+/// How long a ping's pong is waited for before the entry is stale: the
+/// packet's own expiry horizon.
+const PING_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(EXPIRY_SECONDS);
+/// Pings in flight at most; beyond it the stale entries go, then all of them.
+const PING_PENDING_MAX: usize = 4096;
+
+/// Refreshes per below-target episode that get the wide fan-out: a chain whose
+/// target is unreachable (gnosis, PR #553's note) would otherwise keep three
+/// times the FindNode traffic — and three times the ENR exchanges the replies
+/// start — for the life of the process. Eight refreshes are two minutes.
+pub const WIDE_REFRESHES_MAX: u8 = 8;
+/// A new episode's budget is granted at most this often: a pool flapping
+/// around its target every few minutes must not re-earn two wide minutes per
+/// dip.
+pub const WIDE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The wide fan-out's state: a budget granted when the pool drops below
+/// target — once per [`WIDE_COOLDOWN`] — and spent one refresh at a time.
+#[derive(Debug, Default)]
+struct WideState {
+    was_below: bool,
+    budget: u8,
+    last_grant: Option<tokio::time::Instant>,
+}
+
+/// Pure: table peers to ask for neighbours this refresh, given the pool's
+/// below-target flag (`None` = no pool hint: the narrow fan-out).
+fn fan_out(state: &mut WideState, below_target: Option<bool>, now: tokio::time::Instant) -> usize {
+    let below = below_target.unwrap_or(false);
+    if below && !state.was_below {
+        let cooled = state
+            .last_grant
+            .is_none_or(|t| now.duration_since(t) >= WIDE_COOLDOWN);
+        if cooled {
+            state.budget = WIDE_REFRESHES_MAX;
+            state.last_grant = Some(now);
+        }
+    }
+    state.was_below = below;
+    if below && state.budget > 0 {
+        state.budget -= 1;
+        REFRESH_SAMPLE_WIDE
+    } else {
+        REFRESH_SAMPLE
+    }
+}
+
+/// How long a node may stay unjudged before it is handed to the pool anyway:
+/// a node that never answers an ENRRequest (an old client, a lost datagram)
+/// costs this much delay once and is then dialed as before — the filter fails
+/// open.
+pub const ENR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// ENRRequests per pending node: one when its pong arrives, one more when its
+/// ping does (whichever of the two the remote counts as our bond).
+const ENR_REQUESTS_MAX: u8 = 2;
+/// Nodes awaiting an ENR at once; beyond it a node is handed over unjudged.
+/// A wide refresh can surface up to 30 × 16 neighbours in one tick.
+const ENR_PENDING_MAX: usize = 1024;
+/// Remembered verdicts (by node id); cleared wholesale when full.
+const ENR_VERDICTS_MAX: usize = 4096;
+/// How long an `Unknown` verdict stands before the node is judged again. A
+/// lost datagram, a response a shade past the timeout or an old client must
+/// not mean blind dials for the rest of the run — only until the next sighting
+/// after this; `Compatible` and `Foreign` stand for the run.
+const UNKNOWN_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long a verified pong counts as a bond for answering ENRRequests, and
+/// the cap on remembered bonds.
+const BOND_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const BONDED_MAX: usize = 4096;
+/// How often the exchange says how many foreign nodes it kept from the pool.
+const FILTER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Table peers asked for neighbours per refresh, and the wider fan-out while
+/// the pool is below target.
+const REFRESH_SAMPLE: usize = 10;
+const REFRESH_SAMPLE_WIDE: usize = 30;
+
+/// A verified pong: who signed it, and when.
+struct Bond {
+    pubkey: [u8; 64],
+    since: tokio::time::Instant,
+}
+
+/// A discovered node waiting for its ENR before it is handed to the pool.
+struct PendingEnr {
+    entry: TableEntry,
+    /// Hashes of the ENRRequests sent, newest last (at most ENR_REQUESTS_MAX).
+    hashes: Vec<[u8; 32]>,
+    since: tokio::time::Instant,
+    /// `entry.tcp_port` is the node's own claim (a Ping's FROM endpoint), not
+    /// a relayer's hearsay or a guess: hearsay arriving while the record is
+    /// awaited must not displace it, and it is pinned for this address family
+    /// if the record is silent about it.
+    claimed: bool,
+}
+
+/// The index of `ip`'s address family in [`Judgement::tcp_port`]: 0 for IPv4
+/// (4 bytes — every address entering the exchange is un-mapped by
+/// `canonical_addr`, a datagram's sender and a NEIGHBORS listing alike), 1
+/// for IPv6.
+fn family(ip: &[u8]) -> usize {
+    usize::from(ip.len() == 16)
+}
+
+/// What the exchange concluded about a node, kept by node id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Judgement {
+    verdict: Verdict,
+    /// The TCP port by the node's own word, per address family (`[IPv4,
+    /// IPv6]` — a port is a fact about one endpoint, and a record can name
+    /// different ports for the two): its record's (`0`: no TCP connections
+    /// on that family — never dialed; `RemoteEnr::tcp_word_for`); where the
+    /// record is silent about the family the node was reached at, the port
+    /// its own Ping claimed; updated by a later Ping's FROM endpoint, which
+    /// the node signed too and is fresher. `None` where the node said nothing
+    /// about a family. It outlives the sighting: a relayer's hearsay must not
+    /// put a discovery-only node back on the dial list, or a known port back
+    /// to a guess — only the node itself moves its port here. A pin on either
+    /// family also keeps an `Unknown` verdict for the run (see
+    /// [`Judgement::expired`]).
+    tcp_port: [Option<u32>; 2],
+    at: tokio::time::Instant,
+}
+
+impl Judgement {
+    /// An `Unknown` that pins no port on either family — a lost datagram, a
+    /// response a shade past the timeout, a record naming no address from a
+    /// node that never pinged us — no longer stands past
+    /// [`UNKNOWN_VERDICT_TTL`]; one that pins a port stands for the run, so
+    /// the pin is never forgotten with it: a record with an address but no
+    /// `eth` entry (the EF NodeOps bootnodes), or a record silent about the
+    /// node's family from a node whose own Ping claimed its port (an expiring
+    /// pin would reopen the hearsay hole it closes). Its fork id is then not
+    /// re-checked this run — the eth Status check at the handshake still is.
+    fn expired(&self, now: tokio::time::Instant) -> bool {
+        self.verdict == Verdict::Unknown
+            && self.tcp_port == [None, None]
+            && now.duration_since(self.at) >= UNKNOWN_VERDICT_TTL
+    }
+}
+
+/// What `consider` finds on file for a sighted node.
+enum Seen {
+    Foreign,
+    /// Judged, with the port by the node's own word for this sighting's
+    /// address family (its record's, or its Ping's claim; see
+    /// [`Judgement::tcp_port`]), if any: handed over as is.
+    Judged(Option<u32>),
+    /// An expired `Unknown`: judged again.
+    Stale,
+    New,
+}
+
+/// The EIP-868 ENR exchange that feeds the fork-id filter (#539).
+struct EnrExchange {
+    filter: ForkFilter,
+    /// Our own record, as RLP, and the fork id it carries.
+    local: Vec<u8>,
+    local_seq: u64,
+    local_eth: Vec<u8>,
+    pending: HashMap<SocketAddr, PendingEnr>,
+    /// node id → what the exchange concluded about it (bounded).
+    verdicts: HashMap<Vec<u8>, Judgement>,
+    /// Endpoints whose pong we verified — with the key that signed it and
+    /// when: the bond that lets THAT node ask for our ENR. Keyed by address
+    /// and checked against the signer, as geth's `checkBond(id, ip)`: a bond
+    /// by address alone would let a spoofed source borrow a bootnode's.
+    bonded: HashMap<SocketAddr, Bond>,
+    counts: Arc<EnrCounts>,
+    logged_skipped: u64,
+    last_log: tokio::time::Instant,
+}
+
+impl EnrExchange {
+    fn new(
+        key: &NodeKey,
+        filter: ForkFilter,
+        counts: Arc<EnrCounts>,
+    ) -> Result<EnrExchange, String> {
+        let local_eth = filter.local_eth_entry(now_secs());
+        let local = local_enr_rlp(key, 1, &local_eth)?;
+        Ok(EnrExchange {
+            filter,
+            local,
+            local_seq: 1,
+            local_eth,
+            pending: HashMap::new(),
+            verdicts: HashMap::new(),
+            bonded: HashMap::new(),
+            counts,
+            logged_skipped: 0,
+            last_log: tokio::time::Instant::now(),
+        })
+    }
+
+    /// Re-sign our record when the fork schedule moved its `eth` entry.
+    fn refresh_local(&mut self, key: &NodeKey) {
+        let eth = self.filter.local_eth_entry(now_secs());
+        if eth == self.local_eth {
+            return;
+        }
+        match local_enr_rlp(key, self.local_seq + 1, &eth) {
+            Ok(local) => {
+                self.local = local;
+                self.local_seq += 1;
+                self.local_eth = eth;
+                tracing::info!(
+                    seq = self.local_seq,
+                    "discv4: our ENR follows the fork schedule"
+                );
+            }
+            Err(e) => tracing::debug!("discv4: could not re-sign our ENR: {e}"),
+        }
+    }
+
+    /// Whether `signer` at `addr` holds a fresh bond with us: its pong, signed
+    /// by that key, arrived within [`BOND_TTL`].
+    fn is_bonded(&self, addr: SocketAddr, signer: &[u8; 64], now: tokio::time::Instant) -> bool {
+        self.bonded
+            .get(&addr)
+            .is_some_and(|b| b.pubkey == *signer && now.duration_since(b.since) < BOND_TTL)
+    }
+
+    fn mark_bonded(&mut self, addr: SocketAddr, pubkey: [u8; 64], now: tokio::time::Instant) {
+        if self.bonded.len() >= BONDED_MAX {
+            self.bonded
+                .retain(|_, b| now.duration_since(b.since) < BOND_TTL);
+            if self.bonded.len() >= BONDED_MAX {
+                self.bonded.clear();
+            }
+        }
+        self.bonded.insert(addr, Bond { pubkey, since: now });
+    }
+
+    fn record(
+        &mut self,
+        node_id: Vec<u8>,
+        verdict: Verdict,
+        tcp_port: [Option<u32>; 2],
+        now: tokio::time::Instant,
+    ) {
+        if self.verdicts.len() >= ENR_VERDICTS_MAX {
+            self.verdicts.clear();
+        }
+        self.verdicts.insert(
+            node_id,
+            Judgement {
+                verdict,
+                tcp_port,
+                at: now,
+            },
+        );
+    }
+
+    fn skip_foreign(&self) {
+        self.counts.foreign.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The periodic summary line, when there is something new to say.
+    fn maybe_log(&mut self, now: tokio::time::Instant) {
+        if now.duration_since(self.last_log) < FILTER_LOG_INTERVAL {
+            return;
+        }
+        let (compatible, total, unjudged) = self.counts.snapshot();
+        if total > self.logged_skipped {
+            let known_foreign = self
+                .verdicts
+                .values()
+                .filter(|j| j.verdict == Verdict::Foreign)
+                .count();
+            tracing::info!(
+                skipped = total - self.logged_skipped,
+                total,
+                known_foreign,
+                compatible,
+                unjudged,
+                "discv4: nodes on other chains kept from the pool before any dial (ENR fork id)"
+            );
+            self.logged_skipped = total;
+        }
+        self.last_log = now;
+    }
 }
 
 impl ServiceLoop {
     async fn run(mut self, mut stop_rx: tokio::sync::watch::Receiver<bool>) {
         tracing::info!(port = self.local_port, "discv4 listening");
         // Bootstrap: ping all bootnodes; then refresh every 15 s (first at 10 s).
+        let now = tokio::time::Instant::now();
         for bootnode in self.bootnodes.clone() {
-            self.send_ping(bootnode).await;
+            if !self.fresh_ping_pending(bootnode, now) {
+                self.send_ping(bootnode).await;
+            }
         }
         let mut refresh = tokio::time::interval_at(
             tokio::time::Instant::now() + std::time::Duration::from_secs(10),
@@ -557,6 +1013,9 @@ impl ServiceLoop {
         // After a stall/sleep, catch up with ONE tick, not a burst of them —
         // otherwise we'd flood peers with a storm of FindNodes on wakeup.
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The ENR exchange's timeout sweep (a no-op without a filter).
+        let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = vec![0u8; RECV_BUF];
         loop {
             tokio::select! {
@@ -565,6 +1024,7 @@ impl ServiceLoop {
                     return;
                 }
                 _ = refresh.tick() => self.refresh().await,
+                _ = sweep.tick() => self.sweep_enr().await,
                 // `Some(addr) =` disables this branch once all senders drop
                 // (recv() → None fails the pattern) — no busy-loop at shutdown.
                 Some(addr) = self.probe_rx.recv() => self.probe(addr).await,
@@ -597,6 +1057,8 @@ impl ServiceLoop {
             TYPE_PING => self.handle_ping(p, sender).await,
             TYPE_PONG => self.handle_pong(p, sender).await,
             TYPE_NEIGHBORS => self.handle_neighbors(p, sender).await,
+            TYPE_ENR_REQUEST => self.handle_enr_request(p, sender).await,
+            TYPE_ENR_RESPONSE => self.handle_enr_response(p, sender).await,
             // FindNode inbound: deliberately unanswered (client-only stack).
             other => tracing::trace!(?other, %sender, "discv4 ignoring packet type"),
         }
@@ -620,25 +1082,55 @@ impl ServiceLoop {
         // The sender's advertised TCP port rides the Ping's FROM endpoint.
         // Java's Tuweni readInt is SIGNED: a 4-byte port with the high bit set
         // reads negative there and fails its `> 0` check, falling back to the
-        // UDP port — mirror that by accepting only 1..=i32::MAX.
+        // UDP port — mirror that by accepting only 1..=i32::MAX; otherwise the
+        // packet claims no port and `admit` falls back the same way.
         let tcp_port = match decode_ping_from_ports(&p.data) {
-            Ok((_, tcp)) if (1..=i32::MAX as u32).contains(&tcp) => tcp,
-            _ => u32::from(sender.port()),
+            Ok((_, tcp)) if (1..=i32::MAX as u32).contains(&tcp) => Some(tcp),
+            _ => None,
         };
-        self.admit(sender, tcp_port, p.sender_pubkey.to_vec()).await;
+        // Bond back when we have not (geth does): a node answers an
+        // ENRRequest only from a node whose pong it holds — and so do we — so
+        // the exchange needs the bond in both directions.
+        let now = tokio::time::Instant::now();
+        let bond_back = self
+            .enr
+            .as_ref()
+            .is_some_and(|e| !e.is_bonded(sender, &p.sender_pubkey, now))
+            && !self.fresh_ping_pending(sender, now);
+        if bond_back {
+            self.send_ping(sender).await;
+        }
+        // Its ping is in hand, so our pong is on its way: an ENRRequest now
+        // meets a node that counts us as bonded.
+        self.admit(sender, tcp_port, p.sender_pubkey.to_vec(), true)
+            .await;
     }
 
     async fn handle_pong(&mut self, p: Parsed, sender: SocketAddr) {
         let Ok(ping_hash) = decode_pong_ping_hash(&p.data) else {
             return;
         };
-        match self.pending_pings.remove(&sender) {
-            Some(expected) if expected == ping_hash => {
+        // Compare before removing: a pong for a ping this entry no longer
+        // records (a refresh or probe ping overwrote it) must not discard the
+        // bond in flight for the newer one.
+        let verified = self
+            .pending_pings
+            .get(&sender)
+            .is_some_and(|p| p.hash == ping_hash);
+        match verified
+            .then(|| self.pending_pings.remove(&sender))
+            .flatten()
+        {
+            Some(_) => {
                 tracing::debug!(%sender, "discv4 pong verified");
                 // NOTE (Java parity): no FindNode here — go-ethereum requires
                 // OUR pong to the bootnode's return Ping before it answers
                 // FindNode; the refresh loop issues FindNodes later.
-                self.admit(sender, u32::from(sender.port()), p.sender_pubkey.to_vec())
+                if let Some(enr) = self.enr.as_mut() {
+                    enr.mark_bonded(sender, p.sender_pubkey, tokio::time::Instant::now());
+                }
+                // A pong carries no TCP port: `admit` uses the one on file.
+                self.admit(sender, None, p.sender_pubkey.to_vec(), true)
                     .await;
             }
             _ => tracing::debug!(%sender, "discv4 unsolicited/mismatched pong"),
@@ -651,22 +1143,43 @@ impl ServiceLoop {
         };
         tracing::debug!(count = peers.len(), %sender, "discv4 neighbors");
         for peer in peers {
-            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port) else {
+            // Un-mapped like a datagram's sender: a relayer listing a node at
+            // `::ffff:a.b.c.d` lists its IPv4 endpoint (geth reads it so too),
+            // and the exchange keys pendings and port pins by family.
+            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port).map(canonical_addr) else {
                 continue;
             };
             let entry = TableEntry {
-                ip: peer.ip,
+                ip: ip_bytes(addr.ip()),
                 udp_port: addr.port(),
                 tcp_port: peer.tcp_port,
                 node_id: peer.node_id,
                 last_seen_ms: now_ms(),
             };
-            self.emit(entry).await;
+            // Learned second-hand: no bond yet, so the exchange pings first.
+            self.consider(entry, false, None).await;
         }
     }
 
     /// Table-add + discovered-peer event for a directly-bonded sender.
-    async fn admit(&mut self, sender: SocketAddr, tcp_port: u32, node_id: Vec<u8>) {
+    /// `tcp_port`: the port the packet itself claims (a Ping's FROM endpoint),
+    /// or `None` when it claims nothing (a Pong): then the port on file for the
+    /// node — its NEIGHBORS entry's or its record's — and the UDP port only as
+    /// the last resort (Java parity). Before #539 a Pong's guess was one more
+    /// event beside the advertised one; with the exchange the pool sees one
+    /// entry per node, so a guess would replace the advertised port for good.
+    /// `bonded`: the remote holds our pong (see `consider`).
+    async fn admit(
+        &mut self,
+        sender: SocketAddr,
+        tcp_port: Option<u32>,
+        node_id: Vec<u8>,
+        bonded: bool,
+    ) {
+        let claim = tcp_port;
+        let tcp_port = tcp_port
+            .or_else(|| self.known_tcp_port(sender, &node_id))
+            .unwrap_or_else(|| u32::from(sender.port()));
         let entry = TableEntry {
             ip: ip_bytes(sender.ip()),
             udp_port: sender.port(),
@@ -674,7 +1187,349 @@ impl ServiceLoop {
             node_id,
             last_seen_ms: now_ms(),
         };
-        self.emit(entry).await;
+        self.consider(entry, bonded, claim).await;
+    }
+
+    /// The TCP port on file for the node at `addr`: its pending entry's (a
+    /// NEIGHBORS port or its own Ping's), else its routing-table entry's.
+    fn known_tcp_port(&self, addr: SocketAddr, node_id: &[u8]) -> Option<u32> {
+        if let Some(p) = self.enr.as_ref().and_then(|e| e.pending.get(&addr)) {
+            return Some(p.entry.tcp_port);
+        }
+        self.table
+            .lock()
+            .ok()
+            .and_then(|t| t.get(node_id).map(|e| e.tcp_port))
+    }
+
+    /// Hand a discovered node to the pool — at once without a filter or with a
+    /// verdict in hand; otherwise after its ENR (or [`ENR_TIMEOUT`]).
+    /// `bonded`: the remote has our pong (its ping or pong just arrived), so an
+    /// ENRRequest goes out now; else we ping first and ask when it answers.
+    /// `claim`: the TCP port the packet itself claimed — a Ping's FROM
+    /// endpoint, the node's own signed word — or `None` for a Pong (claims
+    /// nothing) or a NEIGHBORS entry (a relayer's hearsay).
+    async fn consider(&mut self, entry: TableEntry, bonded: bool, claim: Option<u32>) {
+        let Some(enr) = self.enr.as_mut() else {
+            return self.emit(entry).await;
+        };
+        let now = tokio::time::Instant::now();
+        let seen = match enr.verdicts.get(&entry.node_id) {
+            Some(j) if j.verdict == Verdict::Foreign => Seen::Foreign,
+            Some(j) if j.expired(now) => Seen::Stale,
+            Some(j) => Seen::Judged(j.tcp_port[family(&entry.ip)]),
+            None => Seen::New,
+        };
+        match seen {
+            Seen::Foreign => {
+                enr.skip_foreign();
+                // It may have entered the table unjudged earlier (see the gate
+                // below); the pool's below-target walk reads the table.
+                return self.forget(&entry.node_id);
+            }
+            Seen::Judged(record_port) => {
+                // The node's own word on its port for this family outlives the
+                // sighting (see `Judgement::tcp_port`): a relayer's hearsay
+                // yields to it, a Ping's own claim — fresher, and signed by
+                // the node — updates it, so a node that moved its port is
+                // followed and a relayer cannot move it.
+                let mut entry = entry;
+                match claim {
+                    Some(port) => {
+                        if let Some(j) = enr.verdicts.get_mut(&entry.node_id) {
+                            j.tcp_port[family(&entry.ip)] = Some(port);
+                        }
+                    }
+                    None => {
+                        if let Some(port) = record_port {
+                            entry.tcp_port = port;
+                        }
+                    }
+                }
+                return self.emit(entry).await;
+            }
+            Seen::Stale => {
+                enr.verdicts.remove(&entry.node_id); // judged again below
+            }
+            Seen::New => {}
+        }
+        // At target the pool dials nothing. A node already bonding with us is
+        // judged anyway — one request and one response — but a node learned
+        // second-hand from NEIGHBORS is not pinged for a verdict nobody needs
+        // yet: it goes over as before, and is judged when it is next seen
+        // while the pool wants candidates.
+        let pool_wants = self
+            .pool_below_target
+            .as_ref()
+            .is_none_or(|f| f.load(Ordering::Relaxed));
+        if !pool_wants && !bonded {
+            return self.emit(entry).await;
+        }
+        let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
+            return;
+        };
+        let ask = match enr.pending.get_mut(&addr) {
+            Some(p) => {
+                // The newest sighting, with the port by precedence: the node's
+                // own claim (a Ping's FROM endpoint) stands over any later
+                // hearsay — a relayer's NEIGHBORS inside the judging window
+                // must not displace it — while hearsay may replace a port that
+                // was itself hearsay or a guess.
+                let port = match claim {
+                    Some(port) => {
+                        p.claimed = true;
+                        port
+                    }
+                    None if p.claimed => p.entry.tcp_port,
+                    None => entry.tcp_port,
+                };
+                p.entry = entry;
+                p.entry.tcp_port = port;
+                bonded && p.hashes.len() < usize::from(ENR_REQUESTS_MAX)
+            }
+            None => {
+                if enr.pending.len() >= ENR_PENDING_MAX {
+                    // Fail open under load: the pool's Status check still rules.
+                    enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                    return self.emit(entry).await;
+                }
+                enr.pending.insert(
+                    addr,
+                    PendingEnr {
+                        entry,
+                        hashes: Vec::new(),
+                        since: tokio::time::Instant::now(),
+                        claimed: claim.is_some(),
+                    },
+                );
+                if !bonded && !self.fresh_ping_pending(addr, tokio::time::Instant::now()) {
+                    self.send_ping(addr).await;
+                }
+                bonded
+            }
+        };
+        if ask {
+            self.send_enr_request(addr).await;
+        }
+    }
+
+    async fn send_enr_request(&mut self, to: SocketAddr) {
+        let Ok(packet) = encode_enr_request(&self.key, expiry_now()) else {
+            return;
+        };
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&packet[..32]);
+        if let Some(p) = self.enr.as_mut().and_then(|e| e.pending.get_mut(&to)) {
+            if p.hashes.len() >= usize::from(ENR_REQUESTS_MAX) {
+                p.hashes.remove(0);
+            }
+            p.hashes.push(hash);
+        }
+        let _ = self.send_to(&packet, to).await;
+    }
+
+    /// Answer with our record, to a node whose pong we hold — without the bond
+    /// check we would amplify a spoofed source's traffic (geth `checkBond`) —
+    /// and no more often than we answer its Pings.
+    async fn handle_enr_request(&mut self, p: Parsed, sender: SocketAddr) {
+        // Expired requests are ignored (geth `errExpired`): a captured one must
+        // not be replayable for the bond's whole hour.
+        match decode_enr_request_expiry(&p.data) {
+            Ok(expiry) if expiry >= now_secs() => {}
+            _ => return,
+        }
+        let now = tokio::time::Instant::now();
+        let Some(local) = self
+            .enr
+            .as_ref()
+            .filter(|e| e.is_bonded(sender, &p.sender_pubkey, now))
+            .map(|e| e.local.clone())
+        else {
+            tracing::trace!(%sender, "discv4 ENRRequest from an unbonded node, ignored");
+            return;
+        };
+        // Each answer is a signature and a reflected record: a bonded node gets
+        // the Ping budget (5 per 10 s per IP), not line rate for its bond's
+        // hour. After the bond check, so unbonded noise from an address cannot
+        // spend the budget of the node bonded there.
+        if self.enr_limiter.is_limited(sender.ip(), now_ms()) {
+            tracing::debug!(%sender, "discv4 rate-limited ENRRequest");
+            return;
+        }
+        if let Ok(packet) = encode_enr_response(&self.key, &p.hash, &local) {
+            let _ = self.send_to(&packet, sender).await;
+        }
+    }
+
+    async fn handle_enr_response(&mut self, p: Parsed, sender: SocketAddr) {
+        let Some(enr) = self.enr.as_mut() else {
+            return;
+        };
+        // Is anyone waiting on this sender at all? Before any parsing, so an
+        // unsolicited packet costs nothing more than the signature check.
+        let Some(pending) = enr.pending.get(&sender) else {
+            tracing::trace!(%sender, "discv4 unsolicited ENRResponse");
+            return;
+        };
+        let Ok((request_hash, raw)) = decode_enr_response(&p.data) else {
+            return;
+        };
+        if !pending.hashes.contains(&request_hash) {
+            tracing::trace!(%sender, "discv4 ENRResponse to an unknown request");
+            return;
+        }
+        let remote = match decode_enr(&raw, &p.sender_pubkey) {
+            Ok(r) => r,
+            Err(e) => {
+                // Not ours to judge: the node stays pending and times out into
+                // the pool unjudged.
+                tracing::debug!(%sender, "discv4 ENRResponse not usable: {e}");
+                return;
+            }
+        };
+        let Some(mut pending) = enr.pending.remove(&sender) else {
+            return;
+        };
+        // The record's identity is the packet's signer (decode_enr). A
+        // NEIGHBORS entry may have carried a stale key for this address: the
+        // signer is the node that is actually there, so the verdict is recorded
+        // under it and the pool dials it by it.
+        if pending.entry.node_id != p.sender_pubkey {
+            tracing::debug!(%sender, "discv4: ENR signer differs from the advertised node id; using the signer");
+            pending.entry.node_id = p.sender_pubkey.to_vec();
+        }
+        // The record is the node's own word on where it listens, per address
+        // family (`tcp` for IPv4; `tcp6`, else `tcp`, for IPv6): it beats the
+        // NEIGHBORS entry's hearsay and any port `admit` fell back to. A
+        // family on which the node takes no TCP connections (the EF NodeOps
+        // bootnodes) gets port 0: the node stays in the table as a source of
+        // neighbours and is never dialed there — the pool refuses port 0, as
+        // geth refuses such a node (`errNoPort`). Where the record is silent
+        // about a family, it says nothing about that endpoint.
+        let words = [false, true].map(|v6| remote.tcp_word_for(v6).map(u32::from));
+        let fam = family(&pending.entry.ip);
+        // What the judgement pins, per family: the record's word; for the
+        // family the node was reached at, where the record is silent, its own
+        // Ping claim; never hearsay. A node can be pending at two addresses at
+        // once (a dual-stack node, a restart on another port): where this
+        // record is silent, a pin the other pending's judgement left — that
+        // node's own word too — stays. Only pendings created before the first
+        // judgement can meet here, within one ENR timeout of each other.
+        let mut pin = words;
+        if pin[fam].is_none() && pending.claimed {
+            pin[fam] = Some(pending.entry.tcp_port);
+        }
+        if let Some(prev) = enr.verdicts.get(&pending.entry.node_id) {
+            for (slot, kept) in pin.iter_mut().zip(prev.tcp_port) {
+                if slot.is_none() {
+                    *slot = kept;
+                }
+            }
+        }
+        if let Some(port) = pin[fam] {
+            pending.entry.tcp_port = port;
+        }
+        let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
+        enr.record(
+            pending.entry.node_id.clone(),
+            verdict,
+            pin,
+            tokio::time::Instant::now(),
+        );
+        match verdict {
+            Verdict::Foreign => {
+                tracing::debug!(
+                    %sender,
+                    seq = remote.seq,
+                    "discv4: node on another chain (ENR fork id), not handed to the pool"
+                );
+                enr.skip_foreign();
+                self.forget(&pending.entry.node_id);
+            }
+            Verdict::Compatible => {
+                enr.counts.compatible.fetch_add(1, Ordering::Relaxed);
+                self.emit(pending.entry).await;
+            }
+            Verdict::Unknown => {
+                enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                self.emit(pending.entry).await;
+            }
+        }
+    }
+
+    /// Hand over nodes whose ENR never came (fail open), forget stale bonds,
+    /// and say how many foreign nodes were kept from the pool.
+    async fn sweep_enr(&mut self) {
+        let now = tokio::time::Instant::now();
+        // Filter or no filter: pings whose pong is not coming must not pile up.
+        self.prune_pending_pings(now);
+        let Some(enr) = self.enr.as_mut() else {
+            return;
+        };
+        let expired: Vec<SocketAddr> = enr
+            .pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.since) >= ENR_TIMEOUT)
+            .map(|(a, _)| *a)
+            .collect();
+        let mut unjudged = Vec::with_capacity(expired.len());
+        for addr in expired {
+            let Some(p) = enr.pending.remove(&addr) else {
+                continue;
+            };
+            match enr.verdicts.get(&p.entry.node_id).copied() {
+                // Judged meanwhile at another of its addresses: that judgement
+                // stands — a timeout here must not hand a foreign node over,
+                // nor replace a verdict and its pins with an Unknown.
+                Some(j) if j.verdict == Verdict::Foreign => enr.skip_foreign(),
+                Some(j) => {
+                    let mut entry = p.entry;
+                    if let Some(port) = j.tcp_port[family(&entry.ip)] {
+                        entry.tcp_port = port;
+                    }
+                    unjudged.push(entry);
+                }
+                None => {
+                    // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node
+                    // is asked again at its first sighting after that.
+                    enr.record(p.entry.node_id.clone(), Verdict::Unknown, [None, None], now);
+                    enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                    unjudged.push(p.entry);
+                }
+            }
+        }
+        if enr.bonded.len() > BONDED_MAX / 2 {
+            enr.bonded
+                .retain(|_, b| now.duration_since(b.since) < BOND_TTL);
+        }
+        enr.maybe_log(now);
+        for entry in unjudged {
+            self.emit(entry).await;
+        }
+    }
+
+    /// Drop a node the filter placed on another chain from the routing table.
+    fn forget(&self, node_id: &[u8]) {
+        if let Ok(mut table) = self.table.lock() {
+            table.remove(node_id);
+        }
+    }
+
+    /// A ping to `addr` is in flight and may still be answered.
+    fn fresh_ping_pending(&self, addr: SocketAddr, now: tokio::time::Instant) -> bool {
+        self.pending_pings
+            .get(&addr)
+            .is_some_and(|p| now.duration_since(p.since) < PING_PENDING_TTL)
+    }
+
+    /// Drop pings whose pong is not coming; a map at its cap loses them all
+    /// rather than growing (a NEIGHBORS list is mostly nodes that never answer).
+    fn prune_pending_pings(&mut self, now: tokio::time::Instant) {
+        self.pending_pings
+            .retain(|_, p| now.duration_since(p.since) < PING_PENDING_TTL);
+        if self.pending_pings.len() >= PING_PENDING_MAX {
+            self.pending_pings.clear();
+        }
     }
 
     async fn emit(&mut self, entry: TableEntry) {
@@ -732,13 +1587,16 @@ impl ServiceLoop {
         }
         self.probed.insert(addr, now);
         tracing::debug!(%addr, "probing proven peer endpoint");
-        self.send_ping(addr).await;
+        if !self.fresh_ping_pending(addr, now) {
+            self.send_ping(addr).await;
+        }
         let self_target = self.key.public_key_bytes().to_vec();
         self.send_find_node(addr, &self_target).await;
     }
 
     /// 15 s refresh: empty table → re-ping bootnodes; else FindNode-self to
-    /// bootnodes + ping-then-FindNode(random target) to ≤ 10 random peers.
+    /// bootnodes + ping-then-FindNode(random target) to 10 random peers — 30
+    /// while the pool is below target, for a bounded run (`fan_out`).
     async fn refresh(&mut self) {
         let peers = self
             .table
@@ -747,8 +1605,13 @@ impl ServiceLoop {
             .unwrap_or_default();
         tracing::debug!(table = peers.len(), "discv4 refresh");
         if peers.is_empty() {
+            let now = tokio::time::Instant::now();
             for bootnode in self.bootnodes.clone() {
-                self.send_ping(bootnode).await;
+                // Not over a bond in flight (the previous refresh's ping is
+                // inside its 20 s expiry when the next one fires).
+                if !self.fresh_ping_pending(bootnode, now) {
+                    self.send_ping(bootnode).await;
+                }
             }
             return;
         }
@@ -756,13 +1619,28 @@ impl ServiceLoop {
         for bootnode in self.bootnodes.clone() {
             self.send_find_node(bootnode, &self_target).await;
         }
+        if let Some(enr) = self.enr.as_mut() {
+            enr.refresh_local(&self.key);
+        }
+        // Below target the pool wants candidates faster than ten peers' worth
+        // of neighbours per 15 s (#539) — for a bounded while (`fan_out`).
+        let below = self
+            .pool_below_target
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed));
+        let fan_out = fan_out(&mut self.wide, below, tokio::time::Instant::now());
         let mut random_target = [0u8; 64];
         let _ = getrandom::getrandom(&mut random_target);
-        for entry in sample(&peers, 10) {
+        let now = tokio::time::Instant::now();
+        for entry in sample(&peers, fan_out) {
             let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
                 continue;
             };
-            self.send_ping(addr).await;
+            // Never over a bond in flight: a second ping would make the first
+            // pong unverifiable.
+            if !self.fresh_ping_pending(addr, now) {
+                self.send_ping(addr).await;
+            }
             self.send_find_node(addr, &random_target).await;
         }
     }
@@ -781,7 +1659,13 @@ impl ServiceLoop {
         };
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&packet[..32]);
-        self.pending_pings.insert(to, hash);
+        self.pending_pings.insert(
+            to,
+            PendingPing {
+                hash,
+                since: tokio::time::Instant::now(),
+            },
+        );
         let _ = self.send_to(&packet, to).await;
     }
 
@@ -907,6 +1791,875 @@ mod tests {
     }
 
     #[test]
+    fn enr_request_and_response_round_trip() {
+        use crate::el::enrfilter::{eth_entry_rlp, local_enr_rlp};
+        let k = key(5);
+        let request = encode_enr_request(&k, 100).unwrap();
+        let parsed = parse(&request).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_ENR_REQUEST);
+        assert_eq!(parsed.sender_pubkey, k.public_key_bytes());
+        let enr = local_enr_rlp(&k, 3, &eth_entry_rlp([1, 2, 3, 4], 0)).unwrap();
+        let response = encode_enr_response(&k, &parsed.hash, &enr).unwrap();
+        let parsed_response = parse(&response).unwrap();
+        assert_eq!(parsed_response.packet_type, TYPE_ENR_RESPONSE);
+        let (hash, raw) = decode_enr_response(&parsed_response.data).unwrap();
+        assert_eq!(hash, parsed.hash);
+        // The ENR comes back byte for byte: an ENR is canonical RLP.
+        assert_eq!(raw, enr);
+        assert!(decode_enr(&raw, &k.public_key_bytes()).is_ok());
+        // A response whose second item is not a list carries no ENR.
+        let bogus = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![0u8; 32]),
+            Item::Bytes(vec![1, 2, 3]),
+        ]));
+        assert!(decode_enr_response(&bogus).is_err());
+    }
+
+    #[test]
+    fn the_wide_fan_out_is_granted_per_below_target_episode_and_runs_out() {
+        let mut state = WideState::default();
+        let t0 = tokio::time::Instant::now();
+        // No pool hint: narrow.
+        assert_eq!(fan_out(&mut state, None, t0), REFRESH_SAMPLE);
+        // Below target: wide for WIDE_REFRESHES_MAX refreshes, then narrow.
+        for _ in 0..WIDE_REFRESHES_MAX {
+            assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE_WIDE);
+        }
+        assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), t0), REFRESH_SAMPLE);
+        // Back at target, then below again within the cooldown: no new budget.
+        let soon = t0 + std::time::Duration::from_secs(5 * 60);
+        assert_eq!(fan_out(&mut state, Some(false), soon), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), soon), REFRESH_SAMPLE);
+        // After the cooldown, a dip earns a fresh budget.
+        let later = t0 + WIDE_COOLDOWN;
+        assert_eq!(fan_out(&mut state, Some(false), later), REFRESH_SAMPLE);
+        assert_eq!(fan_out(&mut state, Some(true), later), REFRESH_SAMPLE_WIDE);
+    }
+
+    #[test]
+    fn the_table_forgets_a_node() {
+        let local = key(6);
+        let mut table = KademliaTable::new(local.node_id());
+        let entry = |n: u8| TableEntry {
+            ip: vec![10, 0, 0, n],
+            udp_port: 30303,
+            tcp_port: 30303,
+            node_id: vec![n; 64],
+            last_seen_ms: 0,
+        };
+        table.add(entry(1));
+        table.add(entry(2));
+        assert_eq!(table.get(&[1u8; 64]).map(|e| e.tcp_port), Some(30303));
+        table.remove(&[1u8; 64]);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.all_peers()[0].node_id, vec![2u8; 64]);
+        assert!(table.get(&[1u8; 64]).is_none());
+        table.remove(&[9u8; 64]); // unknown: a no-op
+        assert_eq!(table.len(), 1);
+    }
+
+    /// Two services on loopback: the one that bootstraps from the other is
+    /// handed over only once its ENR says it is on the same chain. `None` for
+    /// B's filter = a node that neither asks for nor answers ENRs.
+    async fn loopback_pair(
+        a_filter: ForkFilter,
+        b_filter: Option<ForkFilter>,
+    ) -> (
+        Discv4Service,
+        Discv4Service,
+        tokio::sync::mpsc::Receiver<TableEntry>,
+        [u8; 64],
+    ) {
+        let a_key = Arc::new(key(11));
+        let b_key = Arc::new(key(12));
+        let (a_tx, a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(a_filter),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::channel(16);
+        let b = Discv4Service::start(
+            Arc::clone(&b_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: vec![SocketAddr::from(([127, 0, 0, 1], a.local_port()))],
+                fork_filter: b_filter,
+                pool_below_target: None,
+            },
+            b_tx,
+        )
+        .await
+        .unwrap();
+        (a, b, a_rx, b_key.public_key_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_node_on_our_chain_is_handed_over_after_its_enr() {
+        let same = || ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0);
+        let (a, b, mut a_rx, b_id) = loopback_pair(same(), Some(same())).await;
+        // B pings A at start; A pongs, bonds back and asks for B's ENR; B
+        // answers once A's pong has bonded it; A judges B compatible and emits.
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A should hand B over within the ENR timeout")
+            .unwrap();
+        assert_eq!(entry.node_id, b_id.to_vec());
+        assert_eq!(a.foreign_skipped(), 0);
+        a.stop().await;
+        b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_node_on_another_chain_is_kept_from_the_pool() {
+        let (a, b, mut a_rx, _) = loopback_pair(
+            ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0),
+            Some(ForkFilter::for_chain([0x01, 0x02, 0x03, 0x04], 0)),
+        )
+        .await;
+        // Past the fail-open timeout and then some: nothing was emitted, and
+        // the skip was counted.
+        let got =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(2), a_rx.recv())
+                .await;
+        assert!(
+            got.is_err(),
+            "a foreign node must not reach the pool: {got:?}"
+        );
+        assert!(a.foreign_skipped() >= 1, "the skip is counted");
+        a.stop().await;
+        b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_answers_is_handed_over_unjudged_after_the_timeout() {
+        // B runs no exchange at all (no filter): it never answers A's
+        // ENRRequests. A must hand it over anyway, once the timeout passes —
+        // the fail-open the design's "dialed as before" rests on.
+        let (a, b, mut a_rx, b_id) =
+            loopback_pair(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0), None).await;
+        let started = tokio::time::Instant::now();
+        let entry =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(3), a_rx.recv())
+                .await
+                .expect("A should hand B over after the ENR timeout")
+                .unwrap();
+        assert_eq!(entry.node_id, b_id.to_vec());
+        assert!(
+            started.elapsed() >= ENR_TIMEOUT - std::time::Duration::from_millis(200),
+            "handed over only after the timeout: {:?}",
+            started.elapsed()
+        );
+        let (compatible, foreign, unjudged) = a.enr_counts().snapshot();
+        assert_eq!((compatible, foreign), (0, 0));
+        assert!(unjudged >= 1, "the timeout is counted as unjudged");
+        a.stop().await;
+        b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn enr_requests_are_answered_for_the_bonded_signer_only() {
+        let a_key = Arc::new(key(14));
+        let (a_tx, _a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let stranger = key(15);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 2048];
+        // 1. Never bonded: a valid, unexpired request gets no answer.
+        let request = encode_enr_request(&stranger, expiry_now()).unwrap();
+        sock.send_to(&request, a_addr).await.unwrap();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            sock.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            answered.is_err(),
+            "an unbonded ENRRequest must get no answer (amplification)"
+        );
+        // 2. Bond: ping A; A pongs and pings back; pong that ping. A now holds
+        //    our pong under the stranger's key, and answers our request.
+        let ping = encode_ping(
+            &stranger,
+            &[0, 0, 0, 0],
+            30303,
+            &[127, 0, 0, 1],
+            a.local_port(),
+            expiry_now(),
+        )
+        .unwrap();
+        sock.send_to(&ping, a_addr).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut bonded = false;
+        let mut answered_enr = false;
+        while tokio::time::Instant::now() < deadline && !answered_enr {
+            let Ok(Ok((n, from))) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), sock.recv_from(&mut buf))
+                    .await
+            else {
+                continue;
+            };
+            let Ok(p) = parse(&buf[..n]) else { continue };
+            match p.packet_type {
+                TYPE_PING => {
+                    let pong = encode_pong(
+                        &stranger,
+                        &[127, 0, 0, 1],
+                        from.port(),
+                        &p.hash,
+                        expiry_now(),
+                    )
+                    .unwrap();
+                    sock.send_to(&pong, from).await.unwrap();
+                    bonded = true;
+                    let request = encode_enr_request(&stranger, expiry_now()).unwrap();
+                    sock.send_to(&request, from).await.unwrap();
+                }
+                TYPE_ENR_RESPONSE => {
+                    let (_, raw) = decode_enr_response(&p.data).unwrap();
+                    assert!(
+                        decode_enr(&raw, &a_key.public_key_bytes()).is_ok(),
+                        "A's own record"
+                    );
+                    answered_enr = true;
+                }
+                _ => {} // A's pong, and its ENRRequest to us
+            }
+        }
+        assert!(bonded, "A should ping back a node that pinged it");
+        assert!(
+            answered_enr,
+            "A should answer the bonded signer's ENRRequest"
+        );
+        // 3. The same address, another key: a spoofed source cannot borrow the
+        //    bond (geth checkBond(id, ip)).
+        let impostor = key(16);
+        let request = encode_enr_request(&impostor, expiry_now()).unwrap();
+        sock.send_to(&request, a_addr).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok((n, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                sock.recv_from(&mut buf),
+            )
+            .await
+            else {
+                continue;
+            };
+            if let Ok(p) = parse(&buf[..n]) {
+                assert_ne!(
+                    p.packet_type, TYPE_ENR_RESPONSE,
+                    "another key must not borrow the bond"
+                );
+            }
+        }
+        a.stop().await;
+    }
+
+    /// The record a raw node answers A's ENRRequest with — on A's chain
+    /// unless said otherwise.
+    #[derive(Clone, Copy)]
+    enum RawRecord {
+        /// No address, no port: the record says nothing about its endpoint.
+        Bare,
+        /// Listening on this TCP port.
+        Tcp(u16),
+        /// An address and a UDP port, no TCP port — the discovery-only shape;
+        /// with or without an `eth` entry (the EF NodeOps bootnodes have none).
+        DiscoveryOnly { eth: bool },
+        /// An IPv6 address and UDP port only, with or without an IPv6-specific
+        /// TCP port (`tcp6`) — while the node talks to A over IPv4.
+        V6Only { tcp6: Option<u16> },
+        /// Both addresses and UDP ports, and a TCP port for IPv6 only.
+        DualStack { tcp6: u16 },
+    }
+
+    /// Play a node for `a` over a raw socket: announce ourselves to A in a
+    /// NEIGHBORS packet as listening on `advertised_tcp`, pong A's ping, and
+    /// answer A's ENRRequest with `record`. Returns the entry A hands to its
+    /// pool.
+    async fn raw_node_round(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        advertised_tcp: u32,
+        record: RawRecord,
+    ) -> TableEntry {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let our_udp = sock.local_addr().unwrap().port();
+        let mut secret = node.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let mut builder = Enr::<CombinedKey>::builder();
+        builder.seq(1);
+        if !matches!(record, RawRecord::DiscoveryOnly { eth: false }) {
+            builder.add_value_rlp(
+                "eth",
+                alloy_rlp::Bytes::from(eth_entry_rlp([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+            );
+        }
+        match record {
+            RawRecord::DiscoveryOnly { .. } => {
+                builder.ip4([127, 0, 0, 1].into()).udp4(our_udp);
+            }
+            RawRecord::Tcp(tcp) => {
+                builder.tcp4(tcp);
+            }
+            RawRecord::V6Only { tcp6 } => {
+                builder.ip6(std::net::Ipv6Addr::LOCALHOST).udp6(our_udp);
+                if let Some(port) = tcp6 {
+                    builder.tcp6(port);
+                }
+            }
+            RawRecord::DualStack { tcp6 } => {
+                builder
+                    .ip4([127, 0, 0, 1].into())
+                    .udp4(our_udp)
+                    .ip6(std::net::Ipv6Addr::LOCALHOST)
+                    .udp6(our_udp)
+                    .tcp6(tcp6);
+            }
+            RawRecord::Bare => {}
+        }
+        let record = alloy_rlp::encode(builder.build(&signing).unwrap());
+        // 1. NEIGHBORS, unsolicited (A takes any): "this node, at our UDP
+        //    port, listens on advertised_tcp".
+        let data = rlp::encode(&Item::List(vec![
+            Item::List(vec![Item::List(vec![
+                Item::Bytes(vec![127, 0, 0, 1]),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(our_udp))),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
+                Item::Bytes(node.public_key_bytes().to_vec()),
+            ])]),
+            Item::Bytes(rlp::u64_to_minimal_be(expiry_now())),
+        ]));
+        let neighbors = encode_packet(node, TYPE_NEIGHBORS, &data).unwrap();
+        sock.send_to(&neighbors, a_addr).await.unwrap();
+        // 2. A pings first (we are second-hand); pong it. Bonded, A asks for
+        //    our record; answer it. A judges us compatible and hands us over.
+        let mut buf = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                got = a_rx.recv() => return got.expect("A's event channel"),
+                recv = tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)) => {
+                    let (n, from) = recv.expect("A handed nothing over within 5 s").unwrap();
+                    let Ok(p) = parse(&buf[..n]) else { continue };
+                    match p.packet_type {
+                        TYPE_PING => {
+                            let pong = encode_pong(
+                                node,
+                                &[127, 0, 0, 1],
+                                from.port(),
+                                &p.hash,
+                                expiry_now(),
+                            )
+                            .unwrap();
+                            sock.send_to(&pong, from).await.unwrap();
+                        }
+                        TYPE_ENR_REQUEST => {
+                            let response = encode_enr_response(node, &p.hash, &record).unwrap();
+                            sock.send_to(&response, from).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pong_keeps_the_advertised_tcp_port_and_the_record_overrides_it() {
+        let a_key = Arc::new(key(17));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // A node whose record names no port: the port its NEIGHBORS entry
+        // advertised survives its pong — which carries none — to the pool.
+        let quiet = key(18);
+        let entry = raw_node_round(&a, &mut a_rx, &quiet, 40404, RawRecord::Bare).await;
+        assert_eq!(entry.node_id, quiet.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 40404,
+            "a pong must not replace the advertised TCP port with the UDP port"
+        );
+        // A node whose record names its port: the signed record beats the
+        // NEIGHBORS hearsay.
+        let outspoken = key(19);
+        let entry = raw_node_round(&a, &mut a_rx, &outspoken, 40404, RawRecord::Tcp(50505)).await;
+        assert_eq!(entry.node_id, outspoken.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 50505,
+            "the node's own record names the port to dial"
+        );
+        // A node whose record names an address and a UDP port but no TCP port
+        // is discovery-only: handed over at port 0, which the pool refuses,
+        // whatever NEIGHBORS claimed.
+        let discovery_only = key(20);
+        let entry = raw_node_round(&a, &mut a_rx, &discovery_only, 40404, RawRecord::DiscoveryOnly { eth: true }).await;
+        assert_eq!(entry.node_id, discovery_only.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 0, "a record with an address and no TCP port is never dialed");
+        // Re-learned from a relayer's NEIGHBORS with other ports: the record's
+        // word outlives the sighting — the discovery-only node stays at port
+        // 0, the outspoken one at its record's port; only the node whose
+        // record named no address takes the hearsay.
+        let entry = reannounce(&a, &mut a_rx, &discovery_only, 30303).await;
+        assert_eq!(entry.tcp_port, 0, "hearsay must not put a discovery-only node back on the dial list");
+        let entry = reannounce(&a, &mut a_rx, &outspoken, 30303).await;
+        assert_eq!(entry.tcp_port, 50505, "hearsay must not replace the port the record named");
+        let entry = reannounce(&a, &mut a_rx, &quiet, 41414).await;
+        assert_eq!(entry.tcp_port, 41414, "a record that named no address leaves the port to the sighting");
+        // The EF NodeOps bootnodes' exact shape: an address, no TCP port, no
+        // `eth` entry — unjudged, handed over at port 0, and the pin holds on
+        // a relayer's re-announcement (an Unknown with a record in hand does
+        // not expire).
+        let (compatible_before, _, unjudged_before) = a.enr_counts().snapshot();
+        let bootnode_like = key(24);
+        let entry = raw_node_round(&a, &mut a_rx, &bootnode_like, 30303, RawRecord::DiscoveryOnly { eth: false }).await;
+        assert_eq!(entry.tcp_port, 0);
+        let (compatible, _, unjudged) = a.enr_counts().snapshot();
+        assert_eq!((compatible, unjudged), (compatible_before, unjudged_before + 1), "no eth entry: unjudged");
+        let entry = reannounce(&a, &mut a_rx, &bootnode_like, 30303).await;
+        assert_eq!(entry.tcp_port, 0, "the pin holds for an unjudged record too");
+        // The node's own Ping claims a new port: fresher than its record and
+        // signed by it, so it wins — and a relayer still cannot move it.
+        let entry = ping_claiming(&a, &mut a_rx, &outspoken, 50506).await;
+        assert_eq!(entry.tcp_port, 50506, "a Ping's own claim follows a moved port");
+        let entry = reannounce(&a, &mut a_rx, &outspoken, 30303).await;
+        assert_eq!(entry.tcp_port, 50506, "the claim is kept against later hearsay");
+        a.stop().await;
+    }
+
+    /// `node` pings `a` from a fresh socket, its FROM endpoint claiming
+    /// `claimed_tcp`; returns what A hands over for it.
+    async fn ping_claiming(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        claimed_tcp: u16,
+    ) -> TableEntry {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // `encode_ping` writes the FROM endpoint's UDP port as its TCP port too.
+        let ping = encode_ping(node, &[0, 0, 0, 0], claimed_tcp, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        sock.send_to(&ping, a_addr).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands a pinging judged node over at once")
+            .unwrap()
+    }
+
+    /// A relayer's NEIGHBORS to `a`, from a fresh socket: `node` at
+    /// 127.0.0.1:`udp_port`, claiming `advertised_tcp`.
+    async fn relay_neighbors(a: &Discv4Service, node: &NodeKey, udp_port: u16, advertised_tcp: u32) {
+        relay_neighbors_at(a, node, &[127, 0, 0, 1], udp_port, advertised_tcp).await;
+    }
+
+    /// The same, listing `node` at `ip` (4 or 16 bytes): only the list names
+    /// the address — the packet itself travels over IPv4 loopback.
+    async fn relay_neighbors_at(
+        a: &Discv4Service,
+        node: &NodeKey,
+        ip: &[u8],
+        udp_port: u16,
+        advertised_tcp: u32,
+    ) {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let data = rlp::encode(&Item::List(vec![
+            Item::List(vec![Item::List(vec![
+                Item::Bytes(ip.to_vec()),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(udp_port))),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
+                Item::Bytes(node.public_key_bytes().to_vec()),
+            ])]),
+            Item::Bytes(rlp::u64_to_minimal_be(expiry_now())),
+        ]));
+        let relayer = key(99);
+        let packet = encode_packet(&relayer, TYPE_NEIGHBORS, &data).unwrap();
+        sock.send_to(&packet, a_addr).await.unwrap();
+    }
+
+    /// Announce `node` to `a` again — a relayer's NEIGHBORS naming a fresh UDP
+    /// port and `advertised_tcp` — and return what A hands over.
+    async fn reannounce(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        advertised_tcp: u32,
+    ) -> TableEntry {
+        let fresh = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        relay_neighbors(a, node, fresh.local_addr().unwrap().port(), advertised_tcp).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands a judged node over at once")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pings_own_port_claim_survives_hearsay_inside_the_judging_window() {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        // Node X pings A claiming port 50507; before X answers A's ENRRequest,
+        // a relayer's NEIGHBORS lists X with 30303. X's record names no
+        // address, so the claim is all A has on X's port: it must survive the
+        // hearsay, and be pinned against later hearsay.
+        let a_key = Arc::new(key(25));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(26);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let our_udp = sock.local_addr().unwrap().port();
+        let record = {
+            let mut secret = x.secret_bytes();
+            let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+            let mut b = Enr::<CombinedKey>::builder();
+            b.seq(1).add_value_rlp(
+                "eth",
+                alloy_rlp::Bytes::from(eth_entry_rlp([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+            );
+            alloy_rlp::encode(b.build(&signing).unwrap())
+        };
+        // 1. X pings A, its FROM endpoint claiming TCP 50507.
+        let ping = encode_ping(&x, &[0, 0, 0, 0], 50507, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        sock.send_to(&ping, a_addr).await.unwrap();
+        // 2. A's ENRRequest arrives: A holds the claim and awaits the record.
+        let mut buf = [0u8; 2048];
+        let request = loop {
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("A asks X for its record")
+                .unwrap();
+            if let Ok(p) = parse(&buf[..n]) {
+                if p.packet_type == TYPE_ENR_REQUEST {
+                    break p;
+                }
+            }
+        };
+        // 3. Hearsay inside the window: a relayer lists X with another port.
+        relay_neighbors(&a, &x, our_udp, 30303).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 4. X answers with a record that names no address.
+        let response = encode_enr_response(&x, &request.hash, &record).unwrap();
+        sock.send_to(&response, a_addr).await.unwrap();
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands X over")
+            .unwrap();
+        assert_eq!(entry.node_id, x.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 50507,
+            "the node's own claim survives a relayer's hearsay inside the judging window"
+        );
+        // 5. And it is pinned: later hearsay does not move it.
+        let entry = reannounce(&a, &mut a_rx, &x, 30303).await;
+        assert_eq!(entry.tcp_port, 50507, "the claim is pinned against later hearsay");
+        a.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_pool_gate_judges_second_hand_nodes_below_target_only() {
+        // The pool's flag (part 1's maintainer sets it each tick): at target a
+        // node learned from NEIGHBORS goes over unjudged, without a ping;
+        // below target it is judged first.
+        let below_target = Arc::new(AtomicBool::new(false));
+        let a_key = Arc::new(key(21));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: Some(Arc::clone(&below_target)),
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // At target: handed over at once with the hearsay port, nothing judged.
+        let at_target = key(22);
+        let entry = raw_node_round(&a, &mut a_rx, &at_target, 40404, RawRecord::Tcp(50505)).await;
+        assert_eq!(entry.node_id, at_target.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 40404, "at target the sighting goes over as it came");
+        assert_eq!(a.enr_counts().snapshot(), (0, 0, 0), "nothing was judged at target");
+        // Below target: pinged, asked, judged — the record's port arrives.
+        below_target.store(true, Ordering::Relaxed);
+        let wanted = key(23);
+        let entry = raw_node_round(&a, &mut a_rx, &wanted, 40404, RawRecord::Tcp(50505)).await;
+        assert_eq!(entry.node_id, wanted.public_key_bytes().to_vec());
+        assert_eq!(entry.tcp_port, 50505, "below target the record is asked for first");
+        assert_eq!(a.enr_counts().snapshot(), (1, 0, 0));
+        a.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_records_port_is_read_for_the_family_the_node_is_seen_at() {
+        // EIP-778, as geth reads it: `tcp` for IPv4; `tcp6`, else `tcp`, for
+        // IPv6; and an address with no TCP port at all means no TCP anywhere.
+        // Each raw node talks to A over IPv4 loopback, announced by NEIGHBORS
+        // with TCP 40404.
+        let a_key = Arc::new(key(27));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // An IPv6-only record with its own port: silent about IPv4 — `tcp6`
+        // never stands in for it — so the NEIGHBORS port stands.
+        let v6_only = key(28);
+        let entry = raw_node_round(&a, &mut a_rx, &v6_only, 40404, RawRecord::V6Only { tcp6: Some(50509) }).await;
+        assert_eq!(entry.tcp_port, 40404, "a tcp6 port is no IPv4 port");
+        // An IPv6-only record with no TCP port at all: no TCP on IPv4 either.
+        let v6_silent = key(29);
+        let entry = raw_node_round(&a, &mut a_rx, &v6_silent, 40404, RawRecord::V6Only { tcp6: None }).await;
+        assert_eq!(entry.tcp_port, 0, "no TCP port at all means none on any family");
+        // Both addresses, a port for IPv6 only: never dialed on IPv4 (geth
+        // `errNoPort`); and when a relayer lists its IPv6 address, the
+        // record's IPv6 port — the IPv4 pin does not cross families.
+        let dual = key(30);
+        let entry = raw_node_round(&a, &mut a_rx, &dual, 40404, RawRecord::DualStack { tcp6: 50510 }).await;
+        assert_eq!(entry.tcp_port, 0, "the record names IPv4 and no TCP port for it");
+        relay_neighbors_at(&a, &dual, &std::net::Ipv6Addr::LOCALHOST.octets(), 30303, 30303).await;
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands the judged node over at once")
+            .unwrap();
+        assert_eq!(entry.ip.len(), 16);
+        assert_eq!(entry.tcp_port, 50510, "on IPv6 the record's tcp6, not the IPv4 pin");
+        let entry = reannounce(&a, &mut a_rx, &dual, 30303).await;
+        assert_eq!(entry.tcp_port, 0, "and on IPv4 still none");
+        // A relayer listing it at its v4-mapped IPv6 address lists its IPv4
+        // endpoint: un-mapped, and still none — not the IPv6 pin.
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets();
+        relay_neighbors_at(&a, &dual, &mapped, 30303, 30303).await;
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands the judged node over at once")
+            .unwrap();
+        assert_eq!(entry.ip, vec![127, 0, 0, 1], "a v4-mapped listing is un-mapped");
+        assert_eq!(entry.tcp_port, 0, "and reads the IPv4 pin");
+        a.stop().await;
+    }
+
+    /// A, filtering on `[0xaa, 0xbb, 0xcc, 0xdd]` and judging every node (no
+    /// pool hint).
+    async fn filtered_node(n: u8) -> (Discv4Service, tokio::sync::mpsc::Receiver<TableEntry>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::new(key(n)),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        (a, rx)
+    }
+
+    /// A record for `node` that names no address, announcing fork hash `fork`.
+    fn bare_record(node: &NodeKey, fork: [u8; 4]) -> Vec<u8> {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        let mut secret = node.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let mut b = Enr::<CombinedKey>::builder();
+        b.seq(1)
+            .add_value_rlp("eth", alloy_rlp::Bytes::from(eth_entry_rlp(fork, 0)));
+        alloy_rlp::encode(b.build(&signing).unwrap())
+    }
+
+    /// The next entry A hands to its pool (5 s).
+    async fn handed_over(rx: &mut tokio::sync::mpsc::Receiver<TableEntry>) -> TableEntry {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("A hands the node over")
+            .unwrap()
+    }
+
+    /// The next packet of type `ty` A sends to a raw node's socket.
+    async fn await_packet(sock: &tokio::net::UdpSocket, ty: u8) -> Parsed {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("A sends the expected packet")
+                .unwrap();
+            if let Ok(p) = parse(&buf[..n]) {
+                if p.packet_type == ty {
+                    return p;
+                }
+            }
+        }
+    }
+
+    /// X pending at two addresses at once — two sockets, one key: a restart
+    /// on another port, a NAT rebinding, a dual-stack node's two families. At
+    /// `s1` X pinged A claiming TCP 50507, so A asks it for the record; at
+    /// `s2` a relayer listed X with 30303, so A pings it, and asks it too when
+    /// `s2_answers`. Returns A's ENRRequests to the two (`None` for a silent
+    /// `s2`).
+    async fn pending_at_two_addresses(
+        a: &Discv4Service,
+        x: &NodeKey,
+        s1: &tokio::net::UdpSocket,
+        s2: &tokio::net::UdpSocket,
+        s2_answers: bool,
+    ) -> (Parsed, Option<Parsed>) {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let ping = encode_ping(x, &[0, 0, 0, 0], 50507, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        s1.send_to(&ping, a_addr).await.unwrap();
+        let req1 = await_packet(s1, TYPE_ENR_REQUEST).await;
+        relay_neighbors(a, x, s2.local_addr().unwrap().port(), 30303).await;
+        let ping2 = await_packet(s2, TYPE_PING).await;
+        if !s2_answers {
+            return (req1, None);
+        }
+        let pong = encode_pong(x, &[127, 0, 0, 1], a.local_port(), &ping2.hash, expiry_now()).unwrap();
+        s2.send_to(&pong, a_addr).await.unwrap();
+        let req2 = await_packet(s2, TYPE_ENR_REQUEST).await;
+        (req1, Some(req2))
+    }
+
+    #[tokio::test]
+    async fn a_node_pending_at_two_addresses_keeps_its_own_claim() {
+        // X's record names no address, so its Ping's claim is all X said about
+        // its port: the second response must neither drop it nor hand X over
+        // at the relayer's port.
+        let (a, mut a_rx) = filtered_node(32).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(33);
+        let record = bare_record(&x, [0xaa, 0xbb, 0xcc, 0xdd]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, req2) = pending_at_two_addresses(&a, &x, &s1, &s2, true).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        assert_eq!(handed_over(&mut a_rx).await.tcp_port, 50507, "at s1, X's own claim");
+        s2.send_to(&encode_enr_response(&x, &req2.unwrap().hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let second = handed_over(&mut a_rx).await;
+        assert_eq!(second.udp_port, s2.local_addr().unwrap().port());
+        assert_eq!(second.tcp_port, 50507, "the second response keeps X's own claim");
+        let later = reannounce(&a, &mut a_rx, &x, 30303).await;
+        assert_eq!(later.tcp_port, 50507, "and later hearsay still yields to it");
+        a.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_at_another_address_does_not_undo_a_foreign_verdict() {
+        // X answers at s1 with another chain's record and never at s2: when
+        // s2's request times out, the foreign verdict stands — X is not handed
+        // over, and its verdict is not replaced by an Unknown.
+        let (a, mut a_rx) = filtered_node(34).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(35);
+        let foreign = bare_record(&x, [0x01, 0x02, 0x03, 0x04]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, _) = pending_at_two_addresses(&a, &x, &s1, &s2, false).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &foreign).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let got =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(2), a_rx.recv())
+                .await;
+        assert!(got.is_err(), "a timeout must not hand a foreign node over: {got:?}");
+        let (compatible, foreign_skips, unjudged) = a.enr_counts().snapshot();
+        assert_eq!((compatible, unjudged), (0, 0));
+        assert_eq!(foreign_skips, 2, "the verdict, and the second address skipped");
+        a.stop().await;
+    }
+
+    #[test]
+    fn an_unknown_verdict_expires_but_the_others_stand() {
+        let t0 = tokio::time::Instant::now();
+        let j = |verdict: Verdict| Judgement {
+            verdict,
+            tcp_port: [None, None],
+            at: t0,
+        };
+        let later = t0 + UNKNOWN_VERDICT_TTL;
+        assert!(!j(Verdict::Unknown).expired(t0 + UNKNOWN_VERDICT_TTL / 2));
+        assert!(j(Verdict::Unknown).expired(later));
+        assert!(!j(Verdict::Compatible).expired(later));
+        assert!(!j(Verdict::Foreign).expired(later));
+        // An Unknown with a record in hand — an address but no `eth` entry,
+        // the discovery-only bootnodes' shape — keeps its port pin for the run.
+        let with_record = Judgement {
+            verdict: Verdict::Unknown,
+            tcp_port: [Some(0), Some(0)],
+            at: t0,
+        };
+        assert!(!with_record.expired(later + UNKNOWN_VERDICT_TTL));
+        // So does one pinned on a single family.
+        let one_family = Judgement {
+            verdict: Verdict::Unknown,
+            tcp_port: [None, Some(30306)],
+            at: t0,
+        };
+        assert!(!one_family.expired(later + UNKNOWN_VERDICT_TTL));
+    }
+
+    #[test]
     fn parse_rejects_tampering() {
         let k = key(3);
         let mut packet = encode_find_node(&k, &k.public_key_bytes(), 100).unwrap();
@@ -981,5 +2734,32 @@ mod tests {
         assert!(!limiter.is_limited(ip, T0 + 11_000)); // window expired
         let other: IpAddr = "10.1.2.4".parse().unwrap();
         assert!(!limiter.is_limited(other, T0 + 10)); // per-IP isolation
+    }
+
+    #[test]
+    fn rate_limiter_is_bounded() {
+        const T0: u64 = 1_700_000_000_000;
+        let mut limiter = PingRateLimiter::default();
+        let ip = |n: u32| IpAddr::from(Ipv4Addr::from(n));
+        for n in 0..RATE_LIMIT_IPS_MAX as u32 {
+            assert!(!limiter.is_limited(ip(n), T0));
+        }
+        assert_eq!(limiter.rings.len(), RATE_LIMIT_IPS_MAX);
+        // A known source at the cap is still judged, not evicted around.
+        assert!(!limiter.is_limited(ip(0), T0 + 1));
+        assert_eq!(limiter.rings.len(), RATE_LIMIT_IPS_MAX);
+        // Once the window has passed every ring, a new source evicts the idle
+        // rings — which count nothing any more — rather than growing the map.
+        let later = T0 + PING_RATE_WINDOW_MS + 1;
+        assert!(!limiter.is_limited(ip(u32::MAX), later));
+        assert_eq!(limiter.rings.len(), 1);
+        // A flood of sources all live within the window is forgotten
+        // wholesale (fail open) instead of growing it.
+        for n in 0..RATE_LIMIT_IPS_MAX as u32 {
+            limiter.is_limited(ip(n), later);
+        }
+        assert!(limiter.rings.len() <= RATE_LIMIT_IPS_MAX);
+        assert!(!limiter.is_limited(ip(u32::MAX - 1), later));
+        assert!(limiter.rings.len() <= RATE_LIMIT_IPS_MAX);
     }
 }

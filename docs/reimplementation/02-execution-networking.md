@@ -9,7 +9,9 @@ Reference modules: `core/` and `networking/` (`com.jaeckel.ethp2p.core`, `…net
 
 > **Scope note.** The reference is a **client/dialer only**: it dials peers but never listens; it
 > sends discv4 Ping/FindNode but does **not** respond to FindNode and does **not** implement
-> ENRRequest/ENRResponse; it answers inbound `eth`/`snap` requests with **empty** responses (so
+> ENRRequest/ENRResponse (the Rust engine does implement the latter since #539 — it asks a
+> discovered node for its ENR to judge its chain before dialing, and answers bonded requesters);
+> it answers inbound `eth`/`snap` requests with **empty** responses (so
 > peers don't time out and disconnect). A re-implementation that also *serves* would need the
 > responder halves. For a wallet engine, client-only is correct and far simpler.
 
@@ -74,7 +76,7 @@ Types & bodies (`VERSION = 4`, `expiry = now + 20 s`; endpoint = `[ip(4|16), udp
 | FindNode | `0x03` | `[target(64-byte pubkey), expiry]` |
 | Neighbors | `0x04` | `[[ip, udp, tcp, nodeId], …], expiry]` (decode only) |
 
-(ENRRequest/ENRResponse `0x05/0x06` are not implemented.)
+(ENRRequest/ENRResponse `0x05/0x06`: not implemented in the Java reference; the Rust engine, since #539, sends ENRRequest `[expiration]` to bonded nodes and answers bonded requesters with ENRResponse `[request-hash, ENR]` — `rust/myotis-net/src/el/discv4.rs`, `enrfilter.rs`.)
 
 ### 2.2 Kademlia table
 
@@ -95,8 +97,9 @@ The table is behind a single lock.
 - The service binds a UDP socket with a **fixed 4096-byte receive buffer + 1 MB SO_RCVBUF**
   (NEIGHBORS packets are ~1.2 KB and default allocators truncate them on some stacks — notably
   Android/ART). Refresh every 15 s: if the table is empty re-ping bootnodes; else FindNode to
-  bootnodes (target = our own pubkey) and ping-then-FindNode to ≤10 random peers with a random
-  64-byte target to spread across the keyspace.
+  bootnodes (target = our own pubkey) and ping-then-FindNode to 10 random peers with a random
+  64-byte target to spread across the keyspace — 30 in the Rust engine for the first eight
+  refreshes of a below-target episode, once per 30 minutes (#539).
 
 ---
 
@@ -139,6 +142,19 @@ inbound UDP is dropped.
 The engine refreshes the resolved ENR pool periodically (rate-capped) and fork-filters it; it's the
 candidate pool the snap-peer maintainer dials from. Chains with no DNS tree (Gnosis) instead carry
 a list of full `enode://pubkey@host:port` constants for direct RLPx dialing.
+
+**Rust engine** (`rust/myotis-net/src/el/dnsdisco.rs`, #539 part 3): the same root verification
+and `e=` walk with the same lookup and depth caps (512 / 16) under a 15 s deadline (the Java
+twin's 10 s plus its 5 s grace), plus two checks the Java walk lacks — every record must hash to its label (base32 of `keccak256(text)[..16]`), and each leaf's
+own signature is verified (the `enr` crate's decoder). Leaves go through the discv4 fork-id filter
+(`enrfilter.rs`) first; a leaf naming no TCP port is a discv4 seed, never a dial candidate (geth
+`errNoPort`). Children are walked in random order (EIP-1459's advice), so a tree larger than one
+walk's budget is seen in a different part each walk. Transport: the system resolver through
+`hickory-resolver` (already in the lock via libp2p), 2 s per lookup, one attempt; no host-supplied
+server IPs and no public fallbacks yet, so the walk runs only where a host allows it
+(`myotis_set_dns_discovery`: desktop and daemon) and never while Tor is enabled. The pool dials
+the candidates 10 per maintainer tick (10 s) while below target, re-walks every 4 min while still
+short, and nudges up to 32 of the tree's UDP endpoints into discv4 as DHT seeds.
 
 ---
 
