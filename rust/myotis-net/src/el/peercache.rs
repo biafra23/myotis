@@ -16,13 +16,13 @@
 //!
 //! **Keys are canonical.** An entry is keyed by `ip\tport` with the IP in its
 //! canonical form: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d` — how a
-//! NEIGHBORS entry carrying a 16-byte IP, or a dual-stack socket, spells a v4
-//! peer) is keyed as the plain `a.b.c.d`. Every path computes the key through
-//! the same helper (`key`) — load, [`add`](ElPeerCache::add) and the
-//! `record_*` verdicts alike — so one node reached under both spellings holds
-//! ONE entry (one connect-failure streak, one quality verdict). A file that
-//! already holds both lines loads as one entry and is written back as one on
-//! the next flush.
+//! NEIGHBORS entry carrying a 16-byte IP spells a v4 peer; discv4 un-maps
+//! only the UDP sender itself) is keyed as the plain `a.b.c.d`. Every path
+//! computes the key through the same helper (`key`) — load,
+//! [`add`](ElPeerCache::add) and the `record_*` verdicts alike — so one node
+//! reached under both spellings holds ONE entry (one connect-failure streak,
+//! one quality verdict). A file that already holds both lines loads as one
+//! entry and is written back as one on the next flush.
 //!
 //! **Capability vs quality** (Java parity): the snap flag means the peer
 //! negotiated snap in Hello; it says nothing about whether it actually serves
@@ -254,11 +254,17 @@ impl ElPeerCache {
 
     /// Insert a line parsed from disk. Two lines land on one key when the file
     /// holds both spellings of a node (see the module doc — written while the
-    /// keys were split): for the same node id their verdicts are folded
-    /// together ([`Entry::absorb`]) and the cache is marked dirty, so the next
-    /// flush writes the node once. A different node id at the same endpoint is
-    /// a re-keyed node, not a second spelling: the later line replaces the
-    /// earlier one outright, as a duplicate key always did.
+    /// keys were split). For the same node id their verdicts are folded
+    /// together ([`Entry::absorb`]); this applies to any two lines of one node
+    /// id, an exact-duplicate spelling (a corrupt file) included, where the
+    /// later line used to win outright. A different node id at the same
+    /// endpoint is a re-keyed node, not a second spelling: the later line in
+    /// the file replaces the earlier one (verdicts are not folded across
+    /// identities), as a duplicate key always did. File order is key order
+    /// (`::ffff:` sorts after the plain spelling), not recency, so the id that
+    /// survives can be the stale one — the first successful handshake under
+    /// the live id sets it right ([`add`](Self::add)). Either way the cache is
+    /// marked dirty, so the next flush writes the node once.
     fn insert_loaded(&mut self, k: String, loaded: Entry) {
         match self.entries.get_mut(&k) {
             Some(e) if parse_pubkey(&e.pubkey_hex) == parse_pubkey(&loaded.pubkey_hex) => {
@@ -266,7 +272,9 @@ impl ElPeerCache {
                 self.dirty = true;
             }
             _ => {
-                self.entries.insert(k, loaded);
+                if self.entries.insert(k, loaded).is_some() {
+                    self.dirty = true;
+                }
             }
         }
     }
@@ -312,14 +320,21 @@ impl ElPeerCache {
 
     /// Record a peer that reached a READY session with capability `snap`. New
     /// peers enter as [`SnapQuality::Unknown`]; a re-add only updates the snap
-    /// flag (quality is driven by the serve/failure signals).
+    /// flag (quality is driven by the serve/failure signals). A DIFFERENT node
+    /// id at a cached endpoint — the handshake just authenticated it — is a
+    /// re-keyed node: the entry is replaced, verdicts included, since they were
+    /// earned by the previous identity (the rule `insert_loaded` applies to a
+    /// file). Without this a stale id would sit on the key for good: a dial
+    /// with it fails ECIES, and a success under the live id used to clear the
+    /// streak without touching the id, so the entry neither healed nor reached
+    /// eviction.
     pub fn add(&mut self, addr: SocketAddr, pubkey: &[u8; 64], snap: bool) {
         if self.path.is_none() {
             return;
         }
         let k = addr_key(addr);
         match self.entries.get_mut(&k) {
-            Some(e) => {
+            Some(e) if parse_pubkey(&e.pubkey_hex) == Some(*pubkey) => {
                 if e.snap != snap {
                     e.snap = snap;
                     self.dirty = true;
@@ -333,7 +348,10 @@ impl ElPeerCache {
                     self.dirty = true;
                 }
             }
-            None => {
+            _ => {
+                // New endpoint, or a re-keyed one: a fresh entry either way
+                // (and no snap-failure streak carried over from the old id).
+                self.failures.remove(&k);
                 self.entries.insert(
                     k,
                     Entry {
@@ -815,6 +833,82 @@ mod tests {
     }
 
     #[test]
+    fn lone_v4_mapped_line_loads_under_the_plain_key() {
+        // A file holding only the `::ffff:` spelling of a node (what a Rust
+        // engine wrote while the keys were split, for a node it never reached
+        // as plain v4) loads under the plain key: `peers()` dials the plain
+        // address, verdicts recorded under either spelling land on it, and a
+        // later `add` of the plain form does not duplicate it.
+        let hex = format!("0x{}", "ab".repeat(64));
+        let path = std::env::temp_dir().join("myotis-elcache-lonemapped.cache");
+        fs::write(&path, format!("::ffff:1.2.3.4\t30303\t{hex}\t1\tsnapok\n")).unwrap();
+        let mut c = ElPeerCache::load(path.clone());
+        let plain: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:1.2.3.4]:30303".parse().unwrap();
+        assert_eq!(c.peers()[0].addr, plain);
+        assert_eq!(c.quality_of(plain), Some(SnapQuality::Confirmed));
+        assert_eq!(c.quality_of(mapped), Some(SnapQuality::Confirmed));
+        c.add(plain, &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn absorb_folds_by_the_documented_lattice() {
+        // Pin the fold policy: snap if either; Confirmed over Denied over
+        // Unknown; the lower connect streak.
+        let entry = |snap: bool, quality: SnapQuality, fails: u32| Entry {
+            pubkey_hex: pubkey_hex(&pk(1)),
+            snap,
+            quality,
+            fails,
+        };
+        let fold = |a: Entry, b: Entry| {
+            let mut a = a;
+            a.absorb(b);
+            (a.snap, a.quality, a.fails)
+        };
+        use SnapQuality::{Confirmed, Denied, Unknown};
+        assert_eq!(fold(entry(false, Unknown, 0), entry(true, Unknown, 0)), (true, Unknown, 0));
+        assert_eq!(fold(entry(true, Confirmed, 7), entry(true, Denied, 2)), (true, Confirmed, 2));
+        assert_eq!(fold(entry(true, Denied, 0), entry(true, Confirmed, 9)), (true, Confirmed, 0));
+        assert_eq!(fold(entry(true, Denied, 3), entry(false, Unknown, 1)), (true, Denied, 1));
+        assert_eq!(fold(entry(true, Unknown, 4), entry(true, Denied, 50)), (true, Denied, 4));
+    }
+
+    #[test]
+    fn add_replaces_a_re_keyed_node() {
+        // A successful handshake that authenticates a DIFFERENT node id at a
+        // cached endpoint replaces the entry, verdicts included — the old id
+        // can never handshake again, and its verdicts were its own.
+        let path = std::env::temp_dir().join("myotis-elcache-rekey-add.cache");
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        c.add(a, &pk(0xab), true);
+        c.record_snap_served(a);
+        c.record_snap_failure(a); // a streak in flight under the old id
+        for _ in 0..CONNECT_FAILURE_DEMOTE {
+            c.record_connect_failure(a);
+        }
+        c.add(a, &pk(0xcd), false);
+        assert_eq!(c.len(), 1);
+        let p = &c.peers()[0];
+        assert_eq!(p.pubkey, pk(0xcd));
+        assert!(!p.snap);
+        assert_eq!(p.quality, SnapQuality::Unknown);
+        // The old id's snap-failure streak did not carry over: two failures
+        // under the new id are still below the threshold.
+        c.record_snap_failure(a);
+        c.record_snap_failure(a);
+        assert_eq!(c.quality_of(a), Some(SnapQuality::Unknown));
+        c.flush();
+        let hex_cd = format!("0x{}", "cd".repeat(64));
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("1.2.3.4\t30303\t{hex_cd}\t0\n"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn load_folds_both_spellings_of_one_node_into_one_entry() {
         // A cache written while the keys were split (the dev Mac's
         // peers-sepolia.cache, 2026-10-07) holds one node twice, each line with
@@ -846,21 +940,29 @@ mod tests {
     #[test]
     fn load_keeps_the_later_line_when_the_node_id_differs() {
         // A different node id at the same endpoint is a re-keyed node, not a
-        // second spelling: the later line replaces the earlier one outright
-        // (verdicts are not folded across identities), as a duplicate key
-        // always did.
+        // second spelling: the later line in the file replaces the earlier one
+        // outright (verdicts are not folded across identities), the dropped
+        // line leaves the file on the next flush, and — since file order is
+        // key order, not recency — the first handshake under the live id sets
+        // the id right whichever line won.
         let hex_a = format!("0x{}", "ab".repeat(64));
         let hex_b = format!("0x{}", "cd".repeat(64));
         let text =
             format!("1.2.3.4\t30303\t{hex_a}\t1\tsnapok\n::ffff:1.2.3.4\t30303\t{hex_b}\t0\n");
         let path = std::env::temp_dir().join("myotis-elcache-rekeyed.cache");
         fs::write(&path, text).unwrap();
-        let c = ElPeerCache::load(path.clone());
+        let mut c = ElPeerCache::load(path.clone());
         assert_eq!(c.len(), 1);
         let p = &c.peers()[0];
         assert_eq!(p.pubkey, pk(0xcd));
         assert!(!p.snap);
         assert_eq!(p.quality, SnapQuality::Unknown);
+        c.flush();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("1.2.3.4\t30303\t{hex_b}\t0\n"));
+        // The live node turns out to be the one the earlier line named.
+        c.add("1.2.3.4:30303".parse().unwrap(), &pk(0xab), true);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.peers()[0].pubkey, pk(0xab));
         let _ = fs::remove_file(&path);
     }
 
