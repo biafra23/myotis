@@ -801,6 +801,11 @@ struct PendingEnr {
     /// Hashes of the ENRRequests sent, newest last (at most ENR_REQUESTS_MAX).
     hashes: Vec<[u8; 32]>,
     since: tokio::time::Instant,
+    /// `entry.tcp_port` is the node's own claim (a Ping's FROM endpoint), not
+    /// a relayer's hearsay or a guess: hearsay arriving while the record is
+    /// awaited must not displace it, and it is pinned if the record names no
+    /// address.
+    claimed: bool,
 }
 
 /// What the exchange concluded about a node, kept by node id.
@@ -808,21 +813,29 @@ struct PendingEnr {
 struct Judgement {
     verdict: Verdict,
     /// The TCP port by the node's own word: its record's (`0`: an address but
-    /// no TCP port — never dialed), updated by a later Ping's FROM endpoint,
-    /// which the node signed too and is fresher; `None` when the record named
-    /// no address or never came. It outlives the sighting: a relayer's hearsay
-    /// must not put a discovery-only node back on the dial list, or a known
-    /// port back to a guess — only the node itself moves its port here.
+    /// no TCP port — never dialed); when the record named no address, the port
+    /// the node's own Ping claimed, if it pinged us; updated by a later Ping's
+    /// FROM endpoint, which the node signed too and is fresher. `None` when
+    /// the node said nothing about its port (a record naming no address and
+    /// no Ping of its own, or no record at all). It outlives the sighting: a
+    /// relayer's hearsay must not put a discovery-only node back on the dial
+    /// list, or a known port back to a guess — only the node itself moves its
+    /// port here. A `Some` also keeps an `Unknown` verdict for the run (see
+    /// [`Judgement::expired`]).
     tcp_port: Option<u32>,
     at: tokio::time::Instant,
 }
 
 impl Judgement {
-    /// An `Unknown` that holds no record — a lost datagram, a response a shade
-    /// past the timeout — no longer stands past [`UNKNOWN_VERDICT_TTL`]; one
-    /// with a record in hand (an address but no `eth` entry: the EF NodeOps
-    /// bootnodes) stands for the run, as every verdict with a record does, so
-    /// the port it pinned is never forgotten with it.
+    /// An `Unknown` that pins no port — a lost datagram, a response a shade
+    /// past the timeout, a record naming no address from a node that never
+    /// pinged us — no longer stands past [`UNKNOWN_VERDICT_TTL`]; one that
+    /// pins a port stands for the run, so the pin is never forgotten with it:
+    /// a record with an address but no `eth` entry (the EF NodeOps
+    /// bootnodes), or a record naming no address from a node whose own Ping
+    /// claimed its port (an expiring pin would reopen the hearsay hole it
+    /// closes). Its fork id is then not re-checked this run — the eth Status
+    /// check at the handshake still is.
     fn expired(&self, now: tokio::time::Instant) -> bool {
         self.verdict == Verdict::Unknown
             && self.tcp_port.is_none()
@@ -833,7 +846,8 @@ impl Judgement {
 /// What `consider` finds on file for a sighted node.
 enum Seen {
     Foreign,
-    /// Judged, with the port its record named (if any): handed over as is.
+    /// Judged, with the port by the node's own word (its record's, or its
+    /// Ping's claim; see [`Judgement::tcp_port`]), if any: handed over as is.
     Judged(Option<u32>),
     /// An expired `Unknown`: judged again.
     Stale,
@@ -1242,10 +1256,21 @@ impl ServiceLoop {
         };
         let ask = match enr.pending.get_mut(&addr) {
             Some(p) => {
-                // The newest sighting: its node id, its time, and its TCP port
-                // — a Ping's own claim, or the port already on file (`admit`
-                // never guesses over a known port).
+                // The newest sighting, with the port by precedence: the node's
+                // own claim (a Ping's FROM endpoint) stands over any later
+                // hearsay — a relayer's NEIGHBORS inside the judging window
+                // must not displace it — while hearsay may replace a port that
+                // was itself hearsay or a guess.
+                let port = match claim {
+                    Some(port) => {
+                        p.claimed = true;
+                        port
+                    }
+                    None if p.claimed => p.entry.tcp_port,
+                    None => entry.tcp_port,
+                };
                 p.entry = entry;
+                p.entry.tcp_port = port;
                 bonded && p.hashes.len() < usize::from(ENR_REQUESTS_MAX)
             }
             None => {
@@ -1260,6 +1285,7 @@ impl ServiceLoop {
                         entry,
                         hashes: Vec::new(),
                         since: tokio::time::Instant::now(),
+                        claimed: claim.is_some(),
                     },
                 );
                 if !bonded && !self.fresh_ping_pending(addr, tokio::time::Instant::now()) {
@@ -1372,11 +1398,14 @@ impl ServiceLoop {
         if let Some(port) = record_port {
             pending.entry.tcp_port = port;
         }
+        // What the judgement pins: the record's word; else the node's own
+        // Ping claim, when the record named no address; never hearsay.
+        let pin = record_port.or_else(|| pending.claimed.then_some(pending.entry.tcp_port));
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
         enr.record(
             pending.entry.node_id.clone(),
             verdict,
-            record_port,
+            pin,
             tokio::time::Instant::now(),
         );
         match verdict {
@@ -2189,20 +2218,15 @@ mod tests {
             .unwrap()
     }
 
-    /// Announce `node` to `a` again — a relayer's NEIGHBORS from a fresh
-    /// socket, claiming `advertised_tcp` — and return what A hands over.
-    async fn reannounce(
-        a: &Discv4Service,
-        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
-        node: &NodeKey,
-        advertised_tcp: u32,
-    ) -> TableEntry {
+    /// A relayer's NEIGHBORS to `a`, from a fresh socket: `node` at
+    /// 127.0.0.1:`udp_port`, claiming `advertised_tcp`.
+    async fn relay_neighbors(a: &Discv4Service, node: &NodeKey, udp_port: u16, advertised_tcp: u32) {
         let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let data = rlp::encode(&Item::List(vec![
             Item::List(vec![Item::List(vec![
                 Item::Bytes(vec![127, 0, 0, 1]),
-                Item::Bytes(rlp::u64_to_minimal_be(u64::from(sock.local_addr().unwrap().port()))),
+                Item::Bytes(rlp::u64_to_minimal_be(u64::from(udp_port))),
                 Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
                 Item::Bytes(node.public_key_bytes().to_vec()),
             ])]),
@@ -2211,10 +2235,95 @@ mod tests {
         let relayer = key(99);
         let packet = encode_packet(&relayer, TYPE_NEIGHBORS, &data).unwrap();
         sock.send_to(&packet, a_addr).await.unwrap();
+    }
+
+    /// Announce `node` to `a` again — a relayer's NEIGHBORS naming a fresh UDP
+    /// port and `advertised_tcp` — and return what A hands over.
+    async fn reannounce(
+        a: &Discv4Service,
+        a_rx: &mut tokio::sync::mpsc::Receiver<TableEntry>,
+        node: &NodeKey,
+        advertised_tcp: u32,
+    ) -> TableEntry {
+        let fresh = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        relay_neighbors(a, node, fresh.local_addr().unwrap().port(), advertised_tcp).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
             .await
             .expect("A hands a judged node over at once")
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pings_own_port_claim_survives_hearsay_inside_the_judging_window() {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        // Node X pings A claiming port 50507; before X answers A's ENRRequest,
+        // a relayer's NEIGHBORS lists X with 30303. X's record names no
+        // address, so the claim is all A has on X's port: it must survive the
+        // hearsay, and be pinned against later hearsay.
+        let a_key = Arc::new(key(25));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(26);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let our_udp = sock.local_addr().unwrap().port();
+        let record = {
+            let mut secret = x.secret_bytes();
+            let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+            let mut b = Enr::<CombinedKey>::builder();
+            b.seq(1).add_value_rlp(
+                "eth",
+                alloy_rlp::Bytes::from(eth_entry_rlp([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+            );
+            alloy_rlp::encode(b.build(&signing).unwrap())
+        };
+        // 1. X pings A, its FROM endpoint claiming TCP 50507.
+        let ping = encode_ping(&x, &[0, 0, 0, 0], 50507, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        sock.send_to(&ping, a_addr).await.unwrap();
+        // 2. A's ENRRequest arrives: A holds the claim and awaits the record.
+        let mut buf = [0u8; 2048];
+        let request = loop {
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("A asks X for its record")
+                .unwrap();
+            if let Ok(p) = parse(&buf[..n]) {
+                if p.packet_type == TYPE_ENR_REQUEST {
+                    break p;
+                }
+            }
+        };
+        // 3. Hearsay inside the window: a relayer lists X with another port.
+        relay_neighbors(&a, &x, our_udp, 30303).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 4. X answers with a record that names no address.
+        let response = encode_enr_response(&x, &request.hash, &record).unwrap();
+        sock.send_to(&response, a_addr).await.unwrap();
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands X over")
+            .unwrap();
+        assert_eq!(entry.node_id, x.public_key_bytes().to_vec());
+        assert_eq!(
+            entry.tcp_port, 50507,
+            "the node's own claim survives a relayer's hearsay inside the judging window"
+        );
+        // 5. And it is pinned: later hearsay does not move it.
+        let entry = reannounce(&a, &mut a_rx, &x, 30303).await;
+        assert_eq!(entry.tcp_port, 50507, "the claim is pinned against later hearsay");
+        a.stop().await;
     }
 
     #[tokio::test]
