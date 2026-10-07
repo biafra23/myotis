@@ -153,6 +153,14 @@ pub extern "C" fn myotis_tor_status() -> i32 {
     crate::host::tor_status()
 }
 
+/// Allow or forbid EIP-1459 DNS discovery (`set_dns_discovery` twin): the EL
+/// node lists, walked over the system resolver. Off until a host switches it
+/// on; never used while Tor is enabled. Returns the state now in force.
+#[no_mangle]
+pub extern "C" fn myotis_set_dns_discovery(on: bool) -> bool {
+    crate::host::set_dns_discovery(on)
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle
 /// (`nativeStatusJson` twin).
 #[no_mangle]

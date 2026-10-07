@@ -35,7 +35,7 @@ async fn dials_a_mainnet_peer_to_framed() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
     let discovery = Discv4Service::start(
         Arc::clone(&key),
-        Discv4Config { bind_port: 0, bootnodes: bootnodes.clone() },
+        Discv4Config { bind_port: 0, bootnodes: bootnodes.clone(), ..Default::default() },
         tx,
     )
     .await

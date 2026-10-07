@@ -85,6 +85,12 @@ pub struct ElConfig {
     /// handshake needs, so they are dialed over RLPx directly instead of
     /// waiting for discovery to surface them.
     pub boot_enodes: Vec<Enode>,
+    /// The network's EIP-1459 DNS node lists (`enrtree://<key>@<domain>`),
+    /// walked by `el::dnsdisco` on hosts that allow DNS and never under Tor
+    /// (#539, part 3): a dial source and a DHT seed that owe nothing to the
+    /// bootnodes. Twin of the Java `NetworkConfig.elEnrTreeUrls`. Empty for a
+    /// network without a tree (Gnosis).
+    pub enr_tree_urls: Vec<String>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
@@ -157,6 +163,28 @@ fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
     enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
+/// The discv4 fork-id filter for `cfg`'s chain (#539): the pinned fork id, on
+/// the chain's beacon epoch grid when this crate knows it (`sync::ChainConfig`,
+/// the same grid the fork watch places with; none for a chain it does not).
+/// Public so the live test (`tests/live_enr_filter.rs`) measures the filter
+/// as the reader ships it.
+pub fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
+    let filter = crate::el::enrfilter::ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next);
+    let chain = match cfg.network_id {
+        1 => Some(crate::sync::ChainConfig::mainnet()),
+        11_155_111 => Some(crate::sync::ChainConfig::sepolia()),
+        100 => Some(crate::sync::ChainConfig::gnosis()),
+        _ => None,
+    };
+    match chain {
+        Some(c) => filter.with_epoch_grid(
+            c.genesis_time,
+            c.slots_per_epoch.saturating_mul(c.seconds_per_slot),
+        ),
+        None => filter,
+    }
+}
+
 impl ElConfig {
     /// Mainnet EL parameters (the values the live tests pin). The fork-id is the
     /// pinned hash the Java engine also carries; a hard fork would need a bump
@@ -173,20 +201,22 @@ impl ElConfig {
         // ports: they are per record, not 30303 across the board. Their
         // `ip6`/`udp6` fields are not used. The records carry no `tcp` key:
         // these are discovery-only nodes, and a TCP connect to them times out.
-        // The pool does not know that yet — discv4 admits a bonded node with
-        // its UDP port as the TCP port (`handle_pong`), so below target each
-        // one costs a dial that runs into the handshake timeout and a backoff
-        // (#539: asking a node for its ENR before dialing is what ends this).
+        // Since #539 discv4 asks a node for its ENR before the pool sees it,
+        // and a record that names an address but no TCP port is handed over at
+        // port 0, which the pool refuses (`discv4::handle_enr_response`): they
+        // seed the table and cost no dial.
         //
         // History: the 2026-09-02 re-sync replaced two addresses geth had
         // dropped (18.188.214.86, 3.219.208.172). With no pinned mainnet
-        // enodes and no EIP-1459 DNS fallback, an embedder's fresh profile (no
-        // EL peer cache) on a dead list never seeds discovery and never holds
-        // a snap peer. Mirror any change into the Java `NetworkConfig.MAINNET`
-        // and the pin test below; the live tests under `tests/` read this
-        // list, and `rust/tor-poc/src/main.rs` carries the legacy four with
-        // their pubkeys (it dials over TCP, so the NodeOps records are no use
-        // to it).
+        // enodes, an embedder's fresh profile (no EL peer cache) on a dead
+        // list never seeds discovery and never holds a snap peer — unless its
+        // host allows DNS, where the EIP-1459 tree below (`enr_tree_urls`,
+        // #539 part 3) is the fallback; on hosts without it (mobile) the list
+        // is still all there is. Mirror any change into the Java
+        // `NetworkConfig.MAINNET` and the pin test below; the live tests under
+        // `tests/` read this list, and `rust/tor-poc/src/main.rs` carries the
+        // legacy four with their pubkeys (it dials over TCP, so the NodeOps
+        // records are no use to it).
         const MAINNET_BOOTNODES: &[&str] = &[
             // EF NodeOps bootnodes
             "212.99.218.66:20151",   // nodeops-bootnode-dcl1-01
@@ -214,6 +244,13 @@ impl ElConfig {
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
             boot_enodes: Vec::new(),
+            // The Ethereum Foundation's canonical list, which every EL client
+            // walks (geth `params.KnownDNSNetwork`). Its signing key is the
+            // one the Sepolia list uses too.
+            enr_tree_urls: vec![
+                "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"
+                    .to_string(),
+            ],
         }
     }
 
@@ -268,6 +305,11 @@ impl ElConfig {
             // direct-dialing it beats waiting for discovery on a saturated
             // testnet. Mirrors the Java `NetworkConfig.SEPOLIA_EL_ENODES`.
             boot_enodes: parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]),
+            // The EF's Sepolia list (same signing key as mainnet's).
+            enr_tree_urls: vec![
+                "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net"
+                    .to_string(),
+            ],
         }
     }
     /// Gnosis EL parameters — verbatim from the Java `NetworkConfig.GNOSIS`. The
@@ -295,6 +337,9 @@ impl ElConfig {
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
             block_time: Duration::from_secs(5),
             boot_enodes: Vec::new(),
+            // Gnosis publishes no EL node list; its chainspec enodes are the
+            // Java twin's substitute (`NetworkConfig.GNOSIS_EL_ENODES`).
+            enr_tree_urls: Vec::new(),
         }
     }
 }
@@ -1751,9 +1796,20 @@ impl ElReader {
         read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
+        // Below target until the maintainer's first tick says otherwise — a
+        // fresh start is the one moment the pool is surely short of peers.
+        let below_target = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let discovery = Discv4Service::start(
             Arc::clone(&key),
-            Discv4Config { bind_port: cfg.discv4_port, bootnodes: cfg.bootnodes.clone() },
+            Discv4Config {
+                bind_port: cfg.discv4_port,
+                bootnodes: cfg.bootnodes.clone(),
+                // #539: a node whose ENR places it on another chain never
+                // reaches the pool; the pool's below-target hint gates the
+                // judging and widens the refresh fan-out.
+                fork_filter: Some(fork_filter_for(&cfg)),
+                pool_below_target: Some(Arc::clone(&below_target)),
+            },
             tx,
         )
         .await?;
@@ -1808,6 +1864,15 @@ impl ElReader {
         // Gloas: the light client proves only execution block hashes; the pool
         // fetches their headers for the anchor to verify and adopt.
         pool.start_anchor_resolver(Arc::clone(&anchor));
+        // #539: while below target the pool re-offers discovery's whole table.
+        pool.attach_discovery(discovery.table_handle(), below_target);
+        // #539, part 3: the network's EIP-1459 DNS trees, a dial source and a
+        // DHT seed independent of the bootnodes — on hosts that allow DNS
+        // (`dnsdisco::set_enabled`) and never under Tor; the walk's leaves go
+        // through the same fork-id filter as discovery's candidates.
+        if let Some(seeder) = crate::el::dnsdisco::DnsSeeder::new(&cfg.enr_tree_urls, fork_filter_for(&cfg)) {
+            pool.attach_dns_seeder(Arc::new(seeder));
+        }
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),

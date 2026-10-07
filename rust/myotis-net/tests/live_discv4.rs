@@ -78,6 +78,7 @@ async fn bonds_and_discovers_on_live_network() {
         Discv4Config {
             bind_port: 0, // ephemeral
             bootnodes: bootnodes.clone(),
+            ..Default::default()
         },
         tx,
     )
@@ -169,7 +170,7 @@ async fn census_one(index: usize, addr: SocketAddr) -> Census {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
     let service = Discv4Service::start(
         Arc::clone(&key),
-        Discv4Config { bind_port: 0, bootnodes: vec![addr] },
+        Discv4Config { bind_port: 0, bootnodes: vec![addr], ..Default::default() },
         tx,
     )
     .await
