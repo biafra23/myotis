@@ -57,7 +57,9 @@ use std::time::Duration;
 
 use libp2p::{Multiaddr, PeerId};
 use myotis_consensus::spec::SYNC_COMMITTEE_SIZE;
-use myotis_consensus::store::{LightClientProcessor, LightClientStore};
+use myotis_consensus::store::{
+    headers_in_attested_forks_shape, LightClientProcessor, LightClientStore,
+};
 use myotis_consensus::types::{LightClientBootstrap, LightClientUpdate};
 use myotis_net::codec;
 use myotis_net::reqresp::{self, LocalStatus};
@@ -216,8 +218,13 @@ fn head_update_ok(
     if attested_period != period {
         return Err(format!("an update attested in period {attested_period} (slot {slot})"));
     }
-    let fork = config.fork_schedule.lc_fork_at_slot(slot);
-    if update.attested_header.shape() != fork || update.finalized_header.shape() != fork {
+    // The processor's own shape gate, not a copy of it.
+    if !headers_in_attested_forks_shape(
+        &config.fork_schedule,
+        &update.attested_header,
+        &update.finalized_header,
+    ) {
+        let fork = config.fork_schedule.lc_fork_at_slot(slot);
         return Err(format!("an update for slot {slot} not in its fork's ({fork:?}) wire shape"));
     }
     let participants = update.sync_aggregate.count_participants();

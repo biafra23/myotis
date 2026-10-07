@@ -71,7 +71,7 @@ on:
         type: string
         default: ""
       census_crawl_secs:
-        description: "census scope only: how long to crawl the DHT, in seconds"
+        description: "census scope only: how long to crawl the DHT, in seconds (at most 3600: the report prints at the end, inside the job's timeout)"
         type: string
         default: "900"
 
@@ -110,10 +110,21 @@ jobs:
           cargo test --release -p myotis-net --test live_cold_start --no-run
           cargo test --release -p myotis-net --test live_pins_alive --no-run
 
+      # The report prints only once the crawl ends, and timeout-minutes covers
+      # the build as well, so a crawl the job cannot finish would lose all of
+      # it: refuse that before building. (The census itself refuses a
+      # malformed number.)
       - name: Build the census
         if: inputs.scope == 'census'
         working-directory: rust
-        run: cargo build --release -p myotis-net --example period_census
+        env:
+          CRAWL_SECS: ${{ inputs.census_crawl_secs }}
+        run: |
+          if [ -n "$CRAWL_SECS" ] && ! [ "$CRAWL_SECS" -le 3600 ] 2>/dev/null; then
+            echo "::error::census_crawl_secs must be a whole number of seconds, at most 3600 (got '$CRAWL_SECS')"
+            exit 1
+          fi
+          cargo build --release -p myotis-net --example period_census
 
       # Pins first, one at a time, then every fork-matched peer the crawl
       # finds. An empty period means the current one (the example's default).

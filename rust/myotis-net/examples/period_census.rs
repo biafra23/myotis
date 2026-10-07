@@ -20,8 +20,9 @@
 //! Gloas slot, say) is `wrong-fork-shape`. An error answer is filed by its
 //! result code (`server-error`, `resource-unavailable`, `invalid-request`) and
 //! its message listed under ERROR ANSWERS; an answer with no chunk at all —
-//! what a server without the update is supposed to send — is `answered-empty`;
-//! only bytes that do not decode are `undecodable`. Every answer is also
+//! what a server without the update sends, though a server that closes the
+//! stream unanswered looks the same — is `answered-empty`; only bytes that do
+//! not decode are `undecodable`. Every answer is also
 //! counted under the client its Identify named (BY CLIENT), which is what tells
 //! a client-wide failure — one release refusing a fork's periods — from
 //! scattered sick nodes.
@@ -47,7 +48,10 @@
 //! failure is not grounds to prune. Only `updates_by_range` is asked, so a
 //! `no-updates-protocol` peer may still serve bootstraps and finality updates.
 //!
-//! `PERIOD` defaults to the current wall-clock period. Like `live_pins_alive`,
+//! `PERIOD` defaults to the current wall-clock period. A setting that is set but
+//! malformed (`NET`, `PERIOD`, `CRAWL_SECS`, `PROBES`) stops the census rather
+//! than falling back to a default: a census of the wrong period reads exactly
+//! like one of the right period. Like `live_pins_alive`,
 //! the result is only as good as the host it runs from (CLAUDE.md, release step
 //! 3): the `cold-start regression` workflow's `census` scope runs this from a
 //! GitHub-hosted runner.
@@ -61,6 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use myotis_consensus::store::headers_in_attested_forks_shape;
 use myotis_consensus::types::LightClientUpdate;
 use myotis_net::codec;
 use myotis_net::discovery::{self, DiscoveryConfig};
@@ -92,8 +97,9 @@ enum Verdict {
     WrongShape(u64),
     /// Answered with an error chunk: (result code, the server's message).
     Error(u8, String),
-    /// Answered with no chunk at all — what a server without the update is
-    /// supposed to send.
+    /// Answered with no chunk at all — what a server without the update
+    /// sends, and also what a server that closes the stream unanswered looks
+    /// like: the wire does not tell the two apart.
     Empty,
     /// Answered with a success code, but the frame/SSZ didn't decode.
     Undecodable,
@@ -113,10 +119,7 @@ fn bucket(verdict: &Verdict, need: u64) -> &'static str {
         Verdict::Serves(..) => "below-2/3-bar",
         Verdict::WrongPeriod(_) => "wrong-period",
         Verdict::WrongShape(_) => "wrong-fork-shape",
-        Verdict::Error(codec::RESULT_INVALID_REQUEST, _) => "invalid-request",
-        Verdict::Error(codec::RESULT_SERVER_ERROR, _) => "server-error",
-        Verdict::Error(codec::RESULT_RESOURCE_UNAVAILABLE, _) => "resource-unavailable",
-        Verdict::Error(..) => "unknown-error-code",
+        Verdict::Error(code, _) => error_bucket(*code),
         Verdict::Empty => "answered-empty",
         Verdict::Undecodable => "undecodable",
         Verdict::Unsupported => "no-updates-protocol",
@@ -124,6 +127,25 @@ fn bucket(verdict: &Verdict, need: u64) -> &'static str {
         Verdict::Timeout => "timeout",
         Verdict::ConnectionClosed => "conn-closed",
         Verdict::Io => "io-error",
+    }
+}
+
+/// The bucket of an error answer with result code `code`.
+fn error_bucket(code: u8) -> &'static str {
+    match code {
+        codec::RESULT_INVALID_REQUEST => "invalid-request",
+        codec::RESULT_SERVER_ERROR => "server-error",
+        codec::RESULT_RESOURCE_UNAVAILABLE => "resource-unavailable",
+        _ => "unknown-error-code",
+    }
+}
+
+/// An error answer's bucket, with its code where the bucket does not name it
+/// (a client's own codes, Lighthouse's rate limiting among them).
+fn error_name(code: u8) -> String {
+    match error_bucket(code) {
+        "unknown-error-code" => format!("unknown-error-code {code}"),
+        named => named.to_string(),
     }
 }
 
@@ -135,8 +157,8 @@ fn describe(verdict: &Verdict, need: u64, slots_per_period: u64) -> String {
         Verdict::WrongPeriod(slot) | Verdict::WrongShape(slot) => {
             format!("{name} (attested slot {slot}, period {})", slot / slots_per_period)
         }
-        Verdict::Error(code, msg) if msg.is_empty() => format!("{name} (code {code})"),
-        Verdict::Error(_, msg) => format!("{name} {msg:?}"),
+        Verdict::Error(code, msg) if msg.is_empty() => error_name(*code),
+        Verdict::Error(code, msg) => format!("{} {msg:?}", error_name(*code)),
         _ => name.to_string(),
     }
 }
@@ -165,12 +187,13 @@ fn classify(config: &ChainConfig, period: u64, raw: &[u8]) -> Verdict {
     if slot / config.slots_per_period() != period {
         return Verdict::WrongPeriod(slot);
     }
-    // The processor's first gate: both headers in the shape of the ATTESTED
-    // slot's fork (a Gloas update carries even a pre-Gloas finalized header in
-    // the Gloas shape).
-    let slot_fork = config.fork_schedule.lc_fork_at_slot(slot);
-    if update.attested_header.shape() != slot_fork || update.finalized_header.shape() != slot_fork
-    {
+    // The processor's first gate, the same function: both headers in the shape
+    // of the ATTESTED slot's fork.
+    if !headers_in_attested_forks_shape(
+        &config.fork_schedule,
+        &update.attested_header,
+        &update.finalized_header,
+    ) {
         return Verdict::WrongShape(slot);
     }
     Verdict::Serves(update.sync_aggregate.count_participants() as u64, slot)
@@ -249,8 +272,22 @@ fn client_of(identify: &Option<(String, bool)>) -> String {
     }
 }
 
-/// Error answers: (bucket, the server's message) -> (count, client -> count).
-type ErrorTally = HashMap<(&'static str, String), (usize, HashMap<String, usize>)>;
+/// Error answers: (result code, the server's message) -> client -> count.
+type ErrorTally = HashMap<(u8, String), HashMap<String, usize>>;
+
+/// A numeric setting from the environment: unset or empty takes `default`,
+/// anything else must parse — never a silent fallback (see the header).
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => default,
+        Ok(v) if v.trim().is_empty() => default,
+        Ok(v) => v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={v:?} is not a number; unset it for the default")),
+        Err(e) => panic!("{name}: {e}"),
+    }
+}
 
 /// One probed peer.
 struct Probed {
@@ -271,25 +308,16 @@ async fn main() {
         )
         .init();
 
-    let net = std::env::var("NET").unwrap_or_else(|_| "sepolia".into());
-    let config = match net.as_str() {
+    let config = match std::env::var("NET").unwrap_or_default().trim() {
+        "" | "sepolia" => ChainConfig::sepolia(),
         "mainnet" => ChainConfig::mainnet(),
         "gnosis" => ChainConfig::gnosis(),
-        _ => ChainConfig::sepolia(),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
     };
-    let crawl_secs: u64 = std::env::var("CRAWL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(420);
-    let concurrency: usize = std::env::var("PROBES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
+    let crawl_secs: u64 = env_number("CRAWL_SECS", 420);
+    let concurrency: usize = env_number("PROBES", 24);
     let wall_period = config.wall_clock_period();
-    let period: u64 = std::env::var("PERIOD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(wall_period);
+    let period: u64 = env_number("PERIOD", wall_period);
     let spp = config.slots_per_period();
     // A light client requires a 2/3 supermajority of the 512-member committee.
     let need = 512u64 * 2 / 3 + 1;
@@ -480,10 +508,12 @@ async fn main() {
         match &r.verdict {
             Verdict::Serves(..) => servers.push(r),
             Verdict::WrongPeriod(_) | Verdict::WrongShape(_) => refused.push(r),
-            Verdict::Error(_, msg) => {
-                let e = errors.entry((b, msg.clone())).or_default();
-                e.0 += 1;
-                *e.1.entry(client_name).or_insert(0) += 1;
+            Verdict::Error(code, msg) => {
+                *errors
+                    .entry((*code, msg.clone()))
+                    .or_default()
+                    .entry(client_name)
+                    .or_insert(0) += 1;
             }
             _ => {}
         }
@@ -520,10 +550,13 @@ async fn main() {
 
     if !errors.is_empty() {
         println!("\nERROR ANSWERS (result code, the server's message, count, clients):");
-        let mut errors: Vec<_> = errors.into_iter().collect();
-        errors.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
-        for ((bucket, msg), (n, clients)) in &errors {
-            println!("  {n:>4}  {bucket} {msg:?}  [{}]", tally(clients));
+        let mut errors: Vec<_> = errors
+            .into_iter()
+            .map(|(answer, clients)| (clients.values().sum::<usize>(), answer, clients))
+            .collect();
+        errors.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, (code, msg), clients) in &errors {
+            println!("  {n:>4}  {} {msg:?}  [{}]", error_name(*code), tally(clients));
         }
     }
 

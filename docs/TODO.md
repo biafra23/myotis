@@ -201,3 +201,15 @@ complete on its own.
   dispatch stops red at the pin check and 3b/3c never run there. Whether
   CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
   floor unmet for an upstream reason is the owner's decision.
+  - 2026-10-07: both Lighthouse pins dropped (both engines), roost is the
+    only Sepolia pin. Cause upstream: Lighthouse's light-client server
+    produces nothing for a Gloas block (sigp/lighthouse#9587; fix PRs #9732
+    and #9790 unmerged, no release), and its store keys updates by the
+    signature slot's period, so the update under 1379 is a Fulu one that
+    fails as Gloas ("Database error") — expect 1379 to stay broken on nodes
+    that ran v8.3.0-rc.0 across the fork even after a fixed release.
+    Period-1379 censuses (zbox 170 peers, runner 218) found every Lighthouse
+    answer an error or empty, Prysm and Grandine without the protocol, and
+    100+ peers closing before Identify. zbox's own Nimbus closes inbound
+    connections (low-bandwidth unit, `--max-peers=25`), so #566's option 3
+    needs that unit changed first.
