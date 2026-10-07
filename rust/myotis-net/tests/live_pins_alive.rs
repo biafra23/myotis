@@ -7,7 +7,9 @@
 //! be: the shipped build's servers had moved or gone, every automated check was
 //! green, and a fresh install could not catch up at all.
 //!
-//! Seconds when the pins are healthy; a sick one costs up to its retries
+//! Seconds when the pins are healthy — about 12 s more per pin once the chain
+//! has left the anchor's period, since the second updates ask waits out the
+//! server's quota window; a sick one costs up to its retries
 //! (`3 x PIN_TIMEOUT`), and the bootnode test has its own 60 s budget, so a bad
 //! list of a couple of dozen pins is minutes, not seconds.
 //!
@@ -34,6 +36,14 @@
 //! * a pin that answers but does NOT advertise the light-client protocols —
 //!   it is a beacon node that stopped serving light clients, so it occupies an
 //!   un-evictable pool slot for nothing.
+//! * a pin that serves the anchor but not the CURRENT period — its
+//!   light-client server stopped somewhere between the two, as Sepolia's
+//!   Lighthouse servers did at the Gloas fork (2026-10-06: ServerError
+//!   "Database error" for every Gloas period). A fresh install bootstraps from
+//!   it and then cannot follow the chain. It is asked separately because an
+//!   anchor embedded before the stop says nothing about it: Sepolia's
+//!   pre-fork anchor would have passed this check with every Lighthouse pin
+//!   while only roost could carry a wallet past the fork.
 //! * a pin whose peer ID does not match — the server minted a new key (Nimbus
 //!   does this per restart without `--netkey-file`); the pin is dead even
 //!   though the host is up, and the dial fails with `Unexpected peer ID <new
@@ -45,7 +55,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
+use myotis_consensus::spec::SYNC_COMMITTEE_SIZE;
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{LightClientBootstrap, LightClientUpdate};
 use myotis_net::codec;
@@ -88,10 +99,11 @@ const DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
 /// what reaches the pool). The no-pins cold start is what proves findability.
 const MIN_TABLE_ENTRIES: usize = 8;
 
-/// How many pinned peers must serve the anchor for the list to be doing its
-/// job. A floor, not "all of them": pins are third-party hosts that come and
-/// go, and requiring a clean sweep would fail for reasons that are not the
-/// pin list's fault — which is how a release check becomes one people skip.
+/// How many pinned peers must serve the anchor, and the catch-up from it, for
+/// the list to be doing its job. A floor, not "all of them": pins are
+/// third-party hosts that come and go, and requiring a clean sweep would fail
+/// for reasons that are not the pin list's fault — which is how a release
+/// check becomes one people skip.
 /// Two is the smallest number that is not a single point of failure.
 const MIN_ALIVE_PINS: usize = 2;
 
@@ -119,22 +131,103 @@ fn assert_no_cl_env_overrides() {
     }
 }
 
-/// Did this `updates_by_range` response actually carry an update a wallet
-/// could apply? A success byte is not enough — a truncated or malformed frame
-/// (even a bare `[0]`) would otherwise count as "serves catch-up", letting the
-/// census meet its floor on peers that cannot advance a stale install. Mirrors
-/// the real catch-up path: split the chunks, then decode one.
-fn served_an_update(config: &ChainConfig, raw: &[u8]) -> bool {
-    if raw.first() != Some(&codec::RESULT_SUCCESS) {
-        return false;
+/// The update an `updates_by_range` answer carries, decoded the way the
+/// catch-up decodes it, or why there is none. A success byte is not enough — a
+/// truncated or malformed frame (even a bare `[0]`) must not count as serving
+/// catch-up, or the census meets its floor on peers that cannot advance a
+/// stale install. An error answer keeps its result code and the server's
+/// message: "result code 2" alone hid Lighthouse's "Database error".
+fn decode_update(config: &ChainConfig, raw: &[u8]) -> Result<LightClientUpdate, String> {
+    if raw.is_empty() {
+        return Err("an empty answer (no update)".to_string());
     }
-    match codec::decode_multi_chunk_response_with_digests(raw, 1) {
-        Ok(chunks) => chunks.first().is_some_and(|(digest, c)| {
-            let fork = config.lc_fork_of_chunk(digest, c.len(), LightClientUpdate::GLOAS_SIZE);
-            !c.is_empty() && LightClientUpdate::decode_for(fork, c).is_ok()
-        }),
-        Err(_) => false,
+    if let Some((code, msg)) = codec::leading_error(raw) {
+        return Err(format!("result code {code} {msg:?}"));
     }
+    let chunks = codec::decode_multi_chunk_response_with_digests(raw, 1)
+        .map_err(|e| format!("{} B that do not frame: {e}", raw.len()))?;
+    let (digest, chunk) = chunks
+        .into_iter()
+        .next()
+        .filter(|(_, c)| !c.is_empty())
+        .ok_or_else(|| format!("{} B carrying no update", raw.len()))?;
+    let fork = config.lc_fork_of_chunk(&digest, chunk.len(), LightClientUpdate::GLOAS_SIZE);
+    LightClientUpdate::decode_for(fork, &chunk)
+        .map_err(|e| format!("an update that does not decode: {e}"))
+}
+
+/// Ask `peer` for `updates_by_range(period, 1)` — count 1: Lighthouse's quota
+/// refuses more — and decode the answer. Asked again once when no update came
+/// back: these servers rate-limit each protocol separately and a request
+/// issued straight after the previous one can be closed for quota rather than
+/// capability, so one probe must not condemn a pin. `after_quota` waits out
+/// that window before the FIRST ask too, for a peer that was just asked for
+/// updates.
+async fn ask_update(
+    client: &reqresp::ReqRespClient,
+    config: &ChainConfig,
+    peer: PeerId,
+    addr: &Multiaddr,
+    period: u64,
+    after_quota: bool,
+) -> Result<LightClientUpdate, String> {
+    let mut why = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 || after_quota {
+            tokio::time::sleep(UPDATES_RETRY_BACKOFF).await;
+        }
+        why = match tokio::time::timeout(
+            PIN_TIMEOUT,
+            client.request_raw(
+                peer,
+                addr.clone(),
+                protocols::UPDATES_BY_RANGE,
+                codec::encode_updates_by_range_request(period, 1),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => match decode_update(config, &raw) {
+                Ok(update) => return Ok(update),
+                Err(why) => why,
+            },
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "timeout".to_string(),
+        };
+    }
+    Err(why)
+}
+
+/// Would a wallet take this current-period update? Everything the catch-up
+/// checks short of the BLS aggregate: attested in `period`, both headers in the
+/// wire shape of the attested slot's fork, and the 2/3 participation the BLS
+/// check demands first. The aggregate itself would need period `period`'s
+/// committee, i.e. a walk from the anchor through every period in between —
+/// minutes per pin once an anchor has aged, against a server whose data the
+/// anchor-period ask has just verified in full. What this ask has to show is
+/// that the server still produces the head's updates, in the head's format.
+fn head_update_ok(
+    config: &ChainConfig,
+    update: &LightClientUpdate,
+    period: u64,
+) -> Result<usize, String> {
+    let slot = update.attested_header.beacon.slot;
+    let attested_period = slot / config.slots_per_period();
+    if attested_period != period {
+        return Err(format!("an update attested in period {attested_period} (slot {slot})"));
+    }
+    let fork = config.fork_schedule.lc_fork_at_slot(slot);
+    if update.attested_header.shape() != fork || update.finalized_header.shape() != fork {
+        return Err(format!("an update for slot {slot} not in its fork's ({fork:?}) wire shape"));
+    }
+    let participants = update.sync_aggregate.count_participants();
+    if participants * 3 < SYNC_COMMITTEE_SIZE * 2 {
+        return Err(format!(
+            "{participants}/{SYNC_COMMITTEE_SIZE} participants, below the 2/3 a wallet needs \
+             (a period only minutes old may not have a better one yet)"
+        ));
+    }
+    Ok(participants)
 }
 
 fn init_tracing() {
@@ -150,6 +243,10 @@ fn init_tracing() {
 /// own embedded checkpoint root. That is the strongest cheap check: it proves
 /// the host is up, the peer ID still matches, the fork digest agrees, it serves
 /// light clients, AND it still holds the anchor a fresh install starts from.
+/// Then the catch-up from there: the anchor period's update, run through the
+/// production processor started from that very bootstrap, and — once the chain
+/// has left the anchor's period — the current period's, where a fresh install
+/// has to arrive.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live network test: dials this build's pinned CL servers"]
 async fn every_pinned_cl_peer_serves_this_builds_anchor() {
@@ -167,6 +264,10 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
         earliest_available_slot: 0,
     });
     let client = reqresp::start_host(Arc::clone(&local)).expect("host");
+
+    // Where a fresh install's catch-up starts, and where it has to arrive.
+    let anchor_period = config.checkpoint_slot / config.slots_per_period();
+    let head_period = config.wall_clock_period();
 
     let mut dead = Vec::new();
     let mut alive = 0usize;
@@ -249,6 +350,11 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                     // wallets that are furthest behind"). The production
                     // bootstrap path does not check it either; the checkpoint
                     // pin and the two branches below are the real proof.
+                    let mut processor = LightClientProcessor::new(
+                        LightClientStore::new(config.slots_per_period()),
+                        config.fork_schedule.clone(),
+                        config.genesis_validators_root,
+                    );
                     let verdict = {
                         let fork = config.lc_fork_of_chunk(
                             &d.fork_digest,
@@ -268,81 +374,84 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                             }
                             // The production checks, at the proof indices of the
                             // header's fork (sync.rs bootstrap path).
-                            Ok(b) => LightClientProcessor::new(
-                                LightClientStore::new(config.slots_per_period()),
-                                config.fork_schedule.clone(),
-                                config.genesis_validators_root,
-                            )
-                            .verify_bootstrap(&b)
-                            .map_err(|reason| reason.to_string()),
+                            Ok(b) => processor
+                                .verify_bootstrap(&b)
+                                .map(|()| b)
+                                .map_err(|reason| reason.to_string()),
                         }
                     };
-                    if let Err(why) = verdict {
-                        dead.push(format!("{pin} — {why}"));
-                        eprintln!("[pins] BAD  {addr} — {why}");
-                    } else {
-                        // #422 was "cannot CATCH UP", which needs
-                        // updates_by_range — a server that bootstraps and then
-                        // refuses updates strands a stale install just as
-                        // thoroughly, so ask for one period before calling it
-                        // alive. count=1: Lighthouse's quota refuses more.
-                        let period = config.checkpoint_slot / config.slots_per_period();
-                        let mut req = Vec::with_capacity(16);
-                        req.extend_from_slice(&period.to_le_bytes());
-                        req.extend_from_slice(&1u64.to_le_bytes());
-                        // Retry once: these servers rate-limit per protocol
-                        // and a request issued straight after the bootstrap can
-                        // be closed for quota rather than capability. One
-                        // probe must not condemn a pin.
-                        // `Ok(bytes)` once a server answered, `Err(reason)`
-                        // otherwise; the loop always sets it.
-                        let mut updates: Option<Result<Vec<u8>, String>> = None;
-                        for attempt in 0..2 {
-                            if attempt > 0 {
-                                tokio::time::sleep(UPDATES_RETRY_BACKOFF).await;
-                            }
-                            updates = Some(
-                                match tokio::time::timeout(
-                                    PIN_TIMEOUT,
-                                    client.request_raw(
-                                        peer,
-                                        addr.clone(),
-                                        protocols::UPDATES_BY_RANGE,
-                                        codec::encode_request(&req),
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(raw)) => Ok(raw),
-                                    Ok(Err(e)) => Err(e.to_string()),
-                                    Err(_) => Err("timeout".to_string()),
-                                },
-                            );
-                            if matches!(&updates, Some(Ok(raw)) if served_an_update(&config, raw)) {
-                                break;
-                            }
+                    match verdict {
+                        Err(why) => {
+                            dead.push(format!("{pin} — {why}"));
+                            eprintln!("[pins] BAD  {addr} — {why}");
                         }
-                        match updates.expect("the loop always sets it") {
-                            Ok(raw) if served_an_update(&config, &raw) => {
-                                alive += 1;
-                                eprintln!(
-                                    "[pins] OK   {addr} (bootstrap {} B, serves period {period})",
-                                    d.ssz_payload.len()
-                                );
-                            }
-                            other => {
-                                let why = match other {
-                                    Ok(raw) => format!(
-                                        "result code {}, {} B, no decodable update",
-                                        raw.first().copied().unwrap_or(255),
-                                        raw.len()
-                                    ),
-                                    Err(e) => e,
-                                };
-                                dead.push(format!(
-                                    "{pin} — bootstraps, but refused updates_by_range({period}): {why}"
-                                ));
-                                eprintln!("[pins] HALF {addr} — bootstrap ok, no updates ({why})");
+                        Ok(bootstrap) => {
+                            // #422 was "cannot CATCH UP", which needs
+                            // updates_by_range — a server that bootstraps and
+                            // then refuses updates strands a stale install just
+                            // as thoroughly. So: the anchor period's update,
+                            // through the production processor started from
+                            // this very bootstrap — committee, the 2/3 bar, the
+                            // BLS aggregate and every branch, exactly what a
+                            // fresh install does with it.
+                            processor.store.initialize(
+                                bootstrap.header.clone(),
+                                bootstrap.current_sync_committee.clone(),
+                            );
+                            let at_anchor =
+                                ask_update(&client, &config, peer, &addr, anchor_period, false)
+                                    .await;
+                            let catch_up = match at_anchor {
+                                Ok(update) if processor.process_update(&update) => {
+                                    if head_period <= anchor_period {
+                                        Ok(String::new())
+                                    } else {
+                                        // Same peer and protocol again: wait
+                                        // out its quota window first.
+                                        ask_update(&client, &config, peer, &addr, head_period, true)
+                                            .await
+                                            .and_then(|update| {
+                                                head_update_ok(&config, &update, head_period)
+                                            })
+                                            .map(|participants| {
+                                                format!(
+                                                    ", current period {head_period} at \
+                                                     {participants}/{SYNC_COMMITTEE_SIZE}"
+                                                )
+                                            })
+                                            .map_err(|why| {
+                                                format!(
+                                                    "updates_by_range({head_period}), the current \
+                                                     period, gave {why}"
+                                                )
+                                            })
+                                    }
+                                }
+                                Ok(update) => Err(format!(
+                                    "updates_by_range({anchor_period}) gave an update \
+                                     (attested slot {}, {}/{SYNC_COMMITTEE_SIZE}) the \
+                                     production processor refused — RUST_LOG=debug names \
+                                     the gate",
+                                    update.attested_header.beacon.slot,
+                                    update.sync_aggregate.count_participants()
+                                )),
+                                Err(why) => {
+                                    Err(format!("updates_by_range({anchor_period}) gave {why}"))
+                                }
+                            };
+                            match catch_up {
+                                Ok(head) => {
+                                    alive += 1;
+                                    eprintln!(
+                                        "[pins] OK   {addr} (bootstrap {} B, period \
+                                         {anchor_period} update verified{head})",
+                                        d.ssz_payload.len()
+                                    );
+                                }
+                                Err(why) => {
+                                    dead.push(format!("{pin} — bootstraps, but {why}"));
+                                    eprintln!("[pins] HALF {addr} — bootstrap ok, but {why}");
+                                }
                             }
                         }
                     }
@@ -353,9 +462,15 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                 }
                 Err(e) => {
                     // Includes ResourceUnavailable that the retries did not
-                    // outlast: roost's background fill is not keeping up.
-                    dead.push(format!("{pin} — {e}"));
-                    eprintln!("[pins] THIN {addr} — {e}");
+                    // outlast: roost's background fill is not keeping up. An
+                    // error answer's message is snappy-framed, which
+                    // `decode_response` prints raw; `leading_error` reads it.
+                    let why = match codec::leading_error(&raw) {
+                        Some((code, msg)) => format!("result code {code} {msg:?}"),
+                        None => e.to_string(),
+                    };
+                    dead.push(format!("{pin} — {why}"));
+                    eprintln!("[pins] THIN {addr} — {why}");
                 }
             },
             Ok(Err(e)) => {
@@ -371,7 +486,12 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
     client.shutdown().await;
 
     let total = config.static_peers.len();
-    eprintln!("[pins] {alive} of {total} pinned {} peers served the anchor", config.name);
+    let served = if head_period > anchor_period {
+        format!("the anchor (period {anchor_period}) and the current period ({head_period})")
+    } else {
+        format!("the anchor (period {anchor_period})")
+    };
+    eprintln!("[pins] {alive} of {total} pinned {} peers served {served}", config.name);
     if !dead.is_empty() {
         // Not a failure by itself — see the header — but always worth a human
         // look, because a dead pin is not free: it is exempt from eviction, so
@@ -385,7 +505,7 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
     }
     assert!(
         alive >= MIN_ALIVE_PINS,
-        "only {alive} of {total} pinned CL peers on {} served this build's anchor (want at \
+        "only {alive} of {total} pinned CL peers on {} served {served} (want at \
          least {MIN_ALIVE_PINS}) — a fresh install would depend entirely on discovery. \
          Before treating this as a pin-list problem, check whether THIS host is the \
          outlier: a Lighthouse node that has banned your IP reports as `dial failed` while \

@@ -249,6 +249,9 @@ fn client_of(identify: &Option<(String, bool)>) -> String {
     }
 }
 
+/// Error answers: (bucket, the server's message) -> (count, client -> count).
+type ErrorTally = HashMap<(&'static str, String), (usize, HashMap<String, usize>)>;
+
 /// One probed peer.
 struct Probed {
     peer: String,
@@ -464,9 +467,7 @@ async fn main() {
     let mut histogram: HashMap<&'static str, usize> = HashMap::new();
     // Client -> (answers, bucket -> count).
     let mut by_client: HashMap<String, (usize, HashMap<&'static str, usize>)> = HashMap::new();
-    // (bucket, message) -> (count, client -> count).
-    let mut errors: HashMap<(&'static str, String), (usize, HashMap<String, usize>)> =
-        HashMap::new();
+    let mut errors: ErrorTally = HashMap::new();
     let mut servers: Vec<&Probed> = Vec::new();
     let mut refused: Vec<&Probed> = Vec::new();
     for r in &results {
