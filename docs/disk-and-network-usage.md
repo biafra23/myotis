@@ -205,9 +205,10 @@ charging on an unmetered network) resumes any paused stack and waits for the log
 head gap too, not just a SYNCED beacon: "stay awake while charging" keeps a running stack
 from pausing but never wakes a paused one, so without it a phone that paused before going
 on the charger overnight woke thousands of blocks behind. With that setting on and the
-phone plugged in, either job leaves the stack it resumed running — the idle controller
-keeps it at the head until unplugged (on any network, as that setting always has); with
-it off, the charging job catches up within its 8-min budget and pauses again.
+phone plugged in on an unmetered network, either job leaves the stack it resumed running —
+the idle controller keeps it at the head until unplugged; otherwise (setting off, or a
+metered network, where a job must not start an unbounded run) the job catches up within
+its 8-min budget and pauses again. The two jobs never run a pass at the same time.
 
 So a phone wallet's realistic daily profile is:
 

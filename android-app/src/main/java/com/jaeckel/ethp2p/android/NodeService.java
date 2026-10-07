@@ -1194,8 +1194,9 @@ public final class NodeService extends Service {
      * The daily maintenance pass ({@link CatchUpWorker}): for each idle-PAUSED stack,
      * resume, wait until the beacon client is SYNCED and the verified head is warm (or
      * the per-network budget slice runs out), and pause again — but only if no real
-     * activity arrived meanwhile and "stay awake while charging" does not apply (then
-     * the idle controller owns the stack again; see {@link #catchUpPass}).
+     * activity arrived meanwhile and "stay awake while charging" does not apply on an
+     * unmetered network (then the idle controller owns the stack again; see
+     * {@link #catchUpPass}).
      *
      * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
      * activity clock ({@code lastActivityEpochMillis}), so the "did real activity
@@ -1226,18 +1227,43 @@ public final class NodeService extends Service {
                 h -> syncedWarmOrThrow(h) && logIndexAtHead(h));
     }
 
-    /** The log index has nothing left for head-follow to close (or no index at all).
-     *  Throws like {@link #syncedWarmOrThrow}: a handle that cannot answer ends the wait. */
+    /** The log index has nothing left for head-follow to close (or no index at all). Only a
+     *  handle that THROWS ends the wait early; an engine that answers an error envelope (the
+     *  Rust probe does, rather than throw) reads as not caught up, so the wait runs out its
+     *  slice — bounded, and the pass then pauses as usual. */
     private static boolean logIndexAtHead(ChainHandle h) {
         return io.myotis.ui.LogIndexStatus.headCaughtUp(h.logIndexStatusJson());
     }
 
-    /** The idle controller's "stay awake while charging" rule, evaluated outside it: the
-     *  setting is on, the device is plugged in, and a network is up. While it holds, the
-     *  idle ticker never pauses a RUNNING stack, so a background pass must not either. */
-    private static boolean stayAwakeApplies(android.content.Context c) {
-        return stayAwakeWhileCharging(c) && isCharging(c) && networkAvailable(c);
+    /** Whether a background pass leaves the stack it resumed running: the idle controller's
+     *  "stay awake while charging" rule (setting on, plugged in, network up — while it holds
+     *  the idle ticker never pauses a RUNNING stack, so a pass must not either), narrowed to
+     *  an UNMETERED network. A pass starts without user interaction, and the daily one only
+     *  needs a connection, so on a charging phone on cellular it would otherwise turn its
+     *  bounded catch-up into a run that lasts until unplugged; there it resumes, catches up
+     *  and pauses like any other pass. */
+    private static boolean leaveAwakeAfterPass(android.content.Context c) {
+        return stayAwakeWhileCharging(c) && isCharging(c) && networkAvailable(c)
+                && activeNetworkUnmetered(c);
     }
+
+    /** True when the active network is unmetered. Fail-safe to false (metered), so a read
+     *  error ends a background pass with a pause rather than an unbounded run. */
+    private static boolean activeNetworkUnmetered(android.content.Context c) {
+        try {
+            ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
+            return cm != null && !cm.isActiveNetworkMetered();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Held for the whole of a background pass. The daily and the charging workers are
+     *  separate unique works whose constraints overlap on a charging phone on Wi-Fi; two
+     *  interleaved passes would pause each other's stacks mid-wait (the daily bar is met
+     *  first) and misread each other's activity baseline. The later pass skips instead —
+     *  waiting for the lock would eat into its own WorkManager time limit. */
+    private static final AtomicBoolean CATCH_UP_PASS_RUNNING = new AtomicBoolean(false);
 
     /** Below this much remaining pass budget a resume is not worth starting: it would be
      *  paused again before it had time to sync anything. Also the per-stack floor. */
@@ -1246,7 +1272,7 @@ public final class NodeService extends Service {
     /**
      * Shared body of the background passes. For each idle-PAUSED stack: resume it, then
      * <ul>
-     *   <li>if {@link #stayAwakeApplies} — leave it running. The idle controller now keeps
+     *   <li>if {@link #leaveAwakeAfterPass} — leave it running. The idle controller now keeps
      *       it awake and following the head while the device stays plugged in, and pauses
      *       it on the ordinary idle rules once unplugged; pausing it here would undo the
      *       user's setting until the next pass;</li>
@@ -1259,6 +1285,19 @@ public final class NodeService extends Service {
      */
     private static void catchUpPass(android.content.Context c, String label, long budgetMs,
                                     java.util.function.Predicate<ChainHandle> caughtUp) {
+        if (!CATCH_UP_PASS_RUNNING.compareAndSet(false, true)) {
+            LogBuffer.i(TAG, label + ": another catch-up pass is running; skipping this one");
+            return;
+        }
+        try {
+            runCatchUpPass(c, label, budgetMs, caughtUp);
+        } finally {
+            CATCH_UP_PASS_RUNNING.set(false);
+        }
+    }
+
+    private static void runCatchUpPass(android.content.Context c, String label, long budgetMs,
+                                       java.util.function.Predicate<ChainHandle> caughtUp) {
         List<String> paused = new ArrayList<>();
         for (String n : ENGINE.hostedNetworks()) {
             ChainHandle h = ENGINE.get(n);
@@ -1271,7 +1310,7 @@ public final class NodeService extends Service {
             String n = paused.get(i);
             ChainHandle h = ENGINE.get(n);
             if (h == null || h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
-            boolean stayAwake = stayAwakeApplies(c);
+            boolean stayAwake = leaveAwakeAfterPass(c);
             long remainingMs = (passEndNano - System.nanoTime()) / 1_000_000L;
             if (!stayAwake && remainingMs < MIN_SLICE_MS) {
                 LogBuffer.i(TAG, label + ": budget spent; leaving the remaining stacks paused");
@@ -1316,7 +1355,7 @@ public final class NodeService extends Service {
             // to sleep (pause persists the freshly-caught-up snapshot).
             if (h.lastActivityEpochMillis() != activityBefore) {
                 LogBuffer.i(TAG, "[" + n + "] " + label + ": activity arrived; staying awake");
-            } else if (stayAwakeApplies(c)) {
+            } else if (leaveAwakeAfterPass(c)) {
                 LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
             } else {
                 synchronized (bootLock(n)) {
