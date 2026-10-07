@@ -499,6 +499,35 @@ fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
     witnessed && other_live_peer
 }
 
+/// Longest client id the pool's INFO lines show (see [`log_client_id`]).
+/// Real ids are 30–60 chars (`Geth/v1.16.1-stable-.../linux-amd64/go1.24.4`,
+/// `Nethermind/v1.31.11+.../linux-x64/dotnet9.0.5`); a longer one is cut.
+const LOG_CLIENT_ID_CHARS: usize = 64;
+
+/// Pure: a peer's Hello client id as OPERATOR LOG TEXT — the `client=` field
+/// of the pool's per-peer INFO lines, so a desktop log says which client each
+/// pooled peer runs (#570: the Java engine exposes it on `ConnectedPeer`, the
+/// Rust engine nowhere). The id is peer-controlled and the only bound on it
+/// is the Hello size cap, so: control characters (C0, DEL, C1 — a '\n' would
+/// forge a log line, the host drains split on it; an ESC would drive a
+/// terminal) are dropped, and the rest is cut to [`LOG_CLIENT_ID_CHARS`]
+/// chars with a trailing `…` marking the cut. Log the result with `?`, the
+/// crate's convention for this field (the handshake line in `eth::session`):
+/// Debug-quoting delimits it, so an id with spaces cannot pose as further
+/// `key=value` fields, and escapes what `is_control` does not classify — a
+/// bidi override (U+202E renders the rest of the line reversed), zero-width
+/// and line-separator characters come out as `\u{..}`. Display text only —
+/// never a key, never compared; the status JSON does not carry it (hosts pin
+/// that shape).
+fn log_client_id(client_id: &str) -> String {
+    let mut kept = client_id.chars().filter(|c| !c.is_control());
+    let mut shown: String = kept.by_ref().take(LOG_CLIENT_ID_CHARS).collect();
+    if kept.next().is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
 /// Pure: does a pooled peer count as SERVING — on the evidence, able to answer
 /// a read at the anchored head — for the count the hosts' readiness gates on
 /// (the `snapServingPeers` status key, ABI ≥ 31)? Its
@@ -682,6 +711,7 @@ impl PoolInner {
             if first || strike {
                 tracing::info!(
                     %addr, streak, strike,
+                    client = ?log_client_id(&p.peer.peer_hello.client_id),
                     "snap peer outpaced — silent while another peer served"
                 );
             } else {
@@ -732,6 +762,7 @@ impl PoolInner {
                     let (fails, evict) = read_failure_verdict(p.read_fails, len);
                     if evict {
                         tracing::info!(%addr, fails,
+                            client = ?log_client_id(&p.peer.peer_hello.client_id),
                             "evicting snap peer after repeated verified-read failures — \
                              freeing the slot for a fresh candidate");
                         peers.retain(|p| p.addr != addr);
@@ -826,6 +857,7 @@ impl PoolInner {
                     p.addr,
                     now.saturating_duration_since(p.admitted_at),
                     p.peer.close_reason(),
+                    log_client_id(&p.peer.peer_hello.client_id),
                 ));
                 false
             } else {
@@ -844,14 +876,14 @@ impl PoolInner {
         // connect-failure strike the wait exists to prevent. A peer that closed
         // within 30 s of its admission waits out the remainder; one that lived
         // longer may be re-dialed at once. One lock at a time throughout.
-        for (addr, lived, _) in &freed {
+        for (addr, lived, _, _) in &freed {
             if let Some(wait) = redial_wait_after_close(*lived) {
                 self.record_backoff_window(*addr, BackoffKind::Transient, wait, now)
                     .await;
             }
         }
         let mut attempted = self.attempted.lock().await;
-        for (addr, lived, reason) in &freed {
+        for (addr, lived, reason, client) in &freed {
             // INFO, one line per lost slot: a pool that churned through peers
             // (#539: 236 admissions of 21 peers in 28 minutes) left no line
             // saying why any of them went.
@@ -859,6 +891,7 @@ impl PoolInner {
                 %addr,
                 lived_s = lived.as_secs(),
                 reason = reason.as_deref().unwrap_or("unknown"),
+                client = ?client,
                 "pooled snap peer closed"
             );
             attempted.remove(addr);
@@ -897,19 +930,22 @@ impl PoolInner {
     /// `record_quality` documents, so a concurrent dial cannot re-dial it in
     /// the gap.
     async fn evict_lagging(&self, addr: SocketAddr, why: &str) {
-        let was_pooled = {
+        // The evicted peer's client id, read before its entry goes (the
+        // `client=` of the log line below). Not pooled, or the sole peer:
+        // nothing to do.
+        let client = {
             let mut peers = self.peers.lock().await;
             if peers.len() <= 1 {
                 return;
             }
-            let before = peers.len();
+            let Some(p) = peers.iter().find(|p| p.addr == addr) else {
+                return;
+            };
+            let client = log_client_id(&p.peer.peer_hello.client_id);
             peers.retain(|p| p.addr != addr);
-            peers.len() != before
+            client
         };
-        if !was_pooled {
-            return;
-        }
-        tracing::info!(%addr, "evicting snap peer as lagging: {why}");
+        tracing::info!(%addr, client = ?client, "evicting snap peer as lagging: {why}");
         self.record_backoff(addr, BackoffKind::Lagging, Instant::now()).await;
         self.attempted.lock().await.remove(&addr);
     }
@@ -1054,6 +1090,7 @@ impl PoolInner {
                     %addr,
                     eth = session.eth_version,
                     snap = session.snap_version.unwrap_or_default(),
+                    client = ?log_client_id(&session.peer_hello.client_id),
                     "el dial: snap peer connected"
                 );
                 // The cache's verdict on this peer from earlier runs, read in
@@ -2885,6 +2922,69 @@ mod tests {
                     assert!(!counts_as_snap2_serving(None, benched, cov));
                 }
             }
+        }
+    }
+
+    /// The `client=` field of the pool's INFO lines: peer text, bounded and
+    /// stripped of anything that could forge a line or drive a terminal.
+    mod client_id_text {
+        use super::super::{log_client_id, LOG_CLIENT_ID_CHARS};
+
+        #[test]
+        fn a_real_id_passes_through_unchanged() {
+            let id = "Geth/v1.16.1-stable-12b4131f/linux-amd64/go1.24.4";
+            assert_eq!(log_client_id(id), id);
+        }
+
+        #[test]
+        fn control_characters_are_dropped_not_escaped() {
+            // A newline would start a forged log line in the host drains
+            // (they split on '\n'); ESC would drive a terminal; NUL, DEL and
+            // the C1 range (NEL here) are the other control classes.
+            assert_eq!(
+                log_client_id("Geth\n INFO forged=1\r\x1b[31mred\x00\x7f\u{85}/v1"),
+                "Geth INFO forged=1[31mred/v1"
+            );
+        }
+
+        #[test]
+        fn debug_quoting_at_the_log_site_escapes_what_the_strip_misses() {
+            // The call sites log the result with `?`. A bidi override is not
+            // `is_control`, so the strip keeps it — and the Debug quoting
+            // turns it into an escape, never a rendering instruction, while
+            // the quotes keep an id with spaces from posing as more fields.
+            let shown = log_client_id("Geth\u{202e}/v1 fails=0");
+            assert_eq!(shown, "Geth\u{202e}/v1 fails=0");
+            assert_eq!(format!("{shown:?}"), r#""Geth\u{202e}/v1 fails=0""#);
+        }
+
+        #[test]
+        fn a_long_id_is_cut_and_marked() {
+            // ASCII, so byte and char offsets agree below.
+            let long: String = ('a'..='z').cycle().take(LOG_CLIENT_ID_CHARS + 1).collect();
+            let shown = log_client_id(&long);
+            let (head, marker) = shown.split_at(LOG_CLIENT_ID_CHARS);
+            assert_eq!(head, &long[..LOG_CLIENT_ID_CHARS]);
+            assert_eq!(marker, "…");
+            // Exactly the limit is not a cut, nor is the limit followed by
+            // nothing but control characters.
+            let exact: String = "x".repeat(LOG_CLIENT_ID_CHARS);
+            assert_eq!(log_client_id(&exact), exact);
+            assert_eq!(log_client_id(&format!("{exact}\n\r")), exact);
+        }
+
+        #[test]
+        fn the_cut_counts_chars_after_stripping() {
+            // Control chars do not eat into the budget: 64 kept chars behind
+            // a run of newlines still show whole.
+            let padded = format!("{}{}", "\n".repeat(10), "y".repeat(LOG_CLIENT_ID_CHARS));
+            assert_eq!(log_client_id(&padded), "y".repeat(LOG_CLIENT_ID_CHARS));
+        }
+
+        #[test]
+        fn empty_stays_empty() {
+            assert_eq!(log_client_id(""), "");
+            assert_eq!(log_client_id("\n\t"), "");
         }
     }
 
