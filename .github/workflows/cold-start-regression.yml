@@ -35,6 +35,14 @@
 #                 bootstrapping, first suspect that the file's entry has aged
 #                 out of what roost still serves: re-probe on zbox and update
 #                 the file before hunting for a regression.
+#
+# The `census` scope runs none of the three. It runs
+# rust/myotis-net/examples/period_census.rs instead: the whole discv5 DHT asked
+# for one period's light_client_updates_by_range, each answer filed by its
+# verdict and the client Identify named. That is the re-census the pins-alive
+# step tells you to run when a pin stops serving — from a host whose IP no
+# Lighthouse node has banned — and the way to look for new pins. Diagnostics,
+# not a check: it ends green whatever it finds, so read the report.
 name: cold-start regression
 
 on:
@@ -46,9 +54,9 @@ on:
         options: [gnosis, mainnet, sepolia]
         default: gnosis
       scope:
-        description: "full = all three checks (release). pins-only = skip the deep walk."
+        description: "full = all three checks (release). pins-only = skip the deep walk. census = only the DHT period census (no checks)."
         type: choice
-        options: [full, pins-only]
+        options: [full, pins-only, census]
         default: full
       anchor_root:
         description: "Optional override: old anchor block root (64 hex). Default: this network's entry in rust/testdata/anchors/oldest-servable.properties."
@@ -58,11 +66,20 @@ on:
         description: "Optional override: old anchor slot (set together with anchor_root)"
         type: string
         default: ""
+      census_period:
+        description: "census scope only: the sync-committee period every peer is asked for. Empty = the current one."
+        type: string
+        default: ""
+      census_crawl_secs:
+        description: "census scope only: how long to crawl the DHT, in seconds"
+        type: string
+        default: "900"
 
 # Keyed by network as well as ref: these are dispatched by hand, and running
-# gnosis then mainnet must not silently kill the first run.
+# gnosis then mainnet must not silently kill the first run. A census gets its
+# own group, so looking for new pins never cancels a release check.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.network }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.network }}${{ inputs.scope == 'census' && '-census' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -70,7 +87,7 @@ permissions:
 
 jobs:
   cold-start:
-    name: cold start (${{ inputs.network }}, ${{ inputs.scope }})
+    name: ${{ inputs.scope == 'census' && 'period census' || 'cold start' }} (${{ inputs.network }}, ${{ inputs.scope }})
     runs-on: ubuntu-latest
     # Both budgets plus the build, with headroom: the old-anchor test alone
     # allows 30 minutes of walking.
@@ -87,14 +104,33 @@ jobs:
           workspaces: rust
 
       - name: Build the tests
+        if: inputs.scope != 'census'
         working-directory: rust
         run: |
           cargo test --release -p myotis-net --test live_cold_start --no-run
           cargo test --release -p myotis-net --test live_pins_alive --no-run
 
+      - name: Build the census
+        if: inputs.scope == 'census'
+        working-directory: rust
+        run: cargo build --release -p myotis-net --example period_census
+
+      # Pins first, one at a time, then every fork-matched peer the crawl
+      # finds. An empty period means the current one (the example's default).
+      - name: Period census
+        if: inputs.scope == 'census'
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          PERIOD: ${{ inputs.census_period }}
+          CRAWL_SECS: ${{ inputs.census_crawl_secs }}
+          RUST_LOG: warn
+        run: cargo run --release -p myotis-net --example period_census
+
       # Cheap and first: if the shipped pins are dead, say so before spending
       # 15 minutes proving the wallet copes without them.
       - name: Are the shipped pins and bootnodes alive?
+        if: inputs.scope != 'census'
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
@@ -105,6 +141,7 @@ jobs:
 
       # Discovery-only: no pinned peers at all.
       - name: Cold start with every pinned peer unreachable
+        if: inputs.scope != 'census'
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
@@ -113,11 +150,11 @@ jobs:
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
 
-      # Runs for every scope except an explicit pins-only. With no override the
-      # test reads the committed test-anchor file; a half-supplied override
-      # reaches the test's own loud guard rather than skipping green.
+      # Runs for every scope except an explicit pins-only (or a census). With no
+      # override the test reads the committed test-anchor file; a half-supplied
+      # override reaches the test's own loud guard rather than skipping green.
       - name: Cold start from an old anchor
-        if: inputs.scope != 'pins-only'
+        if: inputs.scope != 'pins-only' && inputs.scope != 'census'
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
