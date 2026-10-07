@@ -539,6 +539,7 @@ impl PoolInner {
             if first || strike {
                 tracing::info!(
                     %addr, streak, strike,
+                    client = ?log_client_id(&p.peer.peer_hello.client_id),
                     "snap peer outpaced — silent while another peer served"
                 );
             } else {
