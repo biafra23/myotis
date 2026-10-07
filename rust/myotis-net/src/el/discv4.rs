@@ -803,42 +803,52 @@ struct PendingEnr {
     since: tokio::time::Instant,
     /// `entry.tcp_port` is the node's own claim (a Ping's FROM endpoint), not
     /// a relayer's hearsay or a guess: hearsay arriving while the record is
-    /// awaited must not displace it, and it is pinned if the record names no
-    /// address.
+    /// awaited must not displace it, and it is pinned for this address family
+    /// if the record is silent about it.
     claimed: bool,
+}
+
+/// The index of `ip`'s address family in [`Judgement::tcp_port`]: 0 for IPv4
+/// (4 bytes — every address entering the exchange is un-mapped by
+/// `canonical_addr`, a datagram's sender and a NEIGHBORS listing alike), 1
+/// for IPv6.
+fn family(ip: &[u8]) -> usize {
+    usize::from(ip.len() == 16)
 }
 
 /// What the exchange concluded about a node, kept by node id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Judgement {
     verdict: Verdict,
-    /// The TCP port by the node's own word: its record's (`0`: an address but
-    /// no TCP port — never dialed); when the record named no address, the port
-    /// the node's own Ping claimed, if it pinged us; updated by a later Ping's
-    /// FROM endpoint, which the node signed too and is fresher. `None` when
-    /// the node said nothing about its port (a record naming no address and
-    /// no Ping of its own, or no record at all). It outlives the sighting: a
-    /// relayer's hearsay must not put a discovery-only node back on the dial
-    /// list, or a known port back to a guess — only the node itself moves its
-    /// port here. A `Some` also keeps an `Unknown` verdict for the run (see
+    /// The TCP port by the node's own word, per address family (`[IPv4,
+    /// IPv6]` — a port is a fact about one endpoint, and a record can name
+    /// different ports for the two): its record's (`0`: no TCP connections
+    /// on that family — never dialed; `RemoteEnr::tcp_word_for`); where the
+    /// record is silent about the family the node was reached at, the port
+    /// its own Ping claimed; updated by a later Ping's FROM endpoint, which
+    /// the node signed too and is fresher. `None` where the node said nothing
+    /// about a family. It outlives the sighting: a relayer's hearsay must not
+    /// put a discovery-only node back on the dial list, or a known port back
+    /// to a guess — only the node itself moves its port here. A pin on either
+    /// family also keeps an `Unknown` verdict for the run (see
     /// [`Judgement::expired`]).
-    tcp_port: Option<u32>,
+    tcp_port: [Option<u32>; 2],
     at: tokio::time::Instant,
 }
 
 impl Judgement {
-    /// An `Unknown` that pins no port — a lost datagram, a response a shade
-    /// past the timeout, a record naming no address from a node that never
-    /// pinged us — no longer stands past [`UNKNOWN_VERDICT_TTL`]; one that
-    /// pins a port stands for the run, so the pin is never forgotten with it:
-    /// a record with an address but no `eth` entry (the EF NodeOps
-    /// bootnodes), or a record naming no address from a node whose own Ping
-    /// claimed its port (an expiring pin would reopen the hearsay hole it
-    /// closes). Its fork id is then not re-checked this run — the eth Status
-    /// check at the handshake still is.
+    /// An `Unknown` that pins no port on either family — a lost datagram, a
+    /// response a shade past the timeout, a record naming no address from a
+    /// node that never pinged us — no longer stands past
+    /// [`UNKNOWN_VERDICT_TTL`]; one that pins a port stands for the run, so
+    /// the pin is never forgotten with it: a record with an address but no
+    /// `eth` entry (the EF NodeOps bootnodes), or a record silent about the
+    /// node's family from a node whose own Ping claimed its port (an expiring
+    /// pin would reopen the hearsay hole it closes). Its fork id is then not
+    /// re-checked this run — the eth Status check at the handshake still is.
     fn expired(&self, now: tokio::time::Instant) -> bool {
         self.verdict == Verdict::Unknown
-            && self.tcp_port.is_none()
+            && self.tcp_port == [None, None]
             && now.duration_since(self.at) >= UNKNOWN_VERDICT_TTL
     }
 }
@@ -846,8 +856,9 @@ impl Judgement {
 /// What `consider` finds on file for a sighted node.
 enum Seen {
     Foreign,
-    /// Judged, with the port by the node's own word (its record's, or its
-    /// Ping's claim; see [`Judgement::tcp_port`]), if any: handed over as is.
+    /// Judged, with the port by the node's own word for this sighting's
+    /// address family (its record's, or its Ping's claim; see
+    /// [`Judgement::tcp_port`]), if any: handed over as is.
     Judged(Option<u32>),
     /// An expired `Unknown`: judged again.
     Stale,
@@ -939,7 +950,7 @@ impl EnrExchange {
         &mut self,
         node_id: Vec<u8>,
         verdict: Verdict,
-        tcp_port: Option<u32>,
+        tcp_port: [Option<u32>; 2],
         now: tokio::time::Instant,
     ) {
         if self.verdicts.len() >= ENR_VERDICTS_MAX {
@@ -1132,11 +1143,14 @@ impl ServiceLoop {
         };
         tracing::debug!(count = peers.len(), %sender, "discv4 neighbors");
         for peer in peers {
-            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port) else {
+            // Un-mapped like a datagram's sender: a relayer listing a node at
+            // `::ffff:a.b.c.d` lists its IPv4 endpoint (geth reads it so too),
+            // and the exchange keys pendings and port pins by family.
+            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port).map(canonical_addr) else {
                 continue;
             };
             let entry = TableEntry {
-                ip: peer.ip,
+                ip: ip_bytes(addr.ip()),
                 udp_port: addr.port(),
                 tcp_port: peer.tcp_port,
                 node_id: peer.node_id,
@@ -1203,7 +1217,7 @@ impl ServiceLoop {
         let seen = match enr.verdicts.get(&entry.node_id) {
             Some(j) if j.verdict == Verdict::Foreign => Seen::Foreign,
             Some(j) if j.expired(now) => Seen::Stale,
-            Some(j) => Seen::Judged(j.tcp_port),
+            Some(j) => Seen::Judged(j.tcp_port[family(&entry.ip)]),
             None => Seen::New,
         };
         match seen {
@@ -1214,16 +1228,16 @@ impl ServiceLoop {
                 return self.forget(&entry.node_id);
             }
             Seen::Judged(record_port) => {
-                // The node's own word on its port outlives the sighting (see
-                // `Judgement::tcp_port`): a relayer's hearsay yields to it, a
-                // Ping's own claim — fresher, and signed by the node — updates
-                // it, so a node that moved its port is followed and a relayer
-                // cannot move it.
+                // The node's own word on its port for this family outlives the
+                // sighting (see `Judgement::tcp_port`): a relayer's hearsay
+                // yields to it, a Ping's own claim — fresher, and signed by
+                // the node — updates it, so a node that moved its port is
+                // followed and a relayer cannot move it.
                 let mut entry = entry;
                 match claim {
                     Some(port) => {
                         if let Some(j) = enr.verdicts.get_mut(&entry.node_id) {
-                            j.tcp_port = Some(port);
+                            j.tcp_port[family(&entry.ip)] = Some(port);
                         }
                     }
                     None => {
@@ -1384,23 +1398,37 @@ impl ServiceLoop {
             tracing::debug!(%sender, "discv4: ENR signer differs from the advertised node id; using the signer");
             pending.entry.node_id = p.sender_pubkey.to_vec();
         }
-        // The record is the node's own word on where it listens: it beats the
-        // NEIGHBORS entry's hearsay and any port `admit` fell back to. An
-        // address without a TCP port is a discovery-only node (the EF NodeOps
-        // bootnodes): it stays in the table as a source of neighbours and is
-        // never dialed — the pool refuses port 0, as geth refuses such a node
-        // (`errNoPort`). A record naming no address says nothing.
-        let record_port = match remote.tcp_port_for(&pending.entry.ip) {
-            Some(tcp) => Some(u32::from(tcp)),
-            None if remote.has_ip => Some(0),
-            None => None,
-        };
-        if let Some(port) = record_port {
+        // The record is the node's own word on where it listens, per address
+        // family (`tcp` for IPv4; `tcp6`, else `tcp`, for IPv6): it beats the
+        // NEIGHBORS entry's hearsay and any port `admit` fell back to. A
+        // family on which the node takes no TCP connections (the EF NodeOps
+        // bootnodes) gets port 0: the node stays in the table as a source of
+        // neighbours and is never dialed there — the pool refuses port 0, as
+        // geth refuses such a node (`errNoPort`). Where the record is silent
+        // about a family, it says nothing about that endpoint.
+        let words = [false, true].map(|v6| remote.tcp_word_for(v6).map(u32::from));
+        let fam = family(&pending.entry.ip);
+        // What the judgement pins, per family: the record's word; for the
+        // family the node was reached at, where the record is silent, its own
+        // Ping claim; never hearsay. A node can be pending at two addresses at
+        // once (a dual-stack node, a restart on another port): where this
+        // record is silent, a pin the other pending's judgement left — that
+        // node's own word too — stays. Only pendings created before the first
+        // judgement can meet here, within one ENR timeout of each other.
+        let mut pin = words;
+        if pin[fam].is_none() && pending.claimed {
+            pin[fam] = Some(pending.entry.tcp_port);
+        }
+        if let Some(prev) = enr.verdicts.get(&pending.entry.node_id) {
+            for (slot, kept) in pin.iter_mut().zip(prev.tcp_port) {
+                if slot.is_none() {
+                    *slot = kept;
+                }
+            }
+        }
+        if let Some(port) = pin[fam] {
             pending.entry.tcp_port = port;
         }
-        // What the judgement pins: the record's word; else the node's own
-        // Ping claim, when the record named no address; never hearsay.
-        let pin = record_port.or_else(|| pending.claimed.then_some(pending.entry.tcp_port));
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
         enr.record(
             pending.entry.node_id.clone(),
@@ -1446,12 +1474,28 @@ impl ServiceLoop {
             .collect();
         let mut unjudged = Vec::with_capacity(expired.len());
         for addr in expired {
-            if let Some(p) = enr.pending.remove(&addr) {
-                // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node is
-                // asked again at its first sighting after that.
-                enr.record(p.entry.node_id.clone(), Verdict::Unknown, None, now);
-                enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
-                unjudged.push(p.entry);
+            let Some(p) = enr.pending.remove(&addr) else {
+                continue;
+            };
+            match enr.verdicts.get(&p.entry.node_id).copied() {
+                // Judged meanwhile at another of its addresses: that judgement
+                // stands — a timeout here must not hand a foreign node over,
+                // nor replace a verdict and its pins with an Unknown.
+                Some(j) if j.verdict == Verdict::Foreign => enr.skip_foreign(),
+                Some(j) => {
+                    let mut entry = p.entry;
+                    if let Some(port) = j.tcp_port[family(&entry.ip)] {
+                        entry.tcp_port = port;
+                    }
+                    unjudged.push(entry);
+                }
+                None => {
+                    // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node
+                    // is asked again at its first sighting after that.
+                    enr.record(p.entry.node_id.clone(), Verdict::Unknown, [None, None], now);
+                    enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                    unjudged.push(p.entry);
+                }
             }
         }
         if enr.bonded.len() > BONDED_MAX / 2 {
@@ -2043,6 +2087,11 @@ mod tests {
         /// An address and a UDP port, no TCP port — the discovery-only shape;
         /// with or without an `eth` entry (the EF NodeOps bootnodes have none).
         DiscoveryOnly { eth: bool },
+        /// An IPv6 address and UDP port only, with or without an IPv6-specific
+        /// TCP port (`tcp6`) — while the node talks to A over IPv4.
+        V6Only { tcp6: Option<u16> },
+        /// Both addresses and UDP ports, and a TCP port for IPv6 only.
+        DualStack { tcp6: u16 },
     }
 
     /// Play a node for `a` over a raw socket: announce ourselves to A in a
@@ -2077,6 +2126,20 @@ mod tests {
             }
             RawRecord::Tcp(tcp) => {
                 builder.tcp4(tcp);
+            }
+            RawRecord::V6Only { tcp6 } => {
+                builder.ip6(std::net::Ipv6Addr::LOCALHOST).udp6(our_udp);
+                if let Some(port) = tcp6 {
+                    builder.tcp6(port);
+                }
+            }
+            RawRecord::DualStack { tcp6 } => {
+                builder
+                    .ip4([127, 0, 0, 1].into())
+                    .udp4(our_udp)
+                    .ip6(std::net::Ipv6Addr::LOCALHOST)
+                    .udp6(our_udp)
+                    .tcp6(tcp6);
             }
             RawRecord::Bare => {}
         }
@@ -2221,11 +2284,23 @@ mod tests {
     /// A relayer's NEIGHBORS to `a`, from a fresh socket: `node` at
     /// 127.0.0.1:`udp_port`, claiming `advertised_tcp`.
     async fn relay_neighbors(a: &Discv4Service, node: &NodeKey, udp_port: u16, advertised_tcp: u32) {
+        relay_neighbors_at(a, node, &[127, 0, 0, 1], udp_port, advertised_tcp).await;
+    }
+
+    /// The same, listing `node` at `ip` (4 or 16 bytes): only the list names
+    /// the address — the packet itself travels over IPv4 loopback.
+    async fn relay_neighbors_at(
+        a: &Discv4Service,
+        node: &NodeKey,
+        ip: &[u8],
+        udp_port: u16,
+        advertised_tcp: u32,
+    ) {
         let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let data = rlp::encode(&Item::List(vec![
             Item::List(vec![Item::List(vec![
-                Item::Bytes(vec![127, 0, 0, 1]),
+                Item::Bytes(ip.to_vec()),
                 Item::Bytes(rlp::u64_to_minimal_be(u64::from(udp_port))),
                 Item::Bytes(rlp::u64_to_minimal_be(u64::from(advertised_tcp))),
                 Item::Bytes(node.public_key_bytes().to_vec()),
@@ -2362,12 +2437,204 @@ mod tests {
         a.stop().await;
     }
 
+    #[tokio::test]
+    async fn a_records_port_is_read_for_the_family_the_node_is_seen_at() {
+        // EIP-778, as geth reads it: `tcp` for IPv4; `tcp6`, else `tcp`, for
+        // IPv6; and an address with no TCP port at all means no TCP anywhere.
+        // Each raw node talks to A over IPv4 loopback, announced by NEIGHBORS
+        // with TCP 40404.
+        let a_key = Arc::new(key(27));
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::clone(&a_key),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            a_tx,
+        )
+        .await
+        .unwrap();
+        // An IPv6-only record with its own port: silent about IPv4 — `tcp6`
+        // never stands in for it — so the NEIGHBORS port stands.
+        let v6_only = key(28);
+        let entry = raw_node_round(&a, &mut a_rx, &v6_only, 40404, RawRecord::V6Only { tcp6: Some(50509) }).await;
+        assert_eq!(entry.tcp_port, 40404, "a tcp6 port is no IPv4 port");
+        // An IPv6-only record with no TCP port at all: no TCP on IPv4 either.
+        let v6_silent = key(29);
+        let entry = raw_node_round(&a, &mut a_rx, &v6_silent, 40404, RawRecord::V6Only { tcp6: None }).await;
+        assert_eq!(entry.tcp_port, 0, "no TCP port at all means none on any family");
+        // Both addresses, a port for IPv6 only: never dialed on IPv4 (geth
+        // `errNoPort`); and when a relayer lists its IPv6 address, the
+        // record's IPv6 port — the IPv4 pin does not cross families.
+        let dual = key(30);
+        let entry = raw_node_round(&a, &mut a_rx, &dual, 40404, RawRecord::DualStack { tcp6: 50510 }).await;
+        assert_eq!(entry.tcp_port, 0, "the record names IPv4 and no TCP port for it");
+        relay_neighbors_at(&a, &dual, &std::net::Ipv6Addr::LOCALHOST.octets(), 30303, 30303).await;
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands the judged node over at once")
+            .unwrap();
+        assert_eq!(entry.ip.len(), 16);
+        assert_eq!(entry.tcp_port, 50510, "on IPv6 the record's tcp6, not the IPv4 pin");
+        let entry = reannounce(&a, &mut a_rx, &dual, 30303).await;
+        assert_eq!(entry.tcp_port, 0, "and on IPv4 still none");
+        // A relayer listing it at its v4-mapped IPv6 address lists its IPv4
+        // endpoint: un-mapped, and still none — not the IPv6 pin.
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets();
+        relay_neighbors_at(&a, &dual, &mapped, 30303, 30303).await;
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands the judged node over at once")
+            .unwrap();
+        assert_eq!(entry.ip, vec![127, 0, 0, 1], "a v4-mapped listing is un-mapped");
+        assert_eq!(entry.tcp_port, 0, "and reads the IPv4 pin");
+        a.stop().await;
+    }
+
+    /// A, filtering on `[0xaa, 0xbb, 0xcc, 0xdd]` and judging every node (no
+    /// pool hint).
+    async fn filtered_node(n: u8) -> (Discv4Service, tokio::sync::mpsc::Receiver<TableEntry>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::new(key(n)),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        (a, rx)
+    }
+
+    /// A record for `node` that names no address, announcing fork hash `fork`.
+    fn bare_record(node: &NodeKey, fork: [u8; 4]) -> Vec<u8> {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        let mut secret = node.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let mut b = Enr::<CombinedKey>::builder();
+        b.seq(1)
+            .add_value_rlp("eth", alloy_rlp::Bytes::from(eth_entry_rlp(fork, 0)));
+        alloy_rlp::encode(b.build(&signing).unwrap())
+    }
+
+    /// The next entry A hands to its pool (5 s).
+    async fn handed_over(rx: &mut tokio::sync::mpsc::Receiver<TableEntry>) -> TableEntry {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("A hands the node over")
+            .unwrap()
+    }
+
+    /// The next packet of type `ty` A sends to a raw node's socket.
+    async fn await_packet(sock: &tokio::net::UdpSocket, ty: u8) -> Parsed {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("A sends the expected packet")
+                .unwrap();
+            if let Ok(p) = parse(&buf[..n]) {
+                if p.packet_type == ty {
+                    return p;
+                }
+            }
+        }
+    }
+
+    /// X pending at two addresses at once — two sockets, one key: a restart
+    /// on another port, a NAT rebinding, a dual-stack node's two families. At
+    /// `s1` X pinged A claiming TCP 50507, so A asks it for the record; at
+    /// `s2` a relayer listed X with 30303, so A pings it, and asks it too when
+    /// `s2_answers`. Returns A's ENRRequests to the two (`None` for a silent
+    /// `s2`).
+    async fn pending_at_two_addresses(
+        a: &Discv4Service,
+        x: &NodeKey,
+        s1: &tokio::net::UdpSocket,
+        s2: &tokio::net::UdpSocket,
+        s2_answers: bool,
+    ) -> (Parsed, Option<Parsed>) {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let ping = encode_ping(x, &[0, 0, 0, 0], 50507, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        s1.send_to(&ping, a_addr).await.unwrap();
+        let req1 = await_packet(s1, TYPE_ENR_REQUEST).await;
+        relay_neighbors(a, x, s2.local_addr().unwrap().port(), 30303).await;
+        let ping2 = await_packet(s2, TYPE_PING).await;
+        if !s2_answers {
+            return (req1, None);
+        }
+        let pong = encode_pong(x, &[127, 0, 0, 1], a.local_port(), &ping2.hash, expiry_now()).unwrap();
+        s2.send_to(&pong, a_addr).await.unwrap();
+        let req2 = await_packet(s2, TYPE_ENR_REQUEST).await;
+        (req1, Some(req2))
+    }
+
+    #[tokio::test]
+    async fn a_node_pending_at_two_addresses_keeps_its_own_claim() {
+        // X's record names no address, so its Ping's claim is all X said about
+        // its port: the second response must neither drop it nor hand X over
+        // at the relayer's port.
+        let (a, mut a_rx) = filtered_node(32).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(33);
+        let record = bare_record(&x, [0xaa, 0xbb, 0xcc, 0xdd]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, req2) = pending_at_two_addresses(&a, &x, &s1, &s2, true).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        assert_eq!(handed_over(&mut a_rx).await.tcp_port, 50507, "at s1, X's own claim");
+        s2.send_to(&encode_enr_response(&x, &req2.unwrap().hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let second = handed_over(&mut a_rx).await;
+        assert_eq!(second.udp_port, s2.local_addr().unwrap().port());
+        assert_eq!(second.tcp_port, 50507, "the second response keeps X's own claim");
+        let later = reannounce(&a, &mut a_rx, &x, 30303).await;
+        assert_eq!(later.tcp_port, 50507, "and later hearsay still yields to it");
+        a.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_at_another_address_does_not_undo_a_foreign_verdict() {
+        // X answers at s1 with another chain's record and never at s2: when
+        // s2's request times out, the foreign verdict stands — X is not handed
+        // over, and its verdict is not replaced by an Unknown.
+        let (a, mut a_rx) = filtered_node(34).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(35);
+        let foreign = bare_record(&x, [0x01, 0x02, 0x03, 0x04]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, _) = pending_at_two_addresses(&a, &x, &s1, &s2, false).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &foreign).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let got =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(2), a_rx.recv())
+                .await;
+        assert!(got.is_err(), "a timeout must not hand a foreign node over: {got:?}");
+        let (compatible, foreign_skips, unjudged) = a.enr_counts().snapshot();
+        assert_eq!((compatible, unjudged), (0, 0));
+        assert_eq!(foreign_skips, 2, "the verdict, and the second address skipped");
+        a.stop().await;
+    }
+
     #[test]
     fn an_unknown_verdict_expires_but_the_others_stand() {
         let t0 = tokio::time::Instant::now();
         let j = |verdict: Verdict| Judgement {
             verdict,
-            tcp_port: None,
+            tcp_port: [None, None],
             at: t0,
         };
         let later = t0 + UNKNOWN_VERDICT_TTL;
@@ -2379,10 +2646,17 @@ mod tests {
         // the discovery-only bootnodes' shape — keeps its port pin for the run.
         let with_record = Judgement {
             verdict: Verdict::Unknown,
-            tcp_port: Some(0),
+            tcp_port: [Some(0), Some(0)],
             at: t0,
         };
         assert!(!with_record.expired(later + UNKNOWN_VERDICT_TTL));
+        // So does one pinned on a single family.
+        let one_family = Judgement {
+            verdict: Verdict::Unknown,
+            tcp_port: [None, Some(30306)],
+            at: t0,
+        };
+        assert!(!one_family.expired(later + UNKNOWN_VERDICT_TTL));
     }
 
     #[test]
