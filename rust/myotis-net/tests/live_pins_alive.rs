@@ -41,9 +41,13 @@
 //!   Lighthouse servers did at the Gloas fork (2026-10-06: ServerError
 //!   "Database error" for every Gloas period). A fresh install bootstraps from
 //!   it and then cannot follow the chain. It is asked separately because an
-//!   anchor embedded before the stop says nothing about it: Sepolia's
-//!   pre-fork anchor would have passed this check with every Lighthouse pin
-//!   while only roost could carry a wallet past the fork.
+//!   anchor embedded before the stop says nothing about it: run on 2026-10-07
+//!   with v0.1.13's pre-fork anchor, the old check still passed a Lighthouse
+//!   pin that serves nothing after the fork, while only roost could carry a
+//!   wallet past it. The current period is read two epochs back: in a
+//!   period's first slots no server has a supermajority update attested in
+//!   it yet — every pin at once, which reads like a dead list. A red
+//!   current-period ask right after a period boundary means re-run first.
 //! * a pin whose peer ID does not match — the server minted a new key (Nimbus
 //!   does this per restart without `--netkey-file`); the pin is dead even
 //!   though the host is up, and the dial fails with `Unexpected peer ID <new
@@ -272,9 +276,14 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
     });
     let client = reqresp::start_host(Arc::clone(&local)).expect("host");
 
-    // Where a fresh install's catch-up starts, and where it has to arrive.
+    // Where a fresh install's catch-up starts, and where it has to arrive —
+    // read two epochs back, so a run in a period's first slots asks for the
+    // period before it instead of failing every pin at once (see the header).
     let anchor_period = config.checkpoint_slot / config.slots_per_period();
-    let head_period = config.wall_clock_period();
+    let head_period = config
+        .wall_clock_slot()
+        .saturating_sub(2 * config.slots_per_epoch)
+        / config.slots_per_period();
 
     let mut dead = Vec::new();
     let mut alive = 0usize;
@@ -316,21 +325,13 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                 .await,
             );
             // Only a cache MISS is worth retrying. Decide that on the eth2
-            // RESULT CODE, never on the response's length: an error chunk is
-            // `code || varint || snappy(msg)`, about 20 B of framing plus the
-            // message, so a 45-character error outweighs any length threshold
-            // — myotis-net's own responder answers
-            // "InvalidRequest: bootstrap root must be 32 bytes" in 65 B.
-            // InvalidRequest and ServerError are final answers; only
-            // ResourceUnavailable is the miss roost fills in the background.
-            // Byte 0 of an eth2 response frame IS the result code, so read it
-            // rather than measuring the frame: an error chunk is
-            // `code || varint || snappy(msg)`, roughly 20 B of framing plus the
-            // message, so a 45-character error outweighs any length threshold
-            // — myotis-net's own responder answers
-            // "InvalidRequest: bootstrap root must be 32 bytes" in 65 B.
-            // InvalidRequest and ServerError are final; only
-            // ResourceUnavailable is the miss roost fills in the background.
+            // RESULT CODE — byte 0 of the response frame — never on the
+            // response's length: an error chunk is `code || varint ||
+            // snappy(msg)`, about 20 B of framing plus the message, so a
+            // 45-character error outweighs any length threshold — myotis-net's
+            // own responder answers "InvalidRequest: bootstrap root must be 32
+            // bytes" in 65 B. InvalidRequest and ServerError are final answers;
+            // only ResourceUnavailable is the miss roost fills in the background.
             match &outcome {
                 Some(Ok(Ok(raw))) if raw.first() == Some(&codec::RESULT_RESOURCE_UNAVAILABLE) => {
                     continue
