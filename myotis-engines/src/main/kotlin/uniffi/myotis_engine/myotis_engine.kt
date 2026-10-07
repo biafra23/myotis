@@ -738,6 +738,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_send_raw_transaction_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_dns_discovery(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_log_index_config(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_served_block_window(
@@ -833,6 +835,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_send_raw_transaction_json(`handle`: Long,`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_set_dns_discovery(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_set_log_index_config(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1065,6 +1069,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 13582) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_set_dns_discovery() != 13006) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_log_index_config() != 49994) {
@@ -1898,6 +1905,23 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`rawTxHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
+         * system resolver (#539) — for every network this process runs. Off until a
+         * host switches it on; never used while Tor is enabled. Returns the state now
+         * in force. Process-global, not per-handle.
+         */ fun `setDnsDiscovery`(`on`: kotlin.Boolean): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_dns_discovery(
+    
+        
+        FfiConverterBoolean.lower(`on`),_status)
 }
     )
     }

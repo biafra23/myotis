@@ -105,7 +105,9 @@ complete on its own.
     snap-capable peers discovered, 150+ addresses in backoff), and one peer
     that went silent after serving cost 4–5 s reads and two retryable
     `-32000`s over four minutes until the EL hunt engaged and evicted it —
-    the #320 latency class, on a thin pool.
+    the #320 latency class, on a thin pool. (#539 shortens backoffs and
+    re-dials discovery's table while the pool is below target, and logs why
+    each pooled peer closed.)
   - Seed pin through the Node addon on a fresh data dir: a DNS-named entry
     refused (`false`), a `snapok` peer pushed (`true`), dialed on the first
     tick (`EL pool host seed pins replaced count=1`, `snap peer connected`);
@@ -147,8 +149,29 @@ complete on its own.
 ### Accepted as tuning, revisit on live data
 
 - `HEAD_LAG_TOLERANCE = 32` blocks (judged at the moment the peer spoke),
-  `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (not cleared by the
-  hunt's backoff bypass), `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
+  `HEAD_SIGNAL_FRESH = 300 s`, `BACKOFF_LAGGING = 10 min` (below target it
+  shrinks with the shortfall, to 60 s at an empty pool —
+  `LAGGING_RECHECK_FLOOR`; transient and busy never go under geth's 30 s
+  inbound throttle, `PEER_INBOUND_THROTTLE`, which is also why the EL hunt no
+  longer clears a confirmed server's transient backoff outright; #539),
+  `PROBE_MISSES_EVICT = 3`, `MAX_HOST_ENODES = 64`.
+- Engine divergence (#539): the Rust EL hunt no longer clears a cache-confirmed
+  server's transient backoff outright — against geth's 30 s inbound throttle
+  that re-dial is a refusal and a cache strike — while the Java
+  `ChainStack.maintainSnapPeers` still does. Aligning the Java twin is the
+  owner's call.
+- EIP-1459 in the Rust engine (#539 part 3, `el/dnsdisco.rs`) is desktop-first:
+  the walk runs over the system resolver where a host switched it on
+  (`myotis_set_dns_discovery`: the JVM desktop and daemon, `myotis-rpcd`) and
+  never under Tor. Open: a `DnsServers`-style port taking explicit server IPs
+  would bring it to Android (hickory's `builder_with_config`), and whether a
+  phone should spend the lookups at all; the Node addon exposes no
+  `setDnsDiscovery` yet (nor a Tor switch), so Electron/Node hosts stay off; the walk's lookups are sequential (~330 records per 15 s
+  walk on the dev host, of trees with far more — random order spreads the
+  walks); the seeder restarts with the reader on resume, where the Java twin
+  keeps its DNS pool across pause; the Java twin's public DNS fallbacks
+  (`1.1.1.1`/`8.8.8.8`) are left out on purpose (a third party learning the
+  network).
 - A warm resume's first read can cost up to one maintainer tick (~10 s) on
   an eth/68-only pool, since proving a peer now needs a probe round-trip;
   eth/69 peers prove at the handshake.
@@ -167,3 +190,14 @@ complete on its own.
 - On an address the network also pins, the host's key wins; DNS names and
   unspecified addresses are refused, not resolved or dropped.
 - A missing `snapServingPeers` key reads as 0 on the JVM and iOS hosts.
+
+## From the v0.1.14 release (2026-10-06, Glamsterdam day)
+
+- [ ] **Sepolia has one Gloas-capable light-client server (roost).** The
+  release's cold-start pin check stopped at 1 of 4 — both Lighthouse pins
+  stopped serving light-client data at the fork and a 91-peer census found
+  no other Gloas-era server — and the owner released anyway. Tracked in
+  #566: until a second server exists, every Sepolia `cold-start regression`
+  dispatch stops red at the pin check and 3b/3c never run there. Whether
+  CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
+  floor unmet for an upstream reason is the owner's decision.

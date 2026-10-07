@@ -4,8 +4,10 @@
 //! `enr:` + base64url (no padding). Matching the Java decoder
 //! (docs/reimplementation/02 §1.3): the SIGNATURE IS NOT VERIFIED on this
 //! path — nor on the Java twin's (`Enr.decode` skips it too; the Java EIP-1459
-//! DNS walk verifies only the tree's ROOT record against the tree pubkey, and
-//! this engine has no DNS walk at all). Nothing here relies on the signature:
+//! DNS walk verifies only the tree's ROOT record against the tree pubkey).
+//! The Rust engine's own DNS walk (`myotis-net`'s `el/dnsdisco.rs`, #539)
+//! does not use this decoder: it decodes leaves with the `enr` crate, which
+//! verifies each record's signature. Nothing here relies on the signature:
 //! these records seed dials and are never a trust input; simple
 //! bytes-valued pairs are kept, list-valued pairs (`eth`, `attnets`, …) are
 //! skipped in the generic map and re-parsed on demand.
@@ -178,7 +180,9 @@ impl Enr {
 /// base64url (RFC 4648 §5) decode. The ENR text form is unpadded; padding is
 /// tolerated only when it is CORRECT for the body length, matching Java's
 /// `Base64.getUrlDecoder` (which rejects wrong-count padding like `"QQ="`).
-fn base64url_decode(input: &str) -> Result<Vec<u8>, CoreError> {
+/// Public for the EIP-1459 root record's `sig=` field (`myotis-net`'s DNS
+/// walk), which is the same encoding.
+pub fn base64url_decode(input: &str) -> Result<Vec<u8>, CoreError> {
     let trimmed = input.trim_end_matches('=');
     let pad = input.len() - trimmed.len();
     let valid_padding = match (trimmed.len() % 4, pad) {

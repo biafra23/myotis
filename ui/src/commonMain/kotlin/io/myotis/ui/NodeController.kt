@@ -379,8 +379,9 @@ data class NodeSnapshot(
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
     val readyPeers: Int,
-    val snapPeers: Int,             // peers that negotiated snap/1 (capability)
+    val snapPeers: Int,             // peers that negotiated snap/1 or snap/2 (capability)
     val snapServingPeers: Int,      // peers actually in the serving pool now (drives readiness)
+    val snap2ServingPeers: Int,     // of those, the ones on snap/2 (EIP-8189); shown as "serving N (M)"
     val clConnectedPeers: Int,      // connected CL libp2p peers (usually 0 — connections are short-lived)
     val clServedPeersLastMin: Int,  // distinct peers that served a light-client response in the last 60s
     val clCachedPeers: Int,         // CL peers in cl-peers[-net].cache (live file count)
@@ -445,8 +446,8 @@ data class NodeSnapshot(
     // the anchor age the stale-anchor dialog explains.
     val wsBoundPeriods: Long = 0,
     // Fork watch: peers announce — or have already activated — a network upgrade
-    // this build doesn't support (the API's UpgradeAdvisory). null = nothing
-    // detected, or not watched on this network (staged rollout: Sepolia first).
+    // this build doesn't support (the API's UpgradeAdvisory; the EL detector is
+    // Sepolia-only for now, the CL one runs everywhere). null = nothing detected.
     val upgrade: UpgradeNotice? = null,
 )
 
@@ -457,8 +458,13 @@ data class NodeSnapshot(
  */
 data class UpgradeNotice(
     val phase: String,              // SCHEDULED (activation ahead) / ACTIVE (already passed)
-    val activationEpochSec: Long,   // unix seconds of the activation
-    val forkId: String,             // EIP-2124 fork hash upgraded peers use, "0x…"
+    val activationEpochSec: Long,   // unix seconds of the activation; 0 = unknown (peers seen
+                                    // on the fork, its time never announced)
+    val forkId: String,             // the fork identifier upgraded peers use, "0x…": the
+                                    // EIP-2124 fork hash (EL watch) or the consensus fork
+                                    // digest (CL watch); "0x00000000" = unknown (a
+                                    // blob-parameter-only fork rotates to a digest this
+                                    // build cannot compute)
     val observedPeers: Int,         // distinct peer networks (IPv4 /24, IPv6 /48) backing it
 ) {
     val active: Boolean get() = phase == "ACTIVE"

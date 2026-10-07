@@ -171,6 +171,46 @@ class NetworkConfigGnosisTest {
     }
 
     @Test
+    void elBootnodesMatchGoEthereum() {
+        // The discv4 seeds of both go-ethereum-tracked networks, in geth's order
+        // (params/bootnodes.go: the EF NodeOps nodes by their ENR's ip + udp, then
+        // the legacy enodes). The Rust twins (mainnet_config_pins_known_values,
+        // sepolia_config_pins_known_values) pin the same strings, so a re-sync
+        // that reaches only one engine fails in a fast unit test.
+        assertEquals(List.of(
+                        "212.99.218.66:20151",
+                        "129.212.166.61:30303",
+                        "144.126.252.24:30303",
+                        "178.156.215.140:30303",
+                        "5.223.94.81:30303",
+                        "18.138.108.67:30303",
+                        "3.209.45.79:30303",
+                        "65.108.70.101:30303",
+                        "157.90.35.166:30303"),
+                bootnodeStrings(NetworkConfig.MAINNET),
+                "mainnet discv4 bootnodes = go-ethereum MainnetBootnodes");
+        assertEquals(List.of(
+                        "212.99.218.66:20152",
+                        "129.212.166.61:30403",
+                        "144.126.252.24:30403",
+                        "178.156.215.140:30403",
+                        "5.223.94.81:30403",
+                        "138.197.51.181:30303",
+                        "146.190.1.103:30303",
+                        "170.64.250.88:30303",
+                        "139.59.49.206:30303",
+                        "138.68.123.152:30303"),
+                bootnodeStrings(NetworkConfig.SEPOLIA),
+                "sepolia discv4 bootnodes = go-ethereum SepoliaBootnodes");
+    }
+
+    private static List<String> bootnodeStrings(NetworkConfig c) {
+        return c.bootnodes().stream()
+                .map(a -> a.getAddress().getHostAddress() + ":" + a.getPort())
+                .toList();
+    }
+
+    @Test
     void sepoliaPinsTheDedicatedServingNodeOnBothLayers() {
         // Both halves of the dedicated pair are pinned so a wallet reaches them without
         // waiting on discovery. The CL entry must come FIRST: the light client walks
@@ -186,7 +226,6 @@ class NetworkConfigGnosisTest {
         assertEquals(List.of(
                         "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                         "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-                        "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
                         "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"),
                 NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
                 "roost first, then the census-verified public servers, same list as the Rust twin");

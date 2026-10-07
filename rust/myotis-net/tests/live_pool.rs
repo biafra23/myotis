@@ -45,7 +45,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
     let genesis = hex32(MAINNET_GENESIS);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
-    let discovery = Discv4Service::start(Arc::clone(&key), Discv4Config { bind_port: 0, bootnodes }, tx)
+    let discovery = Discv4Service::start(Arc::clone(&key), Discv4Config { bind_port: 0, bootnodes, ..Default::default() }, tx)
         .await
         .expect("discv4 start");
 

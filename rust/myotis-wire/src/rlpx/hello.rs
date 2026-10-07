@@ -10,7 +10,9 @@ pub const P2P_PING: u64 = 0x02;
 pub const P2P_PONG: u64 = 0x03;
 
 /// Build a p2p Hello body: `[protocolVersion, clientId, [[cap,ver]…], listenPort, nodeId]`.
-/// Advertises eth/66-69 + snap/1 (ascending), matching the Java `HelloMessage`.
+/// Advertises eth/66-69 + snap/1 + snap/2 (ascending), matching the Java
+/// `HelloMessage`. Both snap versions are offered so the session runs whichever
+/// one the peer has — the highest shared (see `eth::session::negotiate`).
 pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     use myotis_core::rlp::{self, Item};
     let cap = |name: &str, ver: u64| {
@@ -32,6 +34,7 @@ pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
             cap("eth", 68),
             cap("eth", 69),
             cap("snap", 1),
+            cap("snap", 2),
         ]),
         Item::Bytes(rlp::u64_to_minimal_be(u64::from(listen_port))),
         Item::Bytes(node_pubkey.to_vec()),

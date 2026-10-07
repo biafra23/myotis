@@ -264,6 +264,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     readyPeers = readyPeers(),
     snapPeers = snapPeers(),
     snapServingPeers = snapServingPeers(),
+    snap2ServingPeers = snap2ServingPeers(),
     clConnectedPeers = clPeersConnected(),
     clServedPeersLastMin = clPeersServedLastMin(),
     clCachedPeers = clPeersCached(),

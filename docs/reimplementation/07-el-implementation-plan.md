@@ -299,7 +299,11 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
 - EIP-1459: `enrtree://` root TXT **signature verification against the URL key** (the trust
   step), branch walk with caps (512 nodes / depth 16 / per-lookup + overall deadlines),
   `hickory-resolver` with explicit server IPs (the `DnsServers` port semantics) and TCP
-  fallback path; fork-filter the pool; rate-capped refresh.
+  fallback path; fork-filter the pool; rate-capped refresh. *Status (#539 part 3,
+  `el/dnsdisco.rs`): landed desktop-first — root verification, label-hash and leaf-signature
+  checks, the capped random-order walk, the fork filter, the 4 min refresh and 10-per-tick dial
+  batches, over the system resolver only. Still open: the explicit-server-IP path for mobile
+  (`DnsServers` has no engine port yet; the walk is off there) and the TCP fallback.*
 - **Engine-owned EL peer-cache persistence under `dataDir`** (doc 05 §4 simplification — the
   Rust engine does NOT get an `EnginePeerCache` port): host/port/pubkey/snap + snap-quality
   CONFIRMED/UNKNOWN/DENIED (3 strikes → DENIED, never evicted), loaded into the dial rank at

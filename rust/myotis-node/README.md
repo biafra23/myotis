@@ -365,9 +365,16 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 - **Upgrade advisory**: `statusJson` carries `upgradeAdvisory` — `null`, or
   `{ phase, activationTime, forkId, observedPeers }` when peers announce
   (`"SCHEDULED"`, `activationTime` ahead) or have already activated
-  (`"ACTIVE"`) a network upgrade this engine build does not support (EIP-2124
-  stale-software detection over the peers' eth Status; enabled on Sepolia for
-  now). Tell the user an update is required, with the date while it is
+  (`"ACTIVE"`) a network upgrade this engine build does not support. Two
+  detectors feed it: EIP-2124 stale-software detection over the peers' eth
+  Status (enabled on Sepolia for now), and its consensus-layer twin over
+  discv5 ENR `eth2` fields and peers' libp2p Status fork digests (every
+  network) — `forkId` is the EL fork hash or the CL fork digest accordingly
+  (`"0x00000000"` when unknown: a blob-parameter-only fork rotates the digest
+  to a value the build cannot compute), and `activationTime` is `0` when
+  unknown (peers seen on the fork, its epoch never announced: say "at an
+  unknown time", not 1970). Tell the user an
+  update is required, with the date while it is
   SCHEDULED. It is advisory only: derived from what peers announce
   (unverified; `observedPeers` counts distinct peer networks, and a minority
   can't outvote the peers it contradicts), never from anything verification
@@ -389,7 +396,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 37** and existing JS
+This implementation targets the current engine's **ABI 38** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -412,9 +419,12 @@ the head; the result carries `anchor`); ABI 36 lets `sendRawTransactionJson`
 answer `{"status":"rejected","reason"}` for a transaction the engine refuses
 before broadcasting it, because its sender cannot pay for it or its nonce is
 used (#531): nothing was sent, and the reason is geth's txpool verdict — a
-caller that reads only `txHash` and `error` must handle it; and ABI 37 gives
+caller that reads only `txHash` and `error` must handle it; ABI 37 gives
 `setLogIndexConfig`'s JSON an `unwatch` list (the unsubscribe — see the
-log-index example above; a config without the key behaves as before). It is
+log-index example above; a config without the key behaves as before); and
+ABI 38 adds the `snap2ServingPeers` status key — the part of
+`snapServingPeers` connected over snap/2 (EIP-8189), informational only (a
+key addition — older readers ignore it, and nothing should gate on it). It is
 not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.

@@ -46,7 +46,7 @@ async fn fetches_a_verified_account_on_live_mainnet() {
     let genesis = hex32(MAINNET_GENESIS);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(256);
-    let discovery = Discv4Service::start(Arc::clone(&key), Discv4Config { bind_port: 0, bootnodes }, tx)
+    let discovery = Discv4Service::start(Arc::clone(&key), Discv4Config { bind_port: 0, bootnodes, ..Default::default() }, tx)
         .await
         .expect("discv4 start");
 

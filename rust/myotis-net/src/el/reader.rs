@@ -85,6 +85,12 @@ pub struct ElConfig {
     /// handshake needs, so they are dialed over RLPx directly instead of
     /// waiting for discovery to surface them.
     pub boot_enodes: Vec<Enode>,
+    /// The network's EIP-1459 DNS node lists (`enrtree://<key>@<domain>`),
+    /// walked by `el::dnsdisco` on hosts that allow DNS and never under Tor
+    /// (#539, part 3): a dial source and a DHT seed that owe nothing to the
+    /// bootnodes. Twin of the Java `NetworkConfig.elEnrTreeUrls`. Empty for a
+    /// network without a tree (Gnosis).
+    pub enr_tree_urls: Vec<String>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
@@ -157,22 +163,68 @@ fn parse_boot_enodes(enodes: &[&str]) -> Vec<Enode> {
     enodes.iter().filter_map(|e| parse_enode(e).ok()).collect()
 }
 
+/// The discv4 fork-id filter for `cfg`'s chain (#539): the pinned fork id, on
+/// the chain's beacon epoch grid when this crate knows it (`sync::ChainConfig`,
+/// the same grid the fork watch places with; none for a chain it does not).
+/// Public so the live test (`tests/live_enr_filter.rs`) measures the filter
+/// as the reader ships it.
+pub fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
+    let filter = crate::el::enrfilter::ForkFilter::for_chain(cfg.fork_id_hash, cfg.fork_next);
+    let chain = match cfg.network_id {
+        1 => Some(crate::sync::ChainConfig::mainnet()),
+        11_155_111 => Some(crate::sync::ChainConfig::sepolia()),
+        100 => Some(crate::sync::ChainConfig::gnosis()),
+        _ => None,
+    };
+    match chain {
+        Some(c) => filter.with_epoch_grid(
+            c.genesis_time,
+            c.slots_per_epoch.saturating_mul(c.seconds_per_slot),
+        ),
+        None => filter,
+    }
+}
+
 impl ElConfig {
     /// Mainnet EL parameters (the values the live tests pin). The fork-id is the
     /// pinned hash the Java engine also carries; a hard fork would need a bump
     /// here (tracked as the EL-A7 fork-id item).
     pub fn mainnet() -> ElConfig {
         // discv4 bootnodes = go-ethereum `params/bootnodes.go` MainnetBootnodes
-        // (labels are geth's), re-synced 2026-09-02. The previous list carried
-        // two addresses that are not in geth's current list (18.188.214.86,
-        // 3.219.208.172); observed from one vantage point that day, none of the
-        // old four answered a ping while both Hetzner entries did. With no
-        // pinned mainnet enodes and no EIP-1459 DNS fallback, an embedder's
-        // fresh profile (no EL peer cache) then never seeds discovery and never
-        // holds a snap peer. Mirror any change into the Java
-        // `NetworkConfig.MAINNET`, the live tests under `tests/` (they pin this
-        // list verbatim) and `rust/tor-poc/src/main.rs` (carries the pubkeys).
+        // (labels and order are geth's), re-synced 2026-10-04 after
+        // ethereum/go-ethereum#35682 ("params: replace EF bootnodes with
+        // NodeOps fleet", 2026-09-29) put five EF NodeOps nodes ahead of the
+        // four older ones, which geth now calls "legacy, being phased out".
+        // geth lists the NodeOps nodes as ENRs; the entries here are each
+        // record's `ip` and `udp` fields, which is all discv4 needs — it pings
+        // a bare address cold and learns the node id from the Pong. Mind the
+        // ports: they are per record, not 30303 across the board. Their
+        // `ip6`/`udp6` fields are not used. The records carry no `tcp` key:
+        // these are discovery-only nodes, and a TCP connect to them times out.
+        // Since #539 discv4 asks a node for its ENR before the pool sees it,
+        // and a record that names an address but no TCP port is handed over at
+        // port 0, which the pool refuses (`discv4::handle_enr_response`): they
+        // seed the table and cost no dial.
+        //
+        // History: the 2026-09-02 re-sync replaced two addresses geth had
+        // dropped (18.188.214.86, 3.219.208.172). With no pinned mainnet
+        // enodes, an embedder's fresh profile (no EL peer cache) on a dead
+        // list never seeds discovery and never holds a snap peer — unless its
+        // host allows DNS, where the EIP-1459 tree below (`enr_tree_urls`,
+        // #539 part 3) is the fallback; on hosts without it (mobile) the list
+        // is still all there is. Mirror any change into the Java
+        // `NetworkConfig.MAINNET` and the pin test below; the live tests under
+        // `tests/` read this list, and `rust/tor-poc/src/main.rs` carries the
+        // legacy four with their pubkeys (it dials over TCP, so the NodeOps
+        // records are no use to it).
         const MAINNET_BOOTNODES: &[&str] = &[
+            // EF NodeOps bootnodes
+            "212.99.218.66:20151",   // nodeops-bootnode-dcl1-01
+            "129.212.166.61:30303",  // nodeops-bootnode-sfo3-01
+            "144.126.252.24:30303",  // nodeops-bootnode-blr1-01
+            "178.156.215.140:30303", // nodeops-bootnode-ash-01
+            "5.223.94.81:30303",     // nodeops-bootnode-sin-01
+            // Legacy EF bootnodes, being phased out in favour of the ones above.
             "18.138.108.67:30303", // bootnode-aws-ap-southeast-1-001
             "3.209.45.79:30303",   // bootnode-aws-us-east-1-001
             "65.108.70.101:30303", // bootnode-hetzner-hel
@@ -192,6 +244,13 @@ impl ElConfig {
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
             boot_enodes: Vec::new(),
+            // The Ethereum Foundation's canonical list, which every EL client
+            // walks (geth `params.KnownDNSNetwork`). Its signing key is the
+            // one the Sepolia list uses too.
+            enr_tree_urls: vec![
+                "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"
+                    .to_string(),
+            ],
         }
     }
 
@@ -199,12 +258,29 @@ impl ElConfig {
     /// `NetworkConfig.SEPOLIA` (fork-id is the post-BPO2/Fusaka pinned hash the
     /// Java engine also carries; a hard fork needs a bump here, same as mainnet).
     pub fn sepolia() -> ElConfig {
+        // discv4 bootnodes = go-ethereum `params/bootnodes.go` SepoliaBootnodes
+        // (labels and order are geth's), re-synced 2026-10-04 — see
+        // `ElConfig::mainnet` for the upstream change and for how the NodeOps
+        // ENRs become `ip:udp` entries (the same five hosts as mainnet, on
+        // their Sepolia ports). The legacy five were this network's whole list
+        // until then, and on 2026-10-04 none of them answered a discv4 ping
+        // from the one vantage point that tried (three runs), while all five
+        // NodeOps nodes did: the engine sat at `discv4 refresh table=0`. They
+        // stay only because geth still lists them and a second vantage point
+        // has not confirmed them dead; drop them when geth does.
         const SEPOLIA_BOOTNODES: &[&str] = &[
-            "138.197.51.181:30303",
-            "146.190.1.103:30303",
-            "170.64.250.88:30303",
-            "139.59.49.206:30303",
-            "138.68.123.152:30303",
+            // EF NodeOps bootnodes
+            "212.99.218.66:20152",   // nodeops-bootnode-dcl1-01
+            "129.212.166.61:30403",  // nodeops-bootnode-sfo3-01
+            "144.126.252.24:30403",  // nodeops-bootnode-blr1-01
+            "178.156.215.140:30403", // nodeops-bootnode-ash-01
+            "5.223.94.81:30403",     // nodeops-bootnode-sin-01
+            // Legacy EF bootnodes, being phased out in favour of the ones above.
+            "138.197.51.181:30303", // sepolia-bootnode-1-nyc3
+            "146.190.1.103:30303",  // sepolia-bootnode-1-sfo3
+            "170.64.250.88:30303",  // sepolia-bootnode-1-syd1
+            "139.59.49.206:30303",  // sepolia-bootnode-1-blr1
+            "138.68.123.152:30303", // sepolia-bootnode-1-ams3
         ];
         ElConfig {
             network_id: 11_155_111,
@@ -229,6 +305,11 @@ impl ElConfig {
             // direct-dialing it beats waiting for discovery on a saturated
             // testnet. Mirrors the Java `NetworkConfig.SEPOLIA_EL_ENODES`.
             boot_enodes: parse_boot_enodes(&[SEPOLIA_MYOTIS_ENODE]),
+            // The EF's Sepolia list (same signing key as mainnet's).
+            enr_tree_urls: vec![
+                "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net"
+                    .to_string(),
+            ],
         }
     }
     /// Gnosis EL parameters — verbatim from the Java `NetworkConfig.GNOSIS`. The
@@ -256,6 +337,9 @@ impl ElConfig {
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
             block_time: Duration::from_secs(5),
             boot_enodes: Vec::new(),
+            // Gnosis publishes no EL node list; its chainspec enodes are the
+            // Java twin's substitute (`NetworkConfig.GNOSIS_EL_ENODES`).
+            enr_tree_urls: Vec::new(),
         }
     }
 }
@@ -1712,9 +1796,20 @@ impl ElReader {
         read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
+        // Below target until the maintainer's first tick says otherwise — a
+        // fresh start is the one moment the pool is surely short of peers.
+        let below_target = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let discovery = Discv4Service::start(
             Arc::clone(&key),
-            Discv4Config { bind_port: cfg.discv4_port, bootnodes: cfg.bootnodes.clone() },
+            Discv4Config {
+                bind_port: cfg.discv4_port,
+                bootnodes: cfg.bootnodes.clone(),
+                // #539: a node whose ENR places it on another chain never
+                // reaches the pool; the pool's below-target hint gates the
+                // judging and widens the refresh fan-out.
+                fork_filter: Some(fork_filter_for(&cfg)),
+                pool_below_target: Some(Arc::clone(&below_target)),
+            },
             tx,
         )
         .await?;
@@ -1769,6 +1864,15 @@ impl ElReader {
         // Gloas: the light client proves only execution block hashes; the pool
         // fetches their headers for the anchor to verify and adopt.
         pool.start_anchor_resolver(Arc::clone(&anchor));
+        // #539: while below target the pool re-offers discovery's whole table.
+        pool.attach_discovery(discovery.table_handle(), below_target);
+        // #539, part 3: the network's EIP-1459 DNS trees, a dial source and a
+        // DHT seed independent of the bootnodes — on hosts that allow DNS
+        // (`dnsdisco::set_enabled`) and never under Tor; the walk's leaves go
+        // through the same fork-id filter as discovery's candidates.
+        if let Some(seeder) = crate::el::dnsdisco::DnsSeeder::new(&cfg.enr_tree_urls, fork_filter_for(&cfg)) {
+            pool.attach_dns_seeder(Arc::new(seeder));
+        }
         Ok(ElReader {
             request_shutdown: tokio::sync::watch::channel(false).0,
             requests: std::sync::Mutex::new(Vec::new()),
@@ -4990,6 +5094,14 @@ impl ElReader {
     /// use in place of the pooled count.
     pub async fn snap_serving_count(&self) -> usize {
         self.pool.snap_serving_count().await
+    }
+
+    /// `(serving, serving on snap/2)` from one pass over the pool:
+    /// [`snap_serving_count`](Self::snap_serving_count) and the part of it
+    /// whose connection runs snap/2 (EIP-8189) — the hosts' `snapServingPeers`
+    /// and `snap2ServingPeers` (ABI ≥ 38; the latter shown, never gated on).
+    pub async fn snap_serving_counts(&self) -> (usize, usize) {
+        self.pool.snap_serving_counts().await
     }
 
     /// EL pool/discovery counts for the host status snapshot.
@@ -10971,13 +11083,19 @@ mod tests {
             c.genesis_hash,
             hex32("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
         );
-        // The four discv4 seeds, pinned as strings: this const is the anchor
-        // the live tests build from and the Java NetworkConfig.MAINNET mirrors,
-        // so a partial re-sync fails here in a fast lib test.
+        // The discv4 seeds, pinned as strings: this const is the anchor the
+        // live tests build from and the Java NetworkConfig.MAINNET mirrors
+        // (twin: NetworkConfigGnosisTest#elBootnodesMatchGoEthereum), so a
+        // partial re-sync fails here in a fast lib test.
         let bootnodes: Vec<String> = c.bootnodes.iter().map(|a| a.to_string()).collect();
         assert_eq!(
             bootnodes,
             [
+                "212.99.218.66:20151",
+                "129.212.166.61:30303",
+                "144.126.252.24:30303",
+                "178.156.215.140:30303",
+                "5.223.94.81:30303",
                 "18.138.108.67:30303",
                 "3.209.45.79:30303",
                 "65.108.70.101:30303",
@@ -11094,7 +11212,27 @@ mod tests {
         );
         assert_eq!(cfg.fork_id_hash, [0x26, 0x89, 0x56, 0xb6]);
         assert_eq!(cfg.fork_next, 1_791_294_816, "Amsterdam, announced ahead");
-        assert_eq!(cfg.bootnodes.len(), 5, "all five sepolia bootnodes must parse");
+        // The discv4 seeds as strings, like mainnet's: a malformed entry would
+        // be dropped silently by the `filter_map` parse, and a one-engine
+        // re-sync would leave the Java twin
+        // (NetworkConfigGnosisTest#elBootnodesMatchGoEthereum) behind.
+        let bootnodes: Vec<String> = cfg.bootnodes.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            bootnodes,
+            [
+                "212.99.218.66:20152",
+                "129.212.166.61:30403",
+                "144.126.252.24:30403",
+                "178.156.215.140:30403",
+                "5.223.94.81:30403",
+                "138.197.51.181:30303",
+                "146.190.1.103:30303",
+                "170.64.250.88:30303",
+                "139.59.49.206:30303",
+                "138.68.123.152:30303",
+            ],
+            "sepolia discv4 bootnodes = go-ethereum SepoliaBootnodes (see ElConfig::sepolia)"
+        );
         assert_eq!(cfg.listen_port, 30305);
         assert_eq!(cfg.min_suggested_tip_wei, 100_000_000);
     }

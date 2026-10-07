@@ -1,4 +1,4 @@
-//! snap/1 sub-protocol messages (EL-A6), twin of the Java
+//! snap sub-protocol messages (EL-A6), twin of the Java
 //! `networking.snap.messages` package (docs/reimplementation/02 §7).
 //!
 //! Pure encode/decode; the verify-on-fetch flow lives in [`super::fetch`].
@@ -6,6 +6,11 @@
 //! root-to-leaf boundary proofs), NOT `GetTrieNodes`. Message codes are
 //! DYNAMIC: `base = 0x10 + eth_protocol_length` (17 → base 0x21 for eth/67-68,
 //! 18 → base 0x22 for eth/69); see [`SnapCodes`].
+//!
+//! Both snap/1 and snap/2 (EIP-8189) are spoken. snap/2 leaves ids 0x00-0x05
+//! — every request this engine sends — byte-for-byte unchanged; it retires
+//! `GetTrieNodes`/`TrieNodes` (0x06/0x07) and adds `GetBlockAccessLists`/
+//! `BlockAccessLists` (0x08/0x09), which only matter to a syncing full node.
 
 #[allow(unused_imports)]
 use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec, vec::Vec};
@@ -15,26 +20,39 @@ use myotis_core::CoreError;
 
 use crate::eth::kept;
 
+/// The snap versions this engine speaks, ascending. Must match the snap
+/// capabilities in `rlpx::transport::encode_hello` (pinned by its round-trip test).
+pub const OUR_SNAP_VERSIONS: [u64; 2] = [1, 2];
+
 /// The absolute wire codes for the snap messages, derived from the negotiated
-/// eth protocol length. Offsets from `base` are fixed by the snap/1 spec.
+/// eth protocol length. Offsets from `base` are fixed by the snap spec and are
+/// the same in snap/1 and snap/2; which of the last two pairs is LIVE depends
+/// on [`snap_version`](Self::snap_version).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapCodes {
+    /// The negotiated snap version (1 or 2).
+    pub snap_version: u64,
     pub get_account_range: u64,
     pub account_range: u64,
     pub get_storage_ranges: u64,
     pub storage_ranges: u64,
     pub get_byte_codes: u64,
     pub byte_codes: u64,
+    /// snap/1 only — snap/2 (EIP-8189) removed the pair.
     pub get_trie_nodes: u64,
     pub trie_nodes: u64,
+    /// snap/2 only (EIP-8189).
+    pub get_block_access_lists: u64,
+    pub block_access_lists: u64,
 }
 
 impl SnapCodes {
     /// `base = 0x10 + eth_protocol_length`. eth/67-68 has length 17 (base
     /// 0x21); eth/69 adds BlockRangeUpdate → length 18 (base 0x22).
-    pub fn for_eth_version(eth_version: u64) -> SnapCodes {
+    pub fn negotiated(eth_version: u64, snap_version: u64) -> SnapCodes {
         let base = if eth_version >= 69 { 0x22 } else { 0x21 };
         SnapCodes {
+            snap_version,
             get_account_range: base,
             account_range: base + 1,
             get_storage_ranges: base + 2,
@@ -43,6 +61,8 @@ impl SnapCodes {
             byte_codes: base + 5,
             get_trie_nodes: base + 6,
             trie_nodes: base + 7,
+            get_block_access_lists: base + 8,
+            block_access_lists: base + 9,
         }
     }
 }
@@ -348,7 +368,11 @@ pub fn encode_empty_range(request_id: u64) -> Vec<u8> {
     ]))
 }
 
-/// `[reqId, []]` — an empty ByteCodes / TrieNodes response.
+/// `[reqId, []]` — an empty ByteCodes / TrieNodes / BlockAccessLists response.
+/// For BlockAccessLists (EIP-8189) this reads the spec's "may return fewer
+/// entries, truncating from the tail" as allowing zero; its per-position
+/// "unavailable" marker (`0x80`) would need the request's hash list parsed and
+/// bounded, for an answer that tells the peer the same thing.
 pub fn encode_empty_codes(request_id: u64) -> Vec<u8> {
     rlp::encode(&Item::List(vec![
         Item::Bytes(rlp::u64_to_minimal_be(request_id)),
@@ -381,10 +405,20 @@ mod tests {
 
     #[test]
     fn snap_codes_by_eth_version() {
-        assert_eq!(SnapCodes::for_eth_version(68).get_account_range, 0x21);
-        assert_eq!(SnapCodes::for_eth_version(68).byte_codes, 0x26);
-        assert_eq!(SnapCodes::for_eth_version(69).get_account_range, 0x22);
-        assert_eq!(SnapCodes::for_eth_version(69).byte_codes, 0x27);
+        assert_eq!(SnapCodes::negotiated(68, 1).get_account_range, 0x21);
+        assert_eq!(SnapCodes::negotiated(68, 1).byte_codes, 0x26);
+        assert_eq!(SnapCodes::negotiated(69, 1).get_account_range, 0x22);
+        assert_eq!(SnapCodes::negotiated(69, 1).byte_codes, 0x27);
+        // snap/2 (EIP-8189) keeps 0x00-0x05 where they were — the read path is
+        // version-blind — and puts the BAL pair after the retired trie-node pair.
+        for eth in [68, 69] {
+            let (v1, v2) = (SnapCodes::negotiated(eth, 1), SnapCodes::negotiated(eth, 2));
+            assert_eq!(v2.get_account_range, v1.get_account_range);
+            assert_eq!(v2.storage_ranges, v1.storage_ranges);
+            assert_eq!(v2.byte_codes, v1.byte_codes);
+            assert_eq!(v2.get_block_access_lists, v1.get_account_range + 8);
+            assert_eq!(v2.block_access_lists, v1.get_account_range + 9);
+        }
     }
 
     #[test]

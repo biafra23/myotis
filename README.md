@@ -7,7 +7,7 @@
 
 # myotis
 
-Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/66-69, and snap/1 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality.
+Myotis is a **trustless Ethereum wallet engine** — a full participant in Ethereum's peer-to-peer networks that answers a wallet's requests with cryptographically verified data, with **no trusted RPC provider in the loop**. It speaks devp2p on the execution layer (discv4 discovery, RLPx encrypted transport, eth/66-69, and snap/1 or snap/2 state proofs) and libp2p on the consensus layer (a beacon-chain light client), and verifies every byte against sync-committee BLS signatures back to beacon-chain finality.
 
 Myotis runs **on mobile, on desktop, and as a library embedded in other apps**. The apps: an **Android app** (minSdk 29), an **iOS app**, a **desktop GUI app**, and a **desktop daemon/CLI** for development. The embeddings: a **Node.js native addon** that Electron and Node hosts load to run the node invisibly in-process, the way they run other embedded nodes — the [Freedom browser](https://github.com/solardev-xyz/freedom-browser) is integrating Myotis this way as an experimental tier for fully-P2P verified `.eth` resolution ([PR #181](https://github.com/solardev-xyz/freedom-browser/pull/181)) — and, on iOS, the **`MyotisKit` framework** over the engine's C ABI: iOS suspends backgrounded apps, so an iOS wallet embeds Myotis as a library and runs the node in its own process rather than talking to a separate node app. Prebuilt addon binaries for macOS/Linux/Windows ship with every [release](https://github.com/biafra23/myotis/releases) since v0.1.3; see [Embedding: Node.js / Electron](#embedding-nodejs--electron).
 
@@ -15,7 +15,7 @@ A built-in **JSON-RPC server** exposes a verified subset of the Ethereum API ove
 
 > **Status:** End-to-end verified `send` works on a real device — MetaMask renders the confirm screen from verified balances, fees, and a local gas estimate, then broadcasts the signed transaction over devp2p, with no proxy and no permissioned service. The remaining gaps are listed in [Implementation Status](docs/implementation-status.md).
 
-There are **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`). The original **Java engine** is built on Java 21 with the [Tuweni](https://github.com/consensys/tuweni) libraries (RLP, SECP256K1, byte utilities), in-house SSZ and Merkle-Patricia verification, a BLS verifier (pure-Java Milagro, or native blst from `rust/myotis-bls` behind the `BlsBackends` seam), and an embedded Hyperledger Besu EVM; it ships JVM 17 bytecode where the Android consumer needs it. The **Rust engine** (`rust/` Cargo workspace) reimplements the whole stack natively — discv4/discv5, RLPx, eth/66-69, snap/1, the beacon light client on blst, a revm-based EVM, ENS + CCIP-Read, multichain — and is the primary engine: the default selection, and ahead of the Java engine on features (the `eth_getLogs` log index, Tor routing, EIP-7702/state overrides in the EVM, the `finalized` tag on state reads). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust). The shared UI is Kotlin + Compose Multiplatform (Android, desktop, iOS).
+There are **two interchangeable engines** behind the same zero-dependency API (`:myotis-api`). The original **Java engine** is built on Java 21 with the [Tuweni](https://github.com/consensys/tuweni) libraries (RLP, SECP256K1, byte utilities), in-house SSZ and Merkle-Patricia verification, a BLS verifier (pure-Java Milagro, or native blst from `rust/myotis-bls` behind the `BlsBackends` seam), and an embedded Hyperledger Besu EVM; it ships JVM 17 bytecode where the Android consumer needs it. The **Rust engine** (`rust/` Cargo workspace) reimplements the whole stack natively — discv4/discv5, RLPx, eth/66-69, snap/1 + snap/2, the beacon light client on blst, a revm-based EVM, ENS + CCIP-Read, multichain — and is the primary engine: the default selection, and ahead of the Java engine on features (the `eth_getLogs` log index, Tor routing, EIP-7702/state overrides in the EVM, the `finalized` tag on state reads). Hosts pick one per network via the `:myotis-engines` selector (`myotis.engine=java|rust|auto`, default `auto` — the Rust engine where it can serve, Java fallback; `-Pengine=…` on run tasks, a Settings toggle in the apps). Behavioral parity is pinned by shared conformance vectors and golden tests on both sides — see [Engines](#engines-java-and-rust). The shared UI is Kotlin + Compose Multiplatform (Android, desktop, iOS).
 
 ## Documentation
 
@@ -29,8 +29,9 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 - [Re-Implementation Specification](docs/reimplementation/README.md) — The language-agnostic spec the Rust engine was built from: the trust model, wire protocols, verification ladder, engine API and the Rust-phase notes and plan (`06`, `07`).
 - [eth_getLogs: the log index](docs/eth-getlogs-design.md) — Design of the opt-in, verified log index behind `eth_getLogs` (Rust engine); companions: [verified bundles](docs/logindex-verified-bundle-design.md) (proposed) and [seeded histories](docs/seeded-log-histories.md) (the one bounded trust carve-out).
 - [Privacy & Tor](docs/privacy-and-tor.md) — What the node leaks to peers today and the (feature-gated, experimental) Tor routing of account reads on the Rust engine.
-- [Glamsterdam readiness](docs/glamsterdam-plan.md) — How the Gloas light client and the Amsterdam EVM are handled (implemented for Sepolia, awaiting the fork).
+- [Glamsterdam readiness](docs/glamsterdam-plan.md) — How the Gloas light client and the Amsterdam EVM are handled (live on Sepolia since the 2026-10-06 fork; mainnet and Gnosis have no date yet).
 - [Dedicated light-client server](docs/lc-server-design.md) — The design behind [`rust/roost`](rust/roost/README.md), the light-client server that keeps a free slot for wallets.
+- [Base (L2) evaluation](docs/base-l2-evaluation.md) — Whether and how Base could be supported under the trust model: no sync committee, so the only anchor is Base's proposals on mainnet (TEE-attested, 32–52 min old, no ZK proofs posted in practice), the weaker evidence available before one lands, the RPC landscape, and the cost of proving sequencing from L1 blob data.
 - Integrations and proofs of concept: [Bee (Swarm) on Myotis](docs/bee-rpc-service.md) ([short version](docs/bee-node-from-source.md)), the [RAILGUN PoC build](docs/railgun-poc.md) (and [its seed on Android](docs/railgun-android.md)), [React Native](docs/react-native.md) (design), [inbound connections](docs/inbound-connections.md) (design), [multichain](docs/multichain-design.md).
 - Historical: [Optimisations & Limitations](OPTIMISATIONS_AND_LIMITATIONS.md) (the Java engine's Android tuning record), the [SOLID](SOLID_REVIEW.md) and [Clean Architecture](CLEAN_ARCHITECTURE_REVIEW.md) reviews of the original modules, and the review follow-ups in [docs/TODO.md](docs/TODO.md).
 
@@ -65,7 +66,7 @@ actually been asked and answered.
 | `eth_chainId`, `net_version` | from config |
 | `eth_blockNumber` | beacon optimistic-head execution block number |
 | `eth_syncing` | straight from the beacon light client: `false` once `SYNCED`, otherwise a syncing object with zero bounds (the verified surface has no block-download notion and serves no chain-state reads before `SYNCED`; config and utility methods answer regardless) |
-| `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (absent accounts/slots proven via exclusion proof — a verified zero, not a guess) |
+| `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap (snap/1 or snap/2) Merkle-Patricia proof against a beacon-anchored `stateRoot` (absent accounts/slots proven via exclusion proof — a verified zero, not a guess) |
 | `eth_call` | local EVM over proof-served state — revm on the Rust engine, Besu on the Java engine — with a multi-hop speculative prefetch loop batching the SLOAD round-trips on both, and hedged state fetches across peers on the Rust engine. The whole transaction object is applied as geth applies it: `from`, `to`, `data`/`input`, `value` and the block selector; `gas` is the call's limit (running out of it is geth's `out of gas`); a fee must reach the base fee, is charged before the call runs and is what `GASPRICE` reads, and — fee or not — the sender must hold `gas × fee cap + value`. The Rust engine also applies `accessList`, `authorizationList`, a state override (`params[2]`) and contract creation (an absent `to` runs the init code); the Java engine refuses them (`-32602`), as both engines refuse blob fields and block overrides. A revert is error `3` with the payload |
 | `eth_estimateGas` | local EVM: geth's search for the lowest gas limit at which the transaction succeeds, plus a 15% buffer (and at least the EIP-7623 calldata floor), over the whole transaction object: EIP-7702 `authorizationList` (applied as a mined transaction applies it — an invalid tuple is skipped), `accessList`, the `gas` cap, the fee fields (what `GASPRICE` reads, and geth's cap of what the sender can pay for), `nonce`, `type`, the block selector and a state override — the Rust engine applies all of them; the Java engine applies `gas`, fees and the block and refuses the rest (`-32602`). The answer never exceeds the caller's `gas` (without one, the block's gas limit), and never falls below what the transaction draws when run as simulated; a plain transfer to an EOA short-circuits to 21000; a reverting tx returns an error, never a number |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; priority-fee tips from block bodies verified against `transactionsRoot` (+ receipts vs `receiptsRoot` for the gas-weighted percentile reward walk) |
@@ -258,7 +259,7 @@ only); the default `auto`/Rust engine picks its own discv5 port and is
 unaffected. The one-process form avoids the collision entirely.
 
 > Note: verified-state queries (`get-account`/`get-storage`) require an active
-> EL peer that serves `snap/1`. Public Gnosis nodes are fewer and busier than
+> EL peer that serves `snap` (snap/1 or snap/2). Public Gnosis nodes are fewer and busier than
 > mainnet's, so the light client may reach `SYNCED` (beacon trust anchor ready)
 > before a snap-serving peer is held — retry once `peers` shows snap-capable
 > connections, or let the peer cache warm over runs.
@@ -335,9 +336,10 @@ Returns daemon operational metrics.
 | `discoveredPeers` | int | Total peers in the Kademlia DHT |
 | `connectedPeers` | int | Total active TCP (RLPx) connections |
 | `readyPeers` | long | Peers that completed the eth handshake |
-| `snapPeers` | long | Ready peers that also support snap/1 |
+| `snapPeers` | long | Ready peers that also negotiated snap (snap/1 or snap/2) |
 | `snapServingPeers` | int | Snap peers in the serving pool right now — gate reads on this, not on `snapPeers` (#465). Rust engine: peers whose announced or served head is at or near the anchored head; Java engine: active snap sessions |
-| `backedOffPeers` | long | Peers in temporary exponential backoff |
+| `snap2ServingPeers` | int | The part of `snapServingPeers` whose connection runs snap/2 (EIP-8189). Informational — reads are the same on snap/1 and snap/2, so never gate on it. The Status screen shows it in parentheses after the serving count (`serving 8 (3)`), and omits them at 0 |
+| `backedOffPeers` | long | Peers in temporary backoff (connect failure, busy, incompatible; the Rust engine also lagging). Rust engine: entries still blocking a dial at the pool's current shortfall — below target, a window shrinks in proportion to it, never under geth's 30 s inbound throttle (#539) |
 | `blacklistedPeers` | long | Peers permanently blacklisted (incompatible network) |
 
 ### Peers
@@ -590,7 +592,7 @@ Resolves an ENS name to an Ethereum address by running the ENS contracts in a lo
 **How it works:**
 
 1. By default (AUTO) the daemon resolves against the light client's **beacon-verified finalized** execution state root first — no peer-head probe. Only if that yields no address (the record didn't exist at the finalized block) or can't be served does it fall back to a peer's head. (See *Resolution root* below.) A snap-capable peer serves the state; the proofs descend from the chosen `stateRoot`.
-2. The local EVM (revm on the Rust engine, Hyperledger Besu's standalone EVM module on the Java engine) discovers the name's resolver through the ENS Registry — an ENSIP-10 walk: the exact node, then each parent — and calls it **directly**: `resolve(bytes name, bytes data)` on an ENSIP-10 (wildcard / off-chain) resolver, or the record method itself on a legacy resolver. No Universal Resolver and no shared CCIP batch gateway sit in the path. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap/1 and verified by Merkle-Patricia proof against that `stateRoot`.
+2. The local EVM (revm on the Rust engine, Hyperledger Besu's standalone EVM module on the Java engine) discovers the name's resolver through the ENS Registry — an ENSIP-10 walk: the exact node, then each parent — and calls it **directly**: `resolve(bytes name, bytes data)` on an ENSIP-10 (wildcard / off-chain) resolver, or the record method itself on a legacy resolver. No Universal Resolver and no shared CCIP batch gateway sit in the path. Every account field, storage slot, and contract bytecode the EVM reads is fetched on demand via snap and verified by Merkle-Patricia proof against that `stateRoot`.
 3. If the call reverts with `OffchainLookup` (ERC-3668), the daemon fetches the gateway response over HTTPS from the resolver's **own** gateway (Coinbase's for `cb.id`, for example — no third-party relay) and re-enters the EVM with the resolver's callback. The callback validates the gateway's response on-chain — typically by checking a signer's signature against a list of trusted signers embedded in the resolver — so a malicious gateway cannot inject a wrong answer.
 4. The resolver's return value is decoded as the resolved address.
 
@@ -979,7 +981,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
   - `discv5` -- UDP CL peer discovery (wraps ConsenSys' `io.consensys.protocols:discovery`, consumed as the `com.github.biafra23:discovery` Android fork so it runs at minSdk 29 -- see `gradle/libs.versions.toml`)
   - `rlpx` -- TCP transport with EIP-8 ECIES handshake and AES-256-CTR framed channel
   - `eth` -- eth/66-69 sub-protocol (hello, status, block headers/bodies, receipts, transaction gossip)
-  - `snap` -- snap/1 sub-protocol (account range, storage range, bytecode, with Merkle proofs)
+  - `snap` -- snap sub-protocol, snap/1 and snap/2 / EIP-8189 (account range, storage range, bytecode, with Merkle proofs; the two versions share those messages, and a connection runs the highest one both sides offer)
 - **consensus** -- beacon chain light client (sync committee BLS verification), Merkle-Patricia proof verification
 - **myotis-evm** -- Hyperledger Besu EVM running against a SNAP-backed `StateOracle`. Powers ENS resolution, `eth_call`, and local gas estimation (`DefaultEvmExecutor.estimateGas` — geth's search for the lowest gas limit that succeeds, + 15% safety buffer). Includes `CcipReadEvmExecutor` for ERC-3668 off-chain lookups and `PrefetchingEvmExecutor` (multi-hop speculative prefetch) to amortize SNAP round-trips.
 - **myotis-ens** -- the Java engine's ENS resolver (`EnsResolver`, `ReverseLookup`): discovers each name's resolver through the Registry (ENSIP-10 walk) and calls it directly in the local EVM. Forward and reverse resolution, every record type, ENSIP-10 wildcards, ERC-3668 off-chain records. (The Rust engine has its own equivalent in `rust/myotis-net/src/el`.)
@@ -1015,7 +1017,7 @@ On the **Java engine**, both discv4 (EL) and libp2p (CL) get their initial peer 
 
 DNS resolution is best-effort: on timeout, missing TXT records, or signature mismatch the daemon logs a warning and starts up with whatever the hardcoded + cached sources provide. Per-tree deadline defaults to 10 s.
 
-The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the same on-disk caches (byte-identical formats, so switching engines keeps them), plus discv4/discv5 and, for the EL, any `enode://` seed pins a host hands it (`myotis_set_boot_enodes`, ABI ≥ 31). It has **no EIP-1459 DNS walk**: on mainnet — which pins no enodes — a stale bootnode list therefore never seeds EL discovery on a fresh profile, which is why the release checklist re-syncs the bootnodes from go-ethereum (CLAUDE.md §Releases).
+The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the same on-disk caches (byte-identical formats, so switching engines keeps them), plus discv4/discv5 and, for the EL, any `enode://` seed pins a host hands it (`myotis_set_boot_enodes`, ABI ≥ 31). Since #539 it walks the same EIP-1459 EL trees too (`rust/myotis-net/src/el/dnsdisco.rs`) — but only on hosts that allow DNS (`myotis_set_dns_discovery`, ABI ≥ 39: the desktop app, the daemon and `myotis-rpcd`, through the system resolver; not Android or iOS, until the engine takes a host's DNS servers, and not yet the Node addon) and never while Tor is enabled. Its walk also checks that every record hashes to its DNS label and verifies each leaf's signature, and the leaves pass the same fork-id filter as discv4's candidates before the pool dials them. Where DNS is off — mobile, Tor — a stale bootnode list still never seeds EL discovery on a fresh mainnet profile (no pinned enodes), which is why the release checklist re-syncs the bootnodes from go-ethereum (CLAUDE.md §Releases).
 
 ### Key dependencies
 
@@ -1023,7 +1025,7 @@ The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the sa
 - **Netty 4.2.x** (upstream) -- NIO transport. (The earlier Kotlin-transpiled tuweni/netty forks existed to explore a Kotlin-Multiplatform engine; multiplatform now comes from the Rust engine, so the forks were retired.)
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
-- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks
+- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver`, already part of its libp2p stack)
 
 ## License
 

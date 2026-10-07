@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
+use myotis_net::cl_fork_watch::{self, ClForkWatch};
 use myotis_net::el::fork_watch::{self, ForkWatch};
 use myotis_net::el::pool::Enode;
 use myotis_net::el::reader::{parse_enode, ElReader};
@@ -133,6 +134,11 @@ struct EngineState {
     /// last seen connected: a long sleep re-derives it from the peers dialed on
     /// wake. Only for networks the watch is enabled on. Dies with the handle.
     fork_watches: Mutex<HashMap<i64, Arc<ForkWatch>>>,
+    /// The consensus-layer twin, per handle, on EVERY network: fed discv5 ENR
+    /// `eth2` fields and peer Status digests by the sync loop it is handed to
+    /// at each spin-up (`ChainConfig::cl_fork_watch`). Same lifetime as
+    /// `fork_watches`; the two advisories are merged at status time.
+    cl_fork_watches: Mutex<HashMap<i64, Arc<ClForkWatch>>>,
     /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
     /// anchor-marker read/write, registration). Every guard in those paths is
     /// check-then-act against the filesystem and the handle map; without one
@@ -178,6 +184,7 @@ fn engine() -> Option<&'static EngineState> {
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
                     fork_watches: Mutex::new(HashMap::new()),
+                    cl_fork_watches: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
                 }),
@@ -234,6 +241,17 @@ pub fn tor_status() -> i32 {
     {
         0
     }
+}
+
+/// `nativeSetDnsDiscovery`: allow or forbid the EIP-1459 DNS tree walk (#539,
+/// `el::dnsdisco`) for every network this process runs. Off until a host
+/// switches it on: the hosts that resolve through the system resolver do
+/// (desktop, daemon); a host that supplies its own DNS servers has no port for
+/// them in this engine yet and leaves it off (mobile). The walk never runs
+/// while Tor is enabled, whatever this says. Returns the state now in force.
+pub fn set_dns_discovery(on: bool) -> bool {
+    myotis_net::el::dnsdisco::set_enabled(on);
+    myotis_net::el::dnsdisco::is_enabled()
 }
 
 /// `nativeCreate`: allocate a handle for a hosted network (mainnet, gnosis,
@@ -653,9 +671,16 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             _ => return false, // unknown id, or not in the expected state
         }
     };
+    // The handle's CL fork watch rides into the loop on its config: created on
+    // the first spin-up, reused (evidence intact) on every resume.
+    let cl_watch = cl_fork_watch_for(engine, handle, &config);
     // SyncHandle::start must run inside the tokio runtime (it spawns tasks).
     // The one deep ChainConfig clone: SyncHandle::start takes it by value.
-    let sync = match engine.rt.block_on(async { SyncHandle::start((*config).clone()) }) {
+    let sync = match engine.rt.block_on(async {
+        let mut cfg = (*config).clone();
+        cfg.cl_fork_watch = cl_watch;
+        SyncHandle::start(cfg)
+    }) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -777,6 +802,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             drop(map);
             if gone {
                 if let Ok(mut watches) = engine.fork_watches.lock() {
+                    watches.remove(&handle);
+                }
+                if let Ok(mut watches) = engine.cl_fork_watches.lock() {
                     watches.remove(&handle);
                 }
             }
@@ -923,14 +951,22 @@ pub fn status_json(handle: i64) -> String {
             None => Snap::Unknown,
         }
     };
-    // The handle's fork-watch advisory, read in every lifecycle state (the watch
-    // is handle-owned, not torn down with the pool on pause).
-    let upgrade_advisory = engine
+    // The handle's fork-watch advisories (EL and CL), read in every lifecycle
+    // state (the watches are handle-owned, not torn down with the pool on
+    // pause), merged into the one the status carries.
+    let el_advisory = engine
         .fork_watches
         .lock()
         .ok()
         .and_then(|m| m.get(&handle).cloned())
         .and_then(|w| w.advisory());
+    let cl_advisory = engine
+        .cl_fork_watches
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&handle).cloned())
+        .and_then(|w| w.advisory());
+    let upgrade_advisory = cl_fork_watch::merge_advisories(el_advisory, cl_advisory);
     match snap {
         Snap::Created(network, wall) => status_object(
             Lifecycle::NotStarted,
@@ -944,10 +980,13 @@ pub fn status_json(handle: i64) -> String {
                 Some(r) => engine.rt.block_on(async {
                     {
                         let (h_asked, h_served, b_asked, b_served) = r.serve_stats();
+                        // One pass for both, so snap2_serving <= snap_serving.
+                        let (snap_serving, snap2_serving) = r.snap_serving_counts().await;
                         ElCounts {
                             reader_available: true,
                             snap_peers: r.snap_peer_count().await,
-                            snap_serving: r.snap_serving_count().await,
+                            snap_serving,
+                            snap2_serving,
                             discovered: r.discovered_count(),
                             attempted: r.attempted_count().await,
                             backed_off: r.backoff_count().await,
@@ -996,6 +1035,10 @@ struct ElCounts {
     /// gate readiness on since ABI 31 — a pool of peers still syncing keeps
     /// `snap_peers` positive for hours while every read fails (#465).
     snap_serving: usize,
+    /// The subset of `snap_serving` whose connection runs snap/2 (EIP-8189;
+    /// `ElReader::snap_serving_counts`). Informational — the hosts show it in
+    /// parentheses after the serving count and gate on nothing (ABI 38).
+    snap2_serving: usize,
     discovered: usize,
     attempted: usize,
     backed_off: usize,
@@ -1045,6 +1088,27 @@ fn fork_watch_for(
     Some(Arc::clone(watch))
 }
 
+/// The handle's CL fork watch — created on its first spin-up from the chain's
+/// fork schedule, genesis root, blob params and slot timing, then reused
+/// across pause/resume. On every network (no staged rollout: the CL signal
+/// needs no EL peer, and a false advisory is a banner, never a wrong answer).
+/// None only if the registry mutex is poisoned.
+fn cl_fork_watch_for(engine: &EngineState, handle: i64, config: &ChainConfig) -> Option<Arc<ClForkWatch>> {
+    let mut map = engine.cl_fork_watches.lock().ok()?;
+    let watch = map.entry(handle).or_insert_with(|| {
+        Arc::new(ClForkWatch::new(
+            config.name,
+            config.fork_schedule.clone(),
+            config.genesis_validators_root,
+            config.blob_params_epoch,
+            config.blob_params_max_blobs,
+            config.genesis_time,
+            config.seconds_per_slot,
+        ))
+    });
+    Some(Arc::clone(watch))
+}
+
 /// `nativeStop`: remove + shut down a handle's sync loop. No-op for unknown id.
 pub fn stop(handle: i64) {
     let Some(engine) = engine() else {
@@ -1081,6 +1145,9 @@ pub fn stop(handle: i64) {
         bits.remove(&handle);
     }
     if let Ok(mut watches) = engine.fork_watches.lock() {
+        watches.remove(&handle);
+    }
+    if let Ok(mut watches) = engine.cl_fork_watches.lock() {
         watches.remove(&handle);
     }
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
@@ -2972,12 +3039,14 @@ fn status_object(
     // pool keeps only snap-capable READY peers, so readyPeers == snapPeers —
     // both count POOLED peers. snapServingPeers (ABI >= 31) is the subset that
     // can answer a read at the anchored head now; it is what the hosts gate
-    // on (#465). elReaderAvailable distinguishes "EL warming up" from "EL
-    // reader failed to start" (the CL-only degraded mode) — the wake gate
-    // fast-fails the latter.
+    // on (#465). snap2ServingPeers (ABI >= 38) is the subset of THAT whose
+    // connection runs snap/2 — shown, never gated on. elReaderAvailable
+    // distinguishes "EL warming up" from "EL reader failed to start" (the
+    // CL-only degraded mode) — the wake gate fast-fails the latter.
     obj.insert("elReaderAvailable".into(), el.reader_available.into());
     obj.insert("snapPeers".into(), el.snap_peers.into());
     obj.insert("snapServingPeers".into(), el.snap_serving.into());
+    obj.insert("snap2ServingPeers".into(), el.snap2_serving.into());
     obj.insert("readyPeers".into(), el.snap_peers.into());
     obj.insert("discoveredPeers".into(), el.discovered.into());
     obj.insert("attemptedDials".into(), el.attempted.into());
@@ -3026,7 +3095,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""discv5TableSize":0,"syncStartPeriod":-1,"lcHunting":false,"wsBoundPeriods":0,"#,
     r#""finalizedRootHex":"0000000000000000000000000000000000000000000000000000000000000000","#,
     r#""elReaderAvailable":false,"#,
-    r#""snapPeers":0,"snapServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
+    r#""snapPeers":0,"snapServingPeers":0,"snap2ServingPeers":0,"readyPeers":0,"discoveredPeers":0,"attemptedDials":0,"#,
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
@@ -3587,7 +3656,7 @@ mod tests {
         assert_eq!(v["elReaderAvailable"], false);
         assert!(v["upgradeAdvisory"].is_null(), "no advisory before any peer was seen");
         // EL counts are zero for a not-started handle.
-        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+        for k in ["snapPeers", "snapServingPeers", "snap2ServingPeers", "readyPeers", "discoveredPeers",
                   "attemptedDials", "backedOffPeers", "blacklistedPeers",
                   "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 when not started");
@@ -3637,6 +3706,23 @@ mod tests {
     }
 
     #[test]
+    fn cl_fork_watch_is_per_handle_reused_and_on_every_network() {
+        let engine = engine().expect("engine");
+        for (i, config) in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()]
+            .iter()
+            .enumerate()
+        {
+            let handle = 9_100_001 + i as i64;
+            let a = cl_fork_watch_for(engine, handle, config).expect("every network has one");
+            let b = cl_fork_watch_for(engine, handle, config).expect("still there");
+            assert!(Arc::ptr_eq(&a, &b), "a resume must reuse the handle's watch ({})", config.name);
+            assert_eq!(a.advisory(), None, "no evidence yet ({})", config.name);
+            stop(handle); // not in the handle map, but its watch must still die
+            assert!(engine.cl_fork_watches.lock().unwrap().get(&handle).is_none());
+        }
+    }
+
+    #[test]
     fn status_reports_the_handles_own_network() {
         // Issue #291: a gnosis handle self-reported "mainnet" because the key
         // was a constant. The napi/Node consumer reads this raw object, so the
@@ -3678,6 +3764,7 @@ mod tests {
             reader_available: true,
             snap_peers: 5,
             snap_serving: 3,
+            snap2_serving: 1,
             discovered: 240,
             attempted: 14,
             backed_off: 30,
@@ -3719,10 +3806,12 @@ mod tests {
         assert_eq!(synced["finalizedRootHex"], hex32(&[0xab; 32]));
         // EL counts reflect the pool/discovery snapshot (snapPeers drives
         // readyPeers, since the pool holds only snap-capable READY peers;
-        // snapServingPeers is its own count — the peers that can answer now).
+        // snapServingPeers is its own count — the peers that can answer now —
+        // and snap2ServingPeers the part of it on snap/2).
         assert_eq!(synced["elReaderAvailable"], true);
         assert_eq!(synced["snapPeers"], 5);
         assert_eq!(synced["snapServingPeers"], 3);
+        assert_eq!(synced["snap2ServingPeers"], 1);
         assert_eq!(synced["readyPeers"], 5);
         assert_eq!(synced["discoveredPeers"], 240);
         assert_eq!(synced["attemptedDials"], 14);
@@ -3784,7 +3873,7 @@ mod tests {
         assert_eq!(v["finalizedSlot"], 14_560_000);
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1795);
-        for k in ["snapPeers", "snapServingPeers", "readyPeers", "discoveredPeers",
+        for k in ["snapPeers", "snapServingPeers", "snap2ServingPeers", "readyPeers", "discoveredPeers",
                   "attemptedDials", "backedOffPeers", "blacklistedPeers",
                   "optimisticBlockNumber", "finalizedBlockNumber", "executionBlockNumber"] {
             assert_eq!(v[k], 0, "{k} should be 0 while paused");

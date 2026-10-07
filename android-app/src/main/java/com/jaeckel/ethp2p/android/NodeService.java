@@ -1396,12 +1396,14 @@ public final class NodeService extends Service {
             int discoveredPeers,
             int connectedPeers,
             int readyPeers,
-            int snapPeers,            // peers that NEGOTIATED snap/1 (capability flag)
+            int snapPeers,            // peers that NEGOTIATED snap/1 or snap/2 (capability flag)
             int snapServingPeers,     // peers actually in the serving pool right now
                                       // (negotiated, READY, not benched by snapServingFailed) —
                                       // this is what head builds / heavy confirm screens use.
                                       // Can be far below snapPeers when peers bench out, which
                                       // is what made "54 snap peers but amber/stuck" so confusing.
+            int snap2ServingPeers,    // the part of snapServingPeers on snap/2 (EIP-8189);
+                                      // shown in parentheses after the serving count, never gated on
             int cachedPeers,           // EL peers in peers[-net].cache (live file count)
             int elCachedSnapOk,        // …of which snap-serving confirmed (snapok token)
             int elCachedSnapBad,       // …of which snap-serving denied (snapbad token)
@@ -2205,6 +2207,7 @@ public final class NodeService extends Service {
             // Covers both a stopped stack and a PAUSED one (running=false, warm state
             // retained) — the lifecycle string lets the UI tell them apart.
             return new Snapshot(running, lifecycle, chainStartMs, 0, 0, 0, 0, /*snapServing*/0,
+                    /*snap2Serving*/0,
                     elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                     s.blacklistedPeers(), s.discv5TableSize(), 0,
                     beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),
@@ -2221,7 +2224,7 @@ public final class NodeService extends Service {
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
-                s.snapPeers(), s.snapServingPeers(),
+                s.snapPeers(), s.snapServingPeers(), s.snap2ServingPeers(),
                 elCache.getTotal(), elCache.getSnapOk(), elCache.getSnapBad(), s.attemptedDials(), s.backedOffPeers(),
                 s.blacklistedPeers(), s.discv5TableSize(), 0,
                 beaconState, bs.bootstrapped(), bs.connectedPeers(), (int) bs.lightClientPeers(),

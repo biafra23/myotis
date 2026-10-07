@@ -3,6 +3,7 @@ package io.myotis.node.api;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.networking.NetworkConfig;
+import com.jaeckel.ethp2p.networking.discv5.ClForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.AccountProofResult;
@@ -140,11 +141,20 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
             readyRows.add(new PeerInfo(p.remoteAddress(), p.snapSupported(), p.clientId()));
         }
 
-        // Two DISTINCT counts: peers that negotiated snap/1 vs peers currently in the
+        // Two DISTINCT counts: peers that negotiated snap (1 or 2) vs peers currently in the
         // serving pool (activeSnapHandlers filters out serving-failed peers). Surfacing
         // both makes a serving-pool collapse visible — the live operational issue on
         // peer-scarce chains — so never feed one into the other.
-        int snapServing = conn != null ? conn.activeSnapHandlers().size() : 0;
+        // snap2Serving is the part of the serving pool on snap/2 (EIP-8189) — shown
+        // next to the serving count, never gated on (reads are the same on either).
+        int snapServing = 0;
+        int snap2Serving = 0;
+        if (conn != null) {
+            for (com.jaeckel.ethp2p.networking.eth.EthHandler h : conn.activeSnapHandlers()) {
+                snapServing++;
+                if (h.snapVersion() >= 2) snap2Serving++;
+            }
+        }
         long wallClockPeriod = BeaconChainSpec.currentPeriod(net.clGenesisTime(), net.secondsPerSlot());
         io.myotis.rpc.VerifiedRpcBackend backend = stack.rpcBackend();
 
@@ -157,6 +167,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 ready.size(),
                 snapNegotiated,
                 snapServing,
+                snap2Serving,
                 stack.discV4() != null ? stack.discV4().table().size() : 0,
                 stack.pruneAndCountActiveBackoff(),
                 stack.blacklistedNodeIds().size(),
@@ -192,15 +203,18 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.elHunting(),
                 stack.rpcListenPort(),
                 stack.rpcServing(),
-                upgradeAdvisory(stack.forkWatch()));
+                upgradeAdvisory(stack.forkWatch(), stack.clForkWatch()));
     }
 
-    /** The fork watch's current advisory as the API shape; null when there is none or the
-     *  watch isn't enabled on this network. The watch is stack-owned, so a pause keeps its
-     *  evidence — which still ages out a day after its sources were last seen connected; a
-     *  long sleep re-derives it from the peers dialed on resume. */
-    static UpgradeAdvisory upgradeAdvisory(ForkWatch watch) {
-        ForkWatch.Advisory a = watch != null ? watch.advisory() : null;
+    /** The fork watches' current advisory as the API shape — the EL and CL detectors'
+     *  merged by {@link ClForkWatch#merge}; null when neither has one (the EL watch is
+     *  also null where it isn't enabled). The watches are stack-owned, so a pause keeps
+     *  their evidence — which still ages out a day after it was presented; a long sleep
+     *  re-derives it from the peers dialed on resume. */
+    static UpgradeAdvisory upgradeAdvisory(ForkWatch elWatch, ClForkWatch clWatch) {
+        ForkWatch.Advisory a = ClForkWatch.merge(
+                elWatch != null ? elWatch.advisory() : null,
+                clWatch != null ? clWatch.advisory() : null);
         if (a == null) return null;
         return new UpgradeAdvisory(UpgradePhase.valueOf(a.phase().name()), a.activationTime(),
                 a.forkHashHex(), a.peers());

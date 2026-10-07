@@ -105,11 +105,20 @@ public record NetworkConfig(
             new byte[]{(byte) 0x07, (byte) 0xc9, (byte) 0x46, (byte) 0x2e}, // post-BPO2 (Fusaka)
             0L,
             // discv4 bootnodes = go-ethereum params/bootnodes.go MainnetBootnodes
-            // (labels are geth's), re-synced 2026-09-02: two stale entries replaced
-            // by the Hetzner pair. Keep in lockstep with the Rust twin
-            // (rust/myotis-net/src/el/reader.rs, ElConfig::mainnet), which
-            // documents the incident.
+            // (labels and order are geth's), re-synced 2026-10-04 after
+            // ethereum/go-ethereum#35682 put five EF NodeOps nodes ahead of the
+            // four "legacy" ones. geth lists the NodeOps nodes as ENRs; these are
+            // each record's ip and udp fields — mind the per-record ports. Keep in
+            // lockstep with the Rust twin (rust/myotis-net/src/el/reader.rs,
+            // ElConfig::mainnet), which documents the details and the history.
             List.of(
+                    // EF NodeOps bootnodes
+                    new InetSocketAddress("212.99.218.66", 20151),   // nodeops-bootnode-dcl1-01
+                    new InetSocketAddress("129.212.166.61", 30303),  // nodeops-bootnode-sfo3-01
+                    new InetSocketAddress("144.126.252.24", 30303),  // nodeops-bootnode-blr1-01
+                    new InetSocketAddress("178.156.215.140", 30303), // nodeops-bootnode-ash-01
+                    new InetSocketAddress("5.223.94.81", 30303),     // nodeops-bootnode-sin-01
+                    // Legacy EF bootnodes, being phased out in favour of the ones above.
                     new InetSocketAddress("18.138.108.67", 30303), // bootnode-aws-ap-southeast-1-001
                     new InetSocketAddress("3.209.45.79", 30303),   // bootnode-aws-us-east-1-001
                     new InetSocketAddress("65.108.70.101", 30303), // bootnode-hetzner-hel
@@ -118,9 +127,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15351360, 2026-10-03, period 1873)
-            Bytes.fromHexString("039baa05bc98a69f0acf3a68f7ec0ebfe7aa07da238b3f0cb33741b1d961e89c").toArrayUnsafe(),
-            15351360L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15373376, 2026-10-06, period 1876)
+            Bytes.fromHexString("d590bf3ac2b3010fddda48ecd5d72bc923a43af0751ab7e8fb20b8038cdbe503").toArrayUnsafe(),
+            15373376L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -174,8 +183,12 @@ public record NetworkConfig(
                     // 57.129.130.18 served; a third close in a row would be grounds to prune.
                     // Re-verified 2026-09-21 at the then-shipped period-1863 anchor,
                     // run 35616056243: 5 of 5 — 91.189.182.90 served in full.
-                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // Re-verified 2026-09-24 at the anchor v0.1.12 shipped (period
                     // 1865), run 35988133216: 5 of 5 again.
+                    // Re-verified 2026-10-06 at the anchor v0.1.14 ships (period
+                    // 1876), run 37500516886: 4 of 5 — 57.129.130.18 closed the
+                    // connection from the runner again (first close since it served
+                    // the four runs above; not a row yet).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -241,19 +254,31 @@ public record NetworkConfig(
             // (ethereum/pm#2205). Announced until then; afterwards the fork id is
             // successor(0x268956b6, it) = 0x6c1d9423 — see forkIdAt.
             1_791_294_816L,
+            // discv4 bootnodes = go-ethereum params/bootnodes.go SepoliaBootnodes
+            // (labels and order are geth's), re-synced 2026-10-04: the five EF
+            // NodeOps nodes (each ENR's ip and udp fields) ahead of the legacy
+            // five, which were silent that day. Keep in lockstep with the Rust
+            // twin (ElConfig::sepolia), which documents the details.
             List.of(
-                    new InetSocketAddress("138.197.51.181", 30303),
-                    new InetSocketAddress("146.190.1.103", 30303),
-                    new InetSocketAddress("170.64.250.88", 30303),
-                    new InetSocketAddress("139.59.49.206", 30303),
-                    new InetSocketAddress("138.68.123.152", 30303)
+                    // EF NodeOps bootnodes
+                    new InetSocketAddress("212.99.218.66", 20152),   // nodeops-bootnode-dcl1-01
+                    new InetSocketAddress("129.212.166.61", 30403),  // nodeops-bootnode-sfo3-01
+                    new InetSocketAddress("144.126.252.24", 30403),  // nodeops-bootnode-blr1-01
+                    new InetSocketAddress("178.156.215.140", 30403), // nodeops-bootnode-ash-01
+                    new InetSocketAddress("5.223.94.81", 30403),     // nodeops-bootnode-sin-01
+                    // Legacy EF bootnodes, being phased out in favour of the ones above.
+                    new InetSocketAddress("138.197.51.181", 30303), // sepolia-bootnode-1-nyc3
+                    new InetSocketAddress("146.190.1.103", 30303),  // sepolia-bootnode-1-sfo3
+                    new InetSocketAddress("170.64.250.88", 30303),  // sepolia-bootnode-1-syd1
+                    new InetSocketAddress("139.59.49.206", 30303),  // sepolia-bootnode-1-blr1
+                    new InetSocketAddress("138.68.123.152", 30303)  // sepolia-bootnode-1-ams3
             ),
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11275552, 2026-10-03, period 1376)
-            Bytes.fromHexString("be55abd56d4e752ad86daddef550fa4537e5e5922d54b5c8622433c972a27bed").toArrayUnsafe(),
-            11275552L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11297568, 2026-10-06, period 1379)
+            Bytes.fromHexString("2008fe0e6bc957261f85619221fc91befe6802a647d30bf9e408df3ad89ada9c").toArrayUnsafe(),
+            11297568L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
@@ -321,10 +346,23 @@ public record NetworkConfig(
             // anchor, run 34776027257: 4 of 4 again; 2026-09-16 at the then-shipped
             // period-1361 anchor, run 35065049320: 4 of 4 again; 2026-09-21 at the
             // then-shipped period-1365 anchor, run 35616060242: 4 of 4 again;
-            // 2026-09-24 at the anchor this build ships (period 1368), run
+            // 2026-09-24 at the anchor v0.1.12 shipped (period 1368), run
             // 35989152817: 4 of 4 again. Re-run it after every checkpoint refresh,
             // since a census against a superseded root says nothing about the
-            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
+            // anchor a fresh install starts from.
+            // 2026-10-06, Glamsterdam day, at the anchor v0.1.14 ships (period
+            // 1379, the first past the Gloas fork), run 37500521280: 1 of 4 —
+            // only roost. Both Lighthouse pins (v8.3.0-rc.0) answered
+            // ResourceUnavailable for a Gloas-era bootstrap root and serve
+            // pre-fork-shaped updates for period 1379 (their light-client
+            // server stopped at the fork), and 138.201.192.180 closed the
+            // connection from the runner, the dev Mac and the census crawl:
+            // pruned. A period-1379 census of the DHT (91 fork-matched peers)
+            // found roost the ONLY server of a Gloas-era update; the public
+            // Lodestar node (65.21.93.60) serves Gloas over REST but closes
+            // inbound libp2p connections. Below the two-pin floor until a
+            // second Gloas-capable server exists — the owner's call.
+            // They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
             // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
             // switched off as well, cost the Rust engine's bootstrap fan-out
@@ -335,7 +373,6 @@ public record NetworkConfig(
                     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
                             "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-                            "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
                             "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"
                     )),
             null,
@@ -402,9 +439,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30409552, 2026-10-03, period 3712)
-            Bytes.fromHexString("ca3885ed198833ff0c5b2f685ede4a0a93f7b712a3ab4d69a69a68cb6dee9b9c").toArrayUnsafe(),
-            30409552L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30462400, 2026-10-06, period 3718)
+            Bytes.fromHexString("7a49f27ccca8ff682c49ab7979654e5b33e2abbadbf43550cfb151ae196715eb").toArrayUnsafe(),
+            30462400L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
@@ -448,12 +485,14 @@ public record NetworkConfig(
                     // run 35065032444: 8 of 8 again.
                     // Re-verified 2026-09-21 at the then-shipped period-3686 anchor,
                     // run 35616052466: 8 of 8 again.
-                    // Re-verified 2026-09-24 at the anchor this build ships (period
+                    // Re-verified 2026-09-24 at the anchor v0.1.12 shipped (period
                     // 3692), run 35988128286: 6 of 8 — both :9500 pins (134.65.194.144,
                     // 164.152.161.131) failed to dial from the runner. One run from one
                     // vantage point, and the pair has timed out on a runner before
                     // (2026-09-13) and served every run since: a re-census signal, not
                     // grounds to prune. Above the two-pin floor either way.
+                    // Re-verified 2026-10-06 at the anchor v0.1.14 ships (period
+                    // 3718), run 37500512616: 8 of 8 — both :9500 pins served again.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -544,16 +583,32 @@ public record NetworkConfig(
      * Rust twin: {@code ChainConfig::fork_digest_at_epoch}.
      */
     public byte[] forkDigestAtEpoch(long epoch) {
-        byte[] base = forkDigestFor32(forkVersionAtEpoch(epoch));
-        if (activeBlobParamsEpoch == 0) {
+        return forkDigest(forkVersionAtEpoch(epoch), genesisValidatorsRoot(),
+                activeBlobParamsEpoch, activeBlobParamsMaxBlobs);
+    }
+
+    /**
+     * {@link #forkDigestAtEpoch}'s arithmetic for an arbitrary fork version and chain:
+     * the EIP-7892 digest of {@code forkVersion} on the chain with
+     * {@code genesisValidatorsRoot}, with the blob-parameter entry
+     * {@code (blobParamsEpoch, blobParamsMaxBlobs)} folded in ({@code blobParamsEpoch == 0}
+     * = no BPO active, the pre-Fulu formula). What the fork watch uses to judge a version
+     * peers advertise. Rust twin: {@code status::fork_digest_bpo}.
+     */
+    public static byte[] forkDigest(byte[] forkVersion, byte[] genesisValidatorsRoot,
+                                    long blobParamsEpoch, long blobParamsMaxBlobs) {
+        if (forkVersion == null || forkVersion.length != 4)
+            throw new IllegalArgumentException("forkVersion must be 4 bytes");
+        byte[] base = forkDataRoot(forkVersion, genesisValidatorsRoot);
+        if (blobParamsEpoch == 0) {
             byte[] out = new byte[4];
             System.arraycopy(base, 0, out, 0, 4);
             return out;
         }
         byte[] bpInput = new byte[16];
         // SSZ uint64 is little-endian
-        longToLeBytes(activeBlobParamsEpoch, bpInput, 0);
-        longToLeBytes(activeBlobParamsMaxBlobs, bpInput, 8);
+        longToLeBytes(blobParamsEpoch, bpInput, 0);
+        longToLeBytes(blobParamsMaxBlobs, bpInput, 8);
         byte[] bpHash;
         try {
             bpHash = java.security.MessageDigest.getInstance("SHA-256").digest(bpInput);
@@ -565,9 +620,8 @@ public record NetworkConfig(
         return out;
     }
 
-    /** Same as {@link #forkDigestFor} but returns the full 32-byte fork_data_root. */
-    private byte[] forkDigestFor32(byte[] forkVersion) {
-        byte[] genesisValidatorsRoot = genesisValidatorsRoot();
+    /** {@code compute_fork_data_root}: {@code sha256(pad32(fork_version) || genesis_validators_root)}. */
+    private static byte[] forkDataRoot(byte[] forkVersion, byte[] genesisValidatorsRoot) {
         try {
             byte[] buf = new byte[64];
             System.arraycopy(forkVersion, 0, buf, 0, 4);

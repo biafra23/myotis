@@ -52,6 +52,25 @@ fn with_next() -> LightClientProcessor {
     p
 }
 
+/// The sync loop's finality poll wins only on `Advanced`: a re-served update
+/// verifies but moves nothing (`Stale`), and one that fails verification is
+/// `Rejected`. On a network whose servers stalled at a fork, the stale reply
+/// arrives first every round; counting it as the win hid the current server.
+#[test]
+fn apply_finality_update_tells_advanced_from_stale_and_rejected() {
+    use myotis_consensus::store::FinalityOutcome;
+    let mut p = with_next();
+    let fin = finality_of(&update("002-update.ssz"));
+    assert_eq!(p.apply_finality_update(&fin), FinalityOutcome::Advanced);
+    let after = (p.store.finalized_slot(), p.store.optimistic_slot());
+    assert_eq!(p.apply_finality_update(&fin), FinalityOutcome::Stale, "re-served: verifies, moves nothing");
+    assert_eq!((p.store.finalized_slot(), p.store.optimistic_slot()), after);
+    let mut tampered = fin.clone();
+    tampered.finality_branch[0][0] ^= 1;
+    assert_eq!(p.apply_finality_update(&tampered), FinalityOutcome::Rejected);
+    assert_eq!((p.store.finalized_slot(), p.store.optimistic_slot()), after);
+}
+
 #[test]
 fn next_period_finality_update_is_accepted_before_rotation() {
     let mut p = with_next();

@@ -11,6 +11,7 @@ import com.jaeckel.ethp2p.networking.discv4.DiscV4Service;
 import com.jaeckel.ethp2p.networking.discv4.KademliaTable;
 import com.jaeckel.ethp2p.networking.discv5.DiscV5Service;
 import com.jaeckel.ethp2p.networking.dns.DnsEnrResolver;
+import com.jaeckel.ethp2p.networking.discv5.ClForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -188,6 +189,9 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** EIP-2124 stale-software detector over peers' Status fork ids; stack-owned for the
      *  same reason as serveStats. Null where not enabled (staged rollout: Sepolia). */
     private final ForkWatch forkWatch;
+    /** Its consensus-layer twin, over discv5 ENR {@code eth2} fields and peers' Status
+     *  fork digests; stack-owned for the same reason, on every network. */
+    private final ClForkWatch clForkWatch;
     private volatile RLPxConnector connector;
     private volatile DiscV4Service discV4;
     private volatile DiscV5Service discV5;
@@ -224,6 +228,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
         this.forkWatch = ForkWatch.enabledFor(network) ? ForkWatch.forNetwork(network) : null;
+        this.clForkWatch = ClForkWatch.forNetwork(network);
         this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::notReadyDetail,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
                 System::currentTimeMillis, WAKE_POLL_MS, network.name());
@@ -697,6 +702,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     public io.myotis.evm.world.ReadStats readStats() { return readStats; }
     /** The fork watch, or null where it is not enabled for this network. */
     public ForkWatch forkWatch() { return forkWatch; }
+    /** The consensus-layer fork watch (every network). */
+    public ClForkWatch clForkWatch() { return clForkWatch; }
     public DiscV4Service discV4() { return discV4; }
     public DiscV5Service discV5() { return discV5; }
     public BeaconSyncState beaconSyncState() { return beaconSyncState; }
@@ -1021,6 +1028,14 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                         mi == 0 ? "current" : "prior", liveAdded ? " → live pool" : "");
             });
         });
+        // Evidence for the CL fork watch: every record heard, every time, BEFORE the
+        // digest filter above (a fork this build does not know is exactly what the
+        // filter drops) and before the once-ever dedup (the watch's evidence ages
+        // out a day after it was last heard).
+        discV5.setOnEnrHeard(enr -> enr.eth2().ifPresent(eth2 ->
+                enr.udpAddress().or(enr::tcpAddress).ifPresent(addr -> clForkWatch.observeEnr(
+                        ForkWatch.sourceOf(addr.getAddress()), eth2.forkDigest(),
+                        eth2.nextForkVersion(), eth2.nextForkEpoch()))));
         try {
             discV5.start(ports.discv5Port());
         } catch (Throwable t) {
@@ -1055,6 +1070,12 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         blc.setProvenNonLightClient(clPeerCache.lightClientDenied());
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
+        // Every peer Status the host decodes feeds the CL fork watch (a /dns4/
+        // peer names no IP literal and casts no vote).
+        blc.setOnPeerStatus((remote, digest) -> {
+            String source = ClForkWatch.sourceOfMultiaddr(remote);
+            if (source != null) clForkWatch.observeStatus(source, digest);
+        });
         // Weak-subjectivity anchor-age bound: network default + any host override,
         // plus a pre-start stale-anchor consent — all must land before start() so
         // the cold-start gate judges with them.

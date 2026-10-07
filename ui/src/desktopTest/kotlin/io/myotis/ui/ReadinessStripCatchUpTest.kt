@@ -74,7 +74,7 @@ class ReadinessStripCatchUpTest {
     private fun snapshot() = NodeSnapshot(
         running = true, lifecycle = "RUNNING", network = "mainnet", engine = "rust",
         beaconState = "SYNCED", connectedPeers = 17, readyPeers = 8, snapPeers = 8,
-        snapServingPeers = 8, clConnectedPeers = 0, clServedPeersLastMin = 3,
+        snapServingPeers = 8, snap2ServingPeers = 0, clConnectedPeers = 0, clServedPeersLastMin = 3,
         clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
         elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 137, backedOffPeers = 0,
         blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 26_097_901,

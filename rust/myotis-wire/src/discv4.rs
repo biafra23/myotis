@@ -33,6 +33,9 @@ pub const TYPE_PING: u8 = 0x01;
 pub const TYPE_PONG: u8 = 0x02;
 pub const TYPE_FIND_NODE: u8 = 0x03;
 pub const TYPE_NEIGHBORS: u8 = 0x04;
+/// EIP-868: ask a bonded node for its ENR; the reply echoes the request hash.
+pub const TYPE_ENR_REQUEST: u8 = 0x05;
+pub const TYPE_ENR_RESPONSE: u8 = 0x06;
 
 /// Ping/Pong protocol version.
 const VERSION: u64 = 4;
@@ -94,6 +97,50 @@ pub fn encode_find_node(key: &NodeKey, target: &[u8], expiry: u64) -> Result<Vec
     encode_packet(key, TYPE_FIND_NODE, &rlp::encode_list_payload(&payload))
 }
 
+/// EIP-868 ENRRequest: `[expiration]`.
+pub fn encode_enr_request(key: &NodeKey, expiry: u64) -> Result<Vec<u8>, CoreError> {
+    let payload = rlp::encode_u64(expiry);
+    encode_packet(key, TYPE_ENR_REQUEST, &rlp::encode_list_payload(&payload))
+}
+
+/// The expiration of an ENRRequest.
+pub fn decode_enr_request_expiry(data: &[u8]) -> Result<u64, CoreError> {
+    decode_lenient(data)?
+        .as_list()?
+        .first()
+        .ok_or_else(|| CoreError("ENRRequest: missing expiration".into()))?
+        .as_u64()
+}
+
+/// EIP-868 ENRResponse: `[request-hash, ENR]`, the ENR spliced in as the RLP
+/// list it already is.
+pub fn encode_enr_response(
+    key: &NodeKey,
+    request_hash: &[u8; 32],
+    enr_rlp: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    let mut payload = rlp::encode_bytes(request_hash);
+    payload.extend_from_slice(enr_rlp);
+    encode_packet(key, TYPE_ENR_RESPONSE, &rlp::encode_list_payload(&payload))
+}
+
+/// The request hash and the ENR (re-encoded from the parsed list — canonical
+/// RLP, which is what an ENR signature covers) of an ENRResponse.
+pub fn decode_enr_response(data: &[u8]) -> Result<([u8; 32], Vec<u8>), CoreError> {
+    let top = decode_lenient(data)?;
+    let items = top.as_list()?;
+    let hash_item = items
+        .first()
+        .ok_or_else(|| CoreError("ENRResponse: missing request hash".into()))?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(hash_item.as_fixed_bytes(32)?);
+    let enr = items
+        .get(1)
+        .filter(|e| e.is_list())
+        .ok_or_else(|| CoreError("ENRResponse: missing ENR".into()))?;
+    Ok((hash, rlp::encode(enr)))
+}
+
 /// Endpoint: `[ip(4|16), udpPort, tcpPort]`.
 fn encode_endpoint(ip: &[u8], udp_port: u16, tcp_port: u16) -> Vec<u8> {
     let mut payload = rlp::encode_bytes(ip);
@@ -115,6 +162,13 @@ fn encode_packet(key: &NodeKey, packet_type: u8, data: &[u8]) -> Result<Vec<u8>,
     out.extend_from_slice(&hash);
     out.extend_from_slice(&tail);
     Ok(out)
+}
+
+/// Sign and frame any packet type -- for tests that craft packets this client
+/// never sends (Neighbors, from a peer's side).
+#[cfg(any(test, feature = "test-util"))]
+pub fn encode_packet_for_test(key: &NodeKey, packet_type: u8, data: &[u8]) -> Result<Vec<u8>, CoreError> {
+    encode_packet(key, packet_type, data)
 }
 
 /// Parse and verify an inbound packet: hash check, then sender recovery.

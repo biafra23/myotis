@@ -290,6 +290,12 @@ fn anchored_head_number(anchor: &Option<AnchorSource>) -> Option<u64> {
 /// a served proof says where the peer WAS, and so does its next announcement.
 type SharedKnownHead = Arc<std::sync::Mutex<Option<KnownHead>>>;
 
+/// Why the read loop stopped, set once by whichever exit path fired first
+/// (`fail_all`) or by [`ManagedPeer::close`]: the operator-visible reason the
+/// pool logs when it prunes the peer (#539 — a pool that churned through
+/// peers left no line saying why any of them went).
+type SharedCloseReason = Arc<std::sync::Mutex<Option<String>>>;
+
 /// A negotiated eth/snap peer, driven by a background read loop.
 pub struct ManagedPeer {
     writer: SharedWriter,
@@ -298,6 +304,8 @@ pub struct ManagedPeer {
     /// Set once the read loop terminates (disconnect / read error); requests
     /// short-circuit instead of hanging until timeout.
     closed: Arc<AtomicBool>,
+    /// Why (see [`SharedCloseReason`]); `None` while open.
+    close_reason: SharedCloseReason,
     /// Consecutive request timeouts with no answer in between — the log
     /// throttle: the first of a silent streak is a WARN naming the peer, the
     /// rest are DEBUG (an EVM prefetch has dozens of requests in flight
@@ -314,8 +322,10 @@ pub struct ManagedPeer {
 
     /// Negotiated eth version (66-69).
     pub eth_version: u64,
-    /// Whether the peer also advertised snap/1.
+    /// Whether a snap version is shared with the peer (`snap_version.is_some()`).
     pub snap: bool,
+    /// The snap version the session runs (1, or 2 = EIP-8189).
+    pub snap_version: Option<u64>,
     /// The peer's Status (head, fork id).
     pub peer_status: Status,
     /// The peer's Hello (client id, capabilities).
@@ -337,6 +347,9 @@ pub struct ManagedPeer {
 impl ManagedPeer {
     /// Invalidate snapshots too: active oracle Arcs must not keep reads alive.
     pub async fn close(&self) {
+        // The reason before the flag: a reader that sees `closed` then asks
+        // why must never find nothing.
+        set_close_reason(&self.close_reason, "closed by this node");
         self.closed.store(true, Ordering::Release);
         let task = self.reader_task.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(task) = task { task.abort(); let _ = task.await; }
@@ -354,8 +367,8 @@ impl ManagedPeer {
     /// spawning the background read loop. From here the peer serves concurrent
     /// requests and answers Ping/Get\* on its own.
     pub fn spawn(session: EthSession, addr: SocketAddr) -> ManagedPeer {
-        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
-        Self::from_connection(conn, eth_version, snap, peer_status, peer_hello, addr, None, None, None)
+        let (conn, eth_version, snap_version, peer_status, peer_hello) = session.into_parts();
+        Self::from_connection(conn, eth_version, snap_version, peer_status, peer_hello, addr, None, None, None)
     }
 
     /// As [`spawn`](Self::spawn), wiring the pool's shared serving surface so this
@@ -369,11 +382,11 @@ impl ManagedPeer {
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
-        let (conn, eth_version, snap, peer_status, peer_hello) = session.into_parts();
+        let (conn, eth_version, snap_version, peer_status, peer_hello) = session.into_parts();
         Self::from_connection(
             conn,
             eth_version,
-            snap,
+            snap_version,
             peer_status,
             peer_hello,
             addr,
@@ -387,7 +400,7 @@ impl ManagedPeer {
     fn from_connection(
         conn: RlpxConnection,
         eth_version: u64,
-        snap: bool,
+        snap_version: Option<u64>,
         peer_status: Status,
         peer_hello: Hello,
         addr: SocketAddr,
@@ -396,10 +409,11 @@ impl ManagedPeer {
         anchor: Option<AnchorSource>,
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
-        let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
+        let snap_codes = snap_version.map(|v| snap::SnapCodes::negotiated(eth_version, v));
         let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        let close_reason: SharedCloseReason = Arc::new(std::sync::Mutex::new(None));
         // eth/69 Status carries the peer's head, judged against our anchored
         // head as of now; eth/68 carries none (only a best hash), so such a
         // peer starts with no known head until it serves or the pool probes it.
@@ -420,6 +434,7 @@ impl ManagedPeer {
             Arc::clone(&pending),
             Arc::clone(&last_response),
             Arc::clone(&closed),
+            Arc::clone(&close_reason),
             snap_codes,
             serve.clone(),
             tx_watch,
@@ -433,11 +448,13 @@ impl ManagedPeer {
             pending,
             next_id: AtomicU64::new(1),
             closed,
+            close_reason,
             timeout_streak: AtomicU64::new(0),
             last_response,
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
-            snap,
+            snap: snap_version.is_some(),
+            snap_version,
             peer_status,
             peer_hello,
             peer_pubkey,
@@ -461,6 +478,16 @@ impl ManagedPeer {
     /// error); the peer serves no further requests.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Why the peer closed — the remote's Disconnect reason, the read or write
+    /// error, or "closed by this node" — once [`is_closed`](Self::is_closed);
+    /// `None` while open.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The peer's last known head — announced (eth/69 Status /
@@ -524,7 +551,7 @@ impl ManagedPeer {
         // entry inserted above is then drained by that `fail_all`, or by the
         // discarded late response — either way it stays bounded.)
         if let Err(e) = send_frame(&self.writer, send_code, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
             guard.armed = false; // fail_all drained the map
             return Err(e);
         }
@@ -582,7 +609,7 @@ impl ManagedPeer {
         // advanced (see write_frame), so the writer must not be reused — close
         // the peer like every other send path does.
         if let Err(e) = send_frame(&self.writer, messages::BLOCK_RANGE_UPDATE, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
         }
     }
 
@@ -594,7 +621,7 @@ impl ManagedPeer {
     pub async fn send_transaction(&self, raw_tx: &[u8]) -> Result<(), String> {
         let body = messages::encode_transactions(raw_tx);
         if let Err(e) = send_frame(&self.writer, messages::TRANSACTIONS, &body).await {
-            fail_all(&self.pending, &self.closed, format!("peer write failure: {e}")).await;
+            fail_all(&self.pending, &self.closed, &self.close_reason, format!("peer write failure: {e}")).await;
             return Err(e);
         }
         Ok(())
@@ -729,7 +756,7 @@ impl ManagedPeer {
     }
 
     // -----------------------------------------------------------------------
-    // snap/1 verified state fetch (shares the eth peer's RLPx connection).
+    // snap verified state fetch, snap/1 or snap/2 (shares the eth peer's RLPx connection).
     // -----------------------------------------------------------------------
 
     fn snap_codes(&self) -> Option<snap::SnapCodes> {
@@ -744,7 +771,7 @@ impl ManagedPeer {
         state_root: &[u8; 32],
         address: &[u8; 20],
     ) -> Result<AccountOutcome, String> {
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let payload = self
             .request(codes.get_account_range, codes.account_range, |id| {
@@ -769,7 +796,7 @@ impl ManagedPeer {
         if account.storage_root == EMPTY_TRIE_ROOT {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let slot_hash = myotis_core::keccak::keccak256(slot);
         let payload = self
@@ -788,7 +815,7 @@ impl ManagedPeer {
         if code_hash == &EMPTY_CODE_HASH {
             return Ok(Vec::new());
         }
-        let codes = self.snap_codes().ok_or("peer does not support snap/1")?;
+        let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let payload = self
             .request(codes.get_byte_codes, codes.byte_codes, |id| {
                 snap::encode_get_byte_codes(id, &[*code_hash], 256 * 1024)
@@ -912,6 +939,7 @@ async fn read_loop(
     pending: PendingMap,
     last_response: SharedLastResponse,
     closed: Arc<AtomicBool>,
+    close_reason: SharedCloseReason,
     snap_codes: Option<snap::SnapCodes>,
     serve: Option<ServeContext>,
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
@@ -923,7 +951,7 @@ async fn read_loop(
         let frame = match reader.recv().await {
             Ok(f) => f,
             Err(e) => {
-                fail_all(&pending, &closed, format!("peer read loop ended: {e}")).await;
+                fail_all(&pending, &closed, &close_reason, format!("peer read loop ended: {e}")).await;
                 break;
             }
         };
@@ -998,7 +1026,7 @@ async fn read_loop(
             // connection where reads still succeed) means the peer is dead — fail
             // in-flight requests and stop, rather than spin on a zombie.
             if let Err(e) = send_frame(&writer, P2P_PONG, &[0xc0]).await {
-                fail_all(&pending, &closed, format!("peer write failure on Pong: {e}")).await;
+                fail_all(&pending, &closed, &close_reason, format!("peer write failure on Pong: {e}")).await;
                 break;
             }
             continue;
@@ -1007,6 +1035,7 @@ async fn read_loop(
             fail_all(
                 &pending,
                 &closed,
+                &close_reason,
                 format!("peer disconnected: {}", describe_disconnect(&frame.payload)),
             )
             .await;
@@ -1021,7 +1050,7 @@ async fn read_loop(
                 ctx.stats.header_asked();
                 if let Some(resp) = serve_headers(ctx, &frame.payload) {
                     if let Err(e) = send_frame(&writer, messages::BLOCK_HEADERS, &resp).await {
-                        fail_all(&pending, &closed, format!("peer write failure on served headers: {e}"))
+                        fail_all(&pending, &closed, &close_reason, format!("peer write failure on served headers: {e}"))
                             .await;
                         break;
                     }
@@ -1041,7 +1070,7 @@ async fn read_loop(
         // An inbound Get* request we answer with an empty response.
         if let Some((resp_code, empty)) = request_id.and_then(|id| empty_answer(code, &snap_codes, id)) {
             if let Err(e) = send_frame(&writer, resp_code, &empty).await {
-                fail_all(&pending, &closed, format!("peer write failure on empty response: {e}"))
+                fail_all(&pending, &closed, &close_reason, format!("peer write failure on empty response: {e}"))
                     .await;
                 break;
             }
@@ -1056,6 +1085,7 @@ async fn read_loop(
     }
     // Backstop: every break above already set `closed` via `fail_all`, but keep
     // this so any future exit path can't leave the peer looking open.
+    set_close_reason(&close_reason, "peer read loop exited");
     closed.store(true, Ordering::SeqCst);
 }
 
@@ -1079,8 +1109,14 @@ fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Opt
                 Some((c.storage_ranges, snap::encode_empty_range(id)))
             } else if code == c.get_byte_codes {
                 Some((c.byte_codes, snap::encode_empty_codes(id)))
-            } else if code == c.get_trie_nodes {
+            } else if c.snap_version == 1 && code == c.get_trie_nodes {
+                // snap/1 only: snap/2 (EIP-8189) retired the pair, so on a
+                // snap/2 session the code is not a request and gets no answer.
                 Some((c.trie_nodes, snap::encode_empty_codes(id)))
+            } else if c.snap_version >= 2 && code == c.get_block_access_lists {
+                // snap/2: we hold no block access lists — answered with zero
+                // entries (see `encode_empty_codes`).
+                Some((c.block_access_lists, snap::encode_empty_codes(id)))
             } else {
                 None
             }
@@ -1098,11 +1134,27 @@ fn requested(max_headers: u64) -> usize {
 /// the peer closed under the pending lock (before draining) so a concurrent
 /// [`ManagedPeer::request`] either inserted before the drain — and gets its Err
 /// here — or observes `closed` and bails, never hanging on a dead connection.
-async fn fail_all(pending: &PendingMap, closed: &Arc<AtomicBool>, reason: String) {
+async fn fail_all(
+    pending: &PendingMap,
+    closed: &Arc<AtomicBool>,
+    close_reason: &SharedCloseReason,
+    reason: String,
+) {
     let mut map = pending.lock().await;
+    // The reason before the flag (see `ManagedPeer::close`).
+    set_close_reason(close_reason, &reason);
     closed.store(true, Ordering::SeqCst);
     for (_id, entry) in map.drain() {
         let _ = entry.tx.send(Err(reason.clone()));
+    }
+}
+
+/// Record why the peer closed. The first reason wins: a write failure that
+/// follows the remote's Disconnect must not overwrite the Disconnect.
+fn set_close_reason(slot: &SharedCloseReason, reason: &str) {
+    let mut r = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if r.is_none() {
+        *r = Some(reason.to_string());
     }
 }
 
@@ -1132,6 +1184,16 @@ fn serve_headers(ctx: &ServeContext, payload: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_close_reason_wins() {
+        // A write failure that follows the remote's Disconnect must not
+        // overwrite the Disconnect (#539).
+        let slot: super::SharedCloseReason = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::set_close_reason(&slot, "peer disconnected: reason=4");
+        super::set_close_reason(&slot, "peer write failure: broken pipe");
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("peer disconnected: reason=4"));
+    }
+
     use super::*;
     use myotis_core::rlp;
 
@@ -1325,7 +1387,7 @@ mod tests {
 
     #[test]
     fn empty_answer_maps_snap_get_star() {
-        let codes = snap::SnapCodes::for_eth_version(68);
+        let codes = snap::SnapCodes::negotiated(68, 1);
         let (code, body) = empty_answer(codes.get_account_range, &Some(codes), 9).unwrap();
         assert_eq!(code, codes.account_range);
         assert_eq!(messages::leading_request_id(&body), Some(9));
@@ -1335,5 +1397,31 @@ mod tests {
 
         // Without snap negotiated, snap codes aren't answered.
         assert!(empty_answer(codes.get_account_range, &None, 9).is_none());
+    }
+
+    #[test]
+    fn empty_answer_follows_the_negotiated_snap_version() {
+        for eth in [68, 69] {
+            let v1 = snap::SnapCodes::negotiated(eth, 1);
+            let v2 = snap::SnapCodes::negotiated(eth, 2);
+
+            // The shared requests are answered on both versions.
+            for codes in [v1, v2] {
+                let (code, _) = empty_answer(codes.get_storage_ranges, &Some(codes), 9).unwrap();
+                assert_eq!(code, codes.storage_ranges);
+            }
+
+            // GetTrieNodes exists on snap/1 only (EIP-8189 removed it) …
+            let (code, body) = empty_answer(v1.get_trie_nodes, &Some(v1), 9).unwrap();
+            assert_eq!(code, v1.trie_nodes);
+            assert_eq!(messages::leading_request_id(&body), Some(9));
+            assert!(empty_answer(v2.get_trie_nodes, &Some(v2), 9).is_none());
+
+            // … and GetBlockAccessLists on snap/2 only.
+            let (code, body) = empty_answer(v2.get_block_access_lists, &Some(v2), 9).unwrap();
+            assert_eq!(code, v2.block_access_lists);
+            assert_eq!(body, snap::encode_empty_codes(9));
+            assert!(empty_answer(v1.get_block_access_lists, &Some(v1), 9).is_none());
+        }
     }
 }

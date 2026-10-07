@@ -32,20 +32,62 @@ public class LightClientProcessor {
     private final ForkSchedule forkSchedule;
     private final byte[] genesisValidatorsRoot;
 
-    /** Aggregate signature of the last successfully applied finality update. The
-     *  signature commits to the attested header root (whose state root in turn commits
-     *  the finality branch), so a byte-identical signature is the same already-applied
-     *  update: any variant with different contents would fail verification anyway.
-     *  Lets the 12s poll loop skip re-verifying an unchanged head — each BLS verify
-     *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
-     *  core re-proving the same update. */
-    private volatile byte[] lastAppliedFinalitySig;
-    /** The signature slot that {@link #lastAppliedFinalitySig} was applied under. The slot is not
-     *  covered by the signature, so the memo must key on both: the same aggregate relabelled into
-     *  another period is a different update that has to face the period gate and the next
-     *  committee's keys (#423), not the memo — and a memo hit must never be a verdict that
-     *  re-verification would not reach. */
-    private volatile long lastAppliedFinalitySigSlot = -1;
+    /** The {@link #VERIFIED_FINALITY_MEMO} most recently verified finality updates, by
+     *  aggregate signature and signature slot, least recently hit first. The signature
+     *  commits to the attested header root (whose state root in turn commits the finality
+     *  branch), so a byte-identical signature under the same slot is the same
+     *  already-verified update: any variant with different contents would fail
+     *  verification anyway, and the store never moves backwards, so a memo hit is
+     *  "verified, no advance". Lets the 12 s poll loop skip re-verifying an unchanged head
+     *  — each BLS verify costs ~18 s on Android/ART, so without this the steady-state
+     *  loop burns a full core re-proving the same update. Guarded by its own monitor. */
+    private final java.util.ArrayDeque<VerifiedFinality> verifiedFinalityMemo = new java.util.ArrayDeque<>();
+    /** How many recently verified finality updates the memo holds. More than one so that a
+     *  server stalled at a fork — re-serving the same old update first every round, while
+     *  a current server's update also applies — does not evict the current one and force a
+     *  full re-verify of each on every round (the poll fans out to both). Small: a memo entry
+     *  is one signature, and a round sees at most a handful of distinct updates. */
+    static final int VERIFIED_FINALITY_MEMO = 4;
+
+    /** A verified finality update, keyed on its signature AND signature slot. The slot is not
+     *  covered by the signature, so the memo must key on both: the same aggregate relabelled
+     *  into another period is a different update that has to face the period gate and the
+     *  next committee's keys (#423), not the memo — and a memo hit must never be a verdict
+     *  that re-verification would not reach. */
+    private record VerifiedFinality(byte[] sig, long sigSlot) {
+        boolean matches(byte[] otherSig, long otherSlot) {
+            return sigSlot == otherSlot && java.util.Arrays.equals(sig, otherSig);
+        }
+    }
+
+    /** Whether {@code update} is memoized as already verified (test seam for the memo's
+     *  width: a stale and a current update must both stay memoized). A hit moves the entry
+     *  to the back (LRU, not FIFO): a server re-serving the same stale update every round
+     *  keeps it memoized through any number of advancing rounds, so a persistent staller
+     *  costs exactly one verify, ever — with plain FIFO it would be evicted every
+     *  {@link #VERIFIED_FINALITY_MEMO} applies and re-verified (~18 s on ART) each time. */
+    boolean isMemoizedFinality(LightClientFinalityUpdate update) {
+        byte[] sig = update.syncAggregate().syncCommitteeSignature();
+        synchronized (verifiedFinalityMemo) {
+            java.util.Iterator<VerifiedFinality> it = verifiedFinalityMemo.iterator();
+            while (it.hasNext()) {
+                VerifiedFinality v = it.next();
+                if (v.matches(sig, update.signatureSlot())) {
+                    it.remove();
+                    verifiedFinalityMemo.addLast(v);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void memoizeVerifiedFinality(byte[] sig, long sigSlot) {
+        synchronized (verifiedFinalityMemo) {
+            if (verifiedFinalityMemo.size() >= VERIFIED_FINALITY_MEMO) verifiedFinalityMemo.pollFirst();
+            verifiedFinalityMemo.addLast(new VerifiedFinality(sig.clone(), sigSlot));
+        }
+    }
 
     public LightClientProcessor(LightClientStore store, ForkSchedule forkSchedule, byte[] genesisValidatorsRoot) {
         this.store = store;
@@ -116,10 +158,10 @@ public class LightClientProcessor {
         }
 
         byte[] sig = update.syncAggregate().syncCommitteeSignature();
-        byte[] lastSig = lastAppliedFinalitySig;
-        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)
-                && lastAppliedFinalitySigSlot == update.signatureSlot()) {
-            log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
+        if (isMemoizedFinality(update)) {
+            // Verified before, and the store already holds it (the store never moves
+            // backwards): the caller sees "verified, no advance" without a re-verify.
+            log.debug("[lc-processor] Finality update is a duplicate of an already-verified one "
                     + "(attestedSlot={}) — skipping re-verify", attestedSlot);
             return true;
         }
@@ -190,8 +232,7 @@ public class LightClientProcessor {
             store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
         }
 
-        lastAppliedFinalitySig = sig.clone();
-        lastAppliedFinalitySigSlot = update.signatureSlot();
+        memoizeVerifiedFinality(sig, update.signatureSlot());
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }

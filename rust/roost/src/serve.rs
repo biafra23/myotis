@@ -491,6 +491,8 @@ pub async fn serve(
             max_established_incoming: Some(MAX_INBOUND),
             keypair: Some(keypair.clone()),
             lc_responder: Some(store.clone()),
+            // A server follows its beacon node's schedule; nothing to warn about.
+            cl_fork_watch: None,
         },
     )
     .map_err(|e| anyhow!("starting the libp2p host: {e}"))?;

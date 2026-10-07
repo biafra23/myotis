@@ -1,7 +1,7 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
 Status: IMPLEMENTED FOR SEPOLIA, awaiting the fork — written 2026-08-19;
-updated 2026-09-30. Sepolia's date and parameters are decided; A.2's EL
+updated 2026-10-06 (A.2 CL signals). Sepolia's date and parameters are decided; A.2's EL
 detector shipped in #491, and #501 (merged 2026-09-26) landed the rest on
 `main`: A.1 (Sepolia schedule + time-gated fork id, both engines), B.0 (the
 pinned delta below), B.1–B.3 (the Gloas light client in both engines —
@@ -200,15 +200,60 @@ verification), but the liveness failure is mute.
   module gets it through the same status JSON (README documents it). No
   JSON-RPC surface (owner decision; `StatusJson` records the IPC-only key).
 
+**CL signals (shipped 2026-10-06, every network, both engines)**
+
+- *Detector:* `networking/.../discv5/ClForkWatch` (Java) ↔
+  `rust/myotis-net/src/cl_fork_watch.rs` (Rust): the EL watch's vote rules
+  and constants verbatim (one vote per source network, ≥3 sources and a
+  majority over dissent, 24 h evidence TTL, 6 h grace past an activation),
+  pinned by both suites against `rust/testdata/lc/fork_watch/params.txt`.
+  Judged against the build's `ForkSchedule` (plus the configured
+  blob-parameter epoch): a peer announcing a transition the schedule carries
+  is dissent, so a build that ships the fork says nothing.
+- *Evidence:* the full `eth2` field of every discv5 ROUTING-TABLE record,
+  unfiltered by digest (a fork this build does not know is exactly what the
+  accepted-digest filter drops) but session-verified — Java's ping-checked
+  live table on every poll tick (`DiscV5Service.setOnEnrHeard`), Rust's
+  `table_entries_enr()` once per lookup round. Never a record merely relayed
+  in a NODES response: those are self-declared, keys are free, and one peer
+  could mint records claiming any number of source networks, making the
+  three-source floor free (review of #561). Plus every peer Status the
+  libp2p host's auto-Status gets answered with (Java `BeaconP2PService`
+  `setOnPeerStatus`; Rust `reqresp::note_peer_status`), keyed by the
+  connection's real source address. Known limit: Java's `Enr` reads the
+  `ip` key only, so IPv6-only records cast no vote in that engine.
+  - *announced*: an ENR on one of our digests with an unknown
+    `next_fork_epoch` → SCHEDULED at that epoch's wall-clock time;
+  - *placed*: an ENR on a digest we cannot produce whose `next_fork_version`
+    reproduces it under our genesis root and blob params and is newer than
+    our version (a client with nothing further scheduled publishes its
+    current version there), or any ENR/Status digest that reproduces from a
+    version some source announced → ACTIVE once three sources place it.
+  - A Status on one of our digests is neither support nor dissent (it says
+    nothing about ahead); an unplaceable digest is ignored.
+- *Activation time:* known from an announcement; **0 = unknown** when the
+  fork was only placed (a digest does not encode its epoch). The API
+  (`UpgradeAdvisory.activationTime`), the daemon message, the UI banner and
+  the Node.js README all say "unknown" for 0 instead of printing 1970.
+  Likewise `forkId` is `0x00000000` for a blob-parameter-only fork: it is
+  announced under our own version and rotates the digest to a value the
+  build cannot compute (the new blob params are not on the wire); once it
+  passes, only the EL watch can still place peers.
+- *Freshness:* no `touch` — evidence is re-heard instead. Java
+  `DiscV5Service.setOnEnrHeard` reports every live table entry on every poll
+  tick (before the once-ever dedup), the Rust lookup loop re-reads its
+  routing table every round; a Status is observed once per connection.
+- *Merge:* the host reports ONE advisory — `ClForkWatch.merge` /
+  `cl_fork_watch::merge_advisories`: ACTIVE over SCHEDULED, then a known time,
+  then more sources, then the EL's. `JavaChainHandle.upgradeAdvisory(el, cl)`;
+  Rust `host::status_json` over the handle's `fork_watches` and
+  `cl_fork_watches` (both handle-owned, both survive pause/resume).
+- *Not done:* the req/resp context bytes (still dropped at every call site)
+  — the Status digest covers the same peers; `nfd` (not needed: the ENR's
+  `next_fork_version` is the version, `fork_digest` the proof).
+
 **Still open**
 
-- CL signals (would additionally catch a CL-only fork; Ethereum forks are
-  coordinated EL+CL, BPO forks included, so the EL signal covers today's
-  cases): pre-fork, the discv5 ENR `eth2.next_fork_version/next_fork_epoch`
-  (decoded by Java `Enr.eth2()` but unused; Rust parses only the digest) plus
-  `nfd`; post-fork, the peers' libp2p Status `fork_digest` (decoded and
-  logged, never compared). The req/resp context bytes are extracted in
-  `ReqRespCodec` but dropped at every call site, so they need plumbing first.
 - Schedule-known mode (an explicit `unsupportedFork` once a configured epoch
   is crossed) — depends on A.1. Done with A.1: the watch measures from the
   effective fork id, so after `T` peers on its successor are dissent and a
@@ -229,8 +274,9 @@ verification), but the liveness failure is mute.
   surface is out of scope (owner), and `beaconNotSynced` doesn't fire on an
   already-synced node in either engine, so there was nothing to sharpen — the
   status advisory is the signal.
-- Rollout: flip `ENABLED_NETWORKS` for mainnet/Gnosis in both engines once the
-  Sepolia fork (2026-10-06) has validated it, ahead of their activations.
+- Rollout: flip the EL watch's `ENABLED_NETWORKS` for mainnet/Gnosis in both
+  engines once the Sepolia fork (2026-10-06) has validated it, ahead of their
+  activations. The CL watch already runs on all three.
 
 Correction to the original plan: the UI seam is `NodeController.snapshots()` →
 `NodeSnapshot`; `NetworkStatus` is device connectivity only.

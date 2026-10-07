@@ -514,6 +514,42 @@ impl LightClientProcessor {
         self.store.apply_next_when_period_changes(old_finalized, finalized_slot);
         true
     }
+
+    /// [`process_finality_update`](Self::process_finality_update), telling a
+    /// verified update that ADVANCED the store apart from one that verified
+    /// but moved nothing — the store already held a finalized and an
+    /// optimistic header at least as new (a server re-serving the same update,
+    /// or one that stopped producing them). The sync loop's finality poll
+    /// takes the first response that verifies; counting a stale one as the
+    /// win let a stalled server outrun a current one every round (Sepolia,
+    /// Glamsterdam day: every Lighthouse light-client server stopped at the
+    /// fork and kept answering first, so roost's current update was never
+    /// read). Java twin: the poll's "did not advance" branch.
+    pub fn apply_finality_update(&mut self, update: &LightClientFinalityUpdate) -> FinalityOutcome {
+        let before = (self.store.finalized_slot(), self.store.optimistic_slot());
+        if !self.process_finality_update(update) {
+            return FinalityOutcome::Rejected;
+        }
+        let after = (self.store.finalized_slot(), self.store.optimistic_slot());
+        if after.0 > before.0 || after.1 > before.1 {
+            FinalityOutcome::Advanced
+        } else {
+            FinalityOutcome::Stale
+        }
+    }
+}
+
+/// What a finality update did to the store (see
+/// [`LightClientProcessor::apply_finality_update`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalityOutcome {
+    /// Verified, and the finalized or optimistic header moved forward.
+    Advanced,
+    /// Verified, but the store already held headers at least as new: not a
+    /// win, not a strike — the server is behind, not wrong.
+    Stale,
+    /// Did not verify (period, shape, signature or branch).
+    Rejected,
 }
 
 /// Why [`LightClientProcessor::verify_bootstrap`] refused a bootstrap.
