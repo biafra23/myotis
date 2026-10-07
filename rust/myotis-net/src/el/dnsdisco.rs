@@ -402,15 +402,17 @@ pub struct WalkReport {
     pub links: usize,
     /// The deadline cut the walk short.
     pub timed_out: bool,
-    /// `abort_if` cut the walk short: the policy turned against it mid-walk.
+    /// `abort_if` cut the walk short: the policy turned against it before
+    /// the root lookup or between lookups.
     pub cut_short: bool,
 }
 
 /// Walk `url`'s `e=` subtree depth-first in random order within `limits`,
 /// judging each leaf's `eth` entry with `filter` at `now_secs`, and stop
-/// early once `abort_if` says so — the policy turning against the walk (Tor
-/// switched on while it runs) must not leave it querying the clearnet
-/// resolver for the rest of the deadline. Fails only when the root is missing
+/// once `abort_if` says so — checked before every lookup, the root's
+/// included: the policy turning against the walk (Tor switched on after the
+/// walk was claimed, or while it runs) must not leave it querying the
+/// clearnet resolver. Fails only when the root is missing
 /// or does not verify — a tree with no verified root is no tree; everything
 /// below is best-effort and counted.
 pub async fn walk(
@@ -422,6 +424,15 @@ pub async fn walk(
     abort_if: &(dyn Fn() -> bool + Sync),
 ) -> Result<WalkReport, String> {
     let started = tokio::time::Instant::now();
+    // The policy before the root lookup too: the walk was claimed under it,
+    // but its task can start after Tor (or the host) turned it off — and the
+    // root query alone names the network to the resolver.
+    if abort_if() {
+        return Ok(WalkReport {
+            cut_short: true,
+            ..WalkReport::default()
+        });
+    }
     let records = resolver
         .txt(&url.domain)
         .await
@@ -749,6 +760,15 @@ impl DnsSeeder {
                     continue;
                 }
             };
+            if report.cut_short && report.lookups == 0 {
+                // Stopped before it asked for anything below the root — or for
+                // the root itself: nothing was walked, so nothing is merged.
+                tracing::info!(
+                    domain = %url.domain,
+                    "dns tree walk not run: the policy changed (Tor on, or DNS discovery withdrawn)"
+                );
+                break;
+            }
             let fresh: Vec<Enode> = report
                 .candidates
                 .iter()
@@ -1238,7 +1258,9 @@ mod tests {
         // with what it has (the pool stopping aborts the task; this is Tor
         // switched on, or the host withdrawing DNS, while a walk runs).
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let after_two = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        // Asked before the root lookup and before each child lookup: the
+        // fourth answer stops the walk after two child lookups.
+        let after_two = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3;
         let report = walk(&zone, &url, WalkLimits::default(), &filter(), 1_700_000_000, &after_two)
             .await
             .unwrap();
@@ -1356,6 +1378,49 @@ mod tests {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())
         }
+    }
+
+    #[tokio::test]
+    async fn no_query_leaves_once_the_policy_has_turned_not_even_the_root() {
+        let deadline = std::time::Duration::from_secs(2);
+        // A walk told to stop before it starts asks the resolver nothing — a
+        // Stall resolver would hang it if it asked for the root.
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stall = Stall(Arc::clone(&asked));
+        let url = EnrTreeUrl::parse(SPEC_ZONE_URL).unwrap();
+        let report = tokio::time::timeout(
+            deadline,
+            walk(&stall, &url, WalkLimits::default(), &filter(), 1_700_000_000, &|| true),
+        )
+        .await
+        .expect("a walk the policy forbids returns at once")
+        .unwrap();
+        assert!(report.cut_short);
+        assert_eq!(report.lookups, 0);
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "not even the root was queried");
+        // The race the claim cannot close: the policy allows the walk when it
+        // is claimed, and Tor is switched on before its task starts.
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allow = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seeder = DnsSeeder::with_source(
+            &[SPEC_ZONE_URL.to_string()],
+            filter(),
+            ResolverSource::Fixed(Arc::new(Stall(Arc::clone(&asked)))),
+            WalkLimits::default(),
+            Box::new({
+                let allow = Arc::clone(&allow);
+                move || allow.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+        )
+        .unwrap();
+        assert!(seeder.begin_walk_if_due(tokio::time::Instant::now(), true));
+        allow.store(false, std::sync::atomic::Ordering::SeqCst);
+        let found = tokio::time::timeout(deadline, seeder.walk_once(None))
+            .await
+            .expect("the claimed walk stops before its first query");
+        assert_eq!(found, 0);
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "no query after the policy turned");
+        assert!(!seeder.state.lock().unwrap().walking, "the claim is released");
     }
 
     #[tokio::test]

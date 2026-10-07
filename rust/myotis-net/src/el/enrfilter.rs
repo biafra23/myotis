@@ -176,22 +176,38 @@ pub struct RemoteEnr {
     /// where it listens, which beats a NEIGHBORS entry's hearsay.
     pub tcp4: Option<u16>,
     pub tcp6: Option<u16>,
-    /// Whether the record names an address at all (`ip` or `ip6`): one that
-    /// does, and names no TCP port, is a discovery-only node; one that names
-    /// neither says nothing about its endpoint (our own record is like that).
-    pub has_ip: bool,
+    /// Whether the record names an IPv4 address (`ip`) and an IPv6 address
+    /// (`ip6`) — see [`tcp_word_for`](Self::tcp_word_for) for what that says
+    /// about a missing TCP port.
+    pub has_ip4: bool,
+    pub has_ip6: bool,
 }
 
 impl RemoteEnr {
-    /// The TCP port to dial a node reached at `ip` (4 or 16 bytes): the
-    /// family's own entry first, the other as a fallback; never 0.
-    pub fn tcp_port_for(&self, ip: &[u8]) -> Option<u16> {
-        let (own, other) = if ip.len() == 16 {
-            (self.tcp6, self.tcp4)
-        } else {
-            (self.tcp4, self.tcp6)
-        };
-        own.or(other).filter(|&p| p != 0)
+    /// The TCP port the record names for the node's IPv4 (`v6 = false`) or
+    /// IPv6 endpoint, as EIP-778 assigns them and go-ethereum reads them
+    /// (`enode.Node`'s `setIP4` / `setIP6`): `tcp` for IPv4; `tcp6`, else
+    /// `tcp`, for IPv6 — `tcp6` is IPv6-specific, so it never stands in for
+    /// IPv4. Never 0.
+    pub fn tcp_port_for(&self, v6: bool) -> Option<u16> {
+        let port = if v6 { self.tcp6.or(self.tcp4) } else { self.tcp4 };
+        port.filter(|&p| p != 0)
+    }
+
+    /// What the record says about the node's TCP port on that family:
+    /// `Some(port)`; `Some(0)` when the node takes no TCP connections there —
+    /// the record names an address of the family and no port for it, or names
+    /// an address and no TCP port at all (`tcp` would serve both families, so
+    /// neither key means neither family); `None` when the record is silent
+    /// about that endpoint (it names no address of the family, and our own
+    /// record names none at all).
+    pub fn tcp_word_for(&self, v6: bool) -> Option<u16> {
+        if let Some(port) = self.tcp_port_for(v6) {
+            return Some(port);
+        }
+        let names_family = if v6 { self.has_ip6 } else { self.has_ip4 };
+        let no_tcp_at_all = self.tcp_port_for(false).is_none() && self.tcp_port_for(true).is_none();
+        (names_family || ((self.has_ip4 || self.has_ip6) && no_tcp_at_all)).then_some(0)
     }
 }
 
@@ -211,7 +227,8 @@ pub fn decode_enr(raw: &[u8], signer: &[u8; 64]) -> Result<RemoteEnr, String> {
         eth: enr.get_raw_rlp("eth").map(<[u8]>::to_vec),
         tcp4: enr.tcp4(),
         tcp6: enr.tcp6(),
-        has_ip: enr.ip4().is_some() || enr.ip6().is_some(),
+        has_ip4: enr.ip4().is_some(),
+        has_ip6: enr.ip6().is_some(),
     })
 }
 
@@ -422,7 +439,8 @@ mod tests {
         let remote = decode_enr(&raw, &k.public_key_bytes()).unwrap();
         assert_eq!(remote.seq, 7);
         assert_eq!(remote.eth.as_deref(), Some(&eth[..]));
-        assert_eq!(remote.tcp_port_for(&[127, 0, 0, 1]), None, "our record names no endpoint");
+        assert_eq!(remote.tcp_word_for(false), None, "our record says nothing about an endpoint");
+        assert_eq!(remote.tcp_word_for(true), None);
         // Carried in a packet another node signed: refused.
         assert!(decode_enr(&raw, &key(2).public_key_bytes()).is_err());
         // Tampered: the signature no longer verifies.
@@ -450,26 +468,61 @@ mod tests {
             let raw = alloy_rlp::encode(b.build(&signing).unwrap());
             decode_enr(&raw, &k.public_key_bytes()).unwrap()
         };
-        let v4 = [10, 0, 0, 1];
-        let v6 = [0u8; 16];
+        let (v4, v6) = (false, true);
         // Both named: each family its own.
         let both = build(Some(30303), Some(30306));
-        assert_eq!(both.tcp_port_for(&v4), Some(30303));
-        assert_eq!(both.tcp_port_for(&v6), Some(30306));
-        // One named: the other family falls back to it.
-        assert_eq!(build(Some(30303), None).tcp_port_for(&v6), Some(30303));
-        assert_eq!(build(None, Some(30306)).tcp_port_for(&v4), Some(30306));
-        // None named, or 0: no port to dial — the caller keeps what it has.
-        assert_eq!(build(None, None).tcp_port_for(&v4), None);
-        assert_eq!(build(Some(0), None).tcp_port_for(&v4), None);
+        assert_eq!(both.tcp_port_for(v4), Some(30303));
+        assert_eq!(both.tcp_port_for(v6), Some(30306));
+        // `tcp` serves IPv6 too when no `tcp6` is named (EIP-778, geth)…
+        assert_eq!(build(Some(30303), None).tcp_port_for(v6), Some(30303));
+        // …but `tcp6` is IPv6-specific: it never stands in for IPv4.
+        assert_eq!(build(None, Some(30306)).tcp_port_for(v4), None);
+        // None named, or 0: no port.
+        assert_eq!(build(None, None).tcp_port_for(v4), None);
+        assert_eq!(build(Some(0), None).tcp_port_for(v4), None);
         assert!(build(None, None).eth.is_none());
-        // These records name no address; one that does is marked.
-        assert!(!build(Some(30303), None).has_ip);
-        let mut b = Enr::<CombinedKey>::builder();
-        b.seq(1).ip4([10, 0, 0, 1].into()).udp4(30303);
-        let raw = alloy_rlp::encode(b.build(&signing).unwrap());
-        let discovery_only = decode_enr(&raw, &k.public_key_bytes()).unwrap();
-        assert!(discovery_only.has_ip);
-        assert_eq!(discovery_only.tcp_port_for(&v4), None);
+        // A record naming no address is silent about a family it names no
+        // port for: the caller keeps the port it has.
+        assert_eq!(build(None, None).tcp_word_for(v4), None);
+        assert_eq!(build(None, Some(30306)).tcp_word_for(v4), None);
+        let with = |ip4: bool, ip6: bool, tcp4: Option<u16>, tcp6: Option<u16>| {
+            let mut b = Enr::<CombinedKey>::builder();
+            b.seq(1);
+            if ip4 {
+                b.ip4([10, 0, 0, 1].into()).udp4(30303);
+            }
+            if ip6 {
+                b.ip6(std::net::Ipv6Addr::LOCALHOST).udp6(30303);
+            }
+            if let Some(p) = tcp4 {
+                b.tcp4(p);
+            }
+            if let Some(p) = tcp6 {
+                b.tcp6(p);
+            }
+            let raw = alloy_rlp::encode(b.build(&signing).unwrap());
+            decode_enr(&raw, &k.public_key_bytes()).unwrap()
+        };
+        // An address and no TCP port at all (the EF NodeOps shape): no TCP
+        // connections on either family, whichever it names.
+        for (ip4, ip6) in [(true, false), (false, true), (true, true)] {
+            let discovery_only = with(ip4, ip6, None, None);
+            assert_eq!(discovery_only.tcp_word_for(v4), Some(0), "{ip4} {ip6}");
+            assert_eq!(discovery_only.tcp_word_for(v6), Some(0), "{ip4} {ip6}");
+        }
+        // An IPv6-only record with its own port: that port for IPv6, silent
+        // about IPv4 — a node reached over IPv4 keeps the port it has.
+        let v6_only = with(false, true, None, Some(30306));
+        assert_eq!(v6_only.tcp_word_for(v6), Some(30306));
+        assert_eq!(v6_only.tcp_word_for(v4), None);
+        // Both addresses, a port for IPv6 only: no TCP on IPv4 (geth
+        // `errNoPort`), that port on IPv6.
+        let dual = with(true, true, None, Some(30306));
+        assert_eq!(dual.tcp_word_for(v4), Some(0));
+        assert_eq!(dual.tcp_word_for(v6), Some(30306));
+        // An IPv4 address and `tcp`: the port serves IPv6 too.
+        let v4_tcp = with(true, false, Some(30303), None);
+        assert_eq!(v4_tcp.tcp_word_for(v4), Some(30303));
+        assert_eq!(v4_tcp.tcp_word_for(v6), Some(30303));
     }
 }
