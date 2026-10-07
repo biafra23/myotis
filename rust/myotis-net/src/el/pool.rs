@@ -857,6 +857,7 @@ impl PoolInner {
                     p.addr,
                     now.saturating_duration_since(p.admitted_at),
                     p.peer.close_reason(),
+                    log_client_id(&p.peer.peer_hello.client_id),
                 ));
                 false
             } else {
@@ -875,14 +876,14 @@ impl PoolInner {
         // connect-failure strike the wait exists to prevent. A peer that closed
         // within 30 s of its admission waits out the remainder; one that lived
         // longer may be re-dialed at once. One lock at a time throughout.
-        for (addr, lived, _) in &freed {
+        for (addr, lived, _, _) in &freed {
             if let Some(wait) = redial_wait_after_close(*lived) {
                 self.record_backoff_window(*addr, BackoffKind::Transient, wait, now)
                     .await;
             }
         }
         let mut attempted = self.attempted.lock().await;
-        for (addr, lived, reason) in &freed {
+        for (addr, lived, reason, client) in &freed {
             // INFO, one line per lost slot: a pool that churned through peers
             // (#539: 236 admissions of 21 peers in 28 minutes) left no line
             // saying why any of them went.
@@ -890,6 +891,7 @@ impl PoolInner {
                 %addr,
                 lived_s = lived.as_secs(),
                 reason = reason.as_deref().unwrap_or("unknown"),
+                client = ?client,
                 "pooled snap peer closed"
             );
             attempted.remove(addr);
