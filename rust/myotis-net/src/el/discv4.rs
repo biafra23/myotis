@@ -809,7 +809,9 @@ struct PendingEnr {
 }
 
 /// The index of `ip`'s address family in [`Judgement::tcp_port`]: 0 for IPv4
-/// (4 bytes — senders are un-mapped, `canonical_addr`), 1 for IPv6.
+/// (4 bytes — every address entering the exchange is un-mapped by
+/// `canonical_addr`, a datagram's sender and a NEIGHBORS listing alike), 1
+/// for IPv6.
 fn family(ip: &[u8]) -> usize {
     usize::from(ip.len() == 16)
 }
@@ -1141,11 +1143,14 @@ impl ServiceLoop {
         };
         tracing::debug!(count = peers.len(), %sender, "discv4 neighbors");
         for peer in peers {
-            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port) else {
+            // Un-mapped like a datagram's sender: a relayer listing a node at
+            // `::ffff:a.b.c.d` lists its IPv4 endpoint (geth reads it so too),
+            // and the exchange keys pendings and port pins by family.
+            let Some(addr) = to_socket_addr(&peer.ip, peer.udp_port).map(canonical_addr) else {
                 continue;
             };
             let entry = TableEntry {
-                ip: peer.ip,
+                ip: ip_bytes(addr.ip()),
                 udp_port: addr.port(),
                 tcp_port: peer.tcp_port,
                 node_id: peer.node_id,
@@ -1403,15 +1408,26 @@ impl ServiceLoop {
         // about a family, it says nothing about that endpoint.
         let words = [false, true].map(|v6| remote.tcp_word_for(v6).map(u32::from));
         let fam = family(&pending.entry.ip);
-        if let Some(port) = words[fam] {
-            pending.entry.tcp_port = port;
-        }
         // What the judgement pins, per family: the record's word; for the
         // family the node was reached at, where the record is silent, its own
-        // Ping claim; never hearsay.
+        // Ping claim; never hearsay. A node can be pending at two addresses at
+        // once (a dual-stack node, a restart on another port): where this
+        // record is silent, a pin the other pending's judgement left — that
+        // node's own word too — stays. Only pendings created before the first
+        // judgement can meet here, within one ENR timeout of each other.
         let mut pin = words;
         if pin[fam].is_none() && pending.claimed {
             pin[fam] = Some(pending.entry.tcp_port);
+        }
+        if let Some(prev) = enr.verdicts.get(&pending.entry.node_id) {
+            for (slot, kept) in pin.iter_mut().zip(prev.tcp_port) {
+                if slot.is_none() {
+                    *slot = kept;
+                }
+            }
+        }
+        if let Some(port) = pin[fam] {
+            pending.entry.tcp_port = port;
         }
         let verdict = enr.filter.verdict(remote.eth.as_deref(), now_secs());
         enr.record(
@@ -1458,12 +1474,28 @@ impl ServiceLoop {
             .collect();
         let mut unjudged = Vec::with_capacity(expired.len());
         for addr in expired {
-            if let Some(p) = enr.pending.remove(&addr) {
-                // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node is
-                // asked again at its first sighting after that.
-                enr.record(p.entry.node_id.clone(), Verdict::Unknown, [None, None], now);
-                enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
-                unjudged.push(p.entry);
+            let Some(p) = enr.pending.remove(&addr) else {
+                continue;
+            };
+            match enr.verdicts.get(&p.entry.node_id).copied() {
+                // Judged meanwhile at another of its addresses: that judgement
+                // stands — a timeout here must not hand a foreign node over,
+                // nor replace a verdict and its pins with an Unknown.
+                Some(j) if j.verdict == Verdict::Foreign => enr.skip_foreign(),
+                Some(j) => {
+                    let mut entry = p.entry;
+                    if let Some(port) = j.tcp_port[family(&entry.ip)] {
+                        entry.tcp_port = port;
+                    }
+                    unjudged.push(entry);
+                }
+                None => {
+                    // Unjudged, until UNKNOWN_VERDICT_TTL has passed: the node
+                    // is asked again at its first sighting after that.
+                    enr.record(p.entry.node_id.clone(), Verdict::Unknown, [None, None], now);
+                    enr.counts.unjudged.fetch_add(1, Ordering::Relaxed);
+                    unjudged.push(p.entry);
+                }
             }
         }
         if enr.bonded.len() > BONDED_MAX / 2 {
@@ -2449,6 +2481,151 @@ mod tests {
         assert_eq!(entry.tcp_port, 50510, "on IPv6 the record's tcp6, not the IPv4 pin");
         let entry = reannounce(&a, &mut a_rx, &dual, 30303).await;
         assert_eq!(entry.tcp_port, 0, "and on IPv4 still none");
+        // A relayer listing it at its v4-mapped IPv6 address lists its IPv4
+        // endpoint: un-mapped, and still none — not the IPv6 pin.
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets();
+        relay_neighbors_at(&a, &dual, &mapped, 30303, 30303).await;
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), a_rx.recv())
+            .await
+            .expect("A hands the judged node over at once")
+            .unwrap();
+        assert_eq!(entry.ip, vec![127, 0, 0, 1], "a v4-mapped listing is un-mapped");
+        assert_eq!(entry.tcp_port, 0, "and reads the IPv4 pin");
+        a.stop().await;
+    }
+
+    /// A, filtering on `[0xaa, 0xbb, 0xcc, 0xdd]` and judging every node (no
+    /// pool hint).
+    async fn filtered_node(n: u8) -> (Discv4Service, tokio::sync::mpsc::Receiver<TableEntry>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let a = Discv4Service::start(
+            Arc::new(key(n)),
+            Discv4Config {
+                bind_port: 0,
+                bootnodes: Vec::new(),
+                fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
+                pool_below_target: None,
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        (a, rx)
+    }
+
+    /// A record for `node` that names no address, announcing fork hash `fork`.
+    fn bare_record(node: &NodeKey, fork: [u8; 4]) -> Vec<u8> {
+        use crate::el::enrfilter::eth_entry_rlp;
+        use discv5::enr::{CombinedKey, Enr};
+        let mut secret = node.secret_bytes();
+        let signing = CombinedKey::secp256k1_from_bytes(&mut secret).unwrap();
+        let mut b = Enr::<CombinedKey>::builder();
+        b.seq(1)
+            .add_value_rlp("eth", alloy_rlp::Bytes::from(eth_entry_rlp(fork, 0)));
+        alloy_rlp::encode(b.build(&signing).unwrap())
+    }
+
+    /// The next entry A hands to its pool (5 s).
+    async fn handed_over(rx: &mut tokio::sync::mpsc::Receiver<TableEntry>) -> TableEntry {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("A hands the node over")
+            .unwrap()
+    }
+
+    /// The next packet of type `ty` A sends to a raw node's socket.
+    async fn await_packet(sock: &tokio::net::UdpSocket, ty: u8) -> Parsed {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("A sends the expected packet")
+                .unwrap();
+            if let Ok(p) = parse(&buf[..n]) {
+                if p.packet_type == ty {
+                    return p;
+                }
+            }
+        }
+    }
+
+    /// X pending at two addresses at once — two sockets, one key: a restart
+    /// on another port, a NAT rebinding, a dual-stack node's two families. At
+    /// `s1` X pinged A claiming TCP 50507, so A asks it for the record; at
+    /// `s2` a relayer listed X with 30303, so A pings it, and asks it too when
+    /// `s2_answers`. Returns A's ENRRequests to the two (`None` for a silent
+    /// `s2`).
+    async fn pending_at_two_addresses(
+        a: &Discv4Service,
+        x: &NodeKey,
+        s1: &tokio::net::UdpSocket,
+        s2: &tokio::net::UdpSocket,
+        s2_answers: bool,
+    ) -> (Parsed, Option<Parsed>) {
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let ping = encode_ping(x, &[0, 0, 0, 0], 50507, &[127, 0, 0, 1], a.local_port(), expiry_now()).unwrap();
+        s1.send_to(&ping, a_addr).await.unwrap();
+        let req1 = await_packet(s1, TYPE_ENR_REQUEST).await;
+        relay_neighbors(a, x, s2.local_addr().unwrap().port(), 30303).await;
+        let ping2 = await_packet(s2, TYPE_PING).await;
+        if !s2_answers {
+            return (req1, None);
+        }
+        let pong = encode_pong(x, &[127, 0, 0, 1], a.local_port(), &ping2.hash, expiry_now()).unwrap();
+        s2.send_to(&pong, a_addr).await.unwrap();
+        let req2 = await_packet(s2, TYPE_ENR_REQUEST).await;
+        (req1, Some(req2))
+    }
+
+    #[tokio::test]
+    async fn a_node_pending_at_two_addresses_keeps_its_own_claim() {
+        // X's record names no address, so its Ping's claim is all X said about
+        // its port: the second response must neither drop it nor hand X over
+        // at the relayer's port.
+        let (a, mut a_rx) = filtered_node(32).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(33);
+        let record = bare_record(&x, [0xaa, 0xbb, 0xcc, 0xdd]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, req2) = pending_at_two_addresses(&a, &x, &s1, &s2, true).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        assert_eq!(handed_over(&mut a_rx).await.tcp_port, 50507, "at s1, X's own claim");
+        s2.send_to(&encode_enr_response(&x, &req2.unwrap().hash, &record).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let second = handed_over(&mut a_rx).await;
+        assert_eq!(second.udp_port, s2.local_addr().unwrap().port());
+        assert_eq!(second.tcp_port, 50507, "the second response keeps X's own claim");
+        let later = reannounce(&a, &mut a_rx, &x, 30303).await;
+        assert_eq!(later.tcp_port, 50507, "and later hearsay still yields to it");
+        a.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_at_another_address_does_not_undo_a_foreign_verdict() {
+        // X answers at s1 with another chain's record and never at s2: when
+        // s2's request times out, the foreign verdict stands — X is not handed
+        // over, and its verdict is not replaced by an Unknown.
+        let (a, mut a_rx) = filtered_node(34).await;
+        let a_addr = SocketAddr::from(([127, 0, 0, 1], a.local_port()));
+        let x = key(35);
+        let foreign = bare_record(&x, [0x01, 0x02, 0x03, 0x04]);
+        let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (req1, _) = pending_at_two_addresses(&a, &x, &s1, &s2, false).await;
+        s1.send_to(&encode_enr_response(&x, &req1.hash, &foreign).unwrap(), a_addr)
+            .await
+            .unwrap();
+        let got =
+            tokio::time::timeout(ENR_TIMEOUT + std::time::Duration::from_secs(2), a_rx.recv())
+                .await;
+        assert!(got.is_err(), "a timeout must not hand a foreign node over: {got:?}");
+        let (compatible, foreign_skips, unjudged) = a.enr_counts().snapshot();
+        assert_eq!((compatible, unjudged), (0, 0));
+        assert_eq!(foreign_skips, 2, "the verdict, and the second address skipped");
         a.stop().await;
     }
 
