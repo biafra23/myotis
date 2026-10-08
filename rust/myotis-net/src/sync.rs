@@ -560,15 +560,21 @@ fn hex32(s: &str) -> [u8; 32] {
 /// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
 /// `NetworkConfigGnosisTest` pins that one).
 ///
-/// First is roost, the dedicated light-client server. The per-entry comments below
-/// carry the reasoning and each entry's own stability caveat.
+/// Only roost, the dedicated light-client server, since 2026-10-07: it is the
+/// only Sepolia server known to serve Gloas-era light-client data to a build
+/// without #576. The dropped Lighthouse entries below serve none; zbox's
+/// Nimbus does, but neither engine can hold a Nimbus connection without #576
+/// (see the note at the end of the list). So a roost fault leaves a Sepolia
+/// wallet nothing to fall back to until a second server is pinned (#566) —
+/// below release check 3a's two-pin floor.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
     // FIRST on purpose: it exists because a general-purpose beacon node is
     // structurally bad at serving wallets — one connection semaphore shared
     // between inbound and outbound, and a trimmer that drops light clients
-    // first. The census-verified public servers below it are the fallback,
-    // so a roost fault degrades to working peers rather than to nothing.
+    // first. Census-verified public servers belong below it as the fallback,
+    // so that a roost fault degrades to working peers rather than to nothing;
+    // since the Gloas fork there is none to put there.
     //
     // Its peer id comes from /data/roost/sepolia.key and is stable across
     // restarts by construction — roost has no mode in which it mints a
@@ -577,57 +583,58 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // The address is the netcup relay (see the ADDRESS note above); ENR
     // publication (design §7) is what removes the need to pin at all.
     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-    // Public sepolia LC servers, census-verified 2026-09-11: each answered
-    // light_client_bootstrap for the THEN-pinned root AND
-    // updates_by_range(1356,1) from a fresh peer id, all Lighthouse v8.2.2 (so
-    // the catch-up asks them for one period at a time — see
-    // agent_serves_one_period).
+    // Dropped 2026-10-07: 65.109.144.95 and 198.13.138.237, both Lighthouse
+    // v8.3.0-rc.0. Census-verified public servers from 2026-09-11 (each served
+    // the then-pinned bootstrap and updates_by_range(1356,1)), and every
+    // release run from 2026-09-12 to 2026-09-24 found every Sepolia pin
+    // serving. Then the Gloas fork: Lighthouse's light-client server produces
+    // nothing for a Gloas block (sigp/lighthouse#9587; its fix PRs #9732 and
+    // #9790 are unmerged, and no release carries them), so neither serves the
+    // bootstrap a v0.1.14 install starts from (ResourceUnavailable, "Sync
+    // committee branch for block root 0x2008fe0e… not found") nor any Gloas
+    // period's update — updates_by_range(1379) answers ServerError "Database
+    // error", because the update Lighthouse stored under 1379 is the last
+    // Fulu one (it keys updates by their signature slot's period) and does not
+    // decode as Gloas — and their finality update froze at the last pre-fork
+    // one. A pin is exempt from eviction and keeps a targeted discovery
+    // lookup, so a pin that serves nothing a post-fork wallet can use costs
+    // every Sepolia wallet a pool slot and a lookup for nothing.
     //
-    // Re-verified 2026-09-12 at period 1357, the anchor then embedded, by the
-    // release's live_pins_alive run on a clean CI host: 4 of 4 pins, roost
-    // included, served a bootstrap for that root and a period of updates.
-    // Re-verified 2026-09-13 against the then-shipped period-1358 anchor:
-    // live_pins_alive run 34776027257, 4 of 4 again.
-    // Re-verified 2026-09-16 against the then-shipped period-1361 anchor:
-    // live_pins_alive run 35065049320 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor reached SYNCED in 55 s.
-    // Re-verified 2026-09-21 against the then-shipped period-1365 anchor:
-    // live_pins_alive run 35616060242 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor (42 periods behind) reached SYNCED
-    // in 21 s.
-    // Re-verified 2026-09-24 against the anchor v0.1.12 shipped (period
-    // 1368): live_pins_alive run 35989152817 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor (45 periods behind) reached SYNCED
-    // in 55 s.
-    // 2026-10-06, Glamsterdam day, against the anchor v0.1.14 ships (period
-    // 1379, the first past the Gloas fork): live_pins_alive run 37500521280
-    // on a GitHub-hosted runner, 1 of 4 — only roost. Both Lighthouse pins
-    // (v8.3.0-rc.0) answered ResourceUnavailable for a Gloas-era bootstrap
-    // root and serve pre-fork-shaped updates for period 1379 (their
-    // light-client server stopped at the fork), and 138.201.192.180 closed
-    // the connection from the runner, the dev Mac and the census crawl:
-    // pruned. A period-1379 census of the DHT (91 fork-matched peers: 33
-    // undecodable, 24 dial failures, 21 closed, 12 without the protocol)
-    // found roost the ONLY server of a Gloas-era update (443/512); the
-    // public Lodestar node (65.21.93.60) serves Gloas over REST but closes
-    // inbound libp2p connections. Below the two-pin floor until a second
-    // Gloas-capable server exists — the owner's call.
-    // Re-run it after every checkpoint refresh — a census against
-    // a superseded root says nothing about the anchor a fresh install actually
-    // starts from, which is the #422 shape: every check green while no pinned
-    // server can answer for the root being shipped.
+    // Evidence: v0.1.14's live_pins_alive run 37500521280 (2026-10-06, 1 of 4
+    // pins served the period-1379 anchor: roost; 138.201.192.180 was pruned
+    // then). examples/period_census.rs at period 1379 on 2026-10-07, from zbox
+    // (170 fork-matched peers: 41 Lighthouse v8.3.0-rc.0 answering ServerError
+    // "Database error", 7 answering empty, 17 Prysm without the protocol, roost
+    // the only server, 443/512) and from a GitHub-hosted runner (run
+    // 37642715259, 218 peers: 63 Lighthouse v8.3.0-rc.0 answering ServerError
+    // "Database error" — both pins among them — 13 answering empty, 13 Prysm
+    // and 1 Grandine without the protocol, roost again the only server). Both
+    // censuses also met 100+ peers that closed or refused the connection
+    // before Identify. Many of those were most likely Nimbus or Lodestar
+    // nodes: both speak only mplex on TCP, and the census's host offered only
+    // yamux (#576), so no stream ever opened. "roost the only server" is what
+    // a yamux-only build could see, not who serves — the Lighthouse verdicts
+    // above stand on their own.
     //
-    // They replace
-    // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
-    // libp2p handshake times out — the tunnel's far end is not answering) and
-    // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
-    // roost sepolia switched off as well, the bootstrap fan-out spent 82
-    // rounds on three unreachable pins while a wallet sat in SYNCING.
-    "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-    "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
+    // Re-add one (or pin anything else) only once a census shows it serving
+    // Gloas periods AND live_pins_alive, which now asks for the current
+    // period too, passes it. On nodes that ran rc.0 across the fork, expect
+    // period 1379 to stay broken even after a Lighthouse release with Gloas
+    // support, since the entry stored under 1379 is the Fulu-format one.
+    //
+    // Not pinnable without #576: zbox's own Nimbus (9104) serves Gloas
+    // light-client data — over REST to roost, and over libp2p to a build with
+    // #576, which synced a Rust-engine wallet from it alone (2026-10-08).
+    // Without #576 it cannot: the Rust host offers only yamux where Nimbus
+    // speaks only mplex, and neither engine answers what Nimbus's peer loop
+    // asks of a new peer (metadata/3, then beacon_blocks_by_root,
+    // data_column_sidecars_by_root and execution_payload_envelopes_by_root);
+    // a protocol the peer does not offer ends that loop. It is the obvious
+    // second pin once #576 is in (#566), with a --netkey-file so its peer id
+    // survives restarts. The public Lodestar node (65.21.93.60) closing
+    // inbound connections (2026-10-06) may be the same mismatch — Lodestar
+    // also speaks only mplex on TCP — and was not re-checked; whether Lodestar
+    // serves Gloas light-client data over libp2p is unchecked too.
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -4379,11 +4386,10 @@ mod tests {
             c.static_peers,
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-                "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
             ],
-            "roost first (the dedicated LC server), then the census-verified public \
-             servers — same list, order AND addresses as the Java \
+            "roost alone (the dedicated LC server; no public server a build without #576 \
+             can reach is known to serve Gloas-era light-client data) — same list, order \
+             AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
         // A malformed pin would otherwise reach run_sync and surface only as a
