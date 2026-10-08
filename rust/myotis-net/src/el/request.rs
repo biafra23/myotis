@@ -257,7 +257,10 @@ pub async fn blocking<T: Send + 'static>(
 /// the line keeps its order. The wait returns as soon as `op` is cancelled
 /// or expires, and a refused or cancelled call leaves the line at once. A
 /// cancelled or expired `op` never gets a slot, whichever side of the wait
-/// the cancellation lands on.
+/// the cancellation lands on. Every slow-path outcome logs at debug with the
+/// time waited (`evm slot: …`): the wait is latency a call's own cost log
+/// cannot attribute, and a refusal was loud before, so slot pressure stays
+/// visible either way.
 async fn acquire_slot(
     op: Option<&Operation>,
     wait: Duration,
@@ -267,27 +270,45 @@ async fn acquire_slot(
     if let Ok(permit) = BLOCKING_SLOTS.try_acquire() {
         return Ok(permit);
     }
+    // Calls in the line besides this one (while this one holds a ticket).
+    let others = |ticketed: bool| {
+        let in_line = BLOCKING_WAITERS_MAX - BLOCKING_WAITERS.available_permits();
+        in_line.saturating_sub(usize::from(ticketed))
+    };
     let Ok(_ticket) = BLOCKING_WAITERS.try_acquire() else {
+        tracing::debug!(waiting = others(false), "evm slot: line full, refused at once");
         return Err(format!(
             "native execution busy: {BLOCKING_SLOTS_MAX} running, {BLOCKING_WAITERS_MAX} waiting"
         ));
     };
+    let queued = Instant::now();
     let acquire = tokio::time::timeout(wait, BLOCKING_SLOTS.acquire());
     let acquired = match op {
         Some(o) => o.wait(acquire).await?,
         None => acquire.await,
     };
+    let waited_ms = u64::try_from(queued.elapsed().as_millis()).unwrap_or(u64::MAX);
     let permit = match acquired {
         Ok(Ok(permit)) => permit,
         // The static semaphore is never closed; refuse rather than panic.
         Ok(Err(_)) => return Err("native execution busy: slots closed".to_string()),
         Err(_) => {
+            tracing::debug!(
+                waited_ms,
+                waiting = others(true),
+                "evm slot: no slot freed within the wait, refused"
+            );
             return Err(format!(
                 "native execution busy: no slot freed within {}s",
                 wait.as_secs()
             ))
         }
     };
+    tracing::debug!(
+        waited_ms,
+        waiting = others(true),
+        "evm slot: waited for a free execution slot"
+    );
     // The wait checks every 10 ms; a cancellation inside the last tick, before
     // the slot landed, must not start a job.
     check()?;
