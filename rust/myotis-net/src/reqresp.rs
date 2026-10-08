@@ -326,6 +326,8 @@ pub struct Behaviour {
     pub blocks_by_root: RR,
     /// Likewise — `protocols::DATA_COLUMN_SIDECARS_BY_ROOT`.
     pub data_column_sidecars_by_root: RR,
+    /// Likewise — `protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT`.
+    pub execution_payload_envelopes_by_root: RR,
 }
 
 impl Behaviour {
@@ -393,6 +395,12 @@ impl Behaviour {
             ),
             data_column_sidecars_by_root: rr_with_streams(
                 protocols::DATA_COLUMN_SIDECARS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
+            execution_payload_envelopes_by_root: rr_with_streams(
+                protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT,
                 ProtocolSupport::Inbound,
                 RESP_TIMEOUT,
                 ROOT_LIST_MAX_STREAMS,
@@ -1294,6 +1302,9 @@ fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<
         protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
         protocols::BLOCKS_BY_ROOT => &mut behaviour.blocks_by_root,
         protocols::DATA_COLUMN_SIDECARS_BY_ROOT => &mut behaviour.data_column_sidecars_by_root,
+        protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT => {
+            &mut behaviour.execution_payload_envelopes_by_root
+        }
         _ => return None,
     })
 }
@@ -1457,6 +1468,9 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
         E::BlocksByRoot(ev) => on_rr_event(swarm, ctx, protocols::BLOCKS_BY_ROOT, ev),
         E::DataColumnSidecarsByRoot(ev) => {
             on_rr_event(swarm, ctx, protocols::DATA_COLUMN_SIDECARS_BY_ROOT, ev)
+        }
+        E::ExecutionPayloadEnvelopesByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, ev)
         }
     }
 }
@@ -1692,7 +1706,7 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
         // ResourceUnavailable: that is an error chunk, which Nimbus's root
         // sync treats as a failed request and answers by ending the peer loop
         // (see `protocols::BLOCKS_BY_ROOT`).
-        protocols::BLOCKS_BY_ROOT | protocols::DATA_COLUMN_SIDECARS_BY_ROOT => Vec::new(),
+        p if protocols::is_root_list_request(p) => Vec::new(),
         // Goodbye is a one-way notification: the spec has no response for it,
         // and the caller does not wait. We answer to keep the request_response
         // machinery happy, and the CALLER of this function disconnects the peer
@@ -2310,6 +2324,12 @@ mod dial_resolution_tests {
         let mut list = 4u32.to_le_bytes().to_vec(); // offset of the one element
         list.extend_from_slice(&ident);
         zero_chunks_for(protocols::DATA_COLUMN_SIDECARS_BY_ROOT, codec::encode_request(&list)).await;
+    }
+
+    #[tokio::test]
+    async fn an_envelopes_by_root_request_is_answered_with_zero_chunks() {
+        let roots: Vec<u8> = (0..4u8).flat_map(|i| [i; 32]).collect();
+        zero_chunks_for(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, codec::encode_request(&roots)).await;
     }
 
     async fn zero_chunks_for(protocol: &'static str, request: Vec<u8>) {

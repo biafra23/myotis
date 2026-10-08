@@ -61,14 +61,14 @@ The right split is to stop asking one process to do two unrelated jobs:
 
 ## What a wallet actually needs
 
-The complete surface is twelve protocols. Verified against
+The complete surface is thirteen protocols. Verified against
 `rust/myotis-wire/src/eth2/protocols.rs` and the Java constants in `BeaconP2PService`:
 
 | Protocol | Role |
 |---|---|
 | `status/1`, `status/2` | mandatory handshake — peers drop you without it |
 | `ping/1`, `metadata/2`, `metadata/3`, `goodbye/1` | housekeeping — post-Fulu peers ask for `metadata/3`, and Nimbus drops a peer that cannot answer it |
-| `beacon_blocks_by_root/2`, `data_column_sidecars_by_root/1` | inbound only, always answered with zero chunks — Nimbus's root sync asks a new peer for the head block it advertised in Status, then for the columns its `custody_group_count` says it holds, and drops the peer when a protocol is not even offered |
+| `beacon_blocks_by_root/2`, `data_column_sidecars_by_root/1`, `execution_payload_envelopes_by_root/1` | inbound only, always answered with zero chunks — Nimbus's root sync asks a new peer for the head block it advertised in Status, then for the columns its `custody_group_count` says it holds, then for the Gloas envelopes it is missing, and drops the peer when a protocol is not even offered |
 | `light_client_bootstrap/1` | one-shot trust anchor |
 | `light_client_updates_by_range/1` | per-period sync-committee updates |
 | `light_client_finality_update/1` | per-slot |
@@ -164,11 +164,11 @@ the newest update" question that REST answers unconditionally.
 Most of the server is written. In `rust/myotis-net`:
 
 - Full libp2p host — Noise, yamux or mplex (the spec's mandatory TCP muxer; Nimbus and Lodestar offer nothing else), SSZ+snappy req/resp codecs.
-- **Inbound is already wired for 8 of 12 protocols.** `respond_inbound`
+- **Inbound is already wired for 9 of 13 protocols.** `respond_inbound`
   (`reqresp.rs`) answers `status/1`, `status/2`, `ping` (this node's metadata
   sequence number, not an echo), `metadata/2`, `metadata/3`, `goodbye`
   (answered, then the caller disconnects the peer — Goodbye is a one-way
-  notification), and the two root-list protocols (zero chunks, by design).
+  notification), and the three root-list protocols (zero chunks, by design).
   Without a serving cache the four LC protocols fall through to
   `ResourceUnavailable`.
 - **Multi-chunk responses already round-trip.** `decode_multi_chunk_response`

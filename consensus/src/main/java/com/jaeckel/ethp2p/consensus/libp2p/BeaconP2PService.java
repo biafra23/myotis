@@ -82,6 +82,9 @@ public class BeaconP2PService implements AutoCloseable {
      */
     static final String DATA_COLUMN_SIDECARS_BY_ROOT =
             "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
+    /** The third root-list request of Nimbus's loop (Gloas); same zero-chunk answer. */
+    static final String EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT =
+            "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
     static final String PING =
             "/eth2/beacon_chain/req/ping/1/ssz_snappy";
     static final String METADATA =
@@ -455,6 +458,7 @@ public class BeaconP2PService implements AutoCloseable {
         // not parsed (size 0) because the answer never depends on it.
         registerBinding(BLOCKS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
         registerBinding(DATA_COLUMN_SIDECARS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
+        registerBinding(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
 
         host.start().join();
         log.info("[beacon-p2p] libp2p host started, peerId={}, listenAddrs={}",
