@@ -207,6 +207,22 @@ complete on its own.
   light-client data were unreachable from the Rust engine by construction,
   and zbox's own Nimbus had been dropped as a "dead" pin in September for
   the same reason. mplex is in (`reqresp::build_swarm`); the spec's primary
-  transport, QUIC, which needs no stream muxer, is the follow-up. Re-run the
-  Sepolia census from a build with both before concluding anything about
-  who serves.
+  transport, QUIC, which needs no stream muxer, is the follow-up.
+  **And a second, independent cause behind it:** once a connection to zbox's
+  Nimbus came up over mplex, Nimbus admitted us and then dropped us ~100 ms
+  later, before our bootstrap request was served — its post-Fulu sync
+  overseer asks every new peer for `metadata/3` and nothing else
+  (`doPeerUpdateMetadata` → "Peer loop stopped"), and both engines served
+  only `metadata/2`. Lighthouse and Teku hid this by negotiating v3→v2→v1 in
+  one multistream offer. `metadata/3` is in on both engines
+  (`status::metadata_v3_light_client`, `BeaconP2PService.METADATA_V3`),
+  advertising `CUSTODY_REQUIREMENT` — not 0, which Lighthouse bans.
+  **And a third:** with metadata answered, Nimbus admitted us, served the
+  bootstrap, and then its root sync asked us for the head block we had just
+  advertised in Status (the checkpoint block — not in its sync DAG, which
+  only holds what it saw since its start), could not negotiate
+  `beacon_blocks_by_root` at all, and ended the peer loop ~1 ms later, under
+  our first `updates_by_range`. Both engines now answer `beacon_blocks_by_root/2`
+  inbound with zero chunks — the spec's "none of these" — which passes
+  Nimbus's response check and costs no score. Re-run the Sepolia census from
+  a build with all of this before concluding anything about who serves.

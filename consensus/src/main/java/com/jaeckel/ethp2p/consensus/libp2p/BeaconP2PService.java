@@ -64,10 +64,27 @@ public class BeaconP2PService implements AutoCloseable {
             "/eth2/beacon_chain/req/light_client_optimistic_update/1/ssz_snappy";
     static final String BLOCKS_BY_RANGE =
             "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
+    /**
+     * Answered inbound, always with zero chunks (we hold no blocks). Nimbus's
+     * sync overseer (v26.9) asks every new peer for the head block it advertised
+     * in Status when that block is not in Nimbus's own sync DAG — a light
+     * client's head never is — and ends the peer loop (disconnect) when the
+     * request cannot be negotiated. An empty answer passes its response check
+     * and costs no score. Same reasoning as the Rust {@code protocols::BLOCKS_BY_ROOT}.
+     */
+    static final String BLOCKS_BY_ROOT =
+            "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
     static final String PING =
             "/eth2/beacon_chain/req/ping/1/ssz_snappy";
     static final String METADATA =
             "/eth2/beacon_chain/req/metadata/2/ssz_snappy";
+    /**
+     * Fulu metadata (v2 plus {@code custody_group_count}). Post-Fulu peers ask
+     * for this version — Nimbus's sync overseer for nothing else, and it drops
+     * a peer that cannot answer before that peer's first light-client request.
+     */
+    static final String METADATA_V3 =
+            "/eth2/beacon_chain/req/metadata/3/ssz_snappy";
     static final String GOODBYE =
             "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
 
@@ -83,6 +100,15 @@ public class BeaconP2PService implements AutoCloseable {
      */
     @FunctionalInterface
     public interface ReqRespHandler {
+        /**
+         * Return this exact instance (identity, not equality) to answer with
+         * ZERO chunks — the responder closes its write side without writing
+         * anything. That is the spec's "none of these" for list protocols
+         * such as {@code beacon_blocks_by_root}, distinct from a success chunk
+         * with an empty body and from {@code ResourceUnavailable}.
+         */
+        byte[] NO_CHUNKS = new byte[0];
+
         byte[] handle(byte[] requestSsz, String peerId) throws Exception;
     }
 
@@ -410,12 +436,16 @@ public class BeaconP2PService implements AutoCloseable {
         registerBinding(STATUS_V1, false, 84, statusHandler(false));
         registerBinding(PING, false, 8, pingHandler());
         registerBinding(METADATA, false, 0, metadataHandler());
+        registerBinding(METADATA_V3, false, 0, metadataV3Handler());
         registerBinding(GOODBYE, false, 8, goodbyeHandler());
         registerBinding(FINALITY, true, 0, relayHandler(FINALITY));
         registerBinding(OPTIMISTIC, true, 0, relayHandler(OPTIMISTIC));
         registerBinding(BOOTSTRAP, true, 32, bootstrapHandler());
         registerBinding(UPDATES, true, 16, null); // multi-chunk relay deferred
         registerBinding(BLOCKS_BY_RANGE, true, 16, null); // we never serve blocks
+        // ...but we do ANSWER by-root requests, with nothing: the root list is
+        // not parsed (size 0) because the answer never depends on it.
+        registerBinding(BLOCKS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
 
         host.start().join();
         log.info("[beacon-p2p] libp2p host started, peerId={}, listenAddrs={}",
@@ -592,6 +622,17 @@ public class BeaconP2PService implements AutoCloseable {
         return (req, peerId) -> {
             MetadataMessage md = new MetadataMessage(metadataSeqNumber.get(), new byte[8], new byte[1]);
             return md.encode();
+        };
+    }
+
+    /**
+     * Metadata v3: the v2 answer plus the custody group count every peer
+     * already assumed for us (see {@link MetadataMessage#CUSTODY_GROUP_COUNT}).
+     */
+    private ReqRespHandler metadataV3Handler() {
+        return (req, peerId) -> {
+            MetadataMessage md = new MetadataMessage(metadataSeqNumber.get(), new byte[8], new byte[1]);
+            return md.encodeV3();
         };
     }
 
@@ -2175,6 +2216,13 @@ public class BeaconP2PService implements AutoCloseable {
 
             if (responseSsz == null) {
                 writeError(ctx, (byte) 0x03, "ResourceUnavailable");
+                return;
+            }
+            if (responseSsz == ReqRespHandler.NO_CHUNKS) {
+                // Zero chunks: nothing to write, just half-close.
+                log.debug("[beacon-p2p] responder proto={} peer={} agent={} wrote no chunks durMs={}",
+                        protocolId, peerId, agent, System.currentTimeMillis() - startMs);
+                try { stream.closeWrite(); } catch (Exception ignored) {}
                 return;
             }
 

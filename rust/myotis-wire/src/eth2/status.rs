@@ -83,6 +83,29 @@ pub fn metadata_v2_light_client() -> Vec<u8> {
     out
 }
 
+/// The `custody_group_count` this node advertises in `MetaData` v3.
+///
+/// `CUSTODY_REQUIREMENT` (4 on mainnet, Sepolia and Gnosis) rather than the
+/// honest 0: the Fulu p2p spec lets clients "reject peers with a value less
+/// than `CUSTODY_REQUIREMENT`", and Lighthouse does — `meta_data_response`
+/// goodbyes (reason Fault, which bans) any peer outside
+/// `custody_requirement..=number_of_custody_groups`. Advertising the minimum
+/// changes nothing about how peers treat us: a peer that only got our v2
+/// metadata assumed exactly this value (Nimbus `lookupCgcFromPeer`, Lodestar
+/// `?? CUSTODY_REQUIREMENT`, Lighthouse's v2 default). It does claim columns
+/// we cannot serve; a peer that asks for them gets the same protocol
+/// rejection every other unserved request gets, and scores us down from there
+/// — which is still better than the ban that 0 earns up front.
+pub const CUSTODY_GROUP_COUNT: u64 = 4;
+
+/// `MetaData` v3 (`/req/metadata/3`, Fulu): the v2 bytes followed by
+/// `custody_group_count` uint64 = 25 bytes.
+pub fn metadata_v3_light_client() -> Vec<u8> {
+    let mut out = metadata_v2_light_client();
+    out.extend_from_slice(&CUSTODY_GROUP_COUNT.to_le_bytes());
+    out
+}
+
 /// Our metadata sequence number — what `ping` must answer with.
 ///
 /// Constant zero because this node's metadata never changes: it subscribes to
@@ -184,5 +207,13 @@ mod tests {
     #[test]
     fn metadata_is_17_zero_bytes() {
         assert_eq!(metadata_v2_light_client(), vec![0u8; 17]);
+    }
+
+    #[test]
+    fn metadata_v3_is_v2_plus_the_custody_requirement() {
+        let v3 = metadata_v3_light_client();
+        assert_eq!(v3.len(), 25);
+        assert_eq!(&v3[..17], &[0u8; 17][..]);
+        assert_eq!(u64::from_le_bytes(v3[17..].try_into().unwrap()), 4);
     }
 }

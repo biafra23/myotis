@@ -393,9 +393,10 @@ TCP only (`/ip4/0.0.0.0/tcp/0`), **Noise-XX** secure channel, muxers **yamux the
 
 ### 10.2 Req/resp protocol IDs (all `…/ssz_snappy`)
 
-`status/2`, `status/1`, `ping/1`, `metadata/2`, `goodbye/1`, `light_client_bootstrap/1`,
+`status/2`, `status/1`, `ping/1`, `metadata/2`, `metadata/3`, `goodbye/1`, `light_client_bootstrap/1`,
 `light_client_updates_by_range/1`, `light_client_finality_update/1`,
-`light_client_optimistic_update/1`, `beacon_blocks_by_range/2`.
+`light_client_optimistic_update/1`, `beacon_blocks_by_range/2`, and — answered inbound
+only, always with zero chunks — `beacon_blocks_by_root/2`.
 
 The `light_client_*` and `blocks_by_range` responses carry a 4-byte **fork_digest context byte**;
 `status`/`ping`/`metadata`/`goodbye` do not.
