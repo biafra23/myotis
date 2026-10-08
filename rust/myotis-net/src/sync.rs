@@ -1114,14 +1114,23 @@ struct Peer {
 }
 
 impl Peer {
-    /// Every address to dial, QUIC first: the host dials them concurrently and
-    /// keeps the first connection that completes (`ReqRespClient::request_raw_at`).
+    /// Every address to dial, in the order `ReqRespClient::request_raw_at`
+    /// tries them: TCP first, QUIC only when the TCP dial itself fails.
+    ///
+    /// The spec calls QUIC the primary transport, and a future client may
+    /// well drop TCP — which is what the fallback is for. It is not tried
+    /// first because, measured against Nimbus v26.9.1 (lsquic) on 2026-10-09,
+    /// a QUIC connection answered a handful of streams and then every further
+    /// stream open hung until Nimbus aborted the connection ~70 s later
+    /// ("connection timed out due to lack of progress"); the same node over
+    /// TCP served for as long as it was asked. Until that is understood,
+    /// whichever connection a request lands on must be the TCP one.
     fn dial_addrs(&self) -> Vec<Multiaddr> {
         let mut addrs = Vec::with_capacity(2);
+        addrs.push(self.addr.clone());
         if let Some(quic) = &self.quic {
             addrs.push(quic.clone());
         }
-        addrs.push(self.addr.clone());
         addrs
     }
 }
@@ -1448,19 +1457,27 @@ impl PeerPool {
         self.cooldown_until.get(id).is_none_or(|until| *until <= Instant::now())
     }
 
+    /// Add a peer from a source that knows nothing about QUIC — a config pin
+    /// or the shared cache replay. Leaves an already-pooled peer's QUIC
+    /// address as it is.
     fn add(&mut self, id: PeerId, addr: Multiaddr) {
-        self.add_with_quic(id, addr, None);
+        self.add_inner(id, addr, None, false);
     }
 
-    /// [`add`](Self::add), plus the QUIC address the peer's ENR advertises.
-    /// For an already-pooled peer the QUIC address is learned in place
-    /// (additive, never a cache key, so no identity changes), including for
-    /// a pinned static peer discovered again with its record.
+    /// Add a peer from its ENR, QUIC address included. For an already-pooled
+    /// peer the QUIC address is REPLACED by what the record says now —
+    /// learned, moved to another port, or dropped (`None`) when the operator
+    /// turned QUIC off — including for a pinned static peer discovered again
+    /// with its record. Never a cache key, so no identity changes.
     fn add_with_quic(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>) {
+        self.add_inner(id, addr, quic, true);
+    }
+
+    fn add_inner(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>, from_record: bool) {
         if self.known.contains(&id) {
-            if let Some(quic) = quic {
+            if from_record {
                 if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
-                    p.quic = Some(quic);
+                    p.quic = quic;
                 }
             }
             // Already pooled. Refresh a pinned static peer's address in place:
@@ -4701,6 +4718,57 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// The pool's half of QUIC: a peer's QUIC address is learned from its
+    /// record in place, dialed AFTER the TCP one (see `Peer::dial_addrs` for
+    /// why not first), follows the record (moved or dropped when the operator
+    /// changes it) and is not touched by the sources that know nothing about
+    /// it (a pin, the cache replay). The TCP address stays the peer's
+    /// identity throughout — a name pin is never replaced.
+    #[test]
+    fn a_peer_dials_tcp_then_its_quic_address_and_follows_its_record() {
+        let mut pool = PeerPool::new();
+        let id = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let tcp: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+        let quic: Multiaddr = "/ip4/10.0.0.1/udp/9001/quic-v1".parse().unwrap();
+        let dial = |pool: &PeerPool, id: &PeerId| {
+            pool.peers.iter().find(|p| p.id == *id).expect("pooled").dial_addrs()
+        };
+
+        // From the cache or a pin: TCP only.
+        pool.add(id, tcp.clone());
+        assert_eq!(dial(&pool, &id), vec![tcp.clone()]);
+        // Its record arrives with a QUIC port: learned in place, dialed after TCP.
+        pool.add_with_quic(id, tcp.clone(), Some(quic.clone()));
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), quic.clone()]);
+        assert_eq!(pool.len(), 1, "learning an address never duplicates the peer");
+        // A cache replay knows nothing about QUIC and must not forget it…
+        pool.add(id, tcp.clone());
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), quic.clone()]);
+        // …the record moving the port replaces it…
+        let moved: Multiaddr = "/ip4/10.0.0.1/udp/9002/quic-v1".parse().unwrap();
+        pool.add_with_quic(id, tcp.clone(), Some(moved.clone()));
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), moved]);
+        // …and the record dropping the field (QUIC turned off) forgets it.
+        pool.add_with_quic(id, tcp.clone(), None);
+        assert_eq!(dial(&pool, &id), vec![tcp.clone()]);
+
+        // A name-pinned static peer keeps its name (#348) and still learns QUIC.
+        let pinned = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let name: Multiaddr = "/dns4/roost.example/tcp/9105".parse().unwrap();
+        pool.add_static(pinned, name.clone());
+        pool.add_with_quic(
+            pinned,
+            "/ip4/10.0.0.2/tcp/9105".parse().unwrap(),
+            Some("/ip4/10.0.0.2/udp/9105/quic-v1".parse().unwrap()),
+        );
+        let p = pool.peers.iter().find(|p| p.id == pinned).unwrap();
+        assert_eq!(p.addr, name, "a name pin is never replaced by a numeric snapshot");
+        assert_eq!(
+            p.dial_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            vec![name.to_string(), "/ip4/10.0.0.2/udp/9105/quic-v1".to_string()]
+        );
     }
 
     #[test]

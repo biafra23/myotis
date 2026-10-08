@@ -392,8 +392,10 @@ TCP (`/ip4/0.0.0.0/tcp/0`) with **Noise-XX** and the muxers **yamux then mplex**
 **QUIC** (`/ip4/0.0.0.0/udp/0/quic-v1`, the spec's primary transport — its own TLS 1.3
 handshake and multiplexing, so neither noise nor a muxer applies there); both listeners
 on ephemeral ports. **Random secp256k1 identity each start** (ephemeral PeerId). A peer
-discovered with an ENR `quic`/`quic6` field is dialed at its QUIC and TCP addresses
-concurrently, first connection wins. No WebSocket / relay / DHT.
+discovered with an ENR `quic`/`quic6` field is dialed at TCP first and at its QUIC
+address only when the TCP dial itself fails — not the spec's order, because against
+Nimbus v26.9.1 (lsquic) a QUIC connection answered a handful of streams and then hung
+until Nimbus aborted it (`sync::Peer::dial_addrs`). No WebSocket / relay / DHT.
 
 ### 10.2 Req/resp protocol IDs (all `…/ssz_snappy`)
 

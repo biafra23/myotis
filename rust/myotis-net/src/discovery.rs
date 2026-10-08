@@ -539,8 +539,7 @@ fn filter_candidate(enr: &Enr, accepted_digests: &[[u8; 4]]) -> Option<Discovere
         .and_then(|r| r.ok())
         .filter(|port| *port != 0)
         .map(|port| Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port)).with(Protocol::QuicV1));
-    tracing::debug!(peer = %peer_id, %addr, quic = quic.as_ref().map(|q| q.to_string()).unwrap_or_default(),
-        prior_fork = match_idx > 0, "CL peer discovered");
+    tracing::debug!(peer = %peer_id, %addr, ?quic, prior_fork = match_idx > 0, "CL peer discovered");
     Some(DiscoveredPeer { peer_id, addr, quic })
 }
 

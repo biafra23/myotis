@@ -510,15 +510,47 @@ impl ReqRespClient {
     }
 
     /// [`request_raw`](Self::request_raw) with every address the peer is known
-    /// at, in preference order (QUIC before TCP for a discovered peer). The
-    /// swarm dials them concurrently — libp2p's dial concurrency factor — and
-    /// keeps the first connection that completes, so an unreachable QUIC port
-    /// (a firewall that drops UDP, a port nobody forwarded) costs nothing but
-    /// the TCP handshake that was going to happen anyway.
+    /// at, in preference order (TCP before QUIC for a discovered peer — see
+    /// `sync::Peer::dial_addrs` for why not the spec's order). The addresses
+    /// are tried ONE AT A TIME, and the next is tried only when the dial
+    /// itself failed: a request that reached a connection and then failed
+    /// (timeout, a refused protocol, a closed stream) is the peer's answer, not
+    /// a reason to try the same peer over another transport. The swarm could
+    /// dial them all at once instead — libp2p's dial concurrency factor — but
+    /// then whichever handshake completes first wins, and that is QUIC's
+    /// 1-RTT more often than not, which is the connection this order exists
+    /// to avoid landing on.
     pub async fn request_raw_at(
         &self,
         peer: PeerId,
         addrs: Vec<Multiaddr>,
+        protocol: &'static str,
+        mut wire: Vec<u8>,
+    ) -> Result<Vec<u8>, RequestError> {
+        // An empty list would work exactly as long as the peer happens to be
+        // connected and fail the moment it is not — a contract violation that
+        // must not depend on connection state to show itself.
+        debug_assert!(!addrs.is_empty(), "request_raw_at needs at least one address");
+        let count = addrs.len();
+        for (i, addr) in addrs.into_iter().enumerate() {
+            let is_last = i + 1 == count;
+            // The bytes are cloned only while another attempt may follow.
+            let bytes = if is_last { std::mem::take(&mut wire) } else { wire.clone() };
+            match self.request_raw_once(peer, addr, protocol, bytes).await {
+                Err(RequestError::DialFailure) if !is_last => continue,
+                outcome => return outcome,
+            }
+        }
+        Err(RequestError::DialFailure)
+    }
+
+    /// One attempt at one address — after DNS resolution, which can yield
+    /// several concrete candidates for a name; THOSE are dialed concurrently,
+    /// resolver order first (see `resolve_dial_addrs`).
+    async fn request_raw_once(
+        &self,
+        peer: PeerId,
+        addr: Multiaddr,
         protocol: &'static str,
         wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
@@ -527,18 +559,10 @@ impl ReqRespClient {
         // DNS transport is not always present (Android has no /etc/resolv.conf,
         // so `build_swarm` falls back to plain TCP and a /dns4/ address is
         // rejected outright with "Multiaddr is not supported").
-        let dns_name = addrs.iter().find_map(multiaddr_dns_name);
+        let dns_name = multiaddr_dns_name(&addr);
         // Never empty: a resolver failure yields the original address, so an
         // already-connected peer is unaffected by a transient DNS blip.
-        let mut resolved: Vec<Multiaddr> = Vec::with_capacity(addrs.len());
-        for addr in &addrs {
-            for candidate in resolve_dial_addrs(addr, &self.last_resolved).await {
-                if !resolved.contains(&candidate) {
-                    resolved.push(candidate);
-                }
-            }
-        }
-        let addrs = resolved;
+        let addrs = resolve_dial_addrs(&addr, &self.last_resolved).await;
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
@@ -2499,6 +2523,50 @@ mod dial_resolution_tests {
                 _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
             }
         }
+    }
+
+    /// The address order end to end, through the real client and its swarm
+    /// task: a peer known at a dead TCP address and a live QUIC one is
+    /// answered over QUIC, because `request_raw_at` moves on to the next
+    /// address when — and only when — the dial itself fails.
+    #[tokio::test]
+    async fn a_dead_tcp_address_falls_through_to_the_quic_one() {
+        let (mut peer, mut ctx) = host_with_ctx();
+        peer.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).unwrap();
+        let quic = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        // The peer runs the real event loop body, responder included.
+        tokio::spawn(async move {
+            loop {
+                let ev = peer.select_next_some().await;
+                handle_swarm_event(&mut peer, &mut ctx, ev);
+            }
+        });
+
+        let status = StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        };
+        let wire = codec::encode_request(&status.encode());
+        let client = start_host(LocalStatus::new(status)).expect("the wallet host");
+        // Nothing listens on port 1 (binding it takes root), so this dial is
+        // refused at once — the shape of a TCP port a firewall closed.
+        let dead: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        let answer = client
+            .request_raw_at(peer_id, vec![dead, quic], protocols::STATUS_V2, wire)
+            .await
+            .expect("answered over the second address");
+        let decoded = codec::decode_response(&answer, false).expect("a status chunk");
+        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
+        assert_eq!(decoded.ssz_payload.len(), StatusMessage::SSZ_SIZE_V2);
     }
 
     /// A name-pinned QUIC address resolves the same way a TCP one does: the
