@@ -475,15 +475,21 @@ warm-start dial (Rust), and the CL multiaddr is `prependLocal`-ed onto
 |---|---|
 | EL | `enode://cfd3572b…c37e1b2c@188.68.32.16:30405` |
 | CL (roost, first) | `/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
+| CL (Nimbus, second) | `/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6` |
 
 The Nimbus CL fallback (`/tcp/9104` through the relay) was **unpinned on
 2026-09-11** because the libp2p upgrade failed — not because the tunnel's far
 end was down, as first recorded: the Rust host offered only yamux and Nimbus
-speaks only mplex (#576). The three census-verified public Lighthouse servers
+speaks only mplex, and neither engine answered what Nimbus's peer loop asks
+of a new peer (#576). The three census-verified public Lighthouse servers
 that took its place were dropped at the Gloas fork (2026-10-07: no Gloas
-light-client data; see the list's comment), leaving roost alone. Re-pin the
-Nimbus once #576 is in and its `--netkey-file` identity is confirmed from its
-startup log (#566).
+light-client data; see the list's comment). **Re-pinned 2026-10-09** (#566
+option 3), second after roost, with #576 in on both engines; its peer id is
+the `--netkey-file` one. Two caveats, both in the pin comment: the unit's
+`--max-peers=25` resets a handshake while the node is full (raise it on the
+unit for a reliable pin), and Nimbus's peer loop scores a light client's
+empty by-root answers down, so one connection lasts minutes between
+reconnects.
 
 Both are only stable because their keys persist across restarts (Geth's
 datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is
