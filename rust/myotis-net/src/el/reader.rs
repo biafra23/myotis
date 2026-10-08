@@ -1445,6 +1445,55 @@ enum BlockFromError {
     Undecodable(String),
 }
 
+/// Why one peer's `eth_feeHistory` build failed, split the way
+/// [`BlockFromError`] splits a block serve. `Peer`: the response was missing,
+/// slow, short, or did not rebuild the anchored header's roots — that peer's
+/// failure, banked by the ladder once it settles, and the next peer is asked.
+/// `Ours`: the bodies and receipts DID rebuild the anchored header's
+/// `transactionsRoot` / `receiptsRoot`, and what we made of them failed — a
+/// tx or receipt inside verified bytes our decoder cannot read, or a
+/// gas-accounting check of ours. Every peer serves those same verified bytes,
+/// so the ladder stops without blaming the one that served them. Until this
+/// split, a check that was wrong on OUR side (receipt sums no longer equal the
+/// header's `gasUsed` from Amsterdam on, see [`weigh_tips`]) struck every
+/// snap peer on every build — with a wallet polling feeHistory, the whole
+/// Sepolia pool was evicted once a minute (observed 2026-10-08).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeeBuildError {
+    Peer(String),
+    Ours(String),
+}
+
+impl FeeBuildError {
+    /// The message, whichever side it is.
+    fn message(&self) -> &str {
+        match self {
+            FeeBuildError::Peer(m) | FeeBuildError::Ours(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for FeeBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+// Bare `?`/`ok_or` sites in the build are peer-response failures (transport,
+// a short window, a root mismatch); the handful that are ours are constructed
+// explicitly, each after the root check that makes it ours.
+impl From<String> for FeeBuildError {
+    fn from(message: String) -> Self {
+        FeeBuildError::Peer(message)
+    }
+}
+
+impl From<&str> for FeeBuildError {
+    fn from(message: &str) -> Self {
+        FeeBuildError::Peer(message.to_string())
+    }
+}
+
 /// Compress a whole pool's per-peer failure strings into one diagnosis-grade
 /// line: identical reasons are counted ("6x request timed out"), distinct ones
 /// listed, the output bounded so it stays fit for an error message and a log
@@ -7295,7 +7344,7 @@ impl ElReader {
                 self.fee_history_from(peer, oldest, count, top, reward_percentiles),
             )
             .await
-            .unwrap_or_else(|_| Err("feeHistory build timed out".to_string()));
+            .unwrap_or_else(|_| Err(FeeBuildError::Peer("feeHistory build timed out".to_string())));
             match attempt {
                 Ok(history) => {
                     tracing::debug!(oldest, count, peer = %peer.addr(), tried = failed.len() + 1, "feeHistory served");
@@ -7303,7 +7352,21 @@ impl ElReader {
                     self.pool.record_snap_served(peer.addr()).await;
                     return Ok(history);
                 }
-                Err(e) => {
+                Err(FeeBuildError::Ours(e)) => {
+                    // The peer's bodies and receipts rebuilt the anchored
+                    // header's roots: it SERVED, and what failed is ours —
+                    // the same for every peer, so the ladder stops here (the
+                    // block serve's `BlockAttempt::Undecodable` twin). The
+                    // peer is credited like any server and the earlier
+                    // misses are witnessed by it; nobody is struck for a
+                    // check of ours.
+                    tracing::debug!(oldest, count, peer = %peer.addr(), error = %e,
+                        "feeHistory: verified data we cannot build from — no peer can serve it differently");
+                    self.record_batch_failures(&failed, true).await;
+                    self.pool.record_snap_served(peer.addr()).await;
+                    return Err(format!("feeHistory cannot be built from verified data: {e}"));
+                }
+                Err(FeeBuildError::Peer(e)) => {
                     tracing::debug!(oldest, count, peer = %peer.addr(), error = %e, "feeHistory: peer failed");
                     failed.push(peer.addr());
                     last_err = e;
@@ -7329,7 +7392,7 @@ impl ElReader {
         count: u64,
         top: WindowTop,
         reward_percentiles: Option<&[f64]>,
-    ) -> Result<FeeHistory, String> {
+    ) -> Result<FeeHistory, FeeBuildError> {
         // `[oldest ..= top]`: the span past `newest` is what anchors it — and
         // gives the ACTUAL next-block base fee when the top is above newest.
         let window = fetch_anchored_window(peer, oldest, top).await?;
@@ -7946,7 +8009,9 @@ impl ElReader {
     /// block/receipts loops defer recording until the batch's outcome is known
     /// so a whole-pool TIP-LAG failure (our anchor ahead of the peers' imported
     /// tip — no peer's fault) strikes nobody; every other outcome banks the
-    /// strikes exactly as immediate recording did.
+    /// strikes exactly as immediate recording did. The feeHistory ladder
+    /// likewise strikes nobody for a failure in VERIFIED data
+    /// ([`FeeBuildError::Ours`]): the peer that served it is credited instead.
     ///
     /// `witnessed`: another peer served the same read (a won race's misses).
     /// A whole-pool failure is unwitnessed — banked live, persisted nowhere.
@@ -8572,6 +8637,12 @@ fn build_block_receipts(
 /// caps a block at `gasUsed / 1000` transactions, far above any real block,
 /// and lets [`verify_body_transactions`] refuse a peer's body of millions of
 /// junk transactions before hashing each one into the trie (#454).
+/// Amsterdam's two-dimensional accounting keeps the bound: the header's
+/// `gasUsed` is `max(Σ execution gas, Σ state gas)` before refunds, and the
+/// execution dimension carries every transaction's intrinsic base and
+/// calldata floor (execution-specs `settle_transaction_gas`), so
+/// `gasUsed ≥ 12,000 × txs` still holds there (re-checked 2026-10-08 with
+/// [`weigh_tips`]'s gas cross-check).
 const MIN_GAS_PER_TX: u64 = 1_000;
 
 /// The body half of the per-block trust gate: the fetched transactions must
@@ -9141,13 +9212,15 @@ fn log_fee_summary(line: Option<String>) {
 /// computes never fetch the same block twice (PR #535 review). Every block
 /// that verifies is remembered, even when another one fails the call.
 /// `fetch(hash, with_body)` returns the block's bodies response (only when
-/// asked for) and its receipts response.
+/// asked for) and its receipts response. The error says whose failure it is
+/// ([`FeeBuildError`]); one in VERIFIED data outranks a peer's, since it fails
+/// the build whichever peer serves.
 async fn reward_inputs<F, Fut>(
     cache: &std::sync::Mutex<FeeCache>,
     fill: &tokio::sync::Mutex<()>,
     blocks: &[crate::el::eth::messages::VerifiedHeader],
     fetch: F,
-) -> Result<Vec<BlockRewards>, String>
+) -> Result<Vec<BlockRewards>, FeeBuildError>
 where
     F: Fn([u8; 32], bool) -> Fut,
     Fut: std::future::Future<
@@ -9157,7 +9230,9 @@ where
         ),
     >,
 {
-    let unavailable = |_| "fee cache unavailable".to_string();
+    // A poisoned memo lock is ours, not the peer's (unreachable under
+    // panic="abort", but the classification must not lie).
+    let unavailable = |_| FeeBuildError::Ours("fee cache unavailable".to_string());
     let _fill = fill.lock().await;
     // Per block: its cached list, else the complete tips its receipts need.
     let (mut inputs, known_tips): (Vec<Option<BlockRewards>>, Vec<Option<BlockTips>>) = {
@@ -9182,18 +9257,20 @@ where
     )
     .await;
     let mut fetched = fetched.into_iter();
-    let mut first_err = None;
+    let mut first_err: Option<FeeBuildError> = None;
     for &i in &missing {
         let vh = &blocks[i];
         let weighted = if empty(i) {
             weigh_tips(&vh.header, &[], Vec::new())
         } else {
             match (fetched.next(), &known_tips[i]) {
-                (Some((_, receipts)), Some(tips)) => receipts.and_then(|r| weigh_tips(&vh.header, tips, r)),
-                (Some((Some(bodies), receipts)), None) => {
-                    bodies.and_then(|b| receipts.and_then(|r| block_tx_tips(&vh.header, b, r)))
+                (Some((_, receipts)), Some(tips)) => {
+                    receipts.map_err(FeeBuildError::Peer).and_then(|r| weigh_tips(&vh.header, tips, r))
                 }
-                _ => Err("a block's fetch went missing".to_string()),
+                (Some((Some(bodies), receipts)), None) => bodies.map_err(FeeBuildError::Peer).and_then(|b| {
+                    receipts.map_err(FeeBuildError::Peer).and_then(|r| block_tx_tips(&vh.header, b, r))
+                }),
+                _ => Err(FeeBuildError::Ours("a block's fetch went missing".to_string())),
             }
         };
         match weighted {
@@ -9203,14 +9280,26 @@ where
                 inputs[i] = Some(weighted);
             }
             Err(e) => {
-                first_err.get_or_insert(e);
+                // The first failure, except that one in verified data
+                // outranks any peer's.
+                let replace = match &first_err {
+                    None => true,
+                    Some(FeeBuildError::Peer(_)) => matches!(e, FeeBuildError::Ours(_)),
+                    Some(FeeBuildError::Ours(_)) => false,
+                };
+                if replace {
+                    first_err = Some(e);
+                }
             }
         }
     }
     if let Some(e) = first_err {
         return Err(e);
     }
-    inputs.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| "a block's reward input went missing".to_string())
+    inputs
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| FeeBuildError::Ours("a block's reward input went missing".to_string()))
 }
 
 /// One block's per-tx `(effective_tip, gas_used)` list from its FETCHED body +
@@ -9218,11 +9307,14 @@ where
 /// `transactionsRoot` / `receiptsRoot` before anything is trusted (the Java
 /// `decodeBlockTips` twin). Strict like Java: an undecodable tx inside a
 /// verified body, a receipt-count mismatch, or a failed root fails the block.
+/// The error says whose failure it is ([`FeeBuildError`]): a missing or
+/// root-failing response is the peer's, a failure inside root-verified bytes
+/// ours.
 fn block_tx_tips(
     header: &BlockHeader,
     bodies: Vec<crate::el::eth::messages::BlockBody>,
     receipt_blocks: Vec<crate::el::eth::messages::BlockReceipts>,
-) -> Result<Vec<(u128, u64)>, String> {
+) -> Result<Vec<(u128, u64)>, FeeBuildError> {
     let tips = strict_body_tips(header, bodies)?;
     weigh_tips(header, &tips, receipt_blocks)
 }
@@ -9233,14 +9325,17 @@ fn block_tx_tips(
 fn strict_body_tips(
     header: &BlockHeader,
     bodies: Vec<crate::el::eth::messages::BlockBody>,
-) -> Result<Vec<u128>, String> {
+) -> Result<Vec<u128>, FeeBuildError> {
     let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
     verify_body_transactions(header, &body)?;
+    // From here the body is the anchored header's: a tx we cannot decode is
+    // our rendering failure, not the peer's.
     let base_fee = header_base_fee(header);
     body.transactions
         .iter()
         .map(|raw| {
-            tx::effective_tip(raw, base_fee).ok_or_else(|| format!("block {} has an undecodable tx", header.number))
+            tx::effective_tip(raw, base_fee)
+                .ok_or_else(|| FeeBuildError::Ours(format!("block {} has an undecodable tx", header.number)))
         })
         .collect()
 }
@@ -9248,64 +9343,108 @@ fn strict_body_tips(
 /// Weigh a block's `tips` — every transaction's, in order, from a body
 /// verified against the anchored header — by the gas each used, from FETCHED
 /// receipts verified against the header's `receiptsRoot` first.
+///
+/// The weight is each receipt's cumulative gas less the previous one's: the
+/// gas the SENDER paid for, which is what geth's `eth_feeHistory` weighs by.
+/// The receipts are root-verified, so the weights are consensus data. The
+/// checks after the root are cross-checks against the anchored header, and
+/// what they may assert depends on the header's fork:
+/// - **Before Amsterdam** the header's `gasUsed` is that same sender-paid sum
+///   (`block_gas_used += gas_used`, then `!= header.gas_used → InvalidBlock`),
+///   so the last receipt's cumulative must EQUAL it.
+/// - **From Amsterdam** (EIP-7778, and the two-dimensional gas of EIP-7999 /
+///   EIP-8037) the header's `gasUsed` is `max(Σ execution_gas_used,
+///   Σ state_gas_used)`, both counted BEFORE refunds, while a receipt's
+///   cumulative still adds the sender's gas AFTER refunds and the calldata
+///   floor (execution-specs `forks/amsterdam/fork.py`, `process_transaction`
+///   and `settle_transaction_gas`). The two are no longer tied, in either
+///   direction: a state-gas-heavy block puts the receipts' sum ABOVE the
+///   header (Sepolia 11872301: 77 021 691 over a `gasUsed` of 70 467 467,
+///   2026-10-08), a refund-heavy one puts it BELOW. All the spec gives is
+///   `0.8·gasUsed ≤ sum ≤ 2·gasUsed` (the refund cap and the two
+///   dimensions), and a bound built from those constants is exactly the
+///   check the next fork breaks the way this one broke the equality — every
+///   Sepolia feeHistory with reward percentiles failing from the fork
+///   (2026-10-06) on, and every snap peer struck for it. So an Amsterdam
+///   header's `gasUsed` is NOT compared to the receipts: the receipts root is
+///   the verification, and `gasUsed` is no weight.
+///
+/// Monotonic cumulative gas, and `gasUsed` 0 for a block without
+/// transactions, hold under both accountings: every transaction pays its
+/// intrinsic gas, and an empty block sums to zero in every dimension.
 fn weigh_tips(
     header: &BlockHeader,
     tips: &[u128],
     receipt_blocks: Vec<crate::el::eth::messages::BlockReceipts>,
-) -> Result<Vec<(u128, u64)>, String> {
+) -> Result<Vec<(u128, u64)>, FeeBuildError> {
     if tips.is_empty() {
         // A root-verified EMPTY tx list ⇒ the anchored header must carry
-        // gasUsed 0 (same strictness as the non-empty path's final-sum check).
-        // Receipts are deliberately NOT consulted here — no weights to derive —
-        // matching the Java decodeBlockTips early return, and not making a
-        // quiet chain's feeHistory depend on how peers answer GetReceipts for
-        // zero-tx blocks.
+        // gasUsed 0 (an empty block sums to zero in every dimension, Amsterdam
+        // included). Receipts are deliberately NOT consulted here — no weights
+        // to derive — matching the Java decodeBlockTips early return, and not
+        // making a quiet chain's feeHistory depend on how peers answer
+        // GetReceipts for zero-tx blocks.
         if header.gas_used != 0 {
-            return Err(format!(
+            return Err(FeeBuildError::Ours(format!(
                 "block {} has no transactions but a non-zero header gasUsed {}",
                 header.number, header.gas_used
-            ));
+            )));
         }
         return Ok(Vec::new());
     }
     let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
     if receipts.len() != tips.len() {
-        return Err(format!(
+        return Err(FeeBuildError::Peer(format!(
             "block {} receipt count mismatch ({} receipts for {} txs)",
             header.number,
             receipts.len(),
             tips.len()
-        ));
+        )));
     }
-    let receipts =
-        receipts.canonical(tips.len()).map_err(|e| format!("block {}: {}", header.number, e.0))?;
+    let receipts = receipts
+        .canonical(tips.len())
+        .map_err(|e| FeeBuildError::Peer(format!("block {}: {}", header.number, e.0)))?;
     verify_block_receipts(header, &receipts)?;
+    // From here the receipts are the anchored header's: the peer served, and
+    // whatever fails below is a check of ours against consensus data.
     let mut out = Vec::with_capacity(tips.len());
     let mut prev_cum = 0u64;
     for (&tip, receipt) in tips.iter().zip(receipts.iter()) {
-        let cum = crate::el::receipt::decode(receipt)?.cumulative_gas_used;
+        let cum = crate::el::receipt::decode(receipt).map_err(FeeBuildError::Ours)?.cumulative_gas_used;
         // Strict, like the rest of this path: cumulative gas must be
         // monotonic (a regression is impossible in a consensus-valid block —
         // fail the block rather than silently zero a weight), …
         if cum < prev_cum {
-            return Err(format!(
+            return Err(FeeBuildError::Ours(format!(
                 "block {} receipts have non-monotonic cumulative gas",
                 header.number
-            ));
+            )));
         }
         out.push((tip, cum - prev_cum));
         prev_cum = cum;
     }
-    // …and the last receipt's cumulative must equal the ANCHORED header's
-    // gasUsed (the header field is beacon-anchored; the receipts are
-    // root-verified — consensus ties the two together).
-    if prev_cum != header.gas_used {
-        return Err(format!(
+    // …and, before Amsterdam, the last receipt's cumulative must equal the
+    // ANCHORED header's gasUsed (the header field is beacon-anchored; the
+    // receipts are root-verified — pre-Amsterdam consensus ties the two
+    // together). From Amsterdam the header counts something else (see the
+    // doc above), and there is nothing to hold the sum to.
+    if !header_is_amsterdam(header) && prev_cum != header.gas_used {
+        return Err(FeeBuildError::Ours(format!(
             "block {} receipts' final cumulative gas {} does not match the header gasUsed {}",
             header.number, prev_cum, header.gas_used
-        ));
+        )));
     }
     Ok(out)
+}
+
+/// Whether a header is under Amsterdam's gas accounting, read off the
+/// header's own shape: EIP-7928 appends `blockAccessListHash` at Amsterdam and
+/// no earlier header carries that field ([`BlockHeader::decode`]). The header
+/// is beacon-anchored, so its shape is as trustworthy as its `gasUsed`, and
+/// no per-network fork table is needed — right for any network the moment
+/// its headers carry the field.
+fn header_is_amsterdam(header: &BlockHeader) -> bool {
+    header.block_access_list_hash.is_some()
 }
 
 /// Gas-used-weighted percentile rewards for one block — the Java `rewardJson`
@@ -10617,7 +10756,7 @@ mod tests {
                 wrong
             };
             let err = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap_err();
-            assert!(err.contains("receiptsRoot"), "{err}");
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("receiptsRoot")), "{err}");
             assert!(cache.lock().unwrap().weighted((9, vh.hash)).is_none());
         }
 
@@ -10641,7 +10780,7 @@ mod tests {
             cache.lock().unwrap().put_tips((12, vh.hash), Arc::new(vec![GWEI, 2 * GWEI]), true);
             let fetch = |_hash: [u8; 32], with_body: bool| async move { serve(12, GWEI, with_body) };
             let err = reward_inputs(&cache, &fill, std::slice::from_ref(&vh), fetch).await.unwrap_err();
-            assert!(err.contains("receipt count mismatch"), "{err}");
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("receipt count mismatch")), "{err}");
         }
 
         #[tokio::test]
@@ -10668,7 +10807,182 @@ mod tests {
                 failed
             };
             let err = reward_inputs(&cache, &fill, &window(0, 2), fetch).await.unwrap_err();
-            assert!(err.contains("timed out"), "{err}");
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("timed out")), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_failure_in_verified_data_outranks_a_peers_in_the_rows() {
+            // Block 0's receipts do not rebuild its root (the peer's); block 1's
+            // do, and fail our pre-Amsterdam gas check. The build fails as
+            // OURS: no peer can serve block 1 differently, so the ladder must
+            // stop rather than strike every peer for it.
+            let cache = Mutex::new(FeeCache::default());
+            let fill = tokio::sync::Mutex::new(());
+            let (vh0, _, _) = one_tx_block(0, GWEI, GWEI);
+            let mut vh1 = one_tx_block(1, GWEI, GWEI).0;
+            let over = receipts_of(&[30_000]);
+            vh1.header.receipts_root = triehash::ordered_trie_root(over.iter());
+            for vh in [&vh0, &vh1] {
+                cache.lock().unwrap().put_tips((vh.header.number, vh.hash), Arc::new(vec![GWEI]), true);
+            }
+            let fetch = |_hash: [u8; 32], _with_body: bool| {
+                let served = over.clone();
+                async move {
+                    let out: Fetched = (None, Ok(vec![BlockReceipts::Canonical(served)]));
+                    out
+                }
+            };
+            let err = reward_inputs(&cache, &fill, &[vh0.clone(), vh1.clone()], fetch).await.unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("does not match")), "{err}");
+            let c = cache.lock().unwrap();
+            assert!(c.weighted((0, vh0.hash)).is_none() && c.weighted((1, vh1.hash)).is_none());
+        }
+    }
+
+    /// The gas cross-checks of [`weigh_tips`] against the anchored header, and
+    /// whose failure each check reports ([`FeeBuildError`]).
+    mod weigh_tips_gas_accounting {
+        use super::*;
+        use crate::el::eth::messages::{BlockBody, BlockReceipts, RawList};
+        use myotis_core::rlp::{encode, u64_to_minimal_be, Item};
+
+        const GWEI: u128 = 1_000_000_000;
+
+        /// Canonical legacy receipts with the given cumulative gas values.
+        fn receipts_of(cumulative: &[u64]) -> RawList {
+            let mut list = RawList::new();
+            for &gas in cumulative {
+                list.push(&encode(&Item::List(vec![
+                    Item::Bytes(vec![1]),
+                    Item::Bytes(u64_to_minimal_be(gas)),
+                    Item::Bytes(vec![0; 256]),
+                    Item::List(Vec::new()),
+                ])));
+            }
+            list
+        }
+
+        /// A header committing to `receipts` and carrying `gas_used`, shaped
+        /// pre-Amsterdam or Amsterdam (the EIP-7928 field present).
+        fn header_over(number: u64, gas_used: u64, receipts: &RawList, amsterdam: bool) -> BlockHeader {
+            BlockHeader {
+                number,
+                gas_used,
+                receipts_root: triehash::ordered_trie_root(receipts.iter()),
+                block_access_list_hash: amsterdam.then_some([0x0b; 32]),
+                ..Default::default()
+            }
+        }
+
+        fn weigh(header: &BlockHeader, tips: &[u128], receipts: RawList) -> Result<Vec<(u128, u64)>, FeeBuildError> {
+            weigh_tips(header, tips, vec![BlockReceipts::Canonical(receipts)])
+        }
+
+        #[test]
+        fn pre_amsterdam_receipts_must_sum_to_the_header_gas_used() {
+            let receipts = receipts_of(&[21_000, 63_000]);
+            let header = header_over(5, 63_000, &receipts, false);
+            assert_eq!(weigh(&header, &[GWEI, 2 * GWEI], receipts.clone()).unwrap(), vec![(GWEI, 21_000), (2 * GWEI, 42_000)]);
+            // The same root-verified receipts under a header claiming another
+            // gasUsed: impossible in a consensus-valid block, refused — and
+            // refused as OUR check, since the receipts did rebuild the root.
+            let mismatch = header_over(5, 60_000, &receipts, false);
+            let err = weigh(&mismatch, &[GWEI, 2 * GWEI], receipts).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("does not match the header gasUsed")), "{err}");
+        }
+
+        #[test]
+        fn amsterdam_receipts_are_not_held_to_the_header_gas_used() {
+            // Sepolia 11872301 (2026-10-08): 109 transactions whose receipts
+            // sum to 77 021 691 under a header gasUsed of 70 467 467 — the
+            // header is max(execution, state) gas before refunds, the receipts
+            // the sender's gas after them (EIP-7778 / EIP-7999). Two receipts
+            // stand in for the 109; the first one's 15 000 is the real
+            // first transaction's (EIP-2780 repricing: no 21 000 floor).
+            let receipts = receipts_of(&[15_000, 77_021_691]);
+            let header = header_over(11_872_301, 70_467_467, &receipts, true);
+            assert_eq!(weigh(&header, &[GWEI, GWEI], receipts).unwrap(), vec![(GWEI, 15_000), (GWEI, 77_006_691)]);
+            // A refund-heavy block lands the other way round: the receipts'
+            // sum BELOW the header's pre-refund count. Accepted too — the
+            // spec gives no ordering between the two.
+            let receipts = receipts_of(&[40_000, 80_000]);
+            let header = header_over(11_872_302, 100_000, &receipts, true);
+            assert_eq!(weigh(&header, &[GWEI, GWEI], receipts).unwrap(), vec![(GWEI, 40_000), (GWEI, 40_000)]);
+            // Equal stays fine.
+            let receipts = receipts_of(&[12_000, 24_000]);
+            let header = header_over(11_872_303, 24_000, &receipts, true);
+            assert!(weigh(&header, &[GWEI, GWEI], receipts).is_ok());
+            // The SAME numbers under a pre-Amsterdam header are still refused:
+            // the relaxation is keyed on the header's shape, not on size.
+            let receipts = receipts_of(&[15_000, 77_021_691]);
+            let header = header_over(11_872_301, 70_467_467, &receipts, false);
+            assert!(weigh(&header, &[GWEI, GWEI], receipts).is_err());
+        }
+
+        #[test]
+        fn the_header_shape_says_which_gas_accounting_applies() {
+            assert!(!header_is_amsterdam(&BlockHeader::default()));
+            assert!(header_is_amsterdam(&BlockHeader { block_access_list_hash: Some([0x0b; 32]), ..Default::default() }));
+        }
+
+        #[test]
+        fn cumulative_gas_must_climb_under_either_accounting() {
+            for amsterdam in [false, true] {
+                let receipts = receipts_of(&[30_000, 21_000]);
+                let header = header_over(6, 30_000, &receipts, amsterdam);
+                let err = weigh(&header, &[GWEI, GWEI], receipts).unwrap_err();
+                assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("non-monotonic")), "{err}");
+            }
+        }
+
+        #[test]
+        fn an_empty_block_carries_gas_used_zero_under_either_accounting() {
+            for amsterdam in [false, true] {
+                let mut header = header_over(7, 0, &RawList::new(), amsterdam);
+                assert!(weigh_tips(&header, &[], Vec::new()).unwrap().is_empty());
+                header.gas_used = 12_000;
+                let err = weigh_tips(&header, &[], Vec::new()).unwrap_err();
+                assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("no transactions")), "{err}");
+            }
+        }
+
+        #[test]
+        fn a_failure_before_the_root_check_is_the_peers_after_it_ours() {
+            let receipts = receipts_of(&[21_000]);
+            let header = header_over(8, 21_000, &receipts, false);
+            // Too few receipts for the tips, no receipts at all, receipts that
+            // do not rebuild the root: the peer's, each.
+            let err = weigh(&header, &[GWEI, GWEI], receipts.clone()).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("receipt count mismatch")), "{err}");
+            let err = weigh_tips(&header, &[GWEI], Vec::new()).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("no receipts")), "{err}");
+            let err = weigh(&header, &[GWEI], receipts_of(&[30_000])).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("receiptsRoot")), "{err}");
+            // Bytes that DO rebuild the root but are no receipt we can read:
+            // consensus data our decoder cannot render — ours.
+            let mut unreadable = RawList::new();
+            unreadable.push(&[0xc0]);
+            let header = header_over(9, 21_000, &unreadable, false);
+            let err = weigh(&header, &[GWEI], unreadable).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("receipt")), "{err}");
+            // The body side: a transaction the fee decoder cannot read inside a
+            // body that rebuilt the transactionsRoot is ours; a body that does
+            // not rebuild it is the peer's.
+            let mut transactions = RawList::new();
+            transactions.push(&[0x7f, 0xc0]);
+            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 };
+            let mut header = BlockHeader { number: 10, gas_used: 21_000, ..Default::default() };
+            header.transactions_root = triehash::ordered_trie_root(body.transactions.iter());
+            let err = strict_body_tips(&header, vec![body.clone()]).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("undecodable")), "{err}");
+            header.transactions_root = [0xAA; 32];
+            let err = strict_body_tips(&header, vec![body]).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("transactionsRoot")), "{err}");
+            let err = strict_body_tips(&header, Vec::new()).unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("no block body")), "{err}");
+            // Bare string errors — transport, timeouts — blame the peer.
+            assert_eq!(FeeBuildError::from("request timed out".to_string()), FeeBuildError::Peer("request timed out".to_string()));
+            assert_eq!(FeeBuildError::from("request timed out"), FeeBuildError::Peer("request timed out".to_string()));
         }
     }
 

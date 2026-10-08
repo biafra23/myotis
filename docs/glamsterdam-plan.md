@@ -501,6 +501,18 @@ behaviour on mainnet or gnosis today.
 - Revisit `estimateGas` ceilings once the 200M gas-limit floor is real
   (current 30M ceiling; Osaka already left the EIP-7825 2^24 per-tx cap as a
   known residual).
+- **Gas accounting (EIP-7778 / EIP-7999, Rust fee reads):** from Amsterdam a
+  header's `gasUsed` is `max(Σ execution gas, Σ state gas)` counted before
+  refunds, while receipts still carry the sender's post-refund gas, so the
+  receipts' final cumulative gas no longer equals the header's `gasUsed` —
+  in either direction (Sepolia 11872301: 77 021 691 over 70 467 467). The
+  Rust `eth_feeHistory` reward path (`weigh_tips`) held the two equal and
+  failed every percentile request on Sepolia from fork day, striking every
+  snap peer per build. It now keys that check on the header's shape
+  (equality before Amsterdam, none after — the receipts root is the
+  verification), and a failure inside root-verified data stops the peer
+  ladder without a strike (`FeeBuildError`). The Java twin never had the
+  check.
 
 ### B.5 Networking follow-ups (not fork-day-critical)
 
