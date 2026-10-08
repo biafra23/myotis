@@ -1,7 +1,8 @@
 //! libp2p transport + eth2 req/resp dialer/responder.
 //!
 //! Mirrors the behavior (not the structure) of the Java `BeaconP2PService`:
-//! TCP + noise XX + yamux with a secp256k1 identity (the CL spec requirement),
+//! TCP + noise XX + yamux or mplex with a secp256k1 identity (the CL spec
+//! requirement — see `build_swarm` for why BOTH muxers are offered),
 //! per-protocol req/resp streams where the dialer writes the request, half-closes,
 //! and buffers the response until the responder closes, and minimal responder
 //! roles for status/ping/metadata/goodbye (peers drop clients that don't answer
@@ -916,14 +917,29 @@ fn build_swarm(
     let behaviour = |key: &libp2p::identity::Keypair| {
         Behaviour::new(key.public(), serving, max_incoming)
     };
+    // Both stream multiplexers, yamux proposed first. The consensus p2p spec
+    // (phase0/p2p-interface.md, "Multiplexing") has it the other way round
+    // from what rust-libp2p ships by default: a TCP-capable client "MUST
+    // support mplex and MAY support yamux", and where both exist "yamux MUST
+    // take precedence during negotiation" — the tuple order IS that
+    // precedence. Nimbus dropped yamux in 2024 (status-im/nimbus-eth2#6636)
+    // and speaks only mplex on TCP, as does Lodestar, so a yamux-only host
+    // (this one, before mplex was added) completed noise with every Nimbus
+    // node and then died on the muxer proposal — which is how zbox's own
+    // Nimbus, pinned for both engines
+    // in August, got dropped in September as "the libp2p handshake times out"
+    // (71f8a9d2), and why after the Sepolia Gloas fork roost was the only
+    // light-client server the Rust engine could reach (#573). The Java engine
+    // always offered both.
+    let muxers = || (libp2p::yamux::Config::default, libp2p_mplex::Config::default);
     if dns {
         Ok(base
             .with_tcp(
                 libp2p::tcp::Config::default().nodelay(true),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                muxers(),
             )
-            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
             .with_dns()
             .map_err(|e| format!("dns transport setup failed: {e}"))?
             .with_behaviour(behaviour)
@@ -935,9 +951,9 @@ fn build_swarm(
             .with_tcp(
                 libp2p::tcp::Config::default().nodelay(true),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                muxers(),
             )
-            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
             .with_behaviour(behaviour)
             .map_err(|e| format!("behaviour setup failed: {e}"))?
             .with_swarm_config(idle)
@@ -2052,6 +2068,96 @@ mod dial_resolution_tests {
                 _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
             }
         }
+    }
+
+    /// A peer that offers mplex and NOTHING else on TCP — Nimbus since
+    /// status-im/nimbus-eth2#6636 (2024) — with the same behaviour set as
+    /// ours. `muxer` picks which muxers the dialing side offers.
+    fn mplex_only_peer() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only peer")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    fn yamux_only_host() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("yamux-only host")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    /// Listen, then dial from `dialer` and report whether a STREAM worked
+    /// within the deadline — the peer's Identify answer arrived (`Ok`) — or
+    /// the attempt failed/closed first (`Err(what)`). Drives both swarms.
+    ///
+    /// `ConnectionEstablished` is deliberately not the success signal:
+    /// multistream-select negotiates the muxer optimistically on the dialer
+    /// side, so a dialer with no muxer in common still reports the connection
+    /// established and only then has it closed under it — exactly the shape
+    /// the live Nimbus log showed ("Connection established" then "closed with
+    /// error ... Decode"). Only a completed stream proves a muxer was agreed.
+    async fn dial_outcome(mut dialer: Swarm<Behaviour>, mut peer: Swarm<Behaviour>) -> Result<(), String> {
+        peer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        dialer.dial(addr).unwrap();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = dialer.select_next_some() => match ev {
+                    SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id: p, .. },
+                    )) if p == peer_id => return Ok(()),
+                    SwarmEvent::OutgoingConnectionError { error, .. } => return Err(format!("dial failed: {error}")),
+                    SwarmEvent::ConnectionClosed { peer_id: p, cause, .. } if p == peer_id => {
+                        return Err(format!("closed: {cause:?}"))
+                    }
+                    _ => {}
+                },
+                _ = peer.select_next_some() => {}
+                _ = &mut deadline => return Err("no Identify exchange within 15 s".into()),
+            }
+        }
+    }
+
+    /// The failure that made every Nimbus node look dead to the Rust engine:
+    /// noise succeeds, then the muxer negotiation has no common protocol. Kept
+    /// as the control for the test below — if this ever passes, the peer is no
+    /// longer mplex-only and the test below proves nothing.
+    #[tokio::test]
+    async fn a_yamux_only_host_cannot_connect_to_an_mplex_only_peer() {
+        let outcome = dial_outcome(yamux_only_host(), mplex_only_peer()).await;
+        assert!(outcome.is_err(), "yamux-only host connected to an mplex-only peer: {outcome:?}");
+    }
+
+    /// The host as built offers both muxers, so an mplex-only peer (Nimbus)
+    /// is reachable: a stream completes over the connection, which is where
+    /// the yamux-only host died.
+    #[tokio::test]
+    async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        dial_outcome(host, mplex_only_peer()).await.expect("a stream to an mplex-only peer");
     }
 
     #[tokio::test]

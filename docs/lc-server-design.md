@@ -162,7 +162,7 @@ the newest update" question that REST answers unconditionally.
 
 Most of the server is written. In `rust/myotis-net`:
 
-- Full libp2p host — Noise, yamux, SSZ+snappy req/resp codecs.
+- Full libp2p host — Noise, yamux or mplex (the spec's mandatory TCP muxer; Nimbus and Lodestar offer nothing else), SSZ+snappy req/resp codecs.
 - **Inbound is already wired for 5 of 9 protocols**, though two of those are not
   yet spec-correct. `respond_inbound` (`reqresp.rs`) answers `status/1`,
   `status/2`, `ping`, `metadata/2`, `goodbye`. Of these, `status` and `metadata`

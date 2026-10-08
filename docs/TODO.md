@@ -201,3 +201,12 @@ complete on its own.
   dispatch stops red at the pin check and 3b/3c never run there. Whether
   CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
   floor unmet for an upstream reason is the owner's decision.
+  **Part of the cause was ours (2026-10-08):** the Rust engine's libp2p host
+  offered only yamux on TCP, while Nimbus (since 2024) and Lodestar speak
+  only mplex there — so the two client families that DO serve Gloas
+  light-client data were unreachable from the Rust engine by construction,
+  and zbox's own Nimbus had been dropped as a "dead" pin in September for
+  the same reason. mplex is in (`reqresp::build_swarm`); the spec's primary
+  transport, QUIC, which needs no stream muxer, is the follow-up. Re-run the
+  Sepolia census from a build with both before concluding anything about
+  who serves.
