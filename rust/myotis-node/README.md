@@ -514,10 +514,14 @@ fee-history cancellation/expiry follows the existing stale-cache policy: only
 the same request signature within the cache age limit may be served, and an
 explicit invalid-request rejection never uses stale data.
 
-The global EVM cap deliberately refuses an additional execution immediately
-with `native execution busy`, including C/JNI/UniFFI callers and appender ENS
-lookups. It does not add semaphore waiters. Hosts should bound their own queue
-and retry busy verified reads within their own request deadline. Node's one
+The global EVM cap admits eight native executions at once. A call that finds
+every slot taken waits its turn — FIFO, for at most 5 s, and only while its
+own operation is live — and is refused with `native execution busy` when the
+wait runs out, or at once when 32 calls are already waiting; this applies to
+C/JNI/UniFFI callers and appender ENS lookups alike. The blocking pool itself
+never queues: a job reaches it only with a slot in hand. Hosts should still
+bound their own queue and retry busy verified reads within their own request
+deadline. Node's one
 executing request per handle is intentional: a slow ENS call delays queued
 calls on the same chain, while another chain can execute concurrently. The
 ABI 25+ migration must account for the four queued/executing requests per
