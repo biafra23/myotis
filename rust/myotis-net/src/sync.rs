@@ -622,19 +622,28 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // period 1379 to stay broken even after a Lighthouse release with Gloas
     // support, since the entry stored under 1379 is the Fulu-format one.
     //
-    // Not pinnable without #576: zbox's own Nimbus (9104) serves Gloas
-    // light-client data — over REST to roost, and over libp2p to a build with
-    // #576, which synced a Rust-engine wallet from it alone (2026-10-08).
-    // Without #576 it cannot: the Rust host offers only yamux where Nimbus
-    // speaks only mplex, and neither engine answers what Nimbus's peer loop
-    // asks of a new peer (metadata/3, then beacon_blocks_by_root,
-    // data_column_sidecars_by_root and execution_payload_envelopes_by_root);
-    // a protocol the peer does not offer ends that loop. It is the obvious
-    // second pin once #576 is in (#566), with a --netkey-file so its peer id
-    // survives restarts. The public Lodestar node (65.21.93.60) closing
-    // inbound connections (2026-10-06) may be the same mismatch — Lodestar
-    // also speaks only mplex on TCP — and was not re-checked; whether Lodestar
+    // The public Lodestar node (65.21.93.60) closing inbound connections
+    // (2026-10-06) may be the muxer mismatch #576 fixed — Lodestar also
+    // speaks only mplex on TCP — and was not re-checked; whether Lodestar
     // serves Gloas light-client data over libp2p is unchecked too.
+    //
+    // zbox's own Nimbus (v26.9.1, --light-client-data-serve, --netkey-file so
+    // the peer id survives restarts), behind the same relay on 9104.
+    // Re-pinned 2026-10-09 (#566 option 3). Dropped in September as "the
+    // libp2p handshake times out", which was ours: the Rust host offered only
+    // yamux where Nimbus speaks only mplex, and neither engine answered what
+    // its peer loop asks of a new peer (metadata/3, then beacon_blocks_by_root,
+    // data_column_sidecars_by_root and execution_payload_envelopes_by_root —
+    // a protocol the peer does not offer ends that loop). #576 fixed all of
+    // it, and a Rust-engine wallet synced Sepolia from this node alone
+    // (SYNCED, 2026-10-08/09). Two caveats, both Nimbus's: its unit runs
+    // --max-peers=25, so while it is full the connection is reset during the
+    // noise handshake and a pinned wallet gets in only as peers churn (a 12 s
+    // retry caught a slot within minutes); and its peer loop scores our empty
+    // by-root answers down, so one connection lasts minutes, not hours, with
+    // updates flowing between reconnects. SECOND on purpose: roost serves
+    // without either caveat.
+    "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -4386,10 +4395,10 @@ mod tests {
             c.static_peers,
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
             ],
-            "roost alone (the dedicated LC server; no public server a build without #576 \
-             can reach is known to serve Gloas-era light-client data) — same list, order \
-             AND addresses as the Java \
+            "roost first (the dedicated LC server), zbox's Nimbus second (re-pinned with \
+             #576 in) — same list, order AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
         // A malformed pin would otherwise reach run_sync and surface only as a

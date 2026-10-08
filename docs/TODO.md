@@ -216,7 +216,10 @@ complete on its own.
     Lodestar nodes the yamux-only census host could not reach (#576), so
     those censuses do not show roost to be the only server. zbox's own
     Nimbus serves Gloas light-client data and is #566's option 3 once #576
-    is in.
+    is in — re-pinned second, after roost, on 2026-10-09 (both engines), with
+    its two caveats in the pin comment: the `--max-peers=25` unit resets the
+    handshake while it is full, and its peer loop scores our empty by-root
+    answers down, so a connection lasts minutes between reconnects.
   **Part of the cause was ours (2026-10-08):** the Rust engine's libp2p host
   offered only yamux on TCP, while Nimbus (since 2024) and Lodestar speak
   only mplex there — so the two client families that DO serve Gloas
