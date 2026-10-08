@@ -11,10 +11,23 @@ license = "MIT OR Apache-2.0"
 myotis-bls = { path = "../myotis-bls", default-features = false }
 # SSZ merkleization is SHA-256 only; the containers themselves are hand-decoded
 # (fork-polymorphic layouts — see src/ssz.rs for why not ssz_derive).
-sha2 = "0.10"
+sha2 = { version = "0.10", default-features = false }
 # Diagnostics only (debug-level rejection reasons in store.rs): the tracing
 # facade is I/O-free and wasm-safe, so the sans-I/O canary is unaffected.
-tracing = "=0.1.44"
+tracing = { version = "=0.1.44", default-features = false }
+
+# Bare-metal targets (UEFI firmware, x86_64-unknown-none): the same sha2 steer
+# as myotis-core -- its x86 backend enables SSE per function, which these
+# soft-float targets cannot codegen.
+[target.'cfg(any(target_os = "uefi", target_os = "none"))'.dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+# `no_std` + `alloc` with `default-features = false`, like myotis-core: the
+# light-client core is sans-I/O, so firmware and other bare-metal hosts can run
+# it. `std` (default) keeps every existing consumer unchanged.
+[features]
+default = ["std"]
+std = ["sha2/std", "tracing/std", "myotis-bls/std"]
 
 [dev-dependencies]
 # Signing side of BLS for the synthetic fork-boundary test (tests/fork_boundary.rs).

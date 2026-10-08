@@ -3954,26 +3954,37 @@ dependencies = [
 name = "myotis-net"
 version = "0.1.14"
 dependencies = [
- "aes",
  "alloy-rlp",
  "async-trait",
- "cipher",
- "ctr",
  "discv5",
  "futures",
  "getrandom 0.2.17",
  "hickory-resolver",
- "hmac",
  "libp2p",
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",
+ "myotis-wire",
+ "snap",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "myotis-wire"
+version = "0.1.14"
+dependencies = [
+ "aes",
+ "cipher",
+ "ctr",
+ "hmac",
+ "myotis-consensus",
+ "myotis-core",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "snap",
- "socket2 0.5.10",
  "subtle",
- "tokio",
  "tracing",
 ]
 

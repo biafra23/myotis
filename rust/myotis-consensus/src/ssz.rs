@@ -6,6 +6,8 @@
 //! static ssz_derive containers cannot express. Conformance to the spec is pinned by
 //! the shared corpus (`rust/testdata/lc/mainnet`) instead of by a library.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use sha2::{Digest, Sha256};
 
 pub const ROOT_LEN: usize = 32;

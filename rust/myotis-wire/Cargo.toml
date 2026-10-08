@@ -1,0 +1,48 @@
+[package]
+name = "myotis-wire"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Myotis execution-layer wire protocols without an async runtime: discv4 packet codec, RLPx (ECIES handshake + frame codec), eth and snap/1 messages, snap proof verification (sans-I/O, no_std + alloc)"
+license = "MIT OR Apache-2.0"
+
+# Sans-I/O like myotis-core and myotis-consensus: no tokio, sockets, clock or
+# entropy (handshake randomness is a parameter). This is the protocol logic
+# `myotis-net` drives over tokio, split out (myotis#505) so a host with its own
+# event loop -- UEFI firmware, wasm32 in a browser, a blocking client -- can
+# drive the same code. `myotis-net` re-exports every module at its old path.
+#
+# `std` (default) uses the `snap` crate for RLPx's Snappy; without it a small
+# built-in codec is used (see `snappy`).
+[features]
+default = ["std", "eth2"]
+std = ["myotis-core/std", "myotis-consensus?/std", "tracing?/std", "dep:snap"]
+# The consensus-layer req/resp wire (eth2::{codec, status, protocols}). It is
+# the only part that needs myotis-consensus -- and through it myotis-bls and the
+# blst C library -- so an execution-layer-only host (discv4, RLPx, eth, snap)
+# can turn it off and skip cross-compiling blst.
+eth2 = ["dep:myotis-consensus", "dep:tracing"]
+# `SessionSecrets::test_pair` for other crates' tests (myotis-net's frame/session tests).
+test-util = []
+
+[dependencies]
+myotis-core = { path = "../myotis-core", default-features = false }
+# eth2 status/fork-digest SSZ helpers.
+myotis-consensus = { path = "../myotis-consensus", default-features = false, optional = true }
+# Diagnostics in the eth2 multi-chunk decoder (I/O-free facade).
+tracing = { version = "=0.1.44", default-features = false, optional = true }
+aes = { version = "=0.8.4", default-features = false }
+ctr = { version = "=0.9.2", default-features = false }
+cipher = { version = "=0.4.4", default-features = false }
+hmac = { version = "=0.12.1", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+sha3 = { version = "=0.10.9", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
+snap = { version = "=1.1.1", optional = true }
+
+# Same steer as myotis-core: sha2's x86 backend enables SSE per function, which
+# bare-metal targets (UEFI, x86_64-unknown-none) cannot codegen. `aes` (RLPx) has
+# the same problem but no Cargo feature to steer it: on those targets build with
+# RUSTFLAGS="--cfg aes_force_soft" (the no_std canary does; so must embedders).
+[target.'cfg(any(target_os = "uefi", target_os = "none"))'.dependencies]
+sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
