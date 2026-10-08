@@ -9360,14 +9360,15 @@ fn strict_body_tips(
 ///   and `settle_transaction_gas`). The two are no longer tied, in either
 ///   direction: a state-gas-heavy block puts the receipts' sum ABOVE the
 ///   header (Sepolia 11872301: 77 021 691 over a `gasUsed` of 70 467 467,
-///   2026-10-08), a refund-heavy one puts it BELOW. All the spec gives is
-///   `0.8·gasUsed ≤ sum ≤ 2·gasUsed` (the refund cap and the two
-///   dimensions), and a bound built from those constants is exactly the
-///   check the next fork breaks the way this one broke the equality — every
-///   Sepolia feeHistory with reward percentiles failing from the fork
-///   (2026-10-06) on, and every snap peer struck for it. So an Amsterdam
-///   header's `gasUsed` is NOT compared to the receipts: the receipts root is
-///   the verification, and `gasUsed` is no weight.
+///   2026-10-08), a refund-heavy one puts it BELOW. What does follow from
+///   the spec is only a loose bound (from the one-fifth refund cap and the
+///   two dimensions, `0.8·gasUsed ≤ sum ≤ 2·gasUsed` today), and a check
+///   built from such constants is exactly what the next fork breaks the way
+///   this one broke the equality — feeHistory with reward percentiles
+///   failing on Sepolia from the fork (2026-10-06) on, and every snap peer
+///   struck for it. So an Amsterdam header's `gasUsed` is NOT compared to
+///   the receipts: the receipts root is the verification, and `gasUsed` is
+///   no weight.
 ///
 /// Monotonic cumulative gas, and `gasUsed` 0 for a block without
 /// transactions, hold under both accountings: every transaction pays its
@@ -10837,30 +10838,9 @@ mod tests {
             let c = cache.lock().unwrap();
             assert!(c.weighted((0, vh0.hash)).is_none() && c.weighted((1, vh1.hash)).is_none());
         }
-    }
 
-    /// The gas cross-checks of [`weigh_tips`] against the anchored header, and
-    /// whose failure each check reports ([`FeeBuildError`]).
-    mod weigh_tips_gas_accounting {
-        use super::*;
-        use crate::el::eth::messages::{BlockBody, BlockReceipts, RawList};
-        use myotis_core::rlp::{encode, u64_to_minimal_be, Item};
-
-        const GWEI: u128 = 1_000_000_000;
-
-        /// Canonical legacy receipts with the given cumulative gas values.
-        fn receipts_of(cumulative: &[u64]) -> RawList {
-            let mut list = RawList::new();
-            for &gas in cumulative {
-                list.push(&encode(&Item::List(vec![
-                    Item::Bytes(vec![1]),
-                    Item::Bytes(u64_to_minimal_be(gas)),
-                    Item::Bytes(vec![0; 256]),
-                    Item::List(Vec::new()),
-                ])));
-            }
-            list
-        }
+        // The gas cross-checks of `weigh_tips` against the anchored header, and
+        // whose failure each check reports (`FeeBuildError`).
 
         /// A header committing to `receipts` and carrying `gas_used`, shaped
         /// pre-Amsterdam or Amsterdam (the EIP-7928 field present).
