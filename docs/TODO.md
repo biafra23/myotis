@@ -201,3 +201,51 @@ complete on its own.
   dispatch stops red at the pin check and 3b/3c never run there. Whether
   CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
   floor unmet for an upstream reason is the owner's decision.
+  **Part of the cause was ours (2026-10-08):** the Rust engine's libp2p host
+  offered only yamux on TCP, while Nimbus (since 2024) and Lodestar speak
+  only mplex there — so the two client families that DO serve Gloas
+  light-client data were unreachable from the Rust engine by construction,
+  and zbox's own Nimbus had been dropped as a "dead" pin in September for
+  the same reason. mplex is in (`reqresp::build_swarm`); the spec's primary
+  transport, QUIC, which needs no stream muxer, is the follow-up.
+  **And a second, independent cause behind it:** once a connection to zbox's
+  Nimbus came up over mplex, Nimbus admitted us and then dropped us ~100 ms
+  later, before our bootstrap request was served — its post-Fulu sync
+  overseer asks every new peer for `metadata/3` and nothing else
+  (`doPeerUpdateMetadata` → "Peer loop stopped"), and both engines served
+  only `metadata/2`. Lighthouse and Teku hid this by negotiating v3→v2→v1 in
+  one multistream offer. `metadata/3` is in on both engines
+  (`status::metadata_v3_light_client`, `BeaconP2PService.METADATA_V3`),
+  advertising `CUSTODY_REQUIREMENT` — not 0, which Lighthouse bans.
+  **And a third:** with metadata answered, Nimbus admitted us, served the
+  bootstrap, and then its root sync asked us for the head block we had just
+  advertised in Status (the checkpoint block — not in its sync DAG, which
+  only holds what it saw since its start), could not negotiate
+  `beacon_blocks_by_root` at all, and ended the peer loop ~1 ms later, under
+  our first `updates_by_range`. Both engines now answer `beacon_blocks_by_root/2`
+  inbound with zero chunks — the spec's "none of these" — which passes
+  Nimbus's response check and costs no score. With that in, the Rust engine
+  applied finality updates from zbox's Nimbus alone, every 12 s — the first
+  time ever — and the fourth and last drop showed itself:
+  `data_column_sidecars_by_root/1`, asked every ~45 s because the
+  `custody_group_count` we advertise (Lighthouse's minimum) gives us a column
+  map. Same zero-chunk answer on both engines; Nimbus scores that
+  `PeerScoreNoValues` but keeps the loop (a refused negotiation ends it), so
+  a Nimbus that keeps missing sidecars still cycles us every few minutes,
+  with updates flowing in between. The fifth and last step of that loop,
+  Gloas `execution_payload_envelopes_by_root/1`, behaves like the sidecars
+  (zbox's Nimbus asks on every connection, its missing-envelope set is never
+  empty) and gets the same answer. A refused protocol ends Nimbus's loop with
+  `CommunicationTimeout`, a sunk score with `PeerScoreLow`; neither blocks
+  our reconnect, because its seen-table only gates ITS outbound dials
+  (`checkPeer`). Re-run the Sepolia census from a build with all of this
+  before concluding anything about who serves.
+  **Upstream (owner's call to file, status-im/nimbus-eth2):** the three
+  zero-chunk responders placate `sync_overseer2`, which (a) requests a peer's
+  advertised head by root even when its own DAG holds the block (the sync DAG
+  only covers what it saw since start, and `getMissingBlocksRequest` never
+  consults the DAG), and (b) ends the peer loop on a protocol the peer does
+  not offer, which disconnects every light client — its own
+  `nimbus_light_client` included, whose Status is the genesis head. Every
+  further overseer step that asks for data a light client cannot hold would
+  need another responder here until that is fixed upstream.

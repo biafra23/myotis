@@ -1,7 +1,8 @@
 //! libp2p transport + eth2 req/resp dialer/responder.
 //!
 //! Mirrors the behavior (not the structure) of the Java `BeaconP2PService`:
-//! TCP + noise XX + yamux with a secp256k1 identity (the CL spec requirement),
+//! TCP + noise XX + yamux or mplex with a secp256k1 identity (the CL spec
+//! requirement — see `build_swarm` for why BOTH muxers are offered),
 //! per-protocol req/resp streams where the dialer writes the request, half-closes,
 //! and buffers the response until the responder closes, and minimal responder
 //! roles for status/ping/metadata/goodbye (peers drop clients that don't answer
@@ -91,6 +92,19 @@ const MAX_IN_FLIGHT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const SERVING_UPDATES_MAX_STREAMS: usize = 4;
 
 const MAX_REQUEST_WIRE_BYTES: usize = 1024;
+/// The root-list requests (`protocols::is_root_list_request`) are bigger than
+/// the fixed ones: up to `MAX_REQUEST_BLOCKS` (1024) roots = 32 KiB of SSZ
+/// for `blocks_by_root`, and up to 128 `DataColumnsByRootIdentifier`s of a
+/// root plus up to 128 column indices ≈ 140 KiB for the sidecar one, before
+/// framing. The answer is always empty, but a request we refuse to READ is a
+/// broken stream to the asker, which is exactly the failure these protocols
+/// are served to avoid.
+const MAX_ROOT_LIST_REQUEST_WIRE_BYTES: usize = 256 * 1024;
+/// Concurrent inbound streams per connection for the root-list protocols. The
+/// cap above is buffered per stream, so the default 64 would let one
+/// connection park 16 MiB per protocol in requests this host never reads; an
+/// answer of zero chunks needs no concurrency at all.
+const ROOT_LIST_MAX_STREAMS: usize = 4;
 /// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
 /// uncompressed). 16 MiB is a generous DoS ceiling, not a target.
 const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
@@ -118,7 +132,9 @@ where
     let mut buf = Vec::new();
     io.take(cap as u64 + 1).read_to_end(&mut buf).await?;
     if buf.len() > cap {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "response exceeds size cap"));
+        // Requests and responses both come through here (read_request /
+        // read_response), so the message names neither.
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
     }
     Ok(buf)
 }
@@ -195,12 +211,17 @@ impl request_response::Codec for Eth2Codec {
     type Request = Vec<u8>;
     type Response = Vec<u8>;
 
-    async fn read_request<T>(&mut self, _p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
+    async fn read_request<T>(&mut self, p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
     where
         T: AsyncRead + Unpin + Send,
     {
         // The requester half-closes after writing, so EOF delimits the request.
-        read_capped(io, MAX_REQUEST_WIRE_BYTES).await
+        let cap = if protocols::is_root_list_request(p.as_ref()) {
+            MAX_ROOT_LIST_REQUEST_WIRE_BYTES
+        } else {
+            MAX_REQUEST_WIRE_BYTES
+        };
+        read_capped(io, cap).await
     }
 
     async fn read_response<T>(&mut self, p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
@@ -292,11 +313,21 @@ pub struct Behaviour {
     pub status_v1: RR,
     pub ping: RR,
     pub metadata: RR,
+    /// Fulu metadata. Post-Fulu peers ask for v3 — Nimbus for nothing else,
+    /// and it drops a peer that cannot answer (see `protocols::METADATA_V3`).
+    pub metadata_v3: RR,
     pub goodbye: RR,
     pub bootstrap: RR,
     pub updates: RR,
     pub finality: RR,
     pub optimistic: RR,
+    /// Inbound only, always answered with zero chunks — see
+    /// `protocols::BLOCKS_BY_ROOT` for the Nimbus behaviour this placates.
+    pub blocks_by_root: RR,
+    /// Likewise — `protocols::DATA_COLUMN_SIDECARS_BY_ROOT`.
+    pub data_column_sidecars_by_root: RR,
+    /// Likewise — `protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT`.
+    pub execution_payload_envelopes_by_root: RR,
 }
 
 impl Behaviour {
@@ -336,6 +367,7 @@ impl Behaviour {
             status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),
             ping: rr(protocols::PING, ProtocolSupport::Full, RESP_TIMEOUT),
             metadata: rr(protocols::METADATA_V2, ProtocolSupport::Full, RESP_TIMEOUT),
+            metadata_v3: rr(protocols::METADATA_V3, ProtocolSupport::Full, RESP_TIMEOUT),
             goodbye: rr(protocols::GOODBYE, ProtocolSupport::Full, RESP_TIMEOUT),
             bootstrap: rr(protocols::BOOTSTRAP, ProtocolSupport::Full, RESP_TIMEOUT),
             // Outbound-only for a WALLET: it can't serve catch-up history, and
@@ -354,6 +386,25 @@ impl Behaviour {
             ),
             finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
+            // Inbound only: this host never asks anyone for blocks or columns.
+            blocks_by_root: rr_with_streams(
+                protocols::BLOCKS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
+            data_column_sidecars_by_root: rr_with_streams(
+                protocols::DATA_COLUMN_SIDECARS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
+            execution_payload_envelopes_by_root: rr_with_streams(
+                protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
         }
     }
 }
@@ -916,14 +967,29 @@ fn build_swarm(
     let behaviour = |key: &libp2p::identity::Keypair| {
         Behaviour::new(key.public(), serving, max_incoming)
     };
+    // Both stream multiplexers, yamux proposed first. The consensus p2p spec
+    // (phase0/p2p-interface.md, "Multiplexing") has it the other way round
+    // from what rust-libp2p ships by default: a TCP-capable client "MUST
+    // support mplex and MAY support yamux", and where both exist "yamux MUST
+    // take precedence during negotiation" — the tuple order IS that
+    // precedence. Nimbus dropped yamux in 2024 (status-im/nimbus-eth2#6636)
+    // and speaks only mplex on TCP, as does Lodestar, so a yamux-only host
+    // (this one, before mplex was added) completed noise with every Nimbus
+    // node and then died on the muxer proposal — which is how zbox's own
+    // Nimbus, pinned for both engines
+    // in August, got dropped in September as "the libp2p handshake times out"
+    // (71f8a9d2), and why after the Sepolia Gloas fork roost was the only
+    // light-client server the Rust engine could reach (#573). The Java engine
+    // always offered both.
+    let muxers = || (libp2p::yamux::Config::default, libp2p_mplex::Config::default);
     if dns {
         Ok(base
             .with_tcp(
                 libp2p::tcp::Config::default().nodelay(true),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                muxers(),
             )
-            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
             .with_dns()
             .map_err(|e| format!("dns transport setup failed: {e}"))?
             .with_behaviour(behaviour)
@@ -935,9 +1001,9 @@ fn build_swarm(
             .with_tcp(
                 libp2p::tcp::Config::default().nodelay(true),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                muxers(),
             )
-            .map_err(|e| format!("tcp/noise/yamux setup failed: {e}"))?
+            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
             .with_behaviour(behaviour)
             .map_err(|e| format!("behaviour setup failed: {e}"))?
             .with_swarm_config(idle)
@@ -1228,11 +1294,17 @@ fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<
         protocols::STATUS_V1 => &mut behaviour.status_v1,
         protocols::PING => &mut behaviour.ping,
         protocols::METADATA_V2 => &mut behaviour.metadata,
+        protocols::METADATA_V3 => &mut behaviour.metadata_v3,
         protocols::GOODBYE => &mut behaviour.goodbye,
         protocols::BOOTSTRAP => &mut behaviour.bootstrap,
         protocols::UPDATES_BY_RANGE => &mut behaviour.updates,
         protocols::FINALITY_UPDATE => &mut behaviour.finality,
         protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
+        protocols::BLOCKS_BY_ROOT => &mut behaviour.blocks_by_root,
+        protocols::DATA_COLUMN_SIDECARS_BY_ROOT => &mut behaviour.data_column_sidecars_by_root,
+        protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT => {
+            &mut behaviour.execution_payload_envelopes_by_root
+        }
         _ => return None,
     })
 }
@@ -1387,11 +1459,19 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
         E::StatusV1(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V1, ev),
         E::Ping(ev) => on_rr_event(swarm, ctx, protocols::PING, ev),
         E::Metadata(ev) => on_rr_event(swarm, ctx, protocols::METADATA_V2, ev),
+        E::MetadataV3(ev) => on_rr_event(swarm, ctx, protocols::METADATA_V3, ev),
         E::Goodbye(ev) => on_rr_event(swarm, ctx, protocols::GOODBYE, ev),
         E::Bootstrap(ev) => on_rr_event(swarm, ctx, protocols::BOOTSTRAP, ev),
         E::Updates(ev) => on_rr_event(swarm, ctx, protocols::UPDATES_BY_RANGE, ev),
         E::Finality(ev) => on_rr_event(swarm, ctx, protocols::FINALITY_UPDATE, ev),
         E::Optimistic(ev) => on_rr_event(swarm, ctx, protocols::OPTIMISTIC_UPDATE, ev),
+        E::BlocksByRoot(ev) => on_rr_event(swarm, ctx, protocols::BLOCKS_BY_ROOT, ev),
+        E::DataColumnSidecarsByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::DATA_COLUMN_SIDECARS_BY_ROOT, ev)
+        }
+        E::ExecutionPayloadEnvelopesByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, ev)
+        }
     }
 }
 
@@ -1407,8 +1487,14 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 let mut response = respond_inbound(ctx, protocol, peer, &request);
                 // Refuse rather than queue when the in-flight budget is spent.
                 // ResourceUnavailable is the answer a wallet already knows how
-                // to handle, and it costs us nothing to hold.
-                if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
+                // to handle, and it costs us nothing to hold. A zero-chunk
+                // answer is exempt: it holds nothing either, and swapping it
+                // for an error chunk would turn "none of these" into the
+                // failed request that ends Nimbus's peer loop (see
+                // `protocols::BLOCKS_BY_ROOT`) — on a roost under response
+                // pressure, exactly when it matters.
+                if !response.is_empty()
+                    && ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
                 {
                     tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
                         want = response.len(),
@@ -1419,19 +1505,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                     );
                 }
                 let response_len = response.len();
-                let behaviour = swarm.behaviour_mut();
-                let rr = match protocol {
-                    protocols::STATUS_V2 => &mut behaviour.status_v2,
-                    protocols::STATUS_V1 => &mut behaviour.status_v1,
-                    protocols::PING => &mut behaviour.ping,
-                    protocols::METADATA_V2 => &mut behaviour.metadata,
-                    protocols::GOODBYE => &mut behaviour.goodbye,
-                    protocols::BOOTSTRAP => &mut behaviour.bootstrap,
-                    protocols::UPDATES_BY_RANGE => &mut behaviour.updates,
-                    protocols::FINALITY_UPDATE => &mut behaviour.finality,
-                    protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
-                    _ => return,
-                };
+                let Some(rr) = behaviour_for(swarm, protocol) else { return };
                 if rr.send_response(channel, response).is_err() {
                     tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
                 } else {
@@ -1629,6 +1703,16 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
         protocols::METADATA_V2 => {
             codec::encode_success_response(&status::metadata_v2_light_client(), None)
         }
+        protocols::METADATA_V3 => {
+            codec::encode_success_response(&status::metadata_v3_light_client(), None)
+        }
+        // Zero chunks — write nothing, close. A light client holds no blocks
+        // and no columns, and this is how the spec says so (the root list is
+        // not even read: `expected_request_size` is 0). Not
+        // ResourceUnavailable: that is an error chunk, which Nimbus's root
+        // sync treats as a failed request and answers by ending the peer loop
+        // (see `protocols::BLOCKS_BY_ROOT`).
+        p if protocols::is_root_list_request(p) => Vec::new(),
         // Goodbye is a one-way notification: the spec has no response for it,
         // and the caller does not wait. We answer to keep the request_response
         // machinery happy, and the CALLER of this function disconnects the peer
@@ -2050,6 +2134,265 @@ mod dial_resolution_tests {
                 }
                 _ = b.select_next_some() => {}
                 _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
+            }
+        }
+    }
+
+    /// A peer that offers mplex and NOTHING else on TCP — Nimbus since
+    /// status-im/nimbus-eth2#6636 (2024) — with the same behaviour set as
+    /// ours. Its yamux twin below differs only in the muxer; the two stay
+    /// separate because `with_tcp`'s muxer argument fixes the builder's
+    /// phase type, so one builder cannot take the muxer as a parameter
+    /// without naming libp2p's upgrade traits.
+    fn mplex_only_peer() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only peer")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    fn yamux_only_host() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .expect("yamux-only host")
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    /// Listen, then dial from `dialer` and report whether a STREAM worked
+    /// within the deadline — the peer's Identify answer arrived (`Ok`) — or
+    /// the attempt failed/closed first (`Err(what)`). Drives both swarms.
+    ///
+    /// `ConnectionEstablished` is deliberately not the success signal:
+    /// multistream-select negotiates the muxer optimistically on the dialer
+    /// side, so a dialer with no muxer in common still reports the connection
+    /// established and only then has it closed under it — exactly the shape
+    /// the live Nimbus log showed ("Connection established" then "closed with
+    /// error ... Decode"). Only a completed stream proves a muxer was agreed.
+    async fn dial_outcome(mut dialer: Swarm<Behaviour>, mut peer: Swarm<Behaviour>) -> Result<(), String> {
+        peer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        dialer.dial(addr).unwrap();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = dialer.select_next_some() => match ev {
+                    SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id: p, .. },
+                    )) if p == peer_id => return Ok(()),
+                    SwarmEvent::OutgoingConnectionError { error, .. } => return Err(format!("dial failed: {error}")),
+                    SwarmEvent::ConnectionClosed { peer_id: p, cause, .. } if p == peer_id => {
+                        return Err(format!("closed: {cause:?}"))
+                    }
+                    _ => {}
+                },
+                _ = peer.select_next_some() => {}
+                _ = &mut deadline => return Err("no Identify exchange within 15 s".into()),
+            }
+        }
+    }
+
+    /// The failure that made every Nimbus node look dead to the Rust engine:
+    /// noise succeeds, then the muxer negotiation has no common protocol. Kept
+    /// as the control for the test below — if this ever passes, the peer is no
+    /// longer mplex-only and the test below proves nothing.
+    #[tokio::test]
+    async fn a_yamux_only_host_cannot_connect_to_an_mplex_only_peer() {
+        let outcome = dial_outcome(yamux_only_host(), mplex_only_peer()).await;
+        assert!(outcome.is_err(), "yamux-only host connected to an mplex-only peer: {outcome:?}");
+    }
+
+    /// The host as built offers both muxers, so an mplex-only peer (Nimbus)
+    /// is reachable: a stream completes over the connection, which is where
+    /// the yamux-only host died.
+    #[tokio::test]
+    async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        dial_outcome(host, mplex_only_peer()).await.expect("a stream to an mplex-only peer");
+    }
+
+    /// What Nimbus does right after admitting a peer post-Fulu — its sync
+    /// overseer asks for `metadata/3` and nothing else, and drops the peer
+    /// if that fails ("Peer loop stopped", seen live against zbox's Nimbus
+    /// v26.9.1 with only mplex fixed: admitted, then dropped ~100 ms later,
+    /// before the bootstrap request was served). The host must answer with
+    /// the 25-byte Fulu MetaData: the v2 bytes plus `custody_group_count`.
+    /// The host as the production code runs it (`build_swarm`) plus the
+    /// context its event loop needs, so a test can drive `handle_swarm_event`
+    /// — responder included — against a real peer.
+    fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        let ctx = SwarmCtx::new(
+            LocalStatus::new(StatusMessage {
+                fork_digest: [0; 4],
+                finalized_root: [0; 32],
+                finalized_epoch: 0,
+                head_root: [0; 32],
+                head_slot: 0,
+                earliest_available_slot: 0,
+            }),
+            None,
+            None,
+        );
+        (host, ctx)
+    }
+
+    #[tokio::test]
+    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
+        let (mut host, mut ctx) = host_with_ctx();
+        let mut peer = mplex_only_peer();
+        host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = host.select_next_some().await {
+                break address;
+            }
+        };
+        let host_id = *host.local_peer_id();
+        peer.dial(addr).unwrap();
+        let mut asked = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                // The host runs its real event handling, responder included.
+                ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
+                ev = peer.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
+                        peer.behaviour_mut().metadata_v3.send_request(&host_id, Vec::new());
+                        asked = true;
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::MetadataV3(request_response::Event::Message {
+                        message: request_response::Message::Response { response, .. }, ..
+                    })) => {
+                        let decoded = codec::decode_response(&response, false).expect("a well-formed answer");
+                        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
+                        assert_eq!(decoded.ssz_payload, status::metadata_v3_light_client());
+                        assert_eq!(decoded.ssz_payload.len(), 25);
+                        return;
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::MetadataV3(request_response::Event::OutboundFailure {
+                        error, ..
+                    })) => panic!("metadata/3 request failed: {error}"),
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
+                        panic!("connection closed before metadata/3 was answered: {cause:?}")
+                    }
+                    _ => {}
+                },
+                _ = &mut deadline => panic!("no metadata/3 answer within 15 s"),
+            }
+        }
+    }
+
+    /// Nimbus's root sync, as a stand-alone asker over mplex: right after
+    /// admitting a peer it requests that peer's advertised head block by root
+    /// (seen live: `Requesting blocks by root from peer block_roots=[2008fe0e]`
+    /// — our own checkpoint — then `Blocks by root request failed reason=
+    /// BrokenConnection` and `Peer loop stopped` when the protocol was not
+    /// even offered), and one step later the data column sidecars its map
+    /// says we custody. The host must negotiate the protocol and answer with
+    /// NOTHING: zero chunks, not a success chunk and not an error.
+    #[tokio::test]
+    async fn a_blocks_by_root_request_is_answered_with_zero_chunks() {
+        // 64 roots of incompressible bytes, so the FRAMED request (the cap in
+        // `read_request` counts wire bytes, after snappy) is bigger than the
+        // cap every other request gets — a Nimbus asks for up to 32 real
+        // roots at a time, ~1 KiB of SSZ that does not compress either. The
+        // assert keeps this test honest about pinning the root-list cap.
+        let roots: Vec<u8> = (0..2048u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let request = codec::encode_request(&roots);
+        assert!(
+            request.len() > MAX_REQUEST_WIRE_BYTES,
+            "the cap pin needs a wire request over {MAX_REQUEST_WIRE_BYTES} bytes, got {}",
+            request.len()
+        );
+        zero_chunks_for(protocols::BLOCKS_BY_ROOT, request).await;
+    }
+
+    #[tokio::test]
+    async fn a_data_column_sidecars_by_root_request_is_answered_with_zero_chunks() {
+        // One DataColumnsByRootIdentifier: root + an offset to one column index.
+        let mut ident = vec![0x20u8; 32];
+        ident.extend_from_slice(&36u32.to_le_bytes()); // offset of `indices`
+        ident.extend_from_slice(&7u64.to_le_bytes()); // a single column
+        let mut list = 4u32.to_le_bytes().to_vec(); // offset of the one element
+        list.extend_from_slice(&ident);
+        zero_chunks_for(protocols::DATA_COLUMN_SIDECARS_BY_ROOT, codec::encode_request(&list)).await;
+    }
+
+    #[tokio::test]
+    async fn an_envelopes_by_root_request_is_answered_with_zero_chunks() {
+        let roots: Vec<u8> = (0..4u8).flat_map(|i| [i; 32]).collect();
+        zero_chunks_for(protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, codec::encode_request(&roots)).await;
+    }
+
+    async fn zero_chunks_for(protocol: &'static str, request: Vec<u8>) {
+        let (mut host, mut ctx) = host_with_ctx();
+        let mut asker = libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only asker")
+            .with_behaviour(|_: &libp2p::identity::Keypair| rr(protocol, ProtocolSupport::Full, RESP_TIMEOUT))
+            .expect("behaviour")
+            .build();
+        host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = host.select_next_some().await {
+                break address;
+            }
+        };
+        let host_id = *host.local_peer_id();
+        asker.dial(addr).unwrap();
+        let mut asked = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
+                ev = asker.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
+                        asker.behaviour_mut().send_request(&host_id, request.clone());
+                        asked = true;
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message: request_response::Message::Response { response, .. }, ..
+                    }) => {
+                        assert!(response.is_empty(), "{protocol}: expected zero chunks, got {} bytes", response.len());
+                        return;
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
+                        panic!("{protocol} request failed: {error}")
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
+                        panic!("{protocol}: connection closed before it was answered: {cause:?}")
+                    }
+                    _ => {}
+                },
+                _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
             }
         }
     }

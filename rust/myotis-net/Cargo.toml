@@ -27,6 +27,14 @@ myotis-evm = { path = "../myotis-evm" }
 # intent explicit and survives lockfile regeneration.
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
+# mplex, the TCP stream multiplexer the consensus p2p spec makes MANDATORY
+# ("clients that support the TCP transport MUST support mplex and MAY support
+# yamux", phase0/p2p-interface.md). rust-libp2p dropped it from the `libp2p`
+# facade, so it comes as its own crate — the version libp2p 0.56.0 itself tests
+# against (its dev-dependency). Nimbus speaks ONLY mplex on TCP since 2024
+# (status-im/nimbus-eth2#6636), which is why a yamux-only host could never
+# reach a Nimbus node — see `reqresp::build_swarm`.
+libp2p-mplex = "=0.43.1"
 discv5 = "=0.11.0"
 # The ENR wire codec, for the discv4 fork-id pre-filter (#539): the `enr` crate
 # itself arrives through discv5, alloy-rlp is the codec it implements. Already
