@@ -224,5 +224,23 @@ complete on its own.
   `beacon_blocks_by_root` at all, and ended the peer loop ~1 ms later, under
   our first `updates_by_range`. Both engines now answer `beacon_blocks_by_root/2`
   inbound with zero chunks — the spec's "none of these" — which passes
-  Nimbus's response check and costs no score. Re-run the Sepolia census from
-  a build with all of this before concluding anything about who serves.
+  Nimbus's response check and costs no score. With that in, the Rust engine
+  applied finality updates from zbox's Nimbus alone, every 12 s — the first
+  time ever — and the fourth and last drop showed itself:
+  `data_column_sidecars_by_root/1`, asked every ~45 s because the
+  `custody_group_count` we advertise (Lighthouse's minimum) gives us a column
+  map. Same zero-chunk answer on both engines; Nimbus scores that
+  `PeerScoreNoValues` but keeps the loop (a refused negotiation ends it), so
+  a Nimbus that keeps missing sidecars still cycles us every few minutes,
+  with updates flowing in between. Re-run the Sepolia census from a build
+  with all of this before concluding anything about who serves.
+  **Upstream (owner's call to file, status-im/nimbus-eth2):** the two
+  zero-chunk responders placate `sync_overseer2`, which (a) requests a peer's
+  advertised head by root even when its own DAG holds the block (the sync DAG
+  only covers what it saw since start, and `getMissingBlocksRequest` never
+  consults the DAG), and (b) ends the peer loop on a protocol the peer does
+  not offer, which disconnects every light client — its own
+  `nimbus_light_client` included, whose Status is the genesis head. Every
+  further overseer step that asks for data a light client cannot hold
+  (`execution_payload_envelopes_by_root` on Gloas is the next candidate)
+  would need another responder here until that is fixed upstream.

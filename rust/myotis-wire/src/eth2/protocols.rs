@@ -23,6 +23,17 @@ pub const OPTIMISTIC_UPDATE: &str =
 /// request cannot be negotiated at all. An empty answer passes its
 /// `checkResponse`, costs no score, and the connection survives.
 pub const BLOCKS_BY_ROOT: &str = "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
+/// Fulu `DataColumnSidecarsByRoot v1` — the same inbound-only, zero-chunk
+/// answer as [`BLOCKS_BY_ROOT`], for the same Nimbus loop one step later
+/// (`doRootSidecarsSyncStep`). Advertising `custody_group_count` =
+/// `CUSTODY_REQUIREMENT` in `metadata/3` (the value Lighthouse insists on)
+/// gives this node a column map, and Nimbus asks the peers whose map covers a
+/// column it is missing. A refused negotiation ends its peer loop at once; an
+/// empty answer costs `PeerScoreNoValues` (-100) and the loop goes on, so a
+/// Nimbus that keeps missing sidecars still cycles us every few minutes — but
+/// with light-client updates flowing in between, instead of none at all.
+pub const DATA_COLUMN_SIDECARS_BY_ROOT: &str =
+    "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
 pub const PING: &str = "/eth2/beacon_chain/req/ping/1/ssz_snappy";
 pub const METADATA_V2: &str = "/eth2/beacon_chain/req/metadata/2/ssz_snappy";
 /// Fulu `GetMetaData v3`: v2 plus `custody_group_count`. Post-Fulu peers ask
@@ -39,15 +50,26 @@ pub const GOODBYE: &str = "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
 pub fn has_context_bytes(protocol: &str) -> bool {
     matches!(
         protocol,
-        BOOTSTRAP | UPDATES_BY_RANGE | FINALITY_UPDATE | OPTIMISTIC_UPDATE | BLOCKS_BY_ROOT
+        BOOTSTRAP
+            | UPDATES_BY_RANGE
+            | FINALITY_UPDATE
+            | OPTIMISTIC_UPDATE
+            | BLOCKS_BY_ROOT
+            | DATA_COLUMN_SIDECARS_BY_ROOT
     )
+}
+
+/// The protocols whose request is a root list this node never reads, because
+/// its answer is always zero chunks (see [`BLOCKS_BY_ROOT`]).
+pub fn is_root_list_request(protocol: &str) -> bool {
+    matches!(protocol, BLOCKS_BY_ROOT | DATA_COLUMN_SIDECARS_BY_ROOT)
 }
 
 /// Expected SSZ size of the request body for the responder role. 0 means the
 /// body is not parsed: the request has none (metadata / finality_update /
-/// optimistic_update), or the answer does not depend on it (blocks_by_root,
-/// whose root list is never read because the answer is always empty) — same
-/// table the Java `registerBinding` calls pin.
+/// optimistic_update), or the answer does not depend on it (the root-list
+/// protocols, whose list is never read because the answer is always empty) —
+/// same table the Java `registerBinding` calls pin.
 pub fn expected_request_size(protocol: &str) -> usize {
     match protocol {
         STATUS_V2 => 92,
@@ -55,7 +77,7 @@ pub fn expected_request_size(protocol: &str) -> usize {
         PING | GOODBYE => 8,
         BOOTSTRAP => 32,
         UPDATES_BY_RANGE => 16,
-        _ => 0, // metadata, finality_update, optimistic_update, blocks_by_root
+        _ => 0, // metadata, finality_update, optimistic_update, the root-list protocols
     }
 }
 
@@ -70,9 +92,14 @@ mod tests {
     }
 
     #[test]
-    fn blocks_by_root_is_fork_dependent_and_its_body_is_not_parsed() {
-        assert!(has_context_bytes(BLOCKS_BY_ROOT));
-        assert_eq!(expected_request_size(BLOCKS_BY_ROOT), 0);
+    fn root_list_protocols_are_fork_dependent_and_their_bodies_are_not_parsed() {
+        for p in [BLOCKS_BY_ROOT, DATA_COLUMN_SIDECARS_BY_ROOT] {
+            assert!(is_root_list_request(p), "{p}");
+            assert!(has_context_bytes(p), "{p}");
+            assert_eq!(expected_request_size(p), 0, "{p}");
+        }
+        assert!(!is_root_list_request(BOOTSTRAP));
+        assert!(!is_root_list_request(METADATA_V3));
     }
 
     #[test]

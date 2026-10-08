@@ -74,6 +74,14 @@ public class BeaconP2PService implements AutoCloseable {
      */
     static final String BLOCKS_BY_ROOT =
             "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
+    /**
+     * Same zero-chunk answer, one Nimbus loop step later: advertising
+     * {@code custody_group_count} in metadata v3 gives us a column map, and
+     * Nimbus asks the peers whose map covers a column it is missing. A refused
+     * negotiation ends its peer loop at once; an empty answer only costs score.
+     */
+    static final String DATA_COLUMN_SIDECARS_BY_ROOT =
+            "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
     static final String PING =
             "/eth2/beacon_chain/req/ping/1/ssz_snappy";
     static final String METADATA =
@@ -446,6 +454,7 @@ public class BeaconP2PService implements AutoCloseable {
         // ...but we do ANSWER by-root requests, with nothing: the root list is
         // not parsed (size 0) because the answer never depends on it.
         registerBinding(BLOCKS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
+        registerBinding(DATA_COLUMN_SIDECARS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
 
         host.start().join();
         log.info("[beacon-p2p] libp2p host started, peerId={}, listenAddrs={}",

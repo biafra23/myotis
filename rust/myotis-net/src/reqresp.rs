@@ -92,11 +92,19 @@ const MAX_IN_FLIGHT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const SERVING_UPDATES_MAX_STREAMS: usize = 4;
 
 const MAX_REQUEST_WIRE_BYTES: usize = 1024;
-/// `blocks_by_root` requests carry a root list — up to `MAX_REQUEST_BLOCKS`
-/// (1024) roots, 32 KiB of SSZ before framing. The answer is always empty, but
-/// a request we refuse to READ is a broken stream to the asker, which is
-/// exactly the failure the protocol is served to avoid.
-const MAX_BLOCKS_BY_ROOT_REQUEST_WIRE_BYTES: usize = 64 * 1024;
+/// The root-list requests (`protocols::is_root_list_request`) are bigger than
+/// the fixed ones: up to `MAX_REQUEST_BLOCKS` (1024) roots = 32 KiB of SSZ
+/// for `blocks_by_root`, and up to 128 `DataColumnsByRootIdentifier`s of a
+/// root plus up to 128 column indices ≈ 140 KiB for the sidecar one, before
+/// framing. The answer is always empty, but a request we refuse to READ is a
+/// broken stream to the asker, which is exactly the failure these protocols
+/// are served to avoid.
+const MAX_ROOT_LIST_REQUEST_WIRE_BYTES: usize = 256 * 1024;
+/// Concurrent inbound streams per connection for the root-list protocols. The
+/// cap above is buffered per stream, so the default 64 would let one
+/// connection park 16 MiB per protocol in requests this host never reads; an
+/// answer of zero chunks needs no concurrency at all.
+const ROOT_LIST_MAX_STREAMS: usize = 4;
 /// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
 /// uncompressed). 16 MiB is a generous DoS ceiling, not a target.
 const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
@@ -124,7 +132,9 @@ where
     let mut buf = Vec::new();
     io.take(cap as u64 + 1).read_to_end(&mut buf).await?;
     if buf.len() > cap {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "response exceeds size cap"));
+        // Requests and responses both come through here (read_request /
+        // read_response), so the message names neither.
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
     }
     Ok(buf)
 }
@@ -206,8 +216,8 @@ impl request_response::Codec for Eth2Codec {
         T: AsyncRead + Unpin + Send,
     {
         // The requester half-closes after writing, so EOF delimits the request.
-        let cap = if p.as_ref() == protocols::BLOCKS_BY_ROOT {
-            MAX_BLOCKS_BY_ROOT_REQUEST_WIRE_BYTES
+        let cap = if protocols::is_root_list_request(p.as_ref()) {
+            MAX_ROOT_LIST_REQUEST_WIRE_BYTES
         } else {
             MAX_REQUEST_WIRE_BYTES
         };
@@ -314,6 +324,8 @@ pub struct Behaviour {
     /// Inbound only, always answered with zero chunks — see
     /// `protocols::BLOCKS_BY_ROOT` for the Nimbus behaviour this placates.
     pub blocks_by_root: RR,
+    /// Likewise — `protocols::DATA_COLUMN_SIDECARS_BY_ROOT`.
+    pub data_column_sidecars_by_root: RR,
 }
 
 impl Behaviour {
@@ -372,8 +384,19 @@ impl Behaviour {
             ),
             finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
-            // Inbound only: this host never asks anyone for blocks.
-            blocks_by_root: rr(protocols::BLOCKS_BY_ROOT, ProtocolSupport::Inbound, RESP_TIMEOUT),
+            // Inbound only: this host never asks anyone for blocks or columns.
+            blocks_by_root: rr_with_streams(
+                protocols::BLOCKS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
+            data_column_sidecars_by_root: rr_with_streams(
+                protocols::DATA_COLUMN_SIDECARS_BY_ROOT,
+                ProtocolSupport::Inbound,
+                RESP_TIMEOUT,
+                ROOT_LIST_MAX_STREAMS,
+            ),
         }
     }
 }
@@ -1270,6 +1293,7 @@ fn behaviour_for<'a>(swarm: &'a mut Swarm<Behaviour>, protocol: &str) -> Option<
         protocols::FINALITY_UPDATE => &mut behaviour.finality,
         protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
         protocols::BLOCKS_BY_ROOT => &mut behaviour.blocks_by_root,
+        protocols::DATA_COLUMN_SIDECARS_BY_ROOT => &mut behaviour.data_column_sidecars_by_root,
         _ => return None,
     })
 }
@@ -1431,6 +1455,9 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
         E::Finality(ev) => on_rr_event(swarm, ctx, protocols::FINALITY_UPDATE, ev),
         E::Optimistic(ev) => on_rr_event(swarm, ctx, protocols::OPTIMISTIC_UPDATE, ev),
         E::BlocksByRoot(ev) => on_rr_event(swarm, ctx, protocols::BLOCKS_BY_ROOT, ev),
+        E::DataColumnSidecarsByRoot(ev) => {
+            on_rr_event(swarm, ctx, protocols::DATA_COLUMN_SIDECARS_BY_ROOT, ev)
+        }
     }
 }
 
@@ -1458,21 +1485,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                     );
                 }
                 let response_len = response.len();
-                let behaviour = swarm.behaviour_mut();
-                let rr = match protocol {
-                    protocols::STATUS_V2 => &mut behaviour.status_v2,
-                    protocols::STATUS_V1 => &mut behaviour.status_v1,
-                    protocols::PING => &mut behaviour.ping,
-                    protocols::METADATA_V2 => &mut behaviour.metadata,
-                    protocols::METADATA_V3 => &mut behaviour.metadata_v3,
-                    protocols::GOODBYE => &mut behaviour.goodbye,
-                    protocols::BOOTSTRAP => &mut behaviour.bootstrap,
-                    protocols::UPDATES_BY_RANGE => &mut behaviour.updates,
-                    protocols::FINALITY_UPDATE => &mut behaviour.finality,
-                    protocols::OPTIMISTIC_UPDATE => &mut behaviour.optimistic,
-                    protocols::BLOCKS_BY_ROOT => &mut behaviour.blocks_by_root,
-                    _ => return,
-                };
+                let Some(rr) = behaviour_for(swarm, protocol) else { return };
                 if rr.send_response(channel, response).is_err() {
                     tracing::debug!(peer = %peer, protocol, "inbound response channel closed");
                 } else {
@@ -1673,12 +1686,13 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
         protocols::METADATA_V3 => {
             codec::encode_success_response(&status::metadata_v3_light_client(), None)
         }
-        // Zero chunks — write nothing, close. A light client holds no blocks,
-        // and this is how the spec says so (the root list is not even read:
-        // `expected_request_size` is 0). Not ResourceUnavailable: that is an
-        // error chunk, which Nimbus's root sync treats as a failed request and
-        // answers by ending the peer loop (see `protocols::BLOCKS_BY_ROOT`).
-        protocols::BLOCKS_BY_ROOT => Vec::new(),
+        // Zero chunks — write nothing, close. A light client holds no blocks
+        // and no columns, and this is how the spec says so (the root list is
+        // not even read: `expected_request_size` is 0). Not
+        // ResourceUnavailable: that is an error chunk, which Nimbus's root
+        // sync treats as a failed request and answers by ending the peer loop
+        // (see `protocols::BLOCKS_BY_ROOT`).
+        protocols::BLOCKS_BY_ROOT | protocols::DATA_COLUMN_SIDECARS_BY_ROOT => Vec::new(),
         // Goodbye is a one-way notification: the spec has no response for it,
         // and the caller does not wait. We answer to keep the request_response
         // machinery happy, and the CALLER of this function disconnects the peer
@@ -2106,7 +2120,10 @@ mod dial_resolution_tests {
 
     /// A peer that offers mplex and NOTHING else on TCP — Nimbus since
     /// status-im/nimbus-eth2#6636 (2024) — with the same behaviour set as
-    /// ours. `muxer` picks which muxers the dialing side offers.
+    /// ours. Its yamux twin below differs only in the muxer; the two stay
+    /// separate because `with_tcp`'s muxer argument fixes the builder's
+    /// phase type, so one builder cannot take the muxer as a parameter
+    /// without naming libp2p's upgrade traits.
     fn mplex_only_peer() -> Swarm<Behaviour> {
         libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
             .with_tokio()
@@ -2200,11 +2217,13 @@ mod dial_resolution_tests {
     /// v26.9.1 with only mplex fixed: admitted, then dropped ~100 ms later,
     /// before the bootstrap request was served). The host must answer with
     /// the 25-byte Fulu MetaData: the v2 bytes plus `custody_group_count`.
-    #[tokio::test]
-    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
-        let mut host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+    /// The host as the production code runs it (`build_swarm`) plus the
+    /// context its event loop needs, so a test can drive `handle_swarm_event`
+    /// — responder included — against a real peer.
+    fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
             .expect("swarm");
-        let mut ctx = SwarmCtx::new(
+        let ctx = SwarmCtx::new(
             LocalStatus::new(StatusMessage {
                 fork_digest: [0; 4],
                 finalized_root: [0; 32],
@@ -2216,6 +2235,12 @@ mod dial_resolution_tests {
             None,
             None,
         );
+        (host, ctx)
+    }
+
+    #[tokio::test]
+    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
+        let (mut host, mut ctx) = host_with_ctx();
         let mut peer = mplex_only_peer();
         host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
@@ -2264,24 +2289,31 @@ mod dial_resolution_tests {
     /// (seen live: `Requesting blocks by root from peer block_roots=[2008fe0e]`
     /// — our own checkpoint — then `Blocks by root request failed reason=
     /// BrokenConnection` and `Peer loop stopped` when the protocol was not
-    /// even offered). The host must negotiate the protocol and answer with
+    /// even offered), and one step later the data column sidecars its map
+    /// says we custody. The host must negotiate the protocol and answer with
     /// NOTHING: zero chunks, not a success chunk and not an error.
     #[tokio::test]
     async fn a_blocks_by_root_request_is_answered_with_zero_chunks() {
-        let mut host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
-            .expect("swarm");
-        let mut ctx = SwarmCtx::new(
-            LocalStatus::new(StatusMessage {
-                fork_digest: [0; 4],
-                finalized_root: [0; 32],
-                finalized_epoch: 0,
-                head_root: [0; 32],
-                head_slot: 0,
-                earliest_available_slot: 0,
-            }),
-            None,
-            None,
-        );
+        // 64 roots: 2 KiB of SSZ, twice the cap every other request gets
+        // (`MAX_REQUEST_WIRE_BYTES`), so this also pins the root-list cap in
+        // `read_request` — a Nimbus asks for up to 32 at a time.
+        let roots: Vec<u8> = (0..64u8).flat_map(|i| [i; 32]).collect();
+        zero_chunks_for(protocols::BLOCKS_BY_ROOT, codec::encode_request(&roots)).await;
+    }
+
+    #[tokio::test]
+    async fn a_data_column_sidecars_by_root_request_is_answered_with_zero_chunks() {
+        // One DataColumnsByRootIdentifier: root + an offset to one column index.
+        let mut ident = vec![0x20u8; 32];
+        ident.extend_from_slice(&36u32.to_le_bytes()); // offset of `indices`
+        ident.extend_from_slice(&7u64.to_le_bytes()); // a single column
+        let mut list = 4u32.to_le_bytes().to_vec(); // offset of the one element
+        list.extend_from_slice(&ident);
+        zero_chunks_for(protocols::DATA_COLUMN_SIDECARS_BY_ROOT, codec::encode_request(&list)).await;
+    }
+
+    async fn zero_chunks_for(protocol: &'static str, request: Vec<u8>) {
+        let (mut host, mut ctx) = host_with_ctx();
         let mut asker = libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
             .with_tokio()
             .with_tcp(
@@ -2290,9 +2322,7 @@ mod dial_resolution_tests {
                 libp2p_mplex::Config::default,
             )
             .expect("mplex-only asker")
-            .with_behaviour(|_: &libp2p::identity::Keypair| {
-                rr(protocols::BLOCKS_BY_ROOT, ProtocolSupport::Full, RESP_TIMEOUT)
-            })
+            .with_behaviour(|_: &libp2p::identity::Keypair| rr(protocol, ProtocolSupport::Full, RESP_TIMEOUT))
             .expect("behaviour")
             .build();
         host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
@@ -2311,25 +2341,24 @@ mod dial_resolution_tests {
                 ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
                 ev = asker.select_next_some() => match ev {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
-                        // One root, the way Nimbus asks for a peer's unknown head.
-                        asker.behaviour_mut().send_request(&host_id, codec::encode_request(&[0x20u8; 32]));
+                        asker.behaviour_mut().send_request(&host_id, request.clone());
                         asked = true;
                     }
                     SwarmEvent::Behaviour(request_response::Event::Message {
                         message: request_response::Message::Response { response, .. }, ..
                     }) => {
-                        assert!(response.is_empty(), "expected zero chunks, got {} bytes", response.len());
+                        assert!(response.is_empty(), "{protocol}: expected zero chunks, got {} bytes", response.len());
                         return;
                     }
                     SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
-                        panic!("blocks_by_root request failed: {error}")
+                        panic!("{protocol} request failed: {error}")
                     }
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
-                        panic!("connection closed before blocks_by_root was answered: {cause:?}")
+                        panic!("{protocol}: connection closed before it was answered: {cause:?}")
                     }
                     _ => {}
                 },
-                _ = &mut deadline => panic!("no blocks_by_root answer within 15 s"),
+                _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
             }
         }
     }
