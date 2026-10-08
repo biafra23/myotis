@@ -319,7 +319,7 @@ public record NetworkConfig(
             // AND NOTE WHAT A HEALTHY ROOST COSTS THIS ENGINE. A fallback (the
             // public pins this list held until 2026-10-07, or discovered peers)
             // only engages when roost FAILS. roost serves no blocks —
-            // beacon_blocks_by_range is not among the nine protocols in
+            // beacon_blocks_by_range is not among the protocols in
             // rust/myotis-net/src/protocols.rs — while the steady-state chain
             // fill follows the finality-poll WINNER with no per-peer fallback
             // (fillChainStateRoots(win.peer(), ...)). A pre-encoded byte cache
