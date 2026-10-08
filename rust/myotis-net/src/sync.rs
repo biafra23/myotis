@@ -1109,7 +1109,8 @@ struct Peer {
     /// (`{addr}/p2p/{id}`), so it never changes shape when QUIC is learned.
     addr: Multiaddr,
     /// `/ip4/<ip>/udp/<port>/quic-v1` from the peer's ENR `quic` field, when
-    /// it advertises one. Never a cache key; dialed first, beside `addr`.
+    /// it advertises one. Never a cache key; dialed after `addr` — see
+    /// [`Peer::dial_addrs`] for the order and why.
     quic: Option<Multiaddr>,
 }
 

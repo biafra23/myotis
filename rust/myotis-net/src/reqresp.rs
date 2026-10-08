@@ -1058,8 +1058,9 @@ fn build_swarm(
     // Lodestar, Prysm behind a flag). It brings its own TLS 1.3 handshake
     // (libp2p-tls, peer id in the certificate) and stream multiplexing, so
     // noise and the muxers above apply to TCP only. Addresses are
-    // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at both
-    // concurrently and the first connection that completes is kept.
+    // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at TCP
+    // first, QUIC only when the TCP dial fails — one at a time, never
+    // concurrently (see `ReqRespClient::request_raw_at` for why).
     if dns {
         Ok(base
             .with_tcp(

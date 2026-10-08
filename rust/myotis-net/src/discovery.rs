@@ -32,7 +32,8 @@ pub struct DiscoveredPeer {
     /// `/ip4/<ip>/tcp/<port>` (no `/p2p` suffix; the peer id travels separately).
     pub addr: Multiaddr,
     /// `/ip4/<ip>/udp/<port>/quic-v1` when the record carries a `quic` (`quic6`)
-    /// field — the spec's primary transport. Dialed alongside `addr`, first.
+    /// field — the spec's primary transport. Dialed after `addr`: TCP first,
+    /// QUIC only when the TCP dial fails (see `sync::Peer::dial_addrs`).
     pub quic: Option<Multiaddr>,
 }
 
@@ -823,6 +824,19 @@ mod server_enr_tests {
 
         let zero = filter_candidate(&record(Some(0)), &[digest]).expect("a candidate");
         assert!(zero.quic.is_none(), "port 0 is no listener");
+
+        // An IPv6 endpoint reads `quic6`, and ignores a stray `quic`.
+        let mut builder = Enr::builder();
+        builder.ip6("2001:db8::1".parse().unwrap()).tcp6(9104).udp6(9104);
+        builder.add_value(b"eth2".as_slice(), &eth2_field().as_slice());
+        builder.add_value(b"quic".as_slice(), &9001u16);
+        builder.add_value(b"quic6".as_slice(), &9002u16);
+        let v6 = filter_candidate(&builder.build(&key).unwrap(), &[digest]).expect("a candidate");
+        assert_eq!(v6.addr.to_string(), "/ip6/2001:db8::1/tcp/9104");
+        assert_eq!(
+            v6.quic.as_ref().map(|q| q.to_string()).as_deref(),
+            Some("/ip6/2001:db8::1/udp/9002/quic-v1")
+        );
     }
 
     #[test]
