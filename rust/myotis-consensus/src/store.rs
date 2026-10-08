@@ -173,6 +173,22 @@ impl LightClientStore {
     }
 }
 
+/// The processor's structural gate for an update or finality update, BEFORE any
+/// BLS work: every header in it must be in the shape of its ATTESTED slot's fork
+/// (a Gloas-format update carries even a pre-Gloas finalized header in the Gloas
+/// shape), since that fork also picks the state-proof indices. A mismatch is a
+/// misrouted or forged object, never a genuine one. Public so diagnostics that
+/// judge a server's answers without a store (`period_census`, the release pin
+/// check) apply the same rule instead of a copy of it.
+pub fn headers_in_attested_forks_shape(
+    fork_schedule: &ForkSchedule,
+    attested: &LightClientHeader,
+    finalized: &LightClientHeader,
+) -> bool {
+    let fork = fork_schedule.lc_fork_at_slot(attested.beacon.slot);
+    attested.shape() == fork && finalized.shape() == fork
+}
+
 /// Processes updates against a store — Rust twin of `LightClientProcessor` (minus
 /// the duplicate-signature fast path, which is a perf memo keyed on the applied
 /// signature AND its slot, behind the period gate — not a verdict change:
@@ -258,14 +274,10 @@ impl LightClientProcessor {
         Ok(())
     }
 
-    /// Cheap structural gate for an update, BEFORE any BLS work: every header in
-    /// it must be in the shape of its ATTESTED slot's fork (a Gloas-format update
-    /// carries even a pre-Gloas finalized header in the Gloas shape), since that
-    /// fork also picks the state-proof indices below. A mismatch is a misrouted
-    /// or forged object, never a genuine one.
+    /// Cheap structural gate for an update, BEFORE any BLS work — see
+    /// [`headers_in_attested_forks_shape`].
     fn update_shape_ok(&self, attested: &LightClientHeader, finalized: &LightClientHeader) -> bool {
-        let fork = self.lc_fork_at_slot(attested.beacon.slot);
-        attested.shape() == fork && finalized.shape() == fork
+        headers_in_attested_forks_shape(&self.fork_schedule, attested, finalized)
     }
 
     /// Finality branch against the attested state root, at the attested slot's

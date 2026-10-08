@@ -193,11 +193,27 @@ complete on its own.
 
 ## From the v0.1.14 release (2026-10-06, Glamsterdam day)
 
-- [ ] **Sepolia has one Gloas-capable light-client server (roost).** The
-  release's cold-start pin check stopped at 1 of 4 — both Lighthouse pins
-  stopped serving light-client data at the fork and a 91-peer census found
-  no other Gloas-era server — and the owner released anyway. Tracked in
+- [ ] **Sepolia has one light-client server either engine can sync
+  Gloas-era data from (roost).** The release's cold-start pin check stopped
+  at 1 of 4 — both Lighthouse pins stopped serving light-client data at the
+  fork and a 91-peer census found no other Gloas-era server, from a host
+  that could not reach Nimbus or Lodestar nodes (#576) — and the owner
+  released anyway. Tracked in
   #566: until a second server exists, every Sepolia `cold-start regression`
   dispatch stops red at the pin check and 3b/3c never run there. Whether
   CLAUDE.md's release step 3 ("release-blocking") gets a carve-out for a
   floor unmet for an upstream reason is the owner's decision.
+  - 2026-10-07: both Lighthouse pins dropped (both engines), roost is the
+    only Sepolia pin. Cause upstream: Lighthouse's light-client server
+    produces nothing for a Gloas block (sigp/lighthouse#9587; fix PRs #9732
+    and #9790 unmerged, no release), and its store keys updates by the
+    signature slot's period, so the update under 1379 is a Fulu one that
+    fails as Gloas ("Database error") — expect 1379 to stay broken on nodes
+    that ran v8.3.0-rc.0 across the fork even after a fixed release.
+    Period-1379 censuses (zbox 170 peers, runner 218) found every Lighthouse
+    answer an error or empty, Prysm and Grandine without the protocol, and
+    100+ peers closing before Identify — most likely many of them Nimbus and
+    Lodestar nodes the yamux-only census host could not reach (#576), so
+    those censuses do not show roost to be the only server. zbox's own
+    Nimbus serves Gloas light-client data and is #566's option 3 once #576
+    is in.

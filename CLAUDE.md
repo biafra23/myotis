@@ -351,13 +351,18 @@ asset workflow and a stronger action than the merge this file already forbids.
    the one whose OUTPUT you read rather than just its exit code. It asks every
    pinned CL peer for a `light_client_bootstrap` at this build's own embedded
    anchor and applies the SAME acceptance the production path does (checkpoint
-   pin plus both Merkle branches), then asks for one period of
-   `updates_by_range` — so a pin counts as alive only if a fresh install would
-   accept what it serves AND could catch up from it. Then it checks the
+   pin plus both Merkle branches), then asks for the anchor's period of
+   `updates_by_range` and runs it through the production processor, and — once
+   the chain has left that period — for the current period's, which must be
+   attested in it, in its fork's wire shape and above the 2/3 bar. So a pin
+   counts as alive only if a fresh install would accept what it serves AND
+   could follow the chain from it: an anchor embedded before a server stopped
+   (Sepolia's Lighthouse pins at the Gloas fork) no longer hides that. Then it checks the
    bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
    sweep, because these are third-party hosts and demanding perfection makes a
    check people skip. Individual dead pins are a re-census signal
-   (`examples/period_census.rs`), not automatically a blocker.
+   (`examples/period_census.rs`; the workflow's `census` scope runs it from a
+   clean runner), not automatically a blocker.
 
    **Caveat that will bite you: the result is only as good as the host.** A
    Lighthouse node that has banned your IP reports as `dial failed` while being

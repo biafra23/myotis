@@ -477,11 +477,13 @@ warm-start dial (Rust), and the CL multiaddr is `prependLocal`-ed onto
 | CL (roost, first) | `/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
 
 The Nimbus CL fallback (`/tcp/9104` through the relay) was **unpinned on
-2026-09-11**: the port still accepts TCP but the libp2p handshake times out, so
-the tunnel's far end is not answering. Three census-verified public Lighthouse
-servers took its place in `clPeerMultiaddrs` (see the list's comment). Re-pin
-the Nimbus once the far end is fixed and its `--netkey-file` identity is
-confirmed from its startup log.
+2026-09-11** because the libp2p upgrade failed — not because the tunnel's far
+end was down, as first recorded: the Rust host offered only yamux and Nimbus
+speaks only mplex (#576). The three census-verified public Lighthouse servers
+that took its place were dropped at the Gloas fork (2026-10-07: no Gloas
+light-client data; see the list's comment), leaving roost alone. Re-pin the
+Nimbus once #576 is in and its `--netkey-file` identity is confirmed from its
+startup log (#566).
 
 Both are only stable because their keys persist across restarts (Geth's
 datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is
