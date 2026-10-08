@@ -1449,11 +1449,13 @@ enum BlockFromError {
 /// [`BlockFromError`] splits a block serve. `Peer`: the response was missing,
 /// slow, short, or did not rebuild the anchored header's roots — that peer's
 /// failure, banked by the ladder once it settles, and the next peer is asked.
-/// `Ours`: the bodies and receipts DID rebuild the anchored header's
-/// `transactionsRoot` / `receiptsRoot`, and what we made of them failed — a
-/// tx or receipt inside verified bytes our decoder cannot read, or a
-/// gas-accounting check of ours. Every peer serves those same verified bytes,
-/// so the ladder stops without blaming the one that served them. Until this
+/// `Ours`: not the peer's response — the bodies and receipts DID rebuild the
+/// anchored header's `transactionsRoot` / `receiptsRoot`, and what we made of
+/// them failed (a tx or receipt inside verified bytes our decoder cannot
+/// read, a gas-accounting check of ours), or, at three internal sites that
+/// are unreachable by construction, our own bookkeeping broke. Every peer
+/// serves those same verified bytes, so the ladder stops without blaming the
+/// one that served them. Until this
 /// split, a check that was wrong on OUR side (receipt sums no longer equal the
 /// header's `gasUsed` from Amsterdam on, see [`weigh_tips`]) struck every
 /// snap peer on every build — with a wallet polling feeHistory, the whole
@@ -7360,8 +7362,9 @@ impl ElReader {
                     // peer is credited like any server and the earlier
                     // misses are witnessed by it; nobody is struck for a
                     // check of ours.
-                    tracing::debug!(oldest, count, peer = %peer.addr(), error = %e,
-                        "feeHistory: verified data we cannot build from — no peer can serve it differently");
+                    tracing::warn!(oldest, count, peer = %peer.addr(), error = %e,
+                        "feeHistory: verified data we cannot build from — no peer can serve it differently, \
+                         and every build of this window fails until the window moves");
                     self.record_batch_failures(&failed, true).await;
                     self.pool.record_snap_served(peer.addr()).await;
                     return Err(format!("feeHistory cannot be built from verified data: {e}"));
@@ -8640,9 +8643,9 @@ fn build_block_receipts(
 /// Amsterdam's two-dimensional accounting keeps the bound: the header's
 /// `gasUsed` is `max(Σ execution gas, Σ state gas)` before refunds, and the
 /// execution dimension carries every transaction's intrinsic base and
-/// calldata floor (execution-specs `settle_transaction_gas`), so
-/// `gasUsed ≥ 12,000 × txs` still holds there (re-checked 2026-10-08 with
-/// [`weigh_tips`]'s gas cross-check).
+/// calldata floor (EIP-2780's `TX_BASE_COST` of 12,000 is charged in
+/// execution gas; execution-specs `settle_transaction_gas`), so
+/// `gasUsed ≥ 12,000 × txs` still holds there (re-checked 2026-10-08).
 const MIN_GAS_PER_TX: u64 = 1_000;
 
 /// The body half of the per-block trust gate: the fetched transactions must
@@ -9213,8 +9216,10 @@ fn log_fee_summary(line: Option<String>) {
 /// that verifies is remembered, even when another one fails the call.
 /// `fetch(hash, with_body)` returns the block's bodies response (only when
 /// asked for) and its receipts response. The error says whose failure it is
-/// ([`FeeBuildError`]); one in VERIFIED data outranks a peer's, since it fails
-/// the build whichever peer serves.
+/// ([`FeeBuildError`]), and a peer's outranks one in VERIFIED data: a peer
+/// that did not complete its response is not credited for it, and the ladder
+/// moves on — the peer that then serves everything else hits the same
+/// verified-data failure, which no peer can serve around, and stops it.
 async fn reward_inputs<F, Fut>(
     cache: &std::sync::Mutex<FeeCache>,
     fill: &tokio::sync::Mutex<()>,
@@ -9257,7 +9262,8 @@ where
     )
     .await;
     let mut fetched = fetched.into_iter();
-    let mut first_err: Option<FeeBuildError> = None;
+    // The first failure of each kind; the peer's wins (see the doc above).
+    let (mut first_peer, mut first_ours): (Option<String>, Option<String>) = (None, None);
     for &i in &missing {
         let vh = &blocks[i];
         let weighted = if empty(i) {
@@ -9279,22 +9285,19 @@ where
                 cache.lock().map_err(unavailable)?.put_weighted((vh.header.number, vh.hash), Arc::clone(&weighted));
                 inputs[i] = Some(weighted);
             }
-            Err(e) => {
-                // The first failure, except that one in verified data
-                // outranks any peer's.
-                let replace = match &first_err {
-                    None => true,
-                    Some(FeeBuildError::Peer(_)) => matches!(e, FeeBuildError::Ours(_)),
-                    Some(FeeBuildError::Ours(_)) => false,
-                };
-                if replace {
-                    first_err = Some(e);
-                }
+            Err(FeeBuildError::Peer(e)) => {
+                first_peer.get_or_insert(e);
+            }
+            Err(FeeBuildError::Ours(e)) => {
+                first_ours.get_or_insert(e);
             }
         }
     }
-    if let Some(e) = first_err {
-        return Err(e);
+    if let Some(e) = first_peer {
+        return Err(FeeBuildError::Peer(e));
+    }
+    if let Some(e) = first_ours {
+        return Err(FeeBuildError::Ours(e));
     }
     inputs
         .into_iter()
@@ -9368,7 +9371,12 @@ fn strict_body_tips(
 ///   failing on Sepolia from the fork (2026-10-06) on, and every snap peer
 ///   struck for it. So an Amsterdam header's `gasUsed` is NOT compared to
 ///   the receipts: the receipts root is the verification, and `gasUsed` is
-///   no weight.
+///   no weight. The trade-off: the root verifies the bytes, not our reading
+///   of them, and pre-Amsterdam the equality also caught a mis-parse of a
+///   receipt's cumulative gas. On Amsterdam headers that rests on
+///   `receipt::decode`'s own tests and on the typed-receipt layout, which
+///   Amsterdam leaves unchanged (EIP-7975 changes the eth/70 wire form, not
+///   the trie value).
 ///
 /// Monotonic cumulative gas, and `gasUsed` 0 for a block without
 /// transactions, hold under both accountings: every transaction pays its
@@ -9443,7 +9451,10 @@ fn weigh_tips(
 /// no earlier header carries that field ([`BlockHeader::decode`]). The header
 /// is beacon-anchored, so its shape is as trustworthy as its `gasUsed`, and
 /// no per-network fork table is needed — right for any network the moment
-/// its headers carry the field.
+/// its headers carry the field. That leans on the BAL field and the gas
+/// accounting (EIP-7778 / EIP-7999) shipping in the same fork, which they do
+/// (both are Amsterdam's); a network that split them would need the fork
+/// schedule here instead.
 fn header_is_amsterdam(header: &BlockHeader) -> bool {
     header.block_access_list_hash.is_some()
 }
@@ -10812,11 +10823,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_failure_in_verified_data_outranks_a_peers_in_the_rows() {
+        async fn a_peers_failure_outranks_one_in_verified_data_in_the_rows() {
             // Block 0's receipts do not rebuild its root (the peer's); block 1's
-            // do, and fail our pre-Amsterdam gas check. The build fails as
-            // OURS: no peer can serve block 1 differently, so the ladder must
-            // stop rather than strike every peer for it.
+            // do, and fail our pre-Amsterdam gas check. The call fails as the
+            // PEER's: it did not complete its response, so the ladder moves on
+            // rather than credit it and witness the earlier misses by it.
             let cache = Mutex::new(FeeCache::default());
             let fill = tokio::sync::Mutex::new(());
             let (vh0, _, _) = one_tx_block(0, GWEI, GWEI);
@@ -10826,17 +10837,34 @@ mod tests {
             for vh in [&vh0, &vh1] {
                 cache.lock().unwrap().put_tips((vh.header.number, vh.hash), Arc::new(vec![GWEI]), true);
             }
-            let fetch = |_hash: [u8; 32], _with_body: bool| {
+            let window = [vh0.clone(), vh1.clone()];
+            let junk_for_block_0 = |_hash: [u8; 32], _with_body: bool| {
                 let served = over.clone();
                 async move {
                     let out: Fetched = (None, Ok(vec![BlockReceipts::Canonical(served)]));
                     out
                 }
             };
-            let err = reward_inputs(&cache, &fill, &[vh0.clone(), vh1.clone()], fetch).await.unwrap_err();
+            let err = reward_inputs(&cache, &fill, &window, junk_for_block_0).await.unwrap_err();
+            assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("receiptsRoot")), "{err}");
+            {
+                let c = cache.lock().unwrap();
+                assert!(c.weighted((0, vh0.hash)).is_none() && c.weighted((1, vh1.hash)).is_none());
+            }
+            // The next peer serves block 0 as it is: now the call fails as
+            // OURS — the failure no peer can serve around — so the ladder
+            // stops there, and block 0 is remembered.
+            let honest = |hash: [u8; 32], _with_body: bool| {
+                let served = if hash == vh0.hash { receipts_of(&[21_000]) } else { over.clone() };
+                async move {
+                    let out: Fetched = (None, Ok(vec![BlockReceipts::Canonical(served)]));
+                    out
+                }
+            };
+            let err = reward_inputs(&cache, &fill, &window, honest).await.unwrap_err();
             assert!(matches!(&err, FeeBuildError::Ours(m) if m.contains("does not match")), "{err}");
             let c = cache.lock().unwrap();
-            assert!(c.weighted((0, vh0.hash)).is_none() && c.weighted((1, vh1.hash)).is_none());
+            assert!(c.weighted((0, vh0.hash)).is_some() && c.weighted((1, vh1.hash)).is_none());
         }
 
         // The gas cross-checks of `weigh_tips` against the anchored header, and
