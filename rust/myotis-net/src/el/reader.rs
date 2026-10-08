@@ -1460,6 +1460,10 @@ enum BlockFromError {
 /// header's `gasUsed` from Amsterdam on, see [`weigh_tips`]) struck every
 /// snap peer on every build — with a wallet polling feeHistory, the whole
 /// Sepolia pool was evicted once a minute (observed 2026-10-08).
+///
+/// Deliberately no `From<String>`: every site in the build states its side,
+/// so a `?` on a `String` result added after a root check fails to compile
+/// instead of silently blaming the peer (PR #578 review).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FeeBuildError {
     Peer(String),
@@ -1478,21 +1482,6 @@ impl FeeBuildError {
 impl std::fmt::Display for FeeBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.message())
-    }
-}
-
-// Bare `?`/`ok_or` sites in the build are peer-response failures (transport,
-// a short window, a root mismatch); the handful that are ours are constructed
-// explicitly, each after the root check that makes it ours.
-impl From<String> for FeeBuildError {
-    fn from(message: String) -> Self {
-        FeeBuildError::Peer(message)
-    }
-}
-
-impl From<&str> for FeeBuildError {
-    fn from(message: &str) -> Self {
-        FeeBuildError::Peer(message.to_string())
     }
 }
 
@@ -7398,7 +7387,7 @@ impl ElReader {
     ) -> Result<FeeHistory, FeeBuildError> {
         // `[oldest ..= top]`: the span past `newest` is what anchors it — and
         // gives the ACTUAL next-block base fee when the top is above newest.
-        let window = fetch_anchored_window(peer, oldest, top).await?;
+        let window = fetch_anchored_window(peer, oldest, top).await.map_err(FeeBuildError::Peer)?;
         let count = count as usize;
 
         let mut base_fee_per_gas: Vec<u128> =
@@ -9329,8 +9318,11 @@ fn strict_body_tips(
     header: &BlockHeader,
     bodies: Vec<crate::el::eth::messages::BlockBody>,
 ) -> Result<Vec<u128>, FeeBuildError> {
-    let body = bodies.into_iter().next().ok_or("peer returned no block body")?;
-    verify_body_transactions(header, &body)?;
+    let body = bodies
+        .into_iter()
+        .next()
+        .ok_or_else(|| FeeBuildError::Peer("peer returned no block body".to_string()))?;
+    verify_body_transactions(header, &body).map_err(FeeBuildError::Peer)?;
     // From here the body is the anchored header's: a tx we cannot decode is
     // our rendering failure, not the peer's.
     let base_fee = header_base_fee(header);
@@ -9401,7 +9393,10 @@ fn weigh_tips(
         }
         return Ok(Vec::new());
     }
-    let receipts = receipt_blocks.into_iter().next().ok_or("peer returned no receipts")?;
+    let receipts = receipt_blocks
+        .into_iter()
+        .next()
+        .ok_or_else(|| FeeBuildError::Peer("peer returned no receipts".to_string()))?;
     if receipts.len() != tips.len() {
         return Err(FeeBuildError::Peer(format!(
             "block {} receipt count mismatch ({} receipts for {} txs)",
@@ -9413,7 +9408,7 @@ fn weigh_tips(
     let receipts = receipts
         .canonical(tips.len())
         .map_err(|e| FeeBuildError::Peer(format!("block {}: {}", header.number, e.0)))?;
-    verify_block_receipts(header, &receipts)?;
+    verify_block_receipts(header, &receipts).map_err(FeeBuildError::Peer)?;
     // From here the receipts are the anchored header's: the peer served, and
     // whatever fails below is a check of ours against consensus data.
     let mut out = Vec::with_capacity(tips.len());
@@ -10988,9 +10983,6 @@ mod tests {
             assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("transactionsRoot")), "{err}");
             let err = strict_body_tips(&header, Vec::new()).unwrap_err();
             assert!(matches!(&err, FeeBuildError::Peer(m) if m.contains("no block body")), "{err}");
-            // Bare string errors — transport, timeouts — blame the peer.
-            assert_eq!(FeeBuildError::from("request timed out".to_string()), FeeBuildError::Peer("request timed out".to_string()));
-            assert_eq!(FeeBuildError::from("request timed out"), FeeBuildError::Peer("request timed out".to_string()));
         }
     }
 
