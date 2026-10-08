@@ -26,7 +26,11 @@ myotis-evm = { path = "../myotis-evm" }
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
-libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
+# `quic`: the consensus p2p spec's PRIMARY transport (QUIC MUST be supported;
+# TCP is the fallback, consensus-specs#5330). QUIC carries its own TLS 1.3
+# handshake and stream multiplexing, so neither noise nor a muxer is negotiated
+# on it — see `reqresp::build_swarm`.
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
 # mplex, the TCP stream multiplexer the consensus p2p spec makes MANDATORY
 # ("clients that support the TCP transport MUST support mplex and MAY support
 # yamux", phase0/p2p-interface.md). rust-libp2p dropped it from the `libp2p`

@@ -506,15 +506,39 @@ impl ReqRespClient {
         protocol: &'static str,
         wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
+        self.request_raw_at(peer, vec![addr], protocol, wire).await
+    }
+
+    /// [`request_raw`](Self::request_raw) with every address the peer is known
+    /// at, in preference order (QUIC before TCP for a discovered peer). The
+    /// swarm dials them concurrently — libp2p's dial concurrency factor — and
+    /// keeps the first connection that completes, so an unreachable QUIC port
+    /// (a firewall that drops UDP, a port nobody forwarded) costs nothing but
+    /// the TCP handshake that was going to happen anyway.
+    pub async fn request_raw_at(
+        &self,
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+        protocol: &'static str,
+        wire: Vec<u8>,
+    ) -> Result<Vec<u8>, RequestError> {
         // Resolve HERE, per request, in async context. The swarm task's dial
         // path is synchronous, so it cannot await a lookup — and libp2p's own
         // DNS transport is not always present (Android has no /etc/resolv.conf,
         // so `build_swarm` falls back to plain TCP and a /dns4/ address is
         // rejected outright with "Multiaddr is not supported").
-        let dns_name = multiaddr_dns_name(&addr).map(|n| n.to_string());
+        let dns_name = addrs.iter().find_map(multiaddr_dns_name);
         // Never empty: a resolver failure yields the original address, so an
         // already-connected peer is unaffected by a transient DNS blip.
-        let addrs = resolve_dial_addrs(&addr, &self.last_resolved).await;
+        let mut resolved: Vec<Multiaddr> = Vec::with_capacity(addrs.len());
+        for addr in &addrs {
+            for candidate in resolve_dial_addrs(addr, &self.last_resolved).await {
+                if !resolved.contains(&candidate) {
+                    resolved.push(candidate);
+                }
+            }
+        }
+        let addrs = resolved;
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Request { peer, dns_name, addrs, protocol, wire, reply })
@@ -735,10 +759,23 @@ fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
+/// The TCP port of a multiaddr — and ONLY TCP: this feeds the observed
+/// external address a server publishes as its ENR `tcp` port, and an inbound
+/// QUIC connection would report our UDP port there instead. See
+/// [`multiaddr_transport_port`] for the dial side.
 fn multiaddr_port(addr: &Multiaddr) -> Option<u16> {
     use libp2p::multiaddr::Protocol;
     addr.iter().find_map(|p| match p {
         Protocol::Tcp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// The transport port of a dial address, TCP or UDP (`/udp/<port>/quic-v1`).
+fn multiaddr_transport_port(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Tcp(port) | Protocol::Udp(port) => Some(port),
         _ => None,
     })
 }
@@ -788,18 +825,19 @@ async fn resolve_dial_addrs(
     let Some(name) = multiaddr_dns_name(addr).map(|n| n.to_string()) else {
         return vec![addr.clone()];
     };
-    // Without a /tcp/ component there is nothing to rebuild around: `skip_while`
-    // would consume the whole iterator and every candidate would come out a bare
-    // /ip4/A — no port, no transport, no /p2p/ id — while `unwrap_or(0)` looked
-    // the name up on port 0. Hand the address back untouched instead and let the
-    // transport reject it on its own terms. Reaches here via /dnsaddr/ (which
-    // resolves to TXT records, not A/AAAA) and via a name with no transport.
-    let Some(port) = multiaddr_port(addr) else {
+    // Without a /tcp/ or /udp/ component there is nothing to rebuild around:
+    // `skip_while` would consume the whole iterator and every candidate would
+    // come out a bare /ip4/A — no port, no transport, no /p2p/ id — while
+    // `unwrap_or(0)` looked the name up on port 0. Hand the address back
+    // untouched instead and let the transport reject it on its own terms.
+    // Reaches here via /dnsaddr/ (which resolves to TXT records, not A/AAAA)
+    // and via a name with no transport.
+    let Some(port) = multiaddr_transport_port(addr) else {
         return vec![addr.clone()];
     };
     let tail: Vec<Protocol> = addr
         .iter()
-        .skip_while(|p| !matches!(p, Protocol::Tcp(_)))
+        .skip_while(|p| !matches!(p, Protocol::Tcp(_) | Protocol::Udp(_)))
         .map(|p| p.acquire())
         .collect();
     match tokio::net::lookup_host(format!("{name}:{port}")).await {
@@ -904,6 +942,13 @@ pub struct HostConfig {
     /// Where to listen. The wallet uses an ephemeral port because some peers
     /// reject dial-only hosts; a server pins one so its ENR stays valid.
     pub listen: Multiaddr,
+    /// The QUIC listener (`/ip4/<ip>/udp/<port>/quic-v1`), `None` for TCP only.
+    /// Dialing QUIC never needs it — the transport opens a socket per dial —
+    /// but a listener lets inbound QUIC in and reuses one socket for dials.
+    /// The wallet's default is ephemeral, like `listen`; a server that wants
+    /// its QUIC port reachable also has to forward it and put it in its ENR
+    /// (`quic`), which `rust/roost` does not do yet.
+    pub listen_quic: Option<Multiaddr>,
     /// Cap on established inbound connections. The wallet's 64 is
     /// defense-in-depth; a server sets its own, which is the entire point of
     /// splitting it out of a beacon node whose limit it would otherwise inherit.
@@ -924,6 +969,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
+            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static multiaddr")),
             max_established_incoming: Some(64),
             keypair: None,
             lc_responder: None,
@@ -982,6 +1028,14 @@ fn build_swarm(
     // light-client server the Rust engine could reach (#573). The Java engine
     // always offered both.
     let muxers = || (libp2p::yamux::Config::default, libp2p_mplex::Config::default);
+    // QUIC beside TCP: the spec's PRIMARY transport since consensus-specs#5330
+    // ("QUIC MUST be supported", TCP is the fallback), and what every client
+    // listens on by default now (Nimbus `--quic-port`, Lighthouse, Teku,
+    // Lodestar, Prysm behind a flag). It brings its own TLS 1.3 handshake
+    // (libp2p-tls, peer id in the certificate) and stream multiplexing, so
+    // noise and the muxers above apply to TCP only. Addresses are
+    // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at both
+    // concurrently and the first connection that completes is kept.
     if dns {
         Ok(base
             .with_tcp(
@@ -990,6 +1044,7 @@ fn build_swarm(
                 muxers(),
             )
             .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+            .with_quic()
             .with_dns()
             .map_err(|e| format!("dns transport setup failed: {e}"))?
             .with_behaviour(behaviour)
@@ -1004,6 +1059,7 @@ fn build_swarm(
                 muxers(),
             )
             .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+            .with_quic()
             .with_behaviour(behaviour)
             .map_err(|e| format!("behaviour setup failed: {e}"))?
             .with_swarm_config(idle)
@@ -1051,6 +1107,14 @@ pub fn start_host_with(
     swarm
         .listen_on(config.listen)
         .map_err(|e| format!("listen failed: {e}"))?;
+    // Not fatal: a host that cannot bind a UDP socket still dials QUIC peers
+    // (the transport opens a socket per dial) and still has TCP both ways.
+    if let Some(quic) = config.listen_quic {
+        if let Err(e) = swarm.listen_on(quic) {
+            tracing::warn!(error = %e,
+                "QUIC listen failed — continuing without inbound QUIC; dialing QUIC and TCP are unaffected");
+        }
+    }
 
     let peer_id = *swarm.local_peer_id();
     tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
@@ -2172,9 +2236,20 @@ mod dial_resolution_tests {
             .build()
     }
 
-    /// Listen, then dial from `dialer` and report whether a STREAM worked
-    /// within the deadline — the peer's Identify answer arrived (`Ok`) — or
-    /// the attempt failed/closed first (`Err(what)`). Drives both swarms.
+    /// A peer that speaks QUIC and nothing else — the spec's primary transport
+    /// on its own, as a client that disabled TCP would present itself.
+    fn quic_only_peer() -> Swarm<Behaviour> {
+        libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|key: &libp2p::identity::Keypair| Behaviour::new(key.public(), false, None))
+            .expect("behaviour")
+            .build()
+    }
+
+    /// Listen on `listen`, then dial from `dialer` and report whether a STREAM
+    /// worked within the deadline — the peer's Identify answer arrived (`Ok`)
+    /// — or the attempt failed/closed first (`Err(what)`). Drives both swarms.
     ///
     /// `ConnectionEstablished` is deliberately not the success signal:
     /// multistream-select negotiates the muxer optimistically on the dialer
@@ -2182,8 +2257,12 @@ mod dial_resolution_tests {
     /// established and only then has it closed under it — exactly the shape
     /// the live Nimbus log showed ("Connection established" then "closed with
     /// error ... Decode"). Only a completed stream proves a muxer was agreed.
-    async fn dial_outcome(mut dialer: Swarm<Behaviour>, mut peer: Swarm<Behaviour>) -> Result<(), String> {
-        peer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    async fn dial_outcome(
+        mut dialer: Swarm<Behaviour>,
+        mut peer: Swarm<Behaviour>,
+        listen: &str,
+    ) -> Result<(), String> {
+        peer.listen_on(listen.parse().unwrap()).unwrap();
         let addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
                 break address;
@@ -2217,7 +2296,7 @@ mod dial_resolution_tests {
     /// longer mplex-only and the test below proves nothing.
     #[tokio::test]
     async fn a_yamux_only_host_cannot_connect_to_an_mplex_only_peer() {
-        let outcome = dial_outcome(yamux_only_host(), mplex_only_peer()).await;
+        let outcome = dial_outcome(yamux_only_host(), mplex_only_peer(), "/ip4/127.0.0.1/tcp/0").await;
         assert!(outcome.is_err(), "yamux-only host connected to an mplex-only peer: {outcome:?}");
     }
 
@@ -2228,7 +2307,32 @@ mod dial_resolution_tests {
     async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
         let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
             .expect("swarm");
-        dial_outcome(host, mplex_only_peer()).await.expect("a stream to an mplex-only peer");
+        dial_outcome(host, mplex_only_peer(), "/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("a stream to an mplex-only peer");
+    }
+
+    /// The spec's primary transport, outbound: the host dials a peer that
+    /// listens on QUIC alone (`/udp/<port>/quic-v1`) and completes a stream —
+    /// no noise, no muxer negotiation, the TLS handshake carries the peer id.
+    #[tokio::test]
+    async fn the_host_connects_to_a_quic_only_peer() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        dial_outcome(host, quic_only_peer(), "/ip4/127.0.0.1/udp/0/quic-v1")
+            .await
+            .expect("a stream to a QUIC-only peer");
+    }
+
+    /// …and inbound: a QUIC-only peer dials the host's QUIC listener (the
+    /// wallet's `HostConfig::default` opens one on an ephemeral port).
+    #[tokio::test]
+    async fn a_quic_only_peer_reaches_the_host() {
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        dial_outcome(quic_only_peer(), host, "/ip4/127.0.0.1/udp/0/quic-v1")
+            .await
+            .expect("a stream from a QUIC-only peer");
     }
 
     /// What Nimbus does right after admitting a peer post-Fulu — its sync
@@ -2394,6 +2498,24 @@ mod dial_resolution_tests {
                 },
                 _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
             }
+        }
+    }
+
+    /// A name-pinned QUIC address resolves the same way a TCP one does: the
+    /// `/udp/<port>/quic-v1/p2p/<id>` tail survives on every candidate.
+    #[tokio::test]
+    async fn a_name_with_a_quic_tail_resolves_keeping_the_tail() {
+        let a: Multiaddr = "/dns4/localhost/udp/9105/quic-v1/p2p/\
+            16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            .parse()
+            .unwrap();
+        let out = resolve_dial_addrs(&a, &memo()).await;
+        assert!(!out.is_empty(), "localhost must resolve");
+        for m in &out {
+            assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
+            assert!(m.to_string().ends_with(
+                "/udp/9105/quic-v1/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"
+            ), "{m} lost its QUIC tail");
         }
     }
 

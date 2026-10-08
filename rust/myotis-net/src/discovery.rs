@@ -31,6 +31,9 @@ pub struct DiscoveredPeer {
     pub peer_id: PeerId,
     /// `/ip4/<ip>/tcp/<port>` (no `/p2p` suffix; the peer id travels separately).
     pub addr: Multiaddr,
+    /// `/ip4/<ip>/udp/<port>/quic-v1` when the record carries a `quic` (`quic6`)
+    /// field — the spec's primary transport. Dialed alongside `addr`, first.
+    pub quic: Option<Multiaddr>,
 }
 
 /// The accepted `eth2` fork digests: current first, then the prior fork's
@@ -509,23 +512,36 @@ fn classify_heard(
 /// must carry an `eth2` field whose fork digest is in our accepted set, a TCP
 /// endpoint, and a secp256k1 key we can turn into a libp2p PeerId.
 fn filter_candidate(enr: &Enr, accepted_digests: &[[u8; 4]]) -> Option<DiscoveredPeer> {
+    use libp2p::multiaddr::Protocol;
     let digest = enr_eth2_fork_digest(enr)?;
     let match_idx = accepted_digests.iter().position(|d| *d == digest)?;
 
-    let (ip, tcp_port): (IpAddr, u16) = if let (Some(ip4), Some(tcp4)) = (enr.ip4(), enr.tcp4()) {
-        (IpAddr::V4(ip4), tcp4)
-    } else if let (Some(ip6), Some(tcp6)) = (enr.ip6(), enr.tcp6()) {
-        (IpAddr::V6(ip6), tcp6)
-    } else {
-        return None;
-    };
+    // A TCP endpoint stays the entry ticket: every client listens on TCP, and
+    // the spec's QUIC port is an ADDITIONAL field (`quic` for the IPv4
+    // endpoint, `quic6` for IPv6 — fulu/p2p-interface.md). A record with QUIC
+    // but no TCP is not something the spec produces, so it is not a candidate.
+    let (ip, tcp_port, quic_key): (IpAddr, u16, &[u8]) =
+        if let (Some(ip4), Some(tcp4)) = (enr.ip4(), enr.tcp4()) {
+            (IpAddr::V4(ip4), tcp4, b"quic")
+        } else if let (Some(ip6), Some(tcp6)) = (enr.ip6(), enr.tcp6()) {
+            (IpAddr::V6(ip6), tcp6, b"quic6")
+        } else {
+            return None;
+        };
 
     let peer_id = enr_to_peer_id(enr)?;
-    let addr = Multiaddr::empty()
-        .with(ip.into())
-        .with(libp2p::multiaddr::Protocol::Tcp(tcp_port));
-    tracing::debug!(peer = %peer_id, %addr, prior_fork = match_idx > 0, "CL peer discovered");
-    Some(DiscoveredPeer { peer_id, addr })
+    let addr = Multiaddr::empty().with(ip.into()).with(Protocol::Tcp(tcp_port));
+    // Port 0 means "no QUIC listener" the way an absent field does; and a
+    // field that does not decode as a port is ignored, not a reason to drop
+    // the peer — its TCP endpoint is still good.
+    let quic = enr
+        .get_decodable::<u16>(quic_key)
+        .and_then(|r| r.ok())
+        .filter(|port| *port != 0)
+        .map(|port| Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port)).with(Protocol::QuicV1));
+    tracing::debug!(peer = %peer_id, %addr, quic = quic.as_ref().map(|q| q.to_string()).unwrap_or_default(),
+        prior_fork = match_idx > 0, "CL peer discovered");
+    Some(DiscoveredPeer { peer_id, addr, quic })
 }
 
 /// First 4 bytes of the ENR `eth2` field (SSZ `ENRForkID`: fork_digest(4) ||
@@ -775,6 +791,39 @@ mod server_enr_tests {
         f[4..8].copy_from_slice(&[0x07, 0x00, 0x00, 0x00]);
         f[8..].copy_from_slice(&u64::MAX.to_le_bytes());
         f
+    }
+
+    /// The spec's `quic` field (fulu/p2p-interface.md) names the UDP port of a
+    /// QUIC listener beside the record's TCP endpoint; a candidate carries both
+    /// addresses, and a record without the field — or with port 0 — just the
+    /// TCP one. Written the way Nimbus 26.9 writes it (`--quic-port`, 9001).
+    #[test]
+    fn a_record_with_a_quic_field_yields_a_quic_address_beside_tcp() {
+        let digest = [0x74u8, 0xd0, 0x14, 0x59];
+        let key = CombinedKey::generate_secp256k1();
+        let record = |quic: Option<u16>| {
+            let mut builder = Enr::builder();
+            builder.ip4("87.154.209.161".parse().unwrap()).tcp4(9104).udp4(9104);
+            builder.add_value(b"eth2".as_slice(), &eth2_field().as_slice());
+            if let Some(port) = quic {
+                builder.add_value(b"quic".as_slice(), &port);
+            }
+            builder.build(&key).unwrap()
+        };
+
+        let with = filter_candidate(&record(Some(9001)), &[digest]).expect("a candidate");
+        assert_eq!(with.addr.to_string(), "/ip4/87.154.209.161/tcp/9104");
+        assert_eq!(
+            with.quic.as_ref().map(|q| q.to_string()).as_deref(),
+            Some("/ip4/87.154.209.161/udp/9001/quic-v1")
+        );
+
+        let without = filter_candidate(&record(None), &[digest]).expect("a candidate");
+        assert_eq!(without.addr.to_string(), "/ip4/87.154.209.161/tcp/9104");
+        assert!(without.quic.is_none());
+
+        let zero = filter_candidate(&record(Some(0)), &[digest]).expect("a candidate");
+        assert!(zero.quic.is_none(), "port 0 is no listener");
     }
 
     #[test]

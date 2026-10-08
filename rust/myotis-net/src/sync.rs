@@ -1105,7 +1105,25 @@ impl SyncHandle {
 #[derive(Clone)]
 struct Peer {
     id: PeerId,
+    /// The TCP address — also the peer's identity in the shared cache
+    /// (`{addr}/p2p/{id}`), so it never changes shape when QUIC is learned.
     addr: Multiaddr,
+    /// `/ip4/<ip>/udp/<port>/quic-v1` from the peer's ENR `quic` field, when
+    /// it advertises one. Never a cache key; dialed first, beside `addr`.
+    quic: Option<Multiaddr>,
+}
+
+impl Peer {
+    /// Every address to dial, QUIC first: the host dials them concurrently and
+    /// keeps the first connection that completes (`ReqRespClient::request_raw_at`).
+    fn dial_addrs(&self) -> Vec<Multiaddr> {
+        let mut addrs = Vec::with_capacity(2);
+        if let Some(quic) = &self.quic {
+            addrs.push(quic.clone());
+        }
+        addrs.push(self.addr.clone());
+        addrs
+    }
 }
 
 struct PeerPool {
@@ -1431,7 +1449,20 @@ impl PeerPool {
     }
 
     fn add(&mut self, id: PeerId, addr: Multiaddr) {
+        self.add_with_quic(id, addr, None);
+    }
+
+    /// [`add`](Self::add), plus the QUIC address the peer's ENR advertises.
+    /// For an already-pooled peer the QUIC address is learned in place
+    /// (additive, never a cache key, so no identity changes), including for
+    /// a pinned static peer discovered again with its record.
+    fn add_with_quic(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>) {
         if self.known.contains(&id) {
+            if let Some(quic) = quic {
+                if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
+                    p.quic = Some(quic);
+                }
+            }
             // Already pooled. Refresh a pinned static peer's address in place:
             // it is un-evictable, so removal-then-rediscovery (the path an
             // ordinary peer self-heals an IP change through) never runs for it.
@@ -1473,7 +1504,7 @@ impl PeerPool {
             return;
         }
         self.known.insert(id);
-        self.peers.push(Peer { id, addr });
+        self.peers.push(Peer { id, addr, quic });
     }
 
     /// Whether `id` is a pinned static (config) peer.
@@ -1701,7 +1732,9 @@ fn parse_static_peer(multiaddr: &str) -> Option<Peer> {
             base.push(proto);
         }
     }
-    Some(Peer { id: peer_id?, addr: base })
+    // A pin in `/udp/<port>/quic-v1` form is simply the address; nothing to
+    // learn beside it.
+    Some(Peer { id: peer_id?, addr: base, quic: None })
 }
 
 // -------------------------------------------------------------------------
@@ -2184,7 +2217,7 @@ fn persist_snapshot(
 
 fn drain_discovered(rx: &mut mpsc::Receiver<discovery::DiscoveredPeer>, pool: &mut PeerPool) {
     while let Ok(p) = rx.try_recv() {
-        pool.add(p.peer_id, p.addr);
+        pool.add_with_quic(p.peer_id, p.addr, p.quic);
     }
 }
 
@@ -2218,9 +2251,9 @@ async fn try_bootstrap(
     for peer in &peers {
         let client = client.clone();
         let wire = wire.clone();
-        let (id, addr) = (peer.id, peer.addr.clone());
+        let (id, addrs) = (peer.id, peer.dial_addrs());
         futures.push(async move {
-            let res = client.request_raw(id, addr, protocols::BOOTSTRAP, wire).await;
+            let res = client.request_raw_at(id, addrs, protocols::BOOTSTRAP, wire).await;
             (id, res)
         });
     }
@@ -2900,7 +2933,7 @@ async fn catch_up(
                 let client = client.clone();
                 in_flight.push(Box::pin(async move {
                     let res = client
-                        .request_raw(peer.id, peer.addr.clone(), protocols::UPDATES_BY_RANGE, wire)
+                        .request_raw_at(peer.id, peer.dial_addrs(), protocols::UPDATES_BY_RANGE, wire)
                         .await;
                     (peer, single, from, count, res)
                 }));
@@ -3420,7 +3453,7 @@ async fn poll_finality(
                 // half-close (the empty Vec is the reqresp layer's "write
                 // nothing" contract).
                 let res = client
-                    .request_raw(peer.id, peer.addr.clone(), protocols::FINALITY_UPDATE, Vec::new())
+                    .request_raw_at(peer.id, peer.dial_addrs(), protocols::FINALITY_UPDATE, Vec::new())
                     .await;
                 (peer, res)
             }
@@ -3577,7 +3610,7 @@ async fn hunt_round(
             let client = client.clone();
             async move {
                 let res = client
-                    .request_raw(peer.id, peer.addr.clone(), protocols::FINALITY_UPDATE, Vec::new())
+                    .request_raw_at(peer.id, peer.dial_addrs(), protocols::FINALITY_UPDATE, Vec::new())
                     .await;
                 (peer, res)
             }

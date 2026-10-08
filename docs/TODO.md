@@ -206,8 +206,13 @@ complete on its own.
   only mplex there — so the two client families that DO serve Gloas
   light-client data were unreachable from the Rust engine by construction,
   and zbox's own Nimbus had been dropped as a "dead" pin in September for
-  the same reason. mplex is in (`reqresp::build_swarm`); the spec's primary
-  transport, QUIC, which needs no stream muxer, is the follow-up.
+  the same reason. mplex is in (`reqresp::build_swarm`), and so is the spec's
+  primary transport, QUIC (2026-10-09): the host listens on an ephemeral
+  `/udp/0/quic-v1` beside TCP, discovery turns an ENR `quic`/`quic6` field
+  into a second dial address, and a peer is dialed at both concurrently.
+  Still open: roost listens on TCP only (its relay forwards no spare UDP
+  port and its ENR carries no `quic` field), and the shipped Sepolia /
+  mainnet / gnosis pins are all `/tcp/` multiaddrs.
   **And a second, independent cause behind it:** once a connection to zbox's
   Nimbus came up over mplex, Nimbus admitted us and then dropped us ~100 ms
   later, before our bootstrap request was served — its post-Fulu sync
