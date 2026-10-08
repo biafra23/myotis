@@ -561,12 +561,12 @@ fn hex32(s: &str) -> [u8; 32] {
 /// `NetworkConfigGnosisTest` pins that one).
 ///
 /// Only roost, the dedicated light-client server, since 2026-10-07: it is the
-/// only Sepolia server either engine can sync Gloas-era light-client data from
-/// today. The dropped Lighthouse entries below serve none; Nimbus and Lodestar
-/// nodes do, but neither engine can hold a connection to them before #576
+/// only Sepolia server known to serve Gloas-era light-client data to a build
+/// without #576. The dropped Lighthouse entries below serve none; zbox's
+/// Nimbus does, but neither engine can hold a Nimbus connection without #576
 /// (see the note at the end of the list). So a roost fault leaves a Sepolia
-/// wallet nothing to fall back to until then (#566) — below release check
-/// 3a's two-pin floor.
+/// wallet nothing to fall back to until a second server is pinned (#566) —
+/// below release check 3a's two-pin floor.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
     // FIRST on purpose: it exists because a general-purpose beacon node is
@@ -622,20 +622,19 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // period 1379 to stay broken even after a Lighthouse release with Gloas
     // support, since the entry stored under 1379 is the Fulu-format one.
     //
-    // Not pinnable before #576: zbox's own Nimbus (9104) serves Gloas
+    // Not pinnable without #576: zbox's own Nimbus (9104) serves Gloas
     // light-client data — over REST to roost, and over libp2p to a build with
-    // #576, which synced a Rust-engine wallet from it alone (2026-10-08). On
-    // this list's engines it cannot: the Rust host offers only yamux where
-    // Nimbus speaks only mplex, and neither engine answers what Nimbus's peer
-    // loop asks right after admitting a peer (metadata/3, then the
-    // beacon_blocks_by_root, data_column_sidecars_by_root and
-    // execution_payload_envelopes_by_root requests), each of which ends that
-    // loop. An earlier note here put its closes down to the low-bandwidth
-    // unit's --max-peers=25; it was the muxer mismatch. It is the obvious
+    // #576, which synced a Rust-engine wallet from it alone (2026-10-08).
+    // Without #576 it cannot: the Rust host offers only yamux where Nimbus
+    // speaks only mplex, and neither engine answers what Nimbus's peer loop
+    // asks of a new peer (metadata/3, then beacon_blocks_by_root,
+    // data_column_sidecars_by_root and execution_payload_envelopes_by_root);
+    // a protocol the peer does not offer ends that loop. It is the obvious
     // second pin once #576 is in (#566), with a --netkey-file so its peer id
     // survives restarts. The public Lodestar node (65.21.93.60) closing
-    // inbound connections (2026-10-06) is probably the same mismatch —
-    // Lodestar also speaks only mplex — and was not re-checked.
+    // inbound connections (2026-10-06) may be the same mismatch — Lodestar
+    // also speaks only mplex on TCP — and was not re-checked; whether Lodestar
+    // serves Gloas light-client data over libp2p is unchecked too.
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -4388,8 +4387,8 @@ mod tests {
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
             ],
-            "roost alone (the dedicated LC server; no public server either engine can \
-             reach serves Gloas-era light-client data before #576) — same list, order \
+            "roost alone (the dedicated LC server; no public server a build without #576 \
+             can reach is known to serve Gloas-era light-client data) — same list, order \
              AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
