@@ -210,6 +210,9 @@ complete on its own.
     that ran v8.3.0-rc.0 across the fork even after a fixed release.
     Period-1379 censuses (zbox 170 peers, runner 218) found every Lighthouse
     answer an error or empty, Prysm and Grandine without the protocol, and
-    100+ peers closing before Identify. zbox's own Nimbus closes inbound
-    connections (low-bandwidth unit, `--max-peers=25`), so #566's option 3
-    needs that unit changed first.
+    100+ peers closing before Identify — most likely many of them Nimbus and
+    Lodestar nodes the yamux-only census host could not reach (#576), so
+    those censuses do not show roost to be the only server. zbox's own
+    Nimbus (#566's option 3) needs #576, not a different unit: the
+    `--max-peers=25` explanation first recorded here was that muxer
+    mismatch.

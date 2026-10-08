@@ -43,6 +43,10 @@
 //! undecodable answers (2026-09-13; reqresp keys its outbound bookkeeping by
 //! request id alone, and libp2p issues those ids per protocol). The crawl
 //! itself stays concurrent, so read its negative buckets with that in mind.
+//! A peer that closes or fails the dial with no Identify is often one with no
+//! stream muxer in common — every Nimbus and Lodestar node, which speak only
+//! mplex on TCP, against a yamux-only host (#576) — so a large bucket of those
+//! is unmeasured, not dead.
 //! A pin that fails its first ask gets one more, 11 s later: a busy public
 //! node closes on a full peer table and answers the next ask, so a single
 //! failure is not grounds to prune. Only `updates_by_range` is asked, so a

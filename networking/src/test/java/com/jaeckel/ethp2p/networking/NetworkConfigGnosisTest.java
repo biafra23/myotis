@@ -221,13 +221,14 @@ class NetworkConfigGnosisTest {
         // roost, the dedicated light-client server, is tried first — that is the
         // point of having it. Census-verified public servers would follow, so a
         // roost fault degrades to working peers rather than to dead pins; since
-        // the Gloas fork none serves Gloas-era light-client data, so roost is
-        // alone (#566). The full list, in order — the Rust twin
+        // the Gloas fork none that either engine can reach serves Gloas-era
+        // light-client data (zbox's Nimbus will be, with #576), so roost is alone
+        // (#566). The full list, in order — the Rust twin
         // (sepolia_config_matches_networkconfig_java) pins the same strings.
         assertEquals(List.of(
                         "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
                 NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
-                "roost alone until a public server serves Gloas, same list as the Rust twin");
+                "roost alone until a reachable public server serves Gloas, same list as the Rust twin");
     }
 
     @Test

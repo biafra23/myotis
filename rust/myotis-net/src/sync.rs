@@ -560,10 +560,12 @@ fn hex32(s: &str) -> [u8; 32] {
 /// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
 /// `NetworkConfigGnosisTest` pins that one).
 ///
-/// Only roost, the dedicated light-client server, since 2026-10-07: no other
-/// server a census has found on Sepolia serves light-client data from the Gloas
-/// fork on (the dropped entries below), so a roost fault leaves a Sepolia
-/// wallet nothing to fall back to until one does (#566) — below release check
+/// Only roost, the dedicated light-client server, since 2026-10-07: it is the
+/// only Sepolia server either engine can sync Gloas-era light-client data from
+/// today. The dropped Lighthouse entries below serve none; Nimbus and Lodestar
+/// nodes do, but neither engine can hold a connection to them before #576
+/// (see the note at the end of the list). So a roost fault leaves a Sepolia
+/// wallet nothing to fall back to until then (#566) — below release check
 /// 3a's two-pin floor.
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
@@ -608,8 +610,11 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // "Database error" — both pins among them — 13 answering empty, 13 Prysm
     // and 1 Grandine without the protocol, roost again the only server). Both
     // censuses also met 100+ peers that closed or refused the connection
-    // before Identify, so their clients are unknown: full nodes of any client
-    // do that, and a server among them is out of a wallet's reach as well.
+    // before Identify. Many of those were most likely Nimbus or Lodestar
+    // nodes: both speak only mplex on TCP, and the census's host offered only
+    // yamux (#576), so no stream ever opened. "roost the only server" is what
+    // a yamux-only build could see, not who serves — the Lighthouse verdicts
+    // above stand on their own.
     //
     // Re-add one (or pin anything else) only once a census shows it serving
     // Gloas periods AND live_pins_alive, which now asks for the current
@@ -617,12 +622,20 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // period 1379 to stay broken even after a Lighthouse release with Gloas
     // support, since the entry stored under 1379 is the Fulu-format one.
     //
-    // Not a candidate as configured either: zbox's own Nimbus (9104), which
-    // serves Gloas light-client data to roost over REST, runs the
-    // low-bandwidth unit (--max-peers=25) and closes an inbound connection
-    // right after the muxer upgrade, even over loopback (2026-10-07). The
-    // public Lodestar node (65.21.93.60) closes inbound libp2p connections
-    // (2026-10-06).
+    // Not pinnable before #576: zbox's own Nimbus (9104) serves Gloas
+    // light-client data — over REST to roost, and over libp2p to a build with
+    // #576, which synced a Rust-engine wallet from it alone (2026-10-08). On
+    // this list's engines it cannot: the Rust host offers only yamux where
+    // Nimbus speaks only mplex, and neither engine answers what Nimbus's peer
+    // loop asks right after admitting a peer (metadata/3, then the
+    // beacon_blocks_by_root, data_column_sidecars_by_root and
+    // execution_payload_envelopes_by_root requests), each of which ends that
+    // loop. An earlier note here put its closes down to the low-bandwidth
+    // unit's --max-peers=25; it was the muxer mismatch. It is the obvious
+    // second pin once #576 is in (#566), with a --netkey-file so its peer id
+    // survives restarts. The public Lodestar node (65.21.93.60) closing
+    // inbound connections (2026-10-06) is probably the same mismatch —
+    // Lodestar also speaks only mplex — and was not re-checked.
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -4375,8 +4388,9 @@ mod tests {
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
             ],
-            "roost alone (the dedicated LC server; no public server serves Gloas-era \
-             light-client data) — same list, order AND addresses as the Java \
+            "roost alone (the dedicated LC server; no public server either engine can \
+             reach serves Gloas-era light-client data before #576) — same list, order \
+             AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
         // A malformed pin would otherwise reach run_sync and surface only as a

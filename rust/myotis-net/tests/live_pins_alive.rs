@@ -39,7 +39,8 @@
 //! * a pin that serves the anchor but not the CURRENT period — its
 //!   light-client server stopped somewhere between the two, as Sepolia's
 //!   Lighthouse servers did at the Gloas fork (2026-10-06: ServerError
-//!   "Database error" for every Gloas period). A fresh install bootstraps from
+//!   "Database error" for period 1379, empty answers from 1380 on). A fresh
+//!   install bootstraps from
 //!   it and then cannot follow the chain. It is asked separately because an
 //!   anchor embedded before the stop says nothing about it: run on 2026-10-07
 //!   with v0.1.13's pre-fork anchor, the old check still passed a Lighthouse

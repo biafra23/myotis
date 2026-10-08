@@ -337,10 +337,12 @@ public record NetworkConfig(
             // mainnet list above. ENR publication (lc-server-design §7) is what
             // removes the need to pin at all.
             //
-            // Only roost since 2026-10-07: no other server a census has found
-            // on Sepolia serves light-client data from the Gloas fork on, so a
-            // roost fault leaves a Sepolia wallet nothing to fall back to until
-            // one does (#566) — below release check 3a's two-pin floor.
+            // Only roost since 2026-10-07: it is the only Sepolia server either
+            // engine can sync Gloas-era light-client data from today. Nimbus and
+            // Lodestar nodes serve it too, but neither engine can hold a
+            // connection to them before #576 (see below), so a roost fault
+            // leaves a Sepolia wallet nothing to fall back to until then
+            // (#566) — below release check 3a's two-pin floor.
             //
             // Dropped 2026-10-07: 65.109.144.95 and 198.13.138.237, both
             // Lighthouse v8.3.0-rc.0. Census-verified public servers from
@@ -363,16 +365,24 @@ public record NetworkConfig(
             // peers: 63 Lighthouse rc.0 ServerError, both pins among them, 13
             // empty, Prysm and Grandine without the protocol, roost again the
             // only server); 100+ peers in each closed or refused the connection
-            // before Identify, so their clients are unknown.
+            // before Identify — most likely many Nimbus and Lodestar nodes,
+            // which speak only mplex on TCP while the census's (Rust) host
+            // offered only yamux (#576). So "roost the only server" is what a
+            // yamux-only build could see, not who serves.
             // Re-add one only once a census shows it serving Gloas periods and
             // live_pins_alive (which now asks for the current period too)
             // passes it; on nodes that ran rc.0 across the fork expect period
             // 1379 to stay broken even after a Lighthouse release with Gloas
-            // support. Not candidates as configured: zbox's own Nimbus (9104,
-            // the low-bandwidth unit, --max-peers=25) closes an inbound
-            // connection right after the muxer upgrade even over loopback, and
-            // the public Lodestar node (65.21.93.60) closes inbound libp2p
-            // connections. Keep
+            // support. Not pinnable before #576: zbox's own Nimbus (9104)
+            // serves Gloas light-client data, but the Rust engine offers only
+            // yamux where Nimbus speaks only mplex, and neither engine answers
+            // what Nimbus's peer loop asks right after admitting a peer
+            // (metadata/3, then three by-root requests), each of which ends
+            // the loop. An earlier note put its closes down to
+            // --max-peers=25; it was the muxer mismatch. It is the obvious
+            // second pin once #576 is in. The public Lodestar node
+            // (65.21.93.60) closing inbound connections is probably the same
+            // mismatch (Lodestar also speaks only mplex), not re-checked. Keep
             // this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of("/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
