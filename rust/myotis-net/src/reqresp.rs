@@ -1487,8 +1487,14 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 let mut response = respond_inbound(ctx, protocol, peer, &request);
                 // Refuse rather than queue when the in-flight budget is spent.
                 // ResourceUnavailable is the answer a wallet already knows how
-                // to handle, and it costs us nothing to hold.
-                if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
+                // to handle, and it costs us nothing to hold. A zero-chunk
+                // answer is exempt: it holds nothing either, and swapping it
+                // for an error chunk would turn "none of these" into the
+                // failed request that ends Nimbus's peer loop (see
+                // `protocols::BLOCKS_BY_ROOT`) — on a roost under response
+                // pressure, exactly when it matters.
+                if !response.is_empty()
+                    && ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
                 {
                     tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
                         want = response.len(),
@@ -2308,11 +2314,19 @@ mod dial_resolution_tests {
     /// NOTHING: zero chunks, not a success chunk and not an error.
     #[tokio::test]
     async fn a_blocks_by_root_request_is_answered_with_zero_chunks() {
-        // 64 roots: 2 KiB of SSZ, twice the cap every other request gets
-        // (`MAX_REQUEST_WIRE_BYTES`), so this also pins the root-list cap in
-        // `read_request` — a Nimbus asks for up to 32 at a time.
-        let roots: Vec<u8> = (0..64u8).flat_map(|i| [i; 32]).collect();
-        zero_chunks_for(protocols::BLOCKS_BY_ROOT, codec::encode_request(&roots)).await;
+        // 64 roots of incompressible bytes, so the FRAMED request (the cap in
+        // `read_request` counts wire bytes, after snappy) is bigger than the
+        // cap every other request gets — a Nimbus asks for up to 32 real
+        // roots at a time, ~1 KiB of SSZ that does not compress either. The
+        // assert keeps this test honest about pinning the root-list cap.
+        let roots: Vec<u8> = (0..2048u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let request = codec::encode_request(&roots);
+        assert!(
+            request.len() > MAX_REQUEST_WIRE_BYTES,
+            "the cap pin needs a wire request over {MAX_REQUEST_WIRE_BYTES} bytes, got {}",
+            request.len()
+        );
+        zero_chunks_for(protocols::BLOCKS_BY_ROOT, request).await;
     }
 
     #[tokio::test]
