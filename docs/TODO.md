@@ -206,8 +206,24 @@ complete on its own.
   only mplex there — so the two client families that DO serve Gloas
   light-client data were unreachable from the Rust engine by construction,
   and zbox's own Nimbus had been dropped as a "dead" pin in September for
-  the same reason. mplex is in (`reqresp::build_swarm`); the spec's primary
-  transport, QUIC, which needs no stream muxer, is the follow-up.
+  the same reason. mplex is in (`reqresp::build_swarm`), and so is the spec's
+  primary transport, QUIC (2026-10-09): the host listens on an ephemeral
+  `/udp/0/quic-v1` beside TCP, discovery turns an ENR `quic`/`quic6` field
+  into a second dial address, and a peer is dialed at TCP first, QUIC only
+  when the TCP dial fails. **Not QUIC first, measured:** pinned to zbox's
+  Nimbus over `udp/9001/quic-v1` alone, the handshake, identify, status and
+  the first four finality polls worked (`SYNCED`), then every further
+  stream open hung (`Timeout while waiting for a response`) until Nimbus
+  aborted the connection after ~70 s with lsquic's
+  `connection timed out due to lack of progress` — its `es_noprogress_timeout`,
+  which fires when the APPLICATION (nim-libp2p's QUIC muxer) stops servicing
+  streams, so the stall is on Nimbus's side; over TCP the same node served
+  for as long as it was asked. Upstream candidate (status-im/nim-libp2p,
+  QUIC is new in Nimbus 26.9). Flip the order once a Nimbus release holds a
+  QUIC connection open across many streams. Still open: roost listens on TCP
+  only (its relay forwards no spare UDP port and its ENR carries no `quic`
+  field), and the shipped Sepolia / mainnet / gnosis pins are all `/tcp/`
+  multiaddrs.
   **And a second, independent cause behind it:** once a connection to zbox's
   Nimbus came up over mplex, Nimbus admitted us and then dropped us ~100 ms
   later, before our bootstrap request was served — its post-Fulu sync
