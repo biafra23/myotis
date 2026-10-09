@@ -64,7 +64,8 @@ its deployment block:
      ```bash
      gunzip bee-logindex-gnosis.db.gz
      # daemon: drop the file in place as app/logindex-gnosis.db before first
-     # start, or import into a running desktop/mobile app via the Index tab (Settings → Expert mode).
+     # start, or import into a running desktop/mobile app via the Index tab (Settings →
+     # Expert mode; a PoC build first-starts in Expert mode so the tab is already there).
      ```
 
      After import the node automatically catches up from the snapshot's top
