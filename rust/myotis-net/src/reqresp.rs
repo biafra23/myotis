@@ -430,9 +430,6 @@ enum Command {
     Shutdown,
 }
 
-/// Cheap-to-clone client for issuing eth2 req/resp calls against the running
-/// swarm task. Independent instances of the whole stack are independent — no
-/// globals anywhere in this crate.
 /// Identify `agent_version` per CONNECTED peer, shared between the swarm task
 /// (which fills it on Identify and empties it on the last connection closing)
 /// and the sync loop, which stamps it on every log line that names a peer as
@@ -454,6 +451,9 @@ fn client_label(agents: &AgentMap, peer: &PeerId) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// Cheap-to-clone client for issuing eth2 req/resp calls against the running
+/// swarm task. Independent instances of the whole stack are independent — no
+/// globals anywhere in this crate.
 #[derive(Clone)]
 pub struct ReqRespClient {
     tx: mpsc::Sender<Command>,
@@ -1362,21 +1362,14 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
             if num_established == 0 {
                 ctx.connected.remove(&peer_id);
                 let said_goodbye = ctx.goodbye_from.remove(&peer_id);
-                let had_status = ctx.status_done.contains(&peer_id);
-                let client = client_label(&ctx.peer_agents, &peer_id);
-                // Name the peer that dropped us: a Status-complete peer whose
-                // connection ended on a transport error with no Goodbye first
-                // is the "disconnected us unexpectedly" case a log reader
-                // needs to see by client. A Goodbye already logged itself
-                // (`peer sent goodbye`), and an idle keep-alive expiry or a
-                // close we made ourselves (`cause` None) is routine — those
-                // stay at debug with the rest.
-                match &cause {
-                    Some(libp2p::swarm::ConnectionError::IO(e)) if had_status && !said_goodbye => {
-                        tracing::info!(peer = %peer_id, %client, error = %e,
-                            "peer connection dropped without goodbye");
-                    }
-                    _ => {}
+                // Name the peer that dropped us (see `remote_drop_without_goodbye`
+                // for exactly which closes qualify), while its agent is still
+                // in the map — the clean-up below forgets it.
+                if let Some(e) =
+                    remote_drop_without_goodbye(&cause, ctx.status_done.contains(&peer_id), said_goodbye)
+                {
+                    tracing::info!(peer = %peer_id, client = %client_label(&ctx.peer_agents, &peer_id),
+                        error = %e, "peer connection dropped without goodbye");
                 }
                 // Next connection must redo the Status handshake — and drop the
                 // per-peer metadata it produced so these maps stay bounded by
@@ -1409,6 +1402,25 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
             tracing::debug!(%address, "listening");
         }
         _ => {}
+    }
+}
+
+/// The one connection close worth an INFO line with the peer's client: the
+/// remote side ended it (`cause` is an I/O error — a reset, an EOF, or the
+/// remote shutting the transport down), on a peer whose auto-Status had
+/// settled (answered or failed: a peer we had done business with, not a dial
+/// that never got past the handshake), and no Goodbye came first. A Goodbye
+/// already logged itself (`peer sent goodbye`); an idle keep-alive expiry and
+/// a close we made ourselves (`cause` None) are routine and stay at debug.
+/// Returns the error to print.
+fn remote_drop_without_goodbye(
+    cause: &Option<libp2p::swarm::ConnectionError>,
+    status_settled: bool,
+    said_goodbye: bool,
+) -> Option<&io::Error> {
+    match cause {
+        Some(libp2p::swarm::ConnectionError::IO(e)) if status_settled && !said_goodbye => Some(e),
+        _ => None,
     }
 }
 
@@ -1471,8 +1483,8 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 // to handle, and it costs us nothing to hold.
                 if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
                 {
-                    tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
-                        want = response.len(),
+                    tracing::warn!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                        protocol, queued = ctx.in_flight_bytes, want = response.len(),
                         "in-flight response budget exhausted — answering ResourceUnavailable");
                     response = codec::encode_error_response(
                         codec::RESULT_RESOURCE_UNAVAILABLE,
@@ -1716,8 +1728,8 @@ fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw
             (Some(lc), Ok(root)) => {
                 let root: [u8; 32] = root;
                 let served = lc.bootstrap(&root);
-                tracing::info!(peer = %peer, root = %hex8(&root),
-                    served = served.is_some(), "light_client_bootstrap request");
+                tracing::info!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                    root = %hex8(&root), served = served.is_some(), "light_client_bootstrap request");
                 served.unwrap_or_else(resource_unavailable)
             }
             (Some(_), Err(_)) => codec::encode_error_response(
@@ -1737,8 +1749,8 @@ fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw
                 let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
                 let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
                 let served = lc.updates_by_range(start, count);
-                tracing::info!(peer = %peer, start, count, served = served.is_some(),
-                    "light_client_updates_by_range request");
+                tracing::info!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                    start, count, served = served.is_some(), "light_client_updates_by_range request");
                 served.unwrap_or_else(resource_unavailable)
             }
             None => resource_unavailable(),
@@ -2328,10 +2340,6 @@ mod pending_request_tests {
         handle_swarm_event(swarm, ctx, event);
     }
 
-    /// Two protocols' first requests in flight together carry the same id. Keyed
-    /// on the id alone, the second insert dropped the first caller's reply
-    /// channel — which a caller sees as "service shut down" — and the bootstrap
-    /// response was handed to the finality caller.
     /// The `client=` label a log line prints for a peer: `?` until Identify
     /// names the agent, the agent while connected, `?` again once the last
     /// connection closes (the map is bounded by the connected set) — and the
@@ -2374,6 +2382,26 @@ mod pending_request_tests {
         assert!(!ctx.goodbye_from.contains(&p), "…and the Goodbye mark with it");
     }
 
+    /// The INFO line for a peer that dropped us fires for a remote-side close
+    /// (an I/O cause) of a Status-settled peer that sent no Goodbye — and for
+    /// nothing else: not a Goodbye'd close, not a keep-alive expiry, not a
+    /// close we made ourselves, not a peer that never settled Status.
+    #[test]
+    fn remote_drop_without_goodbye_is_the_only_info_case() {
+        use libp2p::swarm::ConnectionError;
+        let io = || Some(ConnectionError::IO(io::Error::new(io::ErrorKind::ConnectionReset, "reset")));
+        assert!(remote_drop_without_goodbye(&io(), true, false).is_some());
+        assert!(remote_drop_without_goodbye(&io(), true, true).is_none(), "announced leave");
+        assert!(remote_drop_without_goodbye(&io(), false, false).is_none(), "Status never settled");
+        let idle = Some(ConnectionError::KeepAliveTimeout);
+        assert!(remote_drop_without_goodbye(&idle, true, false).is_none(), "keep-alive expiry");
+        assert!(remote_drop_without_goodbye(&None, true, false).is_none(), "closed locally");
+    }
+
+    /// Two protocols' first requests in flight together carry the same id. Keyed
+    /// on the id alone, the second insert dropped the first caller's reply
+    /// channel — which a caller sees as "service shut down" — and the bootstrap
+    /// response was handed to the finality caller.
     #[tokio::test]
     async fn first_requests_on_two_protocols_reach_their_own_callers() {
         let (mut swarm, mut ctx) = host();
