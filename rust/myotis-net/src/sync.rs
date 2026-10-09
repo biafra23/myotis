@@ -1134,8 +1134,12 @@ impl Peer {
     /// Every address to dial, in the order `ReqRespClient::request_raw_at`
     /// tries them: TCP first, QUIC only when the TCP dial itself fails.
     ///
-    /// The spec calls QUIC the primary transport, and a future client may
-    /// well drop TCP — which is what the fallback is for. It is not tried
+    /// The spec calls QUIC the primary transport; the fallback is for a peer
+    /// whose TCP port is closed or filtered while its QUIC one answers. (A
+    /// client that drops TCP altogether publishes no `tcp` field, and
+    /// `discovery::filter_candidate` admits no such record — a candidate needs
+    /// a TCP endpoint — so it would have to be pinned by its QUIC multiaddr,
+    /// which `parse_static_peer` accepts as the address.) It is not tried
     /// first because, measured against Nimbus v26.9.1 (lsquic) on 2026-10-09,
     /// a QUIC connection answered a handful of streams and then every further
     /// stream open hung until Nimbus aborted the connection ~70 s later
