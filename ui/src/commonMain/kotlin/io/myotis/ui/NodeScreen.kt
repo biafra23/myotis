@@ -81,10 +81,6 @@ import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
-// Verified head older than this reads as "warming up" (amber) — wallet calls would -32000 until a
-// fresh servable head exists. Matches the old Android ReadinessStrip threshold.
-private const val READY_HEAD_WARM_MS = 45_000L
-
 /** Default [NetworkStatus] for hosts with no connectivity concept (Desktop): always online. */
 private object AlwaysOnline : NetworkStatus {
     override fun online(): kotlinx.coroutines.flow.Flow<Boolean> = kotlinx.coroutines.flow.flowOf(true)
@@ -298,44 +294,17 @@ private fun NetworkChips(
  */
 @Composable
 internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUpProgress? = null) {
-    // Ranked below every red/amber node state (those explain the index's lag too, and fixing
-    // them comes first) and above both greens: a node whose index refuses head queries is
-    // not "ready", however deep its peer pool.
-    val indexCatchingUp = catchUp != null && s != null && s.running && s.lifecycle != "PAUSED" &&
-        !upgradeCutOff(s) && s.beaconState == "SYNCED" && s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS
-    val (color, height, label) = when {
-        s != null && s.lifecycle == "PAUSED" ->
-            Triple(Color(0xFF78909C), 3.dp,
-                if (s.upgrade == null) "Node readiness: sleeping — a request wakes it"
-                else "Node readiness: sleeping — peers report a network upgrade this version doesn't support")
-        s == null || !s.running ->
-            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
-        // An unsupported upgrade the node's own state corroborates outranks a stale-anchor
-        // park: updating the app fixes both (a new build ships a fresh checkpoint too),
-        // while consenting to the old anchor cannot make this build follow the fork.
-        upgradeCutOff(s) ->
-            Triple(Color(0xFFD32F2F), 3.dp,
-                "Node readiness: not verifying — peers report a network upgrade this version doesn't support; update the app")
-        s.beaconState == "STALE_ANCHOR" ->
-            Triple(Color(0xFFD32F2F), 3.dp,
-                "Node readiness: sync anchor too old — paused awaiting your consent")
-        s.beaconState != "SYNCED" ->
-            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
-        s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
-            Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
-        indexCatchingUp && catchUp != null ->
-            Triple(Color(0xFFF9A825), 6.dp,
-                "Node readiness: ${LogIndexStatus.catchUpLine(catchUp)}; " +
-                    "eth_getLogs near the head is refused" +
-                    if (catchUp.stalled) "" else " until it has caught up")
-        s.snapServingPeers >= deepPoolThreshold ->
-            Triple(Color(0xFF00E676), 6.dp,
-                "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
-        else ->
-            Triple(Color(0xFF2E7D32), 3.dp,
-                "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
+    // One ladder for every readiness surface (Readiness.kt); the strip only paints it.
+    val r = readinessOf(s, deepPoolThreshold, catchUp)
+    val color = StatusColors.of(r.level)
+    // The two rungs past "ready" are drawn thicker: the deep pool, and the index
+    // catch-up whose strip doubles as its progress bar.
+    val height = when (r.level) {
+        ReadinessLevel.INDEX_CATCHING_UP, ReadinessLevel.FULLY_READY -> 6.dp
+        else -> 3.dp
     }
-    if (indexCatchingUp && catchUp != null) {
+    val label = r.a11yLabel
+    if (r.level == ReadinessLevel.INDEX_CATCHING_UP && catchUp != null) {
         // The strip itself becomes the progress bar, with the gap spelled out beneath it.
         // One semantics node carrying both the label and, while it moves, the bar's value.
         Column(
@@ -907,7 +876,7 @@ private fun HuntBanner(s: NodeSnapshot) {
     Text(
         "Hunting for ${targets.joinToString(" and ")}…",
         style = MaterialTheme.typography.bodySmall,
-        color = Color(0xFFF9A825), // amber — same signal family as "warming up"
+        color = StatusColors.Amber, // same signal family as "warming up"
         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
             .semantics { contentDescription = "LC hunt active: searching for light-client servers" },
     )
@@ -975,15 +944,6 @@ private fun PeerRowView(p: PeerRow) {
         )
     }
 }
-
-/**
- * An ACTIVE upgrade advisory that the node's OWN verified state corroborates: the beacon
- * feed is not SYNCED, or its verified head has gone stale. The advisory is unverified peer
- * data, so on its own it never turns readiness red or claims the node stopped verifying —
- * a SYNCED, fresh node is verifying, whatever peers say.
- */
-private fun upgradeCutOff(s: NodeSnapshot): Boolean =
-    s.upgrade?.active == true && (s.beaconState != "SYNCED" || s.verifiedHeadAgeMs > READY_HEAD_WARM_MS)
 
 /**
  * Upgrade banner (Status + Query): peers announce — or report already activated — a network
@@ -1627,7 +1587,7 @@ private fun TxScanInfoCaption(info: TxScanEvent.Started) {
         style = MaterialTheme.typography.bodySmall,
         // Amber when the CID didn't come from the live contract read (cached/hardcoded),
         // or when staleness can't be judged (no verified head to compare against).
-        color = if (degradedSource || info.headBlock == null) Color(0xFFF9A825)
+        color = if (degradedSource || info.headBlock == null) StatusColors.Amber
         else MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
