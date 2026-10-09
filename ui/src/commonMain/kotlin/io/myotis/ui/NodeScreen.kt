@@ -502,16 +502,11 @@ private fun SettingsTab(
             networks.forEach { put(it, settings.rpcPortFor(it).toString()) }
         }
     }
-    var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
-    var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
-    var wsBound by remember { mutableStateOf(settings.wsBoundPeriods().toString()) }
-    var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    // The Expert-mode tuning fields live here, not in NodeTuning: Save persists the text
+    // fields, and the section comes and goes with the Expert switch while the tab stays.
+    val tuning = remember { TuningFields(settings) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
-    var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
-    var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
-    var preferJava by remember { mutableStateOf(settings.preferJavaEngine()) }
-    var torRouting by remember { mutableStateOf(settings.torEnabled()) }
     var allowNap by remember { mutableStateOf(settings.allowAppNap()) }
 
     Column(
@@ -521,7 +516,8 @@ private fun SettingsTab(
         SettingsSection("Networks")
         SettingsNote(
             "Turn a chain on to run it. Each chain runs as its own node with its own JSON-RPC " +
-                "port — add each port to your wallet as a separate RPC URL.",
+                "port — add each port to your wallet as a separate RPC URL. Save applies a " +
+                "port change by restarting that chain.",
         )
         networks.forEach { id ->
             NetworkCard(
@@ -607,26 +603,16 @@ private fun SettingsTab(
 
         if (expert) {
             HorizontalDivider()
-            NodeTuning(
-                controller, settings, onLogIndexChanged,
-                snapTarget, { snapTarget = it },
-                servedWindow, { servedWindow = it },
-                deepPool, { deepPool = it },
-                wsBound, { wsBound = it },
-                strictFreshness, { strictFreshness = it },
-                nativeBls, { nativeBls = it },
-                preferJava, { preferJava = it },
-                torRouting, { torRouting = it },
-            )
+            NodeTuning(controller, settings, tuning, onLogIndexChanged)
         }
         Button(
             onClick = {
-                val snap = snapTarget.toIntOrNull() ?: 32
-                val window = servedWindow.toIntOrNull() ?: 32
-                val deep = deepPool.toIntOrNull() ?: 16
+                val snap = tuning.snapTarget.toIntOrNull() ?: 32
+                val window = tuning.servedWindow.toIntOrNull() ?: 32
+                val deep = tuning.deepPool.toIntOrNull() ?: 16
                 // Blank/invalid keeps the CURRENT value (0 would silently restore the
                 // default bound — a security knob must not change on a stray edit).
-                val ws = wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
+                val ws = tuning.wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
                 settings.setSnapTarget(snap)          // persist
                 settings.setServedBlockWindow(window) // persist
                 settings.setDeepPool(deep)            // persist (read at readiness-check time)
@@ -659,53 +645,61 @@ private fun SettingsTab(
 }
 
 /**
+ * The Expert-mode tuning fields of [SettingsTab], seeded from [Settings] once per tab
+ * composition. The text fields are persisted by the Save button; the switches write
+ * through as they flip and are mirrored here for the UI.
+ */
+private class TuningFields(settings: Settings) {
+    var snapTarget by mutableStateOf(settings.snapTarget().toString())
+    var servedWindow by mutableStateOf(settings.servedBlockWindow().toString())
+    var deepPool by mutableStateOf(settings.deepPoolThreshold().toString())
+    var wsBound by mutableStateOf(settings.wsBoundPeriods().toString())
+    var strictFreshness by mutableStateOf(settings.strictStateFreshness())
+    var nativeBls by mutableStateOf(settings.nativeBlsEnabled())
+    var preferJava by mutableStateOf(settings.preferJavaEngine())
+    var torRouting by mutableStateOf(settings.torEnabled())
+}
+
+/**
  * The Expert-mode "Node tuning" section of [SettingsTab]: the knobs that shape how the
- * node syncs and serves. State lives in the tab (the Save button persists the text
- * fields), so every field arrives as value + setter.
+ * node syncs and serves, over the tab's [TuningFields].
  */
 @Composable
 private fun NodeTuning(
     controller: NodeController,
     settings: Settings,
+    f: TuningFields,
     onLogIndexChanged: () -> Unit,
-    snapTarget: String, onSnapTarget: (String) -> Unit,
-    servedWindow: String, onServedWindow: (String) -> Unit,
-    deepPool: String, onDeepPool: (String) -> Unit,
-    wsBound: String, onWsBound: (String) -> Unit,
-    strictFreshness: Boolean, onStrictFreshness: (Boolean) -> Unit,
-    nativeBls: Boolean, onNativeBls: (Boolean) -> Unit,
-    preferJava: Boolean, onPreferJava: (Boolean) -> Unit,
-    torRouting: Boolean, onTorRouting: (Boolean) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsSection("Node tuning")
         OutlinedTextField(
-            value = snapTarget,
-            onValueChange = { onSnapTarget(it.filter(Char::isDigit).take(3)) },
+            value = f.snapTarget,
+            onValueChange = { f.snapTarget = it.filter(Char::isDigit).take(3) },
             label = { Text("Snap-peer target (default 32)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
-            value = servedWindow,
-            onValueChange = { onServedWindow(it.filter(Char::isDigit).take(4)) },
+            value = f.servedWindow,
+            onValueChange = { f.servedWindow = it.filter(Char::isDigit).take(4) },
             label = { Text("Served-block window (eth/69, default 32)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
-            value = deepPool,
-            onValueChange = { onDeepPool(it.filter(Char::isDigit).take(3)) },
+            value = f.deepPool,
+            onValueChange = { f.deepPool = it.filter(Char::isDigit).take(3) },
             label = { Text("Readiness \"deep pool\" threshold (default 16)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
-            value = wsBound,
-            onValueChange = { onWsBound(it.filter(Char::isDigit).take(4)) },
+            value = f.wsBound,
+            onValueChange = { f.wsBound = it.filter(Char::isDigit).take(4) },
             label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
             supportingText = {
                 Text(
@@ -723,31 +717,27 @@ private fun NodeTuning(
         // checked value is the negation. Persisted immediately; applies on the next node restart.
         SwitchRow(
             label = "Relaxed state freshness",
-            checked = !strictFreshness,
-            onChange = { relaxed -> onStrictFreshness(!relaxed); settings.setStrictStateFreshness(!relaxed) },
+            checked = !f.strictFreshness,
+            onChange = { relaxed -> f.strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
         )
-        Text(
+        SettingsNote(
             "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
                 "fast-fail when no fresh servable root exists, and the wallet retries. " +
                 "On (opt-in, experimental): serve a slightly older verified root — but if " +
                 "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
                 "instead of failing fast. Applies on the next node (re)start.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         // Native BLS applies immediately — flips the process-global backend live.
         SwitchRow(
             label = "Native BLS acceleration",
-            checked = nativeBls,
-            onChange = { on -> onNativeBls(on); settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
+            checked = f.nativeBls,
+            onChange = { on -> f.nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
         )
-        Text(
+        SettingsNote(
             "On (default): use the bundled native blst library for sync-committee BLS " +
                 "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
                 "slower, but useful if the native library fails to load. Applies immediately.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         // Engine choice applies per network (re)start — running networks keep their engine.
@@ -756,21 +746,19 @@ private fun NodeTuning(
         val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
         if (javaUnavailable != null) {
             Text("Engine: Rust only")
-            Text(
+            SettingsNote(
                 javaUnavailable,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
             SwitchRow(
                 label = "Prefer Java engine",
-                checked = preferJava,
+                checked = f.preferJava,
                 onChange = { on ->
-                    onPreferJava(on); settings.setPreferJavaEngine(on); controller.applyEngineChoice()
+                    f.preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
                     onLogIndexChanged()
                 },
             )
-            Text(
+            SettingsNote(
                 "Off (default): the Rust engine runs each network where it can serve, " +
                     "falling back to the Java engine otherwise. The Rust engine is the " +
                     "primary engine — the log index (Index tab) and Tor routing run on it " +
@@ -780,8 +768,6 @@ private fun NodeTuning(
                     "network is (re)started, not to already-running networks. On hosts with " +
                     "an idle controller (Android) both engines idle-sleep; the Status screen's " +
                     "Sleep row shows it per network.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
@@ -792,12 +778,12 @@ private fun NodeTuning(
         if (controller.supportsTor) {
             SwitchRow(
                 label = "Route reads over Tor (experimental)",
-                checked = torRouting && !preferJava,
-                enabled = !preferJava,
-                onChange = { on -> onTorRouting(on); settings.setTorEnabled(on); controller.applyTorMode() },
+                checked = f.torRouting && !f.preferJava,
+                enabled = !f.preferJava,
+                onChange = { on -> f.torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
             )
-            Text(
-                if (preferJava) {
+            SettingsNote(
+                if (f.preferJava) {
                     "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
                 } else {
                     "Off (default): reads use the peer pool directly from your IP. On: route " +
@@ -811,14 +797,11 @@ private fun NodeTuning(
                         "fail-closed while this is on. Takes effect immediately — the next read on a " +
                         "running Rust-engine network routes over Tor (no restart needed)."
                 },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         SettingsNote(
-            "An RPC-port change reboots that chain; the snap-peer target and served-block " +
-                "window apply live to every running chain, and the readiness threshold persists " +
-                "for the next check.",
+            "Save applies the snap-peer target and served-block window live to every running " +
+                "chain; the readiness threshold persists for the next check.",
         )
     }
 }
