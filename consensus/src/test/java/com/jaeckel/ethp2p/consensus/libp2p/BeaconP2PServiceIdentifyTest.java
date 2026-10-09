@@ -27,16 +27,6 @@ import org.junit.jupiter.api.Test;
  */
 class BeaconP2PServiceIdentifyTest {
 
-    private static String loopbackAddress(BeaconP2PService target) {
-        return target.listenAddresses().stream()
-                // jvm-libp2p reports the wildcard bind as /ip4/0.0.0.0/ or /ip6/::/;
-                // either one is reachable on loopback.
-                .map(a -> a.replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/").replace("/ip6/::/", "/ip4/127.0.0.1/"))
-                .filter(a -> a.startsWith("/ip4/127.0.0.1/"))
-                .findFirst()
-                .orElseThrow();
-    }
-
     @Test
     void agentNamesThisRelease() {
         assertEquals("myotis/" + BuildInfo.RELEASE_VERSION + "-java", BeaconP2PService.AGENT_VERSION);
@@ -59,7 +49,7 @@ class BeaconP2PServiceIdentifyTest {
         target.start();
         observer.start();
         try {
-            String addr = loopbackAddress(target);
+            String addr = Loopback.address(target);
             observer.queryIdentify(addr).get(20, TimeUnit.SECONDS);
 
             assertEquals(BeaconP2PService.AGENT_VERSION, observer.cachedAgent(addr),

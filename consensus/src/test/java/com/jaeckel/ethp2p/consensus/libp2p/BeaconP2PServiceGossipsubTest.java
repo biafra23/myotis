@@ -19,16 +19,6 @@ class BeaconP2PServiceGossipsubTest {
 
     private static final String MESHSUB = "/meshsub/1.1.0";
 
-    private static String loopbackAddress(BeaconP2PService target) {
-        return target.listenAddresses().stream()
-                // jvm-libp2p reports the wildcard bind as /ip4/0.0.0.0/ or /ip6/::/;
-                // either one is reachable on loopback.
-                .map(a -> a.replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/").replace("/ip6/::/", "/ip4/127.0.0.1/"))
-                .filter(a -> a.startsWith("/ip4/127.0.0.1/"))
-                .findFirst()
-                .orElseThrow();
-    }
-
     @Test
     void restartCyclesLeaveNoGossipRouterThreadBehind() throws Exception {
         BeaconP2PService svc = new BeaconP2PService(null);
@@ -56,7 +46,7 @@ class BeaconP2PServiceGossipsubTest {
         target.start();
         observer.start();
         try {
-            String addr = loopbackAddress(target);
+            String addr = Loopback.address(target);
             assertEquals(MESHSUB, observer.probeProtocol(addr, MESHSUB).get(20, TimeUnit.SECONDS));
             assertTrue(target.subscribedGossipTopics().isEmpty(),
                     "protocol registration must not join any topic");
