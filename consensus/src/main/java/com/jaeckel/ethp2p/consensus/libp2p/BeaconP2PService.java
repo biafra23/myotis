@@ -2081,9 +2081,9 @@ public class BeaconP2PService implements AutoCloseable {
          * Most a peer may write on one inbound stream before we close it — the
          * Rust engine's {@code MAX_REQUEST_WIRE_BYTES}. Only a binding that
          * parses a body buffers at all, and the largest of those is a 92-byte
-         * Status; a size-0 binding answers at {@code channelActive} and drops
-         * whatever follows, so a root list (legitimately up to ~140 KiB) never
-         * touches {@code incoming}.
+         * Status; a size-0 binding never buffers — {@code channelRead0} drops
+         * its bytes, answered or not — so a root list (legitimately up to
+         * ~140 KiB) never meets this cap.
          */
         static final int MAX_INBOUND_REQUEST_BYTES = 1024;
 
@@ -2140,10 +2140,14 @@ public class BeaconP2PService implements AutoCloseable {
                 @Override
                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
                     // Once answered, nothing reads `incoming` again: drop the
-                    // rest of the request instead of buffering it. The size-0
-                    // bindings answer at channelActive, before a root list
-                    // (legitimately up to ~140 KiB) has even arrived.
-                    if (responded) return;
+                    // rest of the request instead of buffering it. A size-0
+                    // binding never reads it at all (tryRespond parses a body
+                    // only for expectedRequestSize > 0), so its bytes are
+                    // dropped whether or not channelActive has answered yet:
+                    // a root list (legitimately up to ~140 KiB) must never
+                    // meet the cap below, whatever order jvm-libp2p delivers
+                    // a replayed request and channelActive in.
+                    if (responded || expectedRequestSize == 0) return;
                     int readable = msg.readableBytes();
                     if (incoming.size() + readable > MAX_INBOUND_REQUEST_BYTES) {
                         log.debug("[beacon-p2p] responder proto={} peer={} request exceeds {} bytes, closing",
