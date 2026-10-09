@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextReplacement
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -34,6 +35,19 @@ class SettingsSectionsTest {
     private class NapController : FakeController() {
         var applied = 0
         override fun applyAppNap() { applied++ }
+    }
+
+    /** Records the live-applies Save makes, so a test can see what a Save in each mode touches. */
+    private class TuningController : FakeController() {
+        var wsBoundApplied = mutableListOf<Int>()
+        override fun setWsBoundPeriods(periods: Int) { wsBoundApplied += periods }
+    }
+
+    /** [FakeSettings] whose weak-subjectivity bound is real, so a Save can be seen to write it. */
+    private class BoundSettings(expert: Boolean) : Settings by FakeSettings(expert) {
+        var wsBound = 0
+        override fun wsBoundPeriods(): Int = wsBound
+        override fun setWsBoundPeriods(v: Int) { wsBound = v }
     }
 
     @get:Rule
@@ -99,6 +113,28 @@ class SettingsSectionsTest {
         rule.toggleSwitchBeside("Sleep when not in focus")
         assertTrue("the opt-in must persist", settings.allowNap)
         assertEquals("the controller re-applies it at once", 1, controller.applied)
+    }
+
+    @Test
+    fun aNormalModeSaveLeavesHiddenExpertEditsAlone() {
+        // Expert on, type a wider bound, Expert off, Save: the bound must stay untouched —
+        // the field is gone from the screen, so Save must not write what it no longer shows.
+        val settings = BoundSettings(expert = true)
+        val controller = TuningController()
+        rule.setContent { NodeScreen(controller = controller, settings = settings, logs = FakeLogs()) }
+        tab("Settings").performClick()
+        rule.onNodeWithText("Weak-subjectivity bound in periods (0 = network default)").performScrollTo()
+            .performTextReplacement("99")
+        rule.toggleSwitchBeside("Expert mode")
+        rule.onNodeWithText("Save").performScrollTo().performClick()
+        assertEquals(0, settings.wsBound)
+        assertEquals(emptyList<Int>(), controller.wsBoundApplied)
+
+        // Back in Expert mode the edit is still on screen, and Save applies it.
+        rule.toggleSwitchBeside("Expert mode")
+        rule.onNodeWithText("Save").performScrollTo().performClick()
+        assertEquals(99, settings.wsBound)
+        assertEquals(listOf(99), controller.wsBoundApplied)
     }
 
     private fun show(settings: Settings) {

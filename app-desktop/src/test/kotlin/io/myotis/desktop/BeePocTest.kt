@@ -193,6 +193,7 @@ class BeePocTest {
         assertTrue(settings.logIndexEnabled("gnosis"))
         assertTrue(settings.logIndexConfigured("gnosis"))
         assertTrue(settings.logIndexBackfillPaused("gnosis"), "the walk is off from the first start")
+        assertTrue(settings.expertMode(), "the Index tab is Expert-mode only: a PoC first-starts there")
         assertEquals(
             listOf(LogIndexWatch.Entry(gnosis.watchAddress, gnosis.watchDeployBlock)),
             LogIndexWatch.parse(settings.logIndexWatchJson("gnosis")),
@@ -201,6 +202,7 @@ class BeePocTest {
         val again = DesktopSettings(nets, dir.resolve("settings.properties"))
         assertEquals(listOf("gnosis"), again.enabledNetworks())
         assertTrue(again.logIndexEnabled("gnosis"))
+        assertTrue(again.expertMode())
         assertEquals(
             listOf(LogIndexWatch.Entry(gnosis.watchAddress, gnosis.watchDeployBlock)),
             LogIndexWatch.parse(again.logIndexWatchJson("gnosis")),
@@ -214,6 +216,7 @@ class BeePocTest {
         BeePoc.applyFirstStartSettings(settings, firstStart = false)
         assertEquals(listOf("mainnet"), settings.enabledNetworks())
         assertFalse(settings.logIndexConfigured("gnosis"))
+        assertFalse(settings.expertMode(), "a later start never flips Expert mode back on")
     }
 
     // -- the backfill OFF switch (the flavour's whole premise) -----------------

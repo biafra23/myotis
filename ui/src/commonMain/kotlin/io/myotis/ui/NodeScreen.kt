@@ -122,13 +122,17 @@ fun NodeScreen(
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
     // The Index tab is the log-index feature's home — where contracts are added,
-    // snapshots imported, and progress read — so it shows whenever the engine choice
-    // can serve the feature (anything but a forced Java engine; the log index is
-    // Rust-engine-only), OR while any live engine reports an enabled index: an
-    // imported/dropped-in snapshot activates engine-side without any Settings flag
-    // ever having been touched, and hiding a running index would leave its progress
-    // unreachable. Settings are plain reads, so the toggles that change them bump
-    // logIndexRev; the engine side re-derives from `snapshots`.
+    // snapshots imported, and progress read — so, within Expert mode, it shows
+    // whenever the engine choice can serve the feature (anything but a forced Java
+    // engine; the log index is Rust-engine-only), OR while any live engine reports an
+    // enabled index: an imported/dropped-in snapshot activates engine-side without any
+    // Settings flag ever having been touched, and hiding a running index from an
+    // expert would leave its controls unreachable. Normal mode hides the tab in
+    // every case (the Expert switch's note names it); there the index shows as the
+    // readiness strip's catch-up line and the Status tab's Log index tile, and the
+    // PoC flavours that ship a seeded index first-start in Expert mode. Settings are
+    // plain reads, so the toggles that change them bump logIndexRev; the engine side
+    // re-derives from `snapshots`.
     var logIndexRev by remember { mutableStateOf(0) }
     val showIndexTab = remember(logIndexRev, snapshots) {
         !settings.preferJavaEngine() ||
@@ -607,25 +611,32 @@ private fun SettingsTab(
         }
         Button(
             onClick = {
-                val snap = tuning.snapTarget.toIntOrNull() ?: 32
-                val window = tuning.servedWindow.toIntOrNull() ?: 32
-                val deep = tuning.deepPool.toIntOrNull() ?: 16
-                // Blank/invalid keeps the CURRENT value (0 would silently restore the
-                // default bound — a security knob must not change on a stray edit).
-                val ws = tuning.wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
-                settings.setSnapTarget(snap)          // persist
-                settings.setServedBlockWindow(window) // persist
-                settings.setDeepPool(deep)            // persist (read at readiness-check time)
-                settings.setWsBoundPeriods(ws)        // persist
+                // Save writes only what the current mode shows. `tuning` outlives an Expert
+                // flip-off (the tab stays composed), so an edit typed in Expert mode and never
+                // saved would otherwise be persisted — and live-applied — by a normal-mode
+                // Save with no field on screen showing it; for the weak-subjectivity bound
+                // that is a security knob widened invisibly.
+                if (expert) {
+                    val snap = tuning.snapTarget.toIntOrNull() ?: 32
+                    val window = tuning.servedWindow.toIntOrNull() ?: 32
+                    val deep = tuning.deepPool.toIntOrNull() ?: 16
+                    // Blank/invalid keeps the CURRENT value (0 would silently restore the
+                    // default bound — a security knob must not change on a stray edit).
+                    val ws = tuning.wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
+                    settings.setSnapTarget(snap)          // persist
+                    settings.setServedBlockWindow(window) // persist
+                    settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                    settings.setWsBoundPeriods(ws)        // persist
+                    controller.setTargetSnapPeers(snap)   // live-apply to running stacks
+                    controller.setServedBlockWindow(window) // live-apply to running stacks
+                    controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
+                }
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
                 // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
                 if (settings.supportsIdleSleep()) {
                     settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
                 }
-                controller.setTargetSnapPeers(snap)   // live-apply to running stacks
-                controller.setServedBlockWindow(window) // live-apply to running stacks
-                controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,

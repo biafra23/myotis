@@ -71,6 +71,20 @@ class ExpertModeTabsTest {
     }
 
     @Test
+    fun aPhoneWidthRendersEveryExpertTabsIcon() {
+        // NavIcons.of is reached only from the bottom bar: render all five tabs there once,
+        // so a tab added without an icon fails here instead of on phones only.
+        rule.setContent {
+            Box(Modifier.width(360.dp).height(640.dp)) {
+                NodeScreen(controller = FakeController(), settings = FakeSettings(expert = true), logs = FakeLogs())
+            }
+        }
+        listOf("Status", "Query", "Logs", "Index", "Settings").forEach { tab(it).assertIsDisplayed() }
+        tab("Index").performClick()
+        tab("Index").assertIsSelected()
+    }
+
+    @Test
     fun aPhoneWidthGetsTheSameTabsInABottomBar() {
         rule.setContent {
             Box(Modifier.width(360.dp).height(640.dp)) {
