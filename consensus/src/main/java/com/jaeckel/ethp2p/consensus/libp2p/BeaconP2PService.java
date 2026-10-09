@@ -1,13 +1,17 @@
 package com.jaeckel.ethp2p.consensus.libp2p;
 
+import com.google.protobuf.ByteString;
 import com.jaeckel.ethp2p.consensus.types.MetadataMessage;
 import com.jaeckel.ethp2p.consensus.types.StatusMessage;
+import com.jaeckel.ethp2p.core.BuildInfo;
 import com.jaeckel.ethp2p.core.concurrent.Futures;
+import identify.pb.IdentifyOuterClass;
 import io.libp2p.core.Host;
 import io.libp2p.core.P2PChannel;
 import io.libp2p.core.PeerId;
 import io.libp2p.core.StreamPromise;
 import io.libp2p.core.crypto.KeyType;
+import io.libp2p.core.crypto.PubKey;
 import io.libp2p.core.dsl.HostBuilder;
 import io.libp2p.core.multiformats.Multiaddr;
 import io.libp2p.core.multistream.ProtocolBinding;
@@ -152,6 +156,17 @@ public class BeaconP2PService implements AutoCloseable {
      *  CL fork watch's feed. Null = nobody listening. */
     private volatile java.util.function.BiConsumer<String, byte[]> onPeerStatus;
     private Identify identifyBinding;
+
+    /**
+     * The agent our Identify answer names: {@code myotis/<release version>-java},
+     * the Java twin of the Rust engine's {@code myotis/<release version>-rs}
+     * (rust/myotis-net/src/reqresp.rs). Generated from the Gradle version, so a
+     * release sweep moves it with the devp2p Hello id.
+     */
+    static final String AGENT_VERSION = BuildInfo.CLIENT_ID + "-java";
+
+    /** Identify's protocol_version: the eth2 one, as the Rust engine and Lighthouse send. */
+    static final String IDENTIFY_PROTOCOL_VERSION = "eth2/1.0.0";
 
     /** One binding per protocol, registered once at startup. */
     private final Map<String, QueuedReqRespBinding> bindings = new ConcurrentHashMap<>();
@@ -466,6 +481,14 @@ public class BeaconP2PService implements AutoCloseable {
         registerBinding(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, true, ResponderController.DRAINED_BODY,
                 (req, peerId) -> ReqRespHandler.NO_CHUNKS);
 
+        // Our Identify answer. A binding added after the host is built gets no
+        // message from jvm-libp2p's builder, and its responder then sends only
+        // the library's agent "jvm/0.1": no public key, no protocols. Set it
+        // here, once every responder above is registered and before the host
+        // starts, so the first peer to ask already gets the full answer.
+        identifyBinding.getProtocol().setIdMessage(
+                identifyMessage(host.getPrivKey().publicKey(), host.getProtocols()));
+
         host.start().join();
         log.info("[beacon-p2p] libp2p host started, peerId={}, listenAddrs={}",
                 host.getPeerId(), host.listenAddresses());
@@ -591,8 +614,8 @@ public class BeaconP2PService implements AutoCloseable {
                 protoId, peerAgentVersions, handler, hasContextBytes, expectedRequestSize,
                 this::currentForkDigest);
         bindings.put(protoId, binding);
-        // Only advertise the protocol (make it appear in our Identify response)
-        // when we actually have a responder. Advertising protocols we can't
+        // Only register the protocol — which is also what puts it in our
+        // Identify answer (identifyMessage) — when we actually have a responder. Advertising protocols we can't
         // serve (UPDATES, BLOCKS_BY_RANGE) makes CL peers like Lighthouse
         // treat us as misbehaving and goodbye us immediately — observed
         // durationMs=1 closes in the wild. We can still OPEN streams for
@@ -927,6 +950,29 @@ public class BeaconP2PService implements AutoCloseable {
     /** Gossip topics this host has joined (empty unless topic subscription is enabled). */
     public Set<String> subscribedGossipTopics() {
         return Set.copyOf(subscribedGossipTopics);
+    }
+
+    /**
+     * The Identify answer for a host with {@code publicKey} and {@code protocols}:
+     * our agent, the eth2 protocol version, the key, and every protocol the host
+     * answers — the ones whose binding is registered on it, which
+     * {@link #registerBinding} limits to protocols with a responder.
+     *
+     * <p>No listen addresses: the host listens on the wildcard address, usually
+     * behind NAT, so it has nothing a peer could dial back; the responder adds
+     * the address it observed for the asker on its own.
+     */
+    static IdentifyOuterClass.Identify identifyMessage(
+            PubKey publicKey, List<? extends ProtocolBinding<?>> protocols) {
+        IdentifyOuterClass.Identify.Builder b = IdentifyOuterClass.Identify.newBuilder()
+                .setProtocolVersion(IDENTIFY_PROTOCOL_VERSION)
+                .setAgentVersion(AGENT_VERSION)
+                .setPublicKey(ByteString.copyFrom(publicKey.bytes()));
+        protocols.stream()
+                .flatMap(p -> p.getProtocolDescriptor().getAnnounceProtocols().stream())
+                .distinct()
+                .forEach(b::addProtocols);
+        return b.build();
     }
 
     /**
