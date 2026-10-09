@@ -1842,9 +1842,16 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
                     )
                 }
             } else {
-                Text("No account at this address yet", style = MaterialTheme.typography.titleMedium)
+                // Non-existence is a claim too — a peer hiding a balance would make exactly this one.
                 Text(
-                    "Nothing has been sent to it on this chain, so there is no balance to show.",
+                    if (verified) "No account at this address yet"
+                    else "No account at this address yet — unverified peer claim",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (verified) "Nothing has been sent to it on this chain, so there is no balance to show."
+                    else "A peer reports nothing has been sent to it; the node could not verify that yet.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1852,8 +1859,9 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
             if (verified) VerificationBadge(a)
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 // The nonce, in a wallet user's words — a contract's counts its creations.
-                if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString())
-                ResultStat("Block", a.blockNumber.toString())
+                // Muted with the balance while the result is a claim.
+                if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString(), muted = !verified)
+                ResultStat("Block", a.blockNumber.toString(), muted = !verified)
             }
             TextButton(onClick = { showRaw = !showRaw }) {
                 Text(if (showRaw) "Hide raw details" else "Show raw details")
@@ -1875,12 +1883,16 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
     }
 }
 
-/** A small labelled number on the result card. */
+/** A small labelled number on the result card; [muted] while the result is only a peer's claim. */
 @Composable
-private fun ResultStat(label: String, value: String) {
+private fun ResultStat(label: String, value: String, muted: Boolean) {
     Column {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.titleMedium)
+        Text(
+            value,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (muted) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
+        )
     }
 }
 

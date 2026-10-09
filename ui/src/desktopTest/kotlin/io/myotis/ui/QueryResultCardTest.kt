@@ -72,6 +72,18 @@ class QueryResultCardTest {
     }
 
     @Test
+    fun anUnverifiedMissingAccountIsAClaimToo() {
+        lookUp(
+            Node(verified().copy(exists = false, nonce = -1, balanceWei = null, beaconChainVerified = false, blsVerified = false, verifyMethod = null, failReason = "beaconNotSynced")),
+            FakeSettings(),
+        )
+        rule.onNodeWithText("No account at this address yet — unverified peer claim").assertIsDisplayed()
+        rule.onNodeWithText("No account at this address yet").assertDoesNotExist()
+        rule.onNodeWithText("A peer reports nothing has been sent to it; the node could not verify that yet.").assertIsDisplayed()
+        rule.onNodeWithText("✗ Unverified · beaconNotSynced").assertIsDisplayed()
+    }
+
+    @Test
     fun theKeyboardsSearchKeyRunsTheLookup() {
         rule.mainClock.autoAdvance = false
         rule.setContent { NodeScreen(controller = Node(verified()), settings = FakeSettings(), logs = NoLogs) }
