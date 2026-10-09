@@ -1822,11 +1822,24 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
                     Text("Copy")
                 }
             }
+            // The numbers below are a peer's claim until the beacon chain vouches for them:
+            // an unverified result leads with the red pill and shows the balance muted, so
+            // the headline figure never looks more authoritative than it is.
+            val verified = a.beaconChainVerified
+            if (!verified) VerificationBadge(a)
             if (a.exists) {
                 Column {
-                    // Kept verbatim: the iOS UI helpers wait for this caption.
-                    Text("Balance (ETH)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(formatEth(a.balanceWei), style = MaterialTheme.typography.headlineMedium)
+                    // The verified caption is kept verbatim: the iOS UI helpers wait for it.
+                    Text(
+                        if (verified) "Balance (ETH)" else "Balance (ETH) — unverified peer claim",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        formatEth(a.balanceWei),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             } else {
                 Text("No account at this address yet", style = MaterialTheme.typography.titleMedium)
@@ -1836,9 +1849,10 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            VerificationBadge(a)
+            if (verified) VerificationBadge(a)
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                if (a.exists) ResultStat("Transactions sent", a.nonce.toString())
+                // The nonce, in a wallet user's words — a contract's counts its creations.
+                if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString())
                 ResultStat("Block", a.blockNumber.toString())
             }
             TextButton(onClick = { showRaw = !showRaw }) {
@@ -1855,13 +1869,7 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
                 }
                 StatusRow("Block", a.blockNumber.toString())
                 StatusRow("Proof valid", a.peerProofValid.toString())
-                StatusRow(
-                    "Verification",
-                    if (a.beaconChainVerified) "✓ ${a.verifyMethod ?: "verified"}${if (a.blsVerified) " (BLS)" else ""}"
-                    else "✗ ${a.failReason ?: "unverified"}",
-                    color = if (a.beaconChainVerified) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.error,
-                )
+                // The verification verdict is the pill above; the raw rows don't repeat it.
             }
         }
     }

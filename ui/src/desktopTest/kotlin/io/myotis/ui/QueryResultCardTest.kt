@@ -6,10 +6,12 @@ import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -35,7 +37,7 @@ class QueryResultCardTest {
         rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
         rule.onNodeWithText("1234.567800").assertIsDisplayed()
         rule.onNodeWithText("✓ Verified · headerChain · BLS").assertIsDisplayed()
-        rule.onNodeWithText("Transactions sent").assertIsDisplayed()
+        rule.onNodeWithText("Transactions sent (nonce)").assertIsDisplayed()
         rule.onNodeWithText("1412").assertIsDisplayed()
         rule.onNodeWithText("Storage root").assertDoesNotExist()
         rule.onNodeWithText("Proof valid").assertDoesNotExist()
@@ -61,6 +63,26 @@ class QueryResultCardTest {
             FakeSettings(),
         )
         rule.onNodeWithText("✗ Unverified · beaconNotSynced").assertIsDisplayed()
+        // A peer's claim is labelled as one, and the verdict leads the balance.
+        rule.onNodeWithText("Balance (ETH) — unverified peer claim").assertIsDisplayed()
+        rule.onNodeWithText("Balance (ETH)").assertDoesNotExist()
+        val pillTop = rule.onNodeWithText("✗ Unverified · beaconNotSynced").fetchSemanticsNode().boundsInRoot.top
+        val balanceTop = rule.onNodeWithText("1234.567800").fetchSemanticsNode().boundsInRoot.top
+        assertTrue("the pill must sit above an unverified balance", pillTop < balanceTop)
+    }
+
+    @Test
+    fun theKeyboardsSearchKeyRunsTheLookup() {
+        rule.mainClock.autoAdvance = false
+        rule.setContent { NodeScreen(controller = Node(verified()), settings = FakeSettings(), logs = NoLogs) }
+        pumpFrames()
+        rule.onNode(isSelectable() and hasText("Query")).performClick()
+        pumpFrames()
+        rule.onNodeWithText("Address (0x…) or ENS name").performTextInput(ADDR)
+        pumpFrames()
+        rule.onNodeWithText("Address (0x…) or ENS name").performImeAction()
+        awaitText("Copy")
+        rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
     }
 
     @Test
@@ -68,7 +90,7 @@ class QueryResultCardTest {
         lookUp(Node(verified().copy(exists = false, nonce = -1, balanceWei = null)), FakeSettings())
         rule.onNodeWithText("No account at this address yet").assertIsDisplayed()
         rule.onNodeWithText("Balance (ETH)").assertDoesNotExist()
-        rule.onNodeWithText("Transactions sent").assertDoesNotExist()
+        rule.onNodeWithText("Transactions sent (nonce)").assertDoesNotExist()
     }
 
     // ---- harness ----

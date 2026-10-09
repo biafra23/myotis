@@ -957,8 +957,8 @@ around the clock, then hand the file to the apps:
 ```
 
 The exported `.db` is **self-describing and chain-tagged** (network id + genesis hash), so it
-can only be imported into a node on the same chain. Import it via the Index tab's (Settings → Expert mode shows the tab)
-"Import log-index snapshot…" button — the receiving node merges it with whatever it already
+can only be imported into a node on the same chain. Import it via the Index tab's
+"Import log-index snapshot…" button (Settings → Expert mode shows the tab) — the receiving node merges it with whatever it already
 holds and immediately starts catch-up for every imported address, so the file does not need
 to be fresh. One bound: the head-gap bridge spans at most **500,000 blocks** (~29 days on
 Gnosis, ~10 weeks on mainnet), so import a snapshot within that window of its export — or
