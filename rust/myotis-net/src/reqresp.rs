@@ -430,12 +430,39 @@ enum Command {
     Shutdown,
 }
 
+/// Identify `agent_version` per CONNECTED peer, shared between the swarm task
+/// (which fills it on Identify and empties it on the last connection closing)
+/// and the sync loop, which stamps it on every log line that names a peer as
+/// `client=` — the same field the EL pool prints — so a log reader can tell
+/// which client served, refused or dropped us without a peer-id lookup. A
+/// plain lock rather than a swarm round-trip because the readers are log
+/// sites in the sync loop, which must not await the swarm to print a line.
+/// Holds the DISPLAY-SAFE form only — the agent is peer-chosen text, and the
+/// Identify handler runs it through `el::pool::log_client_id` (control
+/// characters dropped, 64-char cap) before it enters; log sites print it with
+/// `?`, as the EL pool does, so what the strip cannot classify is escaped.
+pub type AgentMap = Arc<std::sync::RwLock<HashMap<PeerId, String>>>;
+
+/// The `client=` label for a peer: its (sanitized) Identify agent, or `?`
+/// before Identify arrived or after its connection closed. Poison-tolerant: a
+/// panic on the other side of the lock loses nothing a log label needs.
+fn client_label(agents: &AgentMap, peer: &PeerId) -> String {
+    agents
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .cloned()
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// Cheap-to-clone client for issuing eth2 req/resp calls against the running
 /// swarm task. Independent instances of the whole stack are independent — no
 /// globals anywhere in this crate.
 #[derive(Clone)]
 pub struct ReqRespClient {
     tx: mpsc::Sender<Command>,
+    /// See [`AgentMap`]; read by [`ReqRespClient::client_of`].
+    agents: AgentMap,
     /// Last answer seen per DNS name, so repeat resolutions can log at DEBUG
     /// while a CHANGE still logs at INFO.
     ///
@@ -446,6 +473,14 @@ pub struct ReqRespClient {
 }
 
 impl ReqRespClient {
+    /// The `client=` label for a log line naming `peer`: its Identify agent
+    /// (`Lighthouse/v8.3.0-…`, `nimbus-eth2/v26.7.0`, …), or `?` when Identify
+    /// has not arrived or the peer is no longer connected. Synchronous and
+    /// lock-only, so a log site in the sync loop can call it inline.
+    pub fn client_of(&self, peer: &PeerId) -> String {
+        client_label(&self.agents, peer)
+    }
+
     /// One request against `peer` (dialing `addr` if not connected): sends the
     /// pre-encoded wire bytes, returns the raw wire response.
     pub async fn request_raw(
@@ -990,14 +1025,16 @@ pub fn start_host_with(
     tracing::info!(peer_id = %peer_id, serving, "libp2p host starting");
 
     let (tx, rx) = mpsc::channel(256);
+    let agents: AgentMap = Arc::default();
     let task = tokio::spawn(run_swarm(
         swarm,
         rx,
         local_status,
         config.lc_responder,
         config.cl_fork_watch,
+        agents.clone(),
     ));
-    Ok((ReqRespClient { tx, last_resolved: Arc::default() }, peer_id, task))
+    Ok((ReqRespClient { tx, agents, last_resolved: Arc::default() }, peer_id, task))
 }
 
 /// What a pending outbound request id maps back to.
@@ -1042,8 +1079,13 @@ struct SwarmCtx {
     /// `earliest_available_slot` learned from each peer's auto-Status reply.
     peer_earliest: HashMap<PeerId, u64>,
     /// Identify `agent_version` per peer — the catch-up fan-out sizes its
-    /// request per client family from this (see `sync::agent_serves_one_period`).
-    peer_agents: HashMap<PeerId, String>,
+    /// request per client family from this (see `sync::agent_serves_one_period`),
+    /// and the sync loop's log lines read it through [`ReqRespClient::client_of`]
+    /// (shared handle; see [`AgentMap`]).
+    peer_agents: AgentMap,
+    /// Peers whose current connection delivered a Goodbye, so the close that
+    /// follows is theirs by announcement, not a drop. Cleared with the close.
+    goodbye_from: HashSet<PeerId>,
     local_status: Arc<LocalStatus>,
     /// Present only on a serving host; `None` on a wallet, where the
     /// light-client protocols answer `ResourceUnavailable` as before.
@@ -1078,6 +1120,7 @@ impl SwarmCtx {
         local_status: Arc<LocalStatus>,
         lc: Option<Arc<dyn LcResponder>>,
         cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+        agents: AgentMap,
     ) -> Self {
         Self {
             cl_fork_watch,
@@ -1088,7 +1131,8 @@ impl SwarmCtx {
             queued: HashMap::new(),
             lc_servers: HashSet::new(),
             peer_earliest: HashMap::new(),
-            peer_agents: HashMap::new(),
+            peer_agents: agents,
+            goodbye_from: HashSet::new(),
             local_status,
             lc,
             in_flight: HashMap::new(),
@@ -1105,8 +1149,9 @@ async fn run_swarm(
     local_status: Arc<LocalStatus>,
     lc: Option<Arc<dyn LcResponder>>,
     cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    agents: AgentMap,
 ) {
-    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch);
+    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch, agents);
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -1164,7 +1209,7 @@ async fn run_swarm(
                     let _ = reply.send(CatchupPeerMeta {
                         lc_servers: ctx.lc_servers.clone(),
                         earliest_slots: ctx.peer_earliest.clone(),
-                        agents: ctx.peer_agents.clone(),
+                        agents: ctx.peer_agents.read().unwrap_or_else(|e| e.into_inner()).clone(),
                     });
                 }
             },
@@ -1317,16 +1362,26 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                     Pending::AutoStatusV2(peer_id));
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
             if num_established == 0 {
                 ctx.connected.remove(&peer_id);
+                let said_goodbye = ctx.goodbye_from.remove(&peer_id);
+                // Name the peer that dropped us (see `remote_drop_without_goodbye`
+                // for exactly which closes qualify), while its agent is still
+                // in the map — the clean-up below forgets it.
+                if let Some(e) =
+                    remote_drop_without_goodbye(&cause, ctx.status_done.contains(&peer_id), said_goodbye)
+                {
+                    tracing::info!(peer = %peer_id, client = ?client_label(&ctx.peer_agents, &peer_id),
+                        error = %e, "peer connection dropped without goodbye");
+                }
                 // Next connection must redo the Status handshake — and drop the
                 // per-peer metadata it produced so these maps stay bounded by
                 // the CONNECTED set, not by every peer ever seen (a reconnect
                 // re-runs Identify + auto-Status and repopulates both).
                 ctx.status_done.remove(&peer_id);
                 ctx.lc_servers.remove(&peer_id);
-                ctx.peer_agents.remove(&peer_id);
+                ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
                 ctx.peer_earliest.remove(&peer_id);
                 ctx.observed_ips.remove(&peer_id);
                 ctx.peer_source_ips.remove(&peer_id);
@@ -1354,6 +1409,27 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
     }
 }
 
+/// The one connection close worth an INFO line with the peer's client: the
+/// remote side ended it (`cause` is an I/O error — a reset, an EOF, or the
+/// remote shutting the transport down), on a peer whose auto-Status had
+/// settled (answered or failed: a peer we had done business with, not a dial
+/// that never got past the handshake), and no Goodbye came first. A Goodbye
+/// already logged itself (`peer sent goodbye`); an idle keep-alive expiry and
+/// a close we made ourselves (`cause` None) are routine and stay at debug.
+/// Returns the error to print. Nothing in this crate (or roost) SENDS a
+/// Goodbye today; if an outbound one is ever added, the close that follows
+/// it must be excluded here too, or this line would call our own leave a drop.
+fn remote_drop_without_goodbye(
+    cause: &Option<libp2p::swarm::ConnectionError>,
+    status_settled: bool,
+    said_goodbye: bool,
+) -> Option<&io::Error> {
+    match cause {
+        Some(libp2p::swarm::ConnectionError::IO(e)) if status_settled && !said_goodbye => Some(e),
+        _ => None,
+    }
+}
+
 fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: BehaviourEvent) {
     use BehaviourEvent as E;
     match event {
@@ -1375,9 +1451,15 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
                 ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
             }
-            ctx.peer_agents.insert(peer_id, info.agent_version.clone());
-            tracing::debug!(peer = %peer_id, agent = %info.agent_version,
+            // Stored in the display-safe form only (control characters gone,
+            // 64-char cap): the agent is peer-chosen text and every reader of
+            // this map prints it, so the one place it enters is the one place
+            // it is sanitized. The family prefix `agent_serves_one_period`
+            // matches on survives both the strip and the cap.
+            let agent = crate::el::pool::log_client_id(&info.agent_version);
+            tracing::debug!(peer = %peer_id, agent = ?agent,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
+            ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).insert(peer_id, agent);
         }
         E::Identify(_) => {}
         // No subscriptions, so the only events are peers' subscription
@@ -1410,8 +1492,8 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 // to handle, and it costs us nothing to hold.
                 if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
                 {
-                    tracing::warn!(peer = %peer, protocol, queued = ctx.in_flight_bytes,
-                        want = response.len(),
+                    tracing::warn!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                        protocol, queued = ctx.in_flight_bytes, want = response.len(),
                         "in-flight response budget exhausted — answering ResourceUnavailable");
                     response = codec::encode_error_response(
                         codec::RESULT_RESOURCE_UNAVAILABLE,
@@ -1591,7 +1673,7 @@ fn hex8(b: &[u8]) -> String {
 /// Serve a peer-initiated request, mirroring the Java responder handlers:
 /// status → our current Status; ping/goodbye → echo; metadata → light-client
 /// zeros; light_client_* → ResourceUnavailable (no relay cache in this stage).
-fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[u8]) -> Vec<u8> {
+fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[u8]) -> Vec<u8> {
     let expected = protocols::expected_request_size(protocol);
     let req_ssz: Vec<u8> = if expected == 0 {
         Vec::new()
@@ -1640,7 +1722,9 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
             } else {
                 0
             };
-            tracing::info!(peer = %peer, reason, "peer sent goodbye");
+            ctx.goodbye_from.insert(peer);
+            tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer), reason,
+                "peer sent goodbye");
             let body: &[u8] = if req_ssz.len() == 8 { &req_ssz } else { &[0u8; 8] };
             codec::encode_success_response(body, None)
         }
@@ -1653,8 +1737,8 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
             (Some(lc), Ok(root)) => {
                 let root: [u8; 32] = root;
                 let served = lc.bootstrap(&root);
-                tracing::info!(peer = %peer, root = %hex8(&root),
-                    served = served.is_some(), "light_client_bootstrap request");
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                    root = %hex8(&root), served = served.is_some(), "light_client_bootstrap request");
                 served.unwrap_or_else(resource_unavailable)
             }
             (Some(_), Err(_)) => codec::encode_error_response(
@@ -1674,8 +1758,8 @@ fn respond_inbound(ctx: &SwarmCtx, protocol: &'static str, peer: PeerId, raw: &[
                 let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
                 let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
                 let served = lc.updates_by_range(start, count);
-                tracing::info!(peer = %peer, start, count, served = served.is_some(),
-                    "light_client_updates_by_range request");
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
+                    start, count, served = served.is_some(), "light_client_updates_by_range request");
                 served.unwrap_or_else(resource_unavailable)
             }
             None => resource_unavailable(),
@@ -2181,7 +2265,7 @@ mod pending_request_tests {
     fn host() -> (Swarm<Behaviour>, SwarmCtx) {
         let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
             .expect("swarm");
-        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None))
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default()))
     }
 
     fn peer() -> PeerId {
@@ -2263,6 +2347,67 @@ mod pending_request_tests {
             cause: None,
         };
         handle_swarm_event(swarm, ctx, event);
+    }
+
+    /// The `client=` label a log line prints for a peer: `?` until Identify
+    /// names the agent, the agent while connected, `?` again once the last
+    /// connection closes (the map is bounded by the connected set) — and the
+    /// Goodbye bookkeeping that tells a drop from an announced leave is
+    /// cleared by that same close.
+    #[tokio::test]
+    async fn client_label_follows_identify_goodbye_and_the_last_close() {
+        let agents: AgentMap = Arc::default();
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm");
+        let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone());
+        let client = ReqRespClient { tx: mpsc::channel(1).0, agents: agents.clone(), last_resolved: Arc::default() };
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let p = key.public().to_peer_id();
+
+        connect(&mut swarm, &mut ctx, p);
+        assert_eq!(client.client_of(&p), "?", "before Identify");
+
+        handle_behaviour_event(&mut swarm, &mut ctx, BehaviourEvent::Identify(identify::Event::Received {
+            connection_id: ConnectionId::new_unchecked(1),
+            peer_id: p,
+            info: identify::Info {
+                public_key: key.public(),
+                protocol_version: "eth2/1.0.0".into(),
+                // Peer-chosen text: a forged log line and a terminal escape
+                // must not survive into the label (`el::pool::log_client_id`).
+                agent_version: "nimbus-eth2/v26.7.0\n INFO forged=1\x1b[31m".into(),
+                listen_addrs: Vec::new(),
+                protocols: Vec::new(),
+                observed_addr: addr(),
+                signed_peer_record: None,
+            },
+        }));
+        let shown = "nimbus-eth2/v26.7.0 INFO forged=1[31m";
+        assert_eq!(client.client_of(&p), shown, "after Identify, sanitized");
+        assert_eq!(client_label(&ctx.peer_agents, &p), shown, "swarm side sees the same map");
+
+        respond_inbound(&mut ctx, protocols::GOODBYE, p, &codec::encode_request(&129u64.to_le_bytes()));
+        assert!(ctx.goodbye_from.contains(&p), "an inbound Goodbye marks the peer as having announced its leave");
+
+        disconnect(&mut swarm, &mut ctx, p);
+        assert_eq!(client.client_of(&p), "?", "the last close forgets the agent");
+        assert!(!ctx.goodbye_from.contains(&p), "…and the Goodbye mark with it");
+    }
+
+    /// The INFO line for a peer that dropped us fires for a remote-side close
+    /// (an I/O cause) of a Status-settled peer that sent no Goodbye — and for
+    /// nothing else: not a Goodbye'd close, not a keep-alive expiry, not a
+    /// close we made ourselves, not a peer that never settled Status.
+    #[test]
+    fn remote_drop_without_goodbye_is_the_only_info_case() {
+        use libp2p::swarm::ConnectionError;
+        let io = || Some(ConnectionError::IO(io::Error::new(io::ErrorKind::ConnectionReset, "reset")));
+        assert!(remote_drop_without_goodbye(&io(), true, false).is_some());
+        assert!(remote_drop_without_goodbye(&io(), true, true).is_none(), "announced leave");
+        assert!(remote_drop_without_goodbye(&io(), false, false).is_none(), "Status never settled");
+        let idle = Some(ConnectionError::KeepAliveTimeout);
+        assert!(remote_drop_without_goodbye(&idle, true, false).is_none(), "keep-alive expiry");
+        assert!(remote_drop_without_goodbye(&None, true, false).is_none(), "closed locally");
     }
 
     /// Two protocols' first requests in flight together carry the same id. Keyed

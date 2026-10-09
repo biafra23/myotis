@@ -502,12 +502,15 @@ fn persist_verdict(witnessed: bool, other_live_peer: bool) -> bool {
 /// Longest client id the pool's INFO lines show (see [`log_client_id`]).
 /// Real ids are 30–60 chars (`Geth/v1.16.1-stable-.../linux-amd64/go1.24.4`,
 /// `Nethermind/v1.31.11+.../linux-x64/dotnet9.0.5`); a longer one is cut.
-const LOG_CLIENT_ID_CHARS: usize = 64;
+pub(crate) const LOG_CLIENT_ID_CHARS: usize = 64;
 
 /// Pure: a peer's Hello client id as OPERATOR LOG TEXT — the `client=` field
 /// of the pool's per-peer INFO lines, so a desktop log says which client each
 /// pooled peer runs (#570: the Java engine exposes it on `ConnectedPeer`, the
-/// Rust engine nowhere). The id is peer-controlled and the only bound on it
+/// Rust engine nowhere). The CL side's Identify `agent_version` is the same
+/// kind of text and goes through this too (`reqresp::AgentMap` stores the
+/// result, so every CL `client=` line prints the sanitized form).
+/// The id is peer-controlled and the only bound on it
 /// is the Hello size cap, so: control characters (C0, DEL, C1 — a '\n' would
 /// forge a log line, the host drains split on it; an ESC would drive a
 /// terminal) are dropped, and the rest is cut to [`LOG_CLIENT_ID_CHARS`]
@@ -519,7 +522,7 @@ const LOG_CLIENT_ID_CHARS: usize = 64;
 /// and line-separator characters come out as `\u{..}`. Display text only —
 /// never a key, never compared; the status JSON does not carry it (hosts pin
 /// that shape).
-fn log_client_id(client_id: &str) -> String {
+pub(crate) fn log_client_id(client_id: &str) -> String {
     let mut kept = client_id.chars().filter(|c| !c.is_control());
     let mut shown: String = kept.by_ref().take(LOG_CLIENT_ID_CHARS).collect();
     if kept.next().is_some() {
