@@ -162,8 +162,18 @@ step skipped and none treated as optional or "only if asked"**:
    below: English, the session link as the last line.) Its base is `main` for a
    single-PR work item, and the feature branch for a part of a multi-PR plan
    (next section).
-4. **Wait for review comments** — subscribe to the PR and wait for CI + review
-   feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
+4. **Wait for review comments** — and make sure they REACH you. In the desktop
+   app, immediately after `gh pr create` returns, switch the app's PR monitor
+   on for that PR: `mcp__ccd_pr__set_monitor` with the PR's URL, `auto_fix:
+   true`, `address_comments: true`. It is PER PR and OFF by default — the app
+   has no global switch — so a PR opened without this call never wakes the
+   session for its review comments or CI failures, and the owner ends up
+   typing "please address the comment" for each one (owner ruling,
+   2026-10-09, after a day of exactly that; a memory note had not made it
+   stick, which is why it is here, in the step every PR goes through).
+   Elsewhere, use whatever the host offers to watch a PR
+   (`subscribe_pr_activity`). Then wait for CI + review feedback; do not
+   consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
