@@ -225,6 +225,9 @@ fun NodeScreen(
                 )
             }
 
+            // The one ladder the strip and the Status tab's card both paint.
+            val readiness = readinessOf(current, settings.deepPoolThreshold(), logIndexCatchUps[network], online)
+
             // The header and the tab content are the same in both layouts below; only
             // where the tab switcher sits differs.
             val header: @Composable () -> Unit = {
@@ -252,17 +255,10 @@ fun NodeScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
-                // selected chain. Uses the configurable deep-pool threshold from Settings.
-                ReadinessStrip(
-                    current,
-                    settings.deepPoolThreshold(),
-                    logIndexCatchUps[network],
-                    online,
-                )
+                // selected chain.
+                ReadinessStrip(readiness, logIndexCatchUps[network])
                 Spacer(Modifier.height(12.dp))
             }
-            // The same ladder the strip paints, for the Status tab's card.
-            val readiness = readinessOf(current, settings.deepPoolThreshold(), logIndexCatchUps[network], online)
             val content: @Composable () -> Unit = {
                 when (tabs[tab]) {
                     "Status" -> StatusTab(
@@ -370,9 +366,12 @@ internal fun ReadinessStrip(
     deepPoolThreshold: Int,
     catchUp: CatchUpProgress? = null,
     online: Boolean = true,
-) {
+) = ReadinessStrip(readinessOf(s, deepPoolThreshold, catchUp, online), catchUp)
+
+/** The strip over a ladder rung already computed — [NodeScreen] shares one with the status card. */
+@Composable
+internal fun ReadinessStrip(r: Readiness, catchUp: CatchUpProgress?) {
     // One ladder for every readiness surface (Readiness.kt); the strip only paints it.
-    val r = readinessOf(s, deepPoolThreshold, catchUp, online)
     val color = StatusColors.of(r.level)
     // The two rungs past "ready" are drawn thicker: the deep pool, and the index
     // catch-up whose strip doubles as its progress bar.
@@ -878,12 +877,13 @@ private fun StatusTab(
         // set to boot.
         val primaryActive = snap != null
         StatusHero(readiness, help = { HelpButton("Readiness", StatusHelp.READINESS) }) {
-            when (readiness.level) {
-                // Offline: the fix is outside the app, so offer the door to it.
-                ReadinessLevel.OFFLINE -> Button(onClick = onOpenNetworkSettings) { Text("Open network settings") }
-                // Parked on the user's consent: bring the dismissed dialog back.
-                ReadinessLevel.NEEDS_DECISION -> Button(onClick = onReviewStaleAnchor) { Text("Review") }
-                else -> {}
+            // Offline: the fix is outside the app, so offer the door to it — whatever rung
+            // leads (a sleeping stack outranks offline on the card, and still needs the door
+            // before a wake can succeed).
+            if (!online) Button(onClick = onOpenNetworkSettings) { Text("Open network settings") }
+            // Parked on the user's consent: bring the dismissed dialog back.
+            if (readiness.level == ReadinessLevel.NEEDS_DECISION) {
+                Button(onClick = onReviewStaleAnchor) { Text("Review") }
             }
             if (primaryActive) {
                 OutlinedButton(onClick = { controller.stopNetwork(primary) }) { Text("Stop") }

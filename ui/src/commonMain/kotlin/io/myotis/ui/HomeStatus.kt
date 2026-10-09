@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -21,10 +20,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /**
@@ -58,20 +59,22 @@ internal fun StatusHero(
         ),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.Top) {
                 // The headline and detail form one announcement; the buttons stay their own.
-                Row(
+                Column(
                     Modifier.weight(1f).semantics(mergeDescendants = true) {},
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Box(Modifier.size(14.dp).background(color, CircleShape))
-                    Spacer(Modifier.width(10.dp))
-                    Text(r.headline, style = MaterialTheme.typography.headlineSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ToneDot(color, 14.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(r.headline, style = MaterialTheme.typography.headlineSmall)
+                    }
+                    r.detail?.let {
+                        Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
                 help()
-            }
-            r.detail?.let {
-                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             when {
                 r.progress != null -> LinearProgressIndicator(
@@ -117,7 +120,7 @@ private fun VitalTile(v: Vital, modifier: Modifier) {
             Text(v.label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (v.tone != Tone.NONE) {
-                    Box(Modifier.size(8.dp).background(StatusColors.of(v.tone), CircleShape))
+                    ToneDot(StatusColors.of(v.tone), 8.dp)
                     Spacer(Modifier.width(6.dp))
                 }
                 Text(v.value, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -131,7 +134,12 @@ private fun VitalTile(v: Vital, modifier: Modifier) {
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Spacer(Modifier.height(0.dp))
         }
     }
+}
+
+/** The status dot the card and the tiles share. Decorative: the text beside it carries the meaning. */
+@Composable
+private fun ToneDot(color: Color, size: Dp) {
+    Box(Modifier.size(size).background(color, CircleShape))
 }

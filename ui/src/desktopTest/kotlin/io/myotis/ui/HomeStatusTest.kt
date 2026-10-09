@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -35,7 +36,11 @@ class HomeStatusTest {
     @Test
     fun normalModeShowsTheCardAndTilesButNoRows() {
         rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.onNodeWithTag(STATUS_HERO_TAG).assertIsDisplayed()
         rule.onNodeWithText("Ready").assertIsDisplayed()
+        // The card explains itself in both modes; the Start/Stop help is Expert-mode detail.
+        rule.onNodeWithContentDescription("Help: Readiness").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Help: Start / Stop").assertDoesNotExist()
         rule.onNodeWithContentDescription("Execution peers: 2 usable, of 3 connected").assertIsDisplayed()
         rule.onNodeWithContentDescription("Consensus: Synced, 2 servers answering").assertIsDisplayed()
         rule.onNodeWithContentDescription("Verified head: 1 s, fresh").assertIsDisplayed()
@@ -51,6 +56,7 @@ class HomeStatusTest {
     fun expertModeKeepsTheCardAndAddsTheRows() {
         rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         rule.onNodeWithText("Ready").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Help: Start / Stop").assertIsDisplayed()
         rule.onNodeWithText("Head age").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Reset sync state").performScrollTo().assertIsDisplayed()
         rule.onNodeWithContentDescription("Execution peers", substring = true).assertDoesNotExist()
@@ -73,6 +79,19 @@ class HomeStatusTest {
         rule.onNodeWithText("No internet connection").assertIsDisplayed()
         rule.onNodeWithText("Open network settings").assertIsDisplayed()
         rule.onNodeWithText("Start mainnet").assertIsNotEnabled()
+    }
+
+    @Test
+    fun aSleepingStackOfflineStaysGreyButKeepsTheDoor() {
+        rule.setContent {
+            NodeScreen(
+                controller = Running(synced().copy(lifecycle = "PAUSED")),
+                settings = FakeSettings(), logs = NoLogs, netStatus = Offline(),
+            )
+        }
+        rule.onNodeWithText("Sleeping").assertIsDisplayed()
+        rule.onNodeWithText("No internet connection").assertDoesNotExist()
+        rule.onNodeWithText("Open network settings").assertIsDisplayed()
     }
 
     @Test

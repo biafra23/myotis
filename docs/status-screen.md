@@ -76,7 +76,8 @@ error envelope (a paused or still-starting handle).
 
 ## Readiness strip
 
-A thin colored bar above the tabs — the wallet's "safe to transact" signal for
+A thin colored bar under the header (above the tab row on desktop; a phone's
+tabs sit in a bar at the bottom) — the wallet's "safe to transact" signal for
 the selected chain. Full semantics (including the 45 s "warming up" threshold
 and the deep-pool default) are in `docs/readiness-and-verified-head-age.md`;
 summary:
