@@ -50,6 +50,13 @@ class ReadinessTest {
         assertEquals(ReadinessLevel.STOPPED, r.level)
         assertEquals("Node readiness: not running", r.a11yLabel)
         assertEquals("Not running", r.headline)
+        // A registered handle that is not running is mid-boot or mid-teardown: the card
+        // offers Stop then, so the detail must not ask for a Start.
+        assertEquals("Starting or stopping — give it a moment.", r.detail)
+        assertEquals(
+            "Start the node to verify balances and answer wallet requests.",
+            readinessOf(null, 1).detail,
+        )
     }
 
     @Test

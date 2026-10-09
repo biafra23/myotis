@@ -2080,8 +2080,8 @@ private object StatusHelp {
         "app-open wakes don't count). \"slept\" is the most recent time it went to sleep — " +
         "which can be AFTER this wake, if it's asleep again now."
 
-    const val READINESS = "The card's headline is the readiness ladder, worst first: No internet " +
-        "connection → Sleeping → Not running → Update required → Needs your decision → Syncing → " +
+    const val READINESS = "The card's headline is the readiness ladder, worst first: Sleeping → " +
+        "No internet connection → Not running → Update required → Needs your decision → Syncing → " +
         "Almost ready → Ready. \"Ready\" means verified reads are being served; the strip above " +
         "turns bright green once the peer pool is deep enough for heavy wallet screens too. " +
         "\"Ready — log index catching up\" means reads work but log queries near the head are " +

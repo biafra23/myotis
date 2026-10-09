@@ -59,15 +59,16 @@ rung's own button where it has one.
 
 ## Vitals (normal mode)
 
-Four tiles under the card, each a label, a value with a tone dot (grey = not
-applicable, red = bad, amber = wait, green = ok, bright green = great) and one
-line of detail. All come from `vitalsOf` in `Readiness.kt`:
+Four tiles under the card, each a label, a value with a tone dot (red = bad,
+amber = wait, green = ok, bright green = great; a tile that does not apply
+shows `—` and no dot) and one line of detail. All come from `vitalsOf` in
+`Readiness.kt`:
 
 | Tile | Value | Detail | Tone |
 |---|---|---|---|
 | **Execution peers** | `N usable` — `snapServingPeers`, the peers that can answer a read right now | `of M connected` (`readyPeers`); "· looking for more" while hunting | red at 0, green below the deep-pool threshold, bright green at or above it |
 | **Consensus** | `Synced` / `Catching up` / `Starting` / `Paused` (`STALE_ANCHOR`) | `N servers answering` — distinct light-client servers in the last minute; "· looking for more" while hunting | green when `SYNCED`, red when parked, amber otherwise |
-| **Verified head** | the verified head's age (`4 s`, `2 min`), `None yet`, or `—` | `fresh` (≤ 45 s), `stale — waiting for a fresh head`, `waiting for a peer that can answer`, `waiting for sync`, or `paused — needs your decision` | green when fresh, amber when stale or missing on a synced node, grey while not synced |
+| **Verified head** | the verified head's age (`4 s`, `2 min`), `None yet`, or `—` | `fresh` (≤ 45 s), `stale — waiting for a fresh head`, `waiting for a peer that can answer`, `waiting for sync`, or `paused — needs your decision` | green when fresh, amber when stale or missing on a synced node, no dot while not synced |
 | **Log index** (only when the engine reports an enabled index) | `Up to date` (within the serving slack), `Behind head`, `Too far behind` (past the bridge limit), `Starting` (no block covered yet), `Nothing watched` | the head gap, then the history: `history complete`, `history paused · N blocks unindexed`, or `history incomplete · <ETA or blocks left>` | follows the HEAD side only — an incomplete or paused history is said in the detail and never changes the tone, because it does not affect what the node can answer at the head |
 
 While the stack is down every tile reads `—`; while it sleeps, `—` with
