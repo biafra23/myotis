@@ -410,6 +410,14 @@ class DesktopNodeController(
     // cannot change within a process, and the row reads it on every recomposition.
     override val supportsTor: Boolean by lazy { runCatching { Tor.supported() }.getOrDefault(false) }
 
+    override fun applyAppNap() {
+        // Push the persisted App Nap choice to the process: hold the no-nap activity unless
+        // the user allowed napping (Settings → Power). Live — the activity begins or ends at
+        // once — and a no-op off macOS, where there is nothing to hold.
+        if (!AppNap.isMac) return
+        if (settings.allowAppNap()) AppNap.enable() else AppNap.disable(AppNap.REASON)
+    }
+
     override fun applyTorMode() {
         // Push the persisted Tor preference to the process-global Rust-engine flag
         // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
@@ -743,6 +751,10 @@ class DesktopSettings(
     // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
+    // Expert mode (Logs/Index tabs, full Status rows, advanced settings); off by default.
+    private var expert = false
+    // macOS App Nap opt-in; off = the process holds the no-nap activity (AppNap.kt).
+    private var allowNap = false
     // Per-network opt-in for the eth_getLogs watch-list index (Rust engine only).
     private val logIndexOn = HashMap<String, Boolean>()
     // Per-network backfill pacing (true = max download speed); see Settings.logIndexMaxSpeed.
@@ -827,6 +839,13 @@ class DesktopSettings(
     override fun setPreferJavaEngine(v: Boolean) = mutate { preferJava = v }
     override fun torEnabled(): Boolean = synchronized(this) { torRouting }
     override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
+    override fun expertMode(): Boolean = synchronized(this) { expert }
+    override fun setExpertMode(v: Boolean) = mutate { expert = v }
+    override fun allowAppNap(): Boolean = synchronized(this) { allowNap }
+    override fun setAllowAppNap(v: Boolean) = mutate { allowNap = v }
+    // The row shows only where the toggle can take effect: App Nap is a macOS mechanism,
+    // and Linux has no per-app throttling of unfocused windows to opt into.
+    override fun supportsAppNap(): Boolean = AppNap.isMac
 
     /** Best-effort load; a missing or unreadable file just keeps the defaults. */
     private fun load() {
@@ -854,6 +873,8 @@ class DesktopSettings(
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
         p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
+        p.getProperty(K_EXPERT)?.toBooleanStrictOrNull()?.let { expert = it }
+        p.getProperty(K_APP_NAP)?.toBooleanStrictOrNull()?.let { allowNap = it }
         p.getProperty(K_POC_CONFIGURED)?.let { csv ->
             // Empty counts as no record (never written so; a hand edit): read as "configured
             // nothing" it would re-apply the primary network over the user's settings.
@@ -939,6 +960,8 @@ class DesktopSettings(
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
         p.setProperty(K_PREFER_JAVA, preferJava.toString())
         p.setProperty(K_TOR, torRouting.toString())
+        p.setProperty(K_EXPERT, expert.toString())
+        p.setProperty(K_APP_NAP, allowNap.toString())
         pocConfigured?.let { p.setProperty(K_POC_CONFIGURED, it.joinToString(",")) }
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
@@ -983,6 +1006,8 @@ class DesktopSettings(
         // now (its true meant "auto", which is the default — nothing to migrate).
         const val K_PREFER_JAVA = "engine.preferJava"
         const val K_TOR = "torRouting"
+        const val K_EXPERT = "expertMode"
+        const val K_APP_NAP = "appNap.allow"
         const val K_POC_CONFIGURED = "poc.configuredNetworks"
         const val K_LOG_INDEX_PREFIX = "logIndex."
         // Distinct prefixes nested under logIndex.* so the enable-loader's

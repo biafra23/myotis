@@ -121,7 +121,7 @@ class LogsTailFollowTest {
     private fun openLogsTab() {
         rule.mainClock.autoAdvance = false
         rule.setContent {
-            NodeScreen(controller = FakeController(), settings = FakeSettings(), logs = logs)
+            NodeScreen(controller = FakeController(), settings = FakeSettings(expert = true), logs = logs)
         }
         pumpFrames()
         rule.onNode(isSelectable() and hasText("Logs")).performClick()

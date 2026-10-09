@@ -58,6 +58,26 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `expert mode and the App Nap opt-in round-trip across a restart`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val first = DesktopSettings(nets, file)
+        assertFalse(first.expertMode(), "normal mode is the default")
+        assertFalse(first.allowAppNap(), "the no-nap activity is held by default")
+        first.setExpertMode(true)
+        first.setAllowAppNap(true)
+
+        val second = DesktopSettings(nets, file)
+        assertTrue(second.expertMode(), "Expert mode must be sticky")
+        assertTrue(second.allowAppNap(), "the App Nap opt-in must be sticky")
+
+        // Garbage falls back to the defaults, like every other boolean here.
+        Files.writeString(file, "expertMode=sure\nappNap.allow=1\n")
+        val third = DesktopSettings(nets, file)
+        assertFalse(third.expertMode())
+        assertFalse(third.allowAppNap())
+    }
+
+    @Test
     fun `all networks disabled persists as the empty set, not the default`(@TempDir dir: Path) {
         val file = dir.resolve("settings.properties")
         DesktopSettings(nets, file).setNetworkEnabled("mainnet", false)
