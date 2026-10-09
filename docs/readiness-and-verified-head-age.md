@@ -229,6 +229,7 @@ the tag there (`-32602`) on every method (`VerifiedReads.supportsFinalizedTag`,
   (`verifiedHeadAgeMs`, staleness constants `RPC_*_MS`)
 - Head age (Rust mapping): `myotis-engines/.../RustChainHandle.java` (`status()`)
 - Readiness gate: `node-core/.../ChainStack.java` (`readyForReads`)
-- UI strip + 45 s threshold: `ui/.../NodeScreen.kt` (`ReadinessStrip`, `READY_HEAD_WARM_MS`)
+- UI readiness ladder + 45 s threshold: `ui/.../Readiness.kt` (`readinessOf`,
+  `READY_HEAD_WARM_MS`); the strip that paints it: `ui/.../NodeScreen.kt` (`ReadinessStrip`)
 - Verification ladder (verifyMethod/failReason): `node-core/.../VerifiedAccountQuery.java`,
   `rust/myotis-net/src/el/verify.rs`
