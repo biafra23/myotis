@@ -337,12 +337,13 @@ public record NetworkConfig(
             // mainnet list above. ENR publication (lc-server-design §7) is what
             // removes the need to pin at all.
             //
-            // Only roost since 2026-10-07: it is the only Sepolia server known
-            // to serve Gloas-era light-client data to a build without #576.
-            // zbox's Nimbus serves it too, but neither engine can hold a Nimbus
-            // connection without #576 (see below), so a roost fault leaves a
-            // Sepolia wallet nothing to fall back to until a second server is
-            // pinned (#566) — below release check 3a's two-pin floor.
+            // Two pins since 2026-10-09: roost first, zbox's Nimbus second
+            // (re-pinned once #576 let either engine hold a Nimbus connection
+            // — see below), so a roost fault degrades to a working Gloas
+            // server. That is AT release check 3a's two-pin floor, not above
+            // it: since the Gloas fork no public census-verified server serves
+            // Gloas-era light-client data to put third (the Lighthouse entries
+            // dropped below serve none).
             //
             // Dropped 2026-10-07: 65.109.144.95 and 198.13.138.237, both
             // Lighthouse v8.3.0-rc.0. Census-verified public servers from

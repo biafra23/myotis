@@ -554,9 +554,11 @@ impl ReqRespClient {
 
     /// [`request_raw`](Self::request_raw) with every address the peer is known
     /// at, in preference order (TCP before QUIC for a discovered peer — see
-    /// `sync::Peer::dial_addrs` for why not the spec's order). The addresses
-    /// are tried ONE AT A TIME, and the next is tried only when the dial
-    /// itself failed: a request that reached a connection and then failed
+    /// `sync::Peer::dial_addrs` for why not the spec's order). The order
+    /// decides which connection this node OPENS; a connection that already
+    /// exists, on either transport, carries the request (same doc). The
+    /// addresses are tried ONE AT A TIME, and the next is tried only when the
+    /// dial itself failed: a request that reached a connection and then failed
     /// (timeout, a refused protocol, a closed stream) is the peer's answer, not
     /// a reason to try the same peer over another transport. The swarm could
     /// dial them all at once instead — libp2p's dial concurrency factor — but

@@ -455,10 +455,16 @@ public class BeaconP2PService implements AutoCloseable {
         registerBinding(UPDATES, true, 16, null); // multi-chunk relay deferred
         registerBinding(BLOCKS_BY_RANGE, true, 16, null); // we never serve blocks
         // ...but we do ANSWER by-root requests, with nothing: the root list is
-        // not parsed (size 0) because the answer never depends on it.
-        registerBinding(BLOCKS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
-        registerBinding(DATA_COLUMN_SIDECARS_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
-        registerBinding(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, true, 0, (req, peerId) -> ReqRespHandler.NO_CHUNKS);
+        // drained, never parsed, because the answer never depends on it — and
+        // answered once it has arrived, not from channelActive like a
+        // bodyless request, so the zero-chunk EOF never reaches the asker
+        // mid-request (the Rust engine's order; ResponderController.DRAINED_BODY).
+        registerBinding(BLOCKS_BY_ROOT, true, ResponderController.DRAINED_BODY,
+                (req, peerId) -> ReqRespHandler.NO_CHUNKS);
+        registerBinding(DATA_COLUMN_SIDECARS_BY_ROOT, true, ResponderController.DRAINED_BODY,
+                (req, peerId) -> ReqRespHandler.NO_CHUNKS);
+        registerBinding(EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT, true, ResponderController.DRAINED_BODY,
+                (req, peerId) -> ReqRespHandler.NO_CHUNKS);
 
         host.start().join();
         log.info("[beacon-p2p] libp2p host started, peerId={}, listenAddrs={}",
@@ -1756,9 +1762,11 @@ public class BeaconP2PService implements AutoCloseable {
         private final boolean hasContextBytes;
         /**
          * SSZ size of the request body. 0 means the request has no body
-         * (e.g. metadata, finality_update, optimistic_update); -1 means we
-         * don't know / variable size. Used to detect when we've received a
-         * complete request and can respond.
+         * (e.g. metadata, finality_update, optimistic_update); -1
+         * ({@link ResponderController#DRAINED_BODY}) a variable-size body the
+         * responder drains and never parses (the root lists), or, on an
+         * outbound-only binding without a responder, simply "unknown". Used to
+         * detect when we've received a complete request and can respond.
          */
         private final int expectedRequestSize;
         /** Supplier for current fork digest (only consulted when {@code hasContextBytes}). */
@@ -2078,14 +2086,42 @@ public class BeaconP2PService implements AutoCloseable {
     static class ResponderController {
 
         /**
-         * Most a peer may write on one inbound stream before we close it — the
-         * Rust engine's {@code MAX_REQUEST_WIRE_BYTES}. Only a binding that
-         * parses a body buffers at all, and the largest of those is a 92-byte
-         * Status; a size-0 binding never buffers — {@code channelRead0} drops
-         * its bytes, answered or not — so a root list (legitimately up to
-         * ~140 KiB) never meets this cap.
+         * Most a peer may write on one inbound stream whose body is PARSED
+         * before we close it — the Rust engine's {@code MAX_REQUEST_WIRE_BYTES};
+         * the largest such body is a 92-byte Status. A binding that does not
+         * parse (size 0, or {@link #DRAINED_BODY}) never buffers — its bytes
+         * are counted and dropped — and is bounded by
+         * {@link #MAX_DRAINED_REQUEST_BYTES} instead.
          */
         static final int MAX_INBOUND_REQUEST_BYTES = 1024;
+
+        /**
+         * {@code expectedRequestSize} of a binding whose request HAS a body this
+         * node never parses — the root lists, up to ~140 KiB (1024 block roots,
+         * or 128 column identifiers with their indices): the answer is zero
+         * chunks whatever the list says. Unlike a bodyless request (size 0,
+         * answered from {@code channelActive}), it is answered only once the
+         * request has arrived — the drain timer, or the stream's EOF — the Rust
+         * engine's order (read to EOF, then write nothing and close), so the
+         * zero-chunk EOF never reaches the asker while it is still writing.
+         */
+        static final int DRAINED_BODY = -1;
+
+        /**
+         * Most a peer may write on a stream whose body is not parsed before we
+         * close it: the Rust engine's {@code MAX_ROOT_LIST_REQUEST_WIRE_BYTES}.
+         * Dropped bytes cost no memory, but a stream that never ends is a
+         * stream slot, and a request past this is malformed anyway.
+         */
+        static final int MAX_DRAINED_REQUEST_BYTES = 256 * 1024;
+
+        /**
+         * Longest an inbound stream lives, answered or not — the spec's
+         * RESP_TIMEOUT, which also bounds the Rust engine's inbound streams
+         * (its request-response timeout). A peer that keeps the request side
+         * open after our half-close holds a stream slot until this closes it.
+         */
+        static final long STREAM_LIFETIME_MS = 10_000;
 
         private final io.libp2p.core.Stream stream;
         private final ReqRespHandler handler;
@@ -2096,8 +2132,11 @@ public class BeaconP2PService implements AutoCloseable {
         private final String peerId;
         private final String agent;
         private final ByteArrayOutputStream incoming = new ByteArrayOutputStream();
+        /** Bytes dropped on a binding that does not parse its body (size 0 or {@link #DRAINED_BODY}). */
+        private long drained;
         private volatile boolean responded;
         private volatile java.util.concurrent.ScheduledFuture<?> respondTimer;
+        private volatile java.util.concurrent.ScheduledFuture<?> lifetime;
         private final long startMs = System.currentTimeMillis();
 
         ResponderController(io.libp2p.core.Stream stream,
@@ -2123,6 +2162,16 @@ public class BeaconP2PService implements AutoCloseable {
 
                 @Override
                 public void channelActive(ChannelHandlerContext ctx) throws Exception {
+                    // Whatever else happens, the stream ends: a peer that never
+                    // half-closes its side after our answer would otherwise hold
+                    // the slot forever.
+                    lifetime = ctx.executor().schedule(() -> {
+                        if (ctx.channel().isOpen()) {
+                            log.debug("[beacon-p2p] responder proto={} peer={} stream open after {} ms, closing",
+                                    protocolId, peerId, STREAM_LIFETIME_MS);
+                            ctx.close();
+                        }
+                    }, STREAM_LIFETIME_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
                     if (expectedRequestSize == 0) {
                         // No request body expected — respond right away.
                         tryRespond(ctx);
@@ -2130,7 +2179,9 @@ public class BeaconP2PService implements AutoCloseable {
                         return;
                     }
                     // RESP_TIMEOUT safety: if we never see the full request,
-                    // respond (or reject) after 1 s so the peer doesn't time us out.
+                    // respond (or reject) after 1 s so the peer doesn't time us
+                    // out. A DRAINED_BODY binding takes this path too: it
+                    // answers after its request arrived, or after this.
                     respondTimer = ctx.executor().schedule(
                             () -> tryRespond(ctx),
                             1_000, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -2139,16 +2190,28 @@ public class BeaconP2PService implements AutoCloseable {
 
                 @Override
                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-                    // Once answered, nothing reads `incoming` again: drop the
-                    // rest of the request instead of buffering it. A size-0
-                    // binding never reads it at all (tryRespond parses a body
-                    // only for expectedRequestSize > 0), so its bytes are
-                    // dropped whether or not channelActive has answered yet:
-                    // a root list (legitimately up to ~140 KiB) must never
-                    // meet the cap below, whatever order jvm-libp2p delivers
-                    // a replayed request and channelActive in.
-                    if (responded || expectedRequestSize == 0) return;
                     int readable = msg.readableBytes();
+                    if (expectedRequestSize <= 0) {
+                        // A body this binding never parses (tryRespond parses one
+                        // only for expectedRequestSize > 0): counted and dropped,
+                        // whether or not the answer is out yet — a size-0 binding
+                        // answered at channelActive, a DRAINED_BODY one answers
+                        // from channelReadComplete once the bytes stop. The count
+                        // bounds a stream that never ends: a root list is at most
+                        // ~140 KiB, so past the cap the stream is malformed and
+                        // closed, as the Rust engine's drain does.
+                        drained += readable;
+                        if (drained > MAX_DRAINED_REQUEST_BYTES) {
+                            log.debug("[beacon-p2p] responder proto={} peer={} unparsed request exceeds {} bytes, closing",
+                                    protocolId, peerId, MAX_DRAINED_REQUEST_BYTES);
+                            responded = true;
+                            ctx.close();
+                        }
+                        return;
+                    }
+                    // Once answered, nothing reads `incoming` again: drop the
+                    // rest of the request instead of buffering it.
+                    if (responded) return;
                     if (incoming.size() + readable > MAX_INBOUND_REQUEST_BYTES) {
                         log.debug("[beacon-p2p] responder proto={} peer={} request exceeds {} bytes, closing",
                                 protocolId, peerId, MAX_INBOUND_REQUEST_BYTES);
@@ -2168,7 +2231,10 @@ public class BeaconP2PService implements AutoCloseable {
 
                 @Override
                 public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
-                    if (!responded && incoming.size() > 0) {
+                    // Something of the request arrived (buffered, or drained):
+                    // answer once the bytes stop for 150 ms — for a DRAINED_BODY
+                    // binding this IS the answer path, after the request.
+                    if (!responded && (incoming.size() > 0 || drained > 0)) {
                         var prev = respondTimer;
                         if (prev != null) prev.cancel(false);
                         respondTimer = ctx.executor().schedule(
@@ -2180,6 +2246,8 @@ public class BeaconP2PService implements AutoCloseable {
 
                 @Override
                 public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                    var life = lifetime;
+                    if (life != null) life.cancel(false);
                     if (!responded) {
                         var prev = respondTimer;
                         if (prev != null) prev.cancel(false);

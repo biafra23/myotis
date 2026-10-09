@@ -560,13 +560,13 @@ fn hex32(s: &str) -> [u8; 32] {
 /// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
 /// `NetworkConfigGnosisTest` pins that one).
 ///
-/// Only roost, the dedicated light-client server, since 2026-10-07: it is the
-/// only Sepolia server known to serve Gloas-era light-client data to a build
-/// without #576. The dropped Lighthouse entries below serve none; zbox's
-/// Nimbus does, but neither engine can hold a Nimbus connection without #576
-/// (see the note at the end of the list). So a roost fault leaves a Sepolia
-/// wallet nothing to fall back to until a second server is pinned (#566) —
-/// below release check 3a's two-pin floor.
+/// Two pins since 2026-10-09: roost, the dedicated light-client server,
+/// first, and zbox's Nimbus second (re-pinned once #576 let either engine
+/// hold a Nimbus connection — see its entry at the end of the list), so a
+/// roost fault degrades to a working Gloas server. That is AT release check
+/// 3a's two-pin floor, not above it: since the Gloas fork no public
+/// census-verified server serves Gloas-era light-client data to put third
+/// (the dropped Lighthouse entries below serve none).
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
     // FIRST on purpose: it exists because a general-purpose beacon node is
@@ -1144,8 +1144,18 @@ impl Peer {
     /// a QUIC connection answered a handful of streams and then every further
     /// stream open hung until Nimbus aborted the connection ~70 s later
     /// ("connection timed out due to lack of progress"); the same node over
-    /// TCP served for as long as it was asked. Until that is understood,
-    /// whichever connection a request lands on must be the TCP one.
+    /// TCP served for as long as it was asked. Until that is understood, the
+    /// connection this node OPENS to a peer must be the TCP one.
+    ///
+    /// That is all the order governs. A request goes over whichever
+    /// connection to the peer already exists — libp2p's request-response
+    /// hands it to any established connection and offers no way to pick one
+    /// by transport — so once a QUIC connection is up, whether this node
+    /// dialed it after a failed TCP dial or a peer opened it inbound to the
+    /// wallet's ephemeral QUIC listener, requests ride it until it closes.
+    /// Closing a QUIC connection once TCP is dialable again, or not listening
+    /// on QUIC in the wallet, would close that gap; neither is done yet
+    /// (docs/TODO.md, #566 entry).
     fn dial_addrs(&self) -> Vec<Multiaddr> {
         let mut addrs = Vec::with_capacity(2);
         addrs.push(self.addr.clone());

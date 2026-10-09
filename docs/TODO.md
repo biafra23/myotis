@@ -292,4 +292,15 @@ complete on its own.
   a different value is added, since Lighthouse bans a peer below its own
   requirement. And the Java engine's `metadata/3` and zero-chunk responders
   have not been run against a live Nimbus — only the Rust engine's have; one
-  `-Pengine=java` run pinned to zbox's Nimbus is owed.
+  `-Pengine=java` run pinned to zbox's Nimbus is owed — exercising the three
+  by-root responders, not only `metadata/3`.
+  **TCP-first is a dial order, not a connection choice (final PR review):**
+  `Peer::dial_addrs` decides which connection this node OPENS; a request goes
+  over whichever connection to the peer exists, and libp2p's request-response
+  offers no way to pick one by transport. So a QUIC connection — the fallback
+  after a failed TCP dial, or one a peer opened inbound to the wallet's
+  ephemeral QUIC listener — carries requests until it closes, Nimbus's stall
+  included. Options, owner's call: close a QUIC connection once a TCP dial to
+  the peer succeeds again; or no QUIC listener in the wallet (then a QUIC
+  connection exists only after TCP failed, which is the one case it is for);
+  or leave it until Nimbus holds QUIC connections and the order flips anyway.
