@@ -4,20 +4,26 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The generated identity constants follow the Gradle release version. The test
- * task passes that version in ({@code myotis.releaseVersion}, core/build.gradle.kts),
- * so a generator that drifts from {@code project.version} — or a stale generated
- * file — fails here rather than shipping an engine that names the wrong release.
+ * The generated identity constants follow the Gradle project version. The test
+ * task passes the raw version in ({@code myotis.projectVersion},
+ * core/build.gradle.kts) and this test derives the release version from it on
+ * its own, so a stale generated file or a generator whose derivation goes wrong
+ * fails here rather than shipping an engine that names the wrong release. Run it
+ * through Gradle: outside it the property is missing and the test fails.
  */
 class BuildInfoTest {
 
     @Test
-    void releaseVersionIsTheGradleVersion() {
-        String gradleVersion = System.getProperty("myotis.releaseVersion");
-        assertNotNull(gradleVersion, "the test task must pass myotis.releaseVersion");
-        assertEquals(gradleVersion, BuildInfo.RELEASE_VERSION);
+    void releaseVersionIsTheGradleVersionWithoutItsSuffix() {
+        String projectVersion = System.getProperty("myotis.projectVersion");
+        assertNotNull(projectVersion, "run through Gradle: the test task passes myotis.projectVersion");
+        int dash = projectVersion.indexOf('-');
+        String expected = dash < 0 ? projectVersion : projectVersion.substring(0, dash);
+        assertEquals(expected, BuildInfo.RELEASE_VERSION);
+        assertTrue(expected.matches("\\d+\\.\\d+\\.\\d+"), "a MAJOR.MINOR.PATCH release version: " + expected);
     }
 
     @Test

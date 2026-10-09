@@ -614,11 +614,11 @@ public class BeaconP2PService implements AutoCloseable {
                 protoId, peerAgentVersions, handler, hasContextBytes, expectedRequestSize,
                 this::currentForkDigest);
         bindings.put(protoId, binding);
-        // Only register the protocol — which is also what puts it in our
-        // Identify answer (identifyMessage) — when we actually have a responder. Advertising protocols we can't
-        // serve (UPDATES, BLOCKS_BY_RANGE) makes CL peers like Lighthouse
-        // treat us as misbehaving and goodbye us immediately — observed
-        // durationMs=1 closes in the wild. We can still OPEN streams for
+        // Register the protocol only when we have a responder. Registration is
+        // what lets multistream-select accept a peer's stream for it, and what
+        // lists it in our Identify answer (identifyMessage), so a protocol we
+        // cannot serve (UPDATES, BLOCKS_BY_RANGE) would be accepted, and
+        // advertised, only to fail every request. We can still OPEN streams for
         // those protocols as initiator because we hold the binding reference.
         if (handler != null) {
             host.addProtocolHandler(binding);

@@ -12,6 +12,8 @@ import io.libp2p.core.crypto.KeyKt;
 import io.libp2p.core.crypto.KeyType;
 import io.libp2p.core.crypto.PubKey;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
@@ -20,9 +22,8 @@ import org.junit.jupiter.api.Test;
  * no key, no protocols — because the binding is added after the host is built.
  * Now it names this release, {@code myotis/<release version>-java} (the Rust
  * engine's is {@code myotis/<release version>-rs}), and lists exactly the
- * protocols the host answers: never one it refuses, such as
- * light_client_updates_by_range or beacon_blocks_by_range, which CL peers
- * punish (see registerBinding).
+ * protocols the host answers: never one it has no responder for, such as
+ * light_client_updates_by_range or beacon_blocks_by_range (see registerBinding).
  */
 class BeaconP2PServiceIdentifyTest {
 
@@ -71,23 +72,28 @@ class BeaconP2PServiceIdentifyTest {
                     .orElseThrow()
                     .protocols();
             assertNotNull(protocols);
-            for (String answered : List.of(
+            assertEquals(protocols.stream().distinct().count(), protocols.size(), "no duplicates");
+
+            // Exactly our own protocols: Identify plus every req/resp binding
+            // registered with a responder, and nothing else.
+            Set<String> ours = protocols.stream()
+                    .filter(p -> !p.startsWith("/meshsub/"))
+                    .collect(Collectors.toSet());
+            assertEquals(Set.of(
                     "/ipfs/id/1.0.0",
-                    "/meshsub/1.1.0",
                     BeaconP2PService.STATUS, BeaconP2PService.STATUS_V1,
                     BeaconP2PService.PING, BeaconP2PService.METADATA, BeaconP2PService.METADATA_V3,
                     BeaconP2PService.GOODBYE,
                     BeaconP2PService.BOOTSTRAP, BeaconP2PService.FINALITY, BeaconP2PService.OPTIMISTIC,
                     BeaconP2PService.BLOCKS_BY_ROOT, BeaconP2PService.DATA_COLUMN_SIDECARS_BY_ROOT,
-                    BeaconP2PService.EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT)) {
-                assertTrue(protocols.contains(answered), "Identify must list " + answered + ": " + protocols);
-            }
-            assertFalse(protocols.contains(BeaconP2PService.UPDATES),
-                    "updates_by_range has no responder, so it must not be advertised");
-            assertFalse(protocols.contains(BeaconP2PService.BLOCKS_BY_RANGE),
-                    "blocks_by_range has no responder, so it must not be advertised");
+                    BeaconP2PService.EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT), ours);
+            assertFalse(ours.contains(BeaconP2PService.UPDATES), "updates_by_range has no responder");
+            assertFalse(ours.contains(BeaconP2PService.BLOCKS_BY_RANGE), "blocks_by_range has no responder");
             assertEquals(Boolean.FALSE, observer.servesLightClientUpdates(addr));
-            assertEquals(protocols.stream().distinct().count(), protocols.size(), "no duplicates");
+
+            // Gossip's versions are jvm-libp2p's to choose; Lighthouse needs
+            // /meshsub/1.1.0 among them (BeaconP2PServiceGossipsubTest).
+            assertTrue(protocols.contains("/meshsub/1.1.0"), "gossipsub must be advertised: " + protocols);
         } finally {
             observer.close();
             target.close();

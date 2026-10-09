@@ -63,7 +63,7 @@ val generateCoreBuildInfo by tasks.registering {
 sourceSets.main { java.srcDir(generateCoreBuildInfo) }
 
 tasks.test {
-    // BuildInfoTest compares the generated constant with the version Gradle
-    // holds, so a generator that drifts from project.version fails here.
-    systemProperty("myotis.releaseVersion", releaseVersion)
+    // BuildInfoTest derives the release version from the raw project version
+    // on its own and compares it with the generated constant.
+    systemProperty("myotis.projectVersion", project.version.toString())
 }
