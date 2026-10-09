@@ -437,11 +437,15 @@ enum Command {
 /// which client served, refused or dropped us without a peer-id lookup. A
 /// plain lock rather than a swarm round-trip because the readers are log
 /// sites in the sync loop, which must not await the swarm to print a line.
+/// Holds the DISPLAY-SAFE form only — the agent is peer-chosen text, and the
+/// Identify handler runs it through `el::pool::log_client_id` (control
+/// characters dropped, 64-char cap) before it enters; log sites print it with
+/// `?`, as the EL pool does, so what the strip cannot classify is escaped.
 pub type AgentMap = Arc<std::sync::RwLock<HashMap<PeerId, String>>>;
 
-/// The `client=` label for a peer: its Identify agent, or `?` before Identify
-/// arrived or after its connection closed. Poison-tolerant: a panic on the
-/// other side of the lock loses nothing a log label needs.
+/// The `client=` label for a peer: its (sanitized) Identify agent, or `?`
+/// before Identify arrived or after its connection closed. Poison-tolerant: a
+/// panic on the other side of the lock loses nothing a log label needs.
 fn client_label(agents: &AgentMap, peer: &PeerId) -> String {
     agents
         .read()
@@ -1368,7 +1372,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 if let Some(e) =
                     remote_drop_without_goodbye(&cause, ctx.status_done.contains(&peer_id), said_goodbye)
                 {
-                    tracing::info!(peer = %peer_id, client = %client_label(&ctx.peer_agents, &peer_id),
+                    tracing::info!(peer = %peer_id, client = ?client_label(&ctx.peer_agents, &peer_id),
                         error = %e, "peer connection dropped without goodbye");
                 }
                 // Next connection must redo the Status handshake — and drop the
@@ -1412,7 +1416,9 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
 /// that never got past the handshake), and no Goodbye came first. A Goodbye
 /// already logged itself (`peer sent goodbye`); an idle keep-alive expiry and
 /// a close we made ourselves (`cause` None) are routine and stay at debug.
-/// Returns the error to print.
+/// Returns the error to print. Nothing in this crate (or roost) SENDS a
+/// Goodbye today; if an outbound one is ever added, the close that follows
+/// it must be excluded here too, or this line would call our own leave a drop.
 fn remote_drop_without_goodbye(
     cause: &Option<libp2p::swarm::ConnectionError>,
     status_settled: bool,
@@ -1445,12 +1451,15 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
                 ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
             }
-            ctx.peer_agents
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(peer_id, info.agent_version.clone());
-            tracing::debug!(peer = %peer_id, agent = %info.agent_version,
+            // Stored in the display-safe form only (control characters gone,
+            // 64-char cap): the agent is peer-chosen text and every reader of
+            // this map prints it, so the one place it enters is the one place
+            // it is sanitized. The family prefix `agent_serves_one_period`
+            // matches on survives both the strip and the cap.
+            let agent = crate::el::pool::log_client_id(&info.agent_version);
+            tracing::debug!(peer = %peer_id, agent = ?agent,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
+            ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).insert(peer_id, agent);
         }
         E::Identify(_) => {}
         // No subscriptions, so the only events are peers' subscription
@@ -1483,7 +1492,7 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 // to handle, and it costs us nothing to hold.
                 if ctx.in_flight_bytes.saturating_add(response.len()) > MAX_IN_FLIGHT_RESPONSE_BYTES
                 {
-                    tracing::warn!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                    tracing::warn!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
                         protocol, queued = ctx.in_flight_bytes, want = response.len(),
                         "in-flight response budget exhausted — answering ResourceUnavailable");
                     response = codec::encode_error_response(
@@ -1714,7 +1723,7 @@ fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw
                 0
             };
             ctx.goodbye_from.insert(peer);
-            tracing::info!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer), reason,
+            tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer), reason,
                 "peer sent goodbye");
             let body: &[u8] = if req_ssz.len() == 8 { &req_ssz } else { &[0u8; 8] };
             codec::encode_success_response(body, None)
@@ -1728,7 +1737,7 @@ fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw
             (Some(lc), Ok(root)) => {
                 let root: [u8; 32] = root;
                 let served = lc.bootstrap(&root);
-                tracing::info!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
                     root = %hex8(&root), served = served.is_some(), "light_client_bootstrap request");
                 served.unwrap_or_else(resource_unavailable)
             }
@@ -1749,7 +1758,7 @@ fn respond_inbound(ctx: &mut SwarmCtx, protocol: &'static str, peer: PeerId, raw
                 let start = u64::from_le_bytes(req_ssz[..8].try_into().expect("checked"));
                 let count = u64::from_le_bytes(req_ssz[8..16].try_into().expect("checked"));
                 let served = lc.updates_by_range(start, count);
-                tracing::info!(peer = %peer, client = %client_label(&ctx.peer_agents, &peer),
+                tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer),
                     start, count, served = served.is_some(), "light_client_updates_by_range request");
                 served.unwrap_or_else(resource_unavailable)
             }
@@ -2364,15 +2373,18 @@ mod pending_request_tests {
             info: identify::Info {
                 public_key: key.public(),
                 protocol_version: "eth2/1.0.0".into(),
-                agent_version: "nimbus-eth2/v26.7.0".into(),
+                // Peer-chosen text: a forged log line and a terminal escape
+                // must not survive into the label (`el::pool::log_client_id`).
+                agent_version: "nimbus-eth2/v26.7.0\n INFO forged=1\x1b[31m".into(),
                 listen_addrs: Vec::new(),
                 protocols: Vec::new(),
                 observed_addr: addr(),
                 signed_peer_record: None,
             },
         }));
-        assert_eq!(client.client_of(&p), "nimbus-eth2/v26.7.0", "after Identify");
-        assert_eq!(client_label(&ctx.peer_agents, &p), "nimbus-eth2/v26.7.0", "swarm side sees the same map");
+        let shown = "nimbus-eth2/v26.7.0 INFO forged=1[31m";
+        assert_eq!(client.client_of(&p), shown, "after Identify, sanitized");
+        assert_eq!(client_label(&ctx.peer_agents, &p), shown, "swarm side sees the same map");
 
         respond_inbound(&mut ctx, protocols::GOODBYE, p, &codec::encode_request(&129u64.to_le_bytes()));
         assert!(ctx.goodbye_from.contains(&p), "an inbound Goodbye marks the peer as having announced its leave");
