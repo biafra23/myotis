@@ -1899,8 +1899,8 @@ private fun ResultStat(label: String, value: String, muted: Boolean) {
 /**
  * The result's verification as a pill: green "Verified" with the method (and BLS when
  * the match was signed), red "Unverified" with the ladder's fail reason. Nothing here
- * is served unverified — a red pill says a peer's claim could not be tied to the beacon
- * chain, and the numbers above it are that claim.
+ * is served unverified — a red pill leads the card and says a peer's claim could not be
+ * tied to the beacon chain, and the muted numbers below it are that claim.
  */
 @Composable
 private fun VerificationBadge(a: AccountResult) {
