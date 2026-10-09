@@ -2,10 +2,19 @@
 
 This documents everything shown for a network on the shared Compose UI (Android +
 desktop; iOS shares the same `NodeScreen.kt` composables) once a chain is
-selected: the readiness strip and banners above the tabs, and every row of the
-**Status** tab itself. Source: `ui/src/commonMain/kotlin/io/myotis/ui/NodeScreen.kt`
-(`NodeScreen`, `ReadinessStrip`, `StatusTab`, `StatusView`), fed by the
-top-level `NodeSnapshot` data class (`ui/.../NodeController.kt`).
+selected: the readiness strip above the tabs, the status card and vitals the
+**Status** tab opens with, and every row the tab shows in Expert mode. Source:
+`ui/src/commonMain/kotlin/io/myotis/ui/NodeScreen.kt` (`NodeScreen`,
+`ReadinessStrip`, `StatusTab`, `StatusView`), `ui/.../HomeStatus.kt` (the card
+and the tiles) and `ui/.../Readiness.kt` (the ladder and the tile rules they all
+draw), fed by the top-level `NodeSnapshot` data class (`ui/.../NodeController.kt`).
+
+**Normal and Expert mode.** Out of the box the app shows the three screens a
+wallet user needs — Status, Query, Settings — and the Status tab is the card and
+the four tiles below. Settings → *Expert mode* adds the Logs and Index tabs, the
+node-tuning settings, and on this tab everything from "Banners" on: the sync
+bar, every row, the maintenance actions and the READY peers list. The card stays
+at the top in both modes.
 
 Every value here reflects the *selected* network — the chips above the strip
 switch which chain's snapshot is shown — with one exception: the stale-anchor
@@ -15,14 +24,55 @@ Host coverage isn't uniform: iOS never fills the READY peers list or the
 Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), and the
 Tor row is desktop-only (see that row below).
 
-The app shows a condensed version of this explanation in place: rows marked
-"ⓘ" open it in a dialog on a single tap anywhere on the row, and each of the
-three actions — Start / Stop (one "ⓘ" for the pair), Clear peer caches, Reset
-sync state — has an "ⓘ" beside it (the buttons' own tap stays the action). The
-dialog is titled with the row or action's name and stays open until dismissed
-(Close, tap outside, or back). The text lives in the `StatusHelp` object in
-`NodeScreen.kt`. **The two are meant to stay in sync**: a behavior change that
-changes what a row or action means must update both `StatusHelp` and this doc.
+The app shows a condensed version of this explanation in place: the card has an
+"ⓘ" ("Readiness") in both modes; in Expert mode rows marked "ⓘ" open it in a
+dialog on a single tap anywhere on the row, and each of the three actions —
+Start / Stop (one "ⓘ" for the pair), Clear peer caches, Reset sync state — has
+an "ⓘ" beside it (the buttons' own tap stays the action). The dialog is titled
+with the row or action's name and stays open until dismissed (Close, tap
+outside, or back). The text lives in the `StatusHelp` object in `NodeScreen.kt`.
+**The two are meant to stay in sync**: a behavior change that changes what a
+row, tile or action means must update both `StatusHelp` and this doc.
+
+## Status card (both modes)
+
+The first thing on the Status tab: a colored dot, a headline, one line of
+detail, a progress bar while something measurable is in progress, and the
+action the state calls for. It paints the same ladder as the strip
+(`readinessOf` in `Readiness.kt`), worst rung first:
+
+| Headline | When | Detail / action |
+|---|---|---|
+| **Sleeping** (grey) | idle-paused (`lifecycle == PAUSED`) | networking is off to save battery; a wallet request wakes it. Names a reported network upgrade if peers announced one. Outranks "No internet connection": nothing is failing while asleep. |
+| **No internet connection** (red) | the host reports no connectivity | *Open network settings* button; Start is refused meanwhile. |
+| **Not running** (red) | no stack registered | *Start `<network>`* button. |
+| **Update required** (red) | an ACTIVE upgrade advisory the node's own state corroborates (not SYNCED, or stale head) | update the app. |
+| **Needs your decision** (red) | parked in `STALE_ANCHOR` | how many periods old the anchor is (and the bound, where the host reports it); a *Review* button re-opens the consent dialog after it was dismissed. |
+| **Syncing** (red) | beacon not `SYNCED` | the sync bar's wording: "Starting the light client…" (Android's `STARTING`-as-`STOPPED`), "Bootstrapping the light client…", "Catching up sync committees — period *c* of *t*." with a determinate bar, or "Finishing sync…"; "Looking for light-client servers…" while hunting. |
+| **Almost ready** (amber) | `SYNCED` but no verified head, or one older than 45 s | waiting for the first / a fresh verified head; "Looking for snap peers…" while hunting. |
+| **Ready — log index catching up** / **too far behind** (amber) | ready, but an enabled log index trails the head past the serving slack | the catch-up line and, unless stalled, its bar — `eth_getLogs` near the head is refused until it has caught up. |
+| **Ready** (green, bright green when the pool is deep) | verified reads are served | the verified head's age, and whether the peer pool is deep enough for heavy wallet screens (the deep-pool threshold in Settings). |
+
+Below the headline sit *Stop* (while the stack is up) or *Start `<network>`*
+(while it is down) — see "Actions" below for their exact semantics — plus the
+rung's own button where it has one.
+
+## Vitals (normal mode)
+
+Four tiles under the card, each a label, a value with a tone dot (grey = not
+applicable, red = bad, amber = wait, green = ok, bright green = great) and one
+line of detail. All come from `vitalsOf` in `Readiness.kt`:
+
+| Tile | Value | Detail | Tone |
+|---|---|---|---|
+| **Execution peers** | `N usable` — `snapServingPeers`, the peers that can answer a read right now | `of M connected` (`readyPeers`); "· looking for more" while hunting | red at 0, green below the deep-pool threshold, bright green at or above it |
+| **Consensus** | `Synced` / `Catching up` / `Starting` / `Paused` (`STALE_ANCHOR`) | `N servers answering` — distinct light-client servers in the last minute; "· looking for more" while hunting | green when `SYNCED`, red when parked, amber otherwise |
+| **Verified head** | the verified head's age (`4 s`, `2 min`), `None yet`, or `—` | `fresh` (≤ 45 s), `stale — waiting for a fresh head`, `waiting for a peer that can answer`, `waiting for sync`, or `paused — needs your decision` | green when fresh, amber when stale or missing on a synced node, grey while not synced |
+| **Log index** (only when the engine reports an enabled index) | `Up to date` (within the serving slack), `Behind head`, `Too far behind` (past the bridge limit), `Starting` (no block covered yet), `Nothing watched` | the head gap, then the history: `history complete`, `history paused · N blocks unindexed`, or `history incomplete · <ETA or blocks left>` | follows the HEAD side only — an incomplete or paused history is said in the detail and never changes the tone, because it does not affect what the node can answer at the head |
+
+While the stack is down every tile reads `—`; while it sleeps, `—` with
+"sleeping". The index tile also disappears whenever the status probe answers an
+error envelope (a paused or still-starting handle).
 
 ## Readiness strip
 
@@ -39,6 +89,7 @@ summary:
 | red — sync anchor too old | parked in `STALE_ANCHOR`, waiting on the consent dialog below |
 | red — not synced | beacon light client isn't `SYNCED` yet |
 | amber | `SYNCED`, but verified head age is over 45 s (or there is no verified head yet) — warming up or wedged: reads are refused, or served from a head that has stopped advancing |
+| amber (thick, a progress bar) | ready, but the log index trails the head past the serving slack — head-reaching `eth_getLogs` is refused until it has caught up; a gap past the bridge limit is a flat amber bar (nothing is closing it) |
 | green (thin) | ready for simple reads |
 | green (thick) | fully ready — snap-serving peer pool at or above the deep-pool threshold (Settings), so heavy confirm screens load too |
 
@@ -53,26 +104,26 @@ network's weak-subjectivity bound until you decide. Three ways out, all describe
 accepts the risk for this run only, never persisted. Dismissing without a
 choice just hides the dialog; it reappears if the network parks again later.
 
-## Banners (above the sync bar, inside the Status tab)
+## Banners (under the card, inside the Status tab)
 
-- **Offline banner** — shown when the device has no connectivity at all
-  ("No internet connection… Open network settings").
-- **Network upgrade banner** — peers announce (`SCHEDULED`) or report already
+- **Offline** — the card's "No internet connection" rung with its *Open
+  network settings* button, in both modes (the former offline banner).
+- **Network upgrade banner** (both modes) — peers announce (`SCHEDULED`) or report already
   active (`ACTIVE`) a fork this build doesn't support. It is advisory only
   (unverified peer data) and never itself claims the node stopped verifying;
   it turns into an alarm ("Update required") only once the node's *own*
   verified state agrees — unsynced, or verified head gone stale. Shows the
   activation time, how many distinct peer networks reported it, and the fork
   id.
-- **Hunt banner** ("Hunting for light-client servers and/or snap peers…") —
+- **Hunt banner** (Expert mode; the card's detail says the same in both) ("Hunting for light-client servers and/or snap peers…") —
   the light client and/or the EL pool are starved of usable servers and
   running boosted discovery/probing to find more. Tracks `lcHunting` /
   `elHunting`.
 
-## Sync progress bar
+## Sync progress bar (Expert mode)
 
 Shown while the beacon side is not yet `SYNCED` (hidden once it is, or if the
-network is stopped):
+network is stopped). The card carries the same progress in both modes:
 
 - **`STALE_ANCHOR`** — no bar (nothing is progressing): text states the anchor
   age in periods against the enforced bound, and that it's waiting on your
@@ -87,7 +138,7 @@ network is stopped):
 - **`CATCHING_UP`**, start period unknown — indeterminate bar, "Catching up
   sync committees…".
 
-## Status rows
+## Status rows (Expert mode)
 
 In on-screen order. "Row" is the literal left-hand text label.
 
@@ -119,21 +170,22 @@ In on-screen order. "Row" is the literal left-hand text label.
 | **Sleep** | Idle-sleep (pseudo-sleep) summary: `always on` if the host has no idle controller at all (e.g. desktop); `never slept` if it supports sleep but hasn't paused yet; otherwise `<duration> over N pause(s)` — cumulative time spent idle-paused and how many times. |
 | **Last woke** | Only shown once there has been at least one demand wake. `<time> (<reason>) · slept <time>` — when the node last woke on a real request (foreground/app-open wakes are excluded so this keeps showing the last *meaningful* wake) and why; `slept` is the most recent time it went to sleep, which can be *after* that wake (e.g. it's asleep again now) — it does not necessarily describe the pause right before the shown wake. |
 
-## Actions below the rows
+## Actions
 
-- **Start `<network>` / Stop** — runtime-only start/stop, decoupled from the
+- **Start `<network>` / Stop** (on the card, both modes; one of the two shows,
+  depending on whether the stack is up) — runtime-only start/stop, decoupled from the
   network's enabled switch in Settings: Stop never flips that switch off. The
   one exception is Start on a chain that isn't enabled at all (e.g. a fresh
   install) — that goes through `enableNetwork`, which *does* flip it on, so a
   cold host ends up with an enabled set to boot from. Start is also disabled
   while offline (discovery has nothing to reach).
-- **Clear peer caches** — wipes the on-disk peer caches through the engine
+- **Clear peer caches** (Expert mode, below the rows) — wipes the on-disk peer caches through the engine
   (so a live stack can't write the old peers back) — gives discovery a fresh
   slate. Only enabled while the network is stopped, making an accidental
   click on a running node unlikely — the gate follows a 2 s snapshot poll, so
   it's a guard rail, not a hard lock (and briefly stale on Android just after
   a foreground rebind).
-- **Reset sync state** — deletes the persisted sync-committee snapshot so the
+- **Reset sync state** (Expert mode, below the rows) — deletes the persisted sync-committee snapshot so the
   next start re-bootstraps from the embedded checkpoint alone (the persisted
   snapshot is usually the *freshest* anchor the node has). Also gated to
   "stopped only"; unlike the cache clear this only ever takes effect at the
@@ -145,7 +197,7 @@ In on-screen order. "Row" is the literal left-hand text label.
   start parks in `STALE_ANCHOR` and shows the stale-anchor consent dialog
   above. Updating the app first (a fresh checkpoint ships with it) avoids that.
 
-## READY peers list
+## READY peers list (Expert mode)
 
 Shown at the bottom once there is at least one ready peer: one row per peer —
 its remote address and whether it negotiated `snap`, with its reported client
