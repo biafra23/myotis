@@ -219,16 +219,15 @@ class NetworkConfigGnosisTest {
         assertTrue(enode.endsWith("@188.68.32.16:30405"), enode);
 
         // roost, the dedicated light-client server, is tried first — that is the
-        // point of having it. Census-verified public servers would follow, so a
-        // roost fault degrades to working peers rather than to dead pins; since
-        // the Gloas fork none that a build without #576 can reach is known to
-        // serve Gloas-era light-client data (zbox's Nimbus does, with #576), so
-        // roost is alone (#566). The full list, in order — the Rust twin
+        // point of having it. zbox's own Nimbus follows (re-pinned with #576 in,
+        // #566 option 3), so a roost fault degrades to a working Gloas server
+        // rather than to nothing. The full list, in order — the Rust twin
         // (sepolia_config_matches_networkconfig_java) pins the same strings.
         assertEquals(List.of(
-                        "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
+                        "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                        "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"),
                 NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
-                "roost alone until a second Gloas-serving server is pinned, same list as the Rust twin");
+                "roost first, zbox's Nimbus second, same list as the Rust twin");
     }
 
     @Test

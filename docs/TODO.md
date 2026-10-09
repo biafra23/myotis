@@ -216,4 +216,91 @@ complete on its own.
     Lodestar nodes the yamux-only census host could not reach (#576), so
     those censuses do not show roost to be the only server. zbox's own
     Nimbus serves Gloas light-client data and is #566's option 3 once #576
-    is in.
+    is in — re-pinned second, after roost, on 2026-10-09 (both engines), with
+    its two caveats in the pin comment: the `--max-peers=25` unit resets the
+    handshake while it is full, and its peer loop scores our empty by-root
+    answers down, so a connection lasts minutes between reconnects.
+  **Part of the cause was ours (2026-10-08):** the Rust engine's libp2p host
+  offered only yamux on TCP, while Nimbus (since 2024) and Lodestar speak
+  only mplex there — so the two client families that DO serve Gloas
+  light-client data were unreachable from the Rust engine by construction,
+  and zbox's own Nimbus had been dropped as a "dead" pin in September for
+  the same reason. mplex is in (`reqresp::build_swarm`), and so is the spec's
+  primary transport, QUIC (2026-10-09): the host listens on an ephemeral
+  `/udp/0/quic-v1` beside TCP, discovery turns an ENR `quic`/`quic6` field
+  into a second dial address, and a peer is dialed at TCP first, QUIC only
+  when the TCP dial fails. **Not QUIC first, measured:** pinned to zbox's
+  Nimbus over `udp/9001/quic-v1` alone, the handshake, identify, status and
+  the first four finality polls worked (`SYNCED`), then every further
+  stream open hung (`Timeout while waiting for a response`) until Nimbus
+  aborted the connection after ~70 s with lsquic's
+  `connection timed out due to lack of progress` — its `es_noprogress_timeout`,
+  which fires when the APPLICATION (nim-libp2p's QUIC muxer) stops servicing
+  streams, so the stall is on Nimbus's side; over TCP the same node served
+  for as long as it was asked. Upstream candidate (status-im/nim-libp2p,
+  QUIC is new in Nimbus 26.9). Flip the order once a Nimbus release holds a
+  QUIC connection open across many streams. Still open: roost listens on TCP
+  only (its relay forwards no spare UDP port and its ENR carries no `quic`
+  field), and the shipped Sepolia / mainnet / gnosis pins are all `/tcp/`
+  multiaddrs.
+  **And a second, independent cause behind it:** once a connection to zbox's
+  Nimbus came up over mplex, Nimbus admitted us and then dropped us ~100 ms
+  later, before our bootstrap request was served — its post-Fulu sync
+  overseer asks every new peer for `metadata/3` and nothing else
+  (`doPeerUpdateMetadata` → "Peer loop stopped"), and both engines served
+  only `metadata/2`. Lighthouse and Teku hid this by negotiating v3→v2→v1 in
+  one multistream offer. `metadata/3` is in on both engines
+  (`status::metadata_v3_light_client`, `BeaconP2PService.METADATA_V3`),
+  advertising `CUSTODY_REQUIREMENT` — not 0, which Lighthouse bans.
+  **And a third:** with metadata answered, Nimbus admitted us, served the
+  bootstrap, and then its root sync asked us for the head block we had just
+  advertised in Status (the checkpoint block — not in its sync DAG, which
+  only holds what it saw since its start), could not negotiate
+  `beacon_blocks_by_root` at all, and ended the peer loop ~1 ms later, under
+  our first `updates_by_range`. Both engines now answer `beacon_blocks_by_root/2`
+  inbound with zero chunks — the spec's "none of these" — which passes
+  Nimbus's response check and costs no score. With that in, the Rust engine
+  applied finality updates from zbox's Nimbus alone, every 12 s — the first
+  time ever — and the fourth and last drop showed itself:
+  `data_column_sidecars_by_root/1`, asked every ~45 s because the
+  `custody_group_count` we advertise (Lighthouse's minimum) gives us a column
+  map. Same zero-chunk answer on both engines; Nimbus scores that
+  `PeerScoreNoValues` but keeps the loop (a refused negotiation ends it), so
+  a Nimbus that keeps missing sidecars still cycles us every few minutes,
+  with updates flowing in between. The fifth and last step of that loop,
+  Gloas `execution_payload_envelopes_by_root/1`, behaves like the sidecars
+  (zbox's Nimbus asks on every connection, its missing-envelope set is never
+  empty) and gets the same answer. A refused protocol ends Nimbus's loop with
+  `CommunicationTimeout`, a sunk score with `PeerScoreLow`; neither blocks
+  our reconnect, because its seen-table only gates ITS outbound dials
+  (`checkPeer`). Re-run the Sepolia census from a build with all of this
+  before concluding anything about who serves.
+  **Upstream (owner's call to file, status-im/nimbus-eth2):** the three
+  zero-chunk responders placate `sync_overseer2`, which (a) requests a peer's
+  advertised head by root even when its own DAG holds the block (the sync DAG
+  only covers what it saw since start, and `getMissingBlocksRequest` never
+  consults the DAG), and (b) ends the peer loop on a protocol the peer does
+  not offer, which disconnects every light client — its own
+  `nimbus_light_client` included, whose Status is the genesis head. Every
+  further overseer step that asks for data a light client cannot hold would
+  need another responder here until that is fixed upstream.
+  **Follow-ups from the final PR's review (2026-10-09):** the
+  `custody_group_count` both engines advertise in `metadata/3` is a
+  per-network parameter (`CUSTODY_REQUIREMENT`) hardcoded as 4
+  (`status::CUSTODY_GROUP_COUNT`, `MetadataMessage.CUSTODY_GROUP_COUNT`); it
+  belongs in the network configs with a parity test before any network with
+  a different value is added, since Lighthouse bans a peer below its own
+  requirement. And the Java engine's `metadata/3` and zero-chunk responders
+  have not been run against a live Nimbus — only the Rust engine's have; one
+  `-Pengine=java` run pinned to zbox's Nimbus is owed — exercising the three
+  by-root responders, not only `metadata/3`.
+  **TCP-first is a dial order, not a connection choice (final PR review):**
+  `Peer::dial_addrs` decides which connection this node OPENS; a request goes
+  over whichever connection to the peer exists, and libp2p's request-response
+  offers no way to pick one by transport. So a QUIC connection — the fallback
+  after a failed TCP dial, or one a peer opened inbound to the wallet's
+  ephemeral QUIC listener — carries requests until it closes, Nimbus's stall
+  included. Options, owner's call: close a QUIC connection once a TCP dial to
+  the peer succeeds again; or no QUIC listener in the wallet (then a QUIC
+  connection exists only after TCP failed, which is the one case it is for);
+  or leave it until Nimbus holds QUIC connections and the order flips anyway.

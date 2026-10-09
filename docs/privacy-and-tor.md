@@ -58,6 +58,7 @@ Tor carries **TCP streams only**. Myotis' transports:
 |---|---|---|
 | RLPx / eth / snap (port 30303) | TCP | Yes (Arti data stream) |
 | CL libp2p req/resp (port 9000) | TCP | Yes — but content-benign, may not need it |
+| CL libp2p req/resp over QUIC (`/udp/<port>/quic-v1`; the Rust engine listens on an ephemeral UDP port and dials a peer's QUIC address when its TCP dial fails) | UDP | **No** — if CL traffic is ever routed over Tor, QUIC has to be off for it (`HostConfig.listen_quic = None`, no QUIC dial), or a peer whose TCP dial fails under Tor is reached in the clear |
 | discv4 (EL discovery) | UDP | **No** |
 | discv5 (CL discovery) | UDP | **No** |
 | EIP-1459 ENR trees | DNS TXT (dnsjava; hickory in the Rust engine) | Not directly; needs DoH over a Tor stream. The Rust engine's walk is **skipped while Tor is enabled** (#539): a system-resolver query for `all.mainnet.ethdisco.net` tells the local resolver which network this node is on |

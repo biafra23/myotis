@@ -319,7 +319,7 @@ public record NetworkConfig(
             // AND NOTE WHAT A HEALTHY ROOST COSTS THIS ENGINE. A fallback (the
             // public pins this list held until 2026-10-07, or discovered peers)
             // only engages when roost FAILS. roost serves no blocks —
-            // beacon_blocks_by_range is not among the nine protocols in
+            // beacon_blocks_by_range is not among the protocols in
             // rust/myotis-net/src/protocols.rs — while the steady-state chain
             // fill follows the finality-poll WINNER with no per-peer fallback
             // (fillChainStateRoots(win.peer(), ...)). A pre-encoded byte cache
@@ -337,12 +337,13 @@ public record NetworkConfig(
             // mainnet list above. ENR publication (lc-server-design §7) is what
             // removes the need to pin at all.
             //
-            // Only roost since 2026-10-07: it is the only Sepolia server known
-            // to serve Gloas-era light-client data to a build without #576.
-            // zbox's Nimbus serves it too, but neither engine can hold a Nimbus
-            // connection without #576 (see below), so a roost fault leaves a
-            // Sepolia wallet nothing to fall back to until a second server is
-            // pinned (#566) — below release check 3a's two-pin floor.
+            // Two pins since 2026-10-09: roost first, zbox's Nimbus second
+            // (re-pinned once #576 let either engine hold a Nimbus connection
+            // — see below), so a roost fault degrades to a working Gloas
+            // server. That is AT release check 3a's two-pin floor, not above
+            // it: since the Gloas fork no public census-verified server serves
+            // Gloas-era light-client data to put third (the Lighthouse entries
+            // dropped below serve none).
             //
             // Dropped 2026-10-07: 65.109.144.95 and 198.13.138.237, both
             // Lighthouse v8.3.0-rc.0. Census-verified public servers from
@@ -373,18 +374,30 @@ public record NetworkConfig(
             // live_pins_alive (which now asks for the current period too)
             // passes it; on nodes that ran rc.0 across the fork expect period
             // 1379 to stay broken even after a Lighthouse release with Gloas
-            // support. Not pinnable without #576: zbox's own Nimbus (9104)
-            // serves Gloas light-client data, but the Rust engine offers only
-            // yamux where Nimbus speaks only mplex, and neither engine answers
-            // what Nimbus's peer loop asks of a new peer (metadata/3, then
-            // three by-root requests); a protocol the peer does not offer ends
-            // that loop. It is the obvious second pin once #576 is in. The
-            // public Lodestar node (65.21.93.60) closing inbound connections
-            // may be the same mismatch (Lodestar also speaks only mplex on
-            // TCP), not re-checked. Keep
-            // this list identical to SEPOLIA_STATIC_PEERS in
+            // support. The public Lodestar node (65.21.93.60) closing inbound
+            // connections may be the muxer mismatch #576 fixed (Lodestar also
+            // speaks only mplex on TCP), not re-checked.
+            //
+            // Second: zbox's own Nimbus (v26.9.1, --light-client-data-serve,
+            // --netkey-file so the peer id survives restarts), behind the same
+            // relay on 9104. Re-pinned 2026-10-09 (#566 option 3). Dropped in
+            // September as "the libp2p handshake times out", which was ours:
+            // the Rust host offered only yamux where Nimbus speaks only mplex,
+            // and neither engine answered what its peer loop asks of a new peer
+            // (metadata/3, then three by-root requests — a protocol the peer
+            // does not offer ends that loop). #576 fixed all of it, and a
+            // Rust-engine wallet synced Sepolia from this node alone (SYNCED,
+            // 2026-10-08/09). Two caveats, both Nimbus's: its unit runs
+            // --max-peers=25, so while it is full the connection is reset during
+            // the noise handshake and a pinned wallet gets in only as peers
+            // churn; and its peer loop scores our empty by-root answers down, so
+            // one connection lasts minutes, with updates flowing between
+            // reconnects. roost stays first: it serves without either caveat.
+            // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
-            List.of("/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5"),
+            List.of(
+                    "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                    "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6"),
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
             // EL: Ethereum Foundation canonical sepolia tree (same EF signing key

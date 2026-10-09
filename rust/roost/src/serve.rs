@@ -488,6 +488,11 @@ pub async fn serve(
         status.clone(),
         HostConfig {
             listen,
+            // No QUIC listener yet: the relay forwards no spare UDP port for
+            // it (discv5 holds the ones there are) and the ENR carries no
+            // `quic` field, so an inbound QUIC socket here would be
+            // unreachable and unadvertised. Follow-up, with a forwarded port.
+            listen_quic: None,
             max_established_incoming: Some(MAX_INBOUND),
             keypair: Some(keypair.clone()),
             lc_responder: Some(store.clone()),

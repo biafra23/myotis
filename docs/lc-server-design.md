@@ -61,13 +61,14 @@ The right split is to stop asking one process to do two unrelated jobs:
 
 ## What a wallet actually needs
 
-The complete surface is nine protocols. Verified against
-`rust/myotis-net/src/protocols.rs` and the Java constants in `BeaconP2PService`:
+The complete surface is thirteen protocols. Verified against
+`rust/myotis-wire/src/eth2/protocols.rs` and the Java constants in `BeaconP2PService`:
 
 | Protocol | Role |
 |---|---|
 | `status/1`, `status/2` | mandatory handshake — peers drop you without it |
-| `ping/1`, `metadata/2`, `goodbye/1` | housekeeping |
+| `ping/1`, `metadata/2`, `metadata/3`, `goodbye/1` | housekeeping — post-Fulu peers ask for `metadata/3`, and Nimbus drops a peer that cannot answer it |
+| `beacon_blocks_by_root/2`, `data_column_sidecars_by_root/1`, `execution_payload_envelopes_by_root/1` | inbound only, always answered with zero chunks — Nimbus's root sync asks a new peer for the head block it advertised in Status, then for the columns its `custody_group_count` says it holds, then for the Gloas envelopes it is missing, and drops the peer when a protocol is not even offered |
 | `light_client_bootstrap/1` | one-shot trust anchor |
 | `light_client_updates_by_range/1` | per-period sync-committee updates |
 | `light_client_finality_update/1` | per-slot |
@@ -162,17 +163,14 @@ the newest update" question that REST answers unconditionally.
 
 Most of the server is written. In `rust/myotis-net`:
 
-- Full libp2p host — Noise, yamux, SSZ+snappy req/resp codecs.
-- **Inbound is already wired for 5 of 9 protocols**, though two of those are not
-  yet spec-correct. `respond_inbound` (`reqresp.rs`) answers `status/1`,
-  `status/2`, `ping`, `metadata/2`, `goodbye`. Of these, `status` and `metadata`
-  are real answers; **`ping` echoes the caller's value instead of returning this
-  node's metadata sequence number, and `goodbye` replies without disconnecting**
-  even though Goodbye is a one-way notification. Both are acceptable in a client
-  that dials out and closes; both must be fixed before shipping a public
-  responder, or the daemon retains peers that asked to leave. Count them as
-  remaining work. The four LC protocols currently fall through to
-  `ResourceUnavailable` — "no relay cache yet".
+- Full libp2p host — TCP with Noise and yamux or mplex (the spec's mandatory TCP muxer; Nimbus and Lodestar offer nothing else), QUIC (the spec's primary transport; the wallet listens on an ephemeral UDP port, roost does not listen on QUIC yet — it needs a forwarded UDP port and the ENR `quic` field), SSZ+snappy req/resp codecs.
+- **Inbound is already wired for 9 of 13 protocols.** `respond_inbound`
+  (`reqresp.rs`) answers `status/1`, `status/2`, `ping` (this node's metadata
+  sequence number, not an echo), `metadata/2`, `metadata/3`, `goodbye`
+  (answered, then the caller disconnects the peer — Goodbye is a one-way
+  notification), and the three root-list protocols (zero chunks, by design).
+  Without a serving cache the four LC protocols fall through to
+  `ResourceUnavailable`.
 - **Multi-chunk responses already round-trip.** `decode_multi_chunk_response`
   exists and its test builds the wire by concatenating `encode_success_response`,
   which is exactly how `updates_by_range` must answer. No new protocol work.
