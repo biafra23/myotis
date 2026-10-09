@@ -146,7 +146,7 @@ The strip under the header and the Status tab's card paint one ladder
 | grey | Sleeping | idle-paused — an incoming request wakes it |
 | red | No internet connection / Not running / Update required / Needs your decision / Syncing | offline, not running, an unsupported upgrade the node corroborates, parked in `STALE_ANCHOR`, or beacon not SYNCED |
 | amber | Almost ready | SYNCED but verified head age > 45 s (or none yet) — warming up, not ready to transact |
-| amber (thicker, a progress bar) | Ready — log index catching up | reads are served, but an enabled log index trails the head, so head-reaching `eth_getLogs` is refused until it has caught up |
+| amber (thicker, a progress bar) | Ready — log index catching up | reads are served, but an enabled log index is catching up to the head (a gap that reached 32 blocks, until it is back within the 4-block serving slack), so head-reaching `eth_getLogs` is refused until it has |
 | green | Ready | ready for simple reads |
 | bright green (thicker) | Ready | fully ready — deep snap-peer pool (≥ 16 serving peers by default) |
 

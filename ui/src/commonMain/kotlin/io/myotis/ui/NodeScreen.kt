@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -268,7 +269,7 @@ fun NodeScreen(
                 when (tabs[tab]) {
                     "Status" -> StatusTab(
                         controller, settings, current, network, online, onOpenNetworkSettings,
-                        expert = expert, readiness = readiness,
+                        expert = expert, readiness = readiness, catchUp = logIndexCatchUps[network],
                         // The card's "Review" re-asks a dismissed stale-anchor question.
                         onReviewStaleAnchor = { staleDismissed = staleDismissed - network },
                     )
@@ -834,7 +835,12 @@ private fun NodeTuning(
     }
 }
 
-/** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
+/**
+ * A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab].
+ * The ROW is the toggleable (the switch itself has no handler), so a screen reader
+ * announces one named switch — "Expert mode, on" — instead of a label and an unnamed
+ * toggle side by side, and the whole row is the tap target.
+ */
 @Composable
 internal fun SwitchRow(
     label: String,
@@ -843,7 +849,10 @@ internal fun SwitchRow(
     onChange: (Boolean) -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(top = 4.dp),
+        Modifier
+            .fillMaxWidth()
+            .toggleable(value = checked, enabled = enabled, role = Role.Switch, onValueChange = onChange)
+            .padding(top = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -851,7 +860,7 @@ internal fun SwitchRow(
             label,
             color = if (enabled) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Switch(checked = checked, enabled = enabled, onCheckedChange = onChange)
+        Switch(checked = checked, enabled = enabled, onCheckedChange = null)
     }
 }
 
@@ -870,6 +879,8 @@ private fun StatusTab(
     onOpenNetworkSettings: () -> Unit,
     expert: Boolean,
     readiness: Readiness,
+    // The log index's head catch-up as the ladder saw it, so the tile agrees with the card.
+    catchUp: CatchUpProgress?,
     onReviewStaleAnchor: () -> Unit,
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -912,7 +923,7 @@ private fun StatusTab(
         }
 
         if (!expert) {
-            VitalsGrid(vitalsOf(snap, settings.deepPoolThreshold()))
+            VitalsGrid(vitalsOf(snap, settings.deepPoolThreshold(), catchUp))
             return@Column
         }
 

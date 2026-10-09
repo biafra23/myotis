@@ -3,6 +3,7 @@ package io.myotis.ui
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
+import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -113,6 +114,17 @@ class SettingsSectionsTest {
         rule.toggleSwitchBeside("Sleep when not in focus")
         assertTrue("the opt-in must persist", settings.allowNap)
         assertEquals("the controller re-applies it at once", 1, controller.applied)
+    }
+
+    @Test
+    fun everySwitchIsOneNamedNode() {
+        // The row is the toggleable and the label merges into it, so a screen reader hears
+        // "Expert mode, off" — one named switch — rather than a label beside an unnamed toggle.
+        show(PowerSettings(nap = true, idle = false))
+        tab("Settings").performClick()
+        rule.onNode(isToggleable() and hasText("mainnet")).assertExists()
+        rule.onNode(isToggleable() and hasText("Sleep when not in focus")).performScrollTo().assertExists()
+        rule.onNode(isToggleable() and hasText("Expert mode")).performScrollTo().assertExists()
     }
 
     @Test

@@ -301,7 +301,14 @@ class ReadinessTest {
         val atSlack = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 4, remaining = 0)), 16).index!!
         assertEquals(Tone.OK, atSlack.tone)
         assertEquals("history complete", atSlack.detail)
-        val behind = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 5, remaining = 0)), 16).index!!
+        // Past the serving slack but short of a catch-up (LogIndexCatchUp enters at 32):
+        // the strip stays green by its hysteresis, so does the tile — naming the gap.
+        val trailing = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 5, remaining = 0)), 16).index!!
+        assertEquals("Trailing", trailing.value)
+        assertEquals(Tone.OK, trailing.tone)
+        assertEquals("5 blocks behind the head — queries at the very head wait · history complete", trailing.detail)
+        // The same gap inside a tracked catch-up is the ladder's amber rung.
+        val behind = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 5, remaining = 0)), 16, CatchUpProgress(5, 40)).index!!
         assertEquals("Behind head", behind.value)
         assertEquals(Tone.WAIT, behind.tone)
         assertEquals("5 blocks behind the head · history complete", behind.detail)
@@ -313,9 +320,12 @@ class ReadinessTest {
         val paused = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 0, remaining = 500, paused = true)), 16).index!!
         assertEquals(Tone.OK, paused.tone)
         assertEquals("history paused · 500 blocks unindexed", paused.detail)
-        val stalled = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 600_000, remaining = 0)), 16).index!!
+        val stalled = vitalsOf(
+            synced().copy(logIndexJson = indexJson(headGap = 600_000, remaining = 0)), 16, CatchUpProgress(600_000, 600_000),
+        ).index!!
         assertEquals("Too far behind", stalled.value)
         assertEquals(Tone.WAIT, stalled.tone)
+        assertEquals("600,000 blocks behind the head, not catching up · history complete", stalled.detail)
     }
 
     @Test

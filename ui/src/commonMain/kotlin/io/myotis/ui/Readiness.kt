@@ -208,11 +208,14 @@ internal data class Vitals(val el: Vital, val cl: Vital, val head: Vital, val in
 /**
  * The vitals for one network: usable execution peers, consensus state and servers,
  * verified-head freshness, and — when the engine reports an enabled index — the log
- * index. The index tile's tone follows the HEAD side only (head-reaching queries are
- * refused while it trails); an incomplete backfill is said in the detail and never
- * changes the tone, because it does not affect what the node can answer at the head.
+ * index. The index tile's tone follows the HEAD side only, and exactly as the ladder
+ * sees it: amber while [catchUp] — the hysteresis-tracked catch-up the strip and the
+ * card paint — is in progress, green otherwise, with the raw gap named in the detail
+ * so a trailing follow (past the serving slack but short of a catch-up) is never
+ * called "up to date". An incomplete backfill is said in the detail and never changes
+ * the tone, because it does not affect what the node can answer at the head.
  */
-internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int): Vitals {
+internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUpProgress? = null): Vitals {
     // Same order as the ladder: a paused stack may well report running=false (iOS does),
     // and it is sleeping, not stopped.
     if (s != null && s.lifecycle == "PAUSED") {
@@ -220,7 +223,7 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int): Vitals {
             Vital(EL_LABEL, "—", "sleeping", Tone.NONE),
             Vital(CL_LABEL, "—", "sleeping", Tone.NONE),
             Vital(HEAD_LABEL, "—", "sleeping", Tone.NONE),
-            index = indexVital(s),
+            index = indexVital(s, catchUp),
         )
     }
     if (s == null || !s.running) {
@@ -269,11 +272,11 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int): Vitals {
             Vital(HEAD_LABEL, formatAge(s.verifiedHeadAgeMs), "stale — waiting for a fresh head", Tone.WAIT)
         else -> Vital(HEAD_LABEL, formatAge(s.verifiedHeadAgeMs), "fresh", Tone.OK)
     }
-    return Vitals(el, cl, head, indexVital(s))
+    return Vitals(el, cl, head, indexVital(s, catchUp))
 }
 
 /** The log-index tile, or null when the engine reports no enabled index. */
-private fun indexVital(s: NodeSnapshot): Vital? {
+private fun indexVital(s: NodeSnapshot, catchUp: CatchUpProgress?): Vital? {
     val json = s.logIndexJson ?: return null
     val p = LogIndexStatus.parseOrNull(json)?.takeIf { it.enabled } ?: return null
     val gap = LogIndexStatus.headGap(json)
@@ -281,14 +284,18 @@ private fun indexVital(s: NodeSnapshot): Vital? {
     // nothing to catch up then, but a tile must not call an index that has not covered a
     // single block "up to date". Tell the two apart by the coverage itself.
     val seeded = p.entries.any { it.coveredHigh != null }
+    val behind = "${LogIndexStatus.grouped(gap ?: 0)} blocks behind the head"
     val (value, headDetail, tone) = when {
         p.entries.isEmpty() -> Triple("Nothing watched", null, Tone.NONE)
         !seeded -> Triple("Starting", "no blocks covered yet", Tone.WAIT)
         gap == null -> Triple("Starting", null, Tone.WAIT)
+        // The ladder's rung: a catch-up the tracker entered (32+ blocks) and has not left.
+        catchUp != null && catchUp.stalled -> Triple("Too far behind", "$behind, not catching up", Tone.WAIT)
+        catchUp != null -> Triple("Behind head", behind, Tone.WAIT)
         !LogIndexStatus.refusesHeadQueries(gap) -> Triple("Up to date", null, Tone.OK)
-        gap > LogIndexStatus.BRIDGE_MAX_GAP ->
-            Triple("Too far behind", "${LogIndexStatus.grouped(gap)} blocks behind the head, not catching up", Tone.WAIT)
-        else -> Triple("Behind head", "${LogIndexStatus.grouped(gap)} blocks behind the head", Tone.WAIT)
+        // Past the serving slack but short of a catch-up: the strip stays green by its
+        // hysteresis (LogIndexCatchUp), so does the tile — but it says what the gap is.
+        else -> Triple("Trailing", "$behind — queries at the very head wait", Tone.OK)
     }
     val remaining = p.blocksRemaining
     val backfill = when {
