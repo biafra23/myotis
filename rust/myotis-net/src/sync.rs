@@ -305,11 +305,11 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11318880, 2026-10-09, period 1381)
+            // trusted checkpoint: recent finalized sepolia block root (slot 11319040, 2026-10-09, period 1381)
             checkpoint_root: hex32(
-                "f62e2e5ce86f0107570694662a160de0db4aa215a0674354e8b956f0a6669036",
+                "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e",
             ),
-            checkpoint_slot: 11_318_880,
+            checkpoint_slot: 11_319_040,
             // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -732,6 +732,14 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // SYNCED), a cold start with every pin unreachable reached SYNCED in
     // 30 s, and one from the recorded period-3596 anchor (122 periods
     // behind) in 90 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 3724):
+    // live_pins_alive run 37955473231 on a GitHub-hosted runner, 7 of 8 —
+    // every public pin served; roost (9108) timed out in the transport
+    // handshake (zbox's uplink, see MAINNET_STATIC_PEERS), then served the
+    // old-anchor walk's 116 periods 23 s later in the same job. The bootnodes
+    // seeded discv5 (24 entries), a cold start with every pin unreachable
+    // reached SYNCED in 35 s, and one from the recorded period-3596 anchor
+    // (128 periods behind) in 35 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -870,6 +878,18 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // bootnodes seeded discv5 (32 entries, SYNCED), a cold start with every
     // pin unreachable reached SYNCED in 25 s, and one from the recorded
     // period-1825 anchor (51 periods behind) in 35 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 1879):
+    // live_pins_alive run 37955464357 on a GitHub-hosted runner, 2 of 5 —
+    // exactly the floor. 84.112.35.112 and 54.201.148.177 served;
+    // 57.129.130.18 closed the connection from the runner again (its second
+    // close in a row) and so did 91.189.182.90; roost (9109) timed out in the
+    // transport handshake. Every zbox pin did the same in its network's run
+    // that day (Sepolia's two also from a residential address), while the
+    // relay accepted TCP and answered multistream: a slow path to zbox
+    // behind the relay, not a dead server and not this list.
+    // The bootnodes seeded discv5 (34 entries), a cold start with every pin
+    // unreachable reached SYNCED in 30 s, and one from the recorded
+    // period-1825 anchor (54 periods behind) in 15 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
@@ -4391,10 +4411,10 @@ mod tests {
         assert_eq!(sig(11_296_768), [0x90, 0x00, 0x00, 0x75]);
         assert_eq!(sig(11_296_769), [0x90, 0x00, 0x00, 0x76]);
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 11_318_880);
+        assert_eq!(c.checkpoint_slot, 11_319_040);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "f62e2e5ce86f0107570694662a160de0db4aa215a0674354e8b956f0a6669036"
+            "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e"
         );
         // @checkpoint:sepolia:test:end
         assert_eq!(

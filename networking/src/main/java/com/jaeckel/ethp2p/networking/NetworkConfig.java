@@ -189,6 +189,12 @@ public record NetworkConfig(
                     // 1876), run 37500516886: 4 of 5 — 57.129.130.18 closed the
                     // connection from the runner again (first close since it served
                     // the four runs above; not a row yet).
+                    // Re-verified 2026-10-09 at the anchor v0.1.15 ships (period
+                    // 1879), run 37955464357: 2 of 5, exactly the floor — 84.112.35.112
+                    // and 54.201.148.177 served; 57.129.130.18 (its second close in a
+                    // row) and 91.189.182.90 closed the connection from the runner,
+                    // and roost (9109) timed out in the transport handshake, as every
+                    // zbox pin did that day (see the Rust twin).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -276,9 +282,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11318880, 2026-10-09, period 1381)
-            Bytes.fromHexString("f62e2e5ce86f0107570694662a160de0db4aa215a0674354e8b956f0a6669036").toArrayUnsafe(),
-            11318880L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11319040, 2026-10-09, period 1381)
+            Bytes.fromHexString("90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e").toArrayUnsafe(),
+            11319040L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
@@ -516,6 +522,10 @@ public record NetworkConfig(
                     // grounds to prune. Above the two-pin floor either way.
                     // Re-verified 2026-10-06 at the anchor v0.1.14 ships (period
                     // 3718), run 37500512616: 8 of 8 — both :9500 pins served again.
+                    // Re-verified 2026-10-09 at the anchor v0.1.15 ships (period
+                    // 3724), run 37955473231: 7 of 8 — every public pin served; roost
+                    // (9108) timed out in the transport handshake, then served the
+                    // old-anchor walk 23 s later in the same job.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
