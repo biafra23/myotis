@@ -106,7 +106,8 @@ private object NoQueryHistory : QueryHistory {
  * The shared Myotis screen — identical on Android, Desktop and iOS. A tab host over the
  * per-network [NodeController]/[Settings]/[LogSource] seam: Status / Query / Settings, plus
  * Logs and Index under [Settings.expertMode]. A phone-width window gets a bottom navigation
- * bar, a wider one the tab row under the header. [netStatus] drives the offline banner and
+ * bar, a wider one the tab row under the header. [netStatus] feeds the readiness ladder
+ * (the strip's and the status card's offline rung, and the Start gate) and
  * [onOpenNetworkSettings] opens the platform's network settings; both default to the
  * always-online / no-op behavior desktop wants.
  */
