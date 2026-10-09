@@ -158,9 +158,10 @@ step skipped and none treated as optional or "only if asked"**:
 2. **Review** — run the internal code review on the diff (the `code-review`
    skill / `/code-review`) and address what it finds before going further.
 3. **PR** — open a pull request. This is the default next step after review, not
-   a separate request the user has to make. (Follow the PR-template and
-   attribution rules below.) Its base is `main` for a single-PR work item, and
-   the feature branch for a part of a multi-PR plan (next section).
+   a separate request the user has to make. (Follow the PR-description rules
+   below: English, the session link as the last line.) Its base is `main` for a
+   single-PR work item, and the feature branch for a part of a multi-PR plan
+   (next section).
 4. **Wait for review comments** — subscribe to the PR and wait for CI + review
    feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
@@ -176,6 +177,30 @@ Short form: **code → review → PR → wait for review comments → address th
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
+
+### The session title carries the issue and the PR number
+
+The session renames ITSELF (`mcp__ccd_session_mgmt__set_session_title`,
+`session_id: "self"`) at two moments, without being asked, keeping the rest of
+its title (owner's request, 2026-10-09):
+
+- `IS#536: <title>` the moment the work item is identified as issue #536 — the
+  user names it, or the task is to fix it. Several issues: the one the PR will
+  close.
+- `PR#582: <title>` right after `gh pr create` returns #582. The PR prefix
+  REPLACES the issue prefix — the PR is the later, more specific handle, and
+  the issue number is in the PR body. A multi-PR plan carries the part PR
+  currently being driven; earlier parts are reachable through the part list
+  every part PR description carries (next section).
+
+Why: the desktop app shows one session per sidebar row, and the owner finds a
+row by the number of its GitHub thread. A title the owner typed makes the app
+ask them to approve the rename (an app-generated one is replaced silently) —
+ask anyway, that is the point. Bypass-permissions mode renames without asking;
+an unattended session (scheduled, remote-triggered) is declined — a decline is
+fine, say so in the report, do not retry. A subagent cannot rename the session
+it runs in; the main session does it. Outside the desktop app (a plain `claude`
+terminal, CI) there is no session title and this rule is inapplicable.
 
 ### Multi-PR plans land through a feature branch, never piece by piece on `main`
 
@@ -509,6 +534,19 @@ that produced this note.
   description makes a change unreviewable for part of that audience. Talking to
   the owner in German is fine and unaffected; the moment it lands on GitHub it
   is English.
+- **The last line of every PR description is the link of the session that
+  opened it — never the "🤖 Generated with Claude Code" footer** (owner's
+  ruling, 2026-10-09: the owner opens the session from the PR to continue the
+  work; the footer leads to a product page). The harness asks for that footer
+  on every PR; this rule overrides it, as the harness says a repo rule may.
+  The link is the `link` field of `mcp__ccd_session_mgmt__get_session`
+  (`session_id: "self"`). A claude.ai/code session's
+  `https://claude.ai/code/session_…` is clickable on GitHub; the desktop app's
+  `claude://claude.ai/…/local_…` is NOT (GitHub neither autolinks custom
+  schemes nor keeps them in an href), so write it as a code span for
+  copy-paste. No `link` reported (app links off for the organization): say so
+  in that line. A session that takes a PR over adds its own line below the
+  first. Commit messages keep their `Co-Authored-By` trailer.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
