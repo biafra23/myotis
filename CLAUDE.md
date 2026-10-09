@@ -184,14 +184,14 @@ The session renames ITSELF (`mcp__ccd_session_mgmt__set_session_title`,
 `session_id: "self"`) at two moments, without being asked, keeping the rest of
 its title (owner's request, 2026-10-09):
 
-- `IS#536: <title>` the moment the work item is identified as issue #536 — the
+- `IS#<n>: <title>` the moment the work item is identified as issue n — the
   user names it, or the task is to fix it. Several issues: the one the PR will
   close.
-- `PR#582: <title>` right after `gh pr create` returns #582. The PR prefix
+- `PR#<n>: <title>` right after `gh pr create` returns the number. The PR prefix
   REPLACES the issue prefix — the PR is the later, more specific handle, and
   the issue number is in the PR body. A multi-PR plan carries the part PR
-  currently being driven; earlier parts are reachable through the part list
-  every part PR description carries (next section).
+  currently being driven; the earlier parts are the other PRs based on
+  `feature/<topic>` (next section).
 
 Why: the desktop app shows one session per sidebar row, and the owner finds a
 row by the number of its GitHub thread. A title the owner typed makes the app
@@ -534,19 +534,20 @@ that produced this note.
   description makes a change unreviewable for part of that audience. Talking to
   the owner in German is fine and unaffected; the moment it lands on GitHub it
   is English.
-- **The last line of every PR description is the link of the session that
-  opened it — never the "🤖 Generated with Claude Code" footer** (owner's
-  ruling, 2026-10-09: the owner opens the session from the PR to continue the
-  work; the footer leads to a product page). The harness asks for that footer
+- **Every PR description ends with its session links — the opening session's
+  link first, each session that later takes the PR over appended below — and
+  never with the "🤖 Generated with Claude Code" footer** (owner's ruling,
+  2026-10-09: the owner opens the session from the PR to continue the work;
+  the footer leads to a product page). The harness asks for that footer
   on every PR; this rule overrides it, as the harness says a repo rule may.
   The link is the `link` field of `mcp__ccd_session_mgmt__get_session`
   (`session_id: "self"`). A claude.ai/code session's
   `https://claude.ai/code/session_…` is clickable on GitHub; the desktop app's
   `claude://claude.ai/…/local_…` is NOT (GitHub neither autolinks custom
   schemes nor keeps them in an href), so write it as a code span for
-  copy-paste. No `link` reported (app links off for the organization): say so
-  in that line. A session that takes a PR over adds its own line below the
-  first. Commit messages keep their `Co-Authored-By` trailer.
+  copy-paste. No `link` reported (app links off for the organization), or no
+  session-mgmt tool on this host at all (a plain `claude` terminal, CI): say so
+  in that line. Commit messages keep their `Co-Authored-By` trailer.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
