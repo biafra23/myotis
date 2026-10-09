@@ -19,10 +19,10 @@ internal fun upgradeCutOff(s: NodeSnapshot): Boolean =
  * explains the index's lag too, and fixing it comes first.
  */
 internal enum class ReadinessLevel {
-    /** The host reports no connectivity — nothing below can make progress. */
-    OFFLINE,
-    /** Idle-paused: networking off, a request wakes it. */
+    /** Idle-paused: networking off by design, a request wakes it — nothing is failing. */
     SLEEPING,
+    /** The host reports no connectivity — nothing below can make progress, and Start is refused. */
+    OFFLINE,
     /** No stack registered for this network. */
     STOPPED,
     /** Peers report a network upgrade this build can't follow, and the node agrees it stopped verifying. */
@@ -68,12 +68,8 @@ internal fun readinessOf(
     catchUp: CatchUpProgress? = null,
     online: Boolean = true,
 ): Readiness = when {
-    !online -> Readiness(
-        ReadinessLevel.OFFLINE,
-        "No internet connection",
-        "The node needs internet access to discover and connect to peers.",
-        "Node readiness: offline — no internet connection",
-    )
+    // A sleeping stack has networking off by design: offline changes nothing for it until
+    // a wake is attempted, so grey outranks red here — the one rung offline does not beat.
     s != null && s.lifecycle == "PAUSED" -> Readiness(
         ReadinessLevel.SLEEPING,
         "Sleeping",
@@ -82,6 +78,13 @@ internal fun readinessOf(
             "doesn't support — update the app.",
         if (s.upgrade == null) "Node readiness: sleeping — a request wakes it"
         else "Node readiness: sleeping — peers report a network upgrade this version doesn't support",
+    )
+    // Above "not running": offline is why Start is refused, and the fix is the same either way.
+    !online -> Readiness(
+        ReadinessLevel.OFFLINE,
+        "No internet connection",
+        "The node needs internet access to discover and connect to peers.",
+        "Node readiness: offline — no internet connection",
     )
     s == null || !s.running -> Readiness(
         ReadinessLevel.STOPPED,
@@ -145,7 +148,8 @@ private fun indexCatchingUp(catchUp: CatchUpProgress): Readiness {
     val line = LogIndexStatus.catchUpLine(catchUp)
     return Readiness(
         ReadinessLevel.INDEX_CATCHING_UP,
-        "Ready — log index catching up",
+        // A stalled gap is not catching up (the detail says so): the headline must not claim it.
+        if (catchUp.stalled) "Ready — log index too far behind" else "Ready — log index catching up",
         line,
         "Node readiness: $line; eth_getLogs near the head is refused" +
             if (catchUp.stalled) "" else " until it has caught up",
@@ -253,6 +257,8 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int): Vitals {
         },
     )
     val head = when {
+        // Parked on the user's consent: waiting resolves nothing, so don't promise it.
+        s.beaconState == "STALE_ANCHOR" -> Vital(HEAD_LABEL, "—", "paused — needs your decision", Tone.NONE)
         s.beaconState != "SYNCED" -> Vital(HEAD_LABEL, "—", "waiting for sync", Tone.NONE)
         s.verifiedHeadAgeMs == Long.MAX_VALUE ->
             Vital(HEAD_LABEL, "None yet", "waiting for a peer that can answer", Tone.WAIT)

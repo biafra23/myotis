@@ -14,11 +14,15 @@ import org.junit.Test
 class ReadinessTest {
 
     @Test
-    fun offlineOutranksEverything() {
+    fun offlineOutranksEverythingButASleepingStack() {
         val r = readinessOf(synced(), deepPoolThreshold = 1, online = false)
         assertEquals(ReadinessLevel.OFFLINE, r.level)
         assertEquals("Node readiness: offline — no internet connection", r.a11yLabel)
         assertEquals("No internet connection", r.headline)
+        // Not running + offline: offline is why Start is refused, so it leads.
+        assertEquals(ReadinessLevel.OFFLINE, readinessOf(null, 1, online = false).level)
+        // Sleeping has networking off by design — nothing is failing, so grey holds.
+        assertEquals(ReadinessLevel.SLEEPING, readinessOf(synced().copy(lifecycle = "PAUSED"), 1, online = false).level)
     }
 
     @Test
@@ -149,6 +153,7 @@ class ReadinessTest {
         val r = readinessOf(synced(), 1, CatchUpProgress(600_000, 600_000))
         assertEquals(ReadinessLevel.INDEX_CATCHING_UP, r.level)
         assertNull(r.progress)
+        assertEquals("Ready — log index too far behind", r.headline)
         assertEquals(
             "Node readiness: Log index 600,000 blocks behind the head — too far to bridge, " +
                 "not catching up; eth_getLogs near the head is refused",
@@ -268,7 +273,10 @@ class ReadinessTest {
         assertEquals(Tone.WAIT, none.tone)
         val unsynced = vitalsOf(synced().copy(beaconState = "CATCHING_UP"), 16).head
         assertEquals("—", unsynced.value)
+        assertEquals("waiting for sync", unsynced.detail)
         assertEquals(Tone.NONE, unsynced.tone)
+        val parked = vitalsOf(synced().copy(beaconState = "STALE_ANCHOR"), 16).head
+        assertEquals("paused — needs your decision", parked.detail)
     }
 
     @Test
