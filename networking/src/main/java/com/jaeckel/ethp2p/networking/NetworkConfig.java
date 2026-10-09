@@ -390,9 +390,13 @@ public record NetworkConfig(
             // 2026-10-08/09). Two caveats, both Nimbus's: its unit runs
             // --max-peers=25, so while it is full the connection is reset during
             // the noise handshake and a pinned wallet gets in only as peers
-            // churn; and its peer loop scores our empty by-root answers down, so
-            // one connection lasts minutes, with updates flowing between
-            // reconnects. roost stays first: it serves without either caveat.
+            // churn; and its peer loop scores our empty by-root answers down —
+            // envelopes_by_root every few seconds at -100 each from a start of
+            // 300 — so one connection lasts ~15 s, with a redial about a minute
+            // later and finality updates in bursts between; a wallet still did
+            // the full cold path from this node alone inside its first window
+            // and stayed SYNCED on the gate's 5-epoch slack (measured
+            // 2026-10-09). roost stays first: it serves without either caveat.
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(

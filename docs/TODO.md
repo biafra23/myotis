@@ -219,7 +219,8 @@ complete on its own.
     is in — re-pinned second, after roost, on 2026-10-09 (both engines), with
     its two caveats in the pin comment: the `--max-peers=25` unit resets the
     handshake while it is full, and its peer loop scores our empty by-root
-    answers down, so a connection lasts minutes between reconnects.
+    answers down, so a connection lasts ~15 s between reconnects (measured
+    2026-10-09, below).
   **Part of the cause was ours (2026-10-08):** the Rust engine's libp2p host
   offered only yamux on TCP, while Nimbus (since 2024) and Lodestar speak
   only mplex there — so the two client families that DO serve Gloas
@@ -266,11 +267,22 @@ complete on its own.
   `custody_group_count` we advertise (Lighthouse's minimum) gives us a column
   map. Same zero-chunk answer on both engines; Nimbus scores that
   `PeerScoreNoValues` but keeps the loop (a refused negotiation ends it), so
-  a Nimbus that keeps missing sidecars still cycles us every few minutes,
-  with updates flowing in between. The fifth and last step of that loop,
-  Gloas `execution_payload_envelopes_by_root/1`, behaves like the sidecars
-  (zbox's Nimbus asks on every connection, its missing-envelope set is never
-  empty) and gets the same answer. A refused protocol ends Nimbus's loop with
+  a Nimbus that keeps missing sidecars cycles us, with updates flowing in
+  between. The fifth and last step of that loop, Gloas
+  `execution_payload_envelopes_by_root/1`, behaves like the sidecars (zbox's
+  Nimbus asks on every connection, its missing-envelope set is never empty)
+  and gets the same answer — and it is the one that sets the pace.
+  **Measured 2026-10-09 17:42–17:47 CEST, desktop app from zero (no peer
+  cache), roost stopped, Nimbus at DEBUG:** the wallet connected over mplex,
+  answered `metadata/3`, and inside its FIRST connection got the bootstrap
+  (period 1379), `updates_by_range` 1379–1380 and its first finality updates
+  from Nimbus — the full cold path from Nimbus alone, both engines' first.
+  Nimbus asked `execution_payload_envelopes_by_root` every 2–4 s and charged
+  −100 per empty answer from a starting score of 300, so after four it logged
+  `Peer was disconnected due to low score` (limit 0): a connection lasts
+  **~15 s**. The wallet redialed ~70–90 s later and got the next burst; the
+  app stayed SYNCED on the gate's 5-epoch slack, with finality updates in
+  bursts of 3–4. A refused protocol ends Nimbus's loop with
   `CommunicationTimeout`, a sunk score with `PeerScoreLow`; neither blocks
   our reconnect, because its seen-table only gates ITS outbound dials
   (`checkPeer`). Re-run the Sepolia census from a build with all of this
@@ -281,9 +293,12 @@ complete on its own.
   only covers what it saw since start, and `getMissingBlocksRequest` never
   consults the DAG), and (b) ends the peer loop on a protocol the peer does
   not offer, which disconnects every light client — its own
-  `nimbus_light_client` included, whose Status is the genesis head. Every
-  further overseer step that asks for data a light client cannot hold would
-  need another responder here until that is fixed upstream.
+  `nimbus_light_client` included, whose Status is the genesis head — and
+  (c) charges a light client `PeerScoreNoValues` for every envelope or
+  sidecar it can never hold, every few seconds, which makes every light
+  client a ~15-s peer. Every further overseer step that asks for data a
+  light client cannot hold would need another responder here until that is
+  fixed upstream.
   **Follow-ups from the final PR's review (2026-10-09):** the
   `custody_group_count` both engines advertise in `metadata/3` is a
   per-network parameter (`CUSTODY_REQUIREMENT`) hardcoded as 4

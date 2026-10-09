@@ -488,8 +488,12 @@ option 3), second after roost, with #576 in on both engines; its peer id is
 the `--netkey-file` one. Two caveats, both in the pin comment: the unit's
 `--max-peers=25` resets a handshake while the node is full (raise it on the
 unit for a reliable pin), and Nimbus's peer loop scores a light client's
-empty by-root answers down, so one connection lasts minutes between
-reconnects.
+empty by-root answers down — it asks for execution-payload envelopes every
+few seconds at −100 each, from a start of 300 — so one connection lasts
+**~15 s**, with a redial about a minute later; a wallet still completed the
+full cold path (bootstrap, two periods of updates, finality) from this node
+alone inside its first window and stayed SYNCED on the gate's 5-epoch slack
+(measured 2026-10-09; docs/TODO.md has the log reading).
 
 Both are only stable because their keys persist across restarts (Geth's
 datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is

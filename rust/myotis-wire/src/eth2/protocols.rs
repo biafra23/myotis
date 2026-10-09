@@ -30,15 +30,17 @@ pub const BLOCKS_BY_ROOT: &str = "/eth2/beacon_chain/req/beacon_blocks_by_root/2
 /// gives this node a column map, and Nimbus asks the peers whose map covers a
 /// column it is missing. A refused negotiation ends its peer loop at once; an
 /// empty answer costs `PeerScoreNoValues` (-100) and the loop goes on, so a
-/// Nimbus that keeps missing sidecars still cycles us every few minutes — but
-/// with light-client updates flowing in between, instead of none at all.
+/// Nimbus that keeps missing sidecars cycles us — but with light-client
+/// updates flowing in between, instead of none at all.
 pub const DATA_COLUMN_SIDECARS_BY_ROOT: &str =
     "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
 /// Gloas `ExecutionPayloadEnvelopesByRoot v1` — the third root-list request
 /// of Nimbus's loop (`doRootEnvelopeSyncStep`), asked of every peer while
 /// its own missing-envelope set is non-empty, and the same zero-chunk answer:
 /// a refusal ends the loop, an empty answer costs `PeerScoreNoValues` and
-/// the loop goes on.
+/// the loop goes on. This is the ask that sets the pace: every 2–4 s, so
+/// from a starting score of 300 a light client is dropped for low score
+/// after ~15 s and redials about a minute later (measured 2026-10-09).
 pub const EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT: &str =
     "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy";
 pub const PING: &str = "/eth2/beacon_chain/req/ping/1/ssz_snappy";
