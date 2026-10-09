@@ -233,7 +233,7 @@ cors-allowed-origins:            # only if you run Bee Dashboard (npx @ethersphe
 ```
 
 Order of operations: start Myotis, wait for `SYNCED`, wait for the index to
-cover the head (the Index tab shows the covered range; from the daemon,
+cover the head (the Index tab (Settings → Expert mode) shows the covered range; from the daemon,
 `-Pargs=logindex-status` — read `coveredHigh` and `headGap`), then
 `bee start --config ~/.bee/bee.yaml`. Bee's log then
 shows `connected to blockchain backend version="Myotis/verified-light-client"`

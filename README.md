@@ -142,7 +142,7 @@ On iOS the app form is a development host more than an integration point: iOS su
 
 ### Desktop app (GUI)
 
-`:app-desktop` is the Compose-Multiplatform desktop GUI — the same `:ui` NodeScreen the Android app hosts, running the engine in-process (the Rust engine by default, the Java engine as fallback or by choice). It shows the Status, Index, Query, Logs and Settings tabs, and serves the same verified JSON-RPC.
+`:app-desktop` is the Compose-Multiplatform desktop GUI — the same `:ui` NodeScreen the Android app hosts, running the engine in-process (the Rust engine by default, the Java engine as fallback or by choice). It shows the Status, Query and Settings tabs — plus Logs and Index under Settings → Expert mode — and serves the same verified JSON-RPC.
 
 ```bash
 # Run from source (dev loop) — starts the GUI, compiling the Rust engine first
@@ -957,7 +957,7 @@ around the clock, then hand the file to the apps:
 ```
 
 The exported `.db` is **self-describing and chain-tagged** (network id + genesis hash), so it
-can only be imported into a node on the same chain. Import it via the Index tab's
+can only be imported into a node on the same chain. Import it via the Index tab's (Settings → Expert mode shows the tab)
 "Import log-index snapshot…" button — the receiving node merges it with whatever it already
 holds and immediately starts catch-up for every imported address, so the file does not need
 to be fresh. One bound: the head-gap bridge spans at most **500,000 blocks** (~29 days on
@@ -987,7 +987,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **myotis-ens** -- the Java engine's ENS resolver (`EnsResolver`, `ReverseLookup`): discovers each name's resolver through the Registry (ENSIP-10 walk) and calls it directly in the local EVM. Forward and reverse resolution, every record type, ENSIP-10 wildcards, ERC-3668 off-chain records. (The Rust engine has its own equivalent in `rust/myotis-net/src/el`.)
 - **jsonrpc-server** -- host-agnostic verified JSON-RPC router (Kotlin Multiplatform/Ktor). `RpcRouter` maps the Ethereum API onto this module's `RpcBackend` seam — implemented on the JVM by `VerifiedReadsBackend` over the `io.myotis.api.VerifiedReads` contract, and on iOS by `:app-ios`'s `IosRpcBackend`. Strict permissionless mode by default; binds loopback only. (Consumed by the Android, iOS, and desktop apps and the daemon — which additionally has its CLI/IPC command surface.)
 - **rpc-backend** -- the verified RPC backend (`VerifiedRpcBackend`): anchored-head building, serve-stale policy, and the readiness probe (`verifiedHeadAgeMs`) shared by the JSON-RPC server and the hosts
-- **ui** -- shared Compose Multiplatform `NodeScreen` (the readiness strip and the Status, Query, Logs, Index and Settings tabs) used by the Android, desktop, and iOS apps
+- **ui** -- shared Compose Multiplatform `NodeScreen` (the readiness strip, the Status, Query and Settings tabs, and the Logs and Index tabs of Expert mode) used by the Android, desktop, and iOS apps
 - **app** -- daemon/CLI entry point, Unix domain socket IPC server, peer caching
 - **app-desktop** -- the Compose desktop GUI over `:ui`, packaged with jpackage (dmg/deb), bundling the Rust engine
 - **app-ios** -- the iOS host: a Kotlin/Native framework (`MyotisKit`) bundling `:ui` with iOS seam actuals over the Rust engine's plain C ABI; the Xcode shell lives in `ios-app/` (the JVM engine never runs on iOS)
