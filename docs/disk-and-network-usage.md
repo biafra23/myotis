@@ -200,7 +200,15 @@ configurable 0–240 min) without a wallet request once `SYNCED` — `ChainStack
 quiesces every socket and timer, so traffic drops to **zero** while backgrounded. A
 network-constrained WorkManager job (`CatchUpWorker`, ~daily, 8-min budget) resumes each
 stack, catches up the missed committee periods (~25 KB each + a finality poll), persists
-the snapshot, and pauses again.
+the snapshot, and pauses again. A second job (`ChargingCatchUpWorker`, hourly, only while
+charging on an unmetered network) resumes any paused stack and waits for the log index's
+head gap too, not just a SYNCED beacon: "stay awake while charging" keeps a running stack
+from pausing but never wakes a paused one, so without it a phone that paused before going
+on the charger overnight woke thousands of blocks behind. With that setting on and the
+phone plugged in on an unmetered network, either job leaves the stack it resumed running —
+the idle controller keeps it at the head until unplugged; otherwise (setting off, or a
+metered network, where a job must not start an unbounded run) the job catches up within
+its 8-min budget and pauses again. The two jobs never run a pass at the same time.
 
 So a phone wallet's realistic daily profile is:
 

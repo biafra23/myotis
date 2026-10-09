@@ -1,5 +1,7 @@
 package io.myotis.ui
 
+import kotlin.jvm.JvmStatic
+
 /**
  * Shared formatter for the engine's log-index status JSON, so every host
  * renders the identical line and a serializer change degrades one pinned
@@ -143,6 +145,18 @@ object LogIndexStatus {
     /** True when [gap] is past the engine's serving slack: head-reaching
      *  `eth_getLogs` is refused. */
     fun refusesHeadQueries(gap: Long): Boolean = gap > NORMAL_HEAD_LAG
+
+    /** True when head-follow has nothing left to close: the index is back
+     *  within the serving slack, has nothing to catch up ([headGap] 0), or
+     *  trails by more than [BRIDGE_MAX_GAP] — where the engine holds coverage
+     *  on purpose, so waiting for it would only spend a background budget.
+     *  An unknown gap is NOT caught up. The bar Android's charging catch-up
+     *  waits for before pausing a stack again. */
+    @JvmStatic
+    fun headCaughtUp(json: String?): Boolean {
+        val gap = headGap(json) ?: return false
+        return !refusesHeadQueries(gap) || gap > BRIDGE_MAX_GAP
+    }
 
     /** The top bar's one-line label for a head catch-up. */
     fun catchUpLine(p: CatchUpProgress): String = when {

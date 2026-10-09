@@ -20,7 +20,8 @@ public final class WakeReason {
     /** Observation wake: the app came to the foreground and proactively resumed. Not recorded. */
     public static final String FOREGROUND = "foreground";
 
-    /** The daily WorkManager maintenance pass resumed the stack to catch up + persist. */
+    /** A background WorkManager pass (Android's daily maintenance pass, or its
+     *  charging + unmetered pass) resumed the stack to catch up + persist. */
     public static final String CATCH_UP = "catch-up";
 
     /** The daemon's {@code resume} IPC command, and the {@code myotis_wakeup} JSON-RPC

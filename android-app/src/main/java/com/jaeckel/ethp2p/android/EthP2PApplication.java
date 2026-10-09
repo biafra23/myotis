@@ -58,5 +58,24 @@ public final class EthP2PApplication extends Application {
                                 .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
                                 .build())
                         .build());
+
+        // Charging + unmetered catch-up (see ChargingCatchUpWorker): the daily pass above
+        // stops at a SYNCED beacon, and "stay awake while charging" only keeps a RUNNING
+        // stack awake — so a node that paused before the phone went on the charger slept
+        // through the night and woke thousands of blocks behind on the log index. Hourly
+        // while the constraints hold; cheap to run that often because it only STARTS
+        // plugged in on an unmetered network, and a run with nothing paused is a no-op.
+        // (A stack it leaves awake under "stay awake while charging" then follows that
+        // setting's own rule — plugged in with any network — like any running stack.)
+        androidx.work.WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                "myotis-charging-catchup",
+                androidx.work.ExistingPeriodicWorkPolicy.KEEP,
+                new androidx.work.PeriodicWorkRequest.Builder(
+                        ChargingCatchUpWorker.class, 1, java.util.concurrent.TimeUnit.HOURS)
+                        .setConstraints(new androidx.work.Constraints.Builder()
+                                .setRequiresCharging(true)
+                                .setRequiredNetworkType(androidx.work.NetworkType.UNMETERED)
+                                .build())
+                        .build());
     }
 }
