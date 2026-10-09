@@ -270,7 +270,11 @@ per part costs more than it tells; the final `feature/<topic>` → `main` PR
 builds everything, and a part that touches what those legs alone check (the
 Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
 budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
-the workflow on its branch from the Actions tab.
+the workflow on its branch from the Actions tab. A PR retargeted to `main`
+after it was opened keeps its skipped checks — a base change is an `edited`
+event, which these workflows do not run on — so push a commit or dispatch the
+three workflows before it merges, or the first artifact build of that head is
+the post-merge run on `main`.
 
 ## Releases — ask before cutting one
 
