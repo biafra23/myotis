@@ -231,7 +231,10 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    **cleanly** may be pushed straight to the feature branch: it adds nothing
    `main` doesn't already carry, and it is the ONLY direct push this rule allows.
    A merge that needed **conflict resolution** goes through a PR into the
-   feature branch like a part, because the resolution is new code. Build and
+   feature branch like a part, because the resolution is new code — and, like
+   a part, it gets no artifact build (the exception below): a resolution in
+   `rust/` or a host module is cross-compiled only at the final PR unless the
+   merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
    Test (`ci.yml`) and nearly every other push trigger fire only on `main`
    (path-filtered `roost.yml` is the exception), so a clean merge is first
    fully tested on the next PR into or out of the feature branch — when a part
@@ -258,7 +261,20 @@ Releases are unaffected: the release PR is a single PR against `main`, and
 whatever is still on a feature branch is simply not in that release. This rests
 on the PR workflows' `pull_request` triggers being unscoped (any base branch —
 see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
-gives part PRs full CI and the Claude review; do not narrow them to `main`.
+gives part PRs the tests, clippy, the lockfile check and the Claude review; do
+not narrow them to `main`. **The artifact builds are the exception** (owner
+ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
+iOS framework skip a PR whose base is not `main` (a job-level `if` in those
+workflows — the checks show as skipped, not absent), because a packaging leg
+per part costs more than it tells; the final `feature/<topic>` → `main` PR
+builds everything, and a part that touches what those legs alone check (the
+Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
+budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
+the workflow on its branch from the Actions tab. A PR retargeted to `main`
+after it was opened keeps its skipped checks — a base change is an `edited`
+event, which these workflows do not run on — so push a commit or dispatch the
+three workflows before it merges, or the first artifact build of that head is
+the post-merge run on `main`.
 
 ## Releases — ask before cutting one
 
@@ -440,7 +456,7 @@ demo machine pulls, so nothing waits for a release; a PR build would only add a
 macOS runner leg per push, because a change that breaks a bundle without
 failing a test is next to impossible — what a bundle adds over the standard app
 (a seed, its manifest, warm peer caches) are build inputs, not code paths, and
-the standard dmg leg already proves jpackage on every PR. A bundle-only
+the standard dmg leg already proves jpackage on every PR into `main`. A bundle-only
 regression therefore surfaces on the next `main` run, where it is a hard gate.
 A bundle whose seed lives OUTSIDE the tree (RAILGUN's, on the `railgun-seed`
 release) also takes `workflow_dispatch`, so a refreshed seed can be rebuilt
@@ -559,7 +575,10 @@ that produced this note.
   don't import the `:core` helpers — they inline the few lines instead (hosts
   talk only to `:myotis-api`). The ENFORCEMENT is
   `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
-  built APK's dex — the post-desugaring ground truth. It also resolves calls
+  built APK's dex — the post-desugaring ground truth — on pushes to `main`, on
+  PRs into `main` and on dispatch; a part PR into a feature branch does not
+  build the APK (see the multi-PR section), so for a feature plan this check
+  first runs at the final PR unless a part dispatches the workflow. It also resolves calls
   that reach a JDK method through a third-party subclass, which lint-style
   source checks and a naive api-versions.xml lookup both miss (that is exactly
   how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus
