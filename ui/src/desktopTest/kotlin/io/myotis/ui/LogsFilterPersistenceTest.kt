@@ -32,7 +32,7 @@ class LogsFilterPersistenceTest {
         // manually — with a paused clock, frame-waiting work counts as idle.
         rule.mainClock.autoAdvance = false
         rule.setContent {
-            NodeScreen(controller = FakeController(), settings = FakeSettings(), logs = FakeLogs())
+            NodeScreen(controller = FakeController(), settings = FakeSettings(expert = true), logs = FakeLogs())
         }
         pumpFrames()
 

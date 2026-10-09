@@ -247,7 +247,7 @@ object LogIndexStatus {
     }
 
     /** Thousands-grouped decimal (multiplatform-safe). */
-    private fun grouped(n: Long): String =
+    internal fun grouped(n: Long): String =
         n.toString().reversed().chunked(3).joinToString(",").reversed()
 
     private fun formatDuration(secs: Long): String {

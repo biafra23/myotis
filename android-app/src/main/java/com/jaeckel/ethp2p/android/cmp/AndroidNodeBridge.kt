@@ -351,6 +351,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun stayAwakeWhileCharging(): Boolean = NodeService.stayAwakeWhileCharging(ctx)
     override fun setStayAwakeWhileCharging(v: Boolean) = NodeService.setStayAwakeWhileCharging(ctx, v)
     override fun supportsIdleSleep(): Boolean = true   // NodeService runs the idle controller
+    override fun expertMode(): Boolean = NodeService.expertMode(ctx)
+    override fun setExpertMode(v: Boolean) = NodeService.setExpertMode(ctx, v)
 }
 
 /**

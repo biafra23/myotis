@@ -37,7 +37,7 @@ class StatusHelpDialogTest {
 
     @Test
     fun `a single tap on a row opens its help, which stays until Close`() {
-        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithText("Head age").performScrollTo().performClick()
         pumpFrames()
@@ -55,7 +55,7 @@ class StatusHelpDialogTest {
     @Test
     fun `a button's help opens without running the button's action`() {
         val controller = Stopped()
-        rule.setContent { NodeScreen(controller = controller, settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = controller, settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithContentDescription("Help: Clear peer caches").performScrollTo().performClick()
         pumpFrames()

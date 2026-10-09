@@ -8,8 +8,9 @@ engine differences called out where they exist.
 
 ## TL;DR — how to tell it's ready
 
-- **In the apps**: the readiness strip under a network's status card is **green**
-  ("ready for simple reads") or **bright green** ("fully ready — deep peer pool").
+- **In the apps**: the Status tab's card says **Ready**, and the readiness
+  strip under the header is **green** ("ready for simple reads") or **bright
+  green** ("fully ready — deep peer pool").
 - **On the daemon**: `./gradlew :app:run -Pargs=beacon-status` returns
   `"state":"SYNCED"`, and a query such as `get-account` returns
   `"verifyMethod":"headerChain"` (or `"stateRootMatch"`) instead of a `failReason`.
@@ -137,15 +138,21 @@ Beyond the applicable cap the node **refuses** (JSON-RPC `-32000`, IPC
 
 ### Android + desktop apps (shared UI)
 
-Each network card has a readiness strip, evaluated top-down:
+The strip under the header and the Status tab's card paint one ladder
+(`readinessOf` in `ui/.../Readiness.kt`), evaluated top-down:
 
-| Strip | Meaning |
-|---|---|
-| grey | sleeping (idle-paused) — an incoming request wakes it |
-| red | not running, or beacon not SYNCED |
-| amber | SYNCED but verified head age > 45 s — warming up, not ready to transact |
-| green | ready for simple reads |
-| bright green (thicker) | fully ready — deep snap-peer pool (≥ 16 serving peers by default) |
+| Strip | Card headline | Meaning |
+|---|---|---|
+| grey | Sleeping | idle-paused — an incoming request wakes it |
+| red | No internet connection / Not running / Update required / Needs your decision / Syncing | offline, not running, an unsupported upgrade the node corroborates, parked in `STALE_ANCHOR`, or beacon not SYNCED |
+| amber | Almost ready | SYNCED but verified head age > 45 s (or none yet) — warming up, not ready to transact |
+| amber (thicker, a progress bar) | Ready — log index catching up | reads are served, but an enabled log index is catching up to the head (a gap that reached 32 blocks, until it is back within the 4-block serving slack), so head-reaching `eth_getLogs` is refused until it has |
+| green | Ready | ready for simple reads |
+| bright green (thicker) | Ready | fully ready — deep snap-peer pool (≥ 16 serving peers by default) |
+
+The vitals tiles under the card (normal mode) break the same snapshot down into
+usable execution peers, consensus state and servers, verified-head freshness and
+— when enabled — the log index; `docs/status-screen.md` has the per-tile rules.
 
 The Android foreground notification condenses the same tiers into words:
 `sleeping` → `syncing` → `warming up` (SYNCED but no verified head yet) →
@@ -229,6 +236,7 @@ the tag there (`-32602`) on every method (`VerifiedReads.supportsFinalizedTag`,
   (`verifiedHeadAgeMs`, staleness constants `RPC_*_MS`)
 - Head age (Rust mapping): `myotis-engines/.../RustChainHandle.java` (`status()`)
 - Readiness gate: `node-core/.../ChainStack.java` (`readyForReads`)
-- UI strip + 45 s threshold: `ui/.../NodeScreen.kt` (`ReadinessStrip`, `READY_HEAD_WARM_MS`)
+- UI readiness ladder + 45 s threshold: `ui/.../Readiness.kt` (`readinessOf`,
+  `READY_HEAD_WARM_MS`); the strip that paints it: `ui/.../NodeScreen.kt` (`ReadinessStrip`)
 - Verification ladder (verifyMethod/failReason): `node-core/.../VerifiedAccountQuery.java`,
   `rust/myotis-net/src/el/verify.rs`
