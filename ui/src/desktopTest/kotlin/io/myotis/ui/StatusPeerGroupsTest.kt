@@ -1,8 +1,13 @@
 package io.myotis.ui
 
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -44,6 +49,20 @@ class StatusPeerGroupsTest {
         assertTrue("discv4 table under EL", el < discovered && discovered < cl)
         assertTrue("wrong-chain list under EL", el < blacklisted && blacklisted < cl)
         assertTrue("discv5 table under CL", cl < discv5)
+    }
+
+    @Test
+    fun `screen readers get the layer too - headers are headings, repeated rows are named`() {
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        pumpFrames()
+        val heading = SemanticsMatcher.keyIsDefined(SemanticsProperties.Heading)
+        rule.onNodeWithText("EL · 3 peers · 20 cache").assert(heading)
+        rule.onNodeWithText("CL · served 2/min · 10 cache").assert(heading)
+        // The two "Peers" rows announce as "EL peers" / "CL peers", the two
+        // "Cache" rows as "EL cache" / "CL cache".
+        for (name in listOf("EL peers", "CL peers", "EL cache", "CL cache")) {
+            rule.onAllNodesWithContentDescription(name).assertCountEquals(1)
+        }
     }
 
     @Test

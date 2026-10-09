@@ -16,6 +16,14 @@ class PeerGroupTitleTest {
     }
 
     @Test
+    fun `one ready peer is a peer, not peers`() {
+        assertEquals("1 peer", elPeersPhrase(1))
+        assertEquals("0 peers", elPeersPhrase(0))
+        assertEquals("2 peers", elPeersPhrase(2))
+        assertEquals("EL · 1 peer · 5 cache", peerGroupTitle("EL", elPeersPhrase(1), 5))
+    }
+
+    @Test
     fun `a fresh install reads as zeros, not as a missing header`() {
         assertEquals("EL · 0 peers · 0 cache", peerGroupTitle("EL", "0 peers", 0))
         assertEquals("CL · served 0/min · 0 cache", peerGroupTitle("CL", "served 0/min", 0))

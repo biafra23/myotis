@@ -60,6 +60,7 @@ import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -1114,7 +1115,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // EL — the devp2p side: the snap pool, its peer cache, what EL peers
         // ask US for, and the discv4 table / dial backoff / wrong-chain lists
         // (all EL by their help texts).
-        PeerGroupHeader(peerGroupTitle("EL", "${s.readyPeers} peers", s.elCachedPeers))
+        PeerGroupHeader(peerGroupTitle("EL", elPeersPhrase(s.readyPeers), s.elCachedPeers))
         // Same total-first shape as the cache row (the pool holds only ready
         // peers, so the total IS the ready count).
         StatusRow(
@@ -1848,7 +1849,16 @@ private fun StatusRow(
         Row(Modifier.width(160.dp)) {
             // weight(1f) reserves the badge's own width first, so a long label truncates
             // instead of the two overflowing the 160dp column into the value's Text.
-            Text(key, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // A row whose label repeats across groups ("Peers") is announced by its
+            // qualified title, so a screen reader hears the layer the eye gets
+            // from the header above.
+            val named = if (title == key) Modifier else Modifier.semantics { contentDescription = title }
+            Text(
+                key,
+                Modifier.weight(1f, fill = false).then(named),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (help != null) HelpGlyph(Modifier.padding(start = 4.dp))
         }
         Text(
@@ -1896,29 +1906,35 @@ private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
 }
 
 /**
+ * A peer group's header on the Status tab: `EL · 12 peers · 96 cache` /
+ * `CL · served 2/min · 3 cache`. [peers] is the group's live-peer phrase as
+ * the caller words it (the EL side counts ready pool peers — [elPeersPhrase] —
+ * the CL side counts servers that answered in the last minute), [cache] the
+ * on-disk peer-cache total — the same number the group's Cache row starts with.
+ */
+internal fun peerGroupTitle(layer: String, peers: String, cache: Int): String =
+    "$layer · $peers · $cache cache"
+
+/** The EL header's peer phrase: `12 peers`, `0 peers` — and `1 peer`, a common
+ *  state on phones (snap target 3, pools often at 1–2). */
+internal fun elPeersPhrase(ready: Int): String = "$ready ${if (ready == 1) "peer" else "peers"}"
+
+/** The header above a Status-tab peer group (see [peerGroupTitle]). A semantics
+ *  heading, so a screen-reader user exploring the rows underneath — which say
+ *  just "Peers" / "Cache" — can navigate by headings to learn the layer. */
+@Composable
+private fun PeerGroupHeader(title: String) {
+    Spacer(Modifier.height(8.dp))
+    Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleSmall)
+    Spacer(Modifier.height(2.dp))
+}
+
+/**
  * The EL group's "Peers" row value: `ready · snap M · serving K`, with the number of
  * serving peers connected over snap/2 (EIP-8189) in parentheses after K —
  * "serving 8 (3)". No parentheses while none of them is on snap/2, so a pool that
  * is all snap/1 reads exactly as it did before snap/2 existed.
  */
-/**
- * A peer group's header on the Status tab: `EL · 12 peers · 96 cache` /
- * `CL · served 2/min · 3 cache`. [peers] is the group's live-peer phrase as
- * the caller words it (the EL pool counts connections, the CL side counts
- * servers that answered in the last minute), [cache] the on-disk peer-cache
- * total — the same number the group's Cache row starts with.
- */
-internal fun peerGroupTitle(layer: String, peers: String, cache: Int): String =
-    "$layer · $peers · $cache cache"
-
-/** The header above a Status-tab peer group (see [peerGroupTitle]). */
-@Composable
-private fun PeerGroupHeader(title: String) {
-    Spacer(Modifier.height(8.dp))
-    Text(title, style = MaterialTheme.typography.titleSmall)
-    Spacer(Modifier.height(2.dp))
-}
-
 internal fun elPeersValue(ready: Int, snap: Int, serving: Int, snap2Serving: Int): String {
     val snap2 = if (snap2Serving > 0) " ($snap2Serving)" else ""
     return "$ready · snap $snap · serving $serving$snap2"
