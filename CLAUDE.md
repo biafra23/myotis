@@ -231,7 +231,10 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    **cleanly** may be pushed straight to the feature branch: it adds nothing
    `main` doesn't already carry, and it is the ONLY direct push this rule allows.
    A merge that needed **conflict resolution** goes through a PR into the
-   feature branch like a part, because the resolution is new code. Build and
+   feature branch like a part, because the resolution is new code — and, like
+   a part, it gets no artifact build (the exception below): a resolution in
+   `rust/` or a host module is cross-compiled only at the final PR unless the
+   merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
    Test (`ci.yml`) and nearly every other push trigger fire only on `main`
    (path-filtered `roost.yml` is the exception), so a clean merge is first
    fully tested on the next PR into or out of the feature branch — when a part
@@ -449,7 +452,7 @@ demo machine pulls, so nothing waits for a release; a PR build would only add a
 macOS runner leg per push, because a change that breaks a bundle without
 failing a test is next to impossible — what a bundle adds over the standard app
 (a seed, its manifest, warm peer caches) are build inputs, not code paths, and
-the standard dmg leg already proves jpackage on every PR. A bundle-only
+the standard dmg leg already proves jpackage on every PR into `main`. A bundle-only
 regression therefore surfaces on the next `main` run, where it is a hard gate.
 A bundle whose seed lives OUTSIDE the tree (RAILGUN's, on the `railgun-seed`
 release) also takes `workflow_dispatch`, so a refreshed seed can be rebuilt

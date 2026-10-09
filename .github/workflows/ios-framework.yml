@@ -12,9 +12,10 @@ name: iOS Framework (MyotisKit)
 # Kotlin :app-ios module, so this is the ONLY automated check that does: a
 # break in IosRpcBackend or a drift in the engine's C ABI header would
 # otherwise sail through green until someone built the app on a Mac (which is
-# why the revert PRs each needed a manual compileKotlinIos* run). The PR/main
-# leg is that safety net; the tag leg publishes the xcframework to the same
-# pre-release the sibling asset workflows populate.
+# why the revert PRs each needed a manual compileKotlinIos* run). The leg on
+# pushes to main and on PRs INTO main is that safety net (a PR into a feature
+# branch skips it — see the review-gate job); the tag leg publishes the
+# xcframework to the same pre-release the sibling asset workflows populate.
 
 on:
   # Scope push to main + release tags so a branch push that also has an open PR
