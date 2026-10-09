@@ -3188,14 +3188,14 @@ dependencies = [
 
 [[package]]
 name = "myotis-bls"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blst",
 ]
 
 [[package]]
 name = "myotis-consensus"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-bls",
  "sha2 0.10.9",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "k256",
  "sha2 0.10.9",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-evm"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-core",
  "revm",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-net"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "alloy-rlp",
  "async-trait",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-wire"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aes",
  "cipher",
