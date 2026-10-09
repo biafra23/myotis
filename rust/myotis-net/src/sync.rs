@@ -2287,7 +2287,7 @@ async fn try_bootstrap(
         let header_root = bootstrap.header.beacon.hash_tree_root();
         if header_root != config.checkpoint_root {
             fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, got = %hex_str(&header_root),
+            tracing::warn!(peer = %peer, client = %client.client_of(&peer), got = %hex_str(&header_root),
                 "bootstrap rejected: header root does not match checkpoint");
             continue;
         }
@@ -2306,7 +2306,8 @@ async fn try_bootstrap(
             if spec::compute_sync_committee_period_with(header_slot, spp)
                 != spec::compute_sync_committee_period_with(config.checkpoint_slot, spp)
             {
-                tracing::warn!(peer = %peer, header_slot, configured = config.checkpoint_slot,
+                tracing::warn!(peer = %peer, client = %client.client_of(&peer), header_slot,
+                    configured = config.checkpoint_slot,
                     "bootstrap: verified header lies in a DIFFERENT sync-committee period than \
                      the configured checkpoint slot — the anchor period is wrong; persistence \
                      and snapshot resume will be off until the store passes the claimed period");
@@ -2320,8 +2321,8 @@ async fn try_bootstrap(
         // execution branch — each at the gindex of the header's fork.
         if let Err(reason) = processor.verify_bootstrap(&bootstrap) {
             fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, %reason, slot = bootstrap.header.beacon.slot,
-                "bootstrap rejected");
+            tracing::warn!(peer = %peer, client = %client.client_of(&peer), %reason,
+                slot = bootstrap.header.beacon.slot, "bootstrap rejected");
             continue;
         }
 
@@ -2336,8 +2337,9 @@ async fn try_bootstrap(
                 processor.store.current_period(),
             );
         }
-        tracing::info!(peer = %peer, slot = bootstrap.header.beacon.slot,
-            period = processor.store.current_period(), "bootstrap verified and applied");
+        tracing::info!(peer = %peer, client = %client.client_of(&peer),
+            slot = bootstrap.header.beacon.slot, period = processor.store.current_period(),
+            "bootstrap verified and applied");
         return true; // round has a winner — buffered strikes are discarded
     }
     for addr in &round_failures {
@@ -3078,8 +3080,8 @@ async fn catch_up(
                 "updates_by_range returned no chunks");
             continue;
         }
-        tracing::info!(peer = %peer.id, sub_from, sub_count, served, raw_len = raw.len(),
-            "updates_by_range served");
+        tracing::info!(peer = %peer.id, client = %client.client_of(&peer.id),
+            sub_from, sub_count, served, raw_len = raw.len(), "updates_by_range served");
         // A peer that answered DOES serve the protocol, so reverse any stale
         // nolc verdict — that part is factual. But it is NOT yet "proven":
         // mark_proven also grants the preferred tier and wipes fail_counts,
@@ -3130,7 +3132,7 @@ async fn catch_up(
                 if let Some(id) = pool.id_for_key(bad) {
                     pool.note_verify_reject(id);
                     clcache.mark_failure(bad);
-                    tracing::warn!(peer = %bad, period = before_period,
+                    tracing::warn!(peer = %bad, client = %client.client_of(&id), period = before_period,
                         "catch-up: update failed verification — peer penalised, \
                          will try another next ask");
                 }
@@ -3185,7 +3187,8 @@ async fn catch_up(
         // promoted to the batch tier (it would lead selection and silence
         // the throughput hunt).
         if !single && from_this_response >= 2 && pool.mark_batch_server(peer.id) {
-            tracing::info!(peer = %peer.id, periods = from_this_response,
+            tracing::info!(peer = %peer.id, client = %client.client_of(&peer.id),
+                periods = from_this_response,
                 "catch-up: batch-capable LC server confirmed — preferred from now on");
         }
         hunt.release_throughput(pool, wall_period, processor.store.current_period());
@@ -3487,7 +3490,7 @@ async fn poll_finality(
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
-                    tracing::info!(peer = %peer.id,
+                    tracing::info!(peer = %peer.id, client = %client.client_of(&peer.id),
                         finalized_slot = processor.store.finalized_slot(),
                         optimistic_slot = processor.store.optimistic_slot(),
                         period = processor.store.current_period(),
@@ -3664,7 +3667,7 @@ async fn hunt_round(
                     pool.note_served(peer.id);
                     clcache.note_success(&addr);
                     applied = true;
-                    tracing::info!(peer = %peer.id,
+                    tracing::info!(peer = %peer.id, client = %client.client_of(&peer.id),
                         finalized_slot = processor.store.finalized_slot(),
                         "LC hunt: finality update applied from new server");
                 }
