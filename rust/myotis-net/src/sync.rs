@@ -954,8 +954,8 @@ pub struct SyncStatus {
     pub period: u64,
     pub peer_count: usize,
     /// Distinct peers that successfully served a light-client response
-    /// (bootstrap / updates / finality) in the last 60 s — the UI's "CL peers
-    /// served N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
+    /// (bootstrap / updates / finality) in the last 60 s — the UI's CL "served
+    /// N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
     pub served_peers_last_min: usize,
     /// TOTAL entries in the discv5 routing table, including Disconnected
     /// ones (the UI's "Discv5 peers" row) — deliberately not the connected

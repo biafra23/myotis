@@ -60,6 +60,7 @@ import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -1103,38 +1104,41 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                 color = if (mode == "active") MaterialTheme.colorScheme.primary else null,
             )
         }
-        StatusRow(
-            "CL peers",
-            "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}",
-            help = StatusHelp.CL_PEERS,
-        )
-        // Same total-first shape as the cache rows (the pool holds only ready
+        // Peer rows, grouped by layer so a reader never has to know which of
+        // "Discovered" (discv4) and "Discv5 peers" is which side. Each group's
+        // header carries the two numbers people scan for — live peers and the
+        // on-disk cache total — and the rows underneath keep their full values
+        // and help texts. The rows that occur in both groups ("Peers", "Cache")
+        // pass the qualified name as the help dialog's title, since the dialog
+        // stands alone without the header above it.
+        //
+        // EL — the devp2p side: the snap pool, its peer cache, what EL peers
+        // ask US for, and the discv4 table / dial backoff / wrong-chain lists
+        // (all EL by their help texts).
+        PeerGroupHeader(peerGroupTitle("EL", elPeersPhrase(s.readyPeers), s.elCachedPeers))
+        // Same total-first shape as the cache row (the pool holds only ready
         // peers, so the total IS the ready count).
         StatusRow(
-            "EL peers",
+            "Peers",
             elPeersValue(s.readyPeers, s.snapPeers, s.snapServingPeers, s.snap2ServingPeers),
             help = StatusHelp.EL_PEERS,
+            title = "EL peers",
         )
         // Cache rows: confirmed-server counts predict how fast the NEXT cold
         // start finds servers — the cache learning is visible live. One icon
-        // vocabulary for both rows, sized for phone-width screens:
-        // ✓ confirmed server (CL: proven LC · EL: snap-ok), ✕ confirmed not
-        // (nolc / snap-bad), ? untried.
+        // vocabulary for both groups, sized for phone-width screens:
+        // ✓ confirmed server (EL: snap-ok · CL: proven LC), ✕ confirmed not
+        // (snap-bad / nolc), ? untried.
         // The derived untried bucket can't go negative from ONE CacheFileStats
         // parse (buckets are mutually exclusive per line), but coerce anyway so
         // a future host feeding these fields from another source can't render
         // "?-3".
         StatusRow(
-            "CL cache",
-            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
-                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
-            help = StatusHelp.CL_CACHE,
-        )
-        StatusRow(
-            "EL cache",
+            "Cache",
             "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
                 "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
             help = StatusHelp.EL_CACHE,
+            title = "EL cache",
         )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
@@ -1148,24 +1152,48 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}",
             help = StatusHelp.BLK_ASKS,
         )
+        StatusRow("Discovered", s.discoveredPeers.toString(), help = StatusHelp.DISCOVERED)
+        StatusRow("In backoff", s.backedOffPeers.toString(), help = StatusHelp.IN_BACKOFF)
+        StatusRow("Blacklisted", s.blacklistedPeers.toString(), help = StatusHelp.BLACKLISTED)
+
+        // CL — the libp2p side: light-client servers, their cache, the discv5
+        // table. The header shows "served N/min" rather than a connection
+        // count: CL connections are short-lived, so "con" is usually 0 and
+        // says nothing about whether the node is being served.
+        PeerGroupHeader(peerGroupTitle("CL", "served ${s.clServedPeersLastMin}/min", s.clCachedPeers))
+        StatusRow(
+            "Peers",
+            "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}",
+            help = StatusHelp.CL_PEERS,
+            title = "CL peers",
+        )
+        StatusRow(
+            "Cache",
+            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
+                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
+            help = StatusHelp.CL_CACHE,
+            title = "CL cache",
+        )
+        StatusRow("Discv5 peers", s.discv5Peers.toString(), help = StatusHelp.DISCV5_PEERS)
+        // Close the CL group the way the headers open theirs, whether or not
+        // the Reads rows follow.
+        Spacer(Modifier.height(8.dp))
+
         // The read-fetch shadow cache (docs/read-stats.md): verified state
         // fetches this run, the share a sound cache keying would have served
         // (storage-root keyed slots, per-block accounts, content-addressed
         // code) with the storage time it would have saved, and how often a
         // value up to a minute old would still have been right. Rows appear
         // once the engine has observed a fetch; hidden on hosts that don't
-        // feed the JSON.
+        // feed the JSON. Not a peer group: these are about OUR reads.
         s.readStatsJson?.let(ReadStatsStatus::parse)?.takeIf(ReadStatsStatus::hasReads)?.let { rs ->
             StatusRow("Reads", ReadStatsStatus.fetchesLine(rs), help = StatusHelp.READS)
             StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs), help = StatusHelp.CACHEABLE)
             ReadStatsStatus.staleLine(rs)?.let {
                 StatusRow("Stale ≤60s ok", it, help = StatusHelp.STALE_OK)
             }
+            Spacer(Modifier.height(8.dp))
         }
-        StatusRow("Discovered", s.discoveredPeers.toString(), help = StatusHelp.DISCOVERED)
-        StatusRow("Discv5 peers", s.discv5Peers.toString(), help = StatusHelp.DISCV5_PEERS)
-        StatusRow("In backoff", s.backedOffPeers.toString(), help = StatusHelp.IN_BACKOFF)
-        StatusRow("Blacklisted", s.blacklistedPeers.toString(), help = StatusHelp.BLACKLISTED)
         // JSON-RPC listener: where a same-device client reaches this network's
         // verified endpoint — or why it can't (port squatted / bind failed).
         if (s.rpcPort > 0) {
@@ -1799,9 +1827,18 @@ private fun EnsResultView(e: EnsResult) {
 }
 
 /** A Status-tab row: label, value, and — when [help] is given — a "ⓘ" hint. Nothing else
- *  in a row is interactive, so the whole row is the tap target for the explanation. */
+ *  in a row is interactive, so the whole row is the tap target for the explanation. The
+ *  help dialog is titled [title], which defaults to the row's own label; a row whose
+ *  label is only meaningful under its group header ("Peers" under "EL · …") passes the
+ *  qualified name so the dialog can stand on its own. */
 @Composable
-private fun StatusRow(key: String, value: String, help: String? = null, color: Color? = null) {
+private fun StatusRow(
+    key: String,
+    value: String,
+    help: String? = null,
+    color: Color? = null,
+    title: String = key,
+) {
     var showHelp by remember { mutableStateOf(false) }
     // The row's own text names it for screen readers; the click label names the action.
     val tappable = if (help == null) Modifier else Modifier.clickable(
@@ -1812,7 +1849,16 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
         Row(Modifier.width(160.dp)) {
             // weight(1f) reserves the badge's own width first, so a long label truncates
             // instead of the two overflowing the 160dp column into the value's Text.
-            Text(key, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // A row whose label repeats across groups ("Peers") is announced by its
+            // qualified title, so a screen reader hears the layer the eye gets
+            // from the header above.
+            val named = if (title == key) Modifier else Modifier.semantics { contentDescription = title }
+            Text(
+                key,
+                Modifier.weight(1f, fill = false).then(named),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (help != null) HelpGlyph(Modifier.padding(start = 4.dp))
         }
         Text(
@@ -1822,7 +1868,7 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
             overflow = TextOverflow.Ellipsis,
         )
     }
-    if (showHelp && help != null) HelpDialog(key, help) { showHelp = false }
+    if (showHelp && help != null) HelpDialog(title, help) { showHelp = false }
 }
 
 /** A standalone "ⓘ" for items whose own tap is already an action (the buttons). */
@@ -1860,7 +1906,31 @@ private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
 }
 
 /**
- * The "EL peers" row's value: `ready · snap M · serving K`, with the number of
+ * A peer group's header on the Status tab: `EL · 12 peers · 96 cache` /
+ * `CL · served 2/min · 3 cache`. [peers] is the group's live-peer phrase as
+ * the caller words it (the EL side counts ready pool peers — [elPeersPhrase] —
+ * the CL side counts servers that answered in the last minute), [cache] the
+ * on-disk peer-cache total — the same number the group's Cache row starts with.
+ */
+internal fun peerGroupTitle(layer: String, peers: String, cache: Int): String =
+    "$layer · $peers · $cache cache"
+
+/** The EL header's peer phrase: `12 peers`, `0 peers` — and `1 peer`, a common
+ *  state on phones (snap target 3, pools often at 1–2). */
+internal fun elPeersPhrase(ready: Int): String = "$ready ${if (ready == 1) "peer" else "peers"}"
+
+/** The header above a Status-tab peer group (see [peerGroupTitle]). A semantics
+ *  heading, so a screen-reader user exploring the rows underneath — which say
+ *  just "Peers" / "Cache" — can navigate by headings to learn the layer. */
+@Composable
+private fun PeerGroupHeader(title: String) {
+    Spacer(Modifier.height(8.dp))
+    Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleSmall)
+    Spacer(Modifier.height(2.dp))
+}
+
+/**
+ * The EL group's "Peers" row value: `ready · snap M · serving K`, with the number of
  * serving peers connected over snap/2 (EIP-8189) in parentheses after K —
  * "serving 8 (3)". No parentheses while none of them is on snap/2, so a pool that
  * is all snap/1 reads exactly as it did before snap/2 existed.
