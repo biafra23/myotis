@@ -89,7 +89,10 @@ internal fun readinessOf(
     s == null || !s.running -> Readiness(
         ReadinessLevel.STOPPED,
         "Not running",
-        "Start the node to verify balances and answer wallet requests.",
+        // A registered handle that is not RUNNING is mid-boot or mid-teardown (the Stop
+        // button is what the card offers then); only a missing handle wants a Start.
+        if (s == null) "Start the node to verify balances and answer wallet requests."
+        else "Starting or stopping — give it a moment.",
         "Node readiness: not running",
     )
     // An unsupported upgrade the node's own state corroborates outranks a stale-anchor

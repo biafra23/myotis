@@ -225,6 +225,9 @@ fun NodeScreen(
                 )
             }
 
+            // The one ladder the strip and the Status tab's card both paint.
+            val readiness = readinessOf(current, settings.deepPoolThreshold(), logIndexCatchUps[network], online)
+
             // The header and the tab content are the same in both layouts below; only
             // where the tab switcher sits differs.
             val header: @Composable () -> Unit = {
@@ -252,17 +255,18 @@ fun NodeScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
-                // selected chain. Uses the configurable deep-pool threshold from Settings.
-                ReadinessStrip(
-                    current,
-                    settings.deepPoolThreshold(),
-                    logIndexCatchUps[network],
-                )
+                // selected chain.
+                ReadinessStrip(readiness, logIndexCatchUps[network])
                 Spacer(Modifier.height(12.dp))
             }
             val content: @Composable () -> Unit = {
                 when (tabs[tab]) {
-                    "Status" -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
+                    "Status" -> StatusTab(
+                        controller, settings, current, network, online, onOpenNetworkSettings,
+                        expert = expert, readiness = readiness,
+                        // The card's "Review" re-asks a dismissed stale-anchor question.
+                        onReviewStaleAnchor = { staleDismissed = staleDismissed - network },
+                    )
                     "Query" -> QueryTab(controller, settings, current, network, history)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
@@ -357,9 +361,17 @@ private fun NetworkChips(
  * by color/thickness alone.
  */
 @Composable
-internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUpProgress? = null) {
+internal fun ReadinessStrip(
+    s: NodeSnapshot?,
+    deepPoolThreshold: Int,
+    catchUp: CatchUpProgress? = null,
+    online: Boolean = true,
+) = ReadinessStrip(readinessOf(s, deepPoolThreshold, catchUp, online), catchUp)
+
+/** The strip over a ladder rung already computed — [NodeScreen] shares one with the status card. */
+@Composable
+internal fun ReadinessStrip(r: Readiness, catchUp: CatchUpProgress?) {
     // One ladder for every readiness surface (Readiness.kt); the strip only paints it.
-    val r = readinessOf(s, deepPoolThreshold, catchUp)
     val color = StatusColors.of(r.level)
     // The two rungs past "ready" are drawn thicker: the deep pool, and the index
     // catch-up whose strip doubles as its progress bar.
@@ -838,6 +850,11 @@ internal fun SwitchRow(
     }
 }
 
+/**
+ * The Status tab. Both modes open with the readiness card ([StatusHero]) and its
+ * actions. Normal mode follows with the vitals tiles and nothing else; Expert mode
+ * with today's banners, the full rows, the maintenance actions and the READY peers.
+ */
 @Composable
 private fun StatusTab(
     controller: NodeController,
@@ -846,49 +863,58 @@ private fun StatusTab(
     primary: String,
     online: Boolean,
     onOpenNetworkSettings: () -> Unit,
+    expert: Boolean,
+    readiness: Readiness,
+    onReviewStaleAnchor: () -> Unit,
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        if (!online) {
-            OfflineBanner(onOpenNetworkSettings)
+        // A snapshot for `primary` exists only while its stack is registered (running or
+        // mid-boot): Start shows while it is down, Stop while it is up. Start/Stop are
+        // RUNTIME-only (startNetwork/stopNetwork) — deliberately decoupled from the
+        // Settings enable switches, so stopping a chain here does not flip its switch
+        // off. The one exception: Start on a chain that isn't enabled at all (e.g. fresh
+        // install, nothing on) goes through enableNetwork so a cold host has an enabled
+        // set to boot.
+        val primaryActive = snap != null
+        StatusHero(readiness, help = { HelpButton("Readiness", StatusHelp.READINESS) }) {
+            // Offline: the fix is outside the app, so offer the door to it — whatever rung
+            // leads (a sleeping stack outranks offline on the card, and still needs the door
+            // before a wake can succeed).
+            if (!online) Button(onClick = onOpenNetworkSettings) { Text("Open network settings") }
+            // Parked on the user's consent: bring the dismissed dialog back.
+            if (readiness.level == ReadinessLevel.NEEDS_DECISION) {
+                Button(onClick = onReviewStaleAnchor) { Text("Review") }
+            }
+            if (primaryActive) {
+                OutlinedButton(onClick = { controller.stopNetwork(primary) }) { Text("Stop") }
+            } else {
+                Button(
+                    onClick = {
+                        if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
+                        else controller.enableNetwork(primary)
+                    },
+                    // Don't offer Start while offline — discovery can't reach any peer.
+                    enabled = online,
+                ) { Text("Start $primary") }
+            }
+            if (expert) HelpButton("Start / Stop", StatusHelp.START_STOP)
+        }
+        Spacer(Modifier.height(16.dp))
+
+        snap?.upgrade?.let {
+            UpgradeBanner(it, cutOff = upgradeCutOff(snap))
             Spacer(Modifier.height(16.dp))
         }
 
-        if (snap == null) {
-            Text("Node stopped — no data for $primary")
-        } else {
-            snap.upgrade?.let {
-                UpgradeBanner(it, cutOff = upgradeCutOff(snap))
-                Spacer(Modifier.height(16.dp))
-            }
+        if (!expert) {
+            VitalsGrid(vitalsOf(snap, settings.deepPoolThreshold()))
+            return@Column
+        }
+
+        if (snap != null) {
             HuntBanner(snap)
             SyncProgressBar(snap)
             StatusView(snap, hostSleeps = settings.supportsIdleSleep())
-        }
-
-        Spacer(Modifier.height(16.dp))
-        // A snapshot for `primary` exists only while its stack is registered (running or
-        // mid-boot): Start disabled once up, Stop only while it is. Start/Stop here are
-        // RUNTIME-only (startNetwork/stopNetwork) — deliberately decoupled from the
-        // Settings enable switches, so stopping a chain from Status does not flip its
-        // switch off. The one exception: Start on a chain that isn't enabled at all
-        // (e.g. fresh install, nothing on) goes through enableNetwork so a cold host
-        // has an enabled set to boot.
-        val primaryActive = snap != null
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(
-                onClick = {
-                    if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
-                    else controller.enableNetwork(primary)
-                },
-                // Don't offer Start while offline — discovery can't reach any peer.
-                enabled = !primaryActive && online,
-            ) { Text("Start $primary") }
-            Spacer(Modifier.width(8.dp))
-            OutlinedButton(
-                onClick = { controller.stopNetwork(primary) },
-                enabled = primaryActive,
-            ) { Text("Stop") }
-            HelpButton("Start / Stop", StatusHelp.START_STOP)
         }
 
         Spacer(Modifier.height(16.dp))
@@ -1111,33 +1137,6 @@ private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
             fontSize = 11.sp,
             color = onContainer,
         )
-    }
-}
-
-/** Shown at the top of Status when the device has no connectivity. */
-@Composable
-private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text(
-            "No internet connection",
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-        )
-        Text(
-            "The node needs internet access to discover and connect to peers. " +
-                "Enable Wi-Fi or mobile data to continue.",
-            fontSize = 13.sp,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-        )
-        Button(onClick = onOpenNetworkSettings, modifier = Modifier.fillMaxWidth()) {
-            Text("Open network settings")
-        }
     }
 }
 
@@ -2081,6 +2080,16 @@ private object StatusHelp {
         "app-open wakes don't count). \"slept\" is the most recent time it went to sleep — " +
         "which can be AFTER this wake, if it's asleep again now."
 
+    const val READINESS = "The card's headline is the readiness ladder, worst first: Sleeping → " +
+        "No internet connection → Not running → Update required → Needs your decision → Syncing → " +
+        "Almost ready → Ready. \"Ready\" means verified reads are being served; the strip above " +
+        "turns bright green once the peer pool is deep enough for heavy wallet screens too. " +
+        "\"Ready — log index catching up\" means reads work but log queries near the head are " +
+        "refused until the index has caught up. The tiles: Execution peers = peers that can " +
+        "answer a read right now, of all connected; Consensus = the beacon light client's state " +
+        "and how many servers answered in the last minute; Verified head = how old the head your " +
+        "answers come from is (fresh under 45 s); Log index (if enabled) = whether it serves at " +
+        "the head — an incomplete history is noted, but does not affect readiness."
     const val START_STOP = "Runtime-only start/stop — independent of the network's enabled " +
         "switch in Settings. Exception: starting a disabled network also enables it, so a " +
         "cold host has something to boot next time."
