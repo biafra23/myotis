@@ -41,16 +41,6 @@ fun main() {
     if (poc != null && System.getProperty("myotis.logdir") == null) {
         System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
     }
-    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
-    // processes, so hold a user-initiated activity for the process lifetime (AppNap.kt).
-    // After the logdir property: the outcome is the first line of a start's log.
-    if (AppNap.isMac) {
-        val held = AppNap.disable("Myotis serves JSON-RPC on localhost")
-        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
-            if (held) "App Nap disabled for this process (NSProcessInfo activity held)"
-            else "App Nap NOT disabled — RPC may stall while the window is hidden",
-        )
-    }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
     poc?.installSeedsIfAbsent(resourcesDir, dataDir)
@@ -58,6 +48,21 @@ fun main() {
     val settings = DesktopSettings(file = settingsFile)
     poc?.applyFirstStartSettings(settings, firstStart)
     val controller = DesktopNodeController(dataDir, settings)
+    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
+    // processes, so unless Settings → Power → "Sleep when not in focus" allows it, hold a
+    // user-initiated activity for the process lifetime (AppNap.kt). After the logdir
+    // property and the settings read, before anything starts: the outcome is one of the
+    // first lines of a start's log.
+    if (AppNap.isMac) {
+        controller.applyAppNap()
+        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
+            when {
+                AppNap.active -> "App Nap disabled for this process (NSProcessInfo activity held)"
+                settings.allowAppNap() -> "App Nap allowed (Settings → Power → Sleep when not in focus)"
+                else -> "App Nap NOT disabled — RPC may stall while the window is hidden"
+            },
+        )
+    }
     // Apply the persisted engine choice BEFORE the first network start, so a saved
     // Rust-engine preference survives a restart (Android parity: NodeService applies
     // it at service start). Networks keep the engine that created them. An explicit

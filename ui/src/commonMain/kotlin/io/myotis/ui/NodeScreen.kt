@@ -6,6 +6,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,11 +27,15 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -94,10 +99,12 @@ private object NoQueryHistory : QueryHistory {
 }
 
 /**
- * The shared Myotis screen — identical on Android and Desktop. A tab host over the per-network
- * [NodeController]/[Settings]/[LogSource] seam (Status / Query / Logs / Settings). [netStatus]
- * drives the offline banner and [onOpenNetworkSettings] opens the platform's network settings;
- * both default to the always-online / no-op behavior desktop wants.
+ * The shared Myotis screen — identical on Android, Desktop and iOS. A tab host over the
+ * per-network [NodeController]/[Settings]/[LogSource] seam: Status / Query / Settings, plus
+ * Logs and Index under [Settings.expertMode]. A phone-width window gets a bottom navigation
+ * bar, a wider one the tab row under the header. [netStatus] drives the offline banner and
+ * [onOpenNetworkSettings] opens the platform's network settings; both default to the
+ * always-online / no-op behavior desktop wants.
  */
 @Composable
 fun NodeScreen(
@@ -115,21 +122,38 @@ fun NodeScreen(
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
     // The Index tab is the log-index feature's home — where contracts are added,
-    // snapshots imported, and progress read — so it shows whenever the engine choice
-    // can serve the feature (anything but a forced Java engine; the log index is
-    // Rust-engine-only), OR while any live engine reports an enabled index: an
-    // imported/dropped-in snapshot activates engine-side without any Settings flag
-    // ever having been touched, and hiding a running index would leave its progress
-    // unreachable. Settings are plain reads, so the toggles that change them bump
-    // logIndexRev; the engine side re-derives from `snapshots`.
+    // snapshots imported, and progress read — so, within Expert mode, it shows
+    // whenever the engine choice can serve the feature (anything but a forced Java
+    // engine; the log index is Rust-engine-only), OR while any live engine reports an
+    // enabled index: an imported/dropped-in snapshot activates engine-side without any
+    // Settings flag ever having been touched, and hiding a running index from an
+    // expert would leave its controls unreachable. Normal mode hides the tab in
+    // every case (the Expert switch's note names it); there the index shows as the
+    // readiness strip's catch-up line and the Status tab's Log index tile, and the
+    // PoC flavours that ship a seeded index first-start in Expert mode. Settings are
+    // plain reads, so the toggles that change them bump logIndexRev; the engine side
+    // re-derives from `snapshots`.
     var logIndexRev by remember { mutableStateOf(0) }
     val showIndexTab = remember(logIndexRev, snapshots) {
         !settings.preferJavaEngine() ||
             snapshots.values.any { it.logIndexJson?.contains("\"enabled\":true") == true }
     }
-    val tabs = remember(showIndexTab) {
-        if (showIndexTab) listOf("Status", "Query", "Logs", "Index", "Settings")
-        else listOf("Status", "Query", "Logs", "Settings")
+    // Expert mode is a plain settings read like the engine preference above: the
+    // Settings switch bumps expertRev so the tab set re-derives immediately.
+    var expertRev by remember { mutableStateOf(0) }
+    val expert = remember(expertRev) { settings.expertMode() }
+    // Normal mode is the three screens a wallet user needs; Expert mode adds the Logs
+    // tab and — under the rule above — the Index tab.
+    val tabs = remember(expert, showIndexTab) {
+        buildList {
+            add("Status")
+            add("Query")
+            if (expert) {
+                add("Logs")
+                if (showIndexTab) add("Index")
+            }
+            add("Settings")
+        }
     }
     // Selection is the tab's LABEL, not its position — positions shift when Index
     // appears/disappears. A selection whose tab just vanished falls back to Status.
@@ -176,7 +200,34 @@ fun NodeScreen(
     val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
     MaterialTheme(colorScheme = colorScheme) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(Modifier.fillMaxSize().padding(16.dp)) {
+            // Stale-anchor consent. The engines park fail-closed (beaconState
+            // STALE_ANCHOR) when a network's sync anchor is older than the
+            // weak-subjectivity bound; this dialog is the "ask the user" half of
+            // that contract. Dismissals are remembered only WHILE the network
+            // stays parked, so a later, separate park asks again.
+            var staleDismissed by remember { mutableStateOf(setOf<String>()) }
+            staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
+                snapshots[it]?.beaconState == "STALE_ANCHOR"
+            }
+            val staleNet = snapshots.entries.firstOrNull {
+                it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
+            }?.key
+            val staleSnap = staleNet?.let { snapshots[it] }
+            if (staleNet != null && staleSnap != null) {
+                StaleAnchorDialog(
+                    network = staleNet,
+                    s = staleSnap,
+                    onAccept = {
+                        controller.acceptStaleAnchor(staleNet)
+                        staleDismissed = staleDismissed + staleNet
+                    },
+                    onDismiss = { staleDismissed = staleDismissed + staleNet },
+                )
+            }
+
+            // The header and the tab content are the same in both layouts below; only
+            // where the tab switcher sits differs.
+            val header: @Composable () -> Unit = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Title + version stacked: the version is the first thing to ask for in
                     // a bug report, so it's on screen everywhere rather than buried in an
@@ -207,53 +258,66 @@ fun NodeScreen(
                     settings.deepPoolThreshold(),
                     logIndexCatchUps[network],
                 )
-
-                // Stale-anchor consent. The engines park fail-closed (beaconState
-                // STALE_ANCHOR) when a network's sync anchor is older than the
-                // weak-subjectivity bound; this dialog is the "ask the user" half of
-                // that contract. Dismissals are remembered only WHILE the network
-                // stays parked, so a later, separate park asks again.
-                var staleDismissed by remember { mutableStateOf(setOf<String>()) }
-                staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
-                    snapshots[it]?.beaconState == "STALE_ANCHOR"
-                }
-                val staleNet = snapshots.entries.firstOrNull {
-                    it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
-                }?.key
-                val staleSnap = staleNet?.let { snapshots[it] }
-                if (staleNet != null && staleSnap != null) {
-                    StaleAnchorDialog(
-                        network = staleNet,
-                        s = staleSnap,
-                        onAccept = {
-                            controller.acceptStaleAnchor(staleNet)
-                            staleDismissed = staleDismissed + staleNet
-                        },
-                        onDismiss = { staleDismissed = staleDismissed + staleNet },
-                    )
-                }
                 Spacer(Modifier.height(12.dp))
-
-                TabRow(selectedTabIndex = tab) {
-                    tabs.forEachIndexed { i, label ->
-                        Tab(selected = tab == i, onClick = { tabLabel = label }, text = { Text(label) })
-                    }
-                }
-                Spacer(Modifier.height(16.dp))
-
+            }
+            val content: @Composable () -> Unit = {
                 when (tabs[tab]) {
                     "Status" -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
                     "Query" -> QueryTab(controller, settings, current, network, history)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
-                    "Settings" -> SettingsTab(controller, settings, snapshots,
-                        onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ })
+                    "Settings" -> SettingsTab(controller, settings, snapshots, expert = expert,
+                        onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ },
+                        onExpertChanged = { expertRev++ })
+                }
+            }
+
+            // A phone-width window gets a bottom navigation bar — within the thumb's reach,
+            // icons and labels; a wider one keeps the tab row under the header. Both are
+            // selectable nodes carrying the tab's label, so tests and screen readers see the
+            // same tabs either way.
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                if (maxWidth < COMPACT_WIDTH) {
+                    Scaffold(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        bottomBar = {
+                            NavigationBar {
+                                tabs.forEachIndexed { i, label ->
+                                    NavigationBarItem(
+                                        selected = tab == i,
+                                        onClick = { tabLabel = label },
+                                        icon = { Icon(NavIcons.of(label), contentDescription = null) },
+                                        label = { Text(label) },
+                                    )
+                                }
+                            }
+                        },
+                    ) { inner ->
+                        Column(Modifier.fillMaxSize().padding(inner).padding(16.dp)) {
+                            header()
+                            content()
+                        }
+                    }
+                } else {
+                    Column(Modifier.fillMaxSize().padding(16.dp)) {
+                        header()
+                        TabRow(selectedTabIndex = tab) {
+                            tabs.forEachIndexed { i, label ->
+                                Tab(selected = tab == i, onClick = { tabLabel = label }, text = { Text(label) })
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        content()
+                    }
                 }
             }
         }
     }
 }
+
+/** Below this width the tab switcher is a bottom navigation bar (a phone); at or above it, a tab row. */
+internal val COMPACT_WIDTH = 600.dp
 
 /** Horizontally-scrolling chips over the enabled chains — picks the chain Status + Query act on. */
 @Composable
@@ -418,10 +482,16 @@ private fun SettingsTab(
     // Notifies the screen that the persisted enabled set changed, so the network
     // chips (derived from settings, not snapshot state) re-derive immediately.
     onEnabledChanged: () -> Unit = {},
+    // Whether Expert mode is on (re-read by NodeScreen on every flip): shows the
+    // node-tuning section below the Power and Expert-mode rows.
+    expert: Boolean = false,
     // Notifies the screen that the Kohaku log-index effective state changed (the
     // per-network flags or the Rust engine it depends on), so the Index tab's
     // visibility re-derives immediately.
     onLogIndexChanged: () -> Unit = {},
+    // Notifies the screen that Expert mode flipped, so the tab set and this tab's
+    // sections re-derive immediately.
+    onExpertChanged: () -> Unit = {},
 ) {
     val networks = remember { settings.allNetworks() }
     // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
@@ -436,100 +506,61 @@ private fun SettingsTab(
             networks.forEach { put(it, settings.rpcPortFor(it).toString()) }
         }
     }
-    var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
-    var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
-    var wsBound by remember { mutableStateOf(settings.wsBoundPeriods().toString()) }
-    var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    // The Expert-mode tuning fields live here, not in NodeTuning: Save persists the text
+    // fields, and the section comes and goes with the Expert switch while the tab stays.
+    val tuning = remember { TuningFields(settings) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
-    var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
-    var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
-    var preferJava by remember { mutableStateOf(settings.preferJavaEngine()) }
-    var torRouting by remember { mutableStateOf(settings.torEnabled()) }
+    var allowNap by remember { mutableStateOf(settings.allowAppNap()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Networks", style = MaterialTheme.typography.titleMedium)
-        Text(
-            "Toggle a chain to run it. Each enabled chain runs concurrently as its own node " +
-                "with its own JSON-RPC port — add each port to MetaMask as a separate RPC URL.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        SettingsSection("Networks")
+        SettingsNote(
+            "Turn a chain on to run it. Each chain runs as its own node with its own JSON-RPC " +
+                "port — add each port to your wallet as a separate RPC URL. Save applies a " +
+                "port change by restarting that chain.",
         )
         networks.forEach { id ->
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(settings.displayName(id))
-                    Switch(
-                        checked = enabled[id] == true,
-                        onCheckedChange = { on ->
-                            enabled[id] = on
-                            settings.setNetworkEnabled(id, on)
-                            if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
-                            onEnabledChanged()
-                        },
-                    )
-                }
-                OutlinedTextField(
-                    value = rpcPorts[id] ?: "",
-                    onValueChange = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
-                    label = { Text("JSON-RPC port (default ${settings.defaultRpcPort(id)})") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
+            NetworkCard(
+                name = settings.displayName(id),
+                enabled = enabled[id] == true,
+                port = rpcPorts[id] ?: "",
+                portLabel = "JSON-RPC port (default ${settings.defaultRpcPort(id)})",
+                onEnabled = { on ->
+                    enabled[id] = on
+                    settings.setNetworkEnabled(id, on)
+                    if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
+                    onEnabledChanged()
+                },
+                onPort = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
+            )
         }
 
-        HorizontalDivider()
-
-        Text("Node tuning", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(
-            value = snapTarget,
-            onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
-            label = { Text("Snap-peer target (default 32)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = servedWindow,
-            onValueChange = { servedWindow = it.filter(Char::isDigit).take(4) },
-            label = { Text("Served-block window (eth/69, default 32)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = deepPool,
-            onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
-            label = { Text("Readiness \"deep pool\" threshold (default 16)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = wsBound,
-            onValueChange = { wsBound = it.filter(Char::isDigit).take(4) },
-            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
-            supportingText = {
-                Text(
-                    "How old the sync anchor may be before the node refuses to sync and " +
-                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
-                        "it weakens the long-range-attack protection — leave 0 unless you " +
-                        "know why.",
-                )
-            },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
+        // Power: the rows that trade responsiveness for battery or CPU, one per host that
+        // has such a knob — macOS App Nap, Android's idle controller. Linux has neither
+        // (no per-app throttling of unfocused windows, no idle controller), so the section
+        // is simply absent there.
+        if (settings.supportsAppNap() || settings.supportsIdleSleep()) {
+            HorizontalDivider()
+            SettingsSection("Power")
+        }
+        if (settings.supportsAppNap()) {
+            // Applies live — the controller begins or ends the no-nap activity at once.
+            SwitchRow(
+                label = "Sleep when not in focus",
+                checked = allowNap,
+                onChange = { on -> allowNap = on; settings.setAllowAppNap(on); controller.applyAppNap() },
+            )
+            SettingsNote(
+                "Off (default): Myotis stays fully awake while its window is hidden or covered, " +
+                    "so wallets on this Mac keep getting prompt answers. On: macOS may slow Myotis " +
+                    "down when it is not in focus (App Nap) — saves power, but a wallet's first " +
+                    "request after a while can stall for seconds. Applies immediately.",
+            )
+        }
         // Idle-sleep is only meaningful on a host that actually runs the idle controller
         // (Android). On desktop (no controller) the setting is a no-op, so don't surface a
         // battery-saving toggle that can't take effect.
@@ -542,14 +573,12 @@ private fun SettingsTab(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
-            Text(
+            SettingsNote(
                 "After this many minutes without a wallet request or query, the node goes to " +
                     "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
                     "listening. The first request wakes it — expect that call to take a little longer. " +
                     "On a fresh start it runs through to SYNCED before the first sleep, as long as it " +
                     "has a network to sync over.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             // Applies live — the idle tick reads it each pass.
             SwitchRow(
@@ -557,139 +586,57 @@ private fun SettingsTab(
                 checked = stayAwakeCharging,
                 onChange = { on -> stayAwakeCharging = on; settings.setStayAwakeWhileCharging(on) },
             )
-            Text(
+            SettingsNote(
                 "On (default): while the phone is plugged in, skip idle sleep and keep the node " +
                     "awake and synced (battery isn't a concern). Off: sleep on the same idle timer " +
                     "whether charging or not. Emergency low-memory pauses happen either way.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
-        // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
-        // checked value is the negation. Persisted immediately; applies on the next node restart.
+        HorizontalDivider()
+        // Persisted at once; NodeScreen re-reads it and re-derives the tab set.
         SwitchRow(
-            label = "Relaxed state freshness",
-            checked = !strictFreshness,
-            onChange = { relaxed -> strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
+            label = "Expert mode",
+            checked = expert,
+            onChange = { on -> settings.setExpertMode(on); onExpertChanged() },
         )
-        Text(
-            "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
-                "fast-fail when no fresh servable root exists, and the wallet retries. " +
-                "On (opt-in, experimental): serve a slightly older verified root — but if " +
-                "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
-                "instead of failing fast. Applies on the next node (re)start.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        SettingsNote(
+            "On: the Logs and Index tabs, every status row with its maintenance actions, and " +
+                "the node-tuning settings below. Off (default): the three screens a wallet needs.",
         )
 
-        // Native BLS applies immediately — flips the process-global backend live.
-        SwitchRow(
-            label = "Native BLS acceleration",
-            checked = nativeBls,
-            onChange = { on -> nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
-        )
-        Text(
-            "On (default): use the bundled native blst library for sync-committee BLS " +
-                "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
-                "slower, but useful if the native library fails to load. Applies immediately.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        // Engine choice applies per network (re)start — running networks keep their engine.
-        // A host that cannot run the Java engine at all (Android below API 33) shows why
-        // instead of a toggle it would refuse to honour.
-        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
-        if (javaUnavailable != null) {
-            Text("Engine: Rust only")
-            Text(
-                javaUnavailable,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            SwitchRow(
-                label = "Prefer Java engine",
-                checked = preferJava,
-                onChange = { on ->
-                    preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
-                    onLogIndexChanged()
-                },
-            )
-            Text(
-                "Off (default): the Rust engine runs each network where it can serve, " +
-                    "falling back to the Java engine otherwise. The Rust engine is the " +
-                    "primary engine — the log index (Index tab) and Tor routing run on it " +
-                    "only. On: force the original Java engine everywhere, giving up those " +
-                    "features — currently the only way to use the Query tab's " +
-                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                    "network is (re)started, not to already-running networks. On hosts with " +
-                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
-                    "Sleep row shows it per network.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        if (expert) {
+            HorizontalDivider()
+            NodeTuning(controller, settings, tuning, onLogIndexChanged)
         }
-
-        // Tor routing — shown only on hosts that can actually route over Tor
-        // (controller.supportsTor; a privacy switch that flips ON while reads keep
-        // leaving from the real IP would be accepted-and-ignored). Where shown, the
-        // row is disabled while the Java engine is forced above.
-        if (controller.supportsTor) {
-            SwitchRow(
-                label = "Route reads over Tor (experimental)",
-                checked = torRouting && !preferJava,
-                enabled = !preferJava,
-                onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
-            )
-            Text(
-                if (preferJava) {
-                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
-                } else {
-                    "Off (default): reads use the peer pool directly from your IP. On: route " +
-                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
-                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
-                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
-                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
-                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
-                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
-                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
-                        "running Rust-engine network routes over Tor (no restart needed)."
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Text(
-            "An RPC-port change reboots that chain; the snap-peer target and served-block " +
-                "window apply live to every running chain, and the readiness threshold persists " +
-                "for the next check.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         Button(
             onClick = {
-                val snap = snapTarget.toIntOrNull() ?: 32
-                val window = servedWindow.toIntOrNull() ?: 32
-                val deep = deepPool.toIntOrNull() ?: 16
-                // Blank/invalid keeps the CURRENT value (0 would silently restore the
-                // default bound — a security knob must not change on a stray edit).
-                val ws = wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
-                settings.setSnapTarget(snap)          // persist
-                settings.setServedBlockWindow(window) // persist
-                settings.setDeepPool(deep)            // persist (read at readiness-check time)
-                settings.setWsBoundPeriods(ws)        // persist
+                // Save writes only what the current mode shows. `tuning` outlives an Expert
+                // flip-off (the tab stays composed), so an edit typed in Expert mode and never
+                // saved would otherwise be persisted — and live-applied — by a normal-mode
+                // Save with no field on screen showing it; for the weak-subjectivity bound
+                // that is a security knob widened invisibly.
+                if (expert) {
+                    val snap = tuning.snapTarget.toIntOrNull() ?: 32
+                    val window = tuning.servedWindow.toIntOrNull() ?: 32
+                    val deep = tuning.deepPool.toIntOrNull() ?: 16
+                    // Blank/invalid keeps the CURRENT value (0 would silently restore the
+                    // default bound — a security knob must not change on a stray edit).
+                    val ws = tuning.wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
+                    settings.setSnapTarget(snap)          // persist
+                    settings.setServedBlockWindow(window) // persist
+                    settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                    settings.setWsBoundPeriods(ws)        // persist
+                    controller.setTargetSnapPeers(snap)   // live-apply to running stacks
+                    controller.setServedBlockWindow(window) // live-apply to running stacks
+                    controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
+                }
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
                 // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
                 if (settings.supportsIdleSleep()) {
                     settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
                 }
-                controller.setTargetSnapPeers(snap)   // live-apply to running stacks
-                controller.setServedBlockWindow(window) // live-apply to running stacks
-                controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,
@@ -708,9 +655,171 @@ private fun SettingsTab(
     }
 }
 
+/**
+ * The Expert-mode tuning fields of [SettingsTab], seeded from [Settings] once per tab
+ * composition. The text fields are persisted by the Save button; the switches write
+ * through as they flip and are mirrored here for the UI.
+ */
+private class TuningFields(settings: Settings) {
+    var snapTarget by mutableStateOf(settings.snapTarget().toString())
+    var servedWindow by mutableStateOf(settings.servedBlockWindow().toString())
+    var deepPool by mutableStateOf(settings.deepPoolThreshold().toString())
+    var wsBound by mutableStateOf(settings.wsBoundPeriods().toString())
+    var strictFreshness by mutableStateOf(settings.strictStateFreshness())
+    var nativeBls by mutableStateOf(settings.nativeBlsEnabled())
+    var preferJava by mutableStateOf(settings.preferJavaEngine())
+    var torRouting by mutableStateOf(settings.torEnabled())
+}
+
+/**
+ * The Expert-mode "Node tuning" section of [SettingsTab]: the knobs that shape how the
+ * node syncs and serves, over the tab's [TuningFields].
+ */
+@Composable
+private fun NodeTuning(
+    controller: NodeController,
+    settings: Settings,
+    f: TuningFields,
+    onLogIndexChanged: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        SettingsSection("Node tuning")
+        OutlinedTextField(
+            value = f.snapTarget,
+            onValueChange = { f.snapTarget = it.filter(Char::isDigit).take(3) },
+            label = { Text("Snap-peer target (default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.servedWindow,
+            onValueChange = { f.servedWindow = it.filter(Char::isDigit).take(4) },
+            label = { Text("Served-block window (eth/69, default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.deepPool,
+            onValueChange = { f.deepPool = it.filter(Char::isDigit).take(3) },
+            label = { Text("Readiness \"deep pool\" threshold (default 16)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.wsBound,
+            onValueChange = { f.wsBound = it.filter(Char::isDigit).take(4) },
+            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
+            supportingText = {
+                Text(
+                    "How old the sync anchor may be before the node refuses to sync and " +
+                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
+                        "it weakens the long-range-attack protection — leave 0 unless you " +
+                        "know why.",
+                )
+            },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
+        // checked value is the negation. Persisted immediately; applies on the next node restart.
+        SwitchRow(
+            label = "Relaxed state freshness",
+            checked = !f.strictFreshness,
+            onChange = { relaxed -> f.strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
+        )
+        SettingsNote(
+            "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
+                "fast-fail when no fresh servable root exists, and the wallet retries. " +
+                "On (opt-in, experimental): serve a slightly older verified root — but if " +
+                "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
+                "instead of failing fast. Applies on the next node (re)start.",
+        )
+
+        // Native BLS applies immediately — flips the process-global backend live.
+        SwitchRow(
+            label = "Native BLS acceleration",
+            checked = f.nativeBls,
+            onChange = { on -> f.nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
+        )
+        SettingsNote(
+            "On (default): use the bundled native blst library for sync-committee BLS " +
+                "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
+                "slower, but useful if the native library fails to load. Applies immediately.",
+        )
+
+        // Engine choice applies per network (re)start — running networks keep their engine.
+        // A host that cannot run the Java engine at all (Android below API 33) shows why
+        // instead of a toggle it would refuse to honour.
+        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
+        if (javaUnavailable != null) {
+            Text("Engine: Rust only")
+            SettingsNote(
+                javaUnavailable,
+            )
+        } else {
+            SwitchRow(
+                label = "Prefer Java engine",
+                checked = f.preferJava,
+                onChange = { on ->
+                    f.preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
+                    onLogIndexChanged()
+                },
+            )
+            SettingsNote(
+                "Off (default): the Rust engine runs each network where it can serve, " +
+                    "falling back to the Java engine otherwise. The Rust engine is the " +
+                    "primary engine — the log index (Index tab) and Tor routing run on it " +
+                    "only. On: force the original Java engine everywhere, giving up those " +
+                    "features — currently the only way to use the Query tab's " +
+                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
+                    "network is (re)started, not to already-running networks. On hosts with " +
+                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
+                    "Sleep row shows it per network.",
+            )
+        }
+
+        // Tor routing — shown only on hosts that can actually route over Tor
+        // (controller.supportsTor; a privacy switch that flips ON while reads keep
+        // leaving from the real IP would be accepted-and-ignored). Where shown, the
+        // row is disabled while the Java engine is forced above.
+        if (controller.supportsTor) {
+            SwitchRow(
+                label = "Route reads over Tor (experimental)",
+                checked = f.torRouting && !f.preferJava,
+                enabled = !f.preferJava,
+                onChange = { on -> f.torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+            )
+            SettingsNote(
+                if (f.preferJava) {
+                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
+                } else {
+                    "Off (default): reads use the peer pool directly from your IP. On: route " +
+                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
+                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
+                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
+                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
+                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
+                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
+                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
+                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
+                        "running Rust-engine network routes over Tor (no restart needed)."
+                },
+            )
+        }
+        SettingsNote(
+            "Save applies the snap-peer target and served-block window live to every running " +
+                "chain; the readiness threshold persists for the next check.",
+        )
+    }
+}
+
 /** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
 @Composable
-private fun SwitchRow(
+internal fun SwitchRow(
     label: String,
     checked: Boolean,
     enabled: Boolean = true,

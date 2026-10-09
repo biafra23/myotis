@@ -96,6 +96,14 @@ interface NodeController {
     fun applyTorMode() {}
 
     /**
+     * Re-apply [Settings.allowAppNap] to the process after the Settings row flips it:
+     * on macOS the desktop host begins or ends the NSProcessInfo activity that keeps
+     * App Nap off (AppNap.kt). Live, like the BLS toggle. Default no-op for hosts
+     * without App Nap ([Settings.supportsAppNap] is false there, so the row never shows).
+     */
+    fun applyAppNap() {}
+
+    /**
      * Whether this host can actually route reads over Tor — the Settings row is
      * shown only when true (the [canImportLogIndex] precedent). Default false:
      * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
@@ -354,6 +362,28 @@ interface Settings {
      * battery-saving toggle there would imply a feature that can't take effect. Default false.
      */
     fun supportsIdleSleep(): Boolean = false
+
+    /**
+     * Expert mode: the Logs and Index tabs, the full Status rows and maintenance
+     * actions, and the advanced settings. Off by default — the normal screens are
+     * Status / Query / Settings. Deliberately NOT defaulted: every host persists it,
+     * because a switch that silently forgets its value on restart is the
+     * accepted-and-ignored failure this seam avoids elsewhere.
+     */
+    fun expertMode(): Boolean
+    fun setExpertMode(v: Boolean)
+
+    /**
+     * macOS App Nap opt-in (desktop only). false (default) = the process holds an
+     * NSProcessInfo activity so RPC never stalls while the window is hidden — today's
+     * behaviour; true = let macOS nap the app when it is not in focus. Defaults keep
+     * hosts without App Nap compiling; [NodeController.applyAppNap] pushes a change.
+     */
+    fun allowAppNap(): Boolean = false
+    fun setAllowAppNap(v: Boolean) {}
+
+    /** True only where [allowAppNap] can take effect (macOS desktop); the Power row shows only then. */
+    fun supportsAppNap(): Boolean = false
 }
 
 /** Device network connectivity, as an observable stream so the UI can react to changes. */

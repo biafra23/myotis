@@ -132,6 +132,7 @@ public final class NodeService extends Service {
     private static final String K_PREFER_JAVA = "engine.preferJava";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
+    private static final String K_EXPERT_MODE = "expertMode";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
@@ -537,6 +538,13 @@ public final class NodeService extends Service {
     }
     public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
+    }
+    /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
+    public static boolean expertMode(android.content.Context c) {
+        return prefs(c).getBoolean(K_EXPERT_MODE, false);
+    }
+    public static void setExpertMode(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_EXPERT_MODE, v).apply();
     }
     /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
      *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /

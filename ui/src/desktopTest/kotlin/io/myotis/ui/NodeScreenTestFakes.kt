@@ -1,5 +1,10 @@
 package io.myotis.ui
 
+import androidx.compose.ui.test.isToggleable
+import androidx.compose.ui.test.junit4.ComposeContentTestRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 
@@ -30,7 +35,10 @@ internal open class FakeController : NodeController {
         error("not used in UI tests")
 }
 
-internal class FakeSettings : Settings {
+/** [expert] = Expert mode on: the Logs/Index tabs, the full Status rows, the tuning knobs. */
+internal class FakeSettings(private var expert: Boolean = false) : Settings {
+    override fun expertMode(): Boolean = expert
+    override fun setExpertMode(v: Boolean) { expert = v }
     override fun enabledNetworks(): List<String> = listOf("mainnet")
     override fun primaryNetwork(): String = "mainnet"
     override fun allNetworks(): List<String> = listOf("mainnet")
@@ -51,4 +59,19 @@ internal class FakeSettings : Settings {
     override fun setStrictStateFreshness(v: Boolean) {}
     override fun nativeBlsEnabled(): Boolean = false
     override fun setNativeBlsEnabled(v: Boolean) {}
+}
+
+/**
+ * Click the switch sitting beside [label] (scrolling it into view first). Every
+ * switch in a tab is a semantics SIBLING of every label (the Rows aren't semantic
+ * boundaries), so the pairing goes by vertical overlap.
+ */
+internal fun ComposeContentTestRule.toggleSwitchBeside(label: String) {
+    val labelBounds = onNodeWithText(label).performScrollTo().fetchSemanticsNode().boundsInRoot
+    val switches = onAllNodes(isToggleable())
+    val beside = switches.fetchSemanticsNodes().indexOfFirst {
+        it.boundsInRoot.top < labelBounds.bottom && it.boundsInRoot.bottom > labelBounds.top
+    }
+    check(beside >= 0) { "no switch beside '$label'" }
+    switches[beside].performClick()
 }
