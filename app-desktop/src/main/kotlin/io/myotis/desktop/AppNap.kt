@@ -79,11 +79,19 @@ object AppNap {
         return try {
             val rt = ObjC()
             rt.sendVoid(rt.processInfo(), "endActivity:", token)
-            rt.sendVoid(token, "release") // balances the retain in disable()
+            // The activity is over from here, whatever the release below does: clear the
+            // bookkeeping first, so `active` can never claim protection the OS no longer
+            // gives and a later disable() begins a fresh activity (a leaked retain on a
+            // failed release is the lesser evil).
             activity = null
+            rt.sendVoid(token, "release") // balances the retain in disable()
             true
         } catch (t: Throwable) {
-            log.warn("App Nap could not be re-enabled — the no-nap activity stays held: {}", t.toString())
+            if (activity != null) {
+                log.warn("App Nap could not be re-enabled — the no-nap activity stays held: {}", t.toString())
+            } else {
+                log.warn("App Nap re-enabled, but the activity token could not be released: {}", t.toString())
+            }
             false
         }
     }
