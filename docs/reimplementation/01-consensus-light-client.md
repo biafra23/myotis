@@ -388,25 +388,30 @@ data path — gossip is inert (see below).**
 
 ### 10.1 Transport
 
-TCP (`/ip4/0.0.0.0/tcp/0`) with **Noise-XX** and the muxers **yamux then mplex**, and
-**QUIC** (`/ip4/0.0.0.0/udp/0/quic-v1`, the spec's primary transport — its own TLS 1.3
-handshake and multiplexing, so neither noise nor a muxer applies there); both listeners
-on ephemeral ports. **Random secp256k1 identity each start** (ephemeral PeerId). A peer
-discovered with an ENR `quic`/`quic6` field is dialed at TCP first and at its QUIC
-address only when the TCP dial itself fails — not the spec's order, because against
-Nimbus v26.9.1 (lsquic) a QUIC connection answered a handful of streams and then hung
-until Nimbus aborted it (`sync::Peer::dial_addrs`). No WebSocket / relay / DHT.
+TCP (`/ip4/0.0.0.0/tcp/0`) with **Noise-XX** and the muxers **yamux then mplex** — the
+Java reference (`BeaconP2PService`, jvm-libp2p) is TCP-only. The **Rust engine
+additionally** listens on **QUIC** (`/ip4/0.0.0.0/udp/0/quic-v1`, the spec's primary
+transport — its own TLS 1.3 handshake and multiplexing, so neither noise nor a muxer
+applies there), both listeners on ephemeral ports, and dials a peer discovered with an
+ENR `quic`/`quic6` field at TCP first and at its QUIC address only when the TCP dial
+itself fails — not the spec's order, because against Nimbus v26.9.1 (lsquic) a QUIC
+connection answered a handful of streams and then hung until Nimbus aborted it
+(`sync::Peer::dial_addrs`; the order governs which connection is opened, an existing
+connection on either transport carries requests). **Random secp256k1 identity each
+start** (ephemeral PeerId) on both engines. No WebSocket / relay / DHT.
 
 ### 10.2 Req/resp protocol IDs (all `…/ssz_snappy`)
 
 `status/2`, `status/1`, `ping/1`, `metadata/2`, `metadata/3`, `goodbye/1`, `light_client_bootstrap/1`,
 `light_client_updates_by_range/1`, `light_client_finality_update/1`,
-`light_client_optimistic_update/1`, `beacon_blocks_by_range/2`, and — answered inbound
-only, always with zero chunks — `beacon_blocks_by_root/2`, `data_column_sidecars_by_root/1`
-and `execution_payload_envelopes_by_root/1`.
+`light_client_optimistic_update/1`, and — answered inbound only, always with zero
+chunks — `beacon_blocks_by_root/2`, `data_column_sidecars_by_root/1` and
+`execution_payload_envelopes_by_root/1`; all of these on both engines.
+`beacon_blocks_by_range/2` is bound on the Java reference only (registered without a
+responder — it is never served, and the Rust engine does not bind it at all).
 
-The `light_client_*` and `blocks_by_range` responses carry a 4-byte **fork_digest context byte**;
-`status`/`ping`/`metadata`/`goodbye` do not.
+The `light_client_*`, `blocks_by_range` and the three by-root responses carry a 4-byte
+**fork_digest context byte**; `status`/`ping`/`metadata`/`goodbye` do not.
 
 ### 10.3 Wire framing (`ReqRespCodec`)
 
