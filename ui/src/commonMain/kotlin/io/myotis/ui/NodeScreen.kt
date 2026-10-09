@@ -20,10 +20,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -70,6 +73,7 @@ import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
@@ -267,7 +271,7 @@ fun NodeScreen(
                         // The card's "Review" re-asks a dismissed stale-anchor question.
                         onReviewStaleAnchor = { staleDismissed = staleDismissed - network },
                     )
-                    "Query" -> QueryTab(controller, settings, current, network, history)
+                    "Query" -> QueryTab(controller, settings, current, network, history, expert)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
@@ -1331,6 +1335,8 @@ private fun QueryTab(
     snap: NodeSnapshot?,
     network: String,
     history: QueryHistory,
+    // Expert mode opens the result card's raw rows by default.
+    expert: Boolean = false,
 ) {
     val scope = rememberCoroutineScope()
     val running = snap?.running == true
@@ -1474,6 +1480,9 @@ private fun QueryTab(
             label = { Text(if (ensCapable) "Address (0x…) or ENS name" else "Address (0x…)") },
             singleLine = true,
             enabled = !loading,
+            // The keyboard's search key runs the lookup, like the button below.
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { if (running) run(input) }),
             modifier = Modifier.fillMaxWidth(),
         )
         if (!ensCapable) {
@@ -1504,7 +1513,7 @@ private fun QueryTab(
                 Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
-            account != null -> AccountResultView(account!!)
+            account != null -> AccountResultView(account!!, expert)
         }
 
         // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
@@ -1784,46 +1793,130 @@ private fun looksLikeEnsName(input: String): Boolean {
     return !s.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 }
 
+/**
+ * A verified account, balance first: the address, the ETH balance (or that there is
+ * no account yet), a verification badge, the two numbers a wallet user looks for, and
+ * the raw rows behind "Show raw details" — open from the start under [expert].
+ */
 @Composable
-private fun AccountResultView(a: AccountResult) {
+private fun AccountResultView(a: AccountResult, expert: Boolean) {
     val clipboard = LocalClipboardManager.current
+    var showRaw by remember(expert) { mutableStateOf(expert) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    a.address,
+                    Modifier.weight(1f),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.width(8.dp))
+                // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a))) }) {
+                    Text("Copy")
+                }
+            }
+            // The numbers below are a peer's claim until the beacon chain vouches for them:
+            // an unverified result leads with the red pill and shows the balance muted, so
+            // the headline figure never looks more authoritative than it is.
+            val verified = a.beaconChainVerified
+            if (!verified) VerificationBadge(a)
+            if (a.exists) {
+                Column {
+                    // The verified caption is kept verbatim: the iOS UI helpers wait for it.
+                    Text(
+                        if (verified) "Balance (ETH)" else "Balance (ETH) — unverified peer claim",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        formatEth(a.balanceWei),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                // Non-existence is a claim too — a peer hiding a balance would make exactly this one.
+                Text(
+                    if (verified) "No account at this address yet"
+                    else "No account at this address yet — unverified peer claim",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (verified) "Nothing has been sent to it on this chain, so there is no balance to show."
+                    else "A peer reports nothing has been sent to it; the node could not verify that yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (verified) VerificationBadge(a)
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                // The nonce, in a wallet user's words — a contract's counts its creations.
+                // Muted with the balance while the result is a claim.
+                if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString(), muted = !verified)
+                ResultStat("Block", a.blockNumber.toString(), muted = !verified)
+            }
+            TextButton(onClick = { showRaw = !showRaw }) {
+                Text(if (showRaw) "Hide raw details" else "Show raw details")
+            }
+            if (showRaw) {
+                StatusRow("Address", a.address)
+                StatusRow("Exists", a.exists.toString())
+                if (a.exists) {
+                    StatusRow("Balance (wei)", a.balanceWei ?: "—")
+                    StatusRow("Nonce", a.nonce.toString())
+                    StatusRow("Storage root", a.storageRootHex ?: "—")
+                    StatusRow("Code hash", a.codeHashHex ?: "—")
+                }
+                StatusRow("Block", a.blockNumber.toString())
+                StatusRow("Proof valid", a.peerProofValid.toString())
+                // The verification verdict is the pill above; the raw rows don't repeat it.
+            }
+        }
+    }
+}
+
+/** A small labelled number on the result card; [muted] while the result is only a peer's claim. */
+@Composable
+private fun ResultStat(label: String, value: String, muted: Boolean) {
     Column {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Result", style = MaterialTheme.typography.titleSmall)
-            // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
-            OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a))) }) {
-                Text("Copy")
-            }
-        }
-        StatusRow("Address", a.address)
-        StatusRow("Exists", a.exists.toString())
-        if (a.exists) {
-            StatusRow("Balance (ETH)", formatEth(a.balanceWei))
-            StatusRow("Balance (wei)", a.balanceWei ?: "—")
-            StatusRow("Nonce", a.nonce.toString())
-            StatusRow("Storage root", a.storageRootHex ?: "—")
-            StatusRow("Code hash", a.codeHashHex ?: "—")
-        }
-        StatusRow("Block", a.blockNumber.toString())
-        StatusRow("Proof valid", a.peerProofValid.toString())
-        val badge = if (a.beaconChainVerified) {
-            buildString {
-                append("✓ ")
-                append(a.verifyMethod ?: "verified")
-                if (a.blsVerified) append(" (BLS)")
-            }
-        } else {
-            "✗ ${a.failReason ?: "unverified"}"
-        }
-        StatusRow(
-            "Verification",
-            badge,
-            color = if (a.beaconChainVerified) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.error,
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            value,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (muted) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
+        )
+    }
+}
+
+/**
+ * The result's verification as a pill: green "Verified" with the method (and BLS when
+ * the match was signed), red "Unverified" with the ladder's fail reason. Nothing here
+ * is served unverified — a red pill leads the card and says a peer's claim could not be
+ * tied to the beacon chain, and the muted numbers below it are that claim.
+ */
+@Composable
+private fun VerificationBadge(a: AccountResult) {
+    val ok = a.beaconChainVerified
+    val color = if (ok) StatusColors.Green else StatusColors.Red
+    val text = if (ok) {
+        "✓ Verified" + (a.verifyMethod?.let { " · $it" } ?: "") + (if (a.blsVerified) " · BLS" else "")
+    } else {
+        "✗ Unverified · ${a.failReason ?: "unknown"}"
+    }
+    Surface(shape = RoundedCornerShape(50), color = color.copy(alpha = 0.15f)) {
+        Text(
+            text,
+            Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = color,
         )
     }
 }
