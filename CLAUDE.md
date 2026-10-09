@@ -162,8 +162,18 @@ step skipped and none treated as optional or "only if asked"**:
    below: English, the session link as the last line.) Its base is `main` for a
    single-PR work item, and the feature branch for a part of a multi-PR plan
    (next section).
-4. **Wait for review comments** — subscribe to the PR and wait for CI + review
-   feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
+4. **Wait for review comments** — and make sure they REACH you. In the desktop
+   app, immediately after `gh pr create` returns, switch the app's PR monitor
+   on for that PR: `mcp__ccd_pr__set_monitor` with the PR's URL, `auto_fix:
+   true`, `address_comments: true`. It is PER PR and OFF by default — the app
+   has no global switch — so a PR opened without this call never wakes the
+   session for its review comments or CI failures, and the owner ends up
+   typing "please address the comment" for each one (owner ruling,
+   2026-10-09, after a day of exactly that; a memory note had not made it
+   stick, which is why it is here, in the step every PR goes through).
+   Elsewhere, use whatever the host offers to watch a PR
+   (`subscribe_pr_activity`). Then wait for CI + review feedback; do not
+   consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
@@ -254,9 +264,19 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    never by rebase or force-push (open part PRs are based on it), whenever
    `main` moves in a way the feature has to absorb. A merge that went through
    **cleanly** may be pushed straight to the feature branch: it adds nothing
-   `main` doesn't already carry, and it is the ONLY direct push this rule allows.
-   A merge that needed **conflict resolution** goes through a PR into the
-   feature branch like a part, because the resolution is new code — and, like
+   `main` doesn't already carry. "Cleanly" means more than "no conflict
+   markers": a textually clean merge of two changes to the same file can still
+   fail to compile (#587: `main` gave a constructor a fourth argument, the
+   feature's test helper still passed three), so build the merged tree and run
+   the affected tests locally BEFORE pushing it. This is the only direct push
+   THIS STEP allows, and the restriction is on how `main` reaches the feature
+   branch — a merge, never a rebase or force-push; a resolution reviewed — not
+   on the feature branch in general: the final PR's review fixes are pushed
+   straight to it (step 5).
+   A merge that needed **conflict resolution** — or that compiles or passes
+   its affected tests only with a change, which is the same thing — goes
+   through a PR into the feature
+   branch like a part, because the resolution is new code — and, like
    a part, it gets no artifact build (the exception below): a resolution in
    `rust/` or a host module is cross-compiled only at the final PR unless the
    merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
@@ -271,10 +291,18 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
    above — internal review of the whole combined diff, CI, reviewer comments,
    "ready to merge" — and the merge into `main` is the owner's. Its description
-   links every part PR. Its review is the real gate, not a formality over parts
-   already reviewed: `claude-review` reads its prompt and `CLAUDE.md` from the
-   PR's base, so part PRs were reviewed under the feature branch's copies, and
-   this is the one PR held to `main`'s (see the header of `claude-review.yml`).
+   links every part PR. **Its review comments are fixed on `feature/<topic>`
+   itself** (step 4's exception for a bug in code `main` also carries aside):
+   commit on the feature branch, push, answer each thread with the
+   commit — exactly as on any PR's own branch — and NEVER through another part
+   PR (owner ruling, 2026-10-09: #590 did that for #588's review and only added
+   a merge-ordering trap, the final PR being mergeable without its own fixes).
+   The final PR's review and CI cover what lands on the branch; the clean-merge
+   sentence in step 4 does not forbid this push. Its review is the real gate,
+   not a formality over parts already reviewed: `claude-review` reads its
+   prompt and `CLAUDE.md` from the PR's base, so part PRs were reviewed under
+   the feature branch's copies, and this is the one PR held to `main`'s (see
+   the header of `claude-review.yml`).
 
 A **single-PR** fix or plan still targets `main` directly; none of the above
 applies. If a single-PR task grows a second PR before its first has merged,
@@ -582,6 +610,13 @@ that produced this note.
   `gh api repos/<owner>/<repo>/pulls/<n>/comments --jq '.[].id'`. For bodies
   containing backticks or quotes, prefer `--raw-field body="$(cat <<'EOF' … EOF)"`
   over `-f`.
+- **Fix review comments on the PR's own branch**, whatever that branch is: a
+  single-PR branch, a part branch, or `feature/<topic>` itself for the final
+  PR of a multi-PR plan. A separate PR for fixes to the PR's own diff is never
+  the answer (owner ruling, 2026-10-09, after #590) — it delays the PR under
+  review and lets it merge without its fixes. (A comment that finds a bug in
+  code `main` also carries is the one exception, and it is step 4 of the
+  multi-PR rule above: that fix is its own single PR into `main`.)
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
   either pushing a fix or stating the blocker explicitly.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
