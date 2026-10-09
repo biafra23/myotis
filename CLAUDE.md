@@ -263,8 +263,9 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    branch — a merge, never a rebase or force-push; a resolution reviewed — not
    on the feature branch in general: the final PR's review fixes are pushed
    straight to it (step 5).
-   A merge that needed **conflict resolution** — or that compiles only with a
-   change, which is the same thing — goes through a PR into the feature
+   A merge that needed **conflict resolution** — or that compiles or passes
+   its affected tests only with a change, which is the same thing — goes
+   through a PR into the feature
    branch like a part, because the resolution is new code — and, like
    a part, it gets no artifact build (the exception below): a resolution in
    `rust/` or a host module is cross-compiled only at the final PR unless the
@@ -281,16 +282,17 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    above — internal review of the whole combined diff, CI, reviewer comments,
    "ready to merge" — and the merge into `main` is the owner's. Its description
    links every part PR. **Its review comments are fixed on `feature/<topic>`
-   itself**: commit on the feature branch, push, answer each thread with the
+   itself** (step 4's exception for a bug in code `main` also carries aside):
+   commit on the feature branch, push, answer each thread with the
    commit — exactly as on any PR's own branch — and NEVER through another part
    PR (owner ruling, 2026-10-09: #590 did that for #588's review and only added
    a merge-ordering trap, the final PR being mergeable without its own fixes).
    The final PR's review and CI cover what lands on the branch; the clean-merge
    sentence in step 4 does not forbid this push. Its review is the real gate,
-   not a formality over parts
-   already reviewed: `claude-review` reads its prompt and `CLAUDE.md` from the
-   PR's base, so part PRs were reviewed under the feature branch's copies, and
-   this is the one PR held to `main`'s (see the header of `claude-review.yml`).
+   not a formality over parts already reviewed: `claude-review` reads its
+   prompt and `CLAUDE.md` from the PR's base, so part PRs were reviewed under
+   the feature branch's copies, and this is the one PR held to `main`'s (see
+   the header of `claude-review.yml`).
 
 A **single-PR** fix or plan still targets `main` directly; none of the above
 applies. If a single-PR task grows a second PR before its first has merged,
@@ -603,8 +605,8 @@ that produced this note.
   PR of a multi-PR plan. A separate PR for fixes to the PR's own diff is never
   the answer (owner ruling, 2026-10-09, after #590) — it delays the PR under
   review and lets it merge without its fixes. (A comment that finds a bug in
-  code `main` also carries is the one exception, and it is step 4's: that fix
-  is its own single PR into `main`.)
+  code `main` also carries is the one exception, and it is step 4 of the
+  multi-PR rule above: that fix is its own single PR into `main`.)
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
   either pushing a fix or stating the blocker explicitly.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
