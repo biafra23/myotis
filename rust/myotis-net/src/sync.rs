@@ -643,6 +643,23 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // by-root answers down, so one connection lasts minutes, not hours, with
     // updates flowing between reconnects. SECOND on purpose: roost serves
     // without either caveat.
+    //
+    // Release check for v0.1.15 (2026-10-09), anchor period 1381. The first
+    // refresh, slot 11318880, was served by neither pin: roost answered
+    // ResourceUnavailable after both retries and this Nimbus "LC bootstrap
+    // unavailable", while its Status showed it at head and finalized past
+    // that epoch (run 37955468942, second attempt; cause unconfirmed). The
+    // next finalized checkpoint, slot 11319040, is what ships. Its run
+    // 37959717559: first attempt 1 of 2 (roost's transport handshake timed
+    // out, as zbox pins did on and off that afternoon), second attempt 2 of 2,
+    // bootstrap and the period-1381 update verified from both, and the
+    // bootnodes seeded discv5 (23 entries). The cold start with every pin
+    // unreachable found this Nimbus through discovery at its relay address,
+    // bootstrapped from it in under two minutes and applied advancing finality
+    // from it and roost, but stayed CATCHING_UP for its 900 s budget: since
+    // Gloas, SYNCED also waits for the finalized execution header
+    // (`feed_exec_anchor`), which only the EL peer pool resolves, and
+    // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
@@ -883,10 +900,11 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // exactly the floor. 84.112.35.112 and 54.201.148.177 served;
     // 57.129.130.18 closed the connection from the runner again (its second
     // close in a row) and so did 91.189.182.90; roost (9109) timed out in the
-    // transport handshake. Every zbox pin did the same in its network's run
-    // that day (Sepolia's two also from a residential address), while the
-    // relay accepted TCP and answered multistream: a slow path to zbox
-    // behind the relay, not a dead server and not this list.
+    // transport handshake. Every zbox pin failed the same way in the first
+    // run of each network that afternoon (Sepolia's two also from a
+    // residential address) while the relay accepted TCP and answered
+    // multistream, and later runs reached them: a slow path to zbox behind
+    // the relay, not a dead server and not this list.
     // The bootnodes seeded discv5 (34 entries), a cold start with every pin
     // unreachable reached SYNCED in 30 s, and one from the recorded
     // period-1825 anchor (54 periods behind) in 15 s.

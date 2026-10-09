@@ -399,6 +399,12 @@ public record NetworkConfig(
             // churn; and its peer loop scores our empty by-root answers down, so
             // one connection lasts minutes, with updates flowing between
             // reconnects. roost stays first: it serves without either caveat.
+            // Release check for v0.1.15 (2026-10-09): the first refresh (slot
+            // 11318880) was served by neither pin; slot 11319040 ships, and run
+            // 37959717559 found both serving it (2 of 2 on its second attempt).
+            // Its dead-pins cold start bootstrapped through discovery but could
+            // not report SYNCED without an EL resolver for the Gloas execution
+            // header. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
