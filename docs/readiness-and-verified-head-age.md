@@ -43,7 +43,7 @@ when all three of these hold:
    on `snapServingPeers`: right after SYNCED a cold pool can be full of peers
    that are still syncing themselves, which keep `snapPeers` positive for hours
    while every read fails with `peer returned 0 headers` (#465). The UI shows
-   both on the EL peers line ("snap N · serving M").
+   both on the EL group's Peers line ("snap N · serving M").
 
 3. **A verified head context has been built** — the node has recently anchored a
    peer-reported head block to the beacon-finalized block via a contiguous,
