@@ -284,3 +284,12 @@ complete on its own.
   `nimbus_light_client` included, whose Status is the genesis head. Every
   further overseer step that asks for data a light client cannot hold would
   need another responder here until that is fixed upstream.
+  **Follow-ups from the final PR's review (2026-10-09):** the
+  `custody_group_count` both engines advertise in `metadata/3` is a
+  per-network parameter (`CUSTODY_REQUIREMENT`) hardcoded as 4
+  (`status::CUSTODY_GROUP_COUNT`, `MetadataMessage.CUSTODY_GROUP_COUNT`); it
+  belongs in the network configs with a parity test before any network with
+  a different value is added, since Lighthouse bans a peer below its own
+  requirement. And the Java engine's `metadata/3` and zero-chunk responders
+  have not been run against a live Nimbus — only the Rust engine's have; one
+  `-Pengine=java` run pinned to zbox's Nimbus is owed.

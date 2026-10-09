@@ -98,13 +98,12 @@ const MAX_REQUEST_WIRE_BYTES: usize = 1024;
 /// root plus up to 128 column indices ≈ 140 KiB for the sidecar one, before
 /// framing. The answer is always empty, but a request we refuse to READ is a
 /// broken stream to the asker, which is exactly the failure these protocols
-/// are served to avoid.
+/// are served to avoid. So the list is DRAINED up to this cap, never
+/// buffered (`read_request`): a stream costs nothing while it is read, and
+/// the per-connection stream cap stays at the default — libp2p DROPS an
+/// inbound stream beyond that cap ("at capacity"), which to the asker is the
+/// broken stream again.
 const MAX_ROOT_LIST_REQUEST_WIRE_BYTES: usize = 256 * 1024;
-/// Concurrent inbound streams per connection for the root-list protocols. The
-/// cap above is buffered per stream, so the default 64 would let one
-/// connection park 16 MiB per protocol in requests this host never reads; an
-/// answer of zero chunks needs no concurrency at all.
-const ROOT_LIST_MAX_STREAMS: usize = 4;
 /// A full 128-update batch is ~3.5 MiB on the wire (~128 x ~60 KB SSZ
 /// uncompressed). 16 MiB is a generous DoS ceiling, not a target.
 const MAX_RESPONSE_WIRE_BYTES: usize = 16 * 1024 * 1024;
@@ -137,6 +136,19 @@ where
         return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
     }
     Ok(buf)
+}
+
+/// Read to EOF and throw the bytes away, failing past `cap` exactly like
+/// [`read_capped`] — for a request whose answer never depends on its body.
+async fn drain_capped<T>(io: &mut T, cap: usize) -> io::Result<()>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let n = futures::io::copy(io.take(cap as u64 + 1), &mut futures::io::sink()).await?;
+    if n > cap as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "stream exceeds size cap"));
+    }
+    Ok(())
 }
 
 /// Read to EOF, but once at least one byte is buffered treat `quiet` of
@@ -216,12 +228,13 @@ impl request_response::Codec for Eth2Codec {
         T: AsyncRead + Unpin + Send,
     {
         // The requester half-closes after writing, so EOF delimits the request.
-        let cap = if protocols::is_root_list_request(p.as_ref()) {
-            MAX_ROOT_LIST_REQUEST_WIRE_BYTES
-        } else {
-            MAX_REQUEST_WIRE_BYTES
-        };
-        read_capped(io, cap).await
+        if protocols::is_root_list_request(p.as_ref()) {
+            // Never read by the responder (`respond_inbound` answers zero
+            // chunks whatever the list says), so drained, not buffered.
+            drain_capped(io, MAX_ROOT_LIST_REQUEST_WIRE_BYTES).await?;
+            return Ok(Vec::new());
+        }
+        read_capped(io, MAX_REQUEST_WIRE_BYTES).await
     }
 
     async fn read_response<T>(&mut self, p: &Eth2Protocol, io: &mut T) -> io::Result<Vec<u8>>
@@ -387,23 +400,18 @@ impl Behaviour {
             finality: rr(protocols::FINALITY_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             optimistic: rr(protocols::OPTIMISTIC_UPDATE, ProtocolSupport::Full, RESP_TIMEOUT),
             // Inbound only: this host never asks anyone for blocks or columns.
-            blocks_by_root: rr_with_streams(
-                protocols::BLOCKS_BY_ROOT,
-                ProtocolSupport::Inbound,
-                RESP_TIMEOUT,
-                ROOT_LIST_MAX_STREAMS,
-            ),
-            data_column_sidecars_by_root: rr_with_streams(
+            // The request is drained, not buffered (`read_request`), so the
+            // default stream cap costs nothing and refuses nobody.
+            blocks_by_root: rr(protocols::BLOCKS_BY_ROOT, ProtocolSupport::Inbound, RESP_TIMEOUT),
+            data_column_sidecars_by_root: rr(
                 protocols::DATA_COLUMN_SIDECARS_BY_ROOT,
                 ProtocolSupport::Inbound,
                 RESP_TIMEOUT,
-                ROOT_LIST_MAX_STREAMS,
             ),
-            execution_payload_envelopes_by_root: rr_with_streams(
+            execution_payload_envelopes_by_root: rr(
                 protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT,
                 ProtocolSupport::Inbound,
                 RESP_TIMEOUT,
-                ROOT_LIST_MAX_STREAMS,
             ),
         }
     }
@@ -2360,12 +2368,6 @@ mod dial_resolution_tests {
             .expect("a stream from a QUIC-only peer");
     }
 
-    /// What Nimbus does right after admitting a peer post-Fulu — its sync
-    /// overseer asks for `metadata/3` and nothing else, and drops the peer
-    /// if that fails ("Peer loop stopped", seen live against zbox's Nimbus
-    /// v26.9.1 with only mplex fixed: admitted, then dropped ~100 ms later,
-    /// before the bootstrap request was served). The host must answer with
-    /// the 25-byte Fulu MetaData: the v2 bytes plus `custody_group_count`.
     /// The host as the production code runs it (`build_swarm`) plus the
     /// context its event loop needs, so a test can drive `handle_swarm_event`
     /// — responder included — against a real peer.
@@ -2387,10 +2389,24 @@ mod dial_resolution_tests {
         (host, ctx)
     }
 
-    #[tokio::test]
-    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
+    /// One `protocol` request to the host from an mplex-only asker — the way
+    /// Nimbus asks — answered by the host's REAL event handling (responder
+    /// included). Returns the raw answer: the response wire bytes, empty for
+    /// zero chunks. Panics when the request fails, the connection closes
+    /// first, or nothing arrives within 15 s.
+    async fn ask_host_over_mplex(protocol: &'static str, request: Vec<u8>) -> Vec<u8> {
         let (mut host, mut ctx) = host_with_ctx();
-        let mut peer = mplex_only_peer();
+        let mut asker = libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p_mplex::Config::default,
+            )
+            .expect("mplex-only asker")
+            .with_behaviour(|_: &libp2p::identity::Keypair| rr(protocol, ProtocolSupport::Full, RESP_TIMEOUT))
+            .expect("behaviour")
+            .build();
         host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = host.select_next_some().await {
@@ -2398,39 +2414,47 @@ mod dial_resolution_tests {
             }
         };
         let host_id = *host.local_peer_id();
-        peer.dial(addr).unwrap();
+        asker.dial(addr).unwrap();
         let mut asked = false;
         let deadline = tokio::time::sleep(Duration::from_secs(15));
         tokio::pin!(deadline);
         loop {
             tokio::select! {
-                // The host runs its real event handling, responder included.
                 ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
-                ev = peer.select_next_some() => match ev {
+                ev = asker.select_next_some() => match ev {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
-                        peer.behaviour_mut().metadata_v3.send_request(&host_id, Vec::new());
+                        asker.behaviour_mut().send_request(&host_id, request.clone());
                         asked = true;
                     }
-                    SwarmEvent::Behaviour(BehaviourEvent::MetadataV3(request_response::Event::Message {
+                    SwarmEvent::Behaviour(request_response::Event::Message {
                         message: request_response::Message::Response { response, .. }, ..
-                    })) => {
-                        let decoded = codec::decode_response(&response, false).expect("a well-formed answer");
-                        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
-                        assert_eq!(decoded.ssz_payload, status::metadata_v3_light_client());
-                        assert_eq!(decoded.ssz_payload.len(), 25);
-                        return;
+                    }) => return response,
+                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
+                        panic!("{protocol} request failed: {error}")
                     }
-                    SwarmEvent::Behaviour(BehaviourEvent::MetadataV3(request_response::Event::OutboundFailure {
-                        error, ..
-                    })) => panic!("metadata/3 request failed: {error}"),
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
-                        panic!("connection closed before metadata/3 was answered: {cause:?}")
+                        panic!("{protocol}: connection closed before it was answered: {cause:?}")
                     }
                     _ => {}
                 },
-                _ = &mut deadline => panic!("no metadata/3 answer within 15 s"),
+                _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
             }
         }
+    }
+
+    /// What Nimbus does right after admitting a peer post-Fulu — its sync
+    /// overseer asks for `metadata/3` and nothing else, and drops the peer
+    /// if that fails ("Peer loop stopped", seen live against zbox's Nimbus
+    /// v26.9.1 with only mplex fixed: admitted, then dropped ~100 ms later,
+    /// before the bootstrap request was served). The host must answer with
+    /// the 25-byte Fulu MetaData: the v2 bytes plus `custody_group_count`.
+    #[tokio::test]
+    async fn a_nimbus_like_peer_gets_fulu_metadata_from_the_host() {
+        let response = ask_host_over_mplex(protocols::METADATA_V3, Vec::new()).await;
+        let decoded = codec::decode_response(&response, false).expect("a well-formed answer");
+        assert_eq!(decoded.result_code, codec::RESULT_SUCCESS);
+        assert_eq!(decoded.ssz_payload, status::metadata_v3_light_client());
+        assert_eq!(decoded.ssz_payload.len(), 25);
     }
 
     /// Nimbus's root sync, as a stand-alone asker over mplex: right after
@@ -2476,54 +2500,8 @@ mod dial_resolution_tests {
     }
 
     async fn zero_chunks_for(protocol: &'static str, request: Vec<u8>) {
-        let (mut host, mut ctx) = host_with_ctx();
-        let mut asker = libp2p::SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
-                libp2p_mplex::Config::default,
-            )
-            .expect("mplex-only asker")
-            .with_behaviour(|_: &libp2p::identity::Keypair| rr(protocol, ProtocolSupport::Full, RESP_TIMEOUT))
-            .expect("behaviour")
-            .build();
-        host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-        let addr = loop {
-            if let SwarmEvent::NewListenAddr { address, .. } = host.select_next_some().await {
-                break address;
-            }
-        };
-        let host_id = *host.local_peer_id();
-        asker.dial(addr).unwrap();
-        let mut asked = false;
-        let deadline = tokio::time::sleep(Duration::from_secs(15));
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                ev = host.select_next_some() => handle_swarm_event(&mut host, &mut ctx, ev),
-                ev = asker.select_next_some() => match ev {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == host_id && !asked => {
-                        asker.behaviour_mut().send_request(&host_id, request.clone());
-                        asked = true;
-                    }
-                    SwarmEvent::Behaviour(request_response::Event::Message {
-                        message: request_response::Message::Response { response, .. }, ..
-                    }) => {
-                        assert!(response.is_empty(), "{protocol}: expected zero chunks, got {} bytes", response.len());
-                        return;
-                    }
-                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
-                        panic!("{protocol} request failed: {error}")
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == host_id => {
-                        panic!("{protocol}: connection closed before it was answered: {cause:?}")
-                    }
-                    _ => {}
-                },
-                _ = &mut deadline => panic!("{protocol}: no answer within 15 s"),
-            }
-        }
+        let response = ask_host_over_mplex(protocol, request).await;
+        assert!(response.is_empty(), "{protocol}: expected zero chunks, got {} bytes", response.len());
     }
 
     /// The address order end to end, through the real client and its swarm
@@ -2558,9 +2536,11 @@ mod dial_resolution_tests {
         };
         let wire = codec::encode_request(&status.encode());
         let client = start_host(LocalStatus::new(status)).expect("the wallet host");
-        // Nothing listens on port 1 (binding it takes root), so this dial is
-        // refused at once — the shape of a TCP port a firewall closed.
-        let dead: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        // A port nothing listens on — bound and released just now — so this
+        // dial is refused at once: the shape of a TCP port a firewall closed.
+        // (Port 1 would do on most hosts, but not on one where tcpmux answers.)
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dead: Multiaddr = format!("/ip4/127.0.0.1/tcp/{dead_port}").parse().unwrap();
         let answer = client
             .request_raw_at(peer_id, vec![dead, quic], protocols::STATUS_V2, wire)
             .await

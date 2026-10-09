@@ -2078,12 +2078,14 @@ public class BeaconP2PService implements AutoCloseable {
     static class ResponderController {
 
         /**
-         * Most a peer may write on one inbound stream before we close it. The
-         * largest well-formed request is a root list — up to 1024 block roots
-         * (32 KiB) or 128 column identifiers (~140 KiB) before snappy framing;
-         * the same 256 KiB the Rust engine caps the root-list protocols at.
+         * Most a peer may write on one inbound stream before we close it — the
+         * Rust engine's {@code MAX_REQUEST_WIRE_BYTES}. Only a binding that
+         * parses a body buffers at all, and the largest of those is a 92-byte
+         * Status; a size-0 binding answers at {@code channelActive} and drops
+         * whatever follows, so a root list (legitimately up to ~140 KiB) never
+         * touches {@code incoming}.
          */
-        static final int MAX_INBOUND_REQUEST_BYTES = 256 * 1024;
+        static final int MAX_INBOUND_REQUEST_BYTES = 1024;
 
         private final io.libp2p.core.Stream stream;
         private final ReqRespHandler handler;
