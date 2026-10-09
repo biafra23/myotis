@@ -39,6 +39,9 @@ on:
       - '.github/workflows/ios-framework.yml'
   pull_request:
     paths: *fw_paths
+  # On demand for a branch the PR job skips (a part PR into a feature branch —
+  # see the review-gate job below).
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -52,6 +55,16 @@ jobs:
   # an `if:`.
   review-gate:
     name: Review gate
+    # Skipped on a PR whose base is not main (owner ruling, 2026-10-09): a part
+    # PR of a multi-PR plan targets its feature branch, and a macOS runner leg
+    # per part costs more than it tells; the final feature → main PR builds
+    # it. Everything below needs this job, so the build is skipped with it (a
+    # dependent job is skipped when a needed job was, unless its `if` uses
+    # always()); the release jobs only run on tags. A part that touches the
+    # engine's C ABI or the iOS triples can run this on demand from the
+    # Actions tab (workflow_dispatch) — this is the ONLY check that compiles
+    # :app-ios, see the header.
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     uses: ./.github/workflows/wait-for-claude-review.yml
     permissions:
       actions: read

@@ -258,7 +258,16 @@ Releases are unaffected: the release PR is a single PR against `main`, and
 whatever is still on a feature branch is simply not in that release. This rests
 on the PR workflows' `pull_request` triggers being unscoped (any base branch —
 see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
-gives part PRs full CI and the Claude review; do not narrow them to `main`.
+gives part PRs the tests, clippy, the lockfile check and the Claude review; do
+not narrow them to `main`. **The artifact builds are the exception** (owner
+ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
+iOS framework skip a PR whose base is not `main` (a job-level `if` in those
+workflows — the checks show as skipped, not absent), because a packaging leg
+per part costs more than it tells; the final `feature/<topic>` → `main` PR
+builds everything, and a part that touches what those legs alone check (the
+Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
+budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
+the workflow on its branch from the Actions tab.
 
 ## Releases — ask before cutting one
 
@@ -559,7 +568,10 @@ that produced this note.
   don't import the `:core` helpers — they inline the few lines instead (hosts
   talk only to `:myotis-api`). The ENFORCEMENT is
   `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
-  built APK's dex — the post-desugaring ground truth. It also resolves calls
+  built APK's dex — the post-desugaring ground truth — on pushes to `main`, on
+  PRs into `main` and on dispatch; a part PR into a feature branch does not
+  build the APK (see the multi-PR section), so for a feature plan this check
+  first runs at the final PR unless a part dispatches the workflow. It also resolves calls
   that reach a JDK method through a third-party subclass, which lint-style
   source checks and a naive api-versions.xml lookup both miss (that is exactly
   how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus

@@ -7,9 +7,16 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-  # pull_request stays unscoped (any base branch) — the double-run is already
-  # killed by narrowing push above, and this keeps CI on PRs that don't target main.
+  # pull_request stays unscoped (any base branch) so every PR shows this
+  # workflow's checks — but the JOBS below skip a PR whose base is not main
+  # (owner ruling, 2026-10-09): a part PR of a multi-PR plan targets its
+  # feature branch, and a macOS runner leg per part costs more than it tells;
+  # the final feature → main PR builds everything. Tests, clippy, the
+  # lockfile check and the Claude review stay on every PR (ci.yml and
+  # siblings). A part that needs a dmg can run this on demand from the
+  # Actions tab (workflow_dispatch).
   pull_request:
+  workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR (each of
 # the two arch jobs is cancelled/restarted together).
@@ -25,6 +32,10 @@ jobs:
   # an `if:`.
   review-gate:
     name: Review gate
+    # Everything below needs this job, so skipping it here skips the build legs
+    # too (a dependent job is skipped when a needed job was, unless its `if`
+    # uses always()). The release jobs only run on tags.
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     uses: ./.github/workflows/wait-for-claude-review.yml
     permissions:
       actions: read
