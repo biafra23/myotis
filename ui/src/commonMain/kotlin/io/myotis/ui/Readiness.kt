@@ -102,8 +102,10 @@ internal fun readinessOf(
     s.beaconState == "STALE_ANCHOR" -> Readiness(
         ReadinessLevel.NEEDS_DECISION,
         "Needs your decision",
-        "The sync anchor is ${(s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)} periods " +
-            "old, past the ${s.wsBoundPeriods}-period safety bound. Syncing is paused until you decide.",
+        "The sync anchor is ${(s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)} periods old" +
+            // Not every host reports the enforced bound (Android leaves it 0): name it only when known.
+            (if (s.wsBoundPeriods > 0) ", past the ${s.wsBoundPeriods}-period safety bound" else "") +
+            ". Syncing is paused until you decide.",
         "Node readiness: sync anchor too old — paused awaiting your consent",
     )
     s.beaconState != "SYNCED" -> syncing(s)
@@ -121,15 +123,7 @@ internal fun readinessOf(
         },
         "Node readiness: warming up, not ready to transact",
     )
-    catchUp != null -> Readiness(
-        ReadinessLevel.INDEX_CATCHING_UP,
-        "Ready — log index catching up",
-        LogIndexStatus.catchUpLine(catchUp),
-        "Node readiness: ${LogIndexStatus.catchUpLine(catchUp)}; eth_getLogs near the head is refused" +
-            if (catchUp.stalled) "" else " until it has caught up",
-        // Nothing is closing a stalled gap: a bar would promise motion.
-        progress = if (catchUp.stalled) null else catchUp.fraction,
-    )
+    catchUp != null -> indexCatchingUp(catchUp)
     s.snapServingPeers >= deepPoolThreshold -> Readiness(
         ReadinessLevel.FULLY_READY,
         "Ready",
@@ -143,6 +137,20 @@ internal fun readinessOf(
         "Verified head ${formatAge(s.verifiedHeadAgeMs)} old · peer pool still filling for heavier " +
             "wallet screens (${s.snapServingPeers} of $deepPoolThreshold).",
         "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens",
+    )
+}
+
+/** The one amber rung past "ready": the index trails the head, so head-reaching `eth_getLogs` is refused. */
+private fun indexCatchingUp(catchUp: CatchUpProgress): Readiness {
+    val line = LogIndexStatus.catchUpLine(catchUp)
+    return Readiness(
+        ReadinessLevel.INDEX_CATCHING_UP,
+        "Ready — log index catching up",
+        line,
+        "Node readiness: $line; eth_getLogs near the head is refused" +
+            if (catchUp.stalled) "" else " until it has caught up",
+        // Nothing is closing a stalled gap: a bar would promise motion.
+        progress = if (catchUp.stalled) null else catchUp.fraction,
     )
 }
 
@@ -198,20 +206,22 @@ internal data class Vitals(val el: Vital, val cl: Vital, val head: Vital, val in
  * changes the tone, because it does not affect what the node can answer at the head.
  */
 internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int): Vitals {
+    // Same order as the ladder: a paused stack may well report running=false (iOS does),
+    // and it is sleeping, not stopped.
+    if (s != null && s.lifecycle == "PAUSED") {
+        return Vitals(
+            Vital(EL_LABEL, "—", "sleeping", Tone.NONE),
+            Vital(CL_LABEL, "—", "sleeping", Tone.NONE),
+            Vital(HEAD_LABEL, "—", "sleeping", Tone.NONE),
+            index = indexVital(s),
+        )
+    }
     if (s == null || !s.running) {
         return Vitals(
             Vital(EL_LABEL, "—", null, Tone.NONE),
             Vital(CL_LABEL, "—", null, Tone.NONE),
             Vital(HEAD_LABEL, "—", null, Tone.NONE),
             index = null,
-        )
-    }
-    if (s.lifecycle == "PAUSED") {
-        return Vitals(
-            Vital(EL_LABEL, "—", "sleeping", Tone.NONE),
-            Vital(CL_LABEL, "—", "sleeping", Tone.NONE),
-            Vital(HEAD_LABEL, "—", "sleeping", Tone.NONE),
-            index = indexVital(s),
         )
     }
     val el = Vital(
@@ -258,7 +268,13 @@ private fun indexVital(s: NodeSnapshot): Vital? {
     val json = s.logIndexJson ?: return null
     val p = LogIndexStatus.parseOrNull(json)?.takeIf { it.enabled } ?: return null
     val gap = LogIndexStatus.headGap(json)
+    // headGap() answers 0 for "nothing indexed" — right for the catch-up strip, which has
+    // nothing to catch up then, but a tile must not call an index that has not covered a
+    // single block "up to date". Tell the two apart by the coverage itself.
+    val seeded = p.entries.any { it.coveredHigh != null }
     val (value, headDetail, tone) = when {
+        p.entries.isEmpty() -> Triple("Nothing watched", null, Tone.NONE)
+        !seeded -> Triple("Starting", "no blocks covered yet", Tone.WAIT)
         gap == null -> Triple("Starting", null, Tone.WAIT)
         !LogIndexStatus.refusesHeadQueries(gap) -> Triple("Up to date", null, Tone.OK)
         gap > LogIndexStatus.BRIDGE_MAX_GAP ->
@@ -268,7 +284,7 @@ private fun indexVital(s: NodeSnapshot): Vital? {
     val remaining = p.blocksRemaining
     val backfill = when {
         p.entries.isEmpty() -> "no contracts watched"
-        remaining == null -> null
+        !seeded || remaining == null -> null
         remaining == 0L -> "history complete"
         p.backfillPaused -> "history paused · ${LogIndexStatus.grouped(remaining)} blocks unindexed"
         else -> "history incomplete · " + (LogIndexStatus.progressLine(p) ?: "${LogIndexStatus.grouped(remaining)} blocks left")

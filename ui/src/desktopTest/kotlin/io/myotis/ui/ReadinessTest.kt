@@ -79,6 +79,15 @@ class ReadinessTest {
         assertEquals("Needs your decision", r.headline)
         assertTrue(r.detail, r.detail!!.contains("19 periods old"))
         assertTrue(r.detail, r.detail!!.contains("13-period"))
+        // Android reports no bound: say how old, not "the 0-period bound".
+        val unknownBound = readinessOf(
+            synced().copy(beaconState = "STALE_ANCHOR", syncCurrentPeriod = 1400, syncTargetPeriod = 1419),
+            1,
+        )
+        assertEquals(
+            "The sync anchor is 19 periods old. Syncing is paused until you decide.",
+            unknownBound.detail,
+        )
     }
 
     @Test
@@ -202,6 +211,15 @@ class ReadinessTest {
         assertEquals("—", v.el.value)
         assertEquals("sleeping", v.el.detail)
         assertEquals(Tone.NONE, v.cl.tone)
+        // iOS reports a paused stack with running=false: still sleeping, not stopped,
+        // and the index tile stays (as the ladder does).
+        val ios = vitalsOf(
+            synced().copy(lifecycle = "PAUSED", running = false, logIndexJson = indexJson(headGap = 0, remaining = 0)),
+            16,
+        )
+        assertEquals("sleeping", ios.head.detail)
+        assertEquals("Up to date", ios.index!!.value)
+        assertEquals(ReadinessLevel.SLEEPING, readinessOf(synced().copy(lifecycle = "PAUSED", running = false), 1).level)
     }
 
     @Test
@@ -283,6 +301,20 @@ class ReadinessTest {
         val stalled = vitalsOf(synced().copy(logIndexJson = indexJson(headGap = 600_000, remaining = 0)), 16).index!!
         assertEquals("Too far behind", stalled.value)
         assertEquals(Tone.WAIT, stalled.tone)
+    }
+
+    @Test
+    fun anIndexThatHasCoveredNothingIsNotUpToDate() {
+        val empty = vitalsOf(synced().copy(logIndexJson = "{\"enabled\":true,\"logCount\":0,\"entries\":[]}"), 16).index!!
+        assertEquals("Nothing watched", empty.value)
+        assertEquals(Tone.NONE, empty.tone)
+        assertEquals("no contracts watched", empty.detail)
+        val unseeded = "{\"enabled\":true,\"logCount\":0,\"maxSpeed\":false,\"backfillPaused\":false," +
+            "\"entries\":[{\"address\":\"0x1111111111111111111111111111111111111111\",\"fromBlock\":5}]}"
+        val v = vitalsOf(synced().copy(logIndexJson = unseeded), 16).index!!
+        assertEquals("Starting", v.value)
+        assertEquals(Tone.WAIT, v.tone)
+        assertEquals("no blocks covered yet", v.detail)
     }
 
     @Test
