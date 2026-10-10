@@ -7,7 +7,6 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.window.Notification
 import androidx.compose.ui.window.TrayState
 import io.myotis.ui.Settings
-import io.myotis.ui.WebAccessMode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -50,11 +49,11 @@ internal suspend fun watchWebRefusals(
         delay(REFUSAL_POLL_MS)
         try {
             val fresh = withContext(Dispatchers.IO) {
-                // Only Specific sites has refusals to announce: Off refuses by the user's
-                // own choice, All sites refuses nothing. Skip the engine walk there.
-                val mode = settings.webAccessMode()
-                if (mode != WebAccessMode.ALLOWLIST) emptyList()
-                else alerts.next(controller.recentWebOrigins(), mode, settings.webAccessOrigins())
+                // Every pass, in every mode: under Off and All sites nothing is pending, but
+                // the pass still SEES requests served meanwhile (All sites serves them all),
+                // and that is what re-arms a site — skipping it would lose the re-announce
+                // the next refusal is owed once Specific sites is back. In-memory reads.
+                alerts.next(controller.recentWebOrigins(), settings.webAccessMode(), settings.webAccessOrigins())
             }
             if (alerts.capped && !capLogged) {
                 capLogged = true

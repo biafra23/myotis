@@ -53,6 +53,19 @@ class WebRefusalAlertsTest {
     }
 
     @Test
+    fun `a request served under All sites re-arms the site for when Specific sites is back`() {
+        val alerts = WebRefusalAlerts()
+        assertEquals(1, alerts.next(listOf(listOf(row("https://app.example", 1_000, false))), list, emptyList()).size)
+        // All sites: the page's next request is served. Nothing is announced, but the pass
+        // sees it — which is why the desktop watcher runs the pass in every mode.
+        assertTrue(alerts.next(listOf(listOf(row("https://app.example", 2_000, true))),
+            WebAccessMode.ALL, emptyList()).isEmpty())
+        // Back to Specific sites, the page is refused again: news again.
+        val again = alerts.next(listOf(listOf(row("https://app.example", 3_000, false))), list, emptyList())
+        assertEquals(listOf("https://app.example"), again.map { it.origin })
+    }
+
+    @Test
     fun `a stale allowed sighting on another network does not hide a fresh refusal`() {
         val alerts = WebRefusalAlerts()
         val mainnet = listOf(row("https://app.example", 5_000, false, "mainnet"))
