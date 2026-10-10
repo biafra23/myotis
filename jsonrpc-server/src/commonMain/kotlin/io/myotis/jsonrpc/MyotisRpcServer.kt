@@ -261,8 +261,14 @@ class MyotisRpcServer(
     }
 
     /** Record a judged page; the first sighting and every outcome flip go out at INFO,
-     *  a page retrying in a loop at DEBUG. */
+     *  a page retrying in a loop at DEBUG. A malformed `Origin` (no browser sends one)
+     *  is logged but never listed: the list's Allow could not admit it. */
     private suspend fun logOrigin(origin: String, allowed: Boolean) {
+        if (!WebOrigins.listable(origin)) {
+            rpcLogInfo(LOGGER, "[rpc] web page ${if (allowed) "allowed" else "refused"}: " +
+                "malformed Origin header, not listed (origin=$origin)")
+            return
+        }
         val news = webAccess.record(origin, allowed)
         val line = if (allowed) "[rpc] web page allowed: origin=$origin"
             else "[rpc] web page refused: origin=$origin (allow it under Settings → Web page access)"

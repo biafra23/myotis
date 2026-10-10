@@ -12,14 +12,18 @@ object WebAccessApi {
     fun toPolicy(policy: io.myotis.api.WebAccessPolicy): WebAccessPolicy =
         WebAccessPolicy.of(WebAccessMode.valueOf(policy.mode().name), policy.origins())
 
-    /** Install [policy] on [webAccess] — live, no restart — and return what applies: the
-     *  same mode with the origins as normalized, minus the entries that are not origins,
-     *  so a caller can see a dropped entry and refuse or warn (CLAUDE.md, Trust). */
+    /**
+     * Install [policy] on [webAccess] — live, no restart — and return what applies: the
+     * same mode with the origins as normalized, minus the entries that are not origins,
+     * so a caller can see a dropped entry and refuse or warn (CLAUDE.md, Trust). The
+     * returned list is per ENTRY, multiplicity kept (two spellings of one origin stay
+     * two entries, as the gate's own set would not), so `applied.origins().size() !=
+     * asked.origins().size()` is exactly "an entry was dropped" and never a duplicate.
+     */
     @JvmStatic
     fun apply(webAccess: WebAccess, policy: io.myotis.api.WebAccessPolicy): io.myotis.api.WebAccessPolicy {
-        val applied = toPolicy(policy)
-        webAccess.policy = applied
-        return io.myotis.api.WebAccessPolicy(policy.mode(), applied.origins.toList())
+        webAccess.policy = toPolicy(policy)
+        return io.myotis.api.WebAccessPolicy(policy.mode(), policy.origins().mapNotNull(WebOrigins::normalize))
     }
 
     /** The recent-origins list as api rows, most recent first. */

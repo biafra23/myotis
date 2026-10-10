@@ -219,7 +219,7 @@ private fun RecentWebPages(f: WebAccessFields, snapshots: Map<String, NodeSnapsh
             if (f.mode == WebAccessMode.ALLOWLIST) {
                 if (f.isAllowed(r.origin)) {
                     TextButton(onClick = { f.remove(r.origin) }) { Text("Remove") }
-                } else if (r.origin != "null") {
+                } else if (WebAccessUi.allowable(r.origin)) {
                     TextButton(onClick = { f.allow(r.origin) }) { Text("Allow") }
                 }
             }

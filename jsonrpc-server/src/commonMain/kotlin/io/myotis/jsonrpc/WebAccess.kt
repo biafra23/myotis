@@ -70,7 +70,10 @@ object WebOrigins {
      * an address bar); a path, query, fragment or userinfo is refused; so is the
      * literal `null` — the opaque origin can never be allowed by name. No
      * wildcards: `*.example.org` on a platform that hosts user content on
-     * subdomains would admit anyone who can publish there.
+     * subdomains would admit anyone who can publish there. ASCII only: a
+     * browser serializes an international host in its `xn--` (punycode) form,
+     * so a typed `münchen.example` could never match and is refused rather than
+     * stored inert — allow it as the `xn--` form the recent list shows.
      */
     fun normalize(input: String): String? {
         val s = input.trim()
@@ -85,8 +88,8 @@ object WebOrigins {
             scheme = s.substring(0, schemeEnd).lowercase()
             rest = s.substring(schemeEnd + 3)
         }
-        if (scheme.isEmpty() || !scheme[0].isLetter() ||
-            !scheme.all { it.isLetterOrDigit() || it == '+' || it == '-' || it == '.' }) return null
+        if (scheme.isEmpty() || scheme[0] !in 'a'..'z' ||
+            !scheme.all { it in 'a'..'z' || it in '0'..'9' || it == '+' || it == '-' || it == '.' }) return null
         if (rest.endsWith("/")) rest = rest.dropLast(1)
         if (rest.isEmpty() || rest.any { it == '/' || it == '?' || it == '#' || it == '@' || it == '\\' }) return null
         val host: String
@@ -97,7 +100,7 @@ object WebOrigins {
             if (close < 0) return null
             host = rest.substring(0, close + 1).lowercase()
             val inner = host.substring(1, host.length - 1)
-            if (inner.isEmpty() || !inner.all { it.isDigit() || it in 'a'..'f' || it == ':' || it == '.' }) return null
+            if (inner.isEmpty() || !inner.all { it in '0'..'9' || it in 'a'..'f' || it == ':' || it == '.' }) return null
             val after = rest.substring(close + 1)
             portText = when {
                 after.isEmpty() -> null
@@ -113,11 +116,11 @@ object WebOrigins {
                 host = rest.lowercase()
                 portText = null
             }
-            if (host.isEmpty() || !host.all { it.isLetterOrDigit() || it == '-' || it == '.' || it == '_' }) return null
+            if (host.isEmpty() || !host.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '.' || it == '_' }) return null
         }
         var port: Int? = null
         if (portText != null) {
-            if (portText.isEmpty() || portText.length > 5 || !portText.all { it.isDigit() }) return null
+            if (portText.isEmpty() || portText.length > 5 || !portText.all { it in '0'..'9' }) return null
             port = portText.toInt()
             if (port !in 1..65535) return null
             if (DEFAULT_PORTS[scheme] == port) port = null
@@ -135,6 +138,14 @@ object WebOrigins {
         if (v.equals(OPAQUE, ignoreCase = true)) return OPAQUE
         return normalize(v) ?: v.lowercase()
     }
+
+    /**
+     * Whether a recorded origin belongs in the recent list: a real origin (one
+     * "Allow" could admit) or the opaque [OPAQUE] (shown, never allowable). A
+     * malformed `Origin` — no browser sends one — is refused but not listed: a
+     * row the list's Allow could never satisfy is a dead button.
+     */
+    fun listable(origin: String): Boolean = origin == OPAQUE || normalize(origin) != null
 
     /** A `Host` header's name: lowercase, without the port; an IPv6 literal keeps its brackets. */
     fun hostName(header: String): String {

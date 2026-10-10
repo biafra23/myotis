@@ -726,7 +726,8 @@ public final class NodeService extends Service {
     private void applyWebAccessTo(ChainHandle h) {
         io.myotis.api.WebAccessPolicy asked = webAccessPolicy(this);
         io.myotis.api.WebAccessPolicy applied = h.setWebAccessPolicy(asked);
-        if (applied.origins().size() != new java.util.HashSet<>(asked.origins()).size()) {
+        // Per-entry lists on both sides: only a dropped entry makes them differ.
+        if (applied.origins().size() != asked.origins().size()) {
             LogBuffer.w(TAG, "web page access: not every allowed site is an origin — asked "
                     + asked.origins() + ", applying " + applied.origins());
         }
@@ -2658,8 +2659,15 @@ public final class NodeService extends Service {
     private static final long WEB_REFUSAL_POLL_MS = 5_000;
     /** Origins notified this run → their notification id: never twice for the same page,
      *  however often it retries — until it is allowed (from the notification, the app or a
-     *  sighting the policy admitted), after which a fresh refusal is news again. */
+     *  sighting the policy admitted), after which a fresh refusal is news again. Bounded by
+     *  {@link #WEB_NOTIFICATIONS_PER_RUN}: a local client rotating fake origins (the gate
+     *  lists only well-formed ones, but a native client can send any) must not churn a
+     *  notification per poll nor grow this map; past the cap nothing more is notified this
+     *  run, while the Status banner and the recent list keep showing everything. */
     private final Map<String, Integer> webNotified = new ConcurrentHashMap<>();
+    /** Distinct origins notified per run at most; a real user never sees twenty sites refused. */
+    private static final int WEB_NOTIFICATIONS_PER_RUN = 20;
+    private volatile boolean webNotificationCapLogged;
     /** The next notification id; ids are never reused within a run, so a re-armed origin's
      *  new notification cannot collide with a stale one the user left on screen. */
     private final java.util.concurrent.atomic.AtomicInteger webNotificationIds =
@@ -2712,6 +2720,15 @@ public final class NodeService extends Service {
                         continue;
                     }
                     if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
+                    if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
+                        if (!webNotificationCapLogged) {
+                            webNotificationCapLogged = true;
+                            LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
+                                    + " origins notified this run, no more notifications until restart "
+                                    + "(the Status screen still lists them)");
+                        }
+                        continue;
+                    }
                     int id = webNotificationIds.getAndIncrement();
                     webNotified.put(origin, id);
                     postWebRefusalNotification(id, origin);

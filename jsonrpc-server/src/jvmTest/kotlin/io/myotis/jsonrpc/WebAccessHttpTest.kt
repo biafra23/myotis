@@ -154,6 +154,11 @@ class WebAccessHttpTest {
         val row = gate.recentOrigins().single { it.origin == "https://evil.example" }
         assertFalse(row.lastAllowed)
         assertEquals(3, row.attempts, "two posts and a preflight")
+        // A malformed Origin (no browser sends one) is refused but never listed: the
+        // list's Allow could not admit it.
+        assertEquals(403, postJson("foo bar").status)
+        assertTrue(gate.recentOrigins().none { it.origin == "foo bar" })
+        assertEquals(0, reads.chainIdCalls.get())
     }
 
     @Test fun allowedSiteIsServedWithItsOriginEchoedAndVary_andTheChangeIsLive() {

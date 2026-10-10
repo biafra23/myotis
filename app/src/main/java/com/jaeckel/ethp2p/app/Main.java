@@ -388,9 +388,10 @@ public final class Main {
             io.myotis.api.WebAccessPolicy applied = handle.setWebAccessPolicy(webAccess);
             // Applied or refused, never accepted and ignored (CLAUDE.md, Trust): an
             // entry the engine could not read as an origin is missing from what
-            // applies, and a daemon with no settings screen has no other way to
-            // tell the operator — so it does not boot with a policy they did not ask for.
-            if (applied.origins().size() != new java.util.HashSet<>(webAccess.origins()).size()) {
+            // applies (the returned list is per entry, so only a drop shrinks it),
+            // and a daemon with no settings screen has no other way to tell the
+            // operator — so it does not boot with a policy they did not ask for.
+            if (applied.origins().size() != webAccess.origins().size()) {
                 System.err.println("-Dmyotis.rpc.webAccess: not every entry is an origin "
                         + "(scheme://host[:port], no path, no wildcard): asked " + webAccess.origins()
                         + ", would apply " + applied.origins());

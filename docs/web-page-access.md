@@ -65,6 +65,11 @@ for a local dev server). A path, query, userinfo or wildcard is refused — no
 `*.example.org`: on a platform that hosts user content on subdomains it would
 admit anyone who can publish there. The opaque origin `null` (file:, data:,
 sandboxed frames) never matches a list entry; only *All sites* admits it.
+Hosts are ASCII only: a browser serializes an international name in its
+`xn--` (punycode) form, so a typed `münchen.example` could never match and is
+refused by the add field rather than stored inert — allow it as the `xn--`
+form the recent list shows. A malformed `Origin` (no browser sends one) is
+refused but never listed, so the list never offers an Allow it could not keep.
 
 ## How refusals look, and what a browser shows the user
 

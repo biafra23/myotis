@@ -24,7 +24,8 @@ class WebAccessParityTest {
         "ht tp://app.example", "*.example.org", "https://*.example.org", "://app.example",
         "1http://app.example", "http://[::1", "http://[::1]x", "http://[zz::1]", "https://",
         "ws://app.example:80", "wss://app.example:443", "ftp://files.example:21",
-        "https://xn--mnchen-3ya.example", "https://app_1.example", "https://app-1.example.",
+        "https://xn--mnchen-3ya.example", "https://münchen.example", "https://аpp.example",
+        "https://app.example:８０", "https://app_1.example", "https://app-1.example.",
         "HTTP://LOCALHOST", "http://127.0.0.1:8545/", "https://app.example:00443",
         "https://app.example:65535", "https://app.example:65536", "http:/app.example",
         "http:///app.example", "https://app.example\\", "https://a.example,b.example",
@@ -36,7 +37,7 @@ class WebAccessParityTest {
         }
         // And the same for every string made of the characters an origin can contain, up
         // to a short length: a brute-force sweep of the edge cases no list would think of.
-        val alphabet = "ab1:/.[]-_@?#* "
+        val alphabet = "ab1:/.[]-_@?#* ü"
         fun sweep(prefix: String, depth: Int) {
             if (depth == 0) return
             for (c in alphabet) {

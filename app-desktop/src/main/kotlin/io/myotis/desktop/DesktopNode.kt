@@ -438,7 +438,8 @@ class DesktopNodeController(
     private fun applyWebAccessTo(handle: ChainHandle) {
         val asked = webAccessPolicy(settings)
         val applied = handle.setWebAccessPolicy(asked)
-        if (applied.origins().size != asked.origins().toSet().size) {
+        // Per-entry lists on both sides: only a dropped entry makes them differ.
+        if (applied.origins().size != asked.origins().size) {
             log.warn("[desktop] web page access: not every allowed site is an origin — asked {}, applying {}",
                 asked.origins(), applied.origins())
         }

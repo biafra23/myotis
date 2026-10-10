@@ -45,9 +45,20 @@ class WebAccessTest {
             "https://app.example:abc", "https://app.example:", "ht tp://app.example",
             "*.example.org", "https://*.example.org", "://app.example", "1http://app.example",
             "http://[::1", "http://[::1]x", "http://[zz::1]", "https://",
+            // Non-ASCII: a browser sends an international host as punycode, so a
+            // typed one could never match — refused, not stored inert.
+            "https://münchen.example", "https://аpp.example", "https://app.example:８０",
         )) {
             assertNull(WebOrigins.normalize(bad), "'$bad' must not normalize")
         }
+        assertEquals("https://xn--mnchen-3ya.example", WebOrigins.normalize("https://xn--mnchen-3ya.example"))
+    }
+
+    @Test fun onlyRealOriginsAndTheOpaqueOneAreListable() {
+        assertTrue(WebOrigins.listable("https://app.example"))
+        assertTrue(WebOrigins.listable(WebOrigins.OPAQUE))
+        assertFalse(WebOrigins.listable(WebOrigins.fromHeader("foo bar")), "a malformed header stays off the list")
+        assertFalse(WebOrigins.listable(WebOrigins.fromHeader("https://app.example/rpc")))
     }
 
     @Test fun headerKeepsTheOpaqueOriginAndMalformedValuesMatchNothing() {

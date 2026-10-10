@@ -48,7 +48,8 @@ object WebAccessUi {
      * test pins the rules), so a stored entry and a recent-list origin compare as
      * strings. A bare domain means `https://<domain>`; a scheme's default port is
      * dropped; a trailing slash is tolerated; a path, query, userinfo, wildcard or
-     * the literal `null` is refused.
+     * the literal `null` is refused, and so is a non-ASCII host: a browser sends an
+     * international name in its `xn--` form, which the recent list shows.
      */
     fun normalize(input: String): String? {
         val s = input.trim()
@@ -63,8 +64,8 @@ object WebAccessUi {
             scheme = s.substring(0, schemeEnd).lowercase()
             rest = s.substring(schemeEnd + 3)
         }
-        if (scheme.isEmpty() || !scheme[0].isLetter() ||
-            !scheme.all { it.isLetterOrDigit() || it == '+' || it == '-' || it == '.' }) return null
+        if (scheme.isEmpty() || scheme[0] !in 'a'..'z' ||
+            !scheme.all { it in 'a'..'z' || it in '0'..'9' || it == '+' || it == '-' || it == '.' }) return null
         if (rest.endsWith("/")) rest = rest.dropLast(1)
         if (rest.isEmpty() || rest.any { it == '/' || it == '?' || it == '#' || it == '@' || it == '\\' }) return null
         val host: String
@@ -74,7 +75,7 @@ object WebAccessUi {
             if (close < 0) return null
             host = rest.substring(0, close + 1).lowercase()
             val inner = host.substring(1, host.length - 1)
-            if (inner.isEmpty() || !inner.all { it.isDigit() || it in 'a'..'f' || it == ':' || it == '.' }) return null
+            if (inner.isEmpty() || !inner.all { it in '0'..'9' || it in 'a'..'f' || it == ':' || it == '.' }) return null
             val after = rest.substring(close + 1)
             portText = when {
                 after.isEmpty() -> null
@@ -90,11 +91,11 @@ object WebAccessUi {
                 host = rest.lowercase()
                 portText = null
             }
-            if (host.isEmpty() || !host.all { it.isLetterOrDigit() || it == '-' || it == '.' || it == '_' }) return null
+            if (host.isEmpty() || !host.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '.' || it == '_' }) return null
         }
         var port: Int? = null
         if (portText != null) {
-            if (portText.isEmpty() || portText.length > 5 || !portText.all { it.isDigit() }) return null
+            if (portText.isEmpty() || portText.length > 5 || !portText.all { it in '0'..'9' }) return null
             port = portText.toInt()
             if (port !in 1..65535) return null
             if (DEFAULT_PORTS[scheme] == port) port = null
@@ -129,11 +130,16 @@ object WebAccessUi {
         return byOrigin.values.sortedByDescending { it.lastSeenEpochMs }
     }
 
+    /** Whether "Allow" could admit [origin]: a real origin, not the opaque `null`
+     *  and not a value the engine kept verbatim. The banner and the rows' Allow
+     *  button key off it — a button that cannot do what it says is worse than none. */
+    fun allowable(origin: String): Boolean = normalize(origin) != null
+
     /**
      * The origins the Status screen should raise a refusal for: refused by their
-     * latest attempt, not admitted by the current setting, and not dismissed. The
-     * opaque origin `null` is left out — "Allow" could not admit it — and so is
-     * everything under [WebAccessMode.OFF]: the user said no web pages, so a
+     * latest attempt, not admitted by the current setting, not dismissed, and
+     * [allowable] — the opaque origin `null` is left out, "Allow" could not admit
+     * it — and nothing under [WebAccessMode.OFF]: the user said no web pages, so a
      * refusal there is the setting working, not news.
      */
     fun pendingRefusals(
@@ -142,6 +148,6 @@ object WebAccessUi {
         origins: Collection<String>,
         dismissed: Set<String>,
     ): List<WebOriginRow> = if (mode == WebAccessMode.OFF) emptyList() else rows.filter {
-        !it.lastAllowed && it.origin != "null" && it.origin !in dismissed && !isAllowed(mode, origins, it.origin)
+        !it.lastAllowed && allowable(it.origin) && it.origin !in dismissed && !isAllowed(mode, origins, it.origin)
     }
 }
