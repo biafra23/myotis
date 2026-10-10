@@ -4,6 +4,7 @@ import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
 import io.myotis.engine.capi.myotis_canonical_network_name
 import io.myotis.engine.capi.myotis_create
+import io.myotis.engine.capi.myotis_create_access_list_json
 import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
