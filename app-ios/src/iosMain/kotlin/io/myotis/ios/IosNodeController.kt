@@ -488,6 +488,12 @@ class IosNodeController(
                 blockNumber, verified, null,
             )
             "noRecord" -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, null)
+            // Unreachable for ownership (its reads never go off-chain); mapped as the record
+            // parse above maps it, so a shape the engine owns never reads differently here.
+            "offchain" -> EnsOwnership(
+                n, null, null, false, null, -1L, -1L, blockNumber, verified,
+                "resolves off-chain (CCIP-Read), which this app doesn't support yet",
+            )
             else -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, "unexpected resolver reply")
         }
     }

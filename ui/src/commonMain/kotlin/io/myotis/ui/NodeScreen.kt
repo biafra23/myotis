@@ -2194,7 +2194,12 @@ private fun EnsResultView(
         ownership?.let { o ->
             when {
                 o.error != null -> StatusRow("Ownership", o.error, color = MaterialTheme.colorScheme.error)
-                !o.known -> Text("Nothing on chain for this name.", style = MaterialTheme.typography.labelSmall)
+                // Under the default root a clean absence is answered from the peer head
+                // (a finalized "nothing" is retried there), so it carries the same caveat.
+                !o.known -> Column {
+                    Text("Nothing on chain for this name.", style = MaterialTheme.typography.labelSmall)
+                    if (!o.verified) Text("Ownership read from the peer head.", style = MaterialTheme.typography.labelSmall)
+                }
                 else -> SelectionContainer {
                     Column {
                         val style = MaterialTheme.typography.bodySmall

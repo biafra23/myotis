@@ -80,6 +80,15 @@ class EnsContenthashTest {
             "Expired 2027-10-10 07:57 — past the grace period; free to register",
             ensExpiryLine(expires, 7_776_000, expires + 7_776_000 + 1, tz),
         )
+        // An unanswered grace period is unknown, not over: never "free to register".
+        assertEquals(
+            "Expired 2027-10-10 07:57 — grace period unknown; only the registrant can renew while it lasts",
+            ensExpiryLine(expires, -1, expires + 1, tz),
+        )
+        assertEquals(
+            "Expired 2027-10-10 07:57 — grace period unknown; only the registrant can renew while it lasts",
+            ensExpiryLine(expires, -1, expires + 365 * 86_400, tz),
+        )
         assertEquals("", ensExpiryLine(-1, -1, expires, tz))
     }
 

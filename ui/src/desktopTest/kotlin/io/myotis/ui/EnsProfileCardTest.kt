@@ -90,6 +90,16 @@ class EnsProfileCardTest {
         readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, 1, true, null)), "x.eth")
         awaitText("Nothing on chain for this name.")
         rule.onAllNodes(hasText("Registrant", substring = true)).assertCountEquals(0)
+        rule.onAllNodes(hasText("peer head", substring = true)).assertCountEquals(0)
+    }
+
+    @Test
+    fun anAbsenceReadFromThePeerHeadSaysSoToo() {
+        // The default root answers a clean absence from the peer head; the caveat the
+        // populated rows carry applies to the absence claim as well.
+        readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, 1, false, null)), "x.eth")
+        awaitText("Nothing on chain for this name.")
+        rule.onNodeWithText("Ownership read from the peer head.").assertExists()
     }
 
     @Test

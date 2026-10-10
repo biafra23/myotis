@@ -48,7 +48,9 @@ suspend fun readEnsProfile(name: String, read: suspend (key: String) -> EnsRecor
 /**
  * The card's one line about a `.eth` name's term at [nowSeconds]: when it expires, or
  * that it has — inside its grace period (only the registrant may renew) or past it
- * (free to register). Empty when the name has no registrar entry.
+ * (free to register). A grace period the registrar did not answer (-1) is "unknown",
+ * never "past": the conservative reading, since the name may still be the registrant's
+ * to renew. Empty when the name has no registrar entry.
  */
 internal fun ensExpiryLine(expiresAt: Long, gracePeriodSeconds: Long, nowSeconds: Long, tz: TimeZone): String {
     if (expiresAt < 0) return ""
@@ -64,7 +66,10 @@ internal fun ensExpiryLine(expiresAt: Long, gracePeriodSeconds: Long, nowSeconds
         }
         return "Expires $at ($when_)"
     }
-    val graceEnd = if (gracePeriodSeconds >= 0) expiresAt + gracePeriodSeconds else expiresAt
+    if (gracePeriodSeconds < 0) {
+        return "Expired $at — grace period unknown; only the registrant can renew while it lasts"
+    }
+    val graceEnd = expiresAt + gracePeriodSeconds
     return if (nowSeconds < graceEnd) {
         "Expired $at — in the grace period until ${localDateTime(graceEnd, tz)}; only the registrant can renew"
     } else {
