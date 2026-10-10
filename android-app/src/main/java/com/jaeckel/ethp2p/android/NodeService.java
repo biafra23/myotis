@@ -41,9 +41,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Foreground service that runs the Myotis node — a stripped-down port of
- * {@code Main.runDaemon}: discv4 discovery + RLPx connector, no IPC, no beacon
- * client. Enough to verify peer discovery and handshakes work on Android.
+ * Foreground service that hosts the Myotis node on Android: one engine stack per enabled
+ * network (beacon light client, execution-layer peers, the loopback JSON-RPC listener),
+ * reached only through the {@code :myotis-api} contract — plus the host-side concerns
+ * around it: the ongoing notification, idle sleep and wake-on-request, the background
+ * catch-up passes, and the settings the Compose UI shares.
  */
 public final class NodeService extends Service {
 

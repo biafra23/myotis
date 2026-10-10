@@ -48,6 +48,21 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The Android launcher / status-bar icons are GENERATED from assets/myotis_logo.svg
+      # and committed (android-app/src/main/res: ic_launcher_foreground, ic_stat_myotis,
+      # ic_launcher_background, mipmap-anydpi-v26/ic_launcher). Same idea as the UniFFI
+      # bindings check in android-apk.yml: re-run the generator (stdlib-only, seconds) and
+      # fail on a diff, so a hand edit to the resources, or an SVG change without a re-run,
+      # cannot drift past review.
+      - name: Verify generated Android icons match assets/myotis_logo.svg
+        run: |
+          python3 scripts/gen_android_icons.py
+          git diff --exit-code -- android-app/src/main/res || {
+            echo "::error::android-app/src/main/res icons are STALE vs assets/myotis_logo.svg —" \
+                 "regenerate with \`python3 scripts/gen_android_icons.py\` and commit."
+            exit 1
+          }
+
       # -PskipRustEngine: this runner has no Android Rust toolchain (cargo-ndk,
       # NDK, Android rustup targets), and :android-app builds the Rust engine
       # from source by DEFAULT (a missing toolchain is a hard error naming this

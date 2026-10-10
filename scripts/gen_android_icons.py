@@ -5,138 +5,226 @@ Usage: python3 scripts/gen_android_icons.py [--preview DIR]
 
 Writes android-app/src/main/res/{drawable/ic_launcher_foreground.xml,
 drawable/ic_stat_myotis.xml, values/ic_launcher_background.xml,
-mipmap-anydpi-v26/ic_launcher*.xml}. Needs only the stdlib; --preview DIR also
-renders a preview sheet there (needs cairosvg + Pillow: pip install cairosvg pillow).
+mipmap-anydpi-v26/ic_launcher.xml}. Needs only the stdlib; --preview DIR also
+renders a check sheet there (needs cairosvg + Pillow: pip install cairosvg pillow).
+CI re-runs it and fails on a diff, so the committed resources never drift from
+the logo (ci.yml, "Verify generated Android icons").
 
-Reads the bat's four fill paths, normalises their path data (one line, two
-decimals, no tabs — Android's PathParser treats only ' ' and ',' as separators),
-and writes VectorDrawables whose <group> places the bat on a square canvas:
-Android applies scale first, then translate (pivot 0), so p' = s*p + t.
+The SVG's <path> fills are taken as they are, path data normalised to one line
+with two decimals (Android's PathParser treats only ' ' and ',' as separators),
+so the SVG must stay plain: no transform= anywhere, fill-only paths, absolute
+M/L/C/Z commands. The VectorDrawable <group> then places the bat on a square
+canvas; Android applies scale first, then translate (pivot 0), so p' = s*p + t.
 """
-import re, sys, os
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PREVIEW = sys.argv[sys.argv.index('--preview') + 1] if '--preview' in sys.argv else None
-svg = open(os.path.join(ROOT, 'assets/myotis_logo.svg')).read()
-paths = re.findall(r"\sd=\"\s*([^\"]+)\"", svg)
-tok = re.compile(r'[MCZz]|-?\d*\.?\d+(?:e-?\d+)?')
+import math
+import os
+import re
+import sys
 
-def normalise(d):
-    toks = tok.findall(d); out = []; i = 0
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SVG = os.path.join(ROOT, 'assets', 'myotis_logo.svg')
+RES = os.path.join(ROOT, 'android-app', 'src', 'main', 'res')
+BG = '#1A1A24'              # brand dark (assets/social-preview.svg) behind the white bat
+FG_SIZE = 108               # dp: the adaptive-icon canvas; launchers show the inner 72dp
+SAFE_ZONE_RADIUS = 33.0     # dp: the 66dp safe-zone circle no launcher mask clips
+STAT_SIZE, STAT_WIDTH = 24, 22.0   # dp: status-bar icon canvas, and the bat's width on it
+
+PREVIEW = None
+if '--preview' in sys.argv:
+    i = sys.argv.index('--preview')
+    if i + 1 >= len(sys.argv):
+        sys.exit('usage: gen_android_icons.py [--preview DIR]')
+    PREVIEW = sys.argv[i + 1]
+
+# ---- read the SVG: plain fill paths only ----
+with open(SVG, encoding='utf-8') as fh:
+    svg = fh.read()
+if 'transform=' in svg:
+    sys.exit('refusing %s: it carries a transform= (paths are read untransformed; flatten it first)' % SVG)
+paths = []
+for elem in re.findall(r'<path\b[^>]*>', svg):
+    d = re.search(r'\bd="\s*([^"]+)"', elem)
+    fill = re.search(r'\bfill="([^"]*)"', elem)
+    stroke = re.search(r'\bstroke="([^"]*)"', elem)
+    opacity = re.search(r'\bopacity="([^"]*)"', elem)
+    if (not d or not fill or fill.group(1) == 'none'
+            or (stroke and stroke.group(1) != 'none')
+            or (opacity and float(opacity.group(1)) != 1.0)):
+        sys.exit('refusing %s: every <path> must be an opaque plain fill with a d= attribute, got %s'
+                 % (SVG, re.sub(r'\s+', ' ', elem)[:100]))
+    paths.append(d.group(1))
+if not paths:
+    sys.exit('no <path> elements in ' + SVG)
+
+TOKEN = re.compile(r'[A-Za-z]|-?\d*\.?\d+(?:e-?\d+)?')
+
+
+def f(v, places=2):
+    """Shortest fixed-point text: 297.18, 14.91, 0.1335, 54."""
+    return ('%.*f' % (places, round(float(v), places))).rstrip('0').rstrip('.') or '0'
+
+
+def walk(d):
+    """Yield (command, points) for absolute M/L/C/Z; refuse anything else."""
+    toks = TOKEN.findall(d)
+    i = 0
     while i < len(toks):
         t = toks[i]
-        if t == 'M':
-            out.append('M%s,%s' % (f(toks[i+1]), f(toks[i+2]))); i += 3
-        elif t == 'C':
-            out.append('C' + ' '.join('%s,%s' % (f(toks[i+k]), f(toks[i+k+1])) for k in (1, 3, 5))); i += 7
-        elif t in 'Zz':
-            out.append('Z'); i += 1
-        else:
-            raise SystemExit('unexpected token ' + t)
-    return ' '.join(out)
+        n = {'M': 1, 'L': 1, 'C': 3, 'Z': 0, 'z': 0}.get(t)
+        if n is None:
+            sys.exit('refusing %s: unsupported path command %r (absolute M/L/C/Z only)' % (SVG, t))
+        pts = [(float(toks[i + 1 + 2 * k]), float(toks[i + 2 + 2 * k])) for k in range(n)]
+        yield t.upper(), pts
+        i += 1 + 2 * n
 
-def f(s):
-    v = round(float(s), 2)
-    return ('%.2f' % v).rstrip('0').rstrip('.')
+
+def normalise(d):
+    return ' '.join(c + ' '.join('%s,%s' % (f(x), f(y)) for x, y in pts) for c, pts in walk(d))
+
+
+def samples(ds):
+    """Points on the paths' flattened curves (16 per cubic) — the silhouette's extent."""
+    out = []
+    for d in ds:
+        cur = start = None
+        for c, pts in walk(d):
+            if c == 'M':
+                cur = start = pts[0]
+                out.append(cur)
+            elif c == 'L':
+                cur = pts[0]
+                out.append(cur)
+            elif c == 'C':
+                p0, (p1, p2, p3) = cur, pts
+                for k in range(1, 17):
+                    u = k / 16
+                    a, b, cc, e = (1 - u) ** 3, 3 * (1 - u) ** 2 * u, 3 * (1 - u) * u * u, u ** 3
+                    out.append((a * p0[0] + b * p1[0] + cc * p2[0] + e * p3[0],
+                                a * p0[1] + b * p1[1] + cc * p2[1] + e * p3[1]))
+                cur = p3
+            else:
+                cur = start
+    return out
+
 
 norm = [normalise(d) for d in paths]
-
-def bounds(ds):
-    """Bounding box of the paths' flattened curves (16 samples per cubic)."""
-    xs, ys = [], []
-    for d in ds:
-        toks = tok.findall(d); i = 0; cur = None; start = None
-        while i < len(toks):
-            t = toks[i]
-            if t == 'M':
-                cur = start = (float(toks[i+1]), float(toks[i+2])); xs.append(cur[0]); ys.append(cur[1]); i += 3
-            elif t == 'C':
-                p0 = cur; p1, p2, p3 = [(float(toks[i+k]), float(toks[i+k+1])) for k in (1, 3, 5)]
-                for k in range(1, 17):
-                    u = k / 16; a, b, c, e = (1-u)**3, 3*(1-u)**2*u, 3*(1-u)*u*u, u**3
-                    xs.append(a*p0[0] + b*p1[0] + c*p2[0] + e*p3[0]); ys.append(a*p0[1] + b*p1[1] + c*p2[1] + e*p3[1])
-                cur = p3; i += 7
-            else:
-                cur = start; i += 1
-    return min(xs), max(xs), min(ys), max(ys)
-
-X0, X1, Y0, Y1 = bounds(paths)   # the bat: x 302.86..723.43, y 147.56..410.89 in the SVG's 1024x544
+pts = samples(paths)
+X0, X1 = min(x for x, _ in pts), max(x for x, _ in pts)
+Y0, Y1 = min(y for _, y in pts), max(y for _, y in pts)
 CX, CY = (X0 + X1) / 2, (Y0 + Y1) / 2
+# The farthest point of the silhouette from the bounding box's centre (a wing tip):
+# the launcher icon is scaled so that it lies ON the safe-zone circle.
+MAX_R = max(math.hypot(x - CX, y - CY) for x, y in pts)
+FG_SCALE = float(f(SAFE_ZONE_RADIUS / MAX_R, 4))
+STAT_SCALE = float(f(STAT_WIDTH / (X1 - X0), 4))
 
-def vector(size, scale, fill, comment):
+
+def vector(size, scale, comment):
+    """A VectorDrawable of the bat, white, centred on a size x size dp canvas."""
     tx, ty = size / 2 - CX * scale, size / 2 - CY * scale
     body = '\n'.join(
-        '        <path\n            android:fillColor="%s"\n            android:pathData="%s" />' % (fill, d)
+        '        <path\n            android:fillColor="#FFFFFFFF"\n            android:pathData="%s" />' % d
         for d in norm)
-    return ('<?xml version="1.0" encoding="utf-8"?>\n'
-            '<!--\n%s\n-->\n'
-            '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
-            '    android:width="%ddp"\n    android:height="%ddp"\n'
-            '    android:viewportWidth="%d"\n    android:viewportHeight="%d">\n'
-            '    <group\n        android:scaleX="%s"\n        android:scaleY="%s"\n'
-            '        android:translateX="%s"\n        android:translateY="%s">\n%s\n    </group>\n</vector>\n'
-            % (comment, size, size, size, size, scale, scale, f(tx), f(ty), body)), (tx, ty)
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<!--\n%s\n-->\n'
+           '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+           '    android:width="%ddp"\n    android:height="%ddp"\n'
+           '    android:viewportWidth="%d"\n    android:viewportHeight="%d">\n'
+           '    <group\n        android:scaleX="%s"\n        android:scaleY="%s"\n'
+           '        android:translateX="%s"\n        android:translateY="%s">\n%s\n    </group>\n</vector>\n'
+           % (comment, size, size, size, size, f(scale, 4), f(scale, 4), f(tx), f(ty), body))
+    return xml, (tx, ty)
 
-res = os.path.join(ROOT, 'android-app/src/main/res')
-os.makedirs(os.path.join(res, 'drawable'), exist_ok=True)
-os.makedirs(os.path.join(res, 'mipmap-anydpi-v26'), exist_ok=True)
 
-FG_SCALE = 0.14     # 420.57 source units -> 58.9dp: the wing tips sit on the 66dp safe-zone circle
-STAT_SCALE = 0.052  # -> 21.9dp of the 24dp status-bar icon
-fg, (fgtx, fgty) = vector(108, FG_SCALE, '#FFFFFFFF',
-    '  The bat from assets/myotis_logo.svg (same four fill paths, path data normalised to one\n'
-    '  line) as the adaptive launcher icon\'s foreground layer. Generated by\n'
-    '  scripts/gen_android_icons.py — edit the SVG and re-run, do not hand-edit the paths.\n'
-    '  The 108dp canvas is what launchers mask: the inner 72dp is visible, and the bat\'s wing\n'
-    '  tips are scaled to sit on the 66dp safe-zone circle so no mask shape clips them.')
-stat, (sttx, stty) = vector(24, STAT_SCALE, '#FFFFFFFF',
-    '  The same bat as a 24dp status-bar icon for the foreground-service notification (white on\n'
-    '  transparent, as small icons must be — the system tints it). Generated by\n'
-    '  scripts/gen_android_icons.py from assets/myotis_logo.svg; do not hand-edit the paths.')
-open(os.path.join(res, 'drawable/ic_launcher_foreground.xml'), 'w').write(fg)
-open(os.path.join(res, 'drawable/ic_stat_myotis.xml'), 'w').write(stat)
-open(os.path.join(res, 'values/ic_launcher_background.xml'), 'w').write(
+def write(rel, text):
+    path = os.path.join(RES, *rel.split('/'))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+
+
+fg, (fgtx, fgty) = vector(FG_SIZE, FG_SCALE,
+    "  The bat from assets/myotis_logo.svg (its own fill paths, path data normalised to one\n"
+    "  line) as the adaptive launcher icon's foreground layer. GENERATED by\n"
+    "  scripts/gen_android_icons.py — edit the SVG and re-run; CI fails on a hand edit.\n"
+    "  The 108dp canvas is what launchers mask: the inner 72dp is visible, and the scale puts\n"
+    "  the silhouette's farthest point (a wing tip) on the 66dp safe-zone circle, so no mask\n"
+    "  shape clips it. Also the <monochrome> layer of the themed icon.")
+stat, (sttx, stty) = vector(STAT_SIZE, STAT_SCALE,
+    "  The same bat as a 24dp status-bar icon for the foreground-service notification (white on\n"
+    "  transparent, as small icons must be — the system tints it). GENERATED by\n"
+    "  scripts/gen_android_icons.py from assets/myotis_logo.svg; CI fails on a hand edit.")
+write('drawable/ic_launcher_foreground.xml', fg)
+write('drawable/ic_stat_myotis.xml', stat)
+write('values/ic_launcher_background.xml',
     '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
     '    <!-- Adaptive launcher icon background: the brand dark from assets/social-preview.svg,\n'
-    '         behind the white bat (the dark-scheme logo, assets/myotis_logo_dark.svg). -->\n'
-    '    <color name="ic_launcher_background">#1A1A24</color>\n</resources>\n')
-adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+    '         behind the white bat (the dark-scheme logo, assets/myotis_logo_dark.svg).\n'
+    '         GENERATED by scripts/gen_android_icons.py (BG there); CI fails on a hand edit. -->\n'
+    '    <color name="ic_launcher_background">%s</color>\n</resources>\n' % BG)
+write('mipmap-anydpi-v26/ic_launcher.xml',
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<!-- GENERATED by scripts/gen_android_icons.py. minSdk 29 > 26, so this adaptive icon is the\n'
+    '     only launcher-icon form the app needs: no density PNGs, and no roundIcon (launchers\n'
+    '     that ask for one fall back to android:icon, i.e. this same file). -->\n'
     '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
     '    <background android:drawable="@color/ic_launcher_background" />\n'
     '    <foreground android:drawable="@drawable/ic_launcher_foreground" />\n'
-    '    <!-- Android 13+ themed icons use the foreground\'s alpha, tinted by the launcher. -->\n'
+    "    <!-- Android 13+ themed icons use the foreground's alpha, tinted by the launcher. -->\n"
     '    <monochrome android:drawable="@drawable/ic_launcher_foreground" />\n'
     '</adaptive-icon>\n')
-for n in ('ic_launcher.xml', 'ic_launcher_round.xml'):
-    open(os.path.join(res, 'mipmap-anydpi-v26', n), 'w').write(adaptive)
+print('bat bounds x %s..%s y %s..%s; farthest point %s from centre' % (f(X0), f(X1), f(Y0), f(Y1), f(MAX_R)))
+print('launcher scale %s translate %s,%s | status-bar scale %s translate %s,%s'
+      % (f(FG_SCALE, 4), f(fgtx), f(fgty), f(STAT_SCALE, 4), f(sttx), f(stty)))
 
 # ---- preview sheet (opt-in: --preview DIR; cairosvg + Pillow) ----
-print('foreground translate', f(fgtx), f(fgty), '| stat translate', f(sttx), f(stty))
 if PREVIEW is None:
     sys.exit(0)
-import cairosvg
-from PIL import Image, ImageDraw
-OUT = PREVIEW
-def render(size, scale, tx, ty, bg, fill, px):
-    g = ''.join('<path fill="%s" d="%s"/>' % (fill, d) for d in norm)
+import io  # noqa: E402
+import cairosvg  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+os.makedirs(PREVIEW, exist_ok=True)
+
+
+def render(size, scale, tx, ty, bg, px):
+    g = ''.join('<path fill="#FFFFFF" d="%s"/>' % d for d in norm)
+    rect = '<rect width="%d" height="%d" fill="%s"/>' % (size, size, bg) if bg else ''
     s = ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">'
          '%s<g transform="translate(%s,%s) scale(%s)">%s</g></svg>'
-         % (px, px, size, size, ('<rect width="%d" height="%d" fill="%s"/>' % (size, size, bg)) if bg else '', tx, ty, scale, g))
-    return Image.open(__import__('io').BytesIO(cairosvg.svg2png(bytestring=s.encode()))).convert('RGBA')
+         % (px, px, size, size, rect, tx, ty, scale, g))
+    return Image.open(io.BytesIO(cairosvg.svg2png(bytestring=s.encode()))).convert('RGBA')
 
-full = render(108, FG_SCALE, fgtx, fgty, '#1A1A24', '#FFFFFF', 432)
-# visible 72dp window + 66dp safe-zone circle, drawn on a copy for inspection
-insp = full.copy(); d = ImageDraw.Draw(insp)
-d.rectangle([72, 72, 360, 360], outline='#FF5252', width=2)   # 72dp visible window
-d.ellipse([84, 84, 348, 348], outline='#69F0AE', width=2)     # 66dp safe zone
+
+full = render(FG_SIZE, FG_SCALE, fgtx, fgty, BG, 432)        # 4 px per dp
+insp = full.copy()
+draw = ImageDraw.Draw(insp)
+draw.rectangle([72, 72, 360, 360], outline='#FF5252', width=2)   # the visible 72dp window
+draw.ellipse([84, 84, 348, 348], outline='#69F0AE', width=2)     # the 66dp safe zone
+
+
 def masked(shape):
-    win = full.crop((72, 72, 360, 360)); m = Image.new('L', win.size, 0); md = ImageDraw.Draw(m)
-    if shape == 'circle': md.ellipse([0, 0, 287, 287], fill=255)
-    else: md.rounded_rectangle([0, 0, 287, 287], radius=72, fill=255)
-    out = Image.new('RGBA', win.size, (0, 0, 0, 0)); out.paste(win, (0, 0), m); return out
-stat_img = render(24, STAT_SCALE, sttx, stty, None, '#FFFFFF', 96)
+    win = full.crop((72, 72, 360, 360))
+    m = Image.new('L', win.size, 0)
+    md = ImageDraw.Draw(m)
+    if shape == 'circle':
+        md.ellipse([0, 0, 287, 287], fill=255)
+    else:
+        md.rounded_rectangle([0, 0, 287, 287], radius=72, fill=255)
+    out = Image.new('RGBA', win.size, (0, 0, 0, 0))
+    out.paste(win, (0, 0), m)
+    return out
+
+
+stat_img = render(STAT_SIZE, STAT_SCALE, sttx, stty, None, 96)
 sheet = Image.new('RGBA', (432 + 288 + 288 + 96 + 5 * 24, 432 + 48), '#607D8B')
-sheet.paste(insp, (24, 24)); sheet.paste(masked('circle'), (480, 96), masked('circle'))
-sheet.paste(masked('squircle'), (792, 96), masked('squircle'))
-bar = Image.new('RGBA', (96, 96), '#000000'); bar.paste(stat_img, (0, 0), stat_img); sheet.paste(bar, (1104, 96))
-sheet.save(os.path.join(OUT, 'preview.png'))
-print('wrote', os.path.join(OUT, 'preview.png'))
+sheet.paste(insp, (24, 24))
+for x, shape in ((480, 'circle'), (792, 'squircle')):
+    layer = masked(shape)
+    sheet.paste(layer, (x, 96), layer)
+bar = Image.new('RGBA', (96, 96), '#000000')
+bar.paste(stat_img, (0, 0), stat_img)
+sheet.paste(bar, (1104, 96))
+out = os.path.join(PREVIEW, 'preview.png')
+sheet.save(out)
+print('wrote', out)
