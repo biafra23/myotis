@@ -6,10 +6,12 @@
 > (balance/nonce) reads** — the routing switch sits in `get_account`
 > (`reader.rs`) — over per-address isolated circuits with ephemeral RLPx
 > keys, and **the broadcast of the wallet's own transactions** — the switch
-> sits in `send_judged`; `tor_broadcast` — over a fresh isolated circuit per
-> send, each push confirmed by its peer's Pong, failing closed (a send no
-> peer confirms over Tor is not broadcast at all, and one that went over Tor
-> is never rebroadcast from the real IP, even after Tor is switched off).
+> sits in `send_judged`; `tor_broadcast` — under a fresh isolation token per
+> send (its circuits carry nothing else), each push confirmed by its peer's
+> Pong, failing closed: a send no peer took over Tor is refused, never sent
+> from the real IP (one that landed on a stream but got no Pong counts as
+> sent — it may be out), and one that went over Tor is never rebroadcast from
+> the real IP, even after Tor is switched off.
 > Wired up on the desktop host only today; storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
@@ -180,11 +182,13 @@ Route by sensitivity, not wholesale:
 4. **Real snap queries** for the user's addresses — per-address circuit
    isolation (§3) and **ephemeral RLPx node keys** (§6.1).
 5. **Transaction broadcast** — over Tor to the proven peer pool; zero trust cost
-   by construction. **Shipped:** up to five pool peers at once, one fresh
-   isolated circuit per send, each push a fresh RLPx identity confirmed by the
-   peer's Pong (`EthSession::send_transaction_confirmed`); the send answers at
-   the first confirmed push and fails closed when none is. Rebroadcasts follow
-   the same route, and a Tor send is never re-pushed in the clear.
+   by construction. **Shipped:** up to five pool peers at once under one
+   isolation token fresh to the send, each push a fresh RLPx identity
+   confirmed by the peer's Pong (`EthSession::await_pong`); the send answers
+   at the first confirmed push, counts a push that landed without a Pong as
+   sent (it may be out), and fails closed when none landed. Rebroadcasts
+   follow the same route, one round at a time, each walking on to the next
+   five pool peers; a Tor send is never re-pushed in the clear.
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -350,8 +354,10 @@ and for not shipping a unique clientId on the Tor path.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
-   > **Shipped as:** one circuit per send, up to five pool peers on it. The
-   > peers are not aged yet (§5), so the stronger options remain open.
+   > **Shipped as:** one isolation token per send (its circuits carry no
+   > other send and no read), up to five pool peers; each rebroadcast round
+   > walks on to the next five. The peers are not aged yet (§5), so the
+   > stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).

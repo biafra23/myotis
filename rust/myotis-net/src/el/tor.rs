@@ -67,18 +67,29 @@ fn isolation_for(address: &[u8; 20]) -> IsolationToken {
     *map.entry(*address).or_insert_with(IsolationToken::new)
 }
 
-/// Bootstrap-once accessor for the shared Tor client.
+/// Bootstrap-once accessor for the shared Tor client. The bootstrap runs in
+/// a task of its own: a caller's deadline (a read's, a push's) must not cancel
+/// it halfway, or the next caller starts it over.
 async fn client() -> Result<&'static Arc<TorClient<PreferredRuntime>>, String> {
-    CLIENT
-        .get_or_try_init(|| async {
-            tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
-            let c = TorClient::create_bootstrapped(TorClientConfig::default())
-                .await
-                .map_err(|e| format!("tor bootstrap: {e}"))?;
-            tracing::info!("tor: Arti client bootstrapped");
-            Ok::<_, String>(c)
-        })
-        .await
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    tokio::spawn(async {
+        CLIENT
+            .get_or_try_init(|| async {
+                tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
+                let c = TorClient::create_bootstrapped(TorClientConfig::default())
+                    .await
+                    .map_err(|e| format!("tor bootstrap: {e}"))?;
+                tracing::info!("tor: Arti client bootstrapped");
+                Ok::<_, String>(c)
+            })
+            .await
+            .map(|_| ())
+    })
+    .await
+    .map_err(|e| format!("tor bootstrap task: {e}"))??;
+    CLIENT.get().ok_or_else(|| "tor bootstrap: no client after bootstrap".to_string())
 }
 
 /// Open a per-address ISOLATED Tor circuit to `addr` (identity `pubkey`, already
@@ -99,19 +110,23 @@ pub async fn open_snap_session(
 }
 
 /// Push one of the wallet's own transactions to `addr` over Tor: a stream on
-/// the circuit `isolation` names, a fresh ephemeral RLPx identity, and the push
-/// confirmed by the peer's Pong ([`EthSession::send_transaction_confirmed`]).
-/// The caller picks the isolation: one token per broadcast, so no circuit
-/// carries two sends, or a send and a read.
+/// circuits `isolation` keeps to itself, a fresh ephemeral RLPx identity, and
+/// the push confirmed by the peer's Pong ([`EthSession::await_pong`]). Sets
+/// `written` once the push itself landed — from then on the transaction may
+/// be out, whatever the Pong does. The caller picks the isolation: one token
+/// per broadcast, so no circuit carries two sends, or a send and a read.
 pub async fn push_transaction(
     isolation: IsolationToken,
     addr: SocketAddr,
     pubkey: [u8; 64],
     eth_cfg: &EthConfig,
     raw_tx: &[u8],
+    written: &AtomicBool,
 ) -> Result<(), String> {
     let mut session = open_session(isolation, addr, pubkey, eth_cfg).await?;
-    session.send_transaction_confirmed(raw_tx).await
+    session.send_transaction(raw_tx).await?;
+    written.store(true, Ordering::SeqCst);
+    session.await_pong().await
 }
 
 /// Open a Tor stream to `addr` on the circuit `isolation` names and run the

@@ -306,19 +306,24 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         self.conn.peer_pubkey()
     }
 
-    /// Push one raw transaction to the peer (the eth `Transactions` message)
-    /// and wait until the peer has READ it: a p2p Ping follows the push, and
-    /// the peer's Pong — frames are read in order — proves it took the push
-    /// off the wire. A flushed write proves less on a Tor `DataStream`, whose
-    /// flush hands the cells to the circuit long before an exit delivers
-    /// them, and the one-shot Tor broadcast drops its session right after
-    /// (`el::tor::push_transaction`). Frames before the Pong are skipped
-    /// (gossip, requests we do not serve), a Ping is answered, a Disconnect
-    /// fails. Bounded by the request timeout.
-    pub async fn send_transaction_confirmed(&mut self, raw_tx: &[u8]) -> Result<(), String> {
+    /// Push one raw transaction to the peer (the eth `Transactions` message),
+    /// bounded by the frame-write timeout. A landed write proves the frame
+    /// left this side, not that the peer read it — [`Self::await_pong`] does.
+    pub async fn send_transaction(&mut self, raw_tx: &[u8]) -> Result<(), String> {
         self.conn
             .send(messages::TRANSACTIONS, &messages::encode_transactions(raw_tx))
-            .await?;
+            .await
+    }
+
+    /// Wait until the peer has READ everything sent before: a p2p Ping, then
+    /// the peer's Pong — frames are read in order, so the Pong proves the
+    /// earlier ones were taken off the wire. A flushed write proves less on a
+    /// Tor `DataStream`, whose flush hands the cells to the circuit long before
+    /// an exit delivers them (`el::tor::push_transaction`). Frames before the
+    /// Pong are skipped (gossip, requests we do not serve), a Ping is
+    /// answered, a Disconnect fails. The Ping's write is bounded by the
+    /// frame-write timeout, the wait by the request timeout.
+    pub async fn await_pong(&mut self) -> Result<(), String> {
         // Ping body is an empty RLP list.
         self.conn.send(P2P_PING, &[0xc0]).await?;
         let wait = async {
@@ -328,7 +333,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                     P2P_PONG => return Ok(()),
                     P2P_DISCONNECT => {
                         return Err(format!(
-                            "peer disconnected before confirming the transaction: {}",
+                            "peer disconnected before its Pong: {}",
                             describe_disconnect(&frame.payload)
                         ))
                     }
@@ -338,7 +343,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         };
         tokio::time::timeout(REQUEST_TIMEOUT, wait)
             .await
-            .map_err(|_| "timed out awaiting the peer's Pong after the transaction".to_string())?
+            .map_err(|_| "timed out awaiting the peer's Pong".to_string())?
     }
 
     /// Consume the negotiated session, handing the framed connection and the
@@ -842,7 +847,7 @@ mod tests {
         assert!(crate::el::pool::is_busy_disconnect(&err), "{err}");
     }
 
-    // --- The confirmed transaction push, against a scripted READY peer.
+    // --- A transaction push and its Pong, against a scripted READY peer.
 
     /// Run our handshake against a peer that completes it, then reads our push
     /// and answers with `script`. Returns our push outcome and the codes of
@@ -871,7 +876,10 @@ mod tests {
         let mut session = EthSession::handshake(ours, &[1; 64], &test_config(), None)
             .await
             .expect("handshake completes");
-        let outcome = session.send_transaction_confirmed(&[0x02, 0xc0]).await;
+        let outcome = match session.send_transaction(&[0x02, 0xc0]).await {
+            Ok(()) => session.await_pong().await,
+            Err(e) => Err(e),
+        };
         drop(session); // ends the peer's loop
         (outcome, peer_side.await.unwrap())
     }

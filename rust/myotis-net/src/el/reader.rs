@@ -877,6 +877,11 @@ struct SentTxState {
     pending_nonces: crate::el::sent_tx::PendingNonceTracker,
     /// Our broadcasts by tx hash — what a rebroadcast re-pushes.
     bytes: myotis_evm::Lru<[u8; 32], SentTx>,
+    /// Tor rebroadcast rounds so far: each starts that many candidate sets
+    /// into the pool ([`rotated_take`]), so it reaches peers the send and
+    /// the rounds before it did not.
+    #[cfg(feature = "tor")]
+    tor_rounds: usize,
     last_rebroadcast: std::time::Instant,
 }
 
@@ -1231,46 +1236,81 @@ where
     false
 }
 
-/// Push `raw` over Tor (docs/privacy-and-tor.md §4) to up to
-/// [`TOR_MAX_CANDIDATES`] of `peers` at once: peers the clearnet pool
-/// validated, reached by IDENTITY only — each push is its own Tor stream with
-/// a fresh ephemeral RLPx key — all on ONE circuit isolated to this call, a
-/// fresh one per broadcast, so no exit carries two sends, or a send and a
-/// read. Answers with the number of peers tried once the first push is
-/// confirmed by its peer ([`crate::el::eth::session::EthSession::send_transaction_confirmed`]);
-/// the others run on for [`TOR_BROADCAST_GRACE`] and are then cut. Fails
-/// CLOSED: no confirmed push is an error, never a clearnet send.
+/// The first `n` of `items`, starting `offset` into them and wrapping — how
+/// successive Tor rebroadcasts walk on through the pool instead of re-pushing
+/// to the same peers.
+#[cfg(any(test, feature = "tor"))]
+fn rotated_take<T: Clone>(items: &[T], offset: usize, n: usize) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items.iter().cycle().skip(offset % items.len()).take(n.min(items.len())).cloned().collect()
+}
+
+/// The peers a Tor read or send dials: up to [`TOR_MAX_CANDIDATES`] of the
+/// peers the clearnet pool validated, by IDENTITY only — address and node
+/// key; the dial itself is a fresh Tor stream with an ephemeral key —
+/// starting `offset` into the pool's order.
 ///
-/// KNOWN LIMITATION, as for the Tor account read: the candidates are peers we
-/// hold a live clearnet connection to, so a peer could pair the Tor push with
-/// our real IP by timing — the aged Tor pool of docs §5 is the fix.
+/// KNOWN LIMITATION (docs §5): these are peers we hold a LIVE clearnet
+/// connection to, so the peer a Tor read or send reaches simultaneously sees
+/// our real IP and could pair the two by timing. The quarantined, aged Tor
+/// pool of §5 is the fix, and replaces this one function.
+#[cfg(feature = "tor")]
+fn tor_candidates(peers: &[Arc<ManagedPeer>], offset: usize) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+    rotated_take(peers, offset, TOR_MAX_CANDIDATES)
+        .iter()
+        .map(|p| (p.addr(), p.peer_pubkey()))
+        .collect()
+}
+
+/// How a Tor broadcast went ([`tor_broadcast`]).
+#[cfg(feature = "tor")]
+#[derive(Debug, Clone, Copy)]
+struct TorBroadcast {
+    /// Peers tried.
+    tried: usize,
+    /// Whether a peer's Pong confirmed reading the push; `false` means a push
+    /// landed on a stream but no Pong came — the transaction may be out.
+    confirmed: bool,
+}
+
+/// Push `raw` over Tor (docs/privacy-and-tor.md §4) to every one of
+/// `targets` at once (from [`tor_candidates`]), each push its own Tor stream
+/// with a fresh ephemeral RLPx key, all under ONE isolation token fresh to
+/// this call: whatever circuits carry them carry nothing else — no other
+/// send, no read. Answers once the first push is confirmed by its peer's
+/// Pong ([`crate::el::eth::session::EthSession::await_pong`]); the others
+/// run on for [`TOR_BROADCAST_GRACE`] and are then cut.
+///
+/// With no Pong at all, a push that LANDED still counts — the transaction may
+/// be out, and telling the wallet it was not would invite a conflicting
+/// re-sign — so it answers unconfirmed; only when no push landed is it an
+/// error. Never a clearnet send, either way.
 #[cfg(feature = "tor")]
 async fn tor_broadcast(
-    peers: &[Arc<ManagedPeer>],
+    targets: Vec<(std::net::SocketAddr, [u8; 64])>,
     eth_cfg: &Arc<EthConfig>,
     raw: &Arc<[u8]>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<usize, String> {
-    let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = peers
-        .iter()
-        .take(TOR_MAX_CANDIDATES)
-        .map(|p| (p.addr(), p.peer_pubkey()))
-        .collect();
-    if candidates.is_empty() {
+) -> Result<TorBroadcast, String> {
+    if targets.is_empty() {
         return Err("tor: no clearnet-validated peer to push the transaction to over Tor (fail-closed)".into());
     }
-    let tried = candidates.len();
+    let tried = targets.len();
     let isolation = arti_client::IsolationToken::new();
+    let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let last_err = Arc::new(std::sync::Mutex::new(String::new()));
-    let pushes = candidates.into_iter().map(|(addr, pubkey)| {
-        let (eth_cfg, raw, last_err) = (Arc::clone(eth_cfg), Arc::clone(raw), Arc::clone(&last_err));
+    let pushes = targets.into_iter().map(|(addr, pubkey)| {
+        let (eth_cfg, raw) = (Arc::clone(eth_cfg), Arc::clone(raw));
+        let (written, last_err) = (Arc::clone(&written), Arc::clone(&last_err));
         async move {
-            let push = crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw);
+            let push = crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written);
             let result = tokio::time::timeout(TOR_PUSH_DEADLINE, push)
                 .await
                 .unwrap_or_else(|_| Err(format!("tor push to {addr} exceeded its budget")));
             match &result {
-                Ok(()) => tracing::info!(peer = %addr, "tor: transaction push confirmed"),
+                Ok(()) => tracing::debug!(peer = %addr, "tor: transaction push confirmed"),
                 Err(e) => {
                     tracing::debug!(peer = %addr, error = %e, "tor: transaction push failed");
                     *last_err.lock().unwrap_or_else(|p| p.into_inner()) = e.clone();
@@ -1280,13 +1320,60 @@ async fn tor_broadcast(
         }
     });
     if first_accepted(pushes, TOR_BROADCAST_GRACE, shutdown.clone()).await {
-        return Ok(tried);
+        return Ok(TorBroadcast { tried, confirmed: true });
+    }
+    if written.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(TorBroadcast { tried, confirmed: false });
     }
     if *shutdown.borrow() {
         return Err("transaction broadcast cut: the node is pausing or stopping".to_string());
     }
     let last = last_err.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    Err(format!("tor: none of {tried} peer(s) confirmed the transaction over Tor (fail-closed): {last}"))
+    Err(format!("tor: no peer took the transaction over Tor (fail-closed): {last}"))
+}
+
+/// One Tor rebroadcast round at a time, process-wide: a round pushes each
+/// pending send in turn and can outlast the sweep interval many times over
+/// when pushes keep failing, so a sweep that finds one still running leaves
+/// its Tor sends for the next. Cleared by [`TorRebroadcastGuard`]'s drop.
+#[cfg(feature = "tor")]
+static TOR_REBROADCAST_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "tor")]
+struct TorRebroadcastGuard;
+
+#[cfg(feature = "tor")]
+impl TorRebroadcastGuard {
+    fn claim() -> Option<TorRebroadcastGuard> {
+        use std::sync::atomic::Ordering;
+        TOR_REBROADCAST_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| TorRebroadcastGuard)
+    }
+}
+
+#[cfg(feature = "tor")]
+impl Drop for TorRebroadcastGuard {
+    fn drop(&mut self) {
+        TOR_REBROADCAST_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod rotated_take_tests {
+    use super::rotated_take;
+
+    #[test]
+    fn walks_on_through_the_items_and_wraps() {
+        let items = [1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(rotated_take(&items, 0, 5), vec![1, 2, 3, 4, 5]);
+        assert_eq!(rotated_take(&items, 5, 5), vec![6, 7, 1, 2, 3]);
+        assert_eq!(rotated_take(&items, 10, 5), vec![4, 5, 6, 7, 1]);
+        // Never more than there are, never the same item twice.
+        assert_eq!(rotated_take(&items[..3], 1, 5), vec![2, 3, 1]);
+        assert!(rotated_take::<u8>(&[], 3, 5).is_empty());
+    }
 }
 
 /// Race `make(peer)` across `peers` with hedging: start the first, and every
@@ -2064,6 +2151,8 @@ impl ElReader {
             sent_txs: std::sync::Mutex::new(SentTxState {
                 pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
                 bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
+                #[cfg(feature = "tor")]
+                tor_rounds: 0,
                 last_rebroadcast: std::time::Instant::now(),
             }),
             sent_tx_watch,
@@ -5816,14 +5905,7 @@ impl ElReader {
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = self
-            .pool
-            .snap_peers()
-            .await
-            .iter()
-            .take(TOR_MAX_CANDIDATES)
-            .map(|p| (p.addr(), p.peer_pubkey()))
-            .collect();
+        let candidates = tor_candidates(&self.pool.snap_peers().await, 0);
         if candidates.is_empty() {
             tracing::info!("tor: account read failed — no peer to dial over Tor");
             return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
@@ -7695,15 +7777,25 @@ impl ElReader {
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
-            let peers = self.pool.snap_peers().await;
+            let targets = tor_candidates(&self.pool.snap_peers().await, 0);
             let raw = std::sync::Arc::<[u8]>::from(raw_tx);
             let shutdown = self.request_shutdown.subscribe();
-            let candidates = tor_broadcast(&peers, &self.eth_cfg, &raw, shutdown)
-                .await
-                .map_err(|e| not_broadcast(&e))?;
-            tracing::info!(tx = %tx_hash, candidates, "transaction broadcast over Tor");
-            self.record_sent(hash, raw_tx, summary.as_ref(), true);
-            return Ok(hash);
+            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
+                Ok(sent) => {
+                    tracing::info!(
+                        tx = %tx_hash,
+                        tried = sent.tried,
+                        confirmed = sent.confirmed,
+                        "tor: transaction sent over Tor"
+                    );
+                    self.record_sent(hash, raw_tx, summary.as_ref(), true);
+                    Ok(hash)
+                }
+                Err(e) => {
+                    tracing::info!(tx = %tx_hash, error = %e, "tor: transaction send over Tor failed");
+                    Err(not_broadcast(&e))
+                }
+            };
         }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
@@ -7898,41 +7990,68 @@ impl ElReader {
                 RebroadcastRoute::Skip => {}
             }
         }
-        if clear.is_empty() && over_tor.is_empty() {
-            return;
+        if !clear.is_empty() {
+            self.rebroadcast_in_the_clear(clear).await;
         }
+        #[cfg(feature = "tor")]
+        if !over_tor.is_empty() {
+            self.rebroadcast_over_tor(over_tor).await;
+        }
+        #[cfg(not(feature = "tor"))]
+        drop(over_tor);
+    }
+
+    /// The clearnet half of [`Self::maybe_rebroadcast_sent_txs`]: every pool
+    /// peer, every send. DETACHED, like the Java warmer thread: the wallet's
+    /// receipt poll carries the trigger but must never wait on the pushes — a
+    /// wedged peer (writer lock held, full send buffer) would otherwise freeze
+    /// the confirm loop. Bounded per write; peers are owned Arcs.
+    async fn rebroadcast_in_the_clear(&self, work: Vec<Vec<u8>>) {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return;
         }
-        #[cfg(feature = "tor")]
-        let (eth_cfg, shutdown) = (Arc::clone(&self.eth_cfg), self.request_shutdown.subscribe());
-        // DETACHED, like the Java warmer thread: the wallet's receipt poll
-        // carries the trigger but must never wait on the pushes — a wedged
-        // peer (writer lock held, full send buffer) would otherwise freeze
-        // the confirm loop. Bounded per write; peers are owned Arcs. A Tor
-        // push is bounded by its own deadline, one broadcast after another.
         tokio::spawn(async move {
-            let count = clear.len();
-            for raw in clear {
+            let count = work.len();
+            for raw in work {
                 let sends = peers.iter().map(|peer| {
                     tokio::time::timeout(BROADCAST_WRITE_DEADLINE, peer.send_transaction(&raw))
                 });
                 futures::future::join_all(sends).await;
             }
-            if count > 0 {
-                tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
-            }
-            #[cfg(feature = "tor")]
-            for raw in over_tor {
+            tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
+        });
+    }
+
+    /// The Tor half of [`Self::maybe_rebroadcast_sent_txs`]: one round at a
+    /// time ([`TorRebroadcastGuard`]), each send a [`tor_broadcast`] of its
+    /// own to the next peers in the pool ([`SentTxState::tor_rounds`]),
+    /// detached like the clearnet half.
+    #[cfg(feature = "tor")]
+    async fn rebroadcast_over_tor(&self, work: Vec<Vec<u8>>) {
+        let Some(guard) = TorRebroadcastGuard::claim() else {
+            return; // a round is still running; the next sweep retries
+        };
+        let round = {
+            let mut st = self.sent_txs.lock().unwrap();
+            st.tor_rounds = st.tor_rounds.wrapping_add(1);
+            st.tor_rounds
+        };
+        // Only the targets go into the task, not the pool's peer handles.
+        let targets = tor_candidates(&self.pool.snap_peers().await, round.wrapping_mul(TOR_MAX_CANDIDATES));
+        if targets.is_empty() {
+            return;
+        }
+        let (eth_cfg, shutdown) = (Arc::clone(&self.eth_cfg), self.request_shutdown.subscribe());
+        tokio::spawn(async move {
+            let _guard = guard;
+            for raw in work {
                 let raw = std::sync::Arc::<[u8]>::from(raw);
-                match tor_broadcast(&peers, &eth_cfg, &raw, shutdown.clone()).await {
-                    Ok(_) => tracing::debug!("rebroadcast a sent tx over Tor"),
+                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone()).await {
+                    Ok(sent) => tracing::debug!(confirmed = sent.confirmed, "rebroadcast a sent tx over Tor"),
                     Err(e) => tracing::debug!(error = %e, "Tor rebroadcast of a sent tx failed"),
                 }
             }
-            #[cfg(not(feature = "tor"))]
-            drop(over_tor);
         });
     }
 
