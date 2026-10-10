@@ -65,7 +65,7 @@ pub use ens::{
     reverse_resolve, EnsError, EthCaller, ExecutorCaller, OffchainLookup,
 };
 pub use error::EvmError;
-pub use executor::{CallCost, EvmExecutor};
+pub use executor::{CallCost, CreatedAccessList, EvmExecutor};
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle, WireCost};
 pub use tx::TxRequest;
 

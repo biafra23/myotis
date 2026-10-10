@@ -40,7 +40,7 @@ use crate::el::discv4::{Discv4Config, Discv4Service};
 use crate::el::eth::session::EthConfig;
 use crate::el::feecache::{BlockRewards, BlockTips, FeeCache, Head, HistoryShape, Lookup};
 use crate::el::evm::{
-    block_context, ReadAnchor, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
+    block_context, ReadAnchor, AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
     EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
@@ -6187,6 +6187,51 @@ impl ElReader {
         // (a contradictory request, an Amsterdam block without its slot number)
         // become permanent.
         Ok(GasOutcome::from_executor(joined))
+    }
+
+    /// Verified `eth_createAccessList` for a full transaction object: the
+    /// EIP-2930 access list the transaction touches, built as geth builds it
+    /// (`myotis_evm::EvmExecutor::create_access_list` — traced, then confirmed
+    /// with the list applied), the request checked as [`Self::eth_call_tx`]
+    /// checks it, with `overrides` layered over verified state for the runs
+    /// only. `anchor` selects the block as for [`Self::eth_call_overridden`].
+    /// A run that itself reverts or halts still yields its list
+    /// ([`AccessListOutcome::Created`] carries the failure next to it, as
+    /// geth's result does); a request that cannot run within the caller's
+    /// gas, fee cap or funds yields [`AccessListOutcome::Infeasible`] (geth's
+    /// answer and message).
+    pub async fn create_access_list(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<AccessListAnswer, String> {
+        self.request(self.create_access_list_inner(anchor, tx, chain_id, overrides)).await
+    }
+
+    async fn create_access_list_inner(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<AccessListAnswer, String> {
+        let started = Instant::now();
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "createAccessList").await?;
+        let setup = started.elapsed();
+        let block_number = ctx.block_number;
+        let joined = super::request::blocking(move || {
+            let joined = executor.create_access_list(&tx, &ctx, overrides);
+            log_call_cost("eth_createAccessList", false, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
+        })
+        .await?;
+        Ok(AccessListAnswer {
+            outcome: AccessListOutcome::from_executor(joined),
+            block_number,
+            finalized: anchor == ReadAnchor::Finalized,
+        })
     }
 
     /// Verified ENS forward resolution: `name` → its address record, resolved

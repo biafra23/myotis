@@ -678,6 +678,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_create_access_list_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_create_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_drain_logs(
@@ -774,6 +776,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_create_access_list_json(`handle`: Long,`tx`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_create_handle(`network`: RustBuffer.ByValue,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -979,6 +983,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_canonical_network_name() != 21726) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_create_access_list_json() != 41557) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_create_handle() != 44197) {
@@ -1387,6 +1394,29 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterString.lower(`nameOrAlias`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified `eth_createAccessList` for the FULL JSON-RPC transaction object
+         * (ABI ≥ 40): the same `tx`, `block` and `state_overrides` as
+         * [`estimate_gas_tx_json`] — the EIP-2930 access list the transaction
+         * touches, built as geth builds it, with the gas the run made with it used
+         * and that run's own revert or halt next to the list; every field applied as
+         * [`eth_call_tx_json`] applies it, or the request refused with the permanent
+         * `{"error","code":-32602}` envelope.
+         */ fun `createAccessListJson`(`handle`: kotlin.Long, `tx`: kotlin.String, `block`: kotlin.String, `stateOverrides`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_create_access_list_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`tx`),
+        FfiConverterString.lower(`block`),
+        FfiConverterString.lower(`stateOverrides`),_status)
 }
     )
     }

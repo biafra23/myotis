@@ -158,6 +158,50 @@ impl GasOutcome {
     }
 }
 
+/// The outcome of an `eth_createAccessList`
+/// ([`ElReader::create_access_list`](crate::el::reader::ElReader)): the list,
+/// with the gas the run made with it used and that run's own failure — geth
+/// reports a revert or a halt next to the list, not instead of it — or why
+/// there is none, mapped exactly as [`CallOutcome::from_executor`] maps the
+/// call's. No `Revert` variant: a run that reverts still has a list.
+#[derive(Debug)]
+pub enum AccessListOutcome {
+    /// The list was built ([`myotis_evm::CreatedAccessList`]).
+    Created(myotis_evm::CreatedAccessList),
+    /// No list right now (state unavailable, a list that would not settle).
+    /// The string is diagnostic.
+    Unavailable(String),
+    /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
+    Refused(String),
+    /// The request cannot run within the caller's own limits — its `gas`, its
+    /// fee cap against the base fee, the funds its fee needs — as
+    /// [`CallOutcome::Infeasible`]: geth's -32000 answer in geth's words.
+    Infeasible(String),
+}
+
+impl AccessListOutcome {
+    /// The executor's verdict, mapped as [`CallOutcome::from_executor`].
+    pub fn from_executor(
+        joined: Result<myotis_evm::CreatedAccessList, EvmError>,
+    ) -> AccessListOutcome {
+        match joined {
+            Ok(created) => AccessListOutcome::Created(created),
+            Err(e) if e.is_refusal() => AccessListOutcome::Refused(e.to_string()),
+            Err(e) if e.is_infeasible() => AccessListOutcome::Infeasible(e.to_string()),
+            Err(e) => AccessListOutcome::Unavailable(e.to_string()),
+        }
+    }
+}
+
+/// An access list's outcome plus the block it ran against, as [`CallAnswer`].
+#[derive(Debug)]
+pub struct AccessListAnswer {
+    pub outcome: AccessListOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block.
+    pub finalized: bool,
+}
+
 /// The outcome of an ENS forward resolution. `block_number` is the verified head
 /// the resolution ran against. A hard failure (state unavailable, invalid name)
 /// travels the `Err(String)` channel instead, like the other reads.

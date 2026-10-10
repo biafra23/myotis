@@ -438,6 +438,26 @@ pub unsafe extern "C" fn myotis_eth_call_tx_json(
     into_c(crate::host::eth_call_tx_json(handle, &tx, &block, &state_overrides))
 }
 
+/// Verified `eth_createAccessList` for the full JSON-RPC transaction object
+/// (`nativeCreateAccessListJson` twin, ABI ≥ 40): the arguments of
+/// [`myotis_estimate_gas_tx_json`]. A NULL `tx` reads as empty, which is
+/// refused (not an object) — never traced as some default transaction.
+///
+/// # Safety
+/// All pointer params must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_create_access_list_json(
+    handle: i64,
+    tx: *const c_char,
+    block: *const c_char,
+    state_overrides: *const c_char,
+) -> *mut c_char {
+    let tx = read_string(tx).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    let state_overrides = read_string(state_overrides).unwrap_or_default();
+    into_c(crate::host::create_access_list_json(handle, &tx, &block, &state_overrides))
+}
+
 /// Verified ENS forward resolution (`nativeResolveEnsJson` twin).
 ///
 /// # Safety

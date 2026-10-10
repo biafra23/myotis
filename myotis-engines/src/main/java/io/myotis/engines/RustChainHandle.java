@@ -1091,6 +1091,63 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 handle, txJson, block, stateOverridesJson)));
     }
 
+    /**
+     * One verified {@code eth_createAccessList} for the full transaction object
+     * (ABI 40): the arguments of {@link #estimateGasTxVerifiedDetailed}. Throws
+     * {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.AccessListResult createAccessListVerified(String txJson, String block, String stateOverridesJson) {
+        return accessListFromJson(gated(() -> RustEngineNative.nativeCreateAccessListJson(
+                handle, txJson, block, stateOverridesJson)));
+    }
+
+    /** Package-private test seam: access-list JSON (ABI 40) → the engine's
+     *  outcome. The Rust side emits {@code {"status":"ok","accessList":[…],
+     *  "gasUsed":N}} — plus {@code vmError} (and {@code revertDataHex} for a
+     *  revert) when the run itself failed, which geth reports NEXT TO the list
+     *  as its {@code error}; it is not a top-level {@code error}, the engine's
+     *  failure envelope — / {@code {"status":"unavailable","reason"}} /
+     *  {@code {"status":"infeasible","reason"}}. The permanent {@code {"error",
+     *  "code":-32602}} envelope is REFUSED and a plain {@code {"error"}} throws,
+     *  as for {@link #callDetailedFromJson}; an {@code ok} without its list or
+     *  gas is shape drift and fails closed. */
+    static io.myotis.api.AccessListResult accessListFromJson(String json) {
+        JsonObject o = parseJsonObject(json, "createAccessList");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.AccessListResult.refused(refusal);
+        throwIfError(o);
+        try {
+            String status = stringOrNull(o, "status");
+            if ("ok".equals(status)) {
+                var list = o.get("accessList");
+                if (list == null || !list.isArray()) {
+                    throw new EngineException("createAccessList JSON: status=ok without an accessList array");
+                }
+                var gasUsed = o.get("gasUsed");
+                if (gasUsed == null || !gasUsed.isNumber()) {
+                    throw new EngineException("createAccessList JSON: status=ok without a numeric gasUsed");
+                }
+                String payload = stringOrNull(o, "revertDataHex");
+                return io.myotis.api.AccessListResult.ok(
+                        list.toString(), gasUsed.asLong(), stringOrNull(o, "vmError"),
+                        payload == null ? null : hexToBytes(payload));
+            }
+            if ("infeasible".equals(status)) {
+                String reason = stringOrNull(o, "reason");
+                if (reason == null || reason.isBlank()) {
+                    throw new EngineException("createAccessList JSON: status=infeasible without a reason");
+                }
+                return io.myotis.api.AccessListResult.infeasible(reason);
+            }
+            return io.myotis.api.AccessListResult.unavailable(stringOrNull(o, "reason"));
+        } catch (EngineException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed createAccessList JSON from the Rust engine: " + e.getMessage(), e);
+        }
+    }
+
     /** Package-private test seam: estimateGas JSON → the engine's three-way outcome.
      *  The Rust side emits {@code {"status":"ok","gas":N}} /
      *  {@code {"status":"revert","dataHex"}} (ABI v23) / {@code {"status":

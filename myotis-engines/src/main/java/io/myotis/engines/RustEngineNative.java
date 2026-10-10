@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 39; // 39: set_dns_discovery (the EIP-1459 DNS discovery switch, #539)
+    static final int EXPECTED_ABI_VERSION = 40; // 40: create_access_list_json (eth_createAccessList)
 
     private static final boolean AVAILABLE = load();
 
@@ -325,6 +325,17 @@ final class RustEngineNative {
      */
     static String nativeEthCallTxJson(long handle, String tx, String block, String stateOverrides) {
         return Myotis_engineKt.ethCallTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
+    }
+
+    /**
+     * Verified {@code eth_createAccessList} for the FULL transaction object (ABI
+     * >= 40) — the arguments of {@link #nativeEstimateGasTxJson}. The list the
+     * transaction touches with the gas the run made with it used, and that run's
+     * own revert or halt next to them; every field is applied or the request
+     * refused (-32602).
+     */
+    static String nativeCreateAccessListJson(long handle, String tx, String block, String stateOverrides) {
+        return Myotis_engineKt.createAccessListJson(handle, nz(tx), nz(block), nz(stateOverrides));
     }
 
     /** Verified ENS forward resolution (name → address record), as JSON. */

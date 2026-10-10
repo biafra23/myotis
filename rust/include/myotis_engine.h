@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 39
+#define MYOTIS_ABI_VERSION 40
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -221,6 +221,26 @@ char *myotis_estimate_gas_tx_json(int64_t handle, const char *tx,
  * (PERMANENT, do not retry). */
 char *myotis_eth_call_tx_json(int64_t handle, const char *tx,
                               const char *block, const char *state_overrides);
+/* eth_createAccessList for the FULL JSON-RPC transaction object (ABI >= 40):
+ * the arguments of myotis_estimate_gas_tx_json, the request checked as
+ * myotis_eth_call_tx_json checks it. Returns {"status":"ok","accessList":
+ * [{"address","storageKeys":[...]}],"gasUsed":N} — the EIP-2930 list the
+ * transaction touches, built as geth builds it (sorted by address and key),
+ * and the gas the run made with it used — plus "vmError" when that run
+ * itself failed ("execution reverted", with "revertDataHex" = the raw
+ * payload, or the halt, e.g. "out of gas"): geth's `error` field, which it
+ * reports NEXT TO the list, so serve the list and the error together, never
+ * a code-3 error (named vmError here because a top-level "error" is this
+ * engine's failure envelope) | {"status":
+ * "unavailable","reason"} (retryable) | {"status":"infeasible","reason"} (the
+ * request cannot run within the caller's gas, fee cap or funds; serve
+ * JSON-RPC -32000 with `reason` verbatim, as geth does) | {"error"}
+ * (retryable) | {"error","code":-32602} for a malformed or contradictory
+ * object (PERMANENT, do not retry). Every served status also carries
+ * blockNumber and verified, as myotis_eth_call_json's shapes do. */
+char *myotis_create_access_list_json(int64_t handle, const char *tx,
+                                     const char *block,
+                                     const char *state_overrides);
 /* {"status":"ok","addressHex","blockNumber"} | {"status":"noRecord",...} |
  * {"status":"offchain",...} | {"error"}. */
 char *myotis_resolve_ens_json(int64_t handle, const char *name);

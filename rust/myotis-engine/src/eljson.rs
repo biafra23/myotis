@@ -8,8 +8,10 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
+use myotis_evm::EvmError;
 use myotis_net::el::evm::{
-    CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome,
+    AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome,
+    EnsRecordValue, GasOutcome,
 };
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
@@ -712,6 +714,67 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// Serialize an `eth_createAccessList` answer (ABI ≥ 40):
+/// `{"status":"ok","accessList":[{"address","storageKeys":[…]}],"gasUsed":N}`
+/// — the list sorted by address and key, `gasUsed` what the run made with it
+/// used — plus `"vmError"` when that run itself failed: geth's `error` field,
+/// next to the list rather than instead of it, `"execution reverted"` (with
+/// `"revertDataHex"`, the raw payload, so a host appends the decoded reason as
+/// it does for a code-3 revert) or the halt (`"out of gas"`, …). Not `error`:
+/// a top-level `error` is the engine's failure envelope on every host |
+/// `{"status":"unavailable","reason"}` (retryable) |
+/// `{"status":"infeasible","reason"}` (the request cannot run within the
+/// caller's gas, fee cap or funds: geth's -32000 answer, served verbatim) |
+/// the permanent `{"error","code":-32602}` envelope for an executor refusal.
+/// Every status names the block it ran against (`blockNumber`, `verified`),
+/// as [`call_json`] does.
+pub fn access_list_json(answer: &AccessListAnswer) -> String {
+    let mut obj = serde_json::Map::new();
+    match &answer.outcome {
+        AccessListOutcome::Refused(reason) => return invalid_params_json(reason),
+        AccessListOutcome::Created(created) => {
+            obj.insert("status".into(), "ok".into());
+            let items = created
+                .access_list
+                .iter()
+                .map(|item| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("address".into(), hex0x_var(&item.address).into());
+                    entry.insert(
+                        "storageKeys".into(),
+                        serde_json::Value::Array(item.storage_keys.iter().map(|key| hex0x(key).into()).collect()),
+                    );
+                    serde_json::Value::Object(entry)
+                })
+                .collect();
+            obj.insert("accessList".into(), serde_json::Value::Array(items));
+            obj.insert("gasUsed".into(), json_u64(created.gas_used));
+            match &created.error {
+                None => {}
+                Some(EvmError::Reverted { data }) => {
+                    obj.insert("vmError".into(), "execution reverted".into());
+                    obj.insert("revertDataHex".into(), hex0x_var(data).into());
+                }
+                Some(halt) => {
+                    obj.insert("vmError".into(), halt.to_string().into());
+                }
+            }
+        }
+        AccessListOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+        AccessListOutcome::Infeasible(reason) => {
+            obj.insert("status".into(), "infeasible".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    let ran = !matches!(answer.outcome, AccessListOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// `estimateGas` result: `{"status":"ok","gas":N}` (the gas-limit estimate as a
 /// JSON number: the lowest limit that works, searched as geth searches it, with
 /// the 1.15 buffer on top and never above the caller's ceiling),
@@ -1061,6 +1124,82 @@ mod tests {
         let un: serde_json::Value = serde_json::from_str(&call_json(&unavailable)).unwrap();
         assert_eq!(un["verified"], false);
         assert_eq!(un["blockNumber"], 20_999_936);
+    }
+
+    /// The `eth_createAccessList` shape the hosts parse (ABI 40): the list
+    /// with its gas, the run's own failure next to it, the block it ran
+    /// against; and the four non-answers exactly as `call_json` serves them.
+    #[test]
+    fn access_list_json_shapes() {
+        use myotis_evm::tx::AccessListItem;
+        use myotis_evm::CreatedAccessList;
+        let answer = |outcome: AccessListOutcome, finalized: bool| AccessListAnswer {
+            outcome,
+            block_number: 21_000_000,
+            finalized,
+        };
+        let list = vec![
+            AccessListItem { address: [0x11; 20], storage_keys: vec![[0u8; 32], [0x01; 32]] },
+            AccessListItem { address: [0x22; 20], storage_keys: vec![] },
+        ];
+        let ok: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList { access_list: list.clone(), gas_used: 32_437, error: None }),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["gasUsed"], 32_437);
+        assert_eq!(ok["accessList"][0]["address"], "0x1111111111111111111111111111111111111111");
+        assert_eq!(ok["accessList"][0]["storageKeys"][0], format!("0x{}", "00".repeat(32)));
+        assert_eq!(ok["accessList"][0]["storageKeys"][1], format!("0x{}", "01".repeat(32)));
+        assert_eq!(ok["accessList"][1]["address"], "0x2222222222222222222222222222222222222222");
+        assert_eq!(ok["accessList"][1]["storageKeys"].as_array().map(Vec::len), Some(0));
+        assert!(ok.get("vmError").is_none(), "{ok}");
+        assert_eq!(ok["blockNumber"], 21_000_000);
+        assert_eq!(ok["verified"], false);
+
+        // A revert rides next to the list: geth's `error` as `vmError` (a
+        // top-level `error` is the engine's failure envelope), plus the
+        // payload for the host's reason decoding.
+        let reverted: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList {
+                access_list: list.clone(),
+                gas_used: 23_105,
+                error: Some(EvmError::Reverted { data: vec![0x08, 0xc3, 0x79, 0xa0] }),
+            }),
+            true,
+        )))
+        .unwrap();
+        assert_eq!(reverted["status"], "ok");
+        assert_eq!(reverted["vmError"], "execution reverted");
+        assert!(reverted.get("error").is_none(), "{reverted}");
+        assert_eq!(reverted["revertDataHex"], "0x08c379a0");
+        assert_eq!(reverted["accessList"].as_array().map(Vec::len), Some(2));
+        assert_eq!(reverted["verified"], true);
+        let halted: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList { access_list: vec![], gas_used: 100_000, error: Some(EvmError::OutOfGas) }),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(halted["vmError"], "out of gas");
+        assert!(halted.get("revertDataHex").is_none(), "{halted}");
+
+        let un: serde_json::Value =
+            serde_json::from_str(&access_list_json(&answer(AccessListOutcome::Unavailable("no peer".into()), true))).unwrap();
+        assert_eq!(un["status"], "unavailable");
+        assert_eq!(un["reason"], "no peer");
+        assert_eq!(un["verified"], false, "an unavailable answer ran nowhere");
+        let inf: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Infeasible("err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)".into()),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(inf["status"], "infeasible");
+        assert!(inf["reason"].as_str().unwrap().starts_with("err: intrinsic gas too low"));
+        let refused: serde_json::Value =
+            serde_json::from_str(&access_list_json(&answer(AccessListOutcome::Refused("no slot number".into()), false))).unwrap();
+        assert_eq!(refused["error"], "no slot number");
+        assert_eq!(refused["code"], INVALID_PARAMS);
     }
 
     #[test]

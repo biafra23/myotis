@@ -319,7 +319,7 @@ Methods served (the verified set): `eth_chainId`, `net_version`, `web3_clientVer
 `eth_blockNumber`, `eth_call`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
 `eth_getStorageAt`, `eth_sendRawTransaction`, `eth_getTransactionReceipt`,
 `eth_getTransactionByHash`, `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_gasPrice`,
-`eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_estimateGas`.
+`eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_estimateGas`, `eth_createAccessList` (Rust engine).
 
 ---
 

@@ -131,6 +131,24 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         stateOverridesJson: String?,
     ): RpcEstimateResult = v.estimateGasTx(tx.toApi(), block, stateOverridesJson).toRpc()
 
+    override fun supportsAccessListCreation(): Boolean = v.supportsAccessListCreation()
+
+    override fun createAccessList(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcAccessListResult = v.createAccessList(tx.toApi(), block, stateOverridesJson).toRpc()
+
+    private fun io.myotis.api.AccessListResult.toRpc(): RpcAccessListResult = when (status()!!) {
+        io.myotis.api.AccessListResult.Status.OK ->
+            RpcAccessListResult.ok(accessListJson() ?: "[]", gasUsed(), vmError(), revertData())
+        io.myotis.api.AccessListResult.Status.UNAVAILABLE -> RpcAccessListResult.unavailable(detail())
+        io.myotis.api.AccessListResult.Status.REFUSED ->
+            RpcAccessListResult.refused(detail() ?: "refused by the engine")
+        io.myotis.api.AccessListResult.Status.INFEASIBLE ->
+            RpcAccessListResult.infeasible(detail() ?: "out of gas")
+    }
+
     private fun RpcTransactionArgs.toApi() = io.myotis.api.TransactionArgs(
         from, to, data, valueWei, gas,
         gasPriceWei, maxFeePerGasWei, maxPriorityFeePerGasWei, nonce,

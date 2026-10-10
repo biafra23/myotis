@@ -49,6 +49,9 @@ class RpcRouter(
             "eth_chainId" to 0, "net_version" to 0, "eth_blockNumber" to 0,
             // transaction, block, state overrides, block overrides
             "eth_call" to 4, "eth_estimateGas" to 4,
+            // transaction, block, state overrides: reth's signature (geth takes
+            // no override, and refuses a third argument this node applies)
+            "eth_createAccessList" to 3,
             "eth_getBalance" to 2, "eth_getTransactionCount" to 2, "eth_getCode" to 2,
             "eth_getStorageAt" to 3,
             "eth_sendRawTransaction" to 1, "eth_getTransactionReceipt" to 1, "eth_getBlockByNumber" to 2,
@@ -288,7 +291,8 @@ class RpcRouter(
      *  engine's transaction-object call when it carries anything beyond
      *  from/to/data/value, the plain call otherwise — or why it can never be
      *  served here ([CallTx.Refuse], answered -32602). ONE derivation for the
-     *  handler and the strict branch. */
+     *  handler and the strict branch, and for `eth_createAccessList`, whose
+     *  request is `eth_call`'s with the method named in the refusal. */
     private sealed interface CallTx {
         class Serve(val tx: RpcTransactionArgs, val selector: Selector) : CallTx {
             val block: String get() = selector.value
@@ -296,20 +300,20 @@ class RpcRouter(
         class Refuse(val why: String) : CallTx
     }
 
-    private fun callTx(root: JsonObject): CallTx {
+    private fun callTx(root: JsonObject, method: String = "eth_call"): CallTx {
         val callObj = root.params()?.getOrNull(0) as? JsonObject
-            ?: return CallTx.Refuse("eth_call expects a transaction object as its first parameter")
+            ?: return CallTx.Refuse("$method expects a transaction object as its first parameter")
         val tx = when (val parsed = RpcTransactionArgs.parse(callObj)) {
             is RpcTransactionArgs.Parsed.Invalid -> return CallTx.Refuse("invalid transaction object: ${parsed.why}")
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
         // Every selector form — tag, number, EIP-1898's object — is applied or
         // refused exactly as for eth_estimateGas ([txBlock], #366).
-        val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_call")) {
+        val block = when (val selector = txBlock(root.params()?.getOrNull(1), method)) {
             is SelectorParse.Refuse -> return CallTx.Refuse(selector.why)
             is SelectorParse.Ok -> selector.selector
         }
-        unservableTx(tx, "eth_call", "the call would run without it")?.let { return CallTx.Refuse(it) }
+        unservableTx(tx, method, "the call would run without it")?.let { return CallTx.Refuse(it) }
         return CallTx.Serve(tx, block)
     }
 
@@ -348,11 +352,12 @@ class RpcRouter(
         }
     }
 
-    /** The methods that take override parameters. `eth_call` and
-     *  `eth_estimateGas` state overrides are APPLIED when the backend supports
-     *  them; `blockOverrides` are refused. */
+    /** The methods that take override parameters. `eth_call`, `eth_estimateGas`
+     *  and `eth_createAccessList` state overrides are APPLIED when the backend
+     *  supports them; `blockOverrides` are refused (and `eth_createAccessList`
+     *  has no fourth parameter to carry one). */
     private fun takesOverrides(method: String?): Boolean =
-        method == "eth_call" || method == "eth_estimateGas"
+        method == "eth_call" || method == "eth_estimateGas" || method == "eth_createAccessList"
 
     /**
      * Handle one request object, returning its complete JSON-RPC response envelope.
@@ -621,21 +626,35 @@ class RpcRouter(
                     return errorEnvelope(id, -32602, refusal.why)
                 }
             }
-            if (m == "eth_call") {
-                (callTx(root) as? CallTx.Refuse)?.let { refusal ->
+            // An engine that builds no access lists (the Java engine) is permanent
+            // for that build, never the retryable -32000 a client would spin on —
+            // and the reason, ahead of any field of the request: no form of the
+            // method is served there, so a field-level refusal would send the
+            // wallet fixing a field for nothing.
+            if (m == "eth_createAccessList" && backend?.supportsAccessListCreation() != true) {
+                logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(
+                    id,
+                    -32602,
+                    "method 'eth_createAccessList' is not supported by this node's engine (the Java engine " +
+                        "builds no access lists — select the Rust engine)",
+                )
+            }
+            if (m == "eth_call" || m == "eth_createAccessList") {
+                (callTx(root, m) as? CallTx.Refuse)?.let { refusal ->
                     logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                     return errorEnvelope(id, -32602, refusal.why)
                 }
             }
             // Contract creation this build cannot serve is permanent, not retryable.
-            if (m == "eth_call" && isContractCreation(root) &&
+            if ((m == "eth_call" || m == "eth_createAccessList") && isContractCreation(root) &&
                 backend?.supportsContractCreation() != true
             ) {
                 logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(
                     id,
                     -32602,
-                    "method 'eth_call' without a 'to' (contract creation) is not supported by " +
+                    "method '$m' without a 'to' (contract creation) is not supported by " +
                         "this node's engine",
                 )
             }
@@ -1361,6 +1380,50 @@ class RpcRouter(
                 val historyJson = withContext(rpcIoDispatcher) { b.feeHistory(blockCount, newest, pctArr) }
                     ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(historyJson))
+            }
+            "eth_createAccessList" -> {
+                // geth's `eth_createAccessList`, over the request `eth_call` takes:
+                // overrides decline as there (a malformed one, or one this backend
+                // cannot apply, is `null` here so strict mode names it), the whole
+                // transaction object is applied or refused ([callTx] with this
+                // method's name, the one source of truth for both branches),
+                // creation only where the engine serves it, and the method only
+                // where the engine builds lists — each a `null` for the same
+                // reason. The arity table leaves no room for a block override.
+                if (stateOverrideParam(root) is OverrideParam.Malformed) return null
+                val overrideJson = stateOverrideJson(root)
+                if (overrideJson != null && !b.supportsStateOverrides()) return null
+                val serve = callTx(root, "eth_createAccessList") as? CallTx.Serve ?: return null
+                if (serve.tx.to == null && !b.supportsContractCreation()) return null
+                if (!b.supportsAccessListCreation()) return null
+                if (!pinServable(serve.selector, b, "eth_createAccessList")) return null
+                val outcome = withContext(rpcIoDispatcher) { b.createAccessList(serve.tx, serve.block, overrideJson) }
+                when (outcome.kind) {
+                    RpcAccessListResult.Kind.OK -> {
+                        // geth's result: the list, the gas the run made with it
+                        // used, and that run's own failure as `error` NEXT TO them
+                        // (never a code-3 error: the list is the answer). A list the
+                        // backend could not shape is drift → retryable, never served.
+                        val list = outcome.accessListJson?.let { runCatching { json.parseToJsonElement(it) }.getOrNull() }
+                            as? JsonArray ?: return null
+                        val gasUsed = outcome.gasUsed ?: return null
+                        // A revert's reason, decoded as the code-3 error decodes it.
+                        val vmError = outcome.vmError?.let { error ->
+                            val reason = outcome.revertData?.let(::decodeRevertReason)
+                            if (reason != null) "$error: $reason" else error
+                        }
+                        resultEnvelope(id, buildJsonObject {
+                            put("accessList", list)
+                            vmError?.let { put("error", JsonPrimitive(it)) }
+                            put("gasUsed", JsonPrimitive(hexQuantity(gasUsed)))
+                        })
+                    }
+                    RpcAccessListResult.Kind.UNAVAILABLE -> return null
+                    RpcAccessListResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
+                    // The request cannot run within the caller's gas, fee cap or
+                    // funds: geth's -32000 in geth's words, as for eth_call.
+                    RpcAccessListResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
+                }
             }
             "eth_estimateGas" -> {
                 val p = root.params()
