@@ -18,7 +18,9 @@ import org.slf4j.LoggerFactory;
  * :30303} exit coverage is partial (docs §8). While on, balance/state reads may
  * be slow or fail-closed. The routing sets the process-global flag in the Rust
  * engine; the account read path there dials a per-address isolated Tor circuit
- * with a fresh ephemeral identity instead of the clearnet peer pool.
+ * with a fresh ephemeral identity instead of the clearnet peer pool, and the
+ * broadcast of the wallet's own transactions goes out over a fresh isolated
+ * circuit per send, or not at all.
  */
 public final class Tor {
 

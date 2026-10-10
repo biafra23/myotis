@@ -1,4 +1,5 @@
-//! Tor transport for the verified-read path (`docs/privacy-and-tor.md`).
+//! Tor transport for the verified-read path and the transaction broadcast
+//! (`docs/privacy-and-tor.md`).
 //!
 //! Feature-gated (`tor`): only a host that builds `myotis-net` with
 //! `--features tor` pulls Arti; every other build (Android/iOS/daemon) never
@@ -6,8 +7,9 @@
 //! [`TorClient`] and hands the reader a per-address ISOLATED [`EthSession`] over
 //! a Tor `DataStream`, with a FRESH ephemeral RLPx identity per connection.
 //!
-//! Scope (matches the design's §4 split): only the sensitive verified reads are
-//! routed here. Discovery and clearnet snap-peer validation stay on the real IP.
+//! Scope (matches the design's §4 split): only the sensitive flows are routed
+//! here — account reads, and the broadcast of the wallet's own transactions.
+//! Discovery and clearnet snap-peer validation stay on the real IP.
 //! What is NOT here yet: the quarantined peer pool + aging window (§5) and
 //! multi-source popularity promotion (§6.2) — this reuses whatever the clearnet
 //! pool already validated. Enabling Tor is therefore a network-privacy win
@@ -39,17 +41,17 @@ static CLIENT: OnceCell<Arc<TorClient<PreferredRuntime>>> = OnceCell::const_new(
 /// only ever sees queries for one of the user's addresses.
 static ISOLATION: Mutex<Option<HashMap<[u8; 20], IsolationToken>>> = Mutex::new(None);
 
-/// Enable/disable Tor for subsequent verified reads. Idempotent; cheap.
+/// Enable/disable Tor for subsequent account reads and broadcasts. Idempotent; cheap.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
     if on {
-        tracing::info!("tor: verified-read routing ENABLED");
+        tracing::info!("tor: routing account reads and transaction broadcasts over Tor (ENABLED)");
     } else {
-        tracing::info!("tor: verified-read routing disabled");
+        tracing::info!("tor: routing disabled");
     }
 }
 
-/// Whether verified reads should route over Tor.
+/// Whether account reads and broadcasts should route over Tor.
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
 }
@@ -89,10 +91,41 @@ pub async fn open_snap_session(
     pubkey: [u8; 64],
     eth_cfg: &EthConfig,
 ) -> Result<EthSession<arti_client::DataStream>, String> {
+    let session = open_session(isolation_for(address), addr, pubkey, eth_cfg).await?;
+    if !session.snap {
+        return Err(format!("tor: peer {addr} did not negotiate snap"));
+    }
+    Ok(session)
+}
+
+/// Push one of the wallet's own transactions to `addr` over Tor: a stream on
+/// the circuit `isolation` names, a fresh ephemeral RLPx identity, and the push
+/// confirmed by the peer's Pong ([`EthSession::send_transaction_confirmed`]).
+/// The caller picks the isolation: one token per broadcast, so no circuit
+/// carries two sends, or a send and a read.
+pub async fn push_transaction(
+    isolation: IsolationToken,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+    eth_cfg: &EthConfig,
+    raw_tx: &[u8],
+) -> Result<(), String> {
+    let mut session = open_session(isolation, addr, pubkey, eth_cfg).await?;
+    session.send_transaction_confirmed(raw_tx).await
+}
+
+/// Open a Tor stream to `addr` on the circuit `isolation` names and run the
+/// RLPx + eth handshake with a fresh ephemeral key, returning a READY session.
+async fn open_session(
+    isolation: IsolationToken,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+    eth_cfg: &EthConfig,
+) -> Result<EthSession<arti_client::DataStream>, String> {
     let tor = client().await?;
 
     let mut prefs = StreamPrefs::new();
-    prefs.set_isolation(isolation_for(address));
+    prefs.set_isolation(isolation);
     let target = TorAddr::from((addr.ip().to_string().as_str(), addr.port()))
         .map_err(|e| format!("tor addr {addr}: {e}"))?;
     let stream = tor
@@ -111,11 +144,7 @@ pub async fn open_snap_session(
     .map_err(|_| format!("tor rlpx handshake timed out to {addr}"))?
     .map_err(|e| format!("tor rlpx handshake to {addr}: {e}"))?;
 
-    let session = EthSession::handshake(conn, &key.public_key_bytes(), eth_cfg, None)
+    EthSession::handshake(conn, &key.public_key_bytes(), eth_cfg, None)
         .await
-        .map_err(|e| format!("tor eth handshake to {addr}: {e}"))?;
-    if !session.snap {
-        return Err(format!("tor: peer {addr} did not negotiate snap"));
-    }
-    Ok(session)
+        .map_err(|e| format!("tor eth handshake to {addr}: {e}"))
 }

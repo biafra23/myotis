@@ -306,6 +306,41 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         self.conn.peer_pubkey()
     }
 
+    /// Push one raw transaction to the peer (the eth `Transactions` message)
+    /// and wait until the peer has READ it: a p2p Ping follows the push, and
+    /// the peer's Pong — frames are read in order — proves it took the push
+    /// off the wire. A flushed write proves less on a Tor `DataStream`, whose
+    /// flush hands the cells to the circuit long before an exit delivers
+    /// them, and the one-shot Tor broadcast drops its session right after
+    /// (`el::tor::push_transaction`). Frames before the Pong are skipped
+    /// (gossip, requests we do not serve), a Ping is answered, a Disconnect
+    /// fails. Bounded by the request timeout.
+    pub async fn send_transaction_confirmed(&mut self, raw_tx: &[u8]) -> Result<(), String> {
+        self.conn
+            .send(messages::TRANSACTIONS, &messages::encode_transactions(raw_tx))
+            .await?;
+        // Ping body is an empty RLP list.
+        self.conn.send(P2P_PING, &[0xc0]).await?;
+        let wait = async {
+            loop {
+                let frame = recv_answering_ping(&mut self.conn).await?;
+                match frame.message_code {
+                    P2P_PONG => return Ok(()),
+                    P2P_DISCONNECT => {
+                        return Err(format!(
+                            "peer disconnected before confirming the transaction: {}",
+                            describe_disconnect(&frame.payload)
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, wait)
+            .await
+            .map_err(|_| "timed out awaiting the peer's Pong after the transaction".to_string())?
+    }
+
     /// Consume the negotiated session, handing the framed connection and the
     /// negotiated metadata to the [`ManagedPeer`](crate::el::peer::ManagedPeer)
     /// actor, which drives it from a background read loop.
@@ -805,5 +840,67 @@ mod tests {
         let err = outcome.unwrap_err();
         assert!(err.starts_with("peer disconnected after our Status"), "{err}");
         assert!(crate::el::pool::is_busy_disconnect(&err), "{err}");
+    }
+
+    // --- The confirmed transaction push, against a scripted READY peer.
+
+    /// Run our handshake against a peer that completes it, then reads our push
+    /// and answers with `script`. Returns our push outcome and the codes of
+    /// every frame we sent after the handshake.
+    async fn push_against(script: Vec<(u64, Vec<u8>)>) -> (Result<(), String>, Vec<u64>) {
+        let (ours, mut peer) = framed_pair();
+        let peer_side = tokio::spawn(async move {
+            assert_eq!(peer.recv().await.unwrap().message_code, P2P_HELLO);
+            peer.send(P2P_HELLO, &encode_hello(&[2; 64], 30303)).await.unwrap();
+            assert_eq!(peer.recv().await.unwrap().message_code, messages::STATUS);
+            let status = messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+            peer.send(messages::STATUS, &status).await.unwrap();
+            let mut received = Vec::new();
+            // The push and its Ping arrive first, in that order.
+            for _ in 0..2 {
+                received.push(peer.recv().await.unwrap().message_code);
+            }
+            for (code, body) in script {
+                peer.send(code, &body).await.unwrap();
+            }
+            while let Ok(frame) = peer.recv().await {
+                received.push(frame.message_code);
+            }
+            received
+        });
+        let mut session = EthSession::handshake(ours, &[1; 64], &test_config(), None)
+            .await
+            .expect("handshake completes");
+        let outcome = session.send_transaction_confirmed(&[0x02, 0xc0]).await;
+        drop(session); // ends the peer's loop
+        (outcome, peer_side.await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_transaction_is_confirmed_by_the_pong_that_follows_it() {
+        let (outcome, received) = push_against(vec![(P2P_PONG, vec![0xc0])]).await;
+        outcome.expect("the Pong confirms the push");
+        assert_eq!(received, vec![messages::TRANSACTIONS, P2P_PING]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gossip_is_skipped_and_a_ping_answered_until_the_pong() {
+        let (outcome, received) = push_against(vec![
+            (messages::NEW_POOLED_TRANSACTION_HASHES, vec![0xc0]),
+            (P2P_PING, vec![0xc0]),
+            (P2P_PONG, vec![0xc0]),
+        ])
+        .await;
+        outcome.expect("the Pong still confirms the push");
+        assert_eq!(received, vec![messages::TRANSACTIONS, P2P_PING, P2P_PONG]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disconnect_or_silence_is_no_confirmation() {
+        let (outcome, _) = push_against(vec![(P2P_DISCONNECT, vec![0xc1, 0x04])]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.contains("reason=4"), "{err}");
+        let (outcome, _) = push_against(vec![]).await;
+        assert!(outcome.unwrap_err().contains("Pong"), "silence times out");
     }
 }

@@ -3,18 +3,23 @@
 > **Status: the core transport path is in production, feature-gated and
 > experimental.** `-PtorEngine` links Arti into the Rust engine
 > (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
-> (balance/nonce) reads** — the single routing switch sits in
-> `get_account` (`reader.rs`) — over per-address isolated circuits with
-> ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
+> (balance/nonce) reads** — the routing switch sits in `get_account`
+> (`reader.rs`) — over per-address isolated circuits with ephemeral RLPx
+> keys, and **the broadcast of the wallet's own transactions** — the switch
+> sits in `send_judged`; `tor_broadcast` — over a fresh isolated circuit per
+> send, each push confirmed by its peer's Pong, failing closed (a send no
+> peer confirms over Tor is not broadcast at all, and one that went over Tor
+> is never rebroadcast from the real IP, even after Tor is switched off).
+> Wired up on the desktop host only today; storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
-> reads it), tx broadcast, the CL fetch, and discovery
+> reads it), receipt polling, the CL fetch, and discovery
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch
 > stays clearnet. And the shipped path reuses the live
 > clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
-> a Tor read simultaneously holds a clearnet connection from the user's real
+> a Tor read or receiving a Tor send simultaneously holds a clearnet connection from the user's real
 > IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
 > network-privacy win, not yet the full §5 unlinkability. The runnable proof
 > of concept
@@ -175,7 +180,11 @@ Route by sensitivity, not wholesale:
 4. **Real snap queries** for the user's addresses — per-address circuit
    isolation (§3) and **ephemeral RLPx node keys** (§6.1).
 5. **Transaction broadcast** — over Tor to the proven peer pool; zero trust cost
-   by construction.
+   by construction. **Shipped:** up to five pool peers at once, one fresh
+   isolated circuit per send, each push a fresh RLPx identity confirmed by the
+   peer's Pong (`EthSession::send_transaction_confirmed`); the send answers at
+   the first confirmed push and fails closed when none is. Rebroadcasts follow
+   the same route, and a Tor send is never re-pushed in the clear.
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -341,6 +350,8 @@ and for not shipping a unique clientId on the Tor path.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
+   > **Shipped as:** one circuit per send, up to five pool peers on it. The
+   > peers are not aged yet (§5), so the stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).
@@ -506,6 +517,8 @@ Re-evaluate when any of these becomes true:
 - snap request shapes: `networking/.../eth/EthHandler.java`
   (`SNAP_RESPONSE_BYTES`, GetAccountRange/GetStorageRanges senders)
 - Tx broadcast: `networking/.../rlpx/RLPxConnector.java`
-  (`broadcastTransaction`)
+  (`broadcastTransaction`); Rust: `rust/myotis-net/src/el/reader.rs`
+  (`send_judged`, `tor_broadcast`, `rebroadcast_route`),
+  `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
 - DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
 - Hello clientId: `networking/.../HelloMessage.java`

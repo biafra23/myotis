@@ -192,7 +192,7 @@ An opt-in, per-network index of the logs of contracts the user chooses (the Expe
 ## 12. Privacy — Tor routing
 **Implemented, feature-gated and experimental (Rust engine, desktop host)**
 
-`-PtorEngine` links Arti into the Rust engine; a Settings toggle (desktop only today) routes **account reads** (`get_account` — balance/nonce, and the account half of a code read) over per-address isolated Tor circuits with ephemeral RLPx keys, failing closed with no clearnet fallback. Storage, `eth_call`, blocks, broadcast, the CL fetch and discovery stay on the real IP, and the Tor reads reuse the clearnet-validated peer pool (a timing-correlation limitation the code documents). A finalized read over Tor is refused. Design, threat model and the validated proof of concept (`rust/tor-poc`): [privacy-and-tor.md](privacy-and-tor.md).
+`-PtorEngine` links Arti into the Rust engine; a Settings toggle (desktop only today) routes **account reads** (`get_account` — balance/nonce, and the account half of a code read) over per-address isolated Tor circuits and **the broadcast of the wallet's own transactions** (and their rebroadcasts) over a fresh isolated circuit per send, both with ephemeral RLPx keys, failing closed with no clearnet fallback; a send that went over Tor is never rebroadcast from the real IP. Storage, `eth_call`, blocks, receipt polling, the CL fetch and discovery stay on the real IP, and the Tor reads and sends reuse the clearnet-validated peer pool (a timing-correlation limitation the code documents). A finalized read over Tor is refused. Design, threat model and the validated proof of concept (`rust/tor-poc`): [privacy-and-tor.md](privacy-and-tor.md).
 
 ## Summary
 
