@@ -37,6 +37,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
@@ -72,6 +73,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -1365,8 +1367,9 @@ private fun QueryTab(
     var error by remember(network) { mutableStateOf<String?>(null) }
     // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
+    // Keyed on `network` like the state it fills: a chain switch resets the list, so reload it.
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
-    LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
+    LaunchedEffect(network) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
     // Keys arrive in stream order (newest chunk first); a null row = placeholder still
@@ -1610,7 +1613,7 @@ private fun QueryTab(
             }
         }
 
-        // Recent-query history: tap a row to re-run it (uses the stored input, not the label).
+        // Recent-query history: tap a card to re-run it (uses the stored input, not the label).
         if (historyList.isNotEmpty()) {
             Spacer(Modifier.height(20.dp))
             Row(
@@ -1627,11 +1630,19 @@ private fun QueryTab(
                     }
                 }) { Text("Clear") }
             }
-            // One card per past query, spaced apart; the ages are read when the list changes.
-            val now = remember(historyList) { nowEpochMillis() }
+            // One card per past query, spaced apart. The ages tick: re-read the clock every
+            // 30 s, so a tab left open does not keep saying "just now".
+            var now by remember { mutableStateOf(nowEpochMillis()) }
+            LaunchedEffect(historyList) {
+                while (true) {
+                    now = nowEpochMillis()
+                    delay(30_000)
+                }
+            }
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 historyList.forEach { e ->
-                    QueryHistoryCard(e, nowMillis = now, enabled = !loading, onClick = { run(e.input) })
+                    // Same gate as Look up: a stopped node cannot answer a re-run either.
+                    QueryHistoryCard(e, nowMillis = now, enabled = running && !loading, onClick = { run(e.input) })
                 }
             }
         }
@@ -1645,7 +1656,14 @@ private fun QueryTab(
  */
 @Composable
 private fun QueryHistoryCard(e: QueryHistoryEntry, nowMillis: Long, enabled: Boolean, onClick: () -> Unit) {
-    OutlinedCard(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+    OutlinedCard(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth().semantics { role = Role.Button },
+    ) {
+        // A disabled card dims its content colour; the secondary lines follow it then rather than
+        // keep their own, so the whole card reads as disabled.
+        val secondary = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else LocalContentColor.current
         Row(
             Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1660,7 +1678,7 @@ private fun QueryHistoryCard(e: QueryHistoryEntry, nowMillis: Long, enabled: Boo
                     Text(
                         e.label,
                         fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = secondary,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -1669,7 +1687,7 @@ private fun QueryHistoryCard(e: QueryHistoryEntry, nowMillis: Long, enabled: Boo
             Text(
                 historyAge(e.timestampMillis, nowMillis),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = secondary,
             )
         }
     }

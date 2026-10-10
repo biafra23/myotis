@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
@@ -23,10 +24,12 @@ class QueryHistoryCardTest {
     @get:Rule
     val rule = createComposeRule()
 
-    private class Node : FakeController() {
+    private class Node(private val stackRunning: Boolean = true) : FakeController() {
         val looked = mutableListOf<String>()
-        override val running: Boolean = true
-        override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(emptyMap())
+        override val running: Boolean = stackRunning
+        // A running mainnet stack by default: a card re-runs only on a running node, like Look up.
+        override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
+            flowOf(if (stackRunning) mapOf("mainnet" to snapshot()) else emptyMap())
         override suspend fun requestAccount(network: String, address: String): AccountResult {
             looked += address
             return AccountResult(
@@ -75,6 +78,23 @@ class QueryHistoryCardTest {
     }
 
     @Test
+    fun aStoppedNodeOffersNoReRun() {
+        val node = Node(stackRunning = false)
+        rule.mainClock.autoAdvance = false
+        rule.setContent {
+            NodeScreen(
+                controller = node, settings = FakeSettings(), logs = NoLogs,
+                history = History(listOf(QueryHistoryEntry(OTHER, System.currentTimeMillis(), ""))),
+            )
+        }
+        pumpFrames()
+        rule.onNode(isSelectable() and hasText("Query")).performClick()
+        awaitText("Recent")
+        rule.onNode(hasClickAction() and hasText(OTHER)).performScrollTo().assertIsNotEnabled()
+        assertEquals(emptyList<String>(), node.looked)
+    }
+
+    @Test
     fun agesReadLikeAWalletWould() {
         val t = 1_000_000_000_000L
         assertEquals("just now", historyAge(t, t + 59_000))
@@ -112,5 +132,20 @@ class QueryHistoryCardTest {
     private companion object {
         const val VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
         const val OTHER = "0x1A5F9352Af8aF974bFC03399e3767DF6370d82e4"
+
+        fun snapshot() = NodeSnapshot(
+            running = true, lifecycle = "RUNNING", network = "mainnet", engine = "rust",
+            beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
+            snapServingPeers = 2, snap2ServingPeers = 0,
+            clConnectedPeers = 0, clServedPeersLastMin = 2,
+            clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
+            elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
+            blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,
+            finalizedSlot = 1, syncStartPeriod = -1, syncCurrentPeriod = 0, syncTargetPeriod = 0,
+            verifiedHeadAgeMs = 1_000, uptimeSeconds = 60, peerHeaderRequests = 0,
+            peerHeaderRequestsServed = 0, peerBodyRequests = 0, peerBodyRequestsServed = 0,
+            readyPeerList = emptyList(), pauseCount = 0, totalPausedMs = 0,
+            lastPauseEpochMs = 0, lastResumeEpochMs = 0, lastWakeReason = null,
+        )
     }
 }
