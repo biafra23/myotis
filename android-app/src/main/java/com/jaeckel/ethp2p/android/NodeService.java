@@ -41,9 +41,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Foreground service that runs the ethp2p node — a stripped-down port of
- * {@code Main.runDaemon}: discv4 discovery + RLPx connector, no IPC, no beacon
- * client. Enough to verify peer discovery and handshakes work on Android.
+ * Foreground service that hosts the Myotis node on Android: one engine stack per enabled
+ * network (beacon light client, execution-layer peers, the loopback JSON-RPC listener),
+ * reached through the {@code :myotis-api} contract, with one documented exemption (CLAUDE.md:
+ * the TrueBlocks transaction-history scan, {@link #txHistoryService}, which takes the Java
+ * engine's raw connector via {@code debugStack}) — plus the host-side concerns around it:
+ * the ongoing notification, idle sleep and wake-on-request, the background catch-up passes,
+ * and the settings the Compose UI shares.
  */
 public final class NodeService extends Service {
 
@@ -1402,14 +1406,14 @@ public final class NodeService extends Service {
      */
     private String[] notificationText() {
         if (allStacksPaused()) {
-            return new String[]{"ethp2p node sleeping", "Networking off — a wallet request wakes it"};
+            return new String[]{"Myotis node sleeping", "Networking off — a wallet request wakes it"};
         }
         if (!networkAvailable()) {
             // Actively meant to be running, but the device has no connectivity — surface it: the
             // node can't discover peers or sync until a network returns.
-            return new String[]{"ethp2p node running", "No network connection"};
+            return new String[]{"Myotis node running", "No network connection"};
         }
-        return new String[]{"ethp2p node running", readinessSummary()};
+        return new String[]{"Myotis node running", readinessSummary()};
     }
 
     /** Per-network readiness on one line, e.g. {@code "mainnet ready · gnosis syncing"}; sorted by
@@ -2627,15 +2631,19 @@ public final class NodeService extends Service {
         // (practically impossible) null manager must not NPE the service start.
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) {
+            // The channel ID is the pre-rename "ethp2p_node" on purpose: a channel is keyed by
+            // ID in the system's notification settings, so renaming it would leave existing
+            // installs with an orphaned, muted-or-not "ethp2p node" entry beside the new one.
+            // Only the user-visible name moves to the product name.
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "ethp2p node",
+                    CHANNEL_ID, "Myotis node",
                     NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(channel);
         }
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(text)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setSmallIcon(R.drawable.ic_stat_myotis)
                 .setOngoing(true)
                 .build();
     }
