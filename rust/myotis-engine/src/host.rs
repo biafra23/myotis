@@ -2104,6 +2104,31 @@ pub fn eth_call_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json:
     }
 }
 
+/// `nativeCreateAccessListJson` (ABI ≥ 40): verified `eth_createAccessList`
+/// for the FULL JSON-RPC transaction object — the same `tx_json`, `block` and
+/// `overrides_json` as [`estimate_gas_tx_json`], the request checked as
+/// [`eth_call_tx_json`] checks it, every field applied or the request refused
+/// with the permanent `{"error","code":-32602}` envelope. Otherwise the access
+/// list JSON ([`eljson::access_list_json`]: the list the transaction touches,
+/// built as geth builds it, with the gas the run made with it used and that
+/// run's own revert or halt next to the list; `infeasible` for a request that
+/// cannot run within the caller's gas, fee cap or funds) or a retryable
+/// `{"error": "..."}`.
+pub fn create_access_list_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
+    let (tx, selector, overrides) = match parse_tx_args(tx_json, block, overrides_json) {
+        Ok(parsed) => parsed,
+        Err(json) => return json,
+    };
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(async { reader.create_access_list(anchor, tx, chain_id, overrides).await }) {
+        Ok(answer) => eljson::access_list_json(&answer),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// The request half of the transaction-object entry points. Every refusal of
 /// the request's own arguments is permanent (-32602), and decided before the
 /// handle is consulted: no retry, and no sync progress, changes a
@@ -3304,6 +3329,32 @@ mod tests {
         let earliest: serde_json::Value =
             serde_json::from_str(&estimate_gas_tx_json(i64::MIN, &format!("{{{to}}}"), "earliest", "")).unwrap();
         assert_eq!(earliest["code"], eljson::INVALID_PARAMS);
+    }
+
+    /// The access-list entry point shares the request checks (ABI 40): the
+    /// same refusals, before the handle, in the same words.
+    #[test]
+    fn create_access_list_json_refuses_bad_requests_before_the_handle() {
+        let to = r#""to":"0x2222222222222222222222222222222222222222""#;
+        assert_invalid_params(
+            &create_access_list_json(i64::MIN, &format!(r#"{{{to},"type":"0x4"}}"#), "", ""),
+            "requires an authorizationList",
+        );
+        assert_invalid_params(&create_access_list_json(i64::MIN, "not json", "", ""), "invalid transaction object");
+        assert_invalid_params(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "", "[]"), "state override");
+        let hash: serde_json::Value = serde_json::from_str(&create_access_list_json(
+            i64::MIN,
+            &format!("{{{to}}}"),
+            &format!("0x{}", "ab".repeat(32)),
+            "",
+        ))
+        .unwrap();
+        assert_eq!(hash["code"], eljson::INVALID_PARAMS);
+        // A well-formed request reaches the handle, which does not exist here.
+        let none: serde_json::Value =
+            serde_json::from_str(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "latest", "")).unwrap();
+        assert!(none["error"].is_string(), "{none}");
+        assert!(none.get("code").is_none(), "retryable, not permanent: {none}");
     }
 
     #[test]

@@ -40,6 +40,9 @@ pub trait Engine: Send + Sync {
     ) -> String;
     fn eth_call_tx(&self, tx: &str, block: &str, overrides: &str) -> String;
     fn estimate_gas_tx(&self, tx: &str, block: &str, overrides: &str) -> String;
+    /// `eth_createAccessList` for the transaction object (ABI 40): the engine's
+    /// access-list JSON, the list and gas next to the run's own failure.
+    fn create_access_list(&self, tx: &str, block: &str, overrides: &str) -> String;
     fn block_by_number(&self, tag: &str, full: bool) -> String;
     fn block_by_hash(&self, hash: &str, full: bool) -> String;
     fn fee_estimate(&self) -> String;
@@ -167,6 +170,9 @@ impl Engine for FfiEngine {
     }
     fn estimate_gas_tx(&self, tx: &str, block: &str, overrides: &str) -> String {
         ffi::estimate_gas_tx_json(self.handle, tx.into(), block.into(), overrides.into())
+    }
+    fn create_access_list(&self, tx: &str, block: &str, overrides: &str) -> String {
+        ffi::create_access_list_json(self.handle, tx.into(), block.into(), overrides.into())
     }
     fn block_by_number(&self, tag: &str, full: bool) -> String {
         ffi::get_block_by_number_json(self.handle, tag.into(), full)

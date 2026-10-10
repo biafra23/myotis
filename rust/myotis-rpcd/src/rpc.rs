@@ -110,7 +110,9 @@ fn arity(method: &str) -> Option<usize> {
         | "eth_getCode"
         | "eth_getBlockByNumber"
         | "eth_getBlockByHash" => 2,
-        "eth_getStorageAt" | "eth_feeHistory" => 3,
+        // transaction, block, state overrides (reth's signature; geth takes no
+        // override — one it would refuse as too many arguments is applied here)
+        "eth_getStorageAt" | "eth_feeHistory" | "eth_createAccessList" => 3,
         // transaction, block, state overrides, block overrides
         "eth_call" | "eth_estimateGas" => 4,
         _ => return None,
@@ -688,6 +690,7 @@ impl<E: Engine> Router<E> {
             }
             "eth_call" => self.eth_call(params, g),
             "eth_estimateGas" => self.eth_estimate_gas(params, g),
+            "eth_createAccessList" => self.eth_create_access_list(params, g),
             "eth_gasPrice" | "eth_maxPriorityFeePerGas" => {
                 let o = engine_object(&self.engine_ready(g)?.fee_estimate())?;
                 let key = if method == "eth_gasPrice" {
@@ -891,6 +894,33 @@ impl<E: Engine> Router<E> {
         )
     }
 
+    /// `eth_createAccessList`: the transaction object and the block as for
+    /// `eth_estimateGas`, a state override applied; the engine's list served
+    /// in geth's result shape — `{accessList, gasUsed}`, and the run's own
+    /// revert or halt as `error` NEXT TO them, never as a code-3 error.
+    fn eth_create_access_list(&self, params: &[Value], g: &Gate) -> Out {
+        let overrides = match state_override_param(params) {
+            OverrideParam::Malformed(why) => {
+                return invalid(format!("invalid state override: {why}"))
+            }
+            OverrideParam::Valid(j) => j,
+            OverrideParam::Absent => String::new(),
+        };
+        let Some(obj) = params.first().and_then(|v| v.as_object()) else {
+            return invalid("eth_createAccessList expects a transaction object as its first parameter");
+        };
+        let tx =
+            parse_tx(obj).or_else(|why| invalid(format!("invalid transaction object: {why}")))?;
+        let sel = state_selector_at(params, 1, "eth_createAccessList")?;
+        self.check_chain_id(&tx)?;
+        self.pin_servable(&sel, "eth_createAccessList", g)?;
+        access_list_outcome(
+            &self
+                .engine_ready(g)?
+                .create_access_list(&tx.canonical, &sel.value, &overrides),
+        )
+    }
+
     fn check_chain_id(&self, tx: &TxArgs) -> Result<(), Fail> {
         match &tx.chain_id {
             Some(c) if *c != self.engine.chain_id().to_string() => invalid(format!(
@@ -1088,22 +1118,75 @@ fn call_outcome(json: &str, estimate: bool) -> Out {
             Some(d) => Err(revert_fail(&d)),
             None => unavailable("malformed dataHex from engine"),
         },
-        Some("infeasible") => match o
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .filter(|r| !r.is_empty())
-        {
-            Some(r) => Err(Fail::Rpc {
-                code: -32000,
-                message: r.into(),
-                data: None,
-            }),
-            None => unavailable("infeasible without a reason from engine"),
-        },
-        _ => Err(Fail::Unavailable(
-            o.get("reason").and_then(|r| r.as_str()).map(str::to_owned),
-        )),
+        _ => Err(non_answer(&o)),
     }
+}
+
+/// The engine's non-answers, one mapping for every EVM entry point:
+/// `infeasible` is geth's -32000 in geth's words (a reasonless one is shape
+/// drift: retryable, never a confident answer), anything else the retryable
+/// -32000 with the engine's reason when it gave one.
+fn non_answer(o: &Map<String, Value>) -> Fail {
+    let reason = o
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned);
+    match (o.get("status").and_then(|s| s.as_str()), reason) {
+        (Some("infeasible"), Some(message)) => Fail::Rpc {
+            code: -32000,
+            message,
+            data: None,
+        },
+        (Some("infeasible"), None) => {
+            Fail::Unavailable(Some("infeasible without a reason from engine".into()))
+        }
+        (_, reason) => Fail::Unavailable(reason),
+    }
+}
+
+/// The engine's access-list JSON (ABI 40) as geth's `eth_createAccessList`
+/// result: `ok` → `{"accessList","gasUsed"}` with the run's own failure as
+/// `error` next to them (a revert's message decoded as [`revert_fail`]
+/// decodes it, the payload the engine sent), the permanent envelope →
+/// -32602, and every non-answer as [`call_outcome`] maps it ([`non_answer`]).
+fn access_list_outcome(json: &str) -> Out {
+    let o = engine_object(json)?;
+    let unavailable = |why: &str| Err(Fail::Unavailable(Some(why.into())));
+    match o.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let Some(list) = o.get("accessList").filter(|l| l.is_array()) else {
+                return unavailable("ok without an accessList from engine");
+            };
+            let Some(gas_used) = o.get("gasUsed").and_then(|g| g.as_u64()) else {
+                return unavailable("ok without gasUsed from engine");
+            };
+            let mut result = Map::new();
+            result.insert("accessList".into(), list.clone());
+            result.insert("gasUsed".into(), Value::String(hex_quantity(gas_used)));
+            if let Some(error) = o.get("vmError").and_then(|e| e.as_str()) {
+                let message = match o.get("revertDataHex").map(engine_bytes_of) {
+                    // A revert: the reason decoded as the code-3 error words it.
+                    Some(Some(data)) => match revert_fail(&data) {
+                        Fail::Rpc { message, .. } => message,
+                        _ => error.to_string(),
+                    },
+                    // Malformed payload hex is shape drift: retryable, never a
+                    // confident answer.
+                    Some(None) => return unavailable("malformed revertDataHex from engine"),
+                    None => error.to_string(),
+                };
+                result.insert("error".into(), Value::String(message));
+            }
+            Ok(Value::Object(result).to_string())
+        }
+        _ => Err(non_answer(&o)),
+    }
+}
+
+/// [`engine_bytes`] for a present value.
+fn engine_bytes_of(v: &Value) -> Option<Vec<u8>> {
+    engine_bytes(Some(v))
 }
 
 /// geth's execution-reverted error: code 3, `data` = the raw payload, the

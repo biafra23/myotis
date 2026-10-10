@@ -172,6 +172,7 @@ misbehaves against the node: what it asked, in what order, and what it got.
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | verified | Snap proof at the head or at `finalized`. A number pin is served from head state only within [head-64, head+16]. `pending` nonce adds the node's own broadcasts. |
 | `eth_call` | verified | revm over proven state. State overrides applied; `blockOverrides` refused. A tx object with an explicit `type` or gas/fee/list fields goes through the engine's transaction-object call, which applies or refuses them. |
 | `eth_estimateGas` | verified | Full transaction object, state overrides. |
+| `eth_createAccessList` | verified | Full transaction object, state overrides (a third parameter geth does not take). geth's result: `{accessList, gasUsed}`, with the run's own revert or halt as `error` next to them. |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | verified | The engine's fee suggestion (see gaps). |
 | `eth_feeHistory` | verified | Newest block required. At most 1024 blocks and 100 percentiles. |
 | `eth_getBlockByNumber`, `eth_getBlockByHash` | verified | Hashes or full txs; recent/anchored blocks only. Unknown blocks are `null`. |

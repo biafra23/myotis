@@ -21,6 +21,7 @@
 //! the delegate's code (fetched, again, through the oracle). BLOCKHASH is
 //! unsupported — the `Database` returns an error, surfaced as [`EvmError`].
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use revm::context::result::{ExecutionResult, HaltReason, InvalidTransaction, Output};
@@ -32,6 +33,7 @@ use revm::context_interface::transaction::{
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
 use revm::primitives::hardfork::SpecId;
+use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::{Address, Bytes, TxKind, B256, U256};
 use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
 use revm::interpreter::{CallInputs, CallOutcome, Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
@@ -51,6 +53,9 @@ struct RequestInspector<'a> {
     /// pass's wave fetches the code of these and no other (#532 review).
     /// `None` outside discovery passes.
     code_needed: Option<&'a CodeNeeded>,
+    /// Records, for `eth_createAccessList`, every address and storage key the
+    /// run touches ([`AccessListRecorder`]). `None` on every other run.
+    access_list: Option<&'a AccessListRecorder>,
 }
 
 impl<CTX> Inspector<CTX> for RequestInspector<'_> {
@@ -74,6 +79,9 @@ impl<CTX> Inspector<CTX> for RequestInspector<'_> {
                 }
             }
         }
+        if let Some(recorder) = self.access_list {
+            recorder.record(interp);
+        }
     }
 
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
@@ -84,6 +92,125 @@ impl<CTX> Inspector<CTX> for RequestInspector<'_> {
     }
 }
 
+/// geth's `AccessListTracer` (`eth/tracers/logger/access_list_tracer.go`),
+/// behind `eth_createAccessList`: the addresses and storage keys a run touches
+/// beyond what every transaction warms anyway (EIP-2929) — the sender, the
+/// recipient (for a creation, the address the contract gets) and the fork's
+/// precompiles are left out as addresses, but a storage key always lists its
+/// account, so the recipient's own slots are in. The list is kept sorted by
+/// address and key, so the same run always yields the same list (geth
+/// iterates a map and does not).
+struct AccessListRecorder {
+    excluded: HashSet<Address>,
+    /// What the recording starts from — the list the run is made with — so
+    /// each pass of the convergence loop ([`EvmExecutor::converge`]) records
+    /// from the same seed and the list left behind is the returned run's.
+    seed: BTreeMap<Address, BTreeSet<B256>>,
+    list: std::cell::RefCell<BTreeMap<Address, BTreeSet<B256>>>,
+}
+
+impl AccessListRecorder {
+    /// A recorder seeded with `seed` (geth folds the caller's own list in the
+    /// same way: an excluded address stays out unless one of its keys is
+    /// listed), leaving `excluded` out of every address-only access.
+    fn new(seed: &[AccessListItem], excluded: HashSet<Address>) -> AccessListRecorder {
+        let mut map: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
+        for item in seed {
+            let address = Address::from(item.address);
+            if !excluded.contains(&address) {
+                map.entry(address).or_default();
+            }
+            for key in &item.storage_keys {
+                map.entry(address).or_default().insert(B256::from(*key));
+            }
+        }
+        AccessListRecorder { excluded, list: std::cell::RefCell::new(map.clone()), seed: map }
+    }
+
+    /// Back to the seed, at the start of each pass: a pass that ran against
+    /// placeholders may have taken branches the returned run does not.
+    fn reset(&self) {
+        *self.list.borrow_mut() = self.seed.clone();
+    }
+
+    /// The tracer's `OnOpcode`, before the opcode runs: a storage opcode lists
+    /// its account and key, an account opcode or a call its address.
+    fn record(&self, interp: &Interpreter) {
+        use revm::bytecode::opcode;
+        let address_in = |word: U256| Address::from_word(B256::from(word.to_be_bytes::<32>()));
+        match interp.bytecode.opcode() {
+            opcode::SLOAD | opcode::SSTORE => {
+                if let Ok(slot) = interp.stack.peek(0) {
+                    self.add_slot(interp.input.target_address, B256::from(slot.to_be_bytes::<32>()));
+                }
+            }
+            opcode::EXTCODECOPY
+            | opcode::EXTCODEHASH
+            | opcode::EXTCODESIZE
+            | opcode::BALANCE
+            | opcode::SELFDESTRUCT => {
+                if let Ok(word) = interp.stack.peek(0) {
+                    self.add_address(address_in(word));
+                }
+            }
+            // geth reads the address only from a stack a call can pop.
+            opcode::DELEGATECALL | opcode::CALL | opcode::STATICCALL | opcode::CALLCODE
+                if interp.stack.len() >= 5 =>
+            {
+                if let Ok(word) = interp.stack.peek(1) {
+                    self.add_address(address_in(word));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn add_address(&self, address: Address) {
+        if !self.excluded.contains(&address) {
+            self.list.borrow_mut().entry(address).or_default();
+        }
+    }
+
+    fn add_slot(&self, address: Address, key: B256) {
+        self.list.borrow_mut().entry(address).or_default().insert(key);
+    }
+
+    /// The list so far, sorted by address and key.
+    fn items(&self) -> Vec<AccessListItem> {
+        self.list
+            .borrow()
+            .iter()
+            .map(|(address, keys)| AccessListItem {
+                address: address.into_array(),
+                storage_keys: keys.iter().map(|key| key.0).collect(),
+            })
+            .collect()
+    }
+}
+
+/// What `eth_createAccessList` answers (geth's `accessListResult`): the list,
+/// the gas the run made with it used, and that run's own failure, if any —
+/// geth reports a revert or a halt in the result's `error` next to the list,
+/// not instead of it, so a wallet still gets the list for a transaction it
+/// is about to find out fails.
+#[derive(Debug)]
+pub struct CreatedAccessList {
+    pub access_list: Vec<AccessListItem>,
+    /// What the final run used, after refunds (geth's `UsedGas`).
+    pub gas_used: u64,
+    /// [`EvmError::Reverted`] with the payload, or the halt ([`EvmError::OutOfGas`],
+    /// [`EvmError::Halted`]); `None` when the run succeeded.
+    pub error: Option<EvmError>,
+}
+
+/// How many runs `eth_createAccessList` makes before giving up on a list that
+/// keeps changing. geth runs until the list stops changing, with no bound but
+/// its request deadline: the list only ever grows (a run with the list applied
+/// touches what the run without it touched, and a pre-warmed slot can only open
+/// a branch, not close one), so it settles in two runs for nearly every
+/// transaction and a few more for one that branches on `gasleft()`.
+const ACCESS_LIST_ROUNDS: usize = 10;
+
 use crate::block::BlockContext;
 use crate::cache::{BytecodeCache, StateProofCache};
 use crate::database::{AccessSet, OracleDatabase};
@@ -91,7 +218,7 @@ use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
 use crate::overrides::StateOverrides;
-use crate::tx::{Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_SET_CODE};
+use crate::tx::{AccessListItem, Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_LEGACY, TYPE_SET_CODE};
 
 /// The gas a view call is given — the mainnet block gas limit. Also set as the
 /// per-tx gas cap so revm's spec-default cap (2²⁴ on the latest fork, EIP-7825)
@@ -397,7 +524,7 @@ impl EvmExecutor {
         // passes fetch what the run touches in parallel waves. A single real
         // run fetched each miss one round-trip at a time — the 4–33 s #532
         // measured. The search's probes below then run on what it fetched.
-        let run = self.converge(&db, spec, tx, hi, ctx, PREFETCH_ITERATION_CAP).map_err(|e| match e {
+        let run = self.converge(&db, spec, tx, hi, ctx, PREFETCH_ITERATION_CAP, None).map_err(|e| match e {
             // The intrinsic cost or the EIP-7623 floor above the ceiling: for an
             // estimate that is the caller's allowance talking, exactly like
             // running out of gas during execution — geth answers the same.
@@ -556,6 +683,34 @@ impl EvmExecutor {
         overrides: StateOverrides,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
+        let (spec, db, gas_limit) = self.prepare_tx_call(tx, ctx, overrides)?;
+        match self.run_converged(&db, spec, tx, gas_limit, ctx, cap) {
+            // Running dry is the caller's answer under a limit the caller set. A
+            // larger one was capped to the budget, so running dry there is
+            // refused rather than answered for a smaller limit. Without one it
+            // stays the ordinary out-of-gas at this executor's own budget.
+            Err(EvmError::OutOfGas) => Err(match tx.gas {
+                Some(gas) if gas <= VIEW_CALL_GAS => EvmError::CallOutOfGas,
+                Some(gas) => EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: gas },
+                None => EvmError::OutOfGas,
+            }),
+            Err(error) => Err(before_the_run(gas_limit, error)),
+            ok => ok,
+        }
+    }
+
+    /// Everything an `eth_call` of a transaction object does before it runs,
+    /// shared by [`Self::call_tx`] and [`Self::create_access_list`]: the
+    /// request's own refusals, then geth's checks in its order — each reported
+    /// with the limit it was made against, geth's `err: … (supplied gas N)` —
+    /// and the database the run reads, with the overrides and the request's
+    /// nonce layered in. Yields the spec, the database and the call's gas limit.
+    fn prepare_tx_call(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<(SpecId, OracleDatabase, u64), EvmError> {
         self.oracle.check_request()?;
         let spec = spec_for_context(ctx)?;
         check_tx(tx, ctx, spec)?;
@@ -563,9 +718,7 @@ impl EvmExecutor {
         // override included — exactly as for an estimate.
         let db = self.database_for_with(ctx, with_sender_nonce(overrides, tx)?);
         let gas_limit = tx.gas.map_or(VIEW_CALL_GAS, |gas| gas.min(VIEW_CALL_GAS));
-        // Then geth's checks before the run, in its order, each reported with
-        // the limit it was made against — geth's `err: … (supplied gas N)`.
-        let supplied = |error: EvmError| EvmError::CallFailed { supplied_gas: gas_limit, error: Box::new(error) };
+        let supplied = |error: EvmError| supplied_gas(gas_limit, error);
         check_fee_cap(tx, ctx).map_err(supplied)?;
         // The rest read state (the sender's balance below, the target in the
         // loop's prime), so the first wave goes here, as for an estimate (#532
@@ -587,23 +740,97 @@ impl EvmExecutor {
                 detail: format!("gas × fee cap ({gas_limit} × {fee_cap}) exceeds the 2^128 wei this engine can price"),
             });
         }
-        match self.run_converged(&db, spec, tx, gas_limit, ctx, cap) {
-            // Running dry is the caller's answer under a limit the caller set. A
-            // larger one was capped to the budget, so running dry there is
-            // refused rather than answered for a smaller limit. Without one it
-            // stays the ordinary out-of-gas at this executor's own budget.
-            Err(EvmError::OutOfGas) => Err(match tx.gas {
-                Some(gas) if gas <= VIEW_CALL_GAS => EvmError::CallOutOfGas,
-                Some(gas) => EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: gas },
-                None => EvmError::OutOfGas,
-            }),
-            // The intrinsic cost or the floor above the limit: checks before the
-            // run too, which revm makes.
-            Err(error @ (EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. })) => {
-                Err(supplied(error))
-            }
-            other => other,
+        Ok((spec, db, gas_limit))
+    }
+
+    /// `eth_createAccessList` for a transaction object: the EIP-2930 access
+    /// list for `tx` at `ctx`, built as geth builds it (`internal/ethapi.
+    /// AccessList`). The run is traced for every address and storage key it
+    /// touches ([`AccessListRecorder`], geth's `AccessListTracer`: the sender,
+    /// the recipient and the precompiles stay out, the recipient's own slots
+    /// are in), then made again with that list applied — pre-warming can open
+    /// a branch — until the list stops changing ([`ACCESS_LIST_ROUNDS`]). A
+    /// list the caller sent is the seed. The answer carries the gas the final
+    /// run used and, when that run itself failed, its revert or halt
+    /// ([`CreatedAccessList::error`]) next to the list, as geth's result does.
+    ///
+    /// The request is checked exactly as [`Self::call_tx`] checks it, with the
+    /// same gas limit (`gas`, capped at [`VIEW_CALL_GAS`]; absent, the budget)
+    /// and the same fee and funds checks (an answer in geth's words,
+    /// [`EvmError::is_infeasible`]); a `gas` above the budget whose run runs
+    /// out there is refused rather than answered for a smaller limit, as the
+    /// call refuses it. `overrides` are layered over verified state for the
+    /// runs only. One deliberate difference from geth: a request without a
+    /// fee runs fee-less, as `eth_call` runs it, where geth fills in a fee from
+    /// its own tip oracle and then holds the sender to it.
+    pub fn create_access_list(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+    ) -> Result<CreatedAccessList, EvmError> {
+        self.create_access_list_within(tx, ctx, overrides, ACCESS_LIST_ROUNDS)
+    }
+
+    /// [`Self::create_access_list`] giving up after `rounds` runs (tests pin
+    /// the bound with a list that needs more).
+    fn create_access_list_within(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+        rounds: usize,
+    ) -> Result<CreatedAccessList, EvmError> {
+        let (spec, db, gas_limit) = self.prepare_tx_call(tx, ctx, overrides)?;
+        let from = Address::from(tx.from);
+        let to = match tx.to {
+            Some(to) => Address::from(to),
+            // A creation warms the address the contract gets, from the sender's
+            // nonce as the run sees it (the request's, layered over the account's).
+            None => from.create(db.basic_ref(from)?.map_or(0, |account| account.nonce)),
+        };
+        let mut excluded = HashSet::from([from, to]);
+        excluded.extend(Precompiles::new(PrecompileSpecId::from_spec_id(spec)).addresses().copied());
+        let mut current = AccessListRecorder::new(tx.access_list.as_deref().unwrap_or(&[]), excluded.clone()).items();
+        let mut listed = tx.clone();
+        // The confirmation runs carry the list under the type the list makes
+        // (`TxRequest::tx_type`'s derivation: EIP-2930 once it is non-empty),
+        // not under an explicit legacy `type` the request named for a
+        // transaction that had none yet — the shape a request is refused for,
+        // and one that only revm's leniency runs. geth applies the list
+        // regardless of the declared type, and so does this; a wallet asks
+        // for the list of a transaction it will send as type 1 or later.
+        if listed.tx_type == Some(TYPE_LEGACY) {
+            listed.tx_type = None;
         }
+        for _ in 0..rounds {
+            listed.access_list = Some(current.clone());
+            let recorder = AccessListRecorder::new(&current, excluded.clone());
+            let result = self
+                .converge(&db, spec, &listed, gas_limit, ctx, PREFETCH_ITERATION_CAP, Some(&recorder))
+                .map_err(|error| before_the_run(gas_limit, error))?;
+            let next = recorder.items();
+            if next != current {
+                current = next;
+                continue;
+            }
+            // What the receipt would say (geth's `UsedGas`): after refunds.
+            let gas_used = result.tx_gas_used();
+            let error = match result {
+                ExecutionResult::Success { .. } => None,
+                ExecutionResult::Revert { output, .. } => Some(EvmError::Reverted { data: output.to_vec() }),
+                // Running dry at the budget under a larger limit the caller set
+                // says nothing about that limit: refused, as the call refuses it.
+                ExecutionResult::Halt { reason: HaltReason::OutOfGas(_), .. }
+                    if tx.gas.is_some_and(|gas| gas > VIEW_CALL_GAS) =>
+                {
+                    return Err(EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: tx.gas.unwrap_or(0) });
+                }
+                ExecutionResult::Halt { reason, .. } => Some(map_halt(reason)),
+            };
+            return Ok(CreatedAccessList { access_list: current, gas_used, error });
+        }
+        Err(EvmError::AccessListNotSettled { rounds })
     }
 
     fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
@@ -630,12 +857,15 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
-        self.execute_recording(db, spec, tx, gas_limit, ctx, None)
+        self.execute_recording(db, spec, tx, gas_limit, ctx, None, None)
     }
 
     /// [`Self::execute_with_db`], recording the accounts whose code the run
     /// needed into `code_needed` when given (a discovery pass; see
-    /// [`RequestInspector`]).
+    /// [`RequestInspector`]), and the addresses and storage keys it touched
+    /// into `access_list` when given (`eth_createAccessList`; the recorder is
+    /// reset first, so it holds this run's accesses and no earlier pass's).
+    #[allow(clippy::too_many_arguments)]
     fn execute_recording(
         &self,
         db: &OracleDatabase,
@@ -644,17 +874,25 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
         code_needed: Option<&CodeNeeded>,
+        access_list: Option<&AccessListRecorder>,
     ) -> Result<ExecutionResult, EvmError> {
         self.oracle.check_request()?;
         self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cfg = view_cfg(spec, ctx.chain_id);
         let tx = tx_env(tx, gas_limit, ctx.chain_id)?;
+        if let Some(recorder) = access_list {
+            recorder.reset();
+        }
 
         let mut evm = Context::mainnet()
             .with_ref_db(db)
             .with_block(ctx.block_env())
             .with_cfg(cfg)
-            .build_mainnet_with_inspector(RequestInspector { oracle: self.oracle.as_ref(), code_needed });
+            .build_mainnet_with_inspector(RequestInspector {
+                oracle: self.oracle.as_ref(),
+                code_needed,
+                access_list,
+            });
 
         let result = evm.inspect_tx(tx);
         // Cancellation takes precedence over an interpreter stop (including a
@@ -738,12 +976,15 @@ impl EvmExecutor {
         ctx: &BlockContext,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
-        self.converge(db, spec, tx, gas_limit, ctx, cap).and_then(finish_call)
+        self.converge(db, spec, tx, gas_limit, ctx, cap, None).and_then(finish_call)
     }
 
     /// The convergence loop itself: the converged run's whole result — its
     /// output, and the gas it used, which [`Self::estimate_tx`] searches
-    /// from.
+    /// from. With `access_list`, every pass records into it, and the list it
+    /// holds on return is the returned run's: a pass is only returned straight
+    /// after it ran.
+    #[allow(clippy::too_many_arguments)]
     fn converge(
         &self,
         db: &OracleDatabase,
@@ -752,6 +993,7 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
         cap: usize,
+        access_list: Option<&AccessListRecorder>,
     ) -> Result<ExecutionResult, EvmError> {
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
@@ -778,7 +1020,8 @@ impl EvmExecutor {
             db.set_sentinel(sentinel);
             let misses_before = db.sentinel_misses();
             let code_needed = CodeNeeded::default();
-            let outcome = self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed));
+            let outcome =
+                self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed), access_list);
             db.set_sentinel(false);
             let fresh = db.take_access_set().minus(&seen);
 
@@ -895,6 +1138,27 @@ impl EvmExecutor {
         let code_needed: std::collections::HashSet<[u8; 20]> = tx.to.into_iter().chain(delegates).collect();
         let accounts = std::iter::once(tx.from).chain(code_needed.iter().copied()).collect();
         self.prefetch_wave(ctx, &AccessSet { accounts, ..Default::default() }, &code_needed);
+    }
+}
+
+/// geth's `eth_call` wording for a check that failed before the run, with the
+/// limit it was made against: `err: … (supplied gas N)`.
+fn supplied_gas(gas_limit: u64, error: EvmError) -> EvmError {
+    EvmError::CallFailed { supplied_gas: gas_limit, error: Box::new(error) }
+}
+
+/// A run's error as a transaction-object call reports it: the intrinsic cost
+/// or the EIP-7623 floor above the limit is a check before the run too, which
+/// revm makes, so it is worded as the other pre-run checks are
+/// ([`supplied_gas`]); anything else is what it is. ONE mapping for the call
+/// and the access list, so a new pre-run check cannot be worded in one and
+/// not the other.
+fn before_the_run(gas_limit: u64, error: EvmError) -> EvmError {
+    match error {
+        error @ (EvmError::IntrinsicGasTooLow { .. } | EvmError::FloorDataGasTooLow { .. }) => {
+            supplied_gas(gas_limit, error)
+        }
+        other => other,
     }
 }
 
@@ -1201,7 +1465,8 @@ mod tests {
     #[test]
     fn cancelled_instruction_sets_stop_without_running_bytecode() {
         let mut interpreter = Interpreter::default_ext();
-        RequestInspector { oracle: &CancelledOracle, code_needed: None }.step(&mut interpreter, &mut ());
+        RequestInspector { oracle: &CancelledOracle, code_needed: None, access_list: None }
+            .step(&mut interpreter, &mut ());
         assert!(interpreter.bytecode.action().is_some());
     }
 
@@ -2625,6 +2890,249 @@ mod tests {
         // 21000 + 2400, searched and buffered like any metered estimate.
         assert_eq!(lowest_limit_that_runs(&exec, &tx, &c), 23_400);
         assert_is_the_searched_estimate(&exec, &tx, &c, exec.estimate_tx(&tx, &c, StateOverrides::new()).unwrap());
+    }
+
+    // ---- eth_createAccessList ---------------------------------------------
+
+    const OTHER: [u8; 20] = [0x77; 20];
+    const THIRD: [u8; 20] = [0x88; 20];
+
+    /// PUSH20 `address`; BALANCE; POP.
+    fn balance_of(address: [u8; 20]) -> Vec<u8> {
+        let mut code = vec![0x73];
+        code.extend_from_slice(&address);
+        code.extend_from_slice(&[0x31, 0x50]);
+        code
+    }
+
+    /// PUSH1 `slot`; SLOAD; POP.
+    fn sload(slot: u8) -> Vec<u8> {
+        vec![0x60, slot, 0x54, 0x50]
+    }
+
+    /// CALL `address` with no value, no data and all remaining gas; POP the result.
+    fn call_to(address: [u8; 20]) -> Vec<u8> {
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(&address);
+        code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        code
+    }
+
+    fn slot_key(byte: u8) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[31] = byte;
+        key
+    }
+
+    fn created_with(exec: &EvmExecutor, tx: &TxRequest) -> CreatedAccessList {
+        exec.create_access_list(tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap()
+    }
+
+    /// geth's tracer: a storage opcode lists its account and key, a call or an
+    /// account opcode its address — sorted here, where geth's map order is not
+    /// — and the gas is the run's WITH the list applied.
+    #[test]
+    fn create_access_list_lists_what_the_run_touches() {
+        let mut target = sload(0);
+        target.extend(call_to(OTHER));
+        target.extend(balance_of(THIRD));
+        target.push(0x00);
+        let mut other = sload(1);
+        other.push(0x00);
+        let exec = executor_with_accounts(&[(TARGET, target, U256::ZERO, 1), (OTHER, other, U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+
+        let created = created_with(&exec, &tx);
+        assert_eq!(
+            created.access_list,
+            vec![
+                AccessListItem { address: TARGET, storage_keys: vec![slot_key(0)] },
+                AccessListItem { address: OTHER, storage_keys: vec![slot_key(1)] },
+                AccessListItem { address: THIRD, storage_keys: vec![] },
+            ]
+        );
+        assert!(created.error.is_none(), "{:?}", created.error);
+        // The gas is what the transaction uses WITH its list: the run made with
+        // it, not the bare run. (Here the list costs more than it saves — each
+        // entry saves 200 over a cold access, and the recipient's entry pays
+        // its 2400 address charge although the recipient is warm anyway —
+        // which is EIP-2930's pricing, not this answer's business.)
+        let mut listed = tx.clone();
+        listed.access_list = Some(created.access_list.clone());
+        let with_list = exec.run_tx(&listed, VIEW_CALL_GAS, &c, StateOverrides::new()).unwrap().tx_gas_used();
+        let bare = exec.run_tx(&tx, VIEW_CALL_GAS, &c, StateOverrides::new()).unwrap().tx_gas_used();
+        assert_eq!(created.gas_used, with_list);
+        assert_ne!(with_list, bare);
+    }
+
+    /// What every transaction warms is not listed: the sender, the recipient
+    /// and the precompiles — geth's exclusions.
+    #[test]
+    fn create_access_list_leaves_out_the_sender_the_recipient_and_precompiles() {
+        let mut target = balance_of(SENDER);
+        target.extend_from_slice(&[0x30, 0x31, 0x50]); // ADDRESS; BALANCE; POP
+        let mut identity = [0u8; 20];
+        identity[19] = 0x04;
+        target.extend(call_to(identity));
+        target.push(0x00);
+        let exec = executor_with_accounts(&[(TARGET, target, U256::ZERO, 1)]);
+        let created = created_with(&exec, &TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO));
+        assert!(created.access_list.is_empty(), "{:?}", created.access_list);
+        assert!(created.error.is_none(), "{:?}", created.error);
+    }
+
+    /// The caller's own list seeds the answer as geth seeds it: an excluded
+    /// address without keys is dropped, one with a key stays, as does any other.
+    #[test]
+    fn create_access_list_keeps_the_callers_list_as_geth_keeps_it() {
+        let exec = executor_with_accounts(&[(TARGET, vec![0x00], U256::ZERO, 1)]);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.access_list = Some(vec![
+            AccessListItem { address: THIRD, storage_keys: vec![] },
+            AccessListItem { address: TARGET, storage_keys: vec![] },
+            AccessListItem { address: SENDER, storage_keys: vec![slot_key(9)] },
+        ]);
+        let created = created_with(&exec, &tx);
+        assert_eq!(
+            created.access_list,
+            vec![
+                AccessListItem { address: SENDER, storage_keys: vec![slot_key(9)] },
+                AccessListItem { address: THIRD, storage_keys: vec![] },
+            ]
+        );
+    }
+
+    /// A run that fails still has a list: geth reports the revert (or halt) in
+    /// the result next to it, never instead of it.
+    #[test]
+    fn create_access_list_reports_the_runs_revert_next_to_the_list() {
+        let mut target = sload(0);
+        target.extend_from_slice(&[0x60, 0x00, 0x80, 0xfd]); // PUSH1 0; DUP1; REVERT
+        let exec = executor_with_accounts(&[(TARGET, target, U256::ZERO, 1)]);
+        let created = created_with(&exec, &TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO));
+        assert_eq!(created.access_list, vec![AccessListItem { address: TARGET, storage_keys: vec![slot_key(0)] }]);
+        assert!(matches!(created.error, Some(EvmError::Reverted { ref data }) if data.is_empty()), "{:?}", created.error);
+        assert!(created.gas_used > PLAIN_TRANSFER_GAS);
+
+        // Running out of the caller's gas is reported the same way, at that limit.
+        let exec = executor_with_accounts(&[(TARGET, vec![0x5b, 0x60, 0x00, 0x56], U256::ZERO, 1)]); // JUMPDEST; PUSH1 0; JUMP
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(100_000);
+        let created = created_with(&exec, &tx);
+        assert!(matches!(created.error, Some(EvmError::OutOfGas)), "{:?}", created.error);
+        assert_eq!(created.gas_used, 100_000);
+        // Above the budget, running out at the budget says nothing about the
+        // caller's limit: refused, as the call refuses it.
+        tx.gas = Some(VIEW_CALL_GAS + 1);
+        let refused = exec.create_access_list(&tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new());
+        assert!(matches!(refused, Err(EvmError::CallBudgetExceeded { .. })), "{refused:?}");
+    }
+
+    /// A creation warms the address the contract gets — from the request's
+    /// nonce, else the sender's — so that address is listed only through its
+    /// own slots, like any recipient.
+    #[test]
+    fn create_access_list_for_a_creation_leaves_out_the_new_contracts_address() {
+        let mut init = vec![0x30, 0x31, 0x50]; // ADDRESS; BALANCE; POP
+        init.extend(sload(0));
+        init.push(0x00);
+        let exec = executor_with_accounts(&[(SENDER, vec![], U256::ZERO, 5)]);
+        let mut tx = TxRequest::call(SENDER, None, Bytes::from(init), U256::ZERO);
+        let at_nonce = |nonce: u64| Address::from(SENDER).create(nonce).into_array();
+
+        let created = created_with(&exec, &tx);
+        assert_eq!(created.access_list, vec![AccessListItem { address: at_nonce(5), storage_keys: vec![slot_key(0)] }]);
+        tx.nonce = Some(7);
+        let created = created_with(&exec, &tx);
+        assert_eq!(created.access_list, vec![AccessListItem { address: at_nonce(7), storage_keys: vec![slot_key(0)] }]);
+    }
+
+    /// `PUSH1 0; SLOAD; POP; GAS; PUSH3 threshold; GT; PUSH1 dest; JUMPI; STOP;
+    /// JUMPDEST; PUSH1 1; SLOAD; POP; STOP` — slot 1 is touched only when the
+    /// gas left after reading slot 0 is below `threshold`. Pre-warming slot 0
+    /// makes the read cheaper but the list's own charge (EIP-2930: 2400 per
+    /// address, 1900 per key) is paid up front and outweighs it, so each entry
+    /// the list gains lowers the gas left at the branch.
+    fn gas_branching_target(threshold: u32) -> Vec<u8> {
+        let [_, t2, t1, t0] = threshold.to_be_bytes();
+        vec![
+            0x60, 0x00, 0x54, 0x50, // PUSH1 0; SLOAD; POP
+            0x5a, 0x62, t2, t1, t0, 0x11, // GAS; PUSH3 threshold; GT  (threshold > gas left)
+            0x60, 0x0e, 0x57, 0x00, // PUSH1 14; JUMPI; STOP
+            0x5b, 0x60, 0x01, 0x54, 0x50, 0x00, // JUMPDEST; PUSH1 1; SLOAD; POP; STOP
+        ]
+    }
+
+    /// A list the confirmation run changes is carried forward and confirmed
+    /// again — geth's loop — and a list that keeps changing past the bound is
+    /// no answer: the branch above opens a second slot only once the first is
+    /// listed, so the list settles on the third run and not within two.
+    #[test]
+    fn create_access_list_confirms_a_list_that_opened_a_branch_and_bounds_the_rounds() {
+        // At the branch: 100000 − 21000 − PUSH1 3 − SLOAD − POP 2 − GAS 2, less the
+        // list's charge — 76893 bare, 74593 with slot 0 listed, 72693 with both.
+        let exec = executor_with_accounts(&[(TARGET, gas_branching_target(75_000), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(100_000);
+        let created = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        assert_eq!(
+            created.access_list,
+            vec![AccessListItem { address: TARGET, storage_keys: vec![slot_key(0), slot_key(1)] }]
+        );
+        assert!(created.error.is_none(), "{:?}", created.error);
+        // The gas is the confirmed run's: with both slots listed, the branch taken.
+        let mut listed = tx.clone();
+        listed.access_list = Some(created.access_list.clone());
+        let confirmed = exec.run_tx(&listed, 100_000, &c, StateOverrides::new()).unwrap().tx_gas_used();
+        assert_eq!(created.gas_used, confirmed);
+        let unsettled = exec.create_access_list_within(&tx, &c, StateOverrides::new(), 2).unwrap_err();
+        assert!(matches!(unsettled, EvmError::AccessListNotSettled { rounds: 2 }), "{unsettled}");
+        assert!(!unsettled.is_refusal() && !unsettled.is_infeasible(), "retryable: {unsettled}");
+    }
+
+    /// A request that names the legacy type gets the same list, confirmed
+    /// under the type the list makes: geth applies the list regardless of the
+    /// declared type, and the confirmation runs never carry the shape a
+    /// request is refused for (a legacy transaction with an access list).
+    #[test]
+    fn create_access_list_confirms_an_explicitly_legacy_request_under_the_lists_type() {
+        let exec = executor_with_accounts(&[(TARGET, gas_branching_target(75_000), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(100_000);
+        let derived = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        tx.tx_type = Some(TYPE_LEGACY);
+        let legacy = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        assert_eq!(legacy.access_list, derived.access_list);
+        assert_eq!(legacy.access_list.len(), 1);
+        assert_eq!(legacy.access_list[0].storage_keys, vec![slot_key(0), slot_key(1)]);
+        assert_eq!(legacy.gas_used, derived.gas_used);
+        assert!(legacy.error.is_none(), "{:?}", legacy.error);
+        // A type the list fits is kept: the run is a dynamic-fee one, as asked.
+        tx.tx_type = Some(TYPE_DYNAMIC_FEE);
+        tx.fees = Fees::DynamicFee { max_fee_per_gas: 0, max_priority_fee_per_gas: 0 };
+        let dynamic = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        assert_eq!(dynamic.access_list, derived.access_list);
+    }
+
+    /// The request is checked as the call checks it: a limit below the
+    /// intrinsic cost, or funds the fee needs, is geth's answer, never a list.
+    #[test]
+    fn create_access_list_checks_the_request_as_the_call_checks_it() {
+        let exec = executor_with_accounts(&[(TARGET, vec![0x00], U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::from(vec![0x01; 64]), U256::ZERO);
+        tx.gas = Some(PLAIN_TRANSFER_GAS);
+        let short = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap_err();
+        assert!(short.is_infeasible(), "{short}");
+        assert!(short.to_string().starts_with("err: intrinsic gas too low"), "{short}");
+        let mut priced = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        priced.fees = Fees::Legacy { gas_price: 10 };
+        let poor = exec.create_access_list(&priced, &c, StateOverrides::new()).unwrap_err();
+        assert!(poor.is_infeasible(), "{poor}");
+        assert!(poor.to_string().contains("insufficient funds for gas * price + value"), "{poor}");
     }
 
     /// `gas` is the ceiling: the answer never exceeds it, a transaction that

@@ -217,7 +217,19 @@ uniffi::setup_scaffolding!();
 ///      with an engine that silently lacks it. The JVM desktop and daemon
 ///      (`RustMyotisEngine.create`, when the host passes no DnsServers port)
 ///      and myotis-rpcd call it; iOS and the Node addon do not yet.
-pub const ABI_VERSION: i32 = 39;
+/// v40: added create_access_list_json (UniFFI, the C ABI and Node):
+///      eth_createAccessList for the FULL JSON-RPC transaction object — the
+///      EIP-2930 access list the transaction touches, built as geth builds it
+///      (traced with geth's exclusions, then confirmed with the list applied
+///      until it stops changing), with the gas the run made with it used and
+///      that run's own revert or halt NEXT TO the list, as geth's result
+///      carries it (`{"status":"ok","accessList","gasUsed"[,"vmError"
+///      [,"revertDataHex"]]}` — `vmError`, since a top-level `error` is the
+///      engine's failure envelope); the request checked as eth_call_tx_json checks
+///      it, so `infeasible`, the permanent envelope and the block selector
+///      behave as there. The JVM `RustEngineNative` wrappers, the Node addon
+///      and the iOS wrapper moved with it.
+pub const ABI_VERSION: i32 = 40;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

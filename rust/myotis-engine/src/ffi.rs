@@ -268,6 +268,18 @@ pub fn eth_call_tx_json(handle: i64, tx: String, block: String, state_overrides:
     crate::host::eth_call_tx_json(handle, &tx, &block, &state_overrides)
 }
 
+/// Verified `eth_createAccessList` for the FULL JSON-RPC transaction object
+/// (ABI ≥ 40): the same `tx`, `block` and `state_overrides` as
+/// [`estimate_gas_tx_json`] — the EIP-2930 access list the transaction
+/// touches, built as geth builds it, with the gas the run made with it used
+/// and that run's own revert or halt next to the list; every field applied as
+/// [`eth_call_tx_json`] applies it, or the request refused with the permanent
+/// `{"error","code":-32602}` envelope.
+#[uniffi::export]
+pub fn create_access_list_json(handle: i64, tx: String, block: String, state_overrides: String) -> String {
+    crate::host::create_access_list_json(handle, &tx, &block, &state_overrides)
+}
+
 /// Verified ENS forward resolution (name → address record).
 #[uniffi::export]
 pub fn resolve_ens_json(handle: i64, name: String) -> String {

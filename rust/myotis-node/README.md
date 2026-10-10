@@ -81,6 +81,7 @@ unknown handle gets the usual
 | `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
 | `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
+| `eth_createAccessList` | `createAccessListJson(h, txJson, block, overrides)`: serve `{accessList, gasUsed: '0x…'}` from `status: "ok"`, and its `vmError` as geth's `error` next to them when present |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | `feeEstimateJson(h)` |
 | `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
 | `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions?)` |

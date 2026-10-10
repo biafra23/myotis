@@ -510,6 +510,26 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsAccessListCreation() {
+        return true;   // the revm executor traces and confirms the list (ABI >= 40)
+    }
+
+    @Override
+    public io.myotis.api.AccessListResult createAccessList(io.myotis.api.TransactionArgs tx, String block,
+                                                           String stateOverridesJson) {
+        // As callTx: no host-side block guard — the engine applies the selector
+        // and every field of the canonical object, or refuses it as the
+        // permanent {"error","code":-32602} the handle returns as REFUSED.
+        try {
+            return handle.createAccessListVerified(
+                    tx.json(), block, stateOverridesJson == null ? "" : stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified eth_createAccessList unavailable: {}", e.getMessage());
+            return io.myotis.api.AccessListResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public Long estimateGas(byte[] from, byte[] to, byte[] data, String valueWei) {
         // Legacy two-state view of estimateGasDetailed (single source for the
         // guards) — a revert or refusal reads as null here.

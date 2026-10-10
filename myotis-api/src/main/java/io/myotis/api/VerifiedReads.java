@@ -321,4 +321,38 @@ public interface VerifiedReads {
         }
         return callDetailed(tx.from(), tx.to(), tx.data(), tx.valueWei(), block, stateOverridesJson);
     }
+
+    /**
+     * Whether this engine builds access lists ({@code eth_createAccessList},
+     * {@link #createAccessList}). Hosts consult it BEFORE dispatch, as
+     * {@link #supportsContractCreation()}: on an engine that does not, the
+     * request is refused (-32602) without waking a paused stack and waiting
+     * for a verified head only to be refused.
+     *
+     * @return false by default
+     */
+    default boolean supportsAccessListCreation() {
+        return false;
+    }
+
+    /**
+     * {@code eth_createAccessList} for the full transaction object at
+     * {@code block}, with a state override when {@code stateOverridesJson} is
+     * non-empty (engines that report {@link #supportsStateOverrides()} apply it;
+     * the answer is then a simulation, not a chain fact): the EIP-2930 access
+     * list the transaction touches, built as geth builds it, with the gas the
+     * run made with it used, and that run's own revert or halt next to the
+     * list — see {@link AccessListResult}. The request is checked exactly as
+     * {@link #callTx} checks it: every field applied or the request
+     * {@link AccessListResult.Status#REFUSED}, the same gas limit and fee and
+     * funds checks ({@link AccessListResult.Status#INFEASIBLE}).
+     *
+     * <p>Default: {@link AccessListResult.Status#REFUSED} — an engine that
+     * builds no access lists. The Java engine is one: its Besu has no
+     * access-list tracer wired, so hosts point at the Rust engine.
+     */
+    default AccessListResult createAccessList(TransactionArgs tx, String block, String stateOverridesJson) {
+        return AccessListResult.refused(
+                "this engine does not build access lists (eth_createAccessList); select the Rust engine");
+    }
 }

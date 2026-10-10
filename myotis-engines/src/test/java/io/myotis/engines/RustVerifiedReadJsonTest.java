@@ -425,6 +425,76 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.estimateGasFromJson("{\"status\":\"ok\"}"));
     }
 
+    // ---- eth_createAccessList (accessListFromJson, ABI 40) ----
+
+    private static final String ACCESS_LIST_OK = "{\"status\":\"ok\",\"accessList\":[{\"address\":"
+            + "\"0x2222222222222222222222222222222222222222\",\"storageKeys\":"
+            + "[\"0x0000000000000000000000000000000000000000000000000000000000000001\"]},"
+            + "{\"address\":\"0x3333333333333333333333333333333333333333\",\"storageKeys\":[]}],"
+            + "\"gasUsed\":32437,\"blockNumber\":21000000,\"verified\":false}";
+
+    @Test
+    void accessList_okCarriesTheListVerbatimAndTheGasUsed() {
+        var r = RustChainHandle.accessListFromJson(ACCESS_LIST_OK);
+        assertEquals(io.myotis.api.AccessListResult.Status.OK, r.status());
+        assertEquals(32_437L, r.gasUsed());
+        // The list crosses as JSON, exactly as the JSON-RPC result carries it.
+        assertEquals("[{\"address\":\"0x2222222222222222222222222222222222222222\",\"storageKeys\":"
+                + "[\"0x0000000000000000000000000000000000000000000000000000000000000001\"]},"
+                + "{\"address\":\"0x3333333333333333333333333333333333333333\",\"storageKeys\":[]}]",
+                r.accessListJson());
+        assertNull(r.vmError());
+        assertNull(r.revertData());
+        assertNull(r.detail());
+    }
+
+    @Test
+    void accessList_theRunsOwnFailureRidesNextToTheList() {
+        // geth reports a revert or a halt in the result's `error` next to the
+        // list, never instead of it; the engine names it vmError, since a
+        // top-level error is its failure envelope (ABI 40).
+        var reverted = RustChainHandle.accessListFromJson(
+                "{\"status\":\"ok\",\"accessList\":[],\"gasUsed\":23105,"
+                + "\"vmError\":\"execution reverted\",\"revertDataHex\":\"0x08c379a0\","
+                + "\"blockNumber\":1,\"verified\":false}");
+        assertEquals(io.myotis.api.AccessListResult.Status.OK, reverted.status());
+        assertEquals("[]", reverted.accessListJson());
+        assertEquals(23_105L, reverted.gasUsed());
+        assertEquals("execution reverted", reverted.vmError());
+        assertArrayEquals(new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, reverted.revertData());
+        var halted = RustChainHandle.accessListFromJson(
+                "{\"status\":\"ok\",\"accessList\":[],\"gasUsed\":100000,\"vmError\":\"out of gas\"}");
+        assertEquals("out of gas", halted.vmError());
+        assertNull(halted.revertData());
+    }
+
+    @Test
+    void accessList_infeasibleRefusedAndUnavailable() {
+        var inf = RustChainHandle.accessListFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)\"}");
+        assertEquals(io.myotis.api.AccessListResult.Status.INFEASIBLE, inf.status());
+        assertEquals("err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)", inf.detail());
+        var refused = RustChainHandle.accessListFromJson("{\"error\":\"no slot number\",\"code\":-32602}");
+        assertEquals(io.myotis.api.AccessListResult.Status.REFUSED, refused.status());
+        assertEquals("no slot number", refused.detail());
+        var un = RustChainHandle.accessListFromJson("{\"status\":\"unavailable\",\"reason\":\"no peer\"}");
+        assertEquals(io.myotis.api.AccessListResult.Status.UNAVAILABLE, un.status());
+        assertEquals("no peer", un.detail());
+        // A plain error envelope is a failure to answer, never a refusal.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"error\":\"handle not started\"}"));
+    }
+
+    @Test
+    void accessList_okWithoutItsListOrGasFailsClosed() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"ok\",\"gasUsed\":1}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"ok\",\"accessList\":[]}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"infeasible\"}"));
+    }
+
     // ---- resolve-ens (ensResolutionFromJson) ----
 
     @Test
