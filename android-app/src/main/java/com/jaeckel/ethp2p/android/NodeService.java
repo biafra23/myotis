@@ -2047,7 +2047,8 @@ public final class NodeService extends Service {
         // service that is NOT running (its notifications are dropped at shutdown, so
         // this is the rare stale tap) persists the site and goes away again.
         if (intent != null && ACTION_ALLOW_WEB_ORIGIN.equals(intent.getAction())) {
-            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN));
+            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN),
+                    intent.getIntExtra(EXTRA_WEB_NOTIFICATION_ID, -1));
             if (!RUNNING.get()) stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -2723,13 +2724,26 @@ public final class NodeService extends Service {
 
     // ----- Web page refusals (#502): one notification per refused page, with Allow -----
 
-    /** Its own channel: a refusal is a question for the user, unlike the silent ongoing
-     *  node notification, so it may make a sound and show on the lock screen. */
-    private static final String WEB_CHANNEL_ID = "ethp2p_web_access";
+    /** Its own channel, HIGH importance: a refusal is a question for the user, and it
+     *  arrives while they are looking at the page that was refused — so it must peek
+     *  as a heads-up banner over the browser, Allow button included, not land silently
+     *  in the shade (the default-importance first cut did, and was missed). An overlay
+     *  over other apps would need the "display over other apps" permission, which
+     *  Android and Play discourage; a heads-up notification is the sanctioned way to
+     *  put a question on top of another app. A channel's importance is frozen when it
+     *  is first created, so the id carries a suffix: devices that already saw the
+     *  original channel get this one fresh, and the original is deleted. */
+    private static final String WEB_CHANNEL_ID = "ethp2p_web_access_alert";
+    /** The first cut's channel (default importance), removed once seen. */
+    private static final String LEGACY_WEB_CHANNEL_ID = "ethp2p_web_access";
     /** Notification ids above the foreground one; one per refused origin this run. */
     private static final int WEB_NOTIFICATION_BASE = 1000;
     static final String ACTION_ALLOW_WEB_ORIGIN = "com.jaeckel.ethp2p.android.ALLOW_WEB_ORIGIN";
     static final String EXTRA_WEB_ORIGIN = "origin";
+    /** The notification the Allow came from, so a tap that reaches a FRESH process (the
+     *  old one died, its notifications outlived it in the system) still clears it —
+     *  the new process's {@link #webNotified} knows nothing of it. */
+    static final String EXTRA_WEB_NOTIFICATION_ID = "notificationId";
     /** How often the live listeners' recent-origins lists are checked for a new refusal —
      *  a cheap in-memory read per network; the engine surface is a getter by design. */
     private static final long WEB_REFUSAL_POLL_MS = 5_000;
@@ -2752,6 +2766,7 @@ public final class NodeService extends Service {
 
     private void startWebRefusalPoll() {
         if (webRefusalPoll != null) return;
+        ensureWebRefusalChannel();
         java.util.concurrent.ScheduledExecutorService ex =
                 Executors.newSingleThreadScheduledExecutor(r -> {
                     Thread t = new Thread(r, "ethp2p-web-access");
@@ -2782,47 +2797,90 @@ public final class NodeService extends Service {
         try {
             io.myotis.api.WebAccessPolicy policy = webAccessPolicy(this);
             if (policy.mode() != io.myotis.api.WebAccessMode.ALLOWLIST) return;
+            NotificationManager nm = getSystemService(NotificationManager.class);
             List<ChainHandle> live;
             synchronized (handles) {
                 live = new ArrayList<>(handles.values());
             }
+            // Every listener's list folded into ONE entry per origin, the newest sighting
+            // winning (the UI's WebAccessUi.merge does the same). Each listener keeps its
+            // own list, so a page served on one network under a wider policy and refused
+            // on another since would be both "allowed" (stale) and "refused" (fresh);
+            // judged per listener, the stale entry would cancel and re-arm what the fresh
+            // refusal had just posted — a banner every pass. Judged once, the fresh
+            // refusal wins.
+            Map<String, io.myotis.api.WebOrigin> newest = new java.util.HashMap<>();
             for (ChainHandle h : live) {
                 for (io.myotis.api.WebOrigin o : h.recentWebOrigins()) {
-                    String origin = o.origin();
-                    if (o.lastAllowed() || policy.origins().contains(origin)) {
-                        // Allowed since (or served): re-arm, so a later refusal — the user
-                        // removed the site again — is notified afresh.
-                        webNotified.remove(origin);
-                        continue;
+                    io.myotis.api.WebOrigin prev = newest.get(o.origin());
+                    if (prev == null || o.lastSeenEpochMillis() >= prev.lastSeenEpochMillis()) {
+                        newest.put(o.origin(), o);
                     }
-                    if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
-                    if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
-                        if (!webNotificationCapLogged) {
-                            webNotificationCapLogged = true;
-                            LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
-                                    + " origins notified this run, no more notifications until restart "
-                                    + "(the Status screen still lists them)");
-                        }
-                        continue;
-                    }
-                    int id = webNotificationIds.getAndIncrement();
-                    webNotified.put(origin, id);
-                    postWebRefusalNotification(id, origin);
                 }
+            }
+            for (io.myotis.api.WebOrigin o : newest.values()) {
+                String origin = o.origin();
+                if (o.lastAllowed() || policy.origins().contains(origin)) {
+                    // Allowed since (from the app, or served): the question is answered,
+                    // so its notification goes, and the origin is re-armed so a later
+                    // refusal — the user removed the site again — is notified afresh.
+                    Integer answered = webNotified.remove(origin);
+                    if (answered != null && nm != null) nm.cancel(answered);
+                    continue;
+                }
+                if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
+                if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
+                    if (!webNotificationCapLogged) {
+                        webNotificationCapLogged = true;
+                        LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
+                                + " origins notified this run, no more notifications until restart "
+                                + "(the Status screen still lists them)");
+                    }
+                    continue;
+                }
+                int id = webNotificationIds.getAndIncrement();
+                webNotified.put(origin, id);
+                postWebRefusalNotification(id, origin);
             }
         } catch (Throwable t) {
             LogBuffer.w(TAG, "web refusal notification failed: " + t);
         }
     }
 
+    /**
+     * The refusal channel, created once per service start (beside the foreground one):
+     * HIGH importance, so a refusal peeks over the browser — unless the user had quieted
+     * or blocked the first cut's channel, whose importance is carried over: an app may
+     * pick any importance when it CREATES a channel and only lower it afterwards (on an
+     * existing id, createNotificationChannel rewrites name and description and can lower
+     * importance, never raise it — which is why the id changed), so this is the one
+     * moment a prior opt-out can be honoured. The first cut's channel is then deleted,
+     * so it does not linger in system settings beside this one.
+     */
+    private void ensureWebRefusalChannel() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        int importance = NotificationManager.IMPORTANCE_HIGH;
+        NotificationChannel legacy = nm.getNotificationChannel(LEGACY_WEB_CHANNEL_ID);
+        if (legacy != null) {
+            if (legacy.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
+                importance = legacy.getImportance();   // quieted or blocked: keep it so
+            }
+            nm.deleteNotificationChannel(LEGACY_WEB_CHANNEL_ID);
+        }
+        NotificationChannel channel = new NotificationChannel(WEB_CHANNEL_ID, "Web page access", importance);
+        channel.setDescription("A web page tried to use the node and was refused. "
+                + "Allow lets it in; the Status screen shows the same.");
+        nm.createNotificationChannel(channel);
+    }
+
     private void postWebRefusalNotification(int id, String origin) {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm == null) return;
-        nm.createNotificationChannel(new NotificationChannel(
-                WEB_CHANNEL_ID, "Web page access", NotificationManager.IMPORTANCE_DEFAULT));
         Intent allow = new Intent(this, NodeService.class)
                 .setAction(ACTION_ALLOW_WEB_ORIGIN)
-                .putExtra(EXTRA_WEB_ORIGIN, origin);
+                .putExtra(EXTRA_WEB_ORIGIN, origin)
+                .putExtra(EXTRA_WEB_NOTIFICATION_ID, id);
         // The request code is the notification id, so each origin's Allow is its own
         // PendingIntent (equal intents with different extras would otherwise collapse).
         android.app.PendingIntent allowIntent = android.app.PendingIntent.getService(this, id, allow,
@@ -2832,23 +2890,51 @@ public final class NodeService extends Service {
         String text = origin + " tried to use the node and was refused. Allow it only if you "
                 + "trust that site: it can then read balances and run calls through your node. "
                 + "The app's Status screen and Settings → Web page access show the same.";
-        Notification n = new Notification.Builder(this, WEB_CHANNEL_ID)
+        // Allow grants a site access to the node: never from a locked phone. Android 12+
+        // asks for the unlock before firing the action; below that the notification is
+        // kept off the lock screen altogether (a "show sensitive content" lock screen
+        // would otherwise show the button to whoever holds the phone).
+        Notification.Action.Builder allowAction = new Notification.Action.Builder(null, "Allow", allowIntent);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            allowAction.setAuthenticationRequired(true);
+        }
+        Notification.Builder b = new Notification.Builder(this, WEB_CHANNEL_ID)
                 .setContentTitle("A web page was refused")
                 .setContentText(origin + " tried to use the node")
                 .setStyle(new Notification.BigTextStyle().bigText(text))
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(open)
-                .setAutoCancel(true)
-                .addAction(new Notification.Action.Builder(null, "Allow", allowIntent).build())
-                .build();
-        nm.notify(id, n);
-        LogBuffer.i(TAG, "web page refused, notified: " + origin);
+                // No auto-cancel: a stray tap on the banner's body opens the app but leaves
+                // the question, Allow included, in the shade. Allow (here or in the app)
+                // cancels it by id, shutdown drops it, a swipe dismisses it.
+                .addAction(allowAction.build());
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) {
+            b.setVisibility(Notification.VISIBILITY_SECRET);
+        }
+        nm.notify(id, b.build());
+        // nm.notify is a silent no-op when Myotis may not post notifications (an
+        // auto-started app never asked for the permission on Android 13+) and a channel
+        // turned down never peeks: say which, or "notified" would reproduce the missed
+        // banner this channel exists to fix, undiagnosably. The Status screen shows the
+        // refusal either way.
+        NotificationChannel channel = nm.getNotificationChannel(WEB_CHANNEL_ID);
+        if (!nm.areNotificationsEnabled()) {
+            LogBuffer.w(TAG, "web page refused: " + origin + " — notifications are off for Myotis, "
+                    + "so no banner; the Status screen shows it");
+        } else if (channel != null && channel.getImportance() < NotificationManager.IMPORTANCE_HIGH) {
+            LogBuffer.w(TAG, "web page refused: " + origin + " — the Web page access notification "
+                    + "channel is set below High, so no banner; the Status screen shows it");
+        } else {
+            LogBuffer.i(TAG, "web page refused, notified: " + origin);
+        }
     }
 
-    /** The notification's Allow: persist the site, apply live, drop the notification. The
-     *  mode is left alone — a refusal is notified only under Specific sites, and Off must
-     *  not be widened from a notification tap. */
-    private void allowWebOrigin(String origin) {
+    /** The notification's Allow: persist the site, apply live, drop the notification — by
+     *  the id the intent carries ({@code notificationId}, {@code -1} when absent) as well
+     *  as the one this process posted, since a tap can reach a fresh process. The mode is
+     *  left alone — a refusal is notified only under Specific sites, and Off must not be
+     *  widened from a notification tap. */
+    private void allowWebOrigin(String origin, int notificationId) {
         if (origin == null || origin.isBlank()) return;
         List<String> list = new ArrayList<>(webAccessOrigins(this));
         if (!list.contains(origin)) {
@@ -2856,9 +2942,12 @@ public final class NodeService extends Service {
             setWebAccessOrigins(this, list);
         }
         applyWebAccess();
-        Integer id = webNotified.remove(origin);
+        Integer posted = webNotified.remove(origin);
         NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null && id != null) nm.cancel(id);
+        if (nm != null) {
+            if (posted != null) nm.cancel(posted);
+            if (notificationId >= 0) nm.cancel(notificationId);
+        }
         LogBuffer.i(TAG, "web page allowed from its notification: " + origin);
     }
 

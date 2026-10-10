@@ -83,11 +83,21 @@ browser, which is why the apps surface it themselves:
   **Allow** (adds it to the list and applies at once, so the page's next
   request succeeds — dApps retry/poll, and the preflight cache is short) and
   **Dismiss**. Not shown under *Off*: there a refusal is the setting working.
-- **Android notification** (its own channel, "Web page access") with an
-  **Allow** action, once per origin per run; the running service polls the
-  listeners' recent lists every 5 s. The action lands on the service as a
-  start command (`ACTION_ALLOW_WEB_ORIGIN`), which persists the site and
-  applies it live.
+- **Android notification** (its own channel, "Web page access", high
+  importance so it peeks as a heads-up banner over the browser the user is
+  looking at — an overlay over other apps would need the "display over other
+  apps" permission, which Android and Play discourage) with an **Allow**
+  action, once per origin per run, at most twenty per run; the running service
+  polls the listeners' recent lists every 5 s. The banner needs the
+  notification permission (an app auto-started at launch never asked for it)
+  and the channel left at High; when either is missing the service logs why
+  and the Status screen remains the place to see the refusal. A channel the
+  user had quieted or blocked keeps that setting across the channel change.
+  The action lands on the service as a start command
+  (`ACTION_ALLOW_WEB_ORIGIN`), which persists the site and applies it live;
+  Android 12+ asks for the device to be unlocked first, older versions keep
+  the notification off the lock screen. Allowing the site from the app clears
+  the notification.
 - **Settings → Web page access**: the mode, the allowed-sites list with Remove
   and an add field, and **Recent web pages** — every origin that tried this
   run, folded across networks, with network, allowed/refused, attempt count
