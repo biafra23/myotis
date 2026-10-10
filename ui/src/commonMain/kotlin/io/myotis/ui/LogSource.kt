@@ -36,11 +36,13 @@ interface LogSource {
      * ([copyNewest]) — to a file the user picks in the host's native save dialog, offered as
      * [suggestedName]: the host's on-disk log file where it keeps one (Desktop: logback's
      * rolling file, which also holds what the ring has already dropped), else the ring as
-     * [write] renders it into the sink the host opens, line by line (Android). [onResult]
-     * gets one human-readable line — where the file went, "cancelled", or the error — and
-     * may be invoked FROM A WORKER THREAD; callers must only touch thread-safe state in it
-     * (Compose snapshot state qualifies). Returns false when this host cannot save, in which
-     * case [onResult] is never called.
+     * [write] renders it into the sink the host opens, line by line (Android); [write] reads
+     * the ring when it runs, so a host may call it on a worker thread after its picker closed.
+     * [onResult] gets one human-readable line — where the file went, "cancelled", or the
+     * error — and may be invoked FROM A WORKER THREAD; callers must only touch thread-safe
+     * state in it (Compose snapshot state qualifies). Returns false when this host cannot
+     * save, in which case [onResult] is never called. Must not throw: a failure to even start
+     * (no picker on the device, say) is reported through [onResult] like any other.
      */
     fun saveLog(suggestedName: String, write: (Appendable) -> Unit, onResult: (String) -> Unit): Boolean = false
 }

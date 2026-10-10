@@ -2336,21 +2336,28 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
             if (logs.canSaveLog) {
                 Spacer(Modifier.width(4.dp))
                 // The whole log, through the host: its on-disk file where it keeps one, else
-                // the unfiltered ring, streamed. The host answers with one line, maybe from a
-                // worker thread. The label stays put while disabled — a wider "Saving…" would
-                // reflow the row at phone width.
+                // the unfiltered ring, streamed. The ring is snapshotted when the host writes,
+                // not at the click: nothing big is held while the host's picker is open, and
+                // the file holds what was logged up to the write. The host answers with one
+                // line, maybe from a worker thread; a host that throws instead is reported the
+                // same way, so the button never stays disabled. The label stays put while
+                // disabled — a wider "Saving…" would reflow the row at phone width.
                 OutlinedButton(
                     enabled = !saving,
                     onClick = {
                         saving = true
                         exportNote = null
-                        val ring = lines
-                        val started = logs.saveLog(
-                            suggestedLogFileName(tz),
-                            { sink -> formatLogsTo(sink, ring, tz) },
-                        ) { line ->
-                            exportNote = line
-                            saving = false
+                        val started = runCatching {
+                            logs.saveLog(
+                                suggestedLogFileName(tz),
+                                { sink -> formatLogsTo(sink, logs.snapshot(), tz) },
+                            ) { line ->
+                                exportNote = line
+                                saving = false
+                            }
+                        }.getOrElse {
+                            exportNote = "Save failed: ${it.message ?: it::class.simpleName}"
+                            false
                         }
                         if (!started) saving = false
                     },

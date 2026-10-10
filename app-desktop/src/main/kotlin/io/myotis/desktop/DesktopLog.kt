@@ -47,10 +47,15 @@ object DesktopLogSource : LogSource {
      * Desktop's Save…: the AWT save dialog (on the EDT, like the log-index import dialog;
      * owned by the showing frame, so it is modal to the app window), then a copy of
      * logback's active log file — the rolling FILE appender of logback-desktop.xml, fed by
-     * the same per-logger levels as this ring, so it holds everything the tab shows plus what
-     * the ring has already dropped — or, under a logback config without a file appender, the
-     * ring streamed through [write]. The rolled `.gz` siblings are named, not copied: the
-     * active file is the one a diagnosis wants, and the result line says where the rest is.
+     * the same per-logger levels as this ring, so it normally holds everything the tab shows
+     * plus what the ring has already dropped. Not right after a roll, though: the policy rolls
+     * at 10 MB (quickly, with the DEBUG RPC bodies on), and then the active file holds minutes
+     * while the ring still holds the span a diagnosis wants. So the file is copied only when
+     * it is at least as large as the ring's own rendering — a file that holds every line the
+     * ring holds is larger, its lines carry more (thread, logger) — and otherwise, as under a
+     * logback config without a file appender, the ring is streamed through [write] instead.
+     * The rolled `.gz` siblings are named, not copied, and the result line says which of the
+     * two was written.
      */
     override fun saveLog(suggestedName: String, write: (Appendable) -> Unit, onResult: (String) -> Unit): Boolean {
         java.awt.EventQueue.invokeLater {
@@ -78,17 +83,28 @@ object DesktopLogSource : LogSource {
 
     private fun writeLog(target: java.io.File, write: (Appendable) -> Unit): String {
         val source = logbackFile()
-        if (source != null && source.isFile) {
+        val dir = source?.absoluteFile?.parentFile
+        val rolled = dir?.listFiles { f -> f.name.endsWith(".log.gz") }?.size ?: 0
+        val older = if (rolled > 0) "; $rolled older rolled file(s) stay in $dir" else ""
+        if (source != null && source.isFile && source.length() >= ringChars()) {
             java.nio.file.Files.copy(
                 source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
             )
-            val dir = source.absoluteFile.parentFile
-            val rolled = dir?.listFiles { f -> f.name.endsWith(".log.gz") }?.size ?: 0
-            val older = if (rolled > 0) "; $rolled older rolled file(s) stay in $dir" else ""
             return "Saved ${source.name} (${target.length() / 1024} kB) to $target$older. $LOG_SAVE_CAUTION"
         }
         target.bufferedWriter().use { write(it) }
-        return "Saved the in-memory log (${target.length() / 1024} kB) to $target. $LOG_SAVE_CAUTION"
+        val why = when {
+            source == null -> ""
+            !source.isFile -> " — ${source.name} is not there"
+            else -> " — ${source.name} rolled recently and holds less$older"
+        }
+        return "Saved the tab's log (${target.length() / 1024} kB) to $target$why. $LOG_SAVE_CAUTION"
+    }
+
+    /** The size of the ring as the tab renders it (see `formatLogLine`: 18 characters of
+     *  stamp, level and punctuation around tag and message), summed under the lock. */
+    private fun ringChars(): Long = synchronized(lock) {
+        buffer.sumOf { 18L + it.tag.length + it.message.length }
     }
 
     /** The active file of logback's file appender (FILE in logback-desktop.xml), wherever it

@@ -64,7 +64,10 @@ class MainActivity : ComponentActivity() {
     // Logs-tab Save…: the SAF create-document picker's result lands in the callback the
     // shared UI's Save action registered (one save in flight at a time — the picker is modal).
     // The callback lives in the companion, not the instance: a rotation while the picker is
-    // open recreates the Activity, and the result then reaches the NEW instance's launcher.
+    // open recreates the Activity, and the result then reaches the NEW instance's launcher,
+    // so the write still lands. The result LINE does not: it goes to the Logs tab that was
+    // composed before the rotation and is gone, so after a rotation the file is the only
+    // feedback — a known gap, kept rather than a process-wide result holder for a rare case.
     // After a process death nothing is pending any more, and the document SAF already
     // created would stay empty — so it is deleted rather than handed over as a saved log.
     private val createDocumentLauncher = registerForActivityResult(
