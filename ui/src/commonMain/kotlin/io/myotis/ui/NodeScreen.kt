@@ -64,6 +64,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
@@ -1360,6 +1362,9 @@ private fun QueryTab(
     var loadingMsg by remember(network) { mutableStateOf("Querying…") }
     var account by remember(network) { mutableStateOf<AccountResult?>(null) }
     var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
+    var ensProfile by remember(network) { mutableStateOf<EnsProfile?>(null) }
+    var ensProfileError by remember(network) { mutableStateOf<String?>(null) }
+    var ensProfileLoading by remember(network) { mutableStateOf(false) }
     var error by remember(network) { mutableStateOf<String?>(null) }
     // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
@@ -1431,6 +1436,7 @@ private fun QueryTab(
         if (q.isEmpty() || loading) return
         input = q
         loading = true; error = null; account = null; ens = null
+        ensProfile = null; ensProfileError = null; ensProfileLoading = false
         scope.launch {
             try {
                 if (looksLikeEnsName(q)) {
@@ -1514,8 +1520,26 @@ private fun QueryTab(
         Spacer(Modifier.height(16.dp))
 
         // The resolved-ENS panel stays visible while the account verifies (and even if it fails).
-        ens?.let {
-            EnsResultView(it)
+        ens?.let { e ->
+            EnsResultView(
+                e, ensProfile, ensProfileError, ensProfileLoading,
+                // The records beyond the address, on demand — a name without an address can
+                // still carry them. Their failure shows on the card, never as the query's error.
+                onReadRecords = {
+                    ensProfileLoading = true; ensProfileError = null
+                    scope.launch {
+                        try {
+                            ensProfile = controller.resolveEnsProfile(network, e.name)
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (t: Throwable) {
+                            ensProfileError = t.message ?: t.toString()
+                        } finally {
+                            ensProfileLoading = false
+                        }
+                    }
+                },
+            )
             Spacer(Modifier.height(12.dp))
         }
         when {
@@ -1972,8 +1996,16 @@ private fun formatAccountResult(a: AccountResult): String = buildString {
 }
 
 @Composable
-private fun EnsResultView(e: EnsResult) {
+private fun EnsResultView(
+    e: EnsResult,
+    profile: EnsProfile?,
+    profileError: String?,
+    profileLoading: Boolean,
+    onReadRecords: () -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
+    val uriHandler = LocalUriHandler.current
+    var gatewayNote by remember(e.name) { mutableStateOf<String?>(null) }
     Column {
         Row(
             Modifier.fillMaxWidth(),
@@ -1996,6 +2028,95 @@ private fun EnsResultView(e: EnsResult) {
         if (e.error != null) {
             StatusRow("Error", e.error, color = MaterialTheme.colorScheme.error)
         }
+        // The records beyond the address, on demand: the contenthash decoded (ipfs://, ipns://,
+        // bzz://) with a gateway link labelled for what it is — a third party, off the verified
+        // path — and the text records as key: value, selectable and never cut short; a record
+        // read from the peer head says so. One failure shared by every record is one line.
+        if (e.error == null && profile == null) {
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(enabled = !profileLoading, onClick = onReadRecords) { Text("Read records") }
+                Spacer(Modifier.width(8.dp))
+                if (profileLoading) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Reading records…", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    HelpButton(
+                        "ENS records",
+                        "Reads the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and " +
+                            "its common text records (avatar, description, url, email, com.twitter, " +
+                            "com.github, org.telegram, com.discord), each verified against finalized " +
+                            "state. Every record is its own resolution, so this costs more than the " +
+                            "address lookup.",
+                    )
+                }
+            }
+        }
+        profile?.let { p ->
+            val peerHead = " (peer head)"
+            val common = p.records.map { it.error }.distinct().singleOrNull()
+            if (common != null && p.records.all { it.value == null }) {
+                StatusRow("Records", common, color = MaterialTheme.colorScheme.error)
+                return@let
+            }
+            val content = p.records.firstOrNull { it.key == ENS_CONTENTHASH_KEY }
+            val contentHex = content?.value
+            if (contentHex != null) {
+                val link = decodeContenthash(contentHex)
+                SelectionContainer {
+                    Text(
+                        "Content: " + (link?.uri ?: "undecoded $contentHex") + if (content.verified) "" else peerHead,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = { clipboard.setText(AnnotatedString(link?.uri ?: contentHex)) }) {
+                        Text(if (link != null) "Copy link" else "Copy hex")
+                    }
+                    val gateway = ensGatewayUrl(e.name)
+                    if (link != null && gateway != null) {
+                        OutlinedButton(onClick = {
+                            // A browser launch can throw (no handler for https on this host);
+                            // the link on the clipboard is the fallback, said in one line.
+                            runCatching { uriHandler.openUri(gateway) }.onFailure {
+                                clipboard.setText(AnnotatedString(gateway))
+                                gatewayNote = "Could not open a browser — $gateway is on the clipboard."
+                            }
+                        }) { Text("Open via eth.limo") }
+                        HelpButton(
+                            "eth.limo",
+                            "Opens $gateway — eth.limo is a THIRD-PARTY gateway that resolves the name " +
+                                "itself and serves the content over HTTPS. What the browser shows is " +
+                                "not verified by this node: compare it with the content link above, " +
+                                "which is.",
+                        )
+                    }
+                }
+                gatewayNote?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+            } else if (content?.error != null) {
+                StatusRow("Content", content.error, color = MaterialTheme.colorScheme.error)
+            }
+            val texts = p.records.filter { it.key != ENS_CONTENTHASH_KEY && (it.value != null || it.error != null) }
+            if (texts.isNotEmpty()) {
+                SelectionContainer {
+                    Column {
+                        texts.forEach { r ->
+                            val v = r.value
+                            if (v != null) {
+                                Text("${r.key}: $v" + if (r.verified) "" else peerHead, style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                Text("${r.key}: ${r.error}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                }
+            }
+            if (contentHex == null && content?.error == null && texts.isEmpty()) {
+                Text("No records beyond the address.", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        profileError?.let { StatusRow("Records", it, color = MaterialTheme.colorScheme.error) }
     }
 }
 

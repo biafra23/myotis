@@ -177,6 +177,20 @@ interface NodeController {
     suspend fun resolveEns(network: String, name: String): EnsResult
 
     /**
+     * The ENS profile beyond the address: the contenthash (ENSIP-7, under
+     * [ENS_CONTENTHASH_KEY]) and the ENSIP-5 text records in [ENS_PROFILE_KEYS], each read
+     * on its own through the engine's ENS API at its fixed policy for records (finalized
+     * state first, the peer head only when finality holds no record — independent of any
+     * root knob a host offers for the ADDRESS read), through [readEnsProfile], so one
+     * record's failure never hides the others. Read on demand (the card's "Read records"),
+     * not with every lookup: an absent record costs a second resolution at the head, and
+     * most names set few of the keys. Null when this host has no actual (the card shows
+     * the address only). A record the name lacks is a null value without error; one that
+     * could not be read carries its error.
+     */
+    suspend fun resolveEnsProfile(network: String, name: String): EnsProfile? = null
+
+    /**
      * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
      * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
      * Android/iOS compiling and hide the Query-tab section there.
@@ -220,6 +234,19 @@ data class EnsResult(
     val verified: Boolean,           // true iff beacon-verified finalized state
     val error: String?,              // null on success
 )
+
+/** One ENS record beyond the address: a text record under its ENSIP-5 key, or the
+ *  contenthash under [ENS_CONTENTHASH_KEY] (0x-prefixed multicodec bytes). */
+data class EnsRecord(
+    val key: String,
+    val value: String?,              // null = the name has no such record (when error is null)
+    val blockNumber: Long,           // -1 when none
+    val verified: Boolean,           // true iff beacon-verified finalized state
+    val error: String?,              // null unless the read itself failed
+)
+
+/** The records [NodeController.resolveEnsProfile] read for [name]. */
+data class EnsProfile(val name: String, val records: List<EnsRecord>)
 
 /** Persisted per-network + shared settings, abstracted from Android SharedPreferences. */
 interface Settings {

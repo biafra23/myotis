@@ -7,7 +7,10 @@ import android.net.NetworkCapabilities
 import com.jaeckel.ethp2p.android.AndroidQueryHistory
 import com.jaeckel.ethp2p.android.NodeService
 import io.myotis.ui.AccountResult
+import io.myotis.ui.EnsProfile
+import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
@@ -187,6 +190,17 @@ class AndroidNodeController(
         val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
         return svc.resolveEns(network, name).await().let { r ->
             EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.beaconVerified(), r.error())
+        }
+    }
+
+    // One service call per record (each on the service's query pool); readEnsProfile fans
+    // out and folds a call that threw into that record's error.
+    override suspend fun resolveEnsProfile(network: String, name: String): EnsProfile {
+        val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
+        return readEnsProfile(name) { key ->
+            svc.resolveEnsRecord(network, name.trim(), key).await().let { r ->
+                EnsRecord(r.key(), r.value(), r.blockNumber(), r.beaconVerified(), r.error())
+            }
         }
     }
 
