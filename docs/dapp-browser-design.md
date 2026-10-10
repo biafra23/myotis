@@ -146,7 +146,8 @@ purpose: the dApp *is* on the same device. Consequences:
   is in nearly the same position already, modulo the browser's own
   private-network rules. Fixing that is independent of this document (§9,
   phase 0) and leaves the extension path intact, since extension-scheme
-  origins stay served while web origins are refused.
+  origins stay on the allow-list while every other origin, `null` included,
+  is refused.
 
 ### 4.2 Every read is a network query from the user's IP
 
@@ -287,7 +288,7 @@ the page:
 |---|---|---|
 | Reads on Arbitrum, Base, Optimism, Polygon, … | Not served; cannot be routed at all (§6.3) | Those parts of the page keep using the dApp's provider — nothing gained, nothing lost |
 | `eth_getLogs` over arbitrary contracts (position discovery, Transfer history, event-driven UIs) | Served only from the opt-in, per-contract log index, Rust engine only; a range the index has not walked is `-32000`, never a misleading `[]` ([eth-getlogs-design.md](eth-getlogs-design.md)) — and so is a contract that is not on the watch-list at all (`QueryError::UnwatchedAddress` in `host.rs` maps to the plain, retryable error), although no retry will ever index it | The first "your positions" query fails unless the user indexed exactly those contracts, with coverage back to deployment; and because the refusal is the retryable code, a dApp spins on it instead of giving up (§8) |
-| Old blocks, old receipts, `earliest`, historical `eth_call` | A served block window (default 32 blocks, `EthHandler.DEFAULT_SERVED_BLOCK_WINDOW`, user-settable); state reads pinned more than 64 blocks behind the head refused with `-32602`; no historical state; `eth_getProof` not served | History views, "transactions" tabs and anything that re-reads a past block fail |
+| Old blocks, old receipts, `earliest`, historical `eth_call` | A served block window (default 32 blocks, `EthHandler.DEFAULT_SERVED_BLOCK_WINDOW`, user-settable); state reads pinned more than 64 blocks behind the head refused with `-32602` — except a pin at or above a head this node itself reported in the last 15 minutes, which `pinServable` (`RpcRouter.kt`) declines with the retryable `-32000`, because recorded MetaMask sessions showed the head swinging back by thousands of blocks; no historical state; `eth_getProof` not served | History views, "transactions" tabs and anything that re-reads a past block fail; and the `eth_blockNumber`-then-pin pattern every dApp uses is exactly the carve-out's traffic, so under a head swing a dApp sees the retryable code on state pins too (§8 A) |
 | `eth_subscribe` (WebSocket), `eth_newFilter` / `eth_getFilterChanges` | Not served (`-32601`); no WebSocket listener | viem falls back to polling; frontends that require the socket stall |
 | Polling `eth_blockNumber` every few seconds, Multicall3 `eth_call` per block per widget, batched `eth_getBalance` for every token in a list | Each read is a proof fetch from peers, with a round trip per cold storage slot (the prefetch loop batches what it can); the Node addon's 90 s per-operation budget; heartbeat whitespace to survive a wallet's ~30 s read timeout | A hosted RPC answers in tens of milliseconds; the engine answers a cold multicall in hundreds of milliseconds to seconds. dApp timeouts are shorter than a wallet's, and a dApp retries on timeout, which compounds the load (§4.3). [read-stats.md](read-stats.md) measures what a cache would recover |
 | The same reads, from the privacy angle | Every address the page asks about is disclosed to peers with the user's IP (§4.2) | The leak rate becomes the dApp's request rate, for addresses the dApp chose |
@@ -313,7 +314,16 @@ place, every bucket-B call ends in one of three places:
   client will spin on, for a question no retry will ever answer. Policy A
   needs the phase 2 split (permanent `-32602` for an unwatched contract or an
   unindexed topic, `-32000` only for a range the index is still walking)
-  before it is honest for the first query most dApps make.
+  before it is honest for the first query most dApps make. And "honest"
+  holds per intercepted call, not per page: §6.3 never intercepts the
+  other-chain calls of a multichain page, so under A a page still renders
+  engine-verified mainnet or Gnosis values next to unverified Arbitrum or
+  Base values, per value indistinguishable — the blend B is faulted for, in
+  residual form. No regression against today, where nothing on the page is
+  verified, but one more reason the provenance mark and a per-origin
+  aggregate (C's, with the never-intercepted other-chain calls in the
+  denominator) are wanted under A too; the phase 2 mark is independent of
+  the A/C choice.
 - **B. Fall through silently.** A call the engine refuses is re-sent to the
   dApp's original URL. Every dApp works; the page is now a blend of verified
   and unverified numbers that look identical, and nothing on screen says
@@ -343,22 +353,34 @@ value there.
 Ordered so that each step is useful on its own and produces the data the next
 one needs. None of it is scheduled.
 
-**Phase 0 — close the loopback endpoint to web origins.** Independent of
-everything else and overdue on its own (§1), with one client that must keep
-working: the MetaMask extension's background worker reaches the port with
-`Origin: chrome-extension://<id>` (on Firefox `moz-extension://<uuid>`, a
-per-install UUID no static allowlist can name), and that is the validated
-path of §1. So the proposal is: refuse a request whose `Origin` is an `http`
-or `https` web origin; keep serving extension-scheme origins
-(`chrome-extension://`, `moz-extension://`, `safari-web-extension://`) and
-the no-`Origin` path of same-device native clients as today. That shuts out
-a web page in any browser and leaves installed extensions where they are — a
-weaker line than a pairing token, and that trade-off is the owner's call; a
-token (shown in Settings, carried in the wallet's custom-network URL or a
-header) is the tighter follow-up if the owner wants one. Do not rely on the
-browser's private-network rules — they differ by browser and version. The
-phase 1 extension rides the same extension-origin allowance. A single PR
-into `main`.
+**Phase 0 — close the loopback endpoint to browser origins, default-deny.**
+Independent of everything else and overdue on its own (§1), with one client
+that must keep working: the MetaMask extension's background worker reaches
+the port with `Origin: chrome-extension://<id>` (on Firefox
+`moz-extension://<uuid>`, a per-install UUID no static allowlist can name),
+and that is the validated path of §1. So the proposal is an **allow-list**:
+serve a request only when it carries no `Origin` header (same-device native
+clients, as today) or an extension-scheme origin (`chrome-extension://`,
+`moz-extension://`, `safari-web-extension://`); **refuse everything else**,
+`http`/`https` web origins and the literal `Origin: null` included. `null`
+matters: a sandboxed or `data:` iframe has an opaque origin and its `fetch`
+POSTs carry `Origin: null`, so a deny-list that only names web schemes
+leaves the port open to exactly the page it meant to shut out. And the
+refusal has to be the server rejecting the request (Ktor's CORS plugin
+answers a failed origin check with 403), not merely withholding the CORS
+response headers: a POST with `Content-Type: text/plain` is CORS-safelisted
+and goes out without a preflight, the route reads the body whatever its
+content type (`call.receiveText()` in `MyotisRpcServer.kt`), and none of
+`myotis_pause`, the `eth_sendRawTransaction` relay or the §4.2 read oracle
+needs the response to do its damage. Ktor's static `allowHost` cannot name a
+per-install extension UUID, so this is the plugin's origin predicate or a
+custom check. That shuts out a web page in any browser and leaves installed
+extensions where they are — a weaker line than a pairing token, and that
+trade-off is the owner's call; a token (shown in Settings, carried in the
+wallet's custom-network URL or a header) is the tighter follow-up if the
+owner wants one. Do not rely on the browser's private-network rules — they
+differ by browser and version. The phase 1 extension rides the same
+extension-origin allowance. A single PR into `main`.
 
 **Phase 1 — a desktop browser extension PoC.** The body-classifying redirect
 of §6.1 as a content script plus a background worker talking to the loopback
@@ -375,10 +397,15 @@ not a host module.
 the engine and host pieces that any interception needs and that are useful to
 the existing wallet path too:
 
-- a **provenance mark** on every JSON-RPC response (verified / passed-through /
-  refused), so a host can count and show it — the precondition for policy C
-  and the thing the seeded-log carve-out already asks for ("the index marks
-  its provenance", [seeded-log-histories.md](seeded-log-histories.md));
+- a **provenance mark**, split by who can truthfully set it: the engine
+  marks its own responses `verified` or `refused` (and, on the log index,
+  `seeded` — the mark [seeded-log-histories.md](seeded-log-histories.md)
+  already asks for); the interceptor — extension or host bridge — stamps
+  `passed-through` on the responses it fetched itself from the dApp's
+  original URL, which the engine never sees and must never fetch
+  (devp2p/libp2p only in production; HTTP to a client is debug-only).
+  Together they let a host count and show the per-origin aggregate — the
+  precondition for policy C, and wanted under A too (§8);
 - **per-origin quotas** on the bridge (§4.3) and an explicit per-call
   classification the host can read without parsing error strings;
 - the **permanent/retryable split on `eth_getLogs` refusals** (§8 A):
@@ -417,8 +444,9 @@ the advantages of an embedded browser arrive. Items 3–5 are moot until item
 2 is reopened. Item 1 is unaffected by the verdict and still open.
 
 1. Phase 0's exact policy for browser origins on the loopback endpoint
-   (refuse web origins and keep extension origins is the proposal; a pairing
-   token the tighter option).
+   (an allow-list of no-`Origin` and extension-scheme origins, everything
+   else refused by the server, is the proposal; a pairing token the tighter
+   option).
 2. Whether a dApp surface belongs in the myotis apps at all, or stays with
    hosts that embed the engine (§5, §9 "Not recommended").
 3. If it does: policy A or C for unservable calls (§8). B is not proposed.
