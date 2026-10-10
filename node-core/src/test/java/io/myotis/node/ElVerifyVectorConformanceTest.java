@@ -169,11 +169,11 @@ class ElVerifyVectorConformanceTest {
         Header forgedAnchor = header(21_000_001, ATTESTED_STATE_ROOT, hp.hash);
         writeMsg("004-chain-forged-anchor.rlp", hp, forgedAnchor);
 
-        // Wrong first (peer) root: the chain is sound, the read's root is not in it.
-        Header hpWrong = header(21_000_000, tag("not-peer-root"), GENESIS_PARENT);
-        Header hmW = header(21_000_001, tag("mid-root"), hpWrong.hash);
-        Header haW = header(21_000_002, ATTESTED_STATE_ROOT, hmW.hash);
-        writeMsg("005-chain-wrong-first-root.rlp", hpWrong, hmW, haW);
+        // Wrong first (peer) root: anchored at the attested block and hash-linked,
+        // but its first header carries another root (mid-root, not PEER_ROOT), so
+        // only the first-header state-root check can reject it — the half of the
+        // gate that binds the snap proof to the walked block.
+        writeMsg("005-chain-wrong-first-root.rlp", hm, ha);
     }
 
     private record Header(Bytes rlp, Bytes32 hash) {}

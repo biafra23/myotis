@@ -239,7 +239,8 @@ impl ExecAnchor {
     }
 
     /// The block hashes waiting for their header — the pending finality first
-    /// (what the header-chain walk anchors on), then the pending optimistic head.
+    /// (what finalized reads anchor on), then the pending optimistic head (what
+    /// the header-chain walk anchors on).
     pub fn pending_hashes(&self) -> Vec<[u8; 32]> {
         let inner = self.inner.lock().expect("anchor mutex");
         let mut out = Vec::with_capacity(2);

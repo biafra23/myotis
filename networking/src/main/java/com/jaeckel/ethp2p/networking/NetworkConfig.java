@@ -334,7 +334,7 @@ public record NetworkConfig(
             // per poll instead of 40-80, the stateRootMatch fast path stops
             // hitting, and verified reads pay the headerChain EL walk instead.
             // Bounded, not a correctness break — headerChain anchors on the
-            // finalized execution block hash, not the window — but it is a
+            // optimistic execution block hash, not the window — but it is a
             // silent regression on the DEFAULT engine, and the reason
             // lc-server-design rollout step 3 wants this settled.
             //

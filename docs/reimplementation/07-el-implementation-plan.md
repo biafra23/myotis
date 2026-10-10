@@ -284,8 +284,9 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
   `Invalid`/timeout + root-unavailable marking across the connector's active peers.
 - `ExecAnchor` (above) fed from `sync.rs`; verified query ladders ported from
   `VerifiedAccountQuery`/`VerifiedStorageQuery`/`HeaderQuery`: proof-vs-peer-root →
-  `stateRootMatch` (window lookup) → `headerChain` (walk `[finalized … peer head]`, every
-  link `keccak256(RLP)`-pinned, ends matched to the beacon anchor, gap ≤ 8192,
+  `stateRootMatch` (window lookup) → `headerChain` (walk `[peer head … optimistic head]`,
+  every link `keccak256(RLP)`-pinned, the TOP matched to the attested block hash — the
+  plan once said `[finalized … peer head]`, the upward walk fixed in #611 — gap ≤ 8192,
   `headerChainGapTooLarge`/`preMergeBlock`/`beaconNotSynced` tokens exact).
 - JNI natives (list above) + `RustChainHandle`/`RustEngineNative` plumbing on the Java side +
   status JSON extension; goldens for every new JSON shape; `ABI_VERSION` bump.

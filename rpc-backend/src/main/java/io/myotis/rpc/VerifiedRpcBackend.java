@@ -1381,7 +1381,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /**
      * The shared beacon-anchored head context for "latest"-ish reads, or null
      * (→ router errors, logged). Every verified RPC read/call resolves the head
-     * HERE so the head is anchored to the beacon-finalized root once per {@link
+     * HERE so the head is anchored to the beacon light client once per {@link
      * #RPC_HEAD_TTL_MS} window and reused — instead of each call independently
      * re-fetching a head + re-running the headerChain anchor (the slow, fragile
      * step that produced the high fallback rate). The context's stateRoot
@@ -1564,8 +1564,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** Build (or reuse within {@link #RPC_HEAD_TTL_MS}) a snap-peer head context
-     *  whose state root is anchored back to the beacon-finalized root, so reads +
-     *  EVM calls run against cryptographically-verified state. Blocking. */
+     *  whose header is proven by the walk down from the light client's optimistic
+     *  head (or the beacon-finalized payload itself), so reads + EVM calls run
+     *  against cryptographically-verified state. Blocking. */
     /** Full-budget variant for the background warmer. */
     private RpcCallContext verifiedHeadCallContext() throws Exception {
         return verifiedHeadCallContext(RPC_ACCOUNT_TIMEOUT_SEC * 1000L, TimeUnit.MILLISECONDS);
@@ -1750,17 +1751,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         conn.requestBlockHeadersBatched(peerBlock, (int) total),
                         HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
-        if (window.size() != total || !HeaderChains.anchoredAtTop(window, opt.blockHash())) {
+        BlockHeadersMessage.VerifiedHeader head = provenHead(window, total, opt.blockHash(), peerStateRoot);
+        if (head == null) {
             log.info("[verify] head #" + peerBlock + " did not anchor at optimistic #"
                     + opt.blockNumber());
-            return null;
-        }
-        BlockHeadersMessage.VerifiedHeader head = window.get(0);
-        if (!java.util.Arrays.equals(head.header().stateRoot.toArrayUnsafe(), peerStateRoot)) {
-            log.info("[verify] head #" + peerBlock + ": state root is not the canonical block's");
-            return null;
         }
         return head;
+    }
+
+    /** The window's first header, proven, iff {@code window} — fetched as
+     *  {@code [head .. optimistic]} — has exactly {@code total} headers, hash-links up to
+     *  {@code topHash} ({@link HeaderChains#anchoredAtTop}), and its first header carries
+     *  {@code peerStateRoot}; else null. Pure, for {@link #anchorHeadToBeacon}. */
+    static BlockHeadersMessage.VerifiedHeader provenHead(List<BlockHeadersMessage.VerifiedHeader> window,
+                                                         long total, byte[] topHash, byte[] peerStateRoot) {
+        if (window.size() != total || !HeaderChains.anchoredAtTop(window, topHash)) return null;
+        BlockHeadersMessage.VerifiedHeader head = window.get(0);
+        return java.util.Arrays.equals(head.header().stateRoot.toArrayUnsafe(), peerStateRoot) ? head : null;
     }
 
     /** The EVM block context of {@code header} (a header proven by hash, or a peer's head

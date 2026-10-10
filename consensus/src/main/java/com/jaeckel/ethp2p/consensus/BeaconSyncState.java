@@ -268,8 +268,9 @@ public class BeaconSyncState {
     }
 
     /**
-     * The block hashes waiting for their header — the pending finality first (what the
-     * header-chain walk anchors on), then the pending optimistic head; one entry when both
+     * The block hashes waiting for their header — the pending finality first (what
+     * finalized reads and the block query's lower walks anchor on), then the pending
+     * optimistic head (what the account/storage walks anchor on); one entry when both
      * name the same block. Fresh copies.
      */
     public List<byte[]> pendingHashes() {

@@ -154,35 +154,24 @@ public final class VerifiedBlockQuery {
             v.failReason = "beaconNotSynced";
             return v;
         }
-        // The attested block at or above the target: the finalized block for a target at or
-        // below it (the shorter walk), else the optimistic head. Each (number, hash) pair is
-        // one atomic snapshot, so a number is never paired with another update's hash; the
-        // slot is only reported, and may come from a later update.
         BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
         if (fin.blockNumber() <= 0 || fin.blockHash() == null || fin.blockHash().length != 32) {
             v.failReason = "beaconBlockHashUnavailable";
             return v;
         }
-        long anchorNumber;
-        byte[] anchorHash;
-        long anchorSlot;
-        if (blockNumber <= fin.blockNumber()) {
-            anchorNumber = fin.blockNumber();
-            anchorHash = fin.blockHash();
-            anchorSlot = beaconSyncState.getFinalizedSlot();
-        } else {
-            BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
-            if (opt.blockHash() == null || opt.blockNumber() < blockNumber) {
-                v.failReason = "blockAheadOfAnchor";
-                return v;
-            }
-            anchorNumber = opt.blockNumber();
-            anchorHash = opt.blockHash();
-            anchorSlot = opt.slot();
+        // A finality that came from a verified update has its root in the window as
+        // BLS-verified; the seed fallbacks (no bootstrap) do not, and are reported so.
+        BeaconSyncState.SlottedStateRoot finRoot =
+                fin.stateRoot() != null ? beaconSyncState.findStateRoot(fin.stateRoot()) : null;
+        BlockAnchor anchor = blockAnchor(blockNumber, fin, beaconSyncState.getFinalizedSlot(),
+                finRoot != null && finRoot.blsVerified(), beaconSyncState.getOptimisticExecution());
+        if (anchor == null) {
+            v.failReason = "blockAheadOfAnchor";
+            return v;
         }
-        long gap = anchorNumber - blockNumber;
+        long gap = anchor.blockNumber() - blockNumber;
         log.info("[verify-block] headerChain: block={}, anchorBlock={}, gap={}",
-                blockNumber, anchorNumber, gap);
+                blockNumber, anchor.blockNumber(), gap);
         if (gap >= MAX_HEADER_CHAIN_GAP) {
             v.failReason = "headerChainGapTooLarge";
             return v;
@@ -192,18 +181,14 @@ public final class VerifiedBlockQuery {
                     ? List.of(reported)
                     : connector.requestBlockHeadersBatched(blockNumber, (int) (gap + 1))
                             .get(120, TimeUnit.SECONDS);
-            boolean chainValid = window.size() == gap + 1
-                    && HeaderChains.anchoredAtTop(window, anchorHash)
-                    // The window proves ITS first header; it must be the one reported.
-                    && window.get(0).hash().equals(reported.hash());
-            if (chainValid) {
+            if (windowProves(window, gap + 1, anchor.blockHash(), reported)) {
                 v.beaconChainVerified = true;
-                v.matchedSlot = anchorSlot;
-                v.blsVerified = true;
+                v.matchedSlot = anchor.slot();
+                v.blsVerified = anchor.blsVerified();
                 v.verifyMethod = "headerChain";
             } else {
                 log.info("[verify-block] header window for #{} did not anchor at #{}",
-                        blockNumber, anchorNumber);
+                        blockNumber, anchor.blockNumber());
                 v.failReason = "headerChainInvalid";
             }
         } catch (Exception e) {
@@ -211,6 +196,41 @@ public final class VerifiedBlockQuery {
             v.failReason = "headerChainError";
         }
         return v;
+    }
+
+    /** The attested block a block query's walk ends at, the slot reported with it, and
+     *  whether its hash came under a sync-committee signature. */
+    record BlockAnchor(long blockNumber, byte[] blockHash, long slot, boolean blsVerified) {}
+
+    /**
+     * The attested block at or above {@code blockNumber} its walk ends at: the finalized block
+     * for a target at or below it (the shorter walk), else the optimistic head — or null when
+     * nothing attested lies at or above the target yet ({@code blockAheadOfAnchor}). Each
+     * (number, hash) pair is one atomic snapshot; the slot is only reported. The optimistic
+     * head is always signed (no seed path sets it); the finality is as {@code finalizedBls}
+     * says.
+     */
+    static BlockAnchor blockAnchor(long blockNumber, BeaconSyncState.FinalizedExecution fin,
+                                   long finalizedSlot, boolean finalizedBls,
+                                   BeaconSyncState.OptimisticExecution opt) {
+        if (blockNumber <= fin.blockNumber()) {
+            return new BlockAnchor(fin.blockNumber(), fin.blockHash(), finalizedSlot, finalizedBls);
+        }
+        if (opt != null && opt.blockHash() != null && opt.blockNumber() >= blockNumber) {
+            return new BlockAnchor(opt.blockNumber(), opt.blockHash(), opt.slot(), true);
+        }
+        return null;
+    }
+
+    /** True iff {@code window}, fetched as {@code [target .. anchor]}, proves {@code reported}:
+     *  exactly {@code expected} headers, hash-linked up to {@code anchorHash}
+     *  ({@link HeaderChains#anchoredAtTop}), and its FIRST header is the very header this query
+     *  reports — the window proves its own headers, not one fetched separately. */
+    static boolean windowProves(List<BlockHeadersMessage.VerifiedHeader> window, long expected,
+                                byte[] anchorHash, BlockHeadersMessage.VerifiedHeader reported) {
+        return window.size() == expected
+                && HeaderChains.anchoredAtTop(window, anchorHash)
+                && window.get(0).hash().equals(reported.hash());
     }
 
     private static BlockResult errorResult(String message) {

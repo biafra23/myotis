@@ -256,7 +256,8 @@ mod tests {
             Item::Bytes(rlp::u64_to_minimal_be(number)),
             Item::Bytes(rlp::u64_to_minimal_be(30_000_000)),
             Item::Bytes(Vec::new()),
-            Item::Bytes(rlp::u64_to_minimal_be(1_700_000_000)),
+            // A per-number timestamp, so a test can tell which header dated a read.
+            Item::Bytes(rlp::u64_to_minimal_be(1_700_000_000 + number)),
             Item::Bytes(Vec::new()),
             Item::Bytes(z32),          // mixHash
             Item::Bytes(vec![0u8; 8]), // nonce
@@ -330,7 +331,7 @@ mod tests {
         let v = header_chain_verdict(&chain, &h1_hash, &root(0xa0), 77);
         assert_eq!(v.verify_method, Some("headerChain"));
         assert_eq!(v.matched_slot, 77, "the slot that attested the anchor");
-        assert_eq!(v.block_timestamp, Some(1_700_000_000), "the FIRST header's own timestamp");
+        assert_eq!(v.block_timestamp, Some(1_700_000_100), "the FIRST header's own timestamp, not the anchor's");
         let bad = header_chain_verdict(&chain, &root(0xbb), &root(0xa0), 77);
         assert_eq!(bad.fail_reason, Some("headerChainInvalid"));
         assert_eq!(bad.block_timestamp, None);
