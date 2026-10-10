@@ -2210,7 +2210,8 @@ private object StatusHelp {
 /**
  * Live log viewer over [LogSource]: poll the cheap version counter and re-snapshot only on
  * change; filter by substring on tag/message; auto-follow the tail unless the user scrolls up;
- * copy the visible lines or clear the ring. Mirrors the Android Logs tab.
+ * copy the newest visible lines that fit [LOG_COPY_BUDGET_CHARS] ([copyNewest]), save the whole
+ * log through the host ([LogSource.saveLog]), or clear the ring. Mirrors the Android Logs tab.
  */
 @Composable
 private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) -> Unit) {
@@ -2221,6 +2222,10 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
     var level by remember(logs) { mutableStateOf(logs.level()) }
+    // One line under the buttons about the last Copy / Save: what the copy holds (and that it
+    // was cut), or where the host put the file.
+    var exportNote by remember { mutableStateOf<String?>(null) }
+    var saving by remember { mutableStateOf(false) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
     // thread so it can't jank the UI.
@@ -2320,15 +2325,49 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
             Spacer(Modifier.width(8.dp))
             OutlinedButton(onClick = {
                 scope.launch {
-                    // Formatting up to 50k lines also goes off the main thread.
-                    val text = withContext(Dispatchers.Default) { formatLogs(shown, tz) }
-                    clipboard.setText(AnnotatedString(text))
+                    // Formatting goes off the main thread. The copy is the NEWEST shown lines
+                    // that fit the budget, behind a note when it had to cut — a paste of the
+                    // whole ring loses its tail wherever it lands (see LOG_COPY_BUDGET_CHARS).
+                    val copy = withContext(Dispatchers.Default) { copyNewest(shown, tz, logs.canSaveLog) }
+                    clipboard.setText(AnnotatedString(copy.text))
+                    exportNote = copy.status()
                 }
             }) { Text("Copy") }
+            if (logs.canSaveLog) {
+                Spacer(Modifier.width(4.dp))
+                // The whole log, through the host: its on-disk file where it keeps one, else
+                // the unfiltered ring, streamed. The ring is snapshotted when the host writes,
+                // not at the click: nothing big is held while the host's picker is open, and
+                // the file holds what was logged up to the write. The host answers with one
+                // line, maybe from a worker thread; a host that throws instead is reported the
+                // same way, so the button never stays disabled. The label stays put while
+                // disabled — a wider "Saving…" would reflow the row at phone width.
+                OutlinedButton(
+                    enabled = !saving,
+                    onClick = {
+                        saving = true
+                        exportNote = null
+                        val started = runCatching {
+                            logs.saveLog(
+                                suggestedLogFileName(tz),
+                                { sink -> formatLogsTo(sink, logs.snapshot(), tz) },
+                            ) { line ->
+                                exportNote = line
+                                saving = false
+                            }
+                        }.getOrElse {
+                            exportNote = "Save failed: ${it.message ?: it::class.simpleName}"
+                            false
+                        }
+                        if (!started) saving = false
+                    },
+                ) { Text("Save…") }
+            }
             Spacer(Modifier.width(4.dp))
             // Clearing empties the ring — tail-follow the fresh lines that come after.
             OutlinedButton(onClick = { logs.clear(); follow = true }) { Text("Clear") }
         }
+        exportNote?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
         Spacer(Modifier.height(4.dp))
         // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
         // raise it to quiet the log. Applies to capture (logs.setLevel) AND hides already-captured
@@ -2391,13 +2430,6 @@ private fun logLevelRank(c: Char): Int = when (c) {
     else -> 0   // 'D' and 'V'
 }
 
-private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString {
-    for (l in lines) {
-        append(formatLogTime(l.timestampMillis, tz)).append(' ').append(l.level)
-        append(' ').append(l.tag).append(": ").append(l.message).append('\n')
-    }
-}
-
 /** Compact elapsed duration: "45s" / "3m 12s" / "1h 3m". */
 private fun formatDuration(ms: Long): String {
     val totalSec = ms / 1000
@@ -2416,18 +2448,6 @@ private fun formatDuration(ms: Long): String {
 @OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatDateTime(ms: Long, tz: TimeZone): String =
     Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
-
-/** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
-// kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still
-// @ExperimentalTime in the 2.2 stdlib.
-@OptIn(kotlin.time.ExperimentalTime::class)
-private fun formatLogTime(ms: Long, tz: TimeZone): String {
-    val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
-    fun p2(n: Int) = n.toString().padStart(2, '0')
-    fun p3(n: Int) = n.toString().padStart(3, '0')
-    return "${p2(dt.hour)}:${p2(dt.minute)}:${p2(dt.second)}.${p3(dt.nanosecond / 1_000_000)}"
-}
-
 
 /** The confirm button of the Index tab's remove dialog — every row's own button reads "Remove" too. */
 internal const val INDEX_REMOVE_CONFIRM_TAG = "index-remove-confirm"

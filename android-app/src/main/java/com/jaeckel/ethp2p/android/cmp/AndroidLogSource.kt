@@ -12,9 +12,26 @@ import org.slf4j.event.Level
  * provider tees consensus/networking/libp2p logs into, alongside the app's own LogBuffer
  * calls), so the shared Logs tab renders the same lines the Android UI shows today. The capture
  * level is the SLF4J provider's live threshold.
+ *
+ * [saveTo] is the host's hook behind the Logs tab's Save… (the SAF create-document picker
+ * lives with the Activity): launch the picker for the suggested file name and, once the user
+ * picked a target, stream the log into it through the writer and answer through the result
+ * callback — possibly from a worker thread. Null (tests, a host without the picker) hides
+ * the button.
  */
-class AndroidLogSource : LogSource {
+class AndroidLogSource(
+    private val saveTo: ((suggestedName: String, write: (Appendable) -> Unit, onResult: (String) -> Unit) -> Unit)? = null,
+) : LogSource {
     override fun version(): Long = LogBuffer.version()
+
+    override val canSaveLog: Boolean get() = saveTo != null
+
+    /** Android keeps no log file: the whole ring, as the tab renders it, is the log. */
+    override fun saveLog(suggestedName: String, write: (Appendable) -> Unit, onResult: (String) -> Unit): Boolean {
+        val hook = saveTo ?: return false
+        hook(suggestedName, write, onResult)
+        return true
+    }
 
     override fun snapshot(): List<LogLine> = LogBuffer.snapshot().map { e ->
         LogLine(e.sequence(), e.timestampMillis(), e.level(), e.tag(), e.message())
