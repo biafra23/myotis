@@ -137,6 +137,8 @@ public final class NodeService extends Service {
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     private static final String K_EXPERT_MODE = "expertMode";
+    private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
+    private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
@@ -550,6 +552,46 @@ public final class NodeService extends Service {
     public static void setExpertMode(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_EXPERT_MODE, v).apply();
     }
+    /** Web page access (#502): which browser origins may use the JSON-RPC listeners, as an
+     *  {@link io.myotis.api.WebAccessMode} name. Default ALLOWLIST with no sites — every web
+     *  page refused until allowed; an unknown stored value (another build's) reads as that. */
+    public static String webAccessMode(android.content.Context c) {
+        String v = prefs(c).getString(K_WEB_ACCESS_MODE, io.myotis.api.WebAccessMode.ALLOWLIST.name());
+        try {
+            return io.myotis.api.WebAccessMode.valueOf(v).name();
+        } catch (IllegalArgumentException e) {
+            return io.myotis.api.WebAccessMode.ALLOWLIST.name();
+        }
+    }
+    public static void setWebAccessMode(android.content.Context c, String mode) {
+        prefs(c).edit().putString(K_WEB_ACCESS_MODE, io.myotis.api.WebAccessMode.valueOf(mode).name()).apply();
+    }
+    /** The allowed sites, in the order added (newline-separated in the pref: an origin never
+     *  holds one). The UI stores them normalized; the engine normalizes again regardless. */
+    public static List<String> webAccessOrigins(android.content.Context c) {
+        String v = prefs(c).getString(K_WEB_ACCESS_ORIGINS, "");
+        List<String> out = new ArrayList<>();
+        for (String o : v.split("\n")) {
+            String t = o.trim();
+            if (!t.isEmpty() && !out.contains(t)) out.add(t);
+        }
+        return out;
+    }
+    public static void setWebAccessOrigins(android.content.Context c, List<String> origins) {
+        StringBuilder sb = new StringBuilder();
+        for (String o : origins) {
+            String t = o == null ? "" : o.trim();
+            if (t.isEmpty() || t.indexOf('\n') >= 0) continue;
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(t);
+        }
+        prefs(c).edit().putString(K_WEB_ACCESS_ORIGINS, sb.toString()).apply();
+    }
+    /** The policy the engine is handed, from the prefs. */
+    public static io.myotis.api.WebAccessPolicy webAccessPolicy(android.content.Context c) {
+        return new io.myotis.api.WebAccessPolicy(
+                io.myotis.api.WebAccessMode.valueOf(webAccessMode(c)), webAccessOrigins(c));
+    }
     /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
      *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /
      *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
@@ -668,6 +710,45 @@ public final class NodeService extends Service {
         // Same monitor as buildAndStart's read-apply-publish: see the comment there.
         synchronized (handles) {
             for (ChainHandle h : handles.values()) h.setWsBoundPeriods(c);
+        }
+    }
+
+    /** Live-apply the persisted web-page policy (#502) to every live listener. Callers
+     *  persist first (the Settings section, the notification's Allow), then call this —
+     *  same monitor as the boot path's pre-start apply, so a change landing mid-boot is
+     *  either seen there or reaches the handle here. */
+    public void applyWebAccess() {
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) applyWebAccessTo(h);
+        }
+    }
+
+    /** Hand {@code h} the persisted policy and log it if the engine dropped an entry: the
+     *  UI only stores normalized origins, so a difference means a corrupt pref — logged,
+     *  never silently applied as something else (CLAUDE.md, Trust). Caller holds the
+     *  handles monitor. */
+    private void applyWebAccessTo(ChainHandle h) {
+        io.myotis.api.WebAccessPolicy asked = webAccessPolicy(this);
+        io.myotis.api.WebAccessPolicy applied = h.setWebAccessPolicy(asked);
+        // Per-entry lists on both sides: only a dropped entry makes them differ.
+        if (applied.origins().size() != asked.origins().size()) {
+            LogBuffer.w(TAG, "web page access: not every allowed site is an origin — asked "
+                    + asked.origins() + ", applying " + applied.origins());
+        }
+    }
+
+    /** The web origins that tried a RUNNING network's listener this run, most recent
+     *  first; empty when the network isn't hosted. In memory only (browsing history). */
+    public List<io.myotis.api.WebOrigin> recentWebOrigins(String network) {
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(canonicalNetwork(network));
+        }
+        if (handle == null) return List.of();
+        try {
+            return handle.recentWebOrigins();
+        } catch (RuntimeException e) {
+            return List.of();
         }
     }
 
@@ -1961,6 +2042,15 @@ public final class NodeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // The refusal notification's Allow (#502) arrives as a start command on the
+        // running service: persist + apply, and never treat it as a node start. A
+        // service that is NOT running (its notifications are dropped at shutdown, so
+        // this is the rare stale tap) persists the site and goes away again.
+        if (intent != null && ACTION_ALLOW_WEB_ORIGIN.equals(intent.getAction())) {
+            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN));
+            if (!RUNNING.get()) stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         // The system may redeliver onStartCommand (e.g. repeated taps, or a
         // restart race with stopService). Guard so we don't boot two copies
         // of the node racing for the same UDP/TCP ports.
@@ -1984,6 +2074,7 @@ public final class NodeService extends Service {
         startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
+        startWebRefusalPoll();
         registerNotifNetworkCallback();
 
         // Boot every enabled network as its own stack (Step 9). Each Netty/libp2p boot is
@@ -2122,6 +2213,9 @@ public final class NodeService extends Service {
                     // Weak-subjectivity bound override rides the same pre-start apply
                     // + monitor: the cold-start gate must judge with it.
                     handle.setWsBoundPeriods(wsBoundPeriods(this));
+                    // Web page access (#502) too: the listener's first request must be
+                    // judged by the persisted policy, never the engine default.
+                    applyWebAccessTo(handle);
                     handles.put(n, handle);
                 }
 
@@ -2293,6 +2387,8 @@ public final class NodeService extends Service {
         cachedClCounts.clear();
         elCaches.clear();
         clCaches.clear();
+        stopWebRefusalPoll();
+        cancelWebRefusalNotifications();
         // Safe to clear: a Stop->Start just re-runs the SYNCED-once gate until the restarted
         // stack re-observes SYNCED — fast off the warm store, no freeze. stackStartMs is
         // deliberately NOT cleared here (it's static, per-network, and owned by boots): a
@@ -2623,6 +2719,155 @@ public final class NodeService extends Service {
         unregisterNotifNetworkCallback();
         new Thread(this::doShutdown, "ethp2p-shutdown").start();
         super.onDestroy();
+    }
+
+    // ----- Web page refusals (#502): one notification per refused page, with Allow -----
+
+    /** Its own channel: a refusal is a question for the user, unlike the silent ongoing
+     *  node notification, so it may make a sound and show on the lock screen. */
+    private static final String WEB_CHANNEL_ID = "ethp2p_web_access";
+    /** Notification ids above the foreground one; one per refused origin this run. */
+    private static final int WEB_NOTIFICATION_BASE = 1000;
+    static final String ACTION_ALLOW_WEB_ORIGIN = "com.jaeckel.ethp2p.android.ALLOW_WEB_ORIGIN";
+    static final String EXTRA_WEB_ORIGIN = "origin";
+    /** How often the live listeners' recent-origins lists are checked for a new refusal —
+     *  a cheap in-memory read per network; the engine surface is a getter by design. */
+    private static final long WEB_REFUSAL_POLL_MS = 5_000;
+    /** Origins notified this run → their notification id: never twice for the same page,
+     *  however often it retries — until it is allowed (from the notification, the app or a
+     *  sighting the policy admitted), after which a fresh refusal is news again. Bounded by
+     *  {@link #WEB_NOTIFICATIONS_PER_RUN}: a local client rotating fake origins (the gate
+     *  lists only well-formed ones, but a native client can send any) must not churn a
+     *  notification per poll nor grow this map; past the cap nothing more is notified this
+     *  run, while the Status banner and the recent list keep showing everything. */
+    private final Map<String, Integer> webNotified = new ConcurrentHashMap<>();
+    /** Distinct origins notified per run at most; a real user never sees twenty sites refused. */
+    private static final int WEB_NOTIFICATIONS_PER_RUN = 20;
+    private volatile boolean webNotificationCapLogged;
+    /** The next notification id; ids are never reused within a run, so a re-armed origin's
+     *  new notification cannot collide with a stale one the user left on screen. */
+    private final java.util.concurrent.atomic.AtomicInteger webNotificationIds =
+            new java.util.concurrent.atomic.AtomicInteger(WEB_NOTIFICATION_BASE);
+    private volatile java.util.concurrent.ScheduledExecutorService webRefusalPoll;
+
+    private void startWebRefusalPoll() {
+        if (webRefusalPoll != null) return;
+        java.util.concurrent.ScheduledExecutorService ex =
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ethp2p-web-access");
+                    t.setDaemon(true);
+                    return t;
+                });
+        ex.scheduleWithFixedDelay(this::notifyWebRefusals,
+                WEB_REFUSAL_POLL_MS, WEB_REFUSAL_POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        webRefusalPoll = ex;
+    }
+
+    private void stopWebRefusalPoll() {
+        java.util.concurrent.ScheduledExecutorService ex = webRefusalPoll;
+        if (ex != null) {
+            ex.shutdownNow();
+            webRefusalPoll = null;
+        }
+    }
+
+    /**
+     * One pass: every origin a live listener refused that the CURRENT policy still does
+     * not admit, and that was not notified yet, gets a notification. Nothing under Off
+     * (the user said no web pages — a refusal is the setting working) and nothing for
+     * the opaque origin {@code null}, which Allow could not admit. Guarded: a throw
+     * would silently end the schedule.
+     */
+    private void notifyWebRefusals() {
+        try {
+            io.myotis.api.WebAccessPolicy policy = webAccessPolicy(this);
+            if (policy.mode() != io.myotis.api.WebAccessMode.ALLOWLIST) return;
+            List<ChainHandle> live;
+            synchronized (handles) {
+                live = new ArrayList<>(handles.values());
+            }
+            for (ChainHandle h : live) {
+                for (io.myotis.api.WebOrigin o : h.recentWebOrigins()) {
+                    String origin = o.origin();
+                    if (o.lastAllowed() || policy.origins().contains(origin)) {
+                        // Allowed since (or served): re-arm, so a later refusal — the user
+                        // removed the site again — is notified afresh.
+                        webNotified.remove(origin);
+                        continue;
+                    }
+                    if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
+                    if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
+                        if (!webNotificationCapLogged) {
+                            webNotificationCapLogged = true;
+                            LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
+                                    + " origins notified this run, no more notifications until restart "
+                                    + "(the Status screen still lists them)");
+                        }
+                        continue;
+                    }
+                    int id = webNotificationIds.getAndIncrement();
+                    webNotified.put(origin, id);
+                    postWebRefusalNotification(id, origin);
+                }
+            }
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "web refusal notification failed: " + t);
+        }
+    }
+
+    private void postWebRefusalNotification(int id, String origin) {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        nm.createNotificationChannel(new NotificationChannel(
+                WEB_CHANNEL_ID, "Web page access", NotificationManager.IMPORTANCE_DEFAULT));
+        Intent allow = new Intent(this, NodeService.class)
+                .setAction(ACTION_ALLOW_WEB_ORIGIN)
+                .putExtra(EXTRA_WEB_ORIGIN, origin);
+        // The request code is the notification id, so each origin's Allow is its own
+        // PendingIntent (equal intents with different extras would otherwise collapse).
+        android.app.PendingIntent allowIntent = android.app.PendingIntent.getService(this, id, allow,
+                android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+        android.app.PendingIntent open = android.app.PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class), android.app.PendingIntent.FLAG_IMMUTABLE);
+        String text = origin + " tried to use the node and was refused. Allow it only if you "
+                + "trust that site: it can then read balances and run calls through your node. "
+                + "The app's Status screen and Settings → Web page access show the same.";
+        Notification n = new Notification.Builder(this, WEB_CHANNEL_ID)
+                .setContentTitle("A web page was refused")
+                .setContentText(origin + " tried to use the node")
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .addAction(new Notification.Action.Builder(null, "Allow", allowIntent).build())
+                .build();
+        nm.notify(id, n);
+        LogBuffer.i(TAG, "web page refused, notified: " + origin);
+    }
+
+    /** The notification's Allow: persist the site, apply live, drop the notification. The
+     *  mode is left alone — a refusal is notified only under Specific sites, and Off must
+     *  not be widened from a notification tap. */
+    private void allowWebOrigin(String origin) {
+        if (origin == null || origin.isBlank()) return;
+        List<String> list = new ArrayList<>(webAccessOrigins(this));
+        if (!list.contains(origin)) {
+            list.add(origin);
+            setWebAccessOrigins(this, list);
+        }
+        applyWebAccess();
+        Integer id = webNotified.remove(origin);
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null && id != null) nm.cancel(id);
+        LogBuffer.i(TAG, "web page allowed from its notification: " + origin);
+    }
+
+    private void cancelWebRefusalNotifications() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            for (int id : webNotified.values()) nm.cancel(id);
+        }
+        webNotified.clear();
     }
 
     private Notification buildNotification(String title, String text) {

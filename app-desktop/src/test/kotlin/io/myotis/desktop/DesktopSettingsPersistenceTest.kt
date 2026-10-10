@@ -78,6 +78,34 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `web page access round-trips across a restart`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val first = DesktopSettings(nets, file)
+        assertEquals(io.myotis.ui.WebAccessMode.ALLOWLIST, first.webAccessMode(), "specific sites is the default")
+        assertEquals(emptyList<String>(), first.webAccessOrigins(), "with no sites allowed")
+        first.setWebAccessOrigins(listOf("https://app.example", "chrome-extension://nkbihfbeogaeaoehlefnkodbefgpgknn"))
+        first.setWebAccessMode(io.myotis.ui.WebAccessMode.OFF)
+
+        val second = DesktopSettings(nets, file)
+        assertEquals(io.myotis.ui.WebAccessMode.OFF, second.webAccessMode(), "the mode must be sticky")
+        assertEquals(
+            listOf("https://app.example", "chrome-extension://nkbihfbeogaeaoehlefnkodbefgpgknn"),
+            second.webAccessOrigins(),
+            "the allowed sites must be sticky, in order",
+        )
+        // The engine-facing policy carries both.
+        val policy = webAccessPolicy(second)
+        assertEquals(io.myotis.api.WebAccessMode.OFF, policy.mode())
+        assertEquals(2, policy.origins().size)
+
+        // An unknown mode name keeps the safe default; a blank list entry is dropped.
+        Files.writeString(file, "webAccess.mode=EVERYONE\nwebAccess.origins=https://a.example,, https://b.example \n")
+        val third = DesktopSettings(nets, file)
+        assertEquals(io.myotis.ui.WebAccessMode.ALLOWLIST, third.webAccessMode())
+        assertEquals(listOf("https://a.example", "https://b.example"), third.webAccessOrigins())
+    }
+
+    @Test
     fun `all networks disabled persists as the empty set, not the default`(@TempDir dir: Path) {
         val file = dir.resolve("settings.properties")
         DesktopSettings(nets, file).setNetworkEnabled("mainnet", false)

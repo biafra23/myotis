@@ -94,6 +94,32 @@ public interface ChainHandle {
     void setWsBoundPeriods(long periods);
 
     /**
+     * Install the operator's web-page access policy on this network's JSON-RPC
+     * listener (#502): which browser origins may use it. Applied live — the next
+     * request is judged by it, no restart — and accepted before {@link #start()},
+     * so the listener's very first request is already judged by the host's
+     * setting (hosts set it between {@code create()} and {@code start()}, like
+     * {@link #setServedBlockWindow}). Native wallets send no {@code Origin} and
+     * are unaffected in every mode.
+     *
+     * @return the policy that now applies: the same mode, with the origins as the
+     *         engine normalized them and WITHOUT any entry it could not read as an
+     *         origin ({@code scheme://host[:port]}; no path, no wildcard). A caller
+     *         that must not silently lose an entry compares it with what it asked
+     *         for — the daemon refuses to boot on a difference, the apps log it.
+     */
+    WebAccessPolicy setWebAccessPolicy(WebAccessPolicy policy);
+
+    /**
+     * The web origins that tried to use this network's listener this run, most
+     * recent first, with outcome, attempt count and last-seen time — the apps'
+     * "recent web pages" list, from which a refused page is allowed with one
+     * tap. In memory only (it is browsing history: never persisted, never served
+     * over JSON-RPC) and bounded (the 50 most recent distinct origins).
+     */
+    java.util.List<WebOrigin> recentWebOrigins();
+
+    /**
      * Consent to sync forward from an anchor older than the weak-subjectivity
      * bound. Run-sticky: it releases a stack parked in
      * {@link BeaconState#STALE_ANCHOR} and stays armed for any later stale-anchor

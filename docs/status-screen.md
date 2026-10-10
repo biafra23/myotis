@@ -117,6 +117,13 @@ choice just hides the dialog; it reappears if the network parks again later.
   verified state agrees — unsynced, or verified head gone stale. Shows the
   activation time, how many distinct peer networks reported it, and the fork
   id.
+- **Web page refused banner** (both modes) — a web page (a browser origin) tried
+  to use a network's JSON-RPC listener and the *Web page access* setting refused
+  it. Names the origin (the Chrome MetaMask extension by name) with **Allow**
+  (adds it to the allowed sites and applies at once — the page's next request is
+  served) and **Dismiss** (for this screen's lifetime). Folds every network's
+  listener; not shown under the *Off* mode, where a refusal is the setting
+  working. See docs/web-page-access.md.
 - **Hunt banner** (Expert mode; the card's detail says the same in both) ("Hunting for light-client servers and/or snap peers…") —
   the light client and/or the EL pool are starved of usable servers and
   running boosted discovery/probing to find more. Tracks `lcHunting` /

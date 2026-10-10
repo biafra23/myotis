@@ -301,7 +301,13 @@ A standard Ethereum JSON-RPC HTTP endpoint so **unmodified wallets work**. Refer
 
 - **Transport**: HTTP server bound to **`127.0.0.1`** (loopback only — the wallet is a same-device
   client; the endpoint is unauthenticated and TLS-less, so it must not be on a routable interface).
-  `GET /health`, `POST /`. CORS for browser wallets.
+  `GET /health`, `POST /`. Web pages are gated by the operator's *Web page access* policy
+  (#502, docs/web-page-access.md): a request carrying `Origin` is served — with the CORS
+  headers it needs — only when the policy admits that exact origin; a no-cors probe
+  (`Sec-Fetch-Site` without `Origin`) and a `Host` that is not the loopback listener are
+  refused in every mode; native clients (neither header) are untouched. The policy is set
+  per handle (`ChainHandle.setWebAccessPolicy`, live) and the origins that tried are read
+  back (`recentWebOrigins`) for the apps' allow-from-the-list flow.
 - **Backend SPI**: the server depends only on a `MyotisRpcBackend` interface (the verified backend
   implements it) — clean inversion so the server stays host-agnostic.
 - **Routing**: handle single requests and JSON-RPC 2.0 **batch arrays** (each element gets its own

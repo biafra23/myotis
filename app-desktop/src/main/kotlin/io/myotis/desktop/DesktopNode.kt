@@ -37,6 +37,8 @@ import io.myotis.ui.Settings
 import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
 import io.myotis.ui.UpgradeNotice
+import io.myotis.ui.WebAccessMode
+import io.myotis.ui.WebOriginRow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -177,6 +179,9 @@ class DesktopNodeController(
                         // Weak-subjectivity bound override rides the same pre-start
                         // apply + lock: the cold-start gate must judge with it.
                         handle.setWsBoundPeriods(settings.wsBoundPeriods().toLong())
+                        // Web page access (#502) too: the listener's first request must
+                        // already be judged by the persisted policy, never the default.
+                        applyWebAccessTo(handle)
                     }
                     handle.start()
                 } catch (t: Throwable) {
@@ -421,6 +426,28 @@ class DesktopNodeController(
         // once — and a no-op off macOS, where there is nothing to hold.
         if (!AppNap.isMac) return
         if (settings.allowAppNap()) AppNap.enable() else AppNap.disable(AppNap.REASON)
+    }
+
+    override fun applyWebAccess() {
+        // Live on every running listener; the boot path applies the same policy
+        // before start() under the served-window lock, so a Settings change landing
+        // mid-boot is either seen by that pre-start apply or reaches the handle here.
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { net -> engine.get(net)?.let(::applyWebAccessTo) }
+        }
+    }
+
+    /** Hand [handle] the persisted policy and say so if the engine dropped an entry: the
+     *  UI only stores normalized origins, so a difference means a hand-edited settings
+     *  file — logged, never silently applied as something else (CLAUDE.md, Trust). */
+    private fun applyWebAccessTo(handle: ChainHandle) {
+        val asked = webAccessPolicy(settings)
+        val applied = handle.setWebAccessPolicy(asked)
+        // Per-entry lists on both sides: only a dropped entry makes them differ.
+        if (applied.origins().size != asked.origins().size) {
+            log.warn("[desktop] web page access: not every allowed site is an origin — asked {}, applying {}",
+                asked.origins(), applied.origins())
+        }
     }
 
     override fun applyTorMode() {
@@ -721,6 +748,9 @@ class DesktopNodeController(
             upgrade = s.upgradeAdvisory()?.let {
                 UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
             },
+            webOrigins = runCatching { handle.recentWebOrigins() }.getOrDefault(emptyList()).map {
+                WebOriginRow(it.origin(), it.attempts(), it.lastSeenEpochMillis(), it.lastAllowed(), s.network())
+            },
         )
     }
 
@@ -755,6 +785,13 @@ internal fun logIndexConfigJson(settings: Settings, network: String): String? =
         settings.logIndexMaxSpeed(network),
         configured = settings.logIndexConfigured(network),
         backfillPaused = settings.logIndexBackfillPaused(network),
+    )
+
+/** The web-page policy the desktop host hands the engine (#502), straight from [Settings]. */
+internal fun webAccessPolicy(settings: Settings): io.myotis.api.WebAccessPolicy =
+    io.myotis.api.WebAccessPolicy(
+        io.myotis.api.WebAccessMode.valueOf(settings.webAccessMode().name),
+        settings.webAccessOrigins(),
     )
 
 /**
@@ -792,6 +829,10 @@ class DesktopSettings(
     private var torRouting = false
     // Expert mode (Logs/Index tabs, full Status rows, advanced settings); off by default.
     private var expert = false
+    // Web page access (#502): default Specific sites with none allowed — every web page
+    // is refused until the user allows it (native wallets are never affected).
+    private var webAccess = WebAccessMode.ALLOWLIST
+    private val webOrigins = ArrayList<String>()
     // macOS App Nap opt-in; off = the process holds the no-nap activity (AppNap.kt).
     private var allowNap = false
     // Per-network opt-in for the eth_getLogs watch-list index (Rust engine only).
@@ -878,6 +919,16 @@ class DesktopSettings(
     override fun setPreferJavaEngine(v: Boolean) = mutate { preferJava = v }
     override fun torEnabled(): Boolean = synchronized(this) { torRouting }
     override fun setTorEnabled(v: Boolean) = mutate { torRouting = v }
+    override fun supportsWebAccess(): Boolean = true   // persisted here, pushed by the controller
+    override fun webAccessMode(): WebAccessMode = synchronized(this) { webAccess }
+    override fun setWebAccessMode(mode: WebAccessMode) = mutate { webAccess = mode }
+    override fun webAccessOrigins(): List<String> = synchronized(this) { webOrigins.toList() }
+    override fun setWebAccessOrigins(origins: List<String>) = mutate {
+        webOrigins.clear()
+        // Stored as typed-and-normalized by the UI; an origin never holds a comma, so the
+        // file's comma list is unambiguous (load() drops anything that is not one).
+        origins.filter { it.isNotBlank() && ',' !in it }.distinct().forEach(webOrigins::add)
+    }
     override fun expertMode(): Boolean = synchronized(this) { expert }
     override fun setExpertMode(v: Boolean) = mutate { expert = v }
     override fun allowAppNap(): Boolean = synchronized(this) { allowNap }
@@ -914,6 +965,13 @@ class DesktopSettings(
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
         p.getProperty(K_EXPERT)?.toBooleanStrictOrNull()?.let { expert = it }
         p.getProperty(K_APP_NAP)?.toBooleanStrictOrNull()?.let { allowNap = it }
+        // An unknown mode name (a hand edit, a newer version's value) keeps the safe default.
+        p.getProperty(K_WEB_ACCESS)?.let { v -> WebAccessMode.entries.firstOrNull { it.name == v } }
+            ?.let { webAccess = it }
+        p.getProperty(K_WEB_ORIGINS)?.let { csv ->
+            webOrigins.clear()
+            csv.split(',').map(String::trim).filter { it.isNotEmpty() }.distinct().forEach(webOrigins::add)
+        }
         p.getProperty(K_POC_CONFIGURED)?.let { csv ->
             // Empty counts as no record (never written so; a hand edit): read as "configured
             // nothing" it would re-apply the primary network over the user's settings.
@@ -1001,6 +1059,8 @@ class DesktopSettings(
         p.setProperty(K_TOR, torRouting.toString())
         p.setProperty(K_EXPERT, expert.toString())
         p.setProperty(K_APP_NAP, allowNap.toString())
+        p.setProperty(K_WEB_ACCESS, webAccess.name)
+        p.setProperty(K_WEB_ORIGINS, webOrigins.joinToString(","))
         pocConfigured?.let { p.setProperty(K_POC_CONFIGURED, it.joinToString(",")) }
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
@@ -1047,6 +1107,8 @@ class DesktopSettings(
         const val K_TOR = "torRouting"
         const val K_EXPERT = "expertMode"
         const val K_APP_NAP = "appNap.allow"
+        const val K_WEB_ACCESS = "webAccess.mode"
+        const val K_WEB_ORIGINS = "webAccess.origins"
         const val K_POC_CONFIGURED = "poc.configuredNetworks"
         const val K_LOG_INDEX_PREFIX = "logIndex."
         // Distinct prefixes nested under logIndex.* so the enable-loader's
