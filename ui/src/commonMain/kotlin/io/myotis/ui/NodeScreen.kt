@@ -1865,7 +1865,7 @@ private fun looksLikeEnsName(input: String): Boolean {
  * start under [expert].
  */
 @Composable
-private fun AccountResultView(a: AccountResult, currency: String, expert: Boolean) {
+private fun AccountResultView(a: AccountResult, currency: String?, expert: Boolean) {
     val clipboard = LocalClipboardManager.current
     var showRaw by remember(expert) { mutableStateOf(expert) }
     Card(Modifier.fillMaxWidth()) {
@@ -1898,7 +1898,7 @@ private fun AccountResultView(a: AccountResult, currency: String, expert: Boolea
                     // On mainnet the verified caption reads "Balance (ETH)" verbatim: the iOS
                     // UI test (QueryFlowTests) waits for it.
                     Text(
-                        if (verified) "Balance ($currency)" else "Balance ($currency) — unverified peer claim",
+                        if (verified) balanceCaption(currency) else "${balanceCaption(currency)} — unverified peer claim",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1990,14 +1990,21 @@ private fun VerificationBadge(a: AccountResult) {
 
 /**
  * The native currency a chain's balances are counted in, as a wallet shows it: xDAI on
- * Gnosis Chain, ETH on mainnet and Sepolia (Sepolia's is test ether). An unknown network
- * reads as ETH, the Ethereum default. Every one of them has 18 decimals, which is what
- * [formatNative] assumes.
+ * Gnosis Chain, ETH on mainnet and Sepolia (Sepolia's is test ether). Null for a network
+ * this table does not know, and the card then names no unit: a network added later reads
+ * "Balance" until it is listed here, never a wrong symbol. Every listed chain has 18
+ * decimals, which is what [formatNative] assumes; check that before listing a new one.
  */
-internal fun nativeCurrencySymbol(network: String): String = when (network) {
+internal fun nativeCurrencySymbol(network: String): String? = when (network) {
+    "mainnet", "sepolia" -> "ETH"
     "gnosis" -> "xDAI"
-    else -> "ETH"
+    else -> null
 }
+
+/** The balance caption: "Balance (ETH)", or just "Balance" when the unit is unknown. */
+internal fun balanceCaption(currency: String?): String =
+    if (currency != null) "Balance ($currency)" else "Balance"
+
 
 /** Wei (decimal string) → the native currency with 6 dp, truncated toward zero; 18 decimals
  *  on every supported chain ([nativeCurrencySymbol]). Pure-Kotlin (commonMain has no
@@ -2015,11 +2022,11 @@ private fun formatNative(weiDecimal: String?): String {
 }
 
 /** Full plaintext dump of an account result for the clipboard (untruncated hex). */
-private fun formatAccountResult(a: AccountResult, currency: String): String = buildString {
+private fun formatAccountResult(a: AccountResult, currency: String?): String = buildString {
     appendLine("address: ${a.address}")
     appendLine("exists: ${a.exists}")
     if (a.exists) {
-        appendLine("balance ($currency): ${formatNative(a.balanceWei)}")
+        appendLine((if (currency != null) "balance ($currency)" else "balance") + ": ${formatNative(a.balanceWei)}")
         appendLine("balance (wei): ${a.balanceWei ?: "—"}")
         appendLine("nonce: ${a.nonce}")
         a.storageRootHex?.let { appendLine("storageRoot: $it") }

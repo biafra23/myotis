@@ -12,6 +12,7 @@ import androidx.compose.ui.test.performTextInput
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -29,7 +30,7 @@ class QueryResultCardTest {
     private class Node(private val result: AccountResult, private val network: String = "mainnet") : FakeController() {
         override val running: Boolean = true
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
-            flowOf(mapOf(network to snapshot().copy(network = network)))
+            flowOf(mapOf(network to testSnapshot(network)))
         override suspend fun requestAccount(network: String, address: String): AccountResult = result
     }
 
@@ -45,7 +46,7 @@ class QueryResultCardTest {
         rule.onNodeWithText("Proof valid").assertDoesNotExist()
 
         rule.onNodeWithText("Show raw details").performScrollTo().performClick()
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNodeWithText("Storage root").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Hide raw details").performScrollTo().assertIsDisplayed()
     }
@@ -88,14 +89,14 @@ class QueryResultCardTest {
     @Test
     fun theKeyboardsSearchKeyRunsTheLookup() {
         rule.mainClock.autoAdvance = false
-        rule.setContent { NodeScreen(controller = Node(verified()), settings = FakeSettings(), logs = NoLogs) }
-        pumpFrames()
+        rule.setContent { NodeScreen(controller = Node(verified()), settings = FakeSettings(), logs = NoTestLogs) }
+        rule.pumpFrames()
         rule.onNode(isSelectable() and hasText("Query")).performClick()
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNodeWithText("Address (0x…) or ENS name").performTextInput(ADDR)
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNodeWithText("Address (0x…) or ENS name").performImeAction()
-        awaitText("Copy")
+        rule.awaitText("Copy")
         rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
     }
 
@@ -121,6 +122,10 @@ class QueryResultCardTest {
         assertEquals("ETH", nativeCurrencySymbol("mainnet"))
         assertEquals("ETH", nativeCurrencySymbol("sepolia"))
         assertEquals("xDAI", nativeCurrencySymbol("gnosis"))
+        // A network the table does not know names no unit rather than a wrong one.
+        assertNull(nativeCurrencySymbol("hoodi"))
+        assertEquals("Balance", balanceCaption(null))
+        assertEquals("Balance (xDAI)", balanceCaption("xDAI"))
     }
 
     @Test
@@ -135,35 +140,14 @@ class QueryResultCardTest {
 
     private fun lookUp(controller: NodeController, settings: Settings) {
         rule.mainClock.autoAdvance = false
-        rule.setContent { NodeScreen(controller = controller, settings = settings, logs = NoLogs) }
-        pumpFrames()
+        rule.setContent { NodeScreen(controller = controller, settings = settings, logs = NoTestLogs) }
+        rule.pumpFrames()
         rule.onNode(isSelectable() and hasText("Query")).performClick()
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNodeWithText("Address (0x…) or ENS name").performTextInput(ADDR)
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNodeWithText("Look up").performClick()
-        awaitText("Copy")
-    }
-
-    private fun pumpFrames(n: Int = 3) = repeat(n) { rule.mainClock.advanceTimeByFrame() }
-
-    /** Advance virtual time + pump until [text] composes (the lookup hops to a real dispatcher). */
-    private fun awaitText(text: String) {
-        repeat(200) {
-            rule.mainClock.advanceTimeBy(300)
-            Thread.sleep(20)
-            pumpFrames()
-            if (rule.onAllNodes(hasText(text)).fetchSemanticsNodes().isNotEmpty()) return
-        }
-        error("timed out waiting for \"$text\"")
-    }
-
-    private object NoLogs : LogSource {
-        override fun version(): Long = 0
-        override fun snapshot(): List<LogLine> = emptyList()
-        override fun clear() {}
-        override fun level(): LogLevel = LogLevel.INFO
-        override fun setLevel(level: LogLevel) {}
+        rule.awaitText("Copy")
     }
 
     private companion object {
@@ -176,21 +160,6 @@ class QueryResultCardTest {
             blockNumber = 22_843_511, peerStateRootHex = null, peerProofValid = true,
             beaconChainVerified = true, blsVerified = true, matchedBeaconSlot = 1,
             verifyMethod = "headerChain", failReason = null,
-        )
-
-        fun snapshot() = NodeSnapshot(
-            running = true, lifecycle = "RUNNING", network = "mainnet", engine = "rust",
-            beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
-            snapServingPeers = 2, snap2ServingPeers = 0,
-            clConnectedPeers = 0, clServedPeersLastMin = 2,
-            clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
-            elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
-            blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,
-            finalizedSlot = 1, syncStartPeriod = -1, syncCurrentPeriod = 0, syncTargetPeriod = 0,
-            verifiedHeadAgeMs = 1_000, uptimeSeconds = 60, peerHeaderRequests = 0,
-            peerHeaderRequestsServed = 0, peerBodyRequests = 0, peerBodyRequestsServed = 0,
-            readyPeerList = emptyList(), pauseCount = 0, totalPausedMs = 0,
-            lastPauseEpochMs = 0, lastResumeEpochMs = 0, lastWakeReason = null,
         )
     }
 }

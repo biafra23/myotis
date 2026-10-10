@@ -1,5 +1,6 @@
 package io.myotis.ui
 
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.ComposeContentTestRule
 import androidx.compose.ui.test.onNodeWithText
@@ -78,4 +79,43 @@ internal fun ComposeContentTestRule.toggleSwitchBeside(label: String) {
     }
     check(beside >= 0) { "no switch beside '$label'" }
     switches[beside].performClick()
+}
+
+/** A running, synced stack on [network] — the Query tests' shared snapshot. */
+internal fun testSnapshot(network: String = "mainnet") = NodeSnapshot(
+    running = true, lifecycle = "RUNNING", network = network, engine = "rust",
+    beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
+    snapServingPeers = 2, snap2ServingPeers = 0,
+    clConnectedPeers = 0, clServedPeersLastMin = 2,
+    clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
+    elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
+    blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,
+    finalizedSlot = 1, syncStartPeriod = -1, syncCurrentPeriod = 0, syncTargetPeriod = 0,
+    verifiedHeadAgeMs = 1_000, uptimeSeconds = 60, peerHeaderRequests = 0,
+    peerHeaderRequestsServed = 0, peerBodyRequests = 0, peerBodyRequestsServed = 0,
+    readyPeerList = emptyList(), pauseCount = 0, totalPausedMs = 0,
+    lastPauseEpochMs = 0, lastResumeEpochMs = 0, lastWakeReason = null,
+)
+
+/** A log source with no lines, for screens under test that never read them. */
+internal object NoTestLogs : LogSource {
+    override fun version(): Long = 0
+    override fun snapshot(): List<LogLine> = emptyList()
+    override fun clear() {}
+    override fun level(): LogLevel = LogLevel.INFO
+    override fun setLevel(level: LogLevel) {}
+}
+
+/** Pump [n] frames of a test that drives the clock by hand (`autoAdvance = false`). */
+internal fun ComposeContentTestRule.pumpFrames(n: Int = 3) = repeat(n) { mainClock.advanceTimeByFrame() }
+
+/** Advance virtual time and pump until [text] composes (a lookup hops to a real dispatcher). */
+internal fun ComposeContentTestRule.awaitText(text: String) {
+    repeat(200) {
+        mainClock.advanceTimeBy(300)
+        Thread.sleep(20)
+        pumpFrames()
+        if (onAllNodes(hasText(text)).fetchSemanticsNodes().isNotEmpty()) return
+    }
+    error("timed out waiting for \"$text\"")
 }

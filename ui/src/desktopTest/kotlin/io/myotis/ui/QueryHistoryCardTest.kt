@@ -29,7 +29,7 @@ class QueryHistoryCardTest {
         override val running: Boolean = stackRunning
         // A running mainnet stack by default: a card re-runs only on a running node, like Look up.
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
-            flowOf(if (stackRunning) mapOf("mainnet" to snapshot()) else emptyMap())
+            flowOf(if (stackRunning) mapOf("mainnet" to testSnapshot()) else emptyMap())
         override suspend fun requestAccount(network: String, address: String): AccountResult {
             looked += address
             return AccountResult(
@@ -54,16 +54,16 @@ class QueryHistoryCardTest {
         rule.mainClock.autoAdvance = false
         rule.setContent {
             NodeScreen(
-                controller = node, settings = FakeSettings(), logs = NoLogs,
+                controller = node, settings = FakeSettings(), logs = NoTestLogs,
                 history = History(listOf(
                     QueryHistoryEntry("vitalik.eth", now - 5 * 60_000, VITALIK),
                     QueryHistoryEntry(OTHER, now - 2 * 3_600_000, ""),
                 )),
             )
         }
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNode(isSelectable() and hasText("Query")).performClick()
-        awaitText("Recent")
+        rule.awaitText("Recent")
 
         rule.onNodeWithText("vitalik.eth").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText(VITALIK).performScrollTo().assertIsDisplayed()
@@ -73,7 +73,7 @@ class QueryHistoryCardTest {
         // The whole card is the tap target, and it re-runs the stored input.
         // A clickable card merges its texts into one node, so match the merged text.
         rule.onNode(hasClickAction() and hasText(OTHER)).performScrollTo().performClick()
-        awaitText("Copy")
+        rule.awaitText("Copy")
         assertEquals(listOf(OTHER), node.looked)
     }
 
@@ -83,13 +83,13 @@ class QueryHistoryCardTest {
         rule.mainClock.autoAdvance = false
         rule.setContent {
             NodeScreen(
-                controller = node, settings = FakeSettings(), logs = NoLogs,
+                controller = node, settings = FakeSettings(), logs = NoTestLogs,
                 history = History(listOf(QueryHistoryEntry(OTHER, System.currentTimeMillis(), ""))),
             )
         }
-        pumpFrames()
+        rule.pumpFrames()
         rule.onNode(isSelectable() and hasText("Query")).performClick()
-        awaitText("Recent")
+        rule.awaitText("Recent")
         rule.onNode(hasClickAction() and hasText(OTHER)).performScrollTo().assertIsNotEnabled()
         assertEquals(emptyList<String>(), node.looked)
     }
@@ -107,45 +107,8 @@ class QueryHistoryCardTest {
         assertEquals("just now", historyAge(t, t - 10_000))
     }
 
-    // ---- harness ----
-
-    private fun pumpFrames(n: Int = 3) = repeat(n) { rule.mainClock.advanceTimeByFrame() }
-
-    private fun awaitText(text: String) {
-        repeat(200) {
-            rule.mainClock.advanceTimeBy(300)
-            Thread.sleep(20)
-            pumpFrames()
-            if (rule.onAllNodes(hasText(text)).fetchSemanticsNodes().isNotEmpty()) return
-        }
-        error("timed out waiting for \"$text\"")
-    }
-
-    private object NoLogs : LogSource {
-        override fun version(): Long = 0
-        override fun snapshot(): List<LogLine> = emptyList()
-        override fun clear() {}
-        override fun level(): LogLevel = LogLevel.INFO
-        override fun setLevel(level: LogLevel) {}
-    }
-
     private companion object {
         const val VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
         const val OTHER = "0x1A5F9352Af8aF974bFC03399e3767DF6370d82e4"
-
-        fun snapshot() = NodeSnapshot(
-            running = true, lifecycle = "RUNNING", network = "mainnet", engine = "rust",
-            beaconState = "SYNCED", connectedPeers = 3, readyPeers = 3, snapPeers = 2,
-            snapServingPeers = 2, snap2ServingPeers = 0,
-            clConnectedPeers = 0, clServedPeersLastMin = 2,
-            clCachedPeers = 10, clCachedProven = 5, clCachedNolc = 1, elCachedPeers = 20,
-            elCachedSnapOk = 8, elCachedSnapBad = 2, discoveredPeers = 50, backedOffPeers = 0,
-            blacklistedPeers = 0, discv5Peers = 100, executionBlockNumber = 22_843_511,
-            finalizedSlot = 1, syncStartPeriod = -1, syncCurrentPeriod = 0, syncTargetPeriod = 0,
-            verifiedHeadAgeMs = 1_000, uptimeSeconds = 60, peerHeaderRequests = 0,
-            peerHeaderRequestsServed = 0, peerBodyRequests = 0, peerBodyRequestsServed = 0,
-            readyPeerList = emptyList(), pauseCount = 0, totalPausedMs = 0,
-            lastPauseEpochMs = 0, lastResumeEpochMs = 0, lastWakeReason = null,
-        )
     }
 }
