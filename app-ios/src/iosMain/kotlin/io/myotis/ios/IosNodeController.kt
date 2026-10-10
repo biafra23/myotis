@@ -447,6 +447,8 @@ class IosNodeController(
             matchedBeaconSlot = o.engineLong("matchedBeaconSlot", -1L),
             verifyMethod = o.engineString("verifyMethod"),
             failReason = o.engineString("failReason"),
+            // ABI 41: the proven block timestamp; null (none proven) reads as -1.
+            blockTimestamp = o.engineLong("blockTimestamp", -1L),
         )
     }
 
@@ -468,19 +470,21 @@ class IosNodeController(
         val o = parseOrThrow(json, "ENS resolution")
         val blockNumber = o.engineLong("blockNumber", -1L)
         val verified = o.engineBoolean("verified")
+        val blockTimestamp = o.engineLong("blockTimestamp", -1L)
         return when (o.engineString("status")) {
             // status ok MUST carry the address — a missing addressHex is shape
             // drift, and mapping it to (address null, error null) would render
             // as the authoritative "no record" answer. Fail closed instead,
             // like RustEnsApi's Parsed.requireString does over JNI.
             "ok" -> o.engineString("addressHex")
-                ?.let { EnsResult(name, it, blockNumber, verified, null) }
+                ?.let { EnsResult(name, it, blockNumber, verified, null, blockTimestamp) }
                 ?: EnsResult(name, null, blockNumber, verified, "malformed resolver reply (ok without addressHex)")
             // Successfully determined absent — the API's "no record" convention.
-            "noRecord" -> EnsResult(name, null, blockNumber, verified, null)
+            "noRecord" -> EnsResult(name, null, blockNumber, verified, null, blockTimestamp)
             "offchain" -> EnsResult(
                 name, null, blockNumber, verified,
                 "$name resolves off-chain (CCIP-Read), which this app doesn't support yet",
+                blockTimestamp,
             )
             else -> EnsResult(name, null, blockNumber, verified, "unexpected resolver reply")
         }

@@ -32,7 +32,7 @@ class RustVerifiedReadJsonTest {
             + "\"exists\":true,\"nonce\":5898,\"balanceWei\":\"1000000000000000000\","
             + "\"storageRootHex\":\"0x56e81f171bcac1a441cf3f1d5f0b8d5f0f3f0e5e5b5b5b5b5b5b5b5b5b5b5b5b5\","
             + "\"codeHashHex\":\"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470\","
-            + "\"blockNumber\":21000000,"
+            + "\"blockNumber\":21000000,\"blockTimestamp\":1700000000,"
             + "\"peerStateRootHex\":\"0x5555555555555555555555555555555555555555555555555555555555555555\","
             + "\"peerProofValid\":true,\"beaconChainVerified\":true,\"blsVerified\":true,"
             + "\"matchedBeaconSlot\":7000000,\"verifyMethod\":\"headerChain\",\"failReason\":null,"
@@ -63,6 +63,20 @@ class RustVerifiedReadJsonTest {
         assertEquals(20999000L, r.finalizedBlockNumber());
         assertEquals(21000010L, r.optimisticBlockNumber());
         assertTrue(r.proofNodesHex().isEmpty());
+        // ABI 41: the proven block timestamp.
+        assertEquals(1700000000L, r.blockTimestamp());
+    }
+
+    @Test
+    void anUnprovenBlockTimestampIsMinusOne() {
+        // null: the engine proved no timestamp (a peer-head read); absent: an
+        // older literal. Either way the record says "none".
+        AccountProofResult nul = RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"blockTimestamp\":1700000000", "\"blockTimestamp\":null"));
+        assertEquals(-1L, nul.blockTimestamp());
+        AccountProofResult absent = RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"blockTimestamp\":1700000000,", ""));
+        assertEquals(-1L, absent.blockTimestamp());
     }
 
     @Test
@@ -501,10 +515,11 @@ class RustVerifiedReadJsonTest {
     void okEnsResolutionCarriesAddressAndBlock() {
         var r = RustChainHandle.ensResolutionFromJson("vitalik.eth",
                 "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\","
-                + "\"blockNumber\":21000010}");
+                + "\"blockNumber\":21000010,\"blockTimestamp\":1700000120}");
         assertEquals("vitalik.eth", r.name());
         assertEquals("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", r.addressHex());
         assertEquals(21000010L, r.blockNumber());
+        assertEquals(1700000120L, r.blockTimestamp());
         assertNull(r.error());
     }
 
@@ -516,6 +531,7 @@ class RustVerifiedReadJsonTest {
         assertNull(r.addressHex());
         assertNull(r.error());
         assertEquals(21000010L, r.blockNumber());
+        assertEquals(-1L, r.blockTimestamp(), "no blockTimestamp key reads as none");
     }
 
     @Test

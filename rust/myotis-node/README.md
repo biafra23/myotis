@@ -48,6 +48,9 @@ JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, snap
 // Verified reads run on bounded Myotis workers, with a 90 s operation budget
 // including queue wait. Cancellation drains native work before completion:
 const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
+// acct.blockTimestamp (ABI >= 41): blockNumber's own timestamp, unix seconds,
+// when the engine proved it (the read ran against the beacon-attested block),
+// else null. resolveEnsJson / ensRecordJson results carry it too.
 // ...or at the beacon-finalized block (ABI >= 32; a number near the head also works):
 const fin = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045', 'finalized'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));

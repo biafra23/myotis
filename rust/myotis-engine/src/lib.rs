@@ -229,7 +229,17 @@ uniffi::setup_scaffolding!();
 ///      it, so `infeasible`, the permanent envelope and the block selector
 ///      behave as there. The JVM `RustEngineNative` wrappers, the Node addon
 ///      and the iOS wrapper moved with it.
-pub const ABI_VERSION: i32 = 40;
+/// v41: "blockTimestamp" (unix seconds) on the verified-read shapes that name
+///      the block a wallet sees: the account read (`AccountProofResult`) carries
+///      it only when PROVEN — the read ran against the beacon-attested
+///      optimistic or finalized block, whose header the light client verified
+///      with its timestamp, and the verdict holds — else null; the ENS forward
+///      and record shapes always carry it, from the verified header the
+///      resolution ran against. A payload extension, no signature change —
+///      bumped, as v38 was, so a host that shows the block's age is never
+///      paired with an engine that cannot report it. `RustChainHandle`,
+///      `RustEnsApi` and the iOS wrapper read it.
+pub const ABI_VERSION: i32 = 41;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

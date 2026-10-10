@@ -39,6 +39,14 @@ import java.util.List;
  * @param wallClockPeriod       wall-clock sync-committee period
  * @param finalizedBlockNumber  finalized execution block number (0 if none)
  * @param optimisticBlockNumber optimistic-head execution block number (0 if none)
+ * @param blockTimestamp        the timestamp (unix seconds) of block {@code blockNumber}
+ *                              when it is PROVEN: the read ran against the
+ *                              beacon-attested optimistic or finalized execution
+ *                              block, whose header the light client verified with
+ *                              its timestamp, and the verdict holds. -1 otherwise:
+ *                              the timestamp comes only from the execution header
+ *                              the light client holds attested, never from a header
+ *                              a peer served (the Java engine reports -1 throughout)
  */
 public record AccountProofResult(
         String address,
@@ -61,5 +69,6 @@ public record AccountProofResult(
         long finalizedPeriod,
         long wallClockPeriod,
         long finalizedBlockNumber,
-        long optimisticBlockNumber) {
+        long optimisticBlockNumber,
+        long blockTimestamp) {
 }

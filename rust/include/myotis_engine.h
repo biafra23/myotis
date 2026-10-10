@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 40
+#define MYOTIS_ABI_VERSION 41
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -138,7 +138,10 @@ bool myotis_accept_stale_anchor(int64_t handle);
  * refused, retryably, while no finalized block has landed or no peer still
  * serves that state), a number only inside [head-64, head+16] (head state),
  * anything else {"error","code":-32602}. Every result names the block it
- * proved at: "anchor": "head" | "finalized". */
+ * proved at: "anchor": "head" | "finalized".
+ * v41: the account read carries "blockTimestamp" (unix seconds) when that
+ * block's timestamp is PROVEN — the read ran against the beacon-attested
+ * block and its verdict holds — else null. */
 char *myotis_request_account_json(int64_t handle, const char *address,
                                   const char *block);
 char *myotis_get_storage_proof_json(int64_t handle, const char *address,
@@ -241,8 +244,10 @@ char *myotis_eth_call_tx_json(int64_t handle, const char *tx,
 char *myotis_create_access_list_json(int64_t handle, const char *tx,
                                      const char *block,
                                      const char *state_overrides);
-/* {"status":"ok","addressHex","blockNumber"} | {"status":"noRecord",...} |
- * {"status":"offchain",...} | {"error"}. */
+/* {"status":"ok","addressHex","blockNumber","blockTimestamp"} |
+ * {"status":"noRecord",...} | {"status":"offchain",...} | {"error"}.
+ * v41: "blockTimestamp" (unix seconds) on every status, from the verified
+ * header the resolution ran against; the record shapes below carry it too. */
 char *myotis_resolve_ens_json(int64_t handle, const char *name);
 /* Generic ENS record dispatch; method + args travel in params_json. */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);

@@ -276,7 +276,11 @@ public final class VerifiedAccountQuery {
                         finalizedPeriod,
                         wallClockPeriod,
                         finalizedBlockNumber,
-                        optimisticBlockNumber);
+                        optimisticBlockNumber,
+                        // No block timestamp on this engine yet: one is reported only
+                        // from the light client's attested execution header, which this
+                        // read path does not consult (AccountProofResult.blockTimestamp).
+                        -1L);
             });
         });
     }
