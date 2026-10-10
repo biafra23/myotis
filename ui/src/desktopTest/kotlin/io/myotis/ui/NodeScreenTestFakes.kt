@@ -36,13 +36,17 @@ internal open class FakeController : NodeController {
 }
 
 /** [expert] = Expert mode on: the Logs/Index tabs, the full Status rows, the tuning knobs. */
-internal class FakeSettings(private var expert: Boolean = false) : Settings {
+internal class FakeSettings(
+    private var expert: Boolean = false,
+    /** The one enabled chain, and so the one the screen selects. */
+    private val network: String = "mainnet",
+) : Settings {
     override fun expertMode(): Boolean = expert
     override fun setExpertMode(v: Boolean) { expert = v }
-    override fun enabledNetworks(): List<String> = listOf("mainnet")
-    override fun primaryNetwork(): String = "mainnet"
-    override fun allNetworks(): List<String> = listOf("mainnet")
-    override fun isNetworkEnabled(name: String): Boolean = name == "mainnet"
+    override fun enabledNetworks(): List<String> = listOf(network)
+    override fun primaryNetwork(): String = network
+    override fun allNetworks(): List<String> = listOf(network)
+    override fun isNetworkEnabled(name: String): Boolean = name == network
     override fun setNetworkEnabled(name: String, enabled: Boolean) {}
     override fun rpcPortFor(network: String): Int = 8545
     override fun setRpcPort(network: String, port: Int) {}

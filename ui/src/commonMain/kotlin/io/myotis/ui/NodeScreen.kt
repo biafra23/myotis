@@ -38,6 +38,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -87,6 +88,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -1525,7 +1527,7 @@ private fun QueryTab(
                 Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
-            account != null -> AccountResultView(account!!, expert)
+            account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert)
         }
 
         // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
@@ -1625,33 +1627,66 @@ private fun QueryTab(
                     }
                 }) { Text("Clear") }
             }
-            historyList.forEach { e -> QueryHistoryRow(e, enabled = !loading, onClick = { run(e.input) }) }
+            // One card per past query, spaced apart; the ages are read when the list changes.
+            val now = remember(historyList) { nowEpochMillis() }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                historyList.forEach { e ->
+                    QueryHistoryCard(e, nowMillis = now, enabled = !loading, onClick = { run(e.input) })
+                }
+            }
         }
     }
 }
 
-/** One tappable past-query row: the stored input, with the resolved label beneath when present. */
+/**
+ * One past query as a tappable card: the stored input, the resolved address beneath it
+ * when there is one (an ENS lookup), and how long ago it ran. Tapping re-runs the
+ * stored input, not the label.
+ */
 @Composable
-private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 6.dp),
-    ) {
-        Text(
-            e.input,
-            fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            maxLines = 1, overflow = TextOverflow.Ellipsis,
-        )
-        if (e.label.isNotEmpty()) {
+private fun QueryHistoryCard(e: QueryHistoryEntry, nowMillis: Long, enabled: Boolean, onClick: () -> Unit) {
+    OutlinedCard(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    e.input,
+                    fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                if (e.label.isNotEmpty()) {
+                    Text(
+                        e.label,
+                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
             Text(
-                e.label,
-                fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                historyAge(e.timestampMillis, nowMillis),
+                style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
         }
+    }
+}
+
+/** The wall clock in epoch milliseconds; kotlin.time's Clock is @ExperimentalTime in the 2.2 stdlib. */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun nowEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
+
+/** How long ago a past query ran, for its card: "just now", "5 min ago", "3 h ago", "2 d ago". */
+internal fun historyAge(thenMillis: Long, nowMillis: Long): String {
+    val sec = ((nowMillis - thenMillis) / 1000).coerceAtLeast(0)
+    return when {
+        sec < 60 -> "just now"
+        sec < 3_600 -> "${sec / 60} min ago"
+        sec < 86_400 -> "${sec / 3_600} h ago"
+        else -> "${sec / 86_400} d ago"
     }
 }
 
@@ -1806,12 +1841,13 @@ private fun looksLikeEnsName(input: String): Boolean {
 }
 
 /**
- * A verified account, balance first: the address, the ETH balance (or that there is
- * no account yet), a verification badge, the two numbers a wallet user looks for, and
- * the raw rows behind "Show raw details" — open from the start under [expert].
+ * A verified account, balance first: the address, the balance in the chain's native
+ * [currency] (or that there is no account yet), a verification badge, the two numbers
+ * a wallet user looks for, and the raw rows behind "Show raw details" — open from the
+ * start under [expert].
  */
 @Composable
-private fun AccountResultView(a: AccountResult, expert: Boolean) {
+private fun AccountResultView(a: AccountResult, currency: String, expert: Boolean) {
     val clipboard = LocalClipboardManager.current
     var showRaw by remember(expert) { mutableStateOf(expert) }
     Card(Modifier.fillMaxWidth()) {
@@ -1830,7 +1866,7 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
                 )
                 Spacer(Modifier.width(8.dp))
                 // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
-                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a))) }) {
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a, currency))) }) {
                     Text("Copy")
                 }
             }
@@ -1841,14 +1877,15 @@ private fun AccountResultView(a: AccountResult, expert: Boolean) {
             if (!verified) VerificationBadge(a)
             if (a.exists) {
                 Column {
-                    // The verified caption is kept verbatim: the iOS UI helpers wait for it.
+                    // On mainnet the verified caption reads "Balance (ETH)" verbatim: the iOS
+                    // UI test (QueryFlowTests) waits for it.
                     Text(
-                        if (verified) "Balance (ETH)" else "Balance (ETH) — unverified peer claim",
+                        if (verified) "Balance ($currency)" else "Balance ($currency) — unverified peer claim",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        formatEth(a.balanceWei),
+                        formatNative(a.balanceWei),
                         style = MaterialTheme.typography.headlineMedium,
                         color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1933,10 +1970,22 @@ private fun VerificationBadge(a: AccountResult) {
     }
 }
 
-/** Wei (decimal string) → ETH with 6 dp, truncated toward zero. Pure-Kotlin (commonMain has no
+/**
+ * The native currency a chain's balances are counted in, as a wallet shows it: xDAI on
+ * Gnosis Chain, ETH on mainnet and Sepolia (Sepolia's is test ether). An unknown network
+ * reads as ETH, the Ethereum default. Every one of them has 18 decimals, which is what
+ * [formatNative] assumes.
+ */
+internal fun nativeCurrencySymbol(network: String): String = when (network) {
+    "gnosis" -> "xDAI"
+    else -> "ETH"
+}
+
+/** Wei (decimal string) → the native currency with 6 dp, truncated toward zero; 18 decimals
+ *  on every supported chain ([nativeCurrencySymbol]). Pure-Kotlin (commonMain has no
  *  java.math.BigDecimal): pad to ≥19 digits, split at the 18th from the right. Non-numeric input
  *  passes through unchanged. */
-private fun formatEth(weiDecimal: String?): String {
+private fun formatNative(weiDecimal: String?): String {
     if (weiDecimal == null) return "—"
     val neg = weiDecimal.startsWith("-")
     val digits = weiDecimal.trimStart('-')
@@ -1948,11 +1997,11 @@ private fun formatEth(weiDecimal: String?): String {
 }
 
 /** Full plaintext dump of an account result for the clipboard (untruncated hex). */
-private fun formatAccountResult(a: AccountResult): String = buildString {
+private fun formatAccountResult(a: AccountResult, currency: String): String = buildString {
     appendLine("address: ${a.address}")
     appendLine("exists: ${a.exists}")
     if (a.exists) {
-        appendLine("balance (ETH): ${formatEth(a.balanceWei)}")
+        appendLine("balance ($currency): ${formatNative(a.balanceWei)}")
         appendLine("balance (wei): ${a.balanceWei ?: "—"}")
         appendLine("nonce: ${a.nonce}")
         a.storageRootHex?.let { appendLine("storageRoot: $it") }

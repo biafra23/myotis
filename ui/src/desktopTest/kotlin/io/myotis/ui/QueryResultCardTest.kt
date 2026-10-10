@@ -11,6 +11,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -25,9 +26,10 @@ class QueryResultCardTest {
     @get:Rule
     val rule = createComposeRule()
 
-    private class Node(private val result: AccountResult) : FakeController() {
+    private class Node(private val result: AccountResult, private val network: String = "mainnet") : FakeController() {
         override val running: Boolean = true
-        override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(mapOf("mainnet" to snapshot()))
+        override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
+            flowOf(mapOf(network to snapshot().copy(network = network)))
         override suspend fun requestAccount(network: String, address: String): AccountResult = result
     }
 
@@ -95,6 +97,30 @@ class QueryResultCardTest {
         rule.onNodeWithText("Address (0x…) or ENS name").performImeAction()
         awaitText("Copy")
         rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
+    }
+
+    @Test
+    fun gnosisCountsTheBalanceInXdai() {
+        lookUp(Node(verified(), network = "gnosis"), FakeSettings(network = "gnosis"))
+        rule.onNodeWithText("Balance (xDAI)").assertIsDisplayed()
+        rule.onNodeWithText("1234.567800").assertIsDisplayed()
+        rule.onNodeWithText("Balance (ETH)").assertDoesNotExist()
+    }
+
+    @Test
+    fun anUnverifiedGnosisBalanceIsAnXdaiClaim() {
+        lookUp(
+            Node(verified().copy(beaconChainVerified = false, blsVerified = false, verifyMethod = null, failReason = "beaconNotSynced"), network = "gnosis"),
+            FakeSettings(network = "gnosis"),
+        )
+        rule.onNodeWithText("Balance (xDAI) — unverified peer claim").assertIsDisplayed()
+    }
+
+    @Test
+    fun theNativeCurrencyFollowsTheChain() {
+        assertEquals("ETH", nativeCurrencySymbol("mainnet"))
+        assertEquals("ETH", nativeCurrencySymbol("sepolia"))
+        assertEquals("xDAI", nativeCurrencySymbol("gnosis"))
     }
 
     @Test
