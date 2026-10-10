@@ -631,7 +631,10 @@ pub fn call_json(answer: &CallAnswer) -> String {
 /// `{"status":"offchain","blockNumber":N,"blockTimestamp":T}` (ERC-3668 name;
 /// the Java side sets a descriptive error — the record exists but needs
 /// CCIP-Read). `blockTimestamp` (ABI ≥ 41) is the block's own timestamp, unix
-/// seconds, from the verified header the resolution ran against.
+/// seconds, from the verified header the resolution ran against — always a
+/// number, because a resolution runs only over a verified header. A shape where
+/// an unproven block is reachable carries null instead, as the account shape
+/// does; do not copy the always-a-number convention to one.
 pub fn ens_json(outcome: &EnsOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
