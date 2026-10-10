@@ -1418,7 +1418,16 @@ class RpcRouter(
                             put("gasUsed", JsonPrimitive(hexQuantity(gasUsed)))
                         })
                     }
-                    RpcAccessListResult.Kind.UNAVAILABLE -> return null
+                    // No list right now. With the engine's reason it is served as
+                    // the engine's own -32000 ([EngineReadUnavailable]): the first
+                    // such reason is actionable — a list that did not settle within
+                    // the engine's runs, which no retry changes until state does —
+                    // and the generic "no peer / not synced" would misdescribe it
+                    // (the Rust RPC daemon serves the same answer with its reason).
+                    // Without one, the retryable decline as for eth_call.
+                    RpcAccessListResult.Kind.UNAVAILABLE ->
+                        outcome.detail?.takeIf { it.isNotBlank() }?.let { throw EngineReadUnavailable(it) }
+                            ?: return null
                     RpcAccessListResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                     // The request cannot run within the caller's gas, fee cap or
                     // funds: geth's -32000 in geth's words, as for eth_call.

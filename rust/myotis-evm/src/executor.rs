@@ -218,7 +218,7 @@ use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
 use crate::overrides::StateOverrides;
-use crate::tx::{AccessListItem, Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_SET_CODE};
+use crate::tx::{AccessListItem, Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_LEGACY, TYPE_SET_CODE};
 
 /// The gas a view call is given — the mainnet block gas limit. Also set as the
 /// per-tx gas cap so revm's spec-default cap (2²⁴ on the latest fork, EIP-7825)
@@ -793,6 +793,16 @@ impl EvmExecutor {
         excluded.extend(Precompiles::new(PrecompileSpecId::from_spec_id(spec)).addresses().copied());
         let mut current = AccessListRecorder::new(tx.access_list.as_deref().unwrap_or(&[]), excluded.clone()).items();
         let mut listed = tx.clone();
+        // The confirmation runs carry the list under the type the list makes
+        // (`TxRequest::tx_type`'s derivation: EIP-2930 once it is non-empty),
+        // not under an explicit legacy `type` the request named for a
+        // transaction that had none yet — the shape a request is refused for,
+        // and one that only revm's leniency runs. geth applies the list
+        // regardless of the declared type, and so does this; a wallet asks
+        // for the list of a transaction it will send as type 1 or later.
+        if listed.tx_type == Some(TYPE_LEGACY) {
+            listed.tx_type = None;
+        }
         for _ in 0..rounds {
             listed.access_list = Some(current.clone());
             let recorder = AccessListRecorder::new(&current, excluded.clone());
@@ -3080,6 +3090,31 @@ mod tests {
         let unsettled = exec.create_access_list_within(&tx, &c, StateOverrides::new(), 2).unwrap_err();
         assert!(matches!(unsettled, EvmError::AccessListNotSettled { rounds: 2 }), "{unsettled}");
         assert!(!unsettled.is_refusal() && !unsettled.is_infeasible(), "retryable: {unsettled}");
+    }
+
+    /// A request that names the legacy type gets the same list, confirmed
+    /// under the type the list makes: geth applies the list regardless of the
+    /// declared type, and the confirmation runs never carry the shape a
+    /// request is refused for (a legacy transaction with an access list).
+    #[test]
+    fn create_access_list_confirms_an_explicitly_legacy_request_under_the_lists_type() {
+        let exec = executor_with_accounts(&[(TARGET, gas_branching_target(75_000), U256::ZERO, 1)]);
+        let c = ctx(19_500_000, CANCUN_TIME + 1);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+        tx.gas = Some(100_000);
+        let derived = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        tx.tx_type = Some(TYPE_LEGACY);
+        let legacy = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        assert_eq!(legacy.access_list, derived.access_list);
+        assert_eq!(legacy.access_list.len(), 1);
+        assert_eq!(legacy.access_list[0].storage_keys, vec![slot_key(0), slot_key(1)]);
+        assert_eq!(legacy.gas_used, derived.gas_used);
+        assert!(legacy.error.is_none(), "{:?}", legacy.error);
+        // A type the list fits is kept: the run is a dynamic-fee one, as asked.
+        tx.tx_type = Some(TYPE_DYNAMIC_FEE);
+        tx.fees = Fees::DynamicFee { max_fee_per_gas: 0, max_priority_fee_per_gas: 0 };
+        let dynamic = exec.create_access_list(&tx, &c, StateOverrides::new()).unwrap();
+        assert_eq!(dynamic.access_list, derived.access_list);
     }
 
     /// The request is checked as the call checks it: a limit below the

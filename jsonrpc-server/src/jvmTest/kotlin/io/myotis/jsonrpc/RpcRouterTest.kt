@@ -638,8 +638,18 @@ class RpcRouterTest {
         val refused = route(b, accessListRequest)
         assertEquals(-32602, errorCode(refused))
         assertTrue(errorMessageOf(refused).contains("Amsterdam"), errorMessageOf(refused))
-        b.accessList = io.myotis.api.AccessListResult.unavailable("no peer")
-        assertEquals(-32000, errorCode(route(b, accessListRequest)))
+        // No list right now: -32000 carrying the engine's reason when it gave
+        // one — the not-settled answer is actionable, and the generic "no peer
+        // / not synced" would misdescribe it — the generic text otherwise.
+        b.accessList = io.myotis.api.AccessListResult.unavailable(
+            "the access list did not settle within 10 runs of the transaction")
+        val unsettled = route(b, accessListRequest)
+        assertEquals(-32000, errorCode(unsettled))
+        assertTrue(errorMessageOf(unsettled).contains("did not settle within 10 runs"), errorMessageOf(unsettled))
+        b.accessList = io.myotis.api.AccessListResult.unavailable(null)
+        val bare = route(b, accessListRequest)
+        assertEquals(-32000, errorCode(bare))
+        assertTrue(errorMessageOf(bare).contains("no peer / not synced"), errorMessageOf(bare))
     }
 
     /** A state override (params[2]) is applied where the backend can, refused
