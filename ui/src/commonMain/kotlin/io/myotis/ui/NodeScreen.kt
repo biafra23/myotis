@@ -90,6 +90,8 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1370,6 +1372,9 @@ private fun QueryTab(
     var ensProfile by remember(network) { mutableStateOf<EnsProfile?>(null) }
     var ensProfileError by remember(network) { mutableStateOf<String?>(null) }
     var ensProfileLoading by remember(network) { mutableStateOf(false) }
+    var ensOwnership by remember(network) { mutableStateOf<EnsOwnership?>(null) }
+    // Both record reads came back (a host without an actual answers null, which counts).
+    var ensRecordsRead by remember(network) { mutableStateOf(false) }
     // The on-demand records read in flight, so a new lookup cancels it and a superseded
     // job never writes into the card of a later name (the scanJob pattern below).
     var ensRecordsJob by remember(network) { mutableStateOf<Job?>(null) }
@@ -1446,7 +1451,7 @@ private fun QueryTab(
         input = q
         loading = true; error = null; account = null; ens = null
         ensRecordsJob?.cancel(); ensRecordsJob = null
-        ensProfile = null; ensProfileError = null; ensProfileLoading = false
+        ensProfile = null; ensProfileError = null; ensProfileLoading = false; ensOwnership = null; ensRecordsRead = false
         scope.launch {
             try {
                 if (looksLikeEnsName(q)) {
@@ -1532,26 +1537,41 @@ private fun QueryTab(
         // The resolved-ENS panel stays visible while the account verifies (and even if it fails).
         ens?.let { e ->
             EnsResultView(
-                e, ensProfile, ensProfileError, ensProfileLoading,
-                // The records beyond the address, on demand — a name without an address can
-                // still carry them. Their failure shows on the card, never as the query's error.
+                e, ensProfile, ensProfileError, ensProfileLoading, ensOwnership, ensRecordsRead,
+                // The records beyond the address and who holds the name, on demand and
+                // side by side — a name without an address can still carry both. Their
+                // failures show on the card, never as the query's error.
                 onReadRecords = {
                     ensRecordsJob?.cancel()
-                    ensProfileLoading = true; ensProfileError = null
+                    ensProfileLoading = true; ensProfileError = null; ensOwnership = null; ensRecordsRead = false
                     // Started lazily so the ownership check below sees THIS job even when the
                     // host answers without suspending (a dispatcher that runs it inline).
                     val job = scope.launch(start = CoroutineStart.LAZY) {
+                        // A later lookup or click cancelled and replaced this job; only the
+                        // job the card still owns may fill it.
+                        val mine = { ensRecordsJob === coroutineContext[Job] }
                         try {
-                            val result = controller.resolveEnsProfile(network, e.name)
-                            // A later lookup or click cancelled and replaced this job; only
-                            // the job the card still owns may fill it.
-                            if (ensRecordsJob === coroutineContext[Job]) ensProfile = result
-                        } catch (c: CancellationException) {
-                            throw c
-                        } catch (t: Throwable) {
-                            if (ensRecordsJob === coroutineContext[Job]) ensProfileError = t.message ?: t.toString()
+                            coroutineScope {
+                                val records = async { runCatching { controller.resolveEnsProfile(network, e.name) } }
+                                val holder = async { runCatching { controller.resolveEnsOwnership(network, e.name) } }
+                                records.await()
+                                    .onSuccess { if (mine()) ensProfile = it }
+                                    .onFailure {
+                                        if (it is CancellationException) throw it
+                                        if (mine()) ensProfileError = it.message ?: it.toString()
+                                    }
+                                holder.await()
+                                    .onSuccess { if (mine()) ensOwnership = it }
+                                    .onFailure {
+                                        if (it is CancellationException) throw it
+                                        if (mine()) {
+                                            ensOwnership = EnsOwnership(e.name, null, null, false, null, -1, -1, -1, false, it.message ?: it.toString())
+                                        }
+                                    }
+                            }
+                            if (mine()) ensRecordsRead = true
                         } finally {
-                            if (ensRecordsJob === coroutineContext[Job]) ensProfileLoading = false
+                            if (mine()) ensProfileLoading = false
                         }
                     }
                     ensRecordsJob = job
@@ -2097,10 +2117,13 @@ private fun EnsResultView(
     profile: EnsProfile?,
     profileError: String?,
     profileLoading: Boolean,
+    ownership: EnsOwnership?,
+    recordsRead: Boolean,
     onReadRecords: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
     val uriHandler = LocalUriHandler.current
+    val tz = remember { TimeZone.currentSystemDefault() }
     var gatewayNote by remember(e.name) { mutableStateOf<String?>(null) }
     Column {
         Row(
@@ -2137,7 +2160,10 @@ private fun EnsResultView(
         // bzz://) with a gateway link labelled for what it is — a third party, off the verified
         // path — and the text records as key: value, selectable and never cut short; a record
         // read from the peer head says so. One failure shared by every record is one line.
-        if (e.error == null && profile == null) {
+        // Offered until both reads came back clean — a failed read keeps it, as the retry;
+        // a host without one of the actuals answers null, which is a read that came back.
+        val readable = !recordsRead || profileError != null || ownership?.error != null
+        if (e.error == null && readable) {
             Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedButton(enabled = !profileLoading, onClick = onReadRecords) { Text("Read records") }
@@ -2149,13 +2175,37 @@ private fun EnsResultView(
                 } else {
                     HelpButton(
                         "ENS records",
-                        "Reads the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and " +
-                            "its common text records (avatar, description, url, email, com.twitter, " +
+                        "Reads who holds the name (registrant, manager, resolver, expiry and grace " +
+                            "period — the registry and the .eth registrar, seen through the NameWrapper), " +
+                            "the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and its " +
+                            "common text records (avatar, description, url, email, com.twitter, " +
                             "com.github, org.telegram, com.discord), each verified against finalized " +
                             "state where possible — a record served from the peer head is marked as " +
                             "such. Every record is its own resolution, so this costs more than the " +
                             "address lookup.",
                     )
+                }
+            }
+        }
+        // Who holds the name: the registrant (the .eth token owner), the manager (the
+        // registry owner, who sets records and subnames), the resolver, and the term —
+        // with the grace period spelled out, since an expired name in it is still the
+        // registrant's to renew and nobody else's to register.
+        ownership?.let { o ->
+            when {
+                o.error != null -> StatusRow("Ownership", o.error, color = MaterialTheme.colorScheme.error)
+                !o.known -> Text("Nothing on chain for this name.", style = MaterialTheme.typography.labelSmall)
+                else -> SelectionContainer {
+                    Column {
+                        val style = MaterialTheme.typography.bodySmall
+                        o.registrantHex?.let { Text("Registrant: $it", style = style) }
+                        o.managerHex?.let { Text("Manager: $it" + if (o.wrapped) " (wrapped)" else "", style = style) }
+                        o.resolverHex?.let { Text("Resolver: $it", style = style) }
+                        if (o.expiresAt >= 0) {
+                            Text(ensExpiryLine(o.expiresAt, o.gracePeriodSeconds, nowSeconds(), tz), style = style)
+                        }
+                        if (!o.verified) Text("Ownership read from the peer head.", style = style)
+                    }
                 }
             }
         }
@@ -2675,6 +2725,10 @@ private fun formatDuration(ms: Long): String {
 @OptIn(kotlin.time.ExperimentalTime::class)
 private fun formatDateTime(ms: Long, tz: TimeZone): String =
     Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
+
+/** Wall-clock seconds, for a term's "in N days" on the ENS card. */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun nowSeconds(): Long = kotlin.time.Clock.System.now().epochSeconds
 
 /** The confirm button of the Index tab's remove dialog — every row's own button reads "Remove" too. */
 internal const val INDEX_REMOVE_CONFIRM_TAG = "index-remove-confirm"

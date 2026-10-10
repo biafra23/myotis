@@ -240,7 +240,13 @@ uniffi::setup_scaffolding!();
 ///      bumped, as v38 was, so a host that shows the block's age is never
 ///      paired with an engine that cannot report it. `RustChainHandle`,
 ///      `RustEnsApi` and the iOS wrapper read it.
-pub const ABI_VERSION: i32 = 41;
+/// v42: ens_record_json gained the method "ownership" — the registry's owner and
+///      resolver, and for a .eth second-level name the registrar's registrant,
+///      expiry and grace period, seen through the NameWrapper (status ok carries
+///      registrantHex / managerHex / wrapped / resolverHex / expiresAt /
+///      gracePeriodSeconds, absent parts left out). A payload extension, no
+///      signature change: an older engine answers "unknown ens method".
+pub const ABI_VERSION: i32 = 42;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

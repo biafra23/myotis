@@ -4,6 +4,7 @@ import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.ENS_CONTENTHASH_KEY
+import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
@@ -464,6 +465,31 @@ class IosNodeController(
             throw IllegalStateException("ENS is not available on $network")
         }
         return readEnsProfile(name) { key -> withContext(Dispatchers.IO) { ensRecord(handle, name.trim(), key) } }
+    }
+
+    // The "ownership" method of the same record dispatch (engine ABI ≥ 42): absent
+    // parts are left out of the JSON, so every field reads as optional here.
+    override suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership {
+        val handle = handleOrThrow(network)
+        if (!settings.hasEns(canonical(network))) {
+            throw IllegalStateException("ENS is not available on $network")
+        }
+        val n = name.trim()
+        val params = JsonObject(
+            mapOf("method" to JsonPrimitive("ownership"), "name" to JsonPrimitive(n))
+        ).toString()
+        val o = withContext(Dispatchers.IO) { parseOrThrow(RustEngine.ensRecordJson(handle, params), "ENS ownership") }
+        val blockNumber = o.engineLong("blockNumber", -1L)
+        val verified = o.engineBoolean("verified")
+        return when (o.engineString("status")) {
+            "ok" -> EnsOwnership(
+                n, o.engineString("registrantHex"), o.engineString("managerHex"), o.engineBoolean("wrapped"),
+                o.engineString("resolverHex"), o.engineLong("expiresAt", -1L), o.engineLong("gracePeriodSeconds", -1L),
+                blockNumber, verified, null,
+            )
+            "noRecord" -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, null)
+            else -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, "unexpected resolver reply")
+        }
     }
 
     private fun ensRecord(handle: Long, name: String, key: String): EnsRecord {

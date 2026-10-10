@@ -30,6 +30,12 @@ public final class Namehash {
 
     private Namehash() {}
 
+    /** keccak256 of one normalized label — the {@code .eth} registrar's token id. */
+    public static byte[] labelhash(String label) {
+        CryptoProviders.ensureRegistered();
+        return Hash.keccak256(Bytes.wrap(label.getBytes(StandardCharsets.UTF_8))).toArrayUnsafe();
+    }
+
     /** Compute the namehash of {@code name}. Empty string returns 32 zero bytes. */
     public static byte[] of(String name) {
         CryptoProviders.ensureRegistered();

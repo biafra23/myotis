@@ -400,7 +400,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 41** and existing JS
+This implementation targets the current engine's **ABI 42** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`

@@ -663,6 +663,16 @@ Reads the contenthash (ENSIP-7) — a multicodec-encoded pointer to IPFS, Swarm,
 
 **Response fields:** `name`, `resolved`, `contenthash` (0x-prefixed multicodec bytes; decoder is the caller's responsibility), `blockNumber`.
 
+### Resolve ENS ownership
+
+```bash
+./gradlew :app:run -Pargs="resolve-ens-ownership myotis.eth"
+```
+
+Who holds the name and until when: the registry's owner (the **manager**, who sets records and subnames) and resolver, and for a `.eth` second-level name the BaseRegistrar's token owner (the **registrant**), `nameExpires` and `GRACE_PERIOD` — each seen through the chain's NameWrapper where it is the holder (`wrapped`). No resolver is involved; the reads are plain registry and registrar calls, verified like every other ENS read.
+
+**Response fields:** `name`, `blockNumber`, `verified`, `wrapped`, then where present: `registrant`, `manager`, `resolver`, `expiresAt` (unix seconds) with `gracePeriodSeconds`. A subname has no registrar part; an expired name has an `expiresAt` in the past and no `registrant` (the registrar's `ownerOf` reverts from the expiry on, grace period included — only the former registrant may renew inside it). Whether a `.eth` name is taken is therefore a question of time: `expiresAt + gracePeriodSeconds` against the clock, since the registry keeps the old owner and the registrar the old expiry long after the name became free.
+
 ### Resolve ENS multi-coin address
 
 ```bash

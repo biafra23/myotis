@@ -20,6 +20,9 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -57,6 +60,120 @@ class EnsResolverTest {
         // per-resolution EnsResolver instances in production); clear it so tests
         // don't inherit each other's mocked discovery.
         EnsResolver.clearResolverCache();
+    }
+
+    // ---- Ownership (registry + .eth registrar, through the NameWrapper) ----
+
+    private static final Address USER = Address.fromHex("0x" + "51".repeat(20));
+    private static final Address BASE_REGISTRAR = EnsAddresses.BASE_REGISTRAR;
+    private static final Address NAME_WRAPPER = EnsAddresses.MAINNET_NAME_WRAPPER;
+
+    private static byte[] registryCall(String fn, String name) {
+        return AbiEncoder.encodeCall(FunctionSignature.of(fn), AbiEncoder.bytes32(Namehash.of(name)));
+    }
+
+    private static byte[] registrarCall(String fn, String label) {
+        return AbiEncoder.encodeCall(FunctionSignature.of(fn), AbiEncoder.bytes32(Namehash.labelhash(label)));
+    }
+
+    private static byte[] gracePeriodCall() {
+        return AbiEncoder.encodeCall(FunctionSignature.of("GRACE_PERIOD()"));
+    }
+
+    private static byte[] encodeUint(long v) {
+        return AbiEncoder.encodeRaw(AbiEncoder.uint256(v));
+    }
+
+    private static EnsResolver ownershipResolver(MockExecutor mock) {
+        return new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER);
+    }
+
+    @Test
+    void ownershipOfAnUnwrappedEthName() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "myotis.eth"), encodeAddress(USER));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "myotis.eth"), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(BASE_REGISTRAR, registrarCall("ownerOf(uint256)", "myotis"), encodeAddress(USER));
+        mock.respond(BASE_REGISTRAR, registrarCall("nameExpires(uint256)", "myotis"), encodeUint(1_823_155_031L));
+        mock.respond(BASE_REGISTRAR, gracePeriodCall(), encodeUint(7_776_000L));
+
+        // Lowercased before hashing: the registrar hashes the normalized label.
+        var o = ownershipResolver(mock).resolveOwnership("Myotis.eth", ctx()).get().orElseThrow();
+        assertEquals(USER, o.registrant());
+        assertEquals(USER, o.manager());
+        assertFalse(o.wrapped());
+        assertEquals(PUBLIC_RESOLVER, o.resolver());
+        assertEquals(1_823_155_031L, o.expiresAt());
+        assertEquals(7_776_000L, o.gracePeriod());
+    }
+
+    @Test
+    void ownershipOfAWrappedEthNameIsSeenThroughTheWrapper() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "myotis.eth"), encodeAddress(NAME_WRAPPER));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "myotis.eth"), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(NAME_WRAPPER, registryCall("ownerOf(uint256)", "myotis.eth"), encodeAddress(USER));
+        mock.respond(BASE_REGISTRAR, registrarCall("ownerOf(uint256)", "myotis"), encodeAddress(NAME_WRAPPER));
+        mock.respond(BASE_REGISTRAR, registrarCall("nameExpires(uint256)", "myotis"), encodeUint(1_823_155_031L));
+        mock.respond(BASE_REGISTRAR, gracePeriodCall(), encodeUint(7_776_000L));
+
+        var o = ownershipResolver(mock).resolveOwnership("myotis.eth", ctx()).get().orElseThrow();
+        assertTrue(o.wrapped());
+        assertEquals(USER, o.manager());
+        assertEquals(USER, o.registrant());
+    }
+
+    @Test
+    void ownershipOfAnExpiredNameInGraceAndOfASubname() throws Exception {
+        var mock = new MockExecutor();
+        // Expired: ownerOf reverts, the registry still lists the old owner, nameExpires is past.
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "old.eth"), encodeAddress(USER));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "old.eth"), encodeAddress(Address.ZERO));
+        mock.revertOn(BASE_REGISTRAR, registrarCall("ownerOf(uint256)", "old"), new byte[0]);
+        mock.respond(BASE_REGISTRAR, registrarCall("nameExpires(uint256)", "old"), encodeUint(1_700_000_000L));
+        mock.respond(BASE_REGISTRAR, gracePeriodCall(), encodeUint(7_776_000L));
+        var expired = ownershipResolver(mock).resolveOwnership("old.eth", ctx()).get().orElseThrow();
+        assertNull(expired.registrant());
+        assertEquals(USER, expired.manager());
+        assertNull(expired.resolver());
+        assertEquals(1_700_000_000L, expired.expiresAt());
+        // A subname: registry only, no registrar calls at all.
+        var sub = new MockExecutor();
+        sub.respond(REGISTRY, registryCall("owner(bytes32)", "sub.myotis.eth"), encodeAddress(USER));
+        sub.respond(REGISTRY, registryCall("resolver(bytes32)", "sub.myotis.eth"), encodeAddress(PUBLIC_RESOLVER));
+        var s = ownershipResolver(sub).resolveOwnership("sub.myotis.eth", ctx()).get().orElseThrow();
+        assertEquals(USER, s.manager());
+        assertNull(s.registrant());
+        assertEquals(-1L, s.expiresAt());
+        assertEquals(2, sub.callCount());
+    }
+
+    @Test
+    void ownershipOfAnUnregisteredNameIsEmpty() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "nobody.eth"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "nobody.eth"), encodeAddress(Address.ZERO));
+        mock.revertOn(BASE_REGISTRAR, registrarCall("ownerOf(uint256)", "nobody"), new byte[0]);
+        mock.respond(BASE_REGISTRAR, registrarCall("nameExpires(uint256)", "nobody"), encodeUint(0L));
+        assertTrue(ownershipResolver(mock).resolveOwnership("nobody.eth", ctx()).get().isEmpty());
+        // What the record reads reject (DnsEncoder), this rejects.
+        var bad = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> ownershipResolver(mock).resolveOwnership("x..eth", ctx()).get());
+        assertTrue(bad.getCause() instanceof IllegalArgumentException);
+    }
+
+    @Test
+    void aNameWhoseOwnerWasBurnedButKeepsAResolverIsOnChain() throws Exception {
+        // setOwner(node, 0) after setting the resolver — immutable records: the records
+        // still resolve, so "nothing on chain" would contradict them.
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "fixed.myotis.eth"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "fixed.myotis.eth"), encodeAddress(PUBLIC_RESOLVER));
+        var o = ownershipResolver(mock).resolveOwnership("fixed.myotis.eth", ctx()).get().orElseThrow();
+        assertNull(o.manager());
+        assertNull(o.registrant());
+        assertEquals(PUBLIC_RESOLVER, o.resolver());
+        assertEquals(-1L, o.expiresAt());
     }
 
     // ---- Forward resolution: legacy (direct record call) ------------------

@@ -75,6 +75,41 @@ class RustEnsRecordJsonTest {
     }
 
     @Test
+    void ownershipOkSubnameAndNoRecord() {
+        var full = RustEnsApi.ownershipFromJson("myotis.eth", ok(
+                "\"registrantHex\":\"" + ADDR40 + "\",\"managerHex\":\"" + ADDR40 + "\",\"wrapped\":false,"
+                + "\"resolverHex\":\"0x" + "23".repeat(20) + "\",\"expiresAt\":1823155031,"
+                + "\"gracePeriodSeconds\":7776000"));
+        assertEquals(ADDR40, full.registrantHex());
+        assertEquals(ADDR40, full.managerHex());
+        assertFalse(full.wrapped());
+        assertEquals("0x" + "23".repeat(20), full.resolverHex());
+        assertEquals(1823155031L, full.expiresAt());
+        assertEquals(7776000L, full.gracePeriodSeconds());
+        assertEquals(21000010, full.blockNumber());
+        assertEquals(1700000120L, full.blockTimestamp());
+        assertTrue(full.verified());
+        assertNull(full.error());
+        // A wrapped subname: no registrar part, the absent fields left out of the JSON.
+        var sub = RustEnsApi.ownershipFromJson("sub.myotis.eth", ok(
+                "\"managerHex\":\"" + ADDR40 + "\",\"wrapped\":true"));
+        assertNull(sub.registrantHex());
+        assertEquals(ADDR40, sub.managerHex());
+        assertTrue(sub.wrapped());
+        assertNull(sub.resolverHex());
+        assertEquals(-1L, sub.expiresAt());
+        assertEquals(-1L, sub.gracePeriodSeconds());
+        var none = RustEnsApi.ownershipFromJson("nobody.eth", NO_RECORD);
+        assertNull(none.managerHex());
+        assertEquals(-1L, none.expiresAt());
+        assertEquals(1700000120L, none.blockTimestamp());
+        assertNull(none.error());
+        // The mandatory boolean missing is shape drift, fail closed.
+        assertThrows(EngineException.class,
+                () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"managerHex\":\"" + ADDR40 + "\"")));
+    }
+
+    @Test
     void bytesShapedRecords() {
         var ch = RustEnsApi.contenthashFromJson("a.eth", ok("\"dataHex\":\"0xc0ffee\""));
         assertEquals("0xc0ffee", ch.contenthashHex());

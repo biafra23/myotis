@@ -40,4 +40,16 @@ public interface EnsApi {
 
     /** ERC-165 interface implementer record. */
     EnsInterfaceResult resolveInterfaceImplementer(String name, byte[] interfaceId4);
+
+    /**
+     * Who holds {@code name} and until when (registry owner and resolver; for a
+     * {@code .eth} second-level name the registrar's registrant, expiry and grace
+     * period), seen through the NameWrapper where it is the holder. Same root policy
+     * as the record reads (finalized first). Default: an engine that has not
+     * implemented it answers a refusal in {@code error}, never a guess.
+     */
+    default EnsOwnershipResult resolveOwnership(String name) {
+        return new EnsOwnershipResult(name, null, null, false, null, -1, -1, -1, -1, false,
+                "this engine does not read ENS ownership");
+    }
 }
