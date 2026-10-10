@@ -304,7 +304,7 @@ mod tests {
             Some("beaconNotSynced")
         );
         // Synced (a finalized exec root landed) but the peer reports no block.
-        anchor.update_finalized(200, root(0xf0), 21_000_000, root(0xf1));
+        anchor.update_finalized(200, root(0xf0), 21_000_000, root(0xf1), 0);
         assert_eq!(
             fail(ladder_precheck(Some(&root(1)), true, 0, &anchor)),
             Some("noPeerBlockNumber")
@@ -335,7 +335,7 @@ mod tests {
         // Synced (root present) but finalized block number 0 → beaconBlockUnavailable,
         // and crucially it's reported only AFTER the peer-block check (Java order).
         let anchor = ExecAnchor::new();
-        anchor.update_finalized(1, root(0xf0), 0, root(0xf1));
+        anchor.update_finalized(1, root(0xf0), 0, root(0xf1), 0);
         assert_eq!(
             fail(ladder_precheck(Some(&root(1)), true, 100, &anchor)),
             Some("beaconBlockUnavailable")

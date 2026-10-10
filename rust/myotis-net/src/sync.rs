@@ -3861,6 +3861,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
                     e.state_root,
                     e.block_number,
                     e.block_hash,
+                    e.timestamp,
                 );
             }
             HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {

@@ -210,15 +210,21 @@ data class AccountResult(
     val matchedBeaconSlot: Long,     // -1 when not matched
     val verifyMethod: String?,       // "stateRootMatch" / "headerChain" / null
     val failReason: String?,         // null when verified
+    /** [blockNumber]'s own timestamp, unix seconds, when the engine PROVED it (the read
+     *  ran against the beacon-attested block); -1 when none. The UI shows its age. */
+    val blockTimestamp: Long = -1,
 )
 
-/** ENS resolution result. Mirrors `io.myotis.rpc.EnsResolution`. */
+/** ENS resolution result. Mirrors `io.myotis.api.EnsResolutionResult`. */
 data class EnsResult(
     val name: String,
     val addressHex: String?,         // null when unresolved/errored
     val blockNumber: Long,           // -1 when none
     val verified: Boolean,           // true iff beacon-verified finalized state
     val error: String?,              // null on success
+    /** [blockNumber]'s own timestamp, unix seconds, from the verified header the
+     *  resolution ran against; -1 when none. The UI shows its age. */
+    val blockTimestamp: Long = -1,
 )
 
 /** Persisted per-network + shared settings, abstracted from Android SharedPreferences. */

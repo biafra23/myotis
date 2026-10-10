@@ -203,19 +203,21 @@ pub struct AccessListAnswer {
 }
 
 /// The outcome of an ENS forward resolution. `block_number` is the verified head
-/// the resolution ran against. A hard failure (state unavailable, invalid name)
-/// travels the `Err(String)` channel instead, like the other reads.
+/// the resolution ran against, and `block_timestamp` that block's own timestamp
+/// (unix seconds) from the same verified header. A hard failure (state
+/// unavailable, invalid name) travels the `Err(String)` channel instead, like
+/// the other reads.
 #[derive(Debug, Clone)]
 pub enum EnsOutcome {
     /// The name resolved to this address record.
-    Resolved { address: [u8; 20], block_number: u64 },
+    Resolved { address: [u8; 20], block_number: u64, block_timestamp: u64 },
     /// Successfully determined that the name has NO address record (absent name,
     /// zero-address record, or a non-wildcard ancestor resolver).
-    NoRecord { block_number: u64 },
+    NoRecord { block_number: u64, block_timestamp: u64 },
     /// The name resolves OFFCHAIN (ERC-3668 `OffchainLookup`) — the record exists
     /// but needs a CCIP-Read gateway, which this engine doesn't drive yet
     /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
-    Offchain { block_number: u64 },
+    Offchain { block_number: u64, block_timestamp: u64 },
 }
 
 /// Which state root an ENS query resolves against (the Java `EnsRoot` twin —
@@ -277,13 +279,14 @@ pub enum EnsRecordValue {
 
 /// The outcome of an [`EnsQuery`]. `verified` = the resolution ran against the
 /// beacon-FINALIZED root (the API's meaning of "verified"); the optimistic-head
-/// path reports `false`.
+/// path reports `false`. `block_timestamp` is the block's own timestamp (unix
+/// seconds) from the verified header the query ran against, on either root.
 #[derive(Debug, Clone)]
 pub enum EnsQueryOutcome {
     /// The record resolved to this value.
-    Value { value: EnsRecordValue, block_number: u64, verified: bool },
+    Value { value: EnsRecordValue, block_number: u64, block_timestamp: u64, verified: bool },
     /// Successfully determined there is no record.
-    NoRecord { block_number: u64, verified: bool },
+    NoRecord { block_number: u64, block_timestamp: u64, verified: bool },
     /// The record resolves OFFCHAIN (ERC-3668): the host must drive a CCIP-Read
     /// gateway round with the carried tuple, then re-enter via the callback
     /// (`method:"ccipCallback"`). `lookup` is `None` when the revert's tuple was
@@ -291,6 +294,7 @@ pub enum EnsQueryOutcome {
     /// revert came from inside the ENSIP-10 `resolve()` wrap.
     Offchain {
         block_number: u64,
+        block_timestamp: u64,
         verified: bool,
         lookup: Option<Box<myotis_evm::OffchainLookup>>,
         wrapped: bool,

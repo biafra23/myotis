@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 40; // 40: create_access_list_json (eth_createAccessList)
+    static final int EXPECTED_ABI_VERSION = 41; // 41: blockTimestamp on the account and ENS shapes
 
     private static final boolean AVAILABLE = load();
 

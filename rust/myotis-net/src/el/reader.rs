@@ -431,6 +431,13 @@ pub struct VerifiedAccount {
     pub code_hash: [u8; 32],
     /// Peer-reported block the proof anchors to.
     pub block_number: u64,
+    /// That block's own timestamp (unix seconds), only when it is PROVEN: the
+    /// proof ran against the beacon-attested optimistic or finalized execution
+    /// block and the verdict holds. The timestamp is that block's as the anchor
+    /// holds it — from the light client's payload header, or after Gloas from
+    /// the header whose keccak equals the attested block hash. `None`
+    /// otherwise: a header no attestation pins dates nothing.
+    pub block_timestamp: Option<u64>,
     pub peer_state_root: [u8; 32],
     pub peer_proof_valid: bool,
     pub beacon_chain_verified: bool,
@@ -5446,7 +5453,8 @@ impl ElReader {
         fin: Option<FinalizedExecution>,
     ) -> Result<(VerifiedAccount, Duration), String> {
         let started = Instant::now();
-        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
+        let (state_root, block_number, attested_timestamp, outcome) =
+            self.snap_account_at(peer, address, fin).await?;
         let snap_elapsed = started.elapsed();
         // Anchor the (proof-valid) state root to the beacon chain. The anchor
         // path's root short-circuits via the stateRootMatch fast path; the
@@ -5458,6 +5466,7 @@ impl ElReader {
                 address,
                 state_root,
                 block_number,
+                attested_timestamp,
                 outcome,
                 verdict,
                 fin.is_some(),
@@ -5494,7 +5503,10 @@ impl ElReader {
     /// root for a head read ([`Self::snap_account_at_best_root`]), or exactly
     /// the beacon-FINALIZED state root for a finalized read — with NO fallback
     /// to any other root, since answering from another block would be the
-    /// silent substitution CLAUDE.md §Trust forbids. A peer that cannot prove
+    /// silent substitution CLAUDE.md §Trust forbids. Returns the root, its block
+    /// number, the block's PROVEN timestamp when the root is the beacon-attested
+    /// block's own (`None` for a peer-head fallback), and the outcome. A peer
+    /// that cannot prove
     /// at the finalized root (pruned it, most likely: execution clients keep
     /// on the order of a hundred recent states, and finality trails the head
     /// by two epochs or more) fails this attempt with an empty proof;
@@ -5506,7 +5518,7 @@ impl ElReader {
         peer: &ManagedPeer,
         address: [u8; 20],
         fin: Option<FinalizedExecution>,
-    ) -> Result<([u8; 32], u64, AccountOutcome), String> {
+    ) -> Result<([u8; 32], u64, Option<u64>, AccountOutcome), String> {
         let Some(fin) = fin else {
             return self.snap_account_at_best_root(peer, address).await;
         };
@@ -5514,7 +5526,7 @@ impl ElReader {
             .snap_get_account(&fin.state_root, &address)
             .await
             .map_err(|e| format!("finalized-root query failed ({e})"))?;
-        Ok((fin.state_root, fin.block_number, outcome))
+        Ok((fin.state_root, fin.block_number, proven_timestamp(fin.timestamp), outcome))
     }
 
     /// The beacon verdict for a proof-verified state root: the ladder for a
@@ -5565,10 +5577,12 @@ impl ElReader {
         &self,
         peer: &ManagedPeer,
         address: [u8; 20],
-    ) -> Result<([u8; 32], u64, AccountOutcome), String> {
-        if let Some((number, root)) = self.anchor.optimistic_execution() {
+    ) -> Result<([u8; 32], u64, Option<u64>, AccountOutcome), String> {
+        if let Some((number, root, timestamp)) = self.anchor.optimistic_execution() {
             match peer.snap_get_account(&root, &address).await {
-                Ok(outcome) => return Ok((root, number, outcome)),
+                // The anchor's root, number and timestamp were read together,
+                // so the timestamp is this very block's, proven with it.
+                Ok(outcome) => return Ok((root, number, proven_timestamp(timestamp), outcome)),
                 // The peer ANSWERED but could not prove at the anchored root —
                 // pruned it, trails the anchor, OR served a malformed/hostile
                 // proof (every ProofResult::Invalid shape matches; a bad-proof
@@ -5584,7 +5598,8 @@ impl ElReader {
                     let (root, number) = fresh_head(peer).await.map_err(fb)?;
                     let outcome =
                         peer.snap_get_account(&root, &address).await.map_err(fb)?;
-                    return Ok((root, number, outcome));
+                    // A peer's head: no attested header to take a timestamp from.
+                    return Ok((root, number, None, outcome));
                 }
                 // Transport-shaped failure (timeout/disconnect): a second
                 // query against the same peer would pay the same timeout
@@ -5598,18 +5613,20 @@ impl ElReader {
         // Verify-on-fetch: snap_get_account MPT-verifies against the root and
         // returns Present/Absent only when the proof holds.
         let outcome = peer.snap_get_account(&root, &address).await?;
-        Ok((root, number, outcome))
+        Ok((root, number, None, outcome))
     }
 
     /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
     /// anchor verdict + the reader's live anchor diagnostics. Shared by the
     /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
     /// fields are identical regardless of transport.
+    #[allow(clippy::too_many_arguments)]
     fn build_verified_account(
         &self,
         address: [u8; 20],
         state_root: [u8; 32],
         block_number: u64,
+        attested_timestamp: Option<u64>,
         outcome: AccountOutcome,
         verdict: crate::el::verify::Verdict,
         finalized: bool,
@@ -5625,6 +5642,9 @@ impl ElReader {
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: EMPTY_CODE_HASH,
             block_number,
+            // Reported only with a verdict that holds: a timestamp is never more
+            // proven than the read it dates.
+            block_timestamp: attested_timestamp.filter(|_| verdict.beacon_chain_verified),
             peer_state_root: state_root,
             peer_proof_valid: true,
             beacon_chain_verified: verdict.beacon_chain_verified,
@@ -5752,7 +5772,8 @@ impl ElReader {
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         Ok((
-            self.build_verified_account(address, state_root, block_number, outcome, verdict, false),
+            // A fresh session's head: no attested header to take a timestamp from.
+            self.build_verified_account(address, state_root, block_number, None, outcome, verdict, false),
             snap_elapsed,
         ))
     }
@@ -5863,7 +5884,7 @@ impl ElReader {
         // (issue #355 — see snap_account_at_best_root), or IS the finalized
         // root for a finalized read (see snap_account_at).
         let started = Instant::now();
-        let (state_root, block_number, outcome) = self.snap_account_at(peer, address, fin).await?;
+        let (state_root, block_number, _, outcome) = self.snap_account_at(peer, address, fin).await?;
         let mut snap = StorageSnapCost {
             account: match &outcome {
                 AccountOutcome::Present(leaf) => AccountFact::from_leaf(Some(leaf)),
@@ -6247,7 +6268,7 @@ impl ElReader {
 
     async fn resolve_ens_inner(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
-        let block_number = ctx.block_number;
+        let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             myotis_evm::resolve_address(&caller, &name)
@@ -6256,9 +6277,9 @@ impl ElReader {
         // Its oracle waits and interpreter steps observe the same operation.
         let joined = walk.await?;
         match joined {
-            Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
-            Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
-            Err(EnsError::OffchainLookup { .. }) => Ok(EnsOutcome::Offchain { block_number }),
+            Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number, block_timestamp }),
+            Ok(None) => Ok(EnsOutcome::NoRecord { block_number, block_timestamp }),
+            Err(EnsError::OffchainLookup { .. }) => Ok(EnsOutcome::Offchain { block_number, block_timestamp }),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -6327,7 +6348,7 @@ impl ElReader {
         let attempt = async {
             let anchor = ReadAnchor::for_finalized(finalized);
             let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
-            let block_number = ctx.block_number;
+            let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
             let walk = super::request::blocking(move || {
                 let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
                 let raw = myotis_evm::ccip_callback(
@@ -6344,12 +6365,13 @@ impl ElReader {
             let joined = walk.await?;
             match joined {
                 Ok(Some(value)) => {
-                    Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized })
+                    Ok(EnsQueryOutcome::Value { value, block_number, block_timestamp, verified: finalized })
                 }
-                Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
+                Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, block_timestamp, verified: finalized }),
                 Err(EnsError::OffchainLookup { lookup, wrapped }) => {
                     Ok(EnsQueryOutcome::Offchain {
                         block_number,
+                        block_timestamp,
                         verified: finalized,
                         lookup,
                         wrapped,
@@ -6375,7 +6397,7 @@ impl ElReader {
     async fn ens_attempt_inner(&self, query: EnsQuery, chain_id: u64, finalized: bool) -> Result<EnsQueryOutcome, String> {
         let anchor = ReadAnchor::for_finalized(finalized);
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
-        let block_number = ctx.block_number;
+        let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             run_ens_query(&caller, &query)
@@ -6383,10 +6405,11 @@ impl ElReader {
         // The attempt scope drains this worker before AUTO can start another root.
         let joined = walk.await?;
         match joined {
-            Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
-            Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),
+            Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, block_timestamp, verified: finalized }),
+            Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, block_timestamp, verified: finalized }),
             Err(EnsError::OffchainLookup { lookup, wrapped }) => Ok(EnsQueryOutcome::Offchain {
                 block_number,
+                block_timestamp,
                 verified: finalized,
                 lookup,
                 wrapped,
@@ -9586,6 +9609,12 @@ fn apply_verdict(result: &mut VerifiedStorage, verdict: &crate::el::verify::Verd
     result.fail_reason = verdict.fail_reason;
 }
 
+/// An anchor's block timestamp as a read reports it: `None` while the anchor
+/// has none (0: no head with a timestamp has landed yet).
+fn proven_timestamp(timestamp: u64) -> Option<u64> {
+    (timestamp > 0).then_some(timestamp)
+}
+
 /// The matched beacon slot for a result, using the Java `-1`-when-none
 /// convention (the `Verdict` default is a bare `0`, which would read as slot 0).
 fn matched_slot(verdict: &crate::el::verify::Verdict) -> i64 {
@@ -10552,7 +10581,7 @@ mod tests {
                 h[..8].copy_from_slice(&n.to_be_bytes());
                 h
             };
-            anchor.update_finalized(head - 64, [1; 32], head - 64, hash(head - 64));
+            anchor.update_finalized(head - 64, [1; 32], head - 64, hash(head - 64), 0);
             anchor.update_optimistic(head, head, hash(head), [2; 32], 1_700_000_000);
             let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"fee-bounded-wait-test")).unwrap());
             let cfg = ElConfig {
@@ -10564,6 +10593,35 @@ mod tests {
                 ..ElConfig::mainnet()
             };
             Arc::new(ElReader::start(key, anchor, cfg).await.expect("offline reader"))
+        }
+
+        /// An account read reports its block's timestamp only when the read ran
+        /// against the attested block (the caller passes the anchor's proven
+        /// timestamp) AND the verdict holds: a timestamp is never more proven
+        /// than the read it dates.
+        #[tokio::test]
+        async fn an_account_dates_its_block_only_with_a_holding_verdict() {
+            let reader = offline_reader(21_000_000).await;
+            let holds = crate::el::verify::finalized_root_verdict(7);
+            let fails = crate::el::verify::Verdict {
+                beacon_chain_verified: false,
+                fail_reason: Some("beaconNotSynced"),
+                verify_method: None,
+                ..holds.clone()
+            };
+            let build = |ts: Option<u64>, verdict: &crate::el::verify::Verdict| {
+                reader.build_verified_account(
+                    [0x9d; 20], [2; 32], 21_000_000, ts, AccountOutcome::Absent, verdict.clone(), false,
+                )
+            };
+            assert_eq!(build(Some(1_700_000_000), &holds).block_timestamp, Some(1_700_000_000));
+            assert_eq!(build(Some(1_700_000_000), &fails).block_timestamp, None, "a failed verdict dates nothing");
+            assert_eq!(build(None, &holds).block_timestamp, None, "a peer-head read has no attested timestamp");
+            // The anchor reports 0 until a head with its timestamp lands: not a time.
+            assert_eq!(proven_timestamp(0), None);
+            assert_eq!(proven_timestamp(1_700_000_000), Some(1_700_000_000));
+            // The anchor's optimistic head carries its proven timestamp with its root.
+            assert_eq!(reader.anchor.optimistic_execution(), Some((21_000_000, [2; 32], 1_700_000_000)));
         }
 
         #[tokio::test]
@@ -15227,7 +15285,7 @@ mod restart_claim_reader_tests {
 
     /// Point `a` where the CL loop would leave it.
     fn set_anchor(a: &ExecAnchor, finalized: u64, head: u64) {
-        a.update_finalized(finalized, [1; 32], finalized, hash(finalized));
+        a.update_finalized(finalized, [1; 32], finalized, hash(finalized), 0);
         a.update_optimistic(head, head, hash(head), [2; 32], 1_700_000_000);
     }
 
@@ -16228,6 +16286,7 @@ mod pre_broadcast_tests {
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: EMPTY_CODE_HASH,
             block_number: 100,
+            block_timestamp: None,
             peer_state_root: state_root,
             peer_proof_valid: true,
             beacon_chain_verified: verified,
@@ -16248,7 +16307,7 @@ mod pre_broadcast_tests {
     async fn offline_reader(head_time: Option<u64>) -> Arc<ElReader> {
         let anchor = Arc::new(ExecAnchor::new());
         if let Some(time) = head_time {
-            anchor.update_finalized(36, [1; 32], 36, [3; 32]);
+            anchor.update_finalized(36, [1; 32], 36, [3; 32], 0);
             anchor.update_optimistic(99, 99, [5; 32], [6; 32], time - 12);
             anchor.update_optimistic(100, 100, [4; 32], [2; 32], time);
         }
@@ -16326,7 +16385,7 @@ mod pre_broadcast_tests {
         // A start feeds the anchor its restored snapshot's head before any
         // live update: never judged by, whatever the wall clock says.
         let anchor = Arc::new(ExecAnchor::new());
-        anchor.update_finalized(36, [1; 32], 36, [3; 32]);
+        anchor.update_finalized(36, [1; 32], 36, [3; 32], 0);
         anchor.update_optimistic(100, 100, [4; 32], [2; 32], now_unix() - 5);
         let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
         let cfg = ElConfig {

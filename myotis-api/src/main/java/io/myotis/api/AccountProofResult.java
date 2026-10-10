@@ -39,6 +39,15 @@ import java.util.List;
  * @param wallClockPeriod       wall-clock sync-committee period
  * @param finalizedBlockNumber  finalized execution block number (0 if none)
  * @param optimisticBlockNumber optimistic-head execution block number (0 if none)
+ * @param blockTimestamp        the timestamp (unix seconds) of block {@code blockNumber}
+ *                              when it is PROVEN: the read ran against the
+ *                              beacon-attested optimistic or finalized execution
+ *                              block and the verdict holds; the timestamp is that
+ *                              block's own (from the light client's payload header,
+ *                              or after Gloas from the header whose keccak equals the
+ *                              attested block hash). -1 otherwise — a header no
+ *                              attestation pins dates nothing (the Java engine
+ *                              reports -1 throughout)
  */
 public record AccountProofResult(
         String address,
@@ -61,5 +70,6 @@ public record AccountProofResult(
         long finalizedPeriod,
         long wallClockPeriod,
         long finalizedBlockNumber,
-        long optimisticBlockNumber) {
+        long optimisticBlockNumber,
+        long blockTimestamp) {
 }
