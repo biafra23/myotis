@@ -433,10 +433,10 @@ pub struct VerifiedAccount {
     pub block_number: u64,
     /// That block's own timestamp (unix seconds), only when it is PROVEN: the
     /// proof ran against the beacon-attested optimistic or finalized execution
-    /// block, whose header the light client verified with its timestamp, and
-    /// the verdict holds. `None` otherwise: the timestamp comes only from the
-    /// execution header the light client holds attested, never from a header a
-    /// peer served.
+    /// block and the verdict holds. The timestamp is that block's as the anchor
+    /// holds it — from the light client's payload header, or after Gloas from
+    /// the header whose keccak equals the attested block hash. `None`
+    /// otherwise: a header no attestation pins dates nothing.
     pub block_timestamp: Option<u64>,
     pub peer_state_root: [u8; 32],
     pub peer_proof_valid: bool,
@@ -5620,6 +5620,7 @@ impl ElReader {
     /// anchor verdict + the reader's live anchor diagnostics. Shared by the
     /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
     /// fields are identical regardless of transport.
+    #[allow(clippy::too_many_arguments)]
     fn build_verified_account(
         &self,
         address: [u8; 20],
@@ -9608,14 +9609,14 @@ fn apply_verdict(result: &mut VerifiedStorage, verdict: &crate::el::verify::Verd
     result.fail_reason = verdict.fail_reason;
 }
 
-/// The matched beacon slot for a result, using the Java `-1`-when-none
-/// convention (the `Verdict` default is a bare `0`, which would read as slot 0).
 /// An anchor's block timestamp as a read reports it: `None` while the anchor
 /// has none (0: no head with a timestamp has landed yet).
 fn proven_timestamp(timestamp: u64) -> Option<u64> {
     (timestamp > 0).then_some(timestamp)
 }
 
+/// The matched beacon slot for a result, using the Java `-1`-when-none
+/// convention (the `Verdict` default is a bare `0`, which would read as slot 0).
 fn matched_slot(verdict: &crate::el::verify::Verdict) -> i64 {
     if verdict.beacon_chain_verified {
         verdict.matched_slot

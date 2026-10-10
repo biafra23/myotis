@@ -83,7 +83,7 @@ pub fn account_json(
     obj.insert("blockNumber".into(), json_u64(a.block_number));
     // ABI ≥ 41: that block's own timestamp (unix seconds) when it is PROVEN —
     // the read ran against the beacon-attested block and its verdict holds —
-    // else null. Never taken from a header a peer served.
+    // else null. Never from a header no attestation pins.
     obj.insert(
         "blockTimestamp".into(),
         a.block_timestamp.map(json_u64).unwrap_or(serde_json::Value::Null),

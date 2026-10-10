@@ -42,11 +42,12 @@ import java.util.List;
  * @param blockTimestamp        the timestamp (unix seconds) of block {@code blockNumber}
  *                              when it is PROVEN: the read ran against the
  *                              beacon-attested optimistic or finalized execution
- *                              block, whose header the light client verified with
- *                              its timestamp, and the verdict holds. -1 otherwise:
- *                              the timestamp comes only from the execution header
- *                              the light client holds attested, never from a header
- *                              a peer served (the Java engine reports -1 throughout)
+ *                              block and the verdict holds; the timestamp is that
+ *                              block's own (from the light client's payload header,
+ *                              or after Gloas from the header whose keccak equals the
+ *                              attested block hash). -1 otherwise — a header no
+ *                              attestation pins dates nothing (the Java engine
+ *                              reports -1 throughout)
  */
 public record AccountProofResult(
         String address,

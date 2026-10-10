@@ -232,8 +232,9 @@ uniffi::setup_scaffolding!();
 /// v41: "blockTimestamp" (unix seconds) on the verified-read shapes that name
 ///      the block a wallet sees: the account read (`AccountProofResult`) carries
 ///      it only when PROVEN — the read ran against the beacon-attested
-///      optimistic or finalized block, whose header the light client verified
-///      with its timestamp, and the verdict holds — else null; the ENS forward
+///      optimistic or finalized block (its payload header, or after Gloas the
+///      header whose keccak is the attested hash, carries the timestamp) and
+///      the verdict holds — else null; the ENS forward
 ///      and record shapes always carry it, from the verified header the
 ///      resolution ran against. A payload extension, no signature change —
 ///      bumped, as v38 was, so a host that shows the block's age is never

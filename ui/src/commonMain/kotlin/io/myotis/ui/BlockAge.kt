@@ -35,7 +35,8 @@ internal fun blockAgeRefreshMillis(ageSeconds: Long): Long = if (ageSeconds < 60
 @Composable
 internal fun rememberBlockAge(blockTimestampSeconds: Long): String? {
     if (blockTimestampSeconds <= 0) return null
-    var nowSeconds by remember { mutableStateOf(wallClockSeconds()) }
+    // Keyed on the block: a new result starts from a fresh reading, not the last one.
+    var nowSeconds by remember(blockTimestampSeconds) { mutableStateOf(wallClockSeconds()) }
     LaunchedEffect(blockTimestampSeconds) {
         while (true) {
             nowSeconds = wallClockSeconds()

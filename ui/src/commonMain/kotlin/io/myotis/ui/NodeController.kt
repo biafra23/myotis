@@ -215,7 +215,7 @@ data class AccountResult(
     val blockTimestamp: Long = -1,
 )
 
-/** ENS resolution result. Mirrors `io.myotis.rpc.EnsResolution`. */
+/** ENS resolution result. Mirrors `io.myotis.api.EnsResolutionResult`. */
 data class EnsResult(
     val name: String,
     val addressHex: String?,         // null when unresolved/errored
