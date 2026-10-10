@@ -38,10 +38,14 @@ cd "$here"
 # A plain string, not an array: macOS's bash 3.2 rejects an empty array
 # expansion under `set -u`.
 tor_features=""
-if [ "${MYOTIS_TOR_ENGINE:-0}" = "1" ]; then
-    tor_features="--features myotis-engine/tor"
-    echo "building with Tor (myotis-engine/tor)"
-fi
+case "${MYOTIS_TOR_ENGINE:-0}" in
+    0) ;;
+    1)
+        tor_features="--features myotis-engine/tor"
+        echo "building with Tor (myotis-engine/tor)"
+        ;;
+    *) echo "MYOTIS_TOR_ENGINE must be 0 or 1 (got '${MYOTIS_TOR_ENGINE}')" >&2; exit 1 ;;
+esac
 # shellcheck disable=SC2086 # $tor_features is empty or two words, split on purpose
 cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine $tor_features
 

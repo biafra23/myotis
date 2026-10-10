@@ -297,10 +297,11 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
  * doesn't apply — the desktop's `torModeFor`: Tor is a Rust-engine-only capability, and
  * a build without `-PtorEngine` reports no support (status bit0 clear). Otherwise "off"
  * (supported but disabled), "on" (enabled, circuit still bootstrapping), "active"
- * (circuit ready).
+ * (circuit ready). A Tor-less APK answers from BuildConfig, as `supportsTor` does,
+ * without a native call per network on every poll.
  */
 private fun torModeFor(engineKind: String?): String? {
-    if (engineKind != "rust") return null
+    if (!com.jaeckel.ethp2p.android.BuildConfig.TOR_ENGINE || engineKind != "rust") return null
     val st = io.myotis.engines.Tor.status()
     if (st and 1 == 0) return null
     return when {

@@ -26,6 +26,9 @@ class TorStorageTest {
 
     @Test
     void relativeAndNullDirectoriesAreRefused() {
+        // A Tor-less library (CI's) refuses every pair, which would pass this vacuously;
+        // the rule itself is el::tor's storage test, which needs --features tor too.
+        assumeTrue(Tor.supported(), "Tor-less library: a refusal would not exercise the path rule");
         assertFalse(Tor.configureStorage("arti/state", "/abs/cache"));
         assertFalse(Tor.configureStorage(null, null));
     }

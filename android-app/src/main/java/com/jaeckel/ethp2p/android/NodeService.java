@@ -710,8 +710,10 @@ public final class NodeService extends Service {
      *  choice: the engine checks the flag per read, so the next account read of a running
      *  Rust-engine network routes over Tor (or stops doing so) with no restart. Turning it on
      *  names Arti's directories first; an OFF that never followed an ON stays a no-op that
-     *  does not load the native library ({@code Tor.select}). Re-applied on each network boot
-     *  because the flag lives in the native library and so starts off in every new process.
+     *  does not load the native library ({@code Tor.select}). Re-applied on each boot of a
+     *  network the Rust engine may host (not under a forced Java engine, which has no Tor
+     *  path), because the flag lives in the native library and so starts off in every new
+     *  process.
      *  Returns the verdict for the boot log: {@code off}, {@code on}, {@code unsupported}
      *  (ON in Settings, but no Tor in this build — a pref left over from a {@code -PtorEngine}
      *  install, whose Settings row this build hides; like the desktop with a Tor-less dylib,
@@ -737,7 +739,11 @@ public final class NodeService extends Service {
                 LogBuffer.w(TAG, "Tor storage directories refused: reads routed over Tor "
                         + "will fail closed");
             }
-            io.myotis.engines.Tor.select(true);
+            if (!io.myotis.engines.Tor.select(true)) {
+                // torSupported() said yes a moment ago; only a failing native call lands here.
+                LogBuffer.w(TAG, "Tor routing could not be pushed to the engine");
+                return "unsupported";
+            }
             return stored ? "on" : "storage refused";
         }
     }
@@ -2174,9 +2180,14 @@ public final class NodeService extends Service {
             // Same idea for the engine choice: the Settings toggle also applies it on flip,
             // re-applying here makes a freshly (re)started network honor the current setting.
             String engineChoice = applyEngineChoice(this);
-            // And the Tor flag (process-global and live; see applyTorMode), after the engine
-            // choice it depends on.
-            String torMode = applyTorMode(this);
+            // And the Tor flag (process-global and live; see applyTorMode) — but only for a
+            // network the Rust engine may host: a Java-engine network has no Tor path, so
+            // pushing (and loading the native library to push) would only make this line
+            // claim routing that cannot happen. A Rust network already running keeps the
+            // flag its own boot or the Settings switch pushed.
+            String torMode = "java".equals(engineChoice)
+                    ? "n/a (java engine has no Tor path)"
+                    : applyTorMode(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")

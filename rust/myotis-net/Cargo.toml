@@ -81,6 +81,12 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 [target.'cfg(target_os = "android")'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"], optional = true }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"], optional = true }
+# Must stay the rustls tor-rtcompat links: install_default() (el/tor.rs) writes
+# THIS crate's process-default static, so a second rustls version would leave
+# Arti's copy without a provider — and its RustlsProvider::new panics (an abort
+# under the workspace profile) on the first Tor read. After an Arti bump, check
+# that `cargo tree --target aarch64-linux-android -p myotis-net --features tor
+# -i rustls` still resolves (it errors out when there are two versions).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 
 [features]
