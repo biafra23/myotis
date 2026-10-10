@@ -851,7 +851,8 @@ private fun NodeTuning(
                 } else {
                     "Off (default): reads and sends use the peer pool directly from your IP. On: " +
                         "route account/balance reads and the broadcast of your transactions over the Tor " +
-                        "network (embedded Arti) so peers see a Tor exit, not your IP — each address, " +
+                        "network (embedded Arti) so peers see a Tor exit, not your IP (though a peer you " +
+                        "also reach directly can tell both are a Myotis node) — each address, " +
                         "and each send, gets its own isolated circuits and a fresh node identity. SCOPE: " +
                         "only account (balance/nonce) reads and transaction sends route over Tor today; " +
                         "token-balance (storage), contract code, eth_call/gas-estimation and the receipt " +

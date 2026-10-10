@@ -67,28 +67,56 @@ fn isolation_for(address: &[u8; 20]) -> IsolationToken {
     *map.entry(*address).or_insert_with(IsolationToken::new)
 }
 
-/// Bootstrap-once accessor for the shared Tor client. The bootstrap runs in
-/// a task of its own: a caller's deadline (a read's, a push's) must not cancel
-/// it halfway, or the next caller starts it over.
+/// The one bootstrap in flight, with its generation ([`client`]).
+type Bootstrap = futures::future::Shared<futures::future::BoxFuture<'static, Result<(), String>>>;
+static BOOTSTRAP: Mutex<(u64, Option<Bootstrap>)> = Mutex::new((0, None));
+
+/// Bootstrap-once accessor for the shared Tor client. ONE bootstrap runs at a
+/// time, in a task of its own: every caller waits on it under its own deadline
+/// (a read's, a push's), so a deadline never cancels it halfway, and callers
+/// that gave up leave nothing behind to retry it. A failed bootstrap is
+/// cleared by the first caller that sees it fail, so the next CALL starts a
+/// fresh one — never a queue of orphaned retries.
 async fn client() -> Result<&'static Arc<TorClient<PreferredRuntime>>, String> {
+    use futures::FutureExt;
     if let Some(c) = CLIENT.get() {
         return Ok(c);
     }
-    tokio::spawn(async {
-        CLIENT
-            .get_or_try_init(|| async {
-                tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
-                let c = TorClient::create_bootstrapped(TorClientConfig::default())
-                    .await
-                    .map_err(|e| format!("tor bootstrap: {e}"))?;
-                tracing::info!("tor: Arti client bootstrapped");
-                Ok::<_, String>(c)
-            })
-            .await
-            .map(|_| ())
-    })
-    .await
-    .map_err(|e| format!("tor bootstrap task: {e}"))??;
+    let (generation, bootstrap) = {
+        let mut slot = BOOTSTRAP.lock().unwrap_or_else(|p| p.into_inner());
+        let running = slot.1.clone();
+        match running {
+            Some(b) => (slot.0, b),
+            None => {
+                let task = tokio::spawn(async {
+                    CLIENT
+                        .get_or_try_init(|| async {
+                            tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
+                            let c = TorClient::create_bootstrapped(TorClientConfig::default())
+                                .await
+                                .map_err(|e| format!("tor bootstrap: {e}"))?;
+                            tracing::info!("tor: Arti client bootstrapped");
+                            Ok::<_, String>(c)
+                        })
+                        .await
+                        .map(|_| ())
+                });
+                let b: Bootstrap = async move { task.await.map_err(|e| format!("tor bootstrap task: {e}"))? }
+                    .boxed()
+                    .shared();
+                slot.0 = slot.0.wrapping_add(1);
+                slot.1 = Some(b.clone());
+                (slot.0, b)
+            }
+        }
+    };
+    if let Err(e) = bootstrap.await {
+        let mut slot = BOOTSTRAP.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.0 == generation {
+            slot.1 = None;
+        }
+        return Err(e);
+    }
     CLIENT.get().ok_or_else(|| "tor bootstrap: no client after bootstrap".to_string())
 }
 
@@ -138,6 +166,9 @@ async fn open_session(
     eth_cfg: &EthConfig,
 ) -> Result<EthSession<arti_client::DataStream>, String> {
     let tor = client().await?;
+    // The Tor side advertises no listen port: it accepts no inbound, and the
+    // clearnet sessions' port would be one more thing to pair the two by.
+    let eth_cfg = EthConfig { listen_port: 0, ..eth_cfg.clone() };
 
     let mut prefs = StreamPrefs::new();
     prefs.set_isolation(isolation);
@@ -159,7 +190,7 @@ async fn open_session(
     .map_err(|_| format!("tor rlpx handshake timed out to {addr}"))?
     .map_err(|e| format!("tor rlpx handshake to {addr}: {e}"))?;
 
-    EthSession::handshake(conn, &key.public_key_bytes(), eth_cfg, None)
+    EthSession::handshake(conn, &key.public_key_bytes(), &eth_cfg, None)
         .await
         .map_err(|e| format!("tor eth handshake to {addr}: {e}"))
 }

@@ -38,6 +38,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// literal, and tor-poc sits outside the workspace, so CI never compiles it —
 /// update it too, then run `cargo check --manifest-path tor-poc/Cargo.toml`
 /// from `rust/`.
+#[derive(Clone)]
 pub struct EthConfig {
     pub network_id: u64,
     pub genesis_hash: [u8; 32],

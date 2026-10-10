@@ -10,8 +10,9 @@
 > send (its circuits carry nothing else), each push confirmed by its peer's
 > Pong, failing closed: a send no peer took over Tor is refused, never sent
 > from the real IP (one that landed on a stream but got no Pong counts as
-> sent — it may be out), and one that went over Tor is never rebroadcast from
-> the real IP, even after Tor is switched off.
+> sent — it may be out), and one that went over Tor is never pushed from the
+> real IP again: not rebroadcast, and not re-pushed when the wallet
+> re-submits it, even after Tor is switched off.
 > Wired up on the desktop host only today; storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
@@ -22,7 +23,8 @@
 > stays clearnet. And the shipped path reuses the live
 > clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
 > a Tor read or receiving a Tor send simultaneously holds a clearnet connection from the user's real
-> IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
+> IP and can pair the two by timing and by the `myotis/<version>` client id
+> both sessions' Hello carries (§6.3; `reader.rs`'s own KNOWN LIMITATION): a
 > network-privacy win, not yet the full §5 unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
@@ -187,8 +189,11 @@ Route by sensitivity, not wholesale:
    confirmed by the peer's Pong (`EthSession::await_pong`); the send answers
    at the first confirmed push, counts a push that landed without a Pong as
    sent (it may be out), and fails closed when none landed. Rebroadcasts
-   follow the same route, one round at a time, each walking on to the next
-   five pool peers; a Tor send is never re-pushed in the clear.
+   follow the same route, one round at a time per network, each walking on to
+   the next five pool peers; a Tor send is never re-pushed in the clear, a
+   wallet's re-submit of it included. Tor sessions advertise no listen port;
+   they still send the `myotis/<version>` client id (§6.3 — the choice of a
+   Tor-side id is open).
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -482,9 +487,10 @@ Run *underneath* Myotis by the user, a system VPN covers, with zero Myotis
 code, everything the embedded Tor path does not:
 
 - **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
-- **Every not-yet-routed flow** — storage/token reads, `eth_call`, tx
-  broadcast, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
-  CCIP-Read, the tx-history debug fetch) — on both engines.
+- **Every not-yet-routed flow** — storage/token reads, `eth_call`, receipt
+  polling, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
+  CCIP-Read, the tx-history debug fetch) — on both engines, plus the tx
+  broadcast whenever Tor mode is off.
 - **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
   network arrives from one small, saturated, widely blocklisted set of exit
   IPs. Gnosis VPN's exits are today ordinary, low-traffic addresses that
