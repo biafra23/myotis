@@ -212,9 +212,10 @@ jobs:
           echo "::error::DMG build failed after 3 attempts"
           exit 1
 
-      # The desktop tests' macOS branch — AppNapTest, the Objective-C bridge that keeps
-      # App Nap off for the RPC server — runs nowhere else: ci.yml is ubuntu-only, where
-      # it is skipped by assumption. One leg is enough; the x64 leg would only repeat
+      # The desktop tests' macOS branch — the Objective-C bridges: AppNapTest (App Nap off
+      # for the RPC server), ObjCRuntimeTest (NSString round trip, the hand-built block
+      # literals and the notification delegate) and MacNotificationsTest — runs nowhere
+      # else: ci.yml is ubuntu-only, where those are skipped by assumption. One leg is enough; the x64 leg would only repeat
       # it under Rosetta. The Rust engine is not needed by these tests.
       - name: Run desktop tests (macOS)
         if: matrix.flavor == 'standard' && matrix.arch == 'arm64'
@@ -297,6 +298,17 @@ jobs:
             || { echo "::error::JNA stub arch mismatch: expected $want, got [$jnaarchs]"; exit 1; }
           codesign --verify --verbose=2 "$jna" \
             || { echo "::error::JNA stub is not validly signed — jpackage did not sign it"; exit 1; }
+          # The app icon must be the one generateMacIcon rendered from the Android launcher
+          # icon (app-desktop/build.gradle.kts), not jpackage's default Java icon, which
+          # Compose would ship without a word if iconFile stopped reaching jpackage.
+          app=$(find "$mnt" -maxdepth 1 -type d -name '*.app' | head -n1)
+          [ -n "$app" ] || { echo "::error::no .app bundle at the root of $dmg"; exit 1; }
+          icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist" 2>/dev/null) \
+            || { echo "::error::$app has no CFBundleIconFile — jpackage shipped no app icon"; exit 1; }
+          case "$icon" in *.icns) ;; *) icon="$icon.icns" ;; esac
+          cmp app-desktop/build/generated/mac-icon/Myotis.icns "$app/Contents/Resources/$icon" \
+            || { echo "::error::the dmg's app icon ($icon) is not the generated Myotis icon"; exit 1; }
+          echo "OK: app icon is the generated Myotis icon ($icon)"
           bundled_seed=$(find "$mnt" -type f -name 'logindex-gnosis.db' | head -n1 || true)
           if [ "${{ matrix.flavor }}" = "bee-poc" ]; then
             # The Bee PoC flavour must actually carry its seed — the whole point

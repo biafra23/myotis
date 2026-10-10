@@ -4,8 +4,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.window.Notification
-import androidx.compose.ui.window.TrayState
 import io.myotis.ui.Settings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -18,13 +16,21 @@ private val log = org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.DesktopAl
 private const val REFUSAL_POLL_MS = 5_000L
 
 /**
+ * Where a native notification goes: [MacNotifications] in a packaged macOS app, the tray
+ * icon's notification elsewhere (a toast on Windows, the tray's own balloon on Linux).
+ * [post] is true when the platform took the notification.
+ */
+internal fun interface DesktopNotifier {
+    fun post(title: String, message: String): Boolean
+}
+
+/**
  * Tell the user, outside the window, that a web page was refused (#502). Inside the
  * window the Status banner already does; but the refused page is in the browser, in
  * front, and the Myotis window is behind it. Two signals, each where the platform has it:
  *
- * - a native notification through the tray icon ([tray]; Notification Center on macOS,
- *   a toast on Windows, the tray's own balloon elsewhere) — null where the desktop has
- *   no system tray (GNOME without an extension), and then logged once;
+ * - a native notification through [notifier] — null where the desktop has neither
+ *   Notification Center nor a system tray (GNOME without an extension), and then logged once;
  * - an attention request when the window is not focused ([requestUserAttention]: the
  *   dock icon bounces on macOS, the taskbar entry flashes on Windows).
  *
@@ -36,12 +42,12 @@ private const val REFUSAL_POLL_MS = 5_000L
 internal suspend fun watchWebRefusals(
     controller: DesktopNodeController,
     settings: Settings,
-    tray: TrayState?,
+    notifier: DesktopNotifier?,
     window: java.awt.Window,
     onAnnounced: () -> Unit,
 ) {
-    if (tray == null) {
-        log.info("no system tray on this desktop: refused web pages show in the Myotis window only")
+    if (notifier == null) {
+        log.info("no notification route on this desktop (no system tray): refused web pages show in the Myotis window only")
     }
     val alerts = WebRefusalAlerts()
     var capLogged = false
@@ -62,11 +68,11 @@ internal suspend fun watchWebRefusals(
             }
             if (fresh.isEmpty()) continue
             val (title, message) = refusalNotificationText(fresh)
-            tray?.sendNotification(Notification(title, message, Notification.Type.Info))
+            val notified = notifier?.post(title, message) ?: false
             val attention = !window.isFocused && requestUserAttention(window)
             onAnnounced()
             log.info("web page refused, announced: {} (notification: {}, attention: {})",
-                fresh.joinToString { it.origin }, tray != null, attention)
+                fresh.joinToString { it.origin }, notified, attention)
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
