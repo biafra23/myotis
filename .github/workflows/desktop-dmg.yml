@@ -214,8 +214,9 @@ jobs:
 
       # The desktop tests' macOS branch — the Objective-C bridges: AppNapTest (App Nap off
       # for the RPC server), ObjCRuntimeTest (NSString round trip, the hand-built block
-      # literals and the notification delegate) and MacNotificationsTest — runs nowhere
-      # else: ci.yml is ubuntu-only, where those are skipped by assumption. One leg is enough; the x64 leg would only repeat
+      # literals and the notification delegate) and MacNotificationsTest's bundle check —
+      # runs nowhere else: ci.yml is ubuntu-only, where the first two are skipped by
+      # assumption and MacNotificationsTest takes its off-macOS branch. One leg is enough; the x64 leg would only repeat
       # it under Rosetta. The Rust engine is not needed by these tests.
       - name: Run desktop tests (macOS)
         if: matrix.flavor == 'standard' && matrix.arch == 'arm64'

@@ -662,10 +662,12 @@ compose.desktop {
             // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
             includeAllModules = true
             macOS {
-                // Generated at package time from the Android launcher icon. Mapped from the
-                // task, so every task that reads it (jpackage, Compose's run on macOS) depends
-                // on generateMacIcon, not only the ones the name match above wires.
-                iconFile.set(generateMacIcon.map { macIcon.get() })
+                // Generated at package time from the Android launcher icon (generateMacIcon).
+                // A plain file location, not a value mapped from the task: on macOS Compose's
+                // run task reads it at configuration time into -Xdock:icon=, before any task
+                // has run. The packaging tasks get their edge from the name match above, run
+                // from the JavaExec block below.
+                iconFile.set(macIcon)
                 bundleID = when {
                     beePoc -> "io.myotis.desktop.beepoc"
                     railgunPoc -> "io.myotis.desktop.railgunpoc"
@@ -688,6 +690,8 @@ compose.desktop {
 // without the Rust engine until the packaging PR.
 tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // Compose's run passes the macOS icon as -Xdock:icon=<file>: a string, so no task edge.
+    if (isMacHost && name == "run") dependsOn(generateMacIcon)
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the

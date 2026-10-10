@@ -39,9 +39,8 @@ internal object MacNotifications {
     private const val ERROR_DOMAIN = "UNErrorDomain"
     private const val ERROR_NOT_ALLOWED = 1L
 
-    private const val SETTINGS = "System Settings → Notifications → Myotis"
-
-    private class Setup(val rt: ObjCRuntime, val center: Pointer)
+    /** [appName]: the bundle's name, which System Settings → Notifications lists it under. */
+    private class Setup(val rt: ObjCRuntime, val center: Pointer, val appName: String)
 
     /** Null wherever UserNotifications may not be used; see the class doc. */
     private val setup: Setup? by lazy { setUp() }
@@ -89,7 +88,7 @@ internal object MacNotifications {
                         log.info("macOS notifications: not running from an app bundle ({}), so they go through the tray icon", path)
                         null
                     }
-                    rt.send(rt.cls("LSBundleProxy"), "bundleProxyForCurrentProcess") == null -> {
+                    !launchServicesKnowsThisProcess(rt) -> {
                         log.warn("macOS notifications: LaunchServices has no record of {}, so they go through the tray icon", path)
                         null
                     }
@@ -98,7 +97,7 @@ internal object MacNotifications {
                             ?: error("UNUserNotificationCenter.currentNotificationCenter returned nil")
                         // The center keeps its delegate weakly; ours is never released.
                         rt.sendVoid(center, "setDelegate:", foregroundDelegate)
-                        Setup(rt, center)
+                        Setup(rt, center, appName = path.substringAfterLast('/').removeSuffix(".app"))
                     }
                 }
             }
@@ -106,6 +105,21 @@ internal object MacNotifications {
             log.warn("macOS notifications unavailable, using the tray icon: {}", t.toString())
             null
         }
+    }
+
+    /**
+     * `+[LSBundleProxy bundleProxyForCurrentProcess]` is not nil: the question whose "no" makes
+     * `currentNotificationCenter` raise. LSBundleProxy is private, so its method is probed
+     * first with `class_getClassMethod`, plain C that cannot raise. Sending a selector a
+     * future macOS no longer has would raise `NSInvalidArgumentException` instead, which
+     * aborts the JVM like the exception this guards against. A missing class throws a Kotlin
+     * error from [ObjCRuntime.cls], which the caller catches. Either way, anything but a
+     * yes keeps the tray route.
+     */
+    private fun launchServicesKnowsThisProcess(rt: ObjCRuntime): Boolean {
+        val proxy = rt.cls("LSBundleProxy")
+        val method = rt.function("class_getClassMethod").invokePointer(arrayOf(proxy, rt.sel("bundleProxyForCurrentProcess")))
+        return method != null && rt.send(proxy, "bundleProxyForCurrentProcess") != null
     }
 
     /**
@@ -141,6 +155,9 @@ internal object MacNotifications {
         }
     }
 
+    /** Where the user turns this app's notifications on: a PoC build is listed under its own name. */
+    private fun settingsPath() = "System Settings → Notifications → ${setup?.appName ?: "Myotis"}"
+
     /** Domain, code and description of an NSError, for the log. */
     private fun describe(rt: ObjCRuntime, error: Pointer): String = rt.autoreleasePool {
         "${rt.string(rt.send(error, "domain"))} ${rt.sendLong(error, "code")}: " +
@@ -162,8 +179,8 @@ internal object MacNotifications {
                     }
                     else -> {
                         permission = false
-                        log.warn("macOS notifications: not allowed, so refused web pages show in the Myotis window " +
-                            "only (turn them on in {})", SETTINGS)
+                        log.warn("macOS notifications: not allowed, so refused web pages show in the app's window " +
+                            "only (turn them on in {})", settingsPath())
                     }
                 }
             } // never throw into the caller's dispatch queue
@@ -189,7 +206,7 @@ internal object MacNotifications {
                     if (permission == null) {
                         log.warn("macOS notification not shown: the permission prompt is not answered yet")
                     } else {
-                        log.warn("macOS notification not shown: notifications are turned off in {}", SETTINGS)
+                        log.warn("macOS notification not shown: notifications are turned off in {}", settingsPath())
                         permission = false // turned off since the start, if it was on
                     }
                 }
