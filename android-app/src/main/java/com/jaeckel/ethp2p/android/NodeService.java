@@ -2047,7 +2047,8 @@ public final class NodeService extends Service {
         // service that is NOT running (its notifications are dropped at shutdown, so
         // this is the rare stale tap) persists the site and goes away again.
         if (intent != null && ACTION_ALLOW_WEB_ORIGIN.equals(intent.getAction())) {
-            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN));
+            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN),
+                    intent.getIntExtra(EXTRA_WEB_NOTIFICATION_ID, -1));
             if (!RUNNING.get()) stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -2739,6 +2740,10 @@ public final class NodeService extends Service {
     private static final int WEB_NOTIFICATION_BASE = 1000;
     static final String ACTION_ALLOW_WEB_ORIGIN = "com.jaeckel.ethp2p.android.ALLOW_WEB_ORIGIN";
     static final String EXTRA_WEB_ORIGIN = "origin";
+    /** The notification the Allow came from, so a tap that reaches a FRESH process (the
+     *  old one died, its notifications outlived it in the system) still clears it —
+     *  the new process's {@link #webNotified} knows nothing of it. */
+    static final String EXTRA_WEB_NOTIFICATION_ID = "notificationId";
     /** How often the live listeners' recent-origins lists are checked for a new refusal —
      *  a cheap in-memory read per network; the engine surface is a getter by design. */
     private static final long WEB_REFUSAL_POLL_MS = 5_000;
@@ -2797,31 +2802,45 @@ public final class NodeService extends Service {
             synchronized (handles) {
                 live = new ArrayList<>(handles.values());
             }
+            // Every listener's list folded into ONE entry per origin, the newest sighting
+            // winning (the UI's WebAccessUi.merge does the same). Each listener keeps its
+            // own list, so a page served on one network under a wider policy and refused
+            // on another since would be both "allowed" (stale) and "refused" (fresh);
+            // judged per listener, the stale entry would cancel and re-arm what the fresh
+            // refusal had just posted — a banner every pass. Judged once, the fresh
+            // refusal wins.
+            Map<String, io.myotis.api.WebOrigin> newest = new java.util.HashMap<>();
             for (ChainHandle h : live) {
                 for (io.myotis.api.WebOrigin o : h.recentWebOrigins()) {
-                    String origin = o.origin();
-                    if (o.lastAllowed() || policy.origins().contains(origin)) {
-                        // Allowed since (from the app, or served): the question is answered,
-                        // so its notification goes, and the origin is re-armed so a later
-                        // refusal — the user removed the site again — is notified afresh.
-                        Integer answered = webNotified.remove(origin);
-                        if (answered != null && nm != null) nm.cancel(answered);
-                        continue;
+                    io.myotis.api.WebOrigin prev = newest.get(o.origin());
+                    if (prev == null || o.lastSeenEpochMillis() >= prev.lastSeenEpochMillis()) {
+                        newest.put(o.origin(), o);
                     }
-                    if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
-                    if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
-                        if (!webNotificationCapLogged) {
-                            webNotificationCapLogged = true;
-                            LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
-                                    + " origins notified this run, no more notifications until restart "
-                                    + "(the Status screen still lists them)");
-                        }
-                        continue;
-                    }
-                    int id = webNotificationIds.getAndIncrement();
-                    webNotified.put(origin, id);
-                    postWebRefusalNotification(id, origin);
                 }
+            }
+            for (io.myotis.api.WebOrigin o : newest.values()) {
+                String origin = o.origin();
+                if (o.lastAllowed() || policy.origins().contains(origin)) {
+                    // Allowed since (from the app, or served): the question is answered,
+                    // so its notification goes, and the origin is re-armed so a later
+                    // refusal — the user removed the site again — is notified afresh.
+                    Integer answered = webNotified.remove(origin);
+                    if (answered != null && nm != null) nm.cancel(answered);
+                    continue;
+                }
+                if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
+                if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
+                    if (!webNotificationCapLogged) {
+                        webNotificationCapLogged = true;
+                        LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
+                                + " origins notified this run, no more notifications until restart "
+                                + "(the Status screen still lists them)");
+                    }
+                    continue;
+                }
+                int id = webNotificationIds.getAndIncrement();
+                webNotified.put(origin, id);
+                postWebRefusalNotification(id, origin);
             }
         } catch (Throwable t) {
             LogBuffer.w(TAG, "web refusal notification failed: " + t);
@@ -2860,7 +2879,8 @@ public final class NodeService extends Service {
         if (nm == null) return;
         Intent allow = new Intent(this, NodeService.class)
                 .setAction(ACTION_ALLOW_WEB_ORIGIN)
-                .putExtra(EXTRA_WEB_ORIGIN, origin);
+                .putExtra(EXTRA_WEB_ORIGIN, origin)
+                .putExtra(EXTRA_WEB_NOTIFICATION_ID, id);
         // The request code is the notification id, so each origin's Allow is its own
         // PendingIntent (equal intents with different extras would otherwise collapse).
         android.app.PendingIntent allowIntent = android.app.PendingIntent.getService(this, id, allow,
@@ -2909,10 +2929,12 @@ public final class NodeService extends Service {
         }
     }
 
-    /** The notification's Allow: persist the site, apply live, drop the notification. The
-     *  mode is left alone — a refusal is notified only under Specific sites, and Off must
-     *  not be widened from a notification tap. */
-    private void allowWebOrigin(String origin) {
+    /** The notification's Allow: persist the site, apply live, drop the notification — by
+     *  the id the intent carries ({@code notificationId}, {@code -1} when absent) as well
+     *  as the one this process posted, since a tap can reach a fresh process. The mode is
+     *  left alone — a refusal is notified only under Specific sites, and Off must not be
+     *  widened from a notification tap. */
+    private void allowWebOrigin(String origin, int notificationId) {
         if (origin == null || origin.isBlank()) return;
         List<String> list = new ArrayList<>(webAccessOrigins(this));
         if (!list.contains(origin)) {
@@ -2920,9 +2942,12 @@ public final class NodeService extends Service {
             setWebAccessOrigins(this, list);
         }
         applyWebAccess();
-        Integer id = webNotified.remove(origin);
+        Integer posted = webNotified.remove(origin);
         NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null && id != null) nm.cancel(id);
+        if (nm != null) {
+            if (posted != null) nm.cancel(posted);
+            if (notificationId >= 0) nm.cancel(notificationId);
+        }
         LogBuffer.i(TAG, "web page allowed from its notification: " + origin);
     }
 
