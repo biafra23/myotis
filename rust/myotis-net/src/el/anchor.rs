@@ -376,6 +376,18 @@ impl ExecAnchor {
             .map(|hash| (inner.optimistic_block_number, hash))
     }
 
+    /// [`Self::optimistic_head`] with the beacon slot that attested it,
+    /// `(block_number, block_hash, slot)` under ONE lock — the anchor a
+    /// verified read's header-chain walk ends at (`verify::ladder_precheck`),
+    /// which reports the slot as the read's `matchedBeaconSlot`.
+    pub fn optimistic_anchor(&self) -> Option<(u64, [u8; 32], u64)> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_block_hash
+            .filter(|_| inner.optimistic_block_number > 0)
+            .map(|hash| (inner.optimistic_block_number, hash, inner.optimistic_slot))
+    }
+
     /// The optimistic execution `(block_number, state_root, timestamp)` read
     /// atomically — the CURRENT beacon-attested head state, at most a couple of
     /// slots old, and the block's own timestamp proven with it (0 while

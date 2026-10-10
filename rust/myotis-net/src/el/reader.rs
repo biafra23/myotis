@@ -5569,10 +5569,8 @@ impl ElReader {
     /// is the anchor's optimistic number (consistent with `eth_blockNumber`),
     /// not a peer-head claim — the FFI `peerBlockNumber` field follows. This
     /// is deliberate; the Java engine still reports the peer's handshake head
-    /// there, and so does this engine's TOR read path
-    /// ([`Self::account_from_tor_session`] — a fresh session per read, so its
-    /// handshake head is seconds old and #355 does not apply; preferring the
-    /// anchor root there too is a follow-up).
+    /// there. This engine's TOR read path ([`Self::account_from_tor_session`])
+    /// prefers the anchor root the same way.
     async fn snap_account_at_best_root(
         &self,
         peer: &ManagedPeer,
@@ -5598,7 +5596,7 @@ impl ElReader {
                     let (root, number) = fresh_head(peer).await.map_err(fb)?;
                     let outcome =
                         peer.snap_get_account(&root, &address).await.map_err(fb)?;
-                    // A peer's head: no attested header to take a timestamp from.
+                    // A peer's head: a timestamp only if the header walk proves its header.
                     return Ok((root, number, None, outcome));
                 }
                 // Transport-shaped failure (timeout/disconnect): a second
@@ -5643,8 +5641,11 @@ impl ElReader {
             code_hash: EMPTY_CODE_HASH,
             block_number,
             // Reported only with a verdict that holds: a timestamp is never more
-            // proven than the read it dates.
-            block_timestamp: attested_timestamp.filter(|_| verdict.beacon_chain_verified),
+            // proven than the read it dates. The attested block's own, else
+            // the one a header walk proved with the read block's header.
+            block_timestamp: attested_timestamp
+                .or(verdict.block_timestamp)
+                .filter(|_| verdict.beacon_chain_verified),
             peer_state_root: state_root,
             peer_proof_valid: true,
             beacon_chain_verified: verdict.beacon_chain_verified,
@@ -5755,11 +5756,55 @@ impl ElReader {
     }
 
     /// One account fetch + beacon verdict over an already-connected Tor
-    /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path).
+    /// [`EthSession`] (the [`get_account_from`] twin for the one-shot Tor path),
+    /// against the same root the clearnet read prefers
+    /// ([`Self::snap_account_at_best_root`]): the beacon anchor's optimistic
+    /// root, whose number and timestamp are proven with it. Only a peer that
+    /// cannot prove at that root falls back to its own fresh head, which the
+    /// ladder then proves by the header walk up to the optimistic head — or
+    /// refuses, when the head is past it (`peerBlockAheadOfAnchor`), as a
+    /// peer's tip usually is by a block.
     #[cfg(feature = "tor")]
     /// The second value is the snap round-trip's wall-clock over the circuit
     /// (the shadow cache's cost measure), like `get_account_from`'s.
     async fn account_from_tor_session(
+        &self,
+        session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
+        address: [u8; 20],
+    ) -> Result<(VerifiedAccount, Duration), String> {
+        if let Some((number, root, timestamp)) = self.anchor.optimistic_execution() {
+            let started = Instant::now();
+            match session.snap_get_account(&root, &address).await {
+                Ok(outcome) => {
+                    let snap_elapsed = started.elapsed();
+                    let verdict = session
+                        .verified_state_root(&self.anchor, &root, to_ladder_block(number), true)
+                        .await;
+                    // The anchor's root, number and timestamp were read together.
+                    let ts = proven_timestamp(timestamp);
+                    return Ok((
+                        self.build_verified_account(address, root, number, ts, outcome, verdict, false),
+                        snap_elapsed,
+                    ));
+                }
+                // Name both causes, like the clearnet twin: the surfaced error
+                // must not read as the fallback symptom alone.
+                Err(e) if crate::el::snap::fetch::is_unservable_root_error(&e) => {
+                    let fb = |e2: String| {
+                        format!("anchor-root query failed ({e}); fresh-head fallback: {e2}")
+                    };
+                    return self.account_at_tor_session_head(session, address).await.map_err(fb);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.account_at_tor_session_head(session, address).await
+    }
+
+    /// [`Self::account_from_tor_session`]'s fallback: the account at the
+    /// session's own fresh head.
+    #[cfg(feature = "tor")]
+    async fn account_at_tor_session_head(
         &self,
         session: &mut crate::el::eth::session::EthSession<arti_client::DataStream>,
         address: [u8; 20],
@@ -5772,7 +5817,7 @@ impl ElReader {
             .verified_state_root(&self.anchor, &state_root, to_ladder_block(block_number), true)
             .await;
         Ok((
-            // A fresh session's head: no attested header to take a timestamp from.
+            // A peer's head: a timestamp only if the header walk proved its header.
             self.build_verified_account(address, state_root, block_number, None, outcome, verdict, false),
             snap_elapsed,
         ))
@@ -10624,6 +10669,11 @@ mod tests {
             assert_eq!(build(Some(1_700_000_000), &holds).block_timestamp, Some(1_700_000_000));
             assert_eq!(build(Some(1_700_000_000), &fails).block_timestamp, None, "a failed verdict dates nothing");
             assert_eq!(build(None, &holds).block_timestamp, None, "a peer-head read has no attested timestamp");
+            // A header walk proved the peer-head block's header, timestamp included.
+            let walked = crate::el::verify::Verdict { block_timestamp: Some(1_700_000_012), ..holds.clone() };
+            assert_eq!(build(None, &walked).block_timestamp, Some(1_700_000_012));
+            let walk_failed = crate::el::verify::Verdict { block_timestamp: Some(1_700_000_012), ..fails.clone() };
+            assert_eq!(build(None, &walk_failed).block_timestamp, None, "a failed verdict dates nothing");
             // The anchor reports 0 until a head with its timestamp lands: not a time.
             assert_eq!(proven_timestamp(0), None);
             assert_eq!(proven_timestamp(1_700_000_000), Some(1_700_000_000));

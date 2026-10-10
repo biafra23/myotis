@@ -28,8 +28,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * <ul>
  *   <li>The load-bearing {@link VerifiedAccountQuery#verifyHeaderChain} crypto:
  *       committed BlockHeaders messages (valid chain / broken parent link /
- *       wrong first (beacon) root / wrong last (peer) root) → the boolean
- *       verdict, which both languages must reproduce from the same bytes.</li>
+ *       a made-up child of the attested block / a forged stand-in for the
+ *       attested block / wrong first (peer) root) → the boolean verdict, which
+ *       both languages must reproduce from the same bytes.</li>
  *   <li>The stable ladder token set ({@code stateRootMatch}, {@code headerChain},
  *       {@code beaconNotSynced}, {@code headerChainGapTooLarge}, …) that the
  *       operator tooling and integration greps depend on.</li>
@@ -50,16 +51,26 @@ class ElVerifyVectorConformanceTest {
     private static final Path CORPUS = Path.of("..", "rust", "testdata", "el", "verify");
     private static final boolean WRITE = Boolean.getBoolean("myotis.el.writeExpected");
 
-    // The header-chain trust anchor is the finalized BLOCK HASH (keccak of the
-    // whole first header), NOT its state root. PEER_ROOT is the last header's
-    // state root (the query target).
-    private static final Bytes32 BEACON_STATE_ROOT = tag("beacon-finalized-state-root");
+    // The header-chain trust anchor is the ATTESTED block's HASH (keccak of the
+    // whole LAST header), NOT its state root. PEER_ROOT is the first header's
+    // state root (the query target): the walk runs from the peer's block UP to
+    // the attested block, because a parent hash pins only a parent.
+    private static final Bytes32 ATTESTED_STATE_ROOT = tag("beacon-attested-state-root");
     private static final Bytes32 GENESIS_PARENT = tag("genesis-parent");
     private static final Bytes32 PEER_ROOT = tag("peer-head-root");
 
-    /** The canonical finalized block; its hash is the trust anchor. */
-    private static Header finalizedH0() {
-        return header(21_000_000, BEACON_STATE_ROOT, GENESIS_PARENT);
+    /** The canonical chain: the peer's block, one between, the attested block on top. */
+    private static Header peerBlock() {
+        return header(21_000_000, PEER_ROOT, GENESIS_PARENT);
+    }
+
+    private static Header midBlock() {
+        return header(21_000_001, tag("mid-root"), peerBlock().hash);
+    }
+
+    /** The beacon-attested block; its hash is the trust anchor. */
+    private static Header attestedBlock() {
+        return header(21_000_002, ATTESTED_STATE_ROOT, midBlock().hash);
     }
 
     private static Map<String, String> expected;
@@ -88,18 +99,18 @@ class ElVerifyVectorConformanceTest {
     @Test
     void replayReproducesRecordedVerdicts() throws Exception {
         Map<String, String> actual = new TreeMap<>();
-        Bytes32 beaconBlockHash = finalizedH0().hash;
-        actual.put("beaconBlockHash", beaconBlockHash.toUnprefixedHexString());
+        Bytes32 anchorBlockHash = attestedBlock().hash;
+        actual.put("anchorBlockHash", anchorBlockHash.toUnprefixedHexString());
         actual.put("peerRoot", PEER_ROOT.toUnprefixedHexString());
 
         // --- headerChain verification over committed BlockHeaders messages,
-        //     anchored on the finalized BLOCK HASH ---
+        //     anchored on the attested block's HASH at the top ---
         for (Path p : listSorted()) {
             String base = baseName(p);
             List<BlockHeadersMessage.VerifiedHeader> headers =
                     BlockHeadersMessage.decodeWithRequestId(Files.readAllBytes(p)).headers();
             boolean ok = VerifiedAccountQuery.verifyHeaderChain(
-                    headers, beaconBlockHash.toArray(), PEER_ROOT.toArray());
+                    headers, anchorBlockHash.toArray(), PEER_ROOT.toArray());
             actual.put("chain." + base, Boolean.toString(ok));
         }
 
@@ -108,7 +119,8 @@ class ElVerifyVectorConformanceTest {
         actual.put("tokens.failReason", String.join(",",
                 "beaconBlockUnavailable", "beaconNotSynced", "headerChainError",
                 "headerChainGapTooLarge", "headerChainInvalid", "noPeerBlockNumber",
-                "noPeerStateRoot", "peerBlockBehindFinalized", "peerProofInvalid"));
+                "noPeerStateRoot", "peerBlockAheadOfAnchor", "peerBlockBehindFinalized",
+                "peerProofInvalid"));
 
         if (WRITE) {
             StringBuilder sb = new StringBuilder(
@@ -133,28 +145,35 @@ class ElVerifyVectorConformanceTest {
     // -------------------------------------------------------------------------
 
     private static void generateVectors() throws Exception {
-        Header h0 = finalizedH0();
-        Header h1 = header(21_000_001, tag("mid-root"), h0.hash);
-        Header h2 = header(21_000_002, PEER_ROOT, h1.hash);
-        // Valid: h0.hash == beaconBlockHash, h2.stateRoot == PEER_ROOT, parent-linked.
-        writeMsg("001-chain-valid.rlp", h0, h1, h2);
+        Header hp = peerBlock();
+        Header hm = midBlock();
+        Header ha = attestedBlock();
+        // Valid: hp.stateRoot == PEER_ROOT, ha.hash == anchorBlockHash, parent-linked.
+        writeMsg("001-chain-valid.rlp", hp, hm, ha);
 
-        // Broken parent link: h2.parentHash != h1.hash.
-        Header h2broken = header(21_000_002, PEER_ROOT, tag("wrong-parent"));
-        writeMsg("002-chain-broken-link.rlp", h0, h1, h2broken);
+        // Broken parent link: the middle header does not name hp as its parent, so
+        // the attested block (which names the REAL middle block) no longer links either.
+        Header hmBroken = header(21_000_001, tag("mid-root"), tag("wrong-parent"));
+        writeMsg("002-chain-broken-link.rlp", hp, hmBroken, ha);
 
-        // THE ATTACK: a forged first header that COPIES the public beacon state
-        // root into its stateRoot field but has a DIFFERENT block hash (fake
-        // parent) — a state-root-only anchor would accept this; the block-hash
-        // anchor rejects it. Proves the security fix.
-        Header h0forged = header(21_000_000, BEACON_STATE_ROOT, tag("attacker-parent"));
-        Header h1f = header(21_000_001, tag("mid-root"), h0forged.hash);
-        Header h2f = header(21_000_002, PEER_ROOT, h1f.hash);
-        writeMsg("003-chain-forged-first-header.rlp", h0forged, h1f, h2f);
+        // THE ATTACK the old upward walk let through: the real attested block,
+        // followed by a header a peer made up that names it as its parent and
+        // carries the peer's root. A parent hash pins only a parent, so the old
+        // walk (anchored at the FIRST header) accepted this; anchored at the LAST
+        // header it fails — the made-up child does not hash to the attested block.
+        Header madeUp = header(21_000_003, PEER_ROOT, ha.hash);
+        writeMsg("003-chain-made-up-child.rlp", ha, madeUp);
 
-        // Wrong last (peer) root: h2.stateRoot != PEER_ROOT.
-        Header h2w = header(21_000_002, tag("not-peer-root"), h1.hash);
-        writeMsg("004-chain-wrong-last-root.rlp", h0, h1, h2w);
+        // A forged stand-in for the attested block: it COPIES the public attested
+        // state root and links to hp, but its block hash is not the attested one.
+        Header forgedAnchor = header(21_000_001, ATTESTED_STATE_ROOT, hp.hash);
+        writeMsg("004-chain-forged-anchor.rlp", hp, forgedAnchor);
+
+        // Wrong first (peer) root: the chain is sound, the read's root is not in it.
+        Header hpWrong = header(21_000_000, tag("not-peer-root"), GENESIS_PARENT);
+        Header hmW = header(21_000_001, tag("mid-root"), hpWrong.hash);
+        Header haW = header(21_000_002, ATTESTED_STATE_ROOT, hmW.hash);
+        writeMsg("005-chain-wrong-first-root.rlp", hpWrong, hmW, haW);
     }
 
     private record Header(Bytes rlp, Bytes32 hash) {}

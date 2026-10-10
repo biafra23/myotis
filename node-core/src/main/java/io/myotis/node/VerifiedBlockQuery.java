@@ -3,6 +3,7 @@ package io.myotis.node;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
+import com.jaeckel.ethp2p.networking.eth.HeaderChains;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -18,15 +19,20 @@ import java.util.concurrent.TimeUnit;
  * Shared, host-agnostic verified single-block query — the engine home of the daemon's
  * {@code get-block} verification (moved out of the JVM {@code CommandHandler} verbatim).
  *
- * <p>Verification strategy:
- * <ol>
- *   <li><b>stateRootMatch</b> — the block's stateRoot matches a beacon-attested root.</li>
- *   <li><b>headerChain</b> — the beacon's ExecutionPayloadHeader carries a BLS-verified
- *       block_hash; fetch the header range between the finalized block and the target,
- *       require the finalized header's keccak256(RLP) to equal that anchor, then walk the
- *       parent-hash chain. Forging any header would need a keccak preimage.</li>
- * </ol>
- * Pre-Merge blocks can't tie to the beacon chain → {@code failReason:"preMergeBlock"}.
+ * <p>Verification: <b>headerChain</b> — the light client attests the block HASH of the
+ * finalized and the optimistic execution heads. Fetch the header window from the target up
+ * to the attested block at or above it (the finalized block for a target at or below
+ * finality, else the optimistic head), require its TOP to hash to that attested hash and every
+ * header to hash-link to the next ({@link HeaderChains#anchoredAtTop}), and require the
+ * window's FIRST header to be the very header this query reports (same block hash). Trust
+ * flows down from the attested block only — see {@link HeaderChains}. A target above the
+ * optimistic head is not attested yet → {@code failReason:"blockAheadOfAnchor"}.
+ *
+ * <p>There is no state-root fast path: a matching attested state root proves the root, not
+ * the rest of the header, and the transaction count reported here is checked against the
+ * header's transactionsRoot.
+ *
+ * <p>Pre-Merge blocks can't tie to the beacon chain → {@code failReason:"preMergeBlock"}.
  */
 public final class VerifiedBlockQuery {
 
@@ -92,7 +98,7 @@ public final class VerifiedBlockQuery {
             }
 
             // Step 3: beacon verification.
-            Verdict v = verifyAgainstBeacon(connector, beaconSyncState, h, blockNumber);
+            Verdict v = verifyAgainstBeacon(connector, beaconSyncState, vh, blockNumber);
 
             return new BlockResult(
                     h.number,
@@ -135,7 +141,8 @@ public final class VerifiedBlockQuery {
 
     private static Verdict verifyAgainstBeacon(RLPxConnector connector,
                                                BeaconSyncState beaconSyncState,
-                                               BlockHeader header, long blockNumber) {
+                                               BlockHeadersMessage.VerifiedHeader reported,
+                                               long blockNumber) {
         Verdict v = new Verdict();
         if (blockNumber < MERGE_BLOCK) {
             // Pre-merge blocks cannot be verified via the beacon chain (the embedded
@@ -143,50 +150,60 @@ public final class VerifiedBlockQuery {
             v.failReason = "preMergeBlock";
             return v;
         }
-        byte[] blockStateRoot = header.stateRoot.toArrayUnsafe();
-        BeaconSyncState.SlottedStateRoot match = beaconSyncState.findStateRoot(blockStateRoot);
-        if (match != null) {
-            v.beaconChainVerified = true;
-            v.matchedSlot = match.slot();
-            v.blsVerified = match.blsVerified();
-            v.verifyMethod = "stateRootMatch";
-            return v;
-        }
         if (!beaconSyncState.isSynced()) {
             v.failReason = "beaconNotSynced";
             return v;
         }
-        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-        byte[] beaconBlockHash = beaconSyncState.getExecutionBlockHash();
-        long gap = Math.abs(blockNumber - finalizedBlockNum);
-        log.info("[verify-block] headerChain: block={}, finalizedBlock={}, gap={}",
-                blockNumber, finalizedBlockNum, gap);
-        if (finalizedBlockNum <= 0 || beaconBlockHash == null || beaconBlockHash.length != 32) {
+        // The attested block at or above the target: the finalized block for a target at or
+        // below it (the shorter walk), else the optimistic head. Each (number, hash) pair is
+        // one atomic snapshot, so a number is never paired with another update's hash; the
+        // slot is only reported, and may come from a later update.
+        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
+        if (fin.blockNumber() <= 0 || fin.blockHash() == null || fin.blockHash().length != 32) {
             v.failReason = "beaconBlockHashUnavailable";
             return v;
         }
-        if (gap > MAX_HEADER_CHAIN_GAP && blockNumber != finalizedBlockNum) {
+        long anchorNumber;
+        byte[] anchorHash;
+        long anchorSlot;
+        if (blockNumber <= fin.blockNumber()) {
+            anchorNumber = fin.blockNumber();
+            anchorHash = fin.blockHash();
+            anchorSlot = beaconSyncState.getFinalizedSlot();
+        } else {
+            BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
+            if (opt.blockHash() == null || opt.blockNumber() < blockNumber) {
+                v.failReason = "blockAheadOfAnchor";
+                return v;
+            }
+            anchorNumber = opt.blockNumber();
+            anchorHash = opt.blockHash();
+            anchorSlot = opt.slot();
+        }
+        long gap = anchorNumber - blockNumber;
+        log.info("[verify-block] headerChain: block={}, anchorBlock={}, gap={}",
+                blockNumber, anchorNumber, gap);
+        if (gap >= MAX_HEADER_CHAIN_GAP) {
             v.failReason = "headerChainGapTooLarge";
             return v;
         }
         try {
-            boolean chainValid;
-            if (blockNumber == finalizedBlockNum) {
-                chainValid = verifyBlockHashAgainstBeacon(
-                        connector, finalizedBlockNum, beaconBlockHash, blockStateRoot);
-            } else if (blockNumber > finalizedBlockNum) {
-                chainValid = verifyBlockChainFromBeacon(
-                        connector, beaconSyncState, finalizedBlockNum, blockNumber, beaconBlockHash);
-            } else {
-                chainValid = verifyBlockChainFromBeacon(
-                        connector, beaconSyncState, blockNumber, finalizedBlockNum, beaconBlockHash);
-            }
+            List<BlockHeadersMessage.VerifiedHeader> window = gap == 0
+                    ? List.of(reported)
+                    : connector.requestBlockHeadersBatched(blockNumber, (int) (gap + 1))
+                            .get(120, TimeUnit.SECONDS);
+            boolean chainValid = window.size() == gap + 1
+                    && HeaderChains.anchoredAtTop(window, anchorHash)
+                    // The window proves ITS first header; it must be the one reported.
+                    && window.get(0).hash().equals(reported.hash());
             if (chainValid) {
                 v.beaconChainVerified = true;
-                v.matchedSlot = beaconSyncState.getFinalizedSlot();
+                v.matchedSlot = anchorSlot;
                 v.blsVerified = true;
                 v.verifyMethod = "headerChain";
             } else {
+                log.info("[verify-block] header window for #{} did not anchor at #{}",
+                        blockNumber, anchorNumber);
                 v.failReason = "headerChainInvalid";
             }
         } catch (Exception e) {
@@ -194,71 +211,6 @@ public final class VerifiedBlockQuery {
             v.failReason = "headerChainError";
         }
         return v;
-    }
-
-    /** The requested block IS the finalized block: compare its recomputed hash to the
-     *  beacon-attested block hash and its stateRoot to the header's. */
-    private static boolean verifyBlockHashAgainstBeacon(RLPxConnector connector,
-                                                        long blockNumber, byte[] beaconBlockHash,
-                                                        byte[] expectedStateRoot) throws Exception {
-        List<BlockHeadersMessage.VerifiedHeader> headers =
-                connector.requestBlockHeaders(blockNumber, 1).get(30, TimeUnit.SECONDS);
-        if (headers.isEmpty()) return false;
-        BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
-        // VerifiedHeader.hash() is keccak256(rawRLP) computed locally — compare to the anchor.
-        if (!java.util.Arrays.equals(vh.hash().toArrayUnsafe(), beaconBlockHash)) {
-            log.info("[verify-block] Finalized block hash mismatch: peer={} beacon={}",
-                    vh.hash().toShortHexString(), Bytes32.wrap(beaconBlockHash).toShortHexString());
-            return false;
-        }
-        return java.util.Arrays.equals(vh.header().stateRoot.toArrayUnsafe(), expectedStateRoot);
-    }
-
-    /** Fetch [startBlock..endBlock], require the finalized header's hash to equal the
-     *  beacon anchor, and verify parent-hash continuity across the whole range. */
-    private static boolean verifyBlockChainFromBeacon(RLPxConnector connector,
-                                                      BeaconSyncState beaconSyncState,
-                                                      long startBlock, long endBlock,
-                                                      byte[] beaconBlockHash) throws Exception {
-        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
-        int total = (int) (endBlock - startBlock + 1);
-        if (total < 2 || total > MAX_HEADER_CHAIN_GAP) {
-            log.info("[verify-block] Block chain gap {} — out of range [2, {}]", total, MAX_HEADER_CHAIN_GAP);
-            return false;
-        }
-        log.info("[verify-block] Fetching {} headers from block #{} to #{}", total, startBlock, endBlock);
-        List<BlockHeadersMessage.VerifiedHeader> allHeaders =
-                connector.requestBlockHeadersBatched(startBlock, total).get(120, TimeUnit.SECONDS);
-        if (allHeaders.size() != total) {
-            log.info("[verify-block] Expected {} headers, got {}", total, allHeaders.size());
-            return false;
-        }
-        int anchorIndex = (int) (finalizedBlockNum - startBlock);
-        if (anchorIndex < 0 || anchorIndex >= allHeaders.size()) {
-            log.info("[verify-block] Finalized block #{} not in range [{}, {}]",
-                    finalizedBlockNum, startBlock, endBlock);
-            return false;
-        }
-        BlockHeadersMessage.VerifiedHeader anchorHeader = allHeaders.get(anchorIndex);
-        if (!java.util.Arrays.equals(anchorHeader.hash().toArrayUnsafe(), beaconBlockHash)) {
-            log.info("[verify-block] Anchor block hash mismatch at #{}: peer={} beacon={}",
-                    finalizedBlockNum, anchorHeader.hash().toShortHexString(),
-                    Bytes32.wrap(beaconBlockHash).toShortHexString());
-            return false;
-        }
-        for (int i = 0; i < allHeaders.size() - 1; i++) {
-            Bytes32 currentHash = allHeaders.get(i).hash();
-            Bytes32 nextParent = allHeaders.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                log.info("[verify-block] Hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
-                        i, allHeaders.get(i).header().number, currentHash.toShortHexString(),
-                        allHeaders.get(i + 1).header().number, nextParent.toShortHexString());
-                return false;
-            }
-        }
-        log.info("[verify-block] Block chain verified: {} headers anchored at finalized block #{}",
-                total, finalizedBlockNum);
-        return true;
     }
 
     private static BlockResult errorResult(String message) {

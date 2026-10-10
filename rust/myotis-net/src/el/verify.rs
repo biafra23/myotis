@@ -14,7 +14,7 @@ use myotis_core::header::BlockHeader;
 use super::anchor::ExecAnchor;
 
 /// Same bound as the Java `MAX_HEADER_CHAIN_GAP` — the header-chain walk covers
-/// at most 8192 blocks from the finalized block.
+/// at most 8192 headers, the read block and its attested anchor included.
 pub const MAX_HEADER_CHAIN_GAP: u64 = 8192;
 
 /// The verification verdict for a state read. `verify_method` is set (and
@@ -23,13 +23,20 @@ pub const MAX_HEADER_CHAIN_GAP: u64 = 8192;
 pub struct Verdict {
     pub beacon_chain_verified: bool,
     pub bls_verified: bool,
-    /// The beacon slot the anchoring matched (finalized slot for headerChain).
+    /// The beacon slot the anchoring matched (for headerChain, the slot that
+    /// attested the walk's anchor block).
     pub matched_slot: i64,
     /// `"stateRootMatch"` | `"headerChain"` | `None`.
     pub verify_method: Option<&'static str>,
     /// `None` when verified; else a stable token (`beaconNotSynced`,
     /// `headerChainGapTooLarge`, …).
     pub fail_reason: Option<&'static str>,
+    /// The read block's own timestamp (unix seconds) when the verdict proved
+    /// its whole header: a headerChain walk STARTS at the read block, which
+    /// its child's parent hash pins all the way down from the attested anchor.
+    /// `None` for every other verdict — a stateRootMatch proves the root, not
+    /// a header.
+    pub block_timestamp: Option<u64>,
 }
 
 impl Verdict {
@@ -40,6 +47,7 @@ impl Verdict {
             matched_slot: slot,
             verify_method: Some(method),
             fail_reason: None,
+            block_timestamp: None,
         }
     }
 
@@ -55,14 +63,13 @@ impl Verdict {
 /// state root (a finalized state read, ABI ≥ 32): `stateRootMatch` at the
 /// finalized slot, BLS-verified — that root arrived in a sync-committee-signed
 /// finality update (`ExecAnchor::update_finalized` records it as such), so no
-/// ladder runs: its header-chain branch would judge the finalized block itself
-/// as "behind finalized".
+/// ladder runs: there is nothing left for a header walk to prove.
 pub fn finalized_root_verdict(finalized_slot: u64) -> Verdict {
     Verdict::verified("stateRootMatch", finalized_slot as i64, true)
 }
 
 /// The next step after the pre-check: either a final verdict, or the
-/// caller must fetch `[finalized_block ..= peer_block]` and call
+/// caller must fetch `[peer_block ..= anchor_block]` and call
 /// [`header_chain_verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LadderStep {
@@ -70,12 +77,15 @@ pub enum LadderStep {
     Done(Verdict),
     /// Fetch the header range, then call [`header_chain_verdict`].
     NeedHeaderChain {
-        finalized_block: u64,
+        /// The block the peer's state root belongs to: the FIRST header.
         peer_block: u64,
-        /// The beacon-finalized BLOCK HASH — the trust anchor the first fetched
-        /// header must hash to.
-        beacon_block_hash: [u8; 32],
-        finalized_slot: i64,
+        /// The beacon-attested optimistic head at or above it: the LAST header.
+        anchor_block: u64,
+        /// `anchor_block`'s BLS-attested BLOCK HASH — the trust anchor the
+        /// last fetched header must hash to.
+        anchor_hash: [u8; 32],
+        /// The beacon slot that attested `anchor_block`.
+        anchor_slot: i64,
     },
 }
 
@@ -123,21 +133,34 @@ pub fn ladder_precheck(
     if fin.block_number == 0 {
         return LadderStep::Done(Verdict::failed("beaconBlockUnavailable"));
     }
+    // The freshness floor: state at or below finality is too old to answer
+    // with (and its root, were it current, would have matched above).
     if peer_block <= fin.block_number {
         return LadderStep::Done(Verdict::failed("peerBlockBehindFinalized"));
     }
-    if peer_block - fin.block_number > MAX_HEADER_CHAIN_GAP {
+    // The walk ends at an attested block AT OR ABOVE the peer's, never below
+    // it: a header's parent hash pins its parent, so an attested block pins
+    // every header beneath it, while nothing pins a child — a walk upward
+    // from an attested block accepts any header that names it as parent. So
+    // the anchor is the optimistic head, and a peer block past it has nothing
+    // attested above it yet.
+    let Some((anchor_block, anchor_hash, anchor_slot)) =
+        anchor.optimistic_anchor().filter(|&(number, _, _)| peer_block <= number)
+    else {
+        return LadderStep::Done(Verdict::failed("peerBlockAheadOfAnchor"));
+    };
+    if anchor_block - peer_block >= MAX_HEADER_CHAIN_GAP {
         return LadderStep::Done(Verdict::failed("headerChainGapTooLarge"));
     }
     LadderStep::NeedHeaderChain {
-        finalized_block: fin.block_number,
         peer_block,
-        beacon_block_hash: fin.block_hash,
-        finalized_slot: anchor.finalized_slot() as i64,
+        anchor_block,
+        anchor_hash,
+        anchor_slot: anchor_slot as i64,
     }
 }
 
-/// The verified header range `[finalized_block ..= peer_block]`, with each
+/// The verified header range `[peer_block ..= anchor_block]`, with each
 /// header's `(hash, header)` (hash = keccak256 of the canonical RLP, computed
 /// at decode by EL-A5).
 pub struct ChainHeader {
@@ -146,18 +169,22 @@ pub struct ChainHeader {
 }
 
 /// Verdict for the header-chain branch: verify the fetched range end-to-end and
-/// return `headerChain` / `headerChainInvalid`. `beacon_block_hash` is the
-/// finalized block HASH (must equal the FIRST header's keccak — the trust
-/// anchor); `peer_state_root` is what the snap query used (must equal the LAST
-/// header's state root).
+/// return `headerChain` / `headerChainInvalid`. `anchor_hash` is the attested
+/// anchor block's HASH (must equal the LAST header's keccak — the trust
+/// anchor); `peer_state_root` is what the snap query used (must equal the
+/// FIRST header's state root). A verified walk proves the first header whole,
+/// so its timestamp rides along as the read block's.
 pub fn header_chain_verdict(
     headers: &[ChainHeader],
-    beacon_block_hash: &[u8; 32],
+    anchor_hash: &[u8; 32],
     peer_state_root: &[u8; 32],
-    finalized_slot: i64,
+    anchor_slot: i64,
 ) -> Verdict {
-    if verify_header_chain(headers, beacon_block_hash, peer_state_root) {
-        Verdict::verified("headerChain", finalized_slot, true)
+    if verify_header_chain(headers, anchor_hash, peer_state_root) {
+        Verdict {
+            block_timestamp: Some(headers[0].header.timestamp),
+            ..Verdict::verified("headerChain", anchor_slot, true)
+        }
     } else {
         Verdict::failed("headerChainInvalid")
     }
@@ -165,26 +192,32 @@ pub fn header_chain_verdict(
 
 /// Pure verification of a contiguous header range (twin of
 /// `VerifiedAccountQuery.verifyHeaderChain`):
-/// 1. the FIRST header's HASH == the beacon-finalized block hash — THE trust
-///    anchor. Must be the block HASH, not just the state root: the block hash
-///    is `keccak256` of the whole header, so it pins the header completely,
-///    whereas a state-root-only check lets a peer copy the PUBLIC finalized
-///    state root into a fabricated `H_0'` and forge a chain to a fake root.
-/// 2. the LAST header's state root == the peer-reported root (the query target);
-/// 3. every consecutive pair links: `header[i].hash == header[i+1].parentHash`
-///    (each hash being `keccak256(RLP)`, so the chain is peer-unforgeable).
+/// 1. the LAST header's HASH == the attested anchor block hash — THE trust
+///    anchor. It must be the block HASH, not just the state root: the hash is
+///    `keccak256` of the whole header, so it pins that header completely,
+///    whereas a state-root-only check lets a peer copy a PUBLIC attested
+///    state root into a fabricated header.
+/// 2. the FIRST header's state root == the peer-reported root (the query target);
+/// 3. every consecutive pair links: `header[i].hash == header[i+1].parentHash`.
+///
+/// The anchor must be the NEWEST header. A parent hash commits a header to its
+/// parent, never to its children, so trust flows only DOWN from the anchor:
+/// the anchor pins its parent, which pins its own, and so on to the first
+/// header. Anchored at the OLDEST header instead (as this walk once was),
+/// nothing pins the headers above it — a peer could name the anchor as the
+/// parent of a header it made up, with any state root, and pass.
 pub fn verify_header_chain(
     headers: &[ChainHeader],
-    expected_first_block_hash: &[u8; 32],
-    expected_last_state_root: &[u8; 32],
+    expected_last_block_hash: &[u8; 32],
+    expected_first_state_root: &[u8; 32],
 ) -> bool {
     if headers.is_empty() {
         return false;
     }
-    if &headers[0].hash != expected_first_block_hash {
+    if &headers[headers.len() - 1].hash != expected_last_block_hash {
         return false;
     }
-    if &headers[headers.len() - 1].header.state_root != expected_last_state_root {
+    if &headers[0].header.state_root != expected_first_state_root {
         return false;
     }
     for pair in headers.windows(2) {
@@ -236,40 +269,71 @@ mod tests {
 
     #[test]
     fn valid_chain_verifies() {
-        let h0 = header(100, root(0xa0), root(0xff)); // finalized
+        let h0 = header(100, root(0xa0), root(0xff)); // the peer's block
         let h1 = header(101, root(0xa1), h0.hash);
-        let h2 = header(102, root(0xa2), h1.hash); // peer head
-        let h0_hash = h0.hash;
+        let h2 = header(102, root(0xa2), h1.hash); // the attested anchor
+        let h2_hash = h2.hash;
         let chain = [h0, h1, h2];
-        // Anchored by the FIRST header's block HASH, ending at the peer state root.
-        assert!(verify_header_chain(&chain, &h0_hash, &root(0xa2)));
-        // Wrong first (beacon) block hash, wrong last (peer) root, both rejected.
-        assert!(!verify_header_chain(&chain, &root(0xbb), &root(0xa2)));
-        assert!(!verify_header_chain(&chain, &h0_hash, &root(0xbb)));
+        // Anchored by the LAST header's block HASH, starting at the peer state root.
+        assert!(verify_header_chain(&chain, &h2_hash, &root(0xa0)));
+        // Wrong last (anchor) block hash, wrong first (peer) root: both rejected.
+        assert!(!verify_header_chain(&chain, &root(0xbb), &root(0xa0)));
+        assert!(!verify_header_chain(&chain, &h2_hash, &root(0xbb)));
+        // A one-header walk is the anchor itself, at the peer's root.
+        let alone = [header(102, root(0xa2), root(0xa1))];
+        let alone_hash = alone[0].hash;
+        assert!(verify_header_chain(&alone, &alone_hash, &root(0xa2)));
     }
 
     #[test]
-    fn forged_first_header_with_correct_state_root_is_rejected() {
-        // THE attack: a fabricated H_0' that copies the public finalized state
-        // root into its stateRoot field but is otherwise fake — its block HASH
-        // differs from the trusted finalized block hash, so anchoring on the
-        // hash rejects it (a state-root-only anchor would have accepted it).
-        let real_h0 = header(100, root(0xa0), root(0xff));
-        let forged_h0 = header(100, root(0xa0), root(0xde)); // same stateRoot, different parent → different hash
-        assert_ne!(real_h0.hash, forged_h0.hash);
-        let h1 = header(101, root(0xa1), forged_h0.hash);
-        let chain = [forged_h0, h1];
-        // Anchored on the REAL finalized block hash → the forged chain is rejected.
-        assert!(!verify_header_chain(&chain, &real_h0.hash, &root(0xa1)));
+    fn a_made_up_child_of_the_attested_block_is_rejected() {
+        // THE attack the old upward walk let through: the walk anchored on the
+        // OLDEST header, and a parent hash pins only a parent — so a peer named
+        // the real attested block as the parent of a header it made up, with
+        // any state root, and the chain verified. Anchored on the NEWEST
+        // header, the made-up child would have to hash to the attested block.
+        let attested = header(100, root(0xa0), root(0xff));
+        let made_up = header(101, root(0x66), attested.hash);
+        let attested_hash = attested.hash;
+        let chain = [attested, made_up];
+        assert!(!verify_header_chain(&chain, &attested_hash, &root(0x66)));
+    }
+
+    #[test]
+    fn a_forged_anchor_header_with_the_attested_state_root_is_rejected() {
+        // A fabricated stand-in for the anchor that copies its PUBLIC state
+        // root but is otherwise fake: its block HASH differs from the attested
+        // one, so anchoring on the hash rejects it.
+        let real_anchor = header(101, root(0xa1), root(0xff));
+        let peer_block = header(100, root(0xa0), root(0xee));
+        let forged_anchor = header(101, root(0xa1), peer_block.hash);
+        assert_ne!(real_anchor.hash, forged_anchor.hash);
+        let chain = [peer_block, forged_anchor];
+        assert!(!verify_header_chain(&chain, &real_anchor.hash, &root(0xa0)));
     }
 
     #[test]
     fn broken_parent_link_rejected() {
         let h0 = header(100, root(0xa0), root(0xff));
         let h1 = header(101, root(0xa1), root(0xde)); // parent != h0.hash
-        let h0_hash = h0.hash;
+        let h1_hash = h1.hash;
         let chain = [h0, h1];
-        assert!(!verify_header_chain(&chain, &h0_hash, &root(0xa1)));
+        assert!(!verify_header_chain(&chain, &h1_hash, &root(0xa0)));
+    }
+
+    #[test]
+    fn a_verified_walk_dates_the_read_block_and_a_failed_one_nothing() {
+        let h0 = header(100, root(0xa0), root(0xff));
+        let h1 = header(101, root(0xa1), h0.hash);
+        let h1_hash = h1.hash;
+        let chain = [h0, h1];
+        let v = header_chain_verdict(&chain, &h1_hash, &root(0xa0), 77);
+        assert_eq!(v.verify_method, Some("headerChain"));
+        assert_eq!(v.matched_slot, 77, "the slot that attested the anchor");
+        assert_eq!(v.block_timestamp, Some(1_700_000_000), "the FIRST header's own timestamp");
+        let bad = header_chain_verdict(&chain, &root(0xbb), &root(0xa0), 77);
+        assert_eq!(bad.fail_reason, Some("headerChainInvalid"));
+        assert_eq!(bad.block_timestamp, None);
     }
 
     #[test]
@@ -281,6 +345,7 @@ mod tests {
                 assert_eq!(v.verify_method, Some("stateRootMatch"));
                 assert_eq!(v.matched_slot, 50);
                 assert!(v.beacon_chain_verified);
+                assert_eq!(v.block_timestamp, None, "a root match proves no header");
             }
             _ => panic!("expected stateRootMatch"),
         }
@@ -309,25 +374,56 @@ mod tests {
             fail(ladder_precheck(Some(&root(1)), true, 0, &anchor)),
             Some("noPeerBlockNumber")
         );
-        // peer behind finalized.
+        // At or behind finality: below the freshness floor.
+        for behind in [21_000_000, 20_999_999] {
+            assert_eq!(
+                fail(ladder_precheck(Some(&root(1)), true, behind, &anchor)),
+                Some("peerBlockBehindFinalized")
+            );
+        }
+        // Above finality with no optimistic head to anchor on.
         assert_eq!(
-            fail(ladder_precheck(Some(&root(1)), true, 20_999_999, &anchor)),
-            Some("peerBlockBehindFinalized")
+            fail(ladder_precheck(Some(&root(1)), true, 21_000_001, &anchor)),
+            Some("peerBlockAheadOfAnchor")
         );
-        // gap too large.
+        // Above the optimistic head: nothing attested above it yet.
+        anchor.update_optimistic(264, 21_000_064, root(0xe1), root(0xe0), 0);
         assert_eq!(
-            fail(ladder_precheck(Some(&root(1)), true, 21_000_000 + 8193, &anchor)),
+            fail(ladder_precheck(Some(&root(1)), true, 21_000_065, &anchor)),
+            Some("peerBlockAheadOfAnchor")
+        );
+        // A walk longer than its bound (a stalled finality far below the head):
+        // MAX headers, the anchor included, is the longest one allowed.
+        anchor.update_optimistic(300, 21_009_000, root(0xd1), root(0xd0), 0);
+        assert_eq!(
+            fail(ladder_precheck(Some(&root(1)), true, 21_009_000 - 8192, &anchor)),
             Some("headerChainGapTooLarge")
         );
-        // in range → NeedHeaderChain, carrying the finalized BLOCK HASH.
-        match ladder_precheck(Some(&root(1)), true, 21_000_100, &anchor) {
-            LadderStep::NeedHeaderChain { finalized_block, peer_block, beacon_block_hash, .. } => {
-                assert_eq!(finalized_block, 21_000_000);
-                assert_eq!(peer_block, 21_000_100);
-                assert_eq!(beacon_block_hash, root(0xf1)); // the finalized block hash
+        assert!(matches!(
+            ladder_precheck(Some(&root(1)), true, 21_009_000 - 8191, &anchor),
+            LadderStep::NeedHeaderChain { .. }
+        ));
+    }
+
+    #[test]
+    fn the_walk_ends_at_the_optimistic_head_above_the_peer() {
+        let anchor = ExecAnchor::new();
+        anchor.update_finalized(200, root(0xf0), 21_000_000, root(0xf1), 0);
+        anchor.update_optimistic(264, 21_000_064, root(0xe1), root(0xe0), 0);
+        assert_eq!(
+            ladder_precheck(Some(&root(1)), true, 21_000_010, &anchor),
+            LadderStep::NeedHeaderChain {
+                peer_block: 21_000_010,
+                anchor_block: 21_000_064,
+                anchor_hash: root(0xe1),
+                anchor_slot: 264,
             }
-            _ => panic!("expected NeedHeaderChain"),
-        }
+        );
+        // AT the optimistic head: a one-header walk against its own hash.
+        assert!(matches!(
+            ladder_precheck(Some(&root(1)), true, 21_000_064, &anchor),
+            LadderStep::NeedHeaderChain { anchor_block: 21_000_064, peer_block: 21_000_064, .. }
+        ));
     }
 
     #[test]
