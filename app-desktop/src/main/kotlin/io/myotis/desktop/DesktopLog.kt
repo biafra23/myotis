@@ -7,6 +7,7 @@ import ch.qos.logback.classic.spi.ThrowableProxyUtil
 import ch.qos.logback.core.AppenderBase
 import io.myotis.ui.LogLevel
 import io.myotis.ui.LogLine
+import io.myotis.ui.LOG_SAVE_CAUTION
 import io.myotis.ui.LogSource
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
@@ -38,6 +39,68 @@ object DesktopLogSource : LogSource {
     override fun clear() {
         synchronized(lock) { buffer.clear() }
         version.incrementAndGet()
+    }
+
+    override val canSaveLog: Boolean get() = true
+
+    /**
+     * Desktop's Save…: the AWT save dialog (on the EDT, like the log-index import dialog;
+     * owned by the showing frame, so it is modal to the app window), then a copy of
+     * logback's active log file — the rolling FILE appender of logback-desktop.xml, fed by
+     * the same per-logger levels as this ring, so it holds everything the tab shows plus what
+     * the ring has already dropped — or, under a logback config without a file appender, the
+     * ring streamed through [write]. The rolled `.gz` siblings are named, not copied: the
+     * active file is the one a diagnosis wants, and the result line says where the rest is.
+     */
+    override fun saveLog(suggestedName: String, write: (Appendable) -> Unit, onResult: (String) -> Unit): Boolean {
+        java.awt.EventQueue.invokeLater {
+            val owner = java.awt.Frame.getFrames().firstOrNull { it.isShowing }
+            val dialog = java.awt.FileDialog(owner, "Save the Myotis log", java.awt.FileDialog.SAVE)
+            dialog.file = suggestedName
+            dialog.isVisible = true
+            val dir = dialog.directory
+            val name = dialog.file
+            if (dir == null || name == null) {
+                onResult("Save cancelled.")
+                return@invokeLater
+            }
+            val target = java.io.File(dir, name)
+            // The copy (up to 10 MB) and a 50k-line render both stay off the EDT.
+            Thread({
+                onResult(
+                    runCatching { writeLog(target, write) }
+                        .getOrElse { "Save failed: ${it.message ?: it::class.java.simpleName}" },
+                )
+            }, "myotis-log-save").start()
+        }
+        return true
+    }
+
+    private fun writeLog(target: java.io.File, write: (Appendable) -> Unit): String {
+        val source = logbackFile()
+        if (source != null && source.isFile) {
+            java.nio.file.Files.copy(
+                source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
+            val dir = source.absoluteFile.parentFile
+            val rolled = dir?.listFiles { f -> f.name.endsWith(".log.gz") }?.size ?: 0
+            val older = if (rolled > 0) "; $rolled older rolled file(s) stay in $dir" else ""
+            return "Saved ${source.name} (${target.length() / 1024} kB) to $target$older. $LOG_SAVE_CAUTION"
+        }
+        target.bufferedWriter().use { write(it) }
+        return "Saved the in-memory log (${target.length() / 1024} kB) to $target. $LOG_SAVE_CAUTION"
+    }
+
+    /** The active file of logback's file appender (FILE in logback-desktop.xml), wherever it
+     *  is attached, or null when the running config has none. */
+    private fun logbackFile(): java.io.File? {
+        val ctx = LoggerFactory.getILoggerFactory() as? ch.qos.logback.classic.LoggerContext ?: return null
+        for (logger in ctx.loggerList) {
+            for (appender in logger.iteratorForAppenders()) {
+                if (appender is ch.qos.logback.core.FileAppender<*>) return java.io.File(appender.file)
+            }
+        }
+        return null
     }
 
     // The app's own loggers whose level the Logs-tab control drives. Setting the wire logger too
