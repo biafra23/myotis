@@ -11,7 +11,10 @@ object MyotisRpc {
 
     /**
      * Build a server the way the JVM hosts always have: loopback-bound, strict
-     * unless [upstreamUrl] is set, backed by the api contracts.
+     * unless [upstreamUrl] is set, backed by the api contracts. [webAccess] is the
+     * engine's web-page gate for this network (#502) — the engine keeps it so the
+     * policy can be set before the server exists and read back after; null builds
+     * a private one with the default policy.
      */
     @JvmStatic
     @JvmOverloads
@@ -22,6 +25,7 @@ object MyotisRpc {
         backend: io.myotis.api.VerifiedReads?,
         statusReads: io.myotis.api.NodeStatusReads?,
         lifecycle: io.myotis.api.NodeLifecycle? = null,
+        webAccess: WebAccess? = null,
     ): MyotisRpcServer = MyotisRpcServer(
         port,
         upstreamUrl,
@@ -29,6 +33,7 @@ object MyotisRpc {
         backend?.let { VerifiedReadsBackend(it) },
         statusReads?.let { NodeStatusSource(it) },
         lifecycle?.let { NodeLifecycleSource(it) },
+        webAccess ?: WebAccess(boundHost = host),
     )
 }
 

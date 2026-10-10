@@ -152,6 +152,13 @@ fun NodeScreen(
     // Settings switch bumps expertRev so the tab set re-derives immediately.
     var expertRev by remember { mutableStateOf(0) }
     val expert = remember(expertRev) { settings.expertMode() }
+    // Web page access (#502): one live holder of the persisted policy, shared by the
+    // Status tab's refusal banner and the Settings section so an Allow on either is
+    // visible on both at once (the `when` below disposes a tab's own remembers).
+    val webAccess = remember(controller, settings) { WebAccessFields(settings, controller) }
+    // A host may change the policy outside this screen (Android's notification Allow):
+    // pick that up on the snapshot cadence so the screen never writes a stale list back.
+    LaunchedEffect(snapshots) { webAccess.refresh() }
     // Normal mode is the three screens a wallet user needs; Expert mode adds the Logs
     // tab and — under the rule above — the Index tab.
     val tabs = remember(expert, showIndexTab) {
@@ -276,12 +283,13 @@ fun NodeScreen(
                         expert = expert, readiness = readiness, catchUp = logIndexCatchUps[network],
                         // The card's "Review" re-asks a dismissed stale-anchor question.
                         onReviewStaleAnchor = { staleDismissed = staleDismissed - network },
+                        webAccess = webAccess, snapshots = snapshots,
                     )
                     "Query" -> QueryTab(controller, settings, current, network, history, expert)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
-                    "Settings" -> SettingsTab(controller, settings, snapshots, expert = expert,
+                    "Settings" -> SettingsTab(controller, settings, snapshots, webAccess, expert = expert,
                         onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ },
                         onExpertChanged = { expertRev++ })
                 }
@@ -492,15 +500,18 @@ private fun ConsensusUnsyncedBanner(beaconState: String) {
 
 /**
  * Settings: enable/disable each network (each runs concurrently as its own node with its own
- * JSON-RPC port) and tune the shared snap/readiness/BLS/freshness knobs. Toggles that affect
- * a running stack apply live; RPC-port edits are deferred to Save and reboot only the changed
- * chain. Mirrors the Android SettingsScreen over the [Settings]/[NodeController] seam.
+ * JSON-RPC port), decide which web pages may use the node ([WebAccessSection]), and tune
+ * the shared snap/readiness/BLS/freshness knobs. Toggles that affect a running stack
+ * apply live; RPC-port edits are deferred to Save and reboot only the changed chain.
+ * Mirrors the Android SettingsScreen over the [Settings]/[NodeController] seam.
  */
 @Composable
 private fun SettingsTab(
     controller: NodeController,
     settings: Settings,
     snapshots: Map<String, NodeSnapshot>,
+    // The live web-page policy, hoisted in NodeScreen (shared with the Status banner).
+    webAccess: WebAccessFields,
     // Notifies the screen that the persisted enabled set changed, so the network
     // chips (derived from settings, not snapshot state) re-derive immediately.
     onEnabledChanged: () -> Unit = {},
@@ -559,6 +570,15 @@ private fun SettingsTab(
                 },
                 onPort = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
             )
+        }
+
+        // Web page access (#502): in both modes — it is the privacy setting a wallet user
+        // needs when a site they use wants the node, and the recent list is where a
+        // refused page is allowed. Applies live, outside Save. Only where the host
+        // persists and pushes it (supportsWebAccess), never as an inert control.
+        if (settings.supportsWebAccess()) {
+            HorizontalDivider()
+            WebAccessSection(webAccess, snapshots)
         }
 
         // Power: the rows that trade responsiveness for battery or CPU, one per host that
@@ -870,8 +890,9 @@ internal fun SwitchRow(
 
 /**
  * The Status tab. Both modes open with the readiness card ([StatusHero]) and its
- * actions. Normal mode follows with the vitals tiles and nothing else; Expert mode
- * with today's banners, the full rows, the maintenance actions and the READY peers.
+ * actions, then the banners every user needs (a network upgrade, a refused web page).
+ * Normal mode follows with the vitals tiles and nothing else; Expert mode with the
+ * hunt banner, the full rows, the maintenance actions and the READY peers.
  */
 @Composable
 private fun StatusTab(
@@ -886,6 +907,10 @@ private fun StatusTab(
     // The log index's head catch-up as the ladder saw it, so the tile agrees with the card.
     catchUp: CatchUpProgress?,
     onReviewStaleAnchor: () -> Unit,
+    // The live web-page policy (hoisted in NodeScreen) and EVERY network's snapshot:
+    // a page refused on another chain's port is still a page that wants in.
+    webAccess: WebAccessFields,
+    snapshots: Map<String, NodeSnapshot>,
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         // A snapshot for `primary` exists only while its stack is registered (running or
@@ -923,6 +948,20 @@ private fun StatusTab(
 
         snap?.upgrade?.let {
             UpgradeBanner(it, cutOff = upgradeCutOff(snap))
+            Spacer(Modifier.height(16.dp))
+        }
+
+        // A refused web page (#502), in both modes: the browser gives the page no reason
+        // for the failure, so this banner is the one place the user can learn a site
+        // wants in — and allow it for every request from then on, or wave it away.
+        val webRows = remember(snapshots) { WebAccessUi.merge(snapshots.values.map { it.webOrigins }) }
+        val pendingRefusals = if (settings.supportsWebAccess()) webAccess.pendingRefusals(webRows) else emptyList()
+        if (pendingRefusals.isNotEmpty()) {
+            WebAccessBanner(
+                pendingRefusals,
+                onAllow = { webAccess.allow(it) },
+                onDismiss = { webAccess.dismiss(it) },
+            )
             Spacer(Modifier.height(16.dp))
         }
 

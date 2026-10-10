@@ -64,6 +64,30 @@ public final class Main {
     /** Snap-peer target the daemon's per-stack maintainer keeps topped up. */
     private static final int SNAP_PEER_TARGET = 32;
 
+    /**
+     * {@code -Dmyotis.rpc.webAccess}: {@code off}, {@code all}, or a comma-separated
+     * list of origins ({@code https://app.example,chrome-extension://…}; a bare
+     * domain means https). Absent or blank = {@link io.myotis.api.WebAccessPolicy#DEFAULT}.
+     * Entries the engine cannot read as an origin are dropped there; the boot log
+     * line shows what was handed over.
+     */
+    static io.myotis.api.WebAccessPolicy webAccessProperty() {
+        String raw = System.getProperty("myotis.rpc.webAccess");
+        if (raw == null || raw.isBlank()) return io.myotis.api.WebAccessPolicy.DEFAULT;
+        String v = raw.trim();
+        if (v.equalsIgnoreCase("off")) {
+            return new io.myotis.api.WebAccessPolicy(io.myotis.api.WebAccessMode.OFF, List.of());
+        }
+        if (v.equalsIgnoreCase("all")) {
+            return new io.myotis.api.WebAccessPolicy(io.myotis.api.WebAccessMode.ALL, List.of());
+        }
+        List<String> origins = new ArrayList<>();
+        for (String o : v.split(",")) {
+            if (!o.isBlank()) origins.add(o.trim());
+        }
+        return new io.myotis.api.WebAccessPolicy(io.myotis.api.WebAccessMode.ALLOWLIST, origins);
+    }
+
     /** Socket path; override via {@code ETHP2P_SOCKET} env var. Network-specific suffix for non-mainnet. */
     static Path socketPath(String networkName) {
         String env = System.getenv("ETHP2P_SOCKET");
@@ -353,6 +377,31 @@ public final class Main {
             // gate judges with them.
             long wsBound = Long.getLong("myotis.beacon.wsBoundPeriods", 0L);
             if (wsBound > 0) handle.setWsBoundPeriods(wsBound);
+            // Web page access (#502): which browser origins may use the JSON-RPC
+            // listener. The daemon has no settings file, so the operator property
+            // is its only knob (-Dmyotis.rpc.webAccess=off|all|<origin>,<origin>…;
+            // -PwebAccess=… on the run task). Absent = the engine default: specific
+            // sites, none — every web page refused. Native clients (wallet apps,
+            // curl, the replay tools) send no Origin and are unaffected. Lands
+            // BEFORE start() so the listener's first request is judged by it.
+            io.myotis.api.WebAccessPolicy webAccess = webAccessProperty();
+            io.myotis.api.WebAccessPolicy applied = handle.setWebAccessPolicy(webAccess);
+            // Applied or refused, never accepted and ignored (CLAUDE.md, Trust): an
+            // entry the engine could not read as an origin is missing from what
+            // applies, and a daemon with no settings screen has no other way to
+            // tell the operator — so it does not boot with a policy they did not ask for.
+            if (applied.origins().size() != new java.util.HashSet<>(webAccess.origins()).size()) {
+                System.err.println("-Dmyotis.rpc.webAccess: not every entry is an origin "
+                        + "(scheme://host[:port], no path, no wildcard): asked " + webAccess.origins()
+                        + ", would apply " + applied.origins());
+                engine.shutdownAll();
+                closeAll(servers);
+                releaseAll(fileLocks, lockChannels);
+                return;
+            }
+            log.info("[{}] web page access: {}{}", network, applied.mode(),
+                    applied.mode() == io.myotis.api.WebAccessMode.ALLOWLIST
+                            ? " " + applied.origins() : "");
             if (Boolean.getBoolean("myotis.beacon.acceptStaleAnchor")) {
                 log.warn("[{}] -Dmyotis.beacon.acceptStaleAnchor=true: a stale sync anchor "
                         + "will be accepted WITHOUT the interactive warning", network);

@@ -11,6 +11,9 @@ import kotlinx.coroutines.CoroutineDispatcher
 /** Dispatcher for the BLOCKING backend/status reads (JNI or C-ABI crossings). */
 internal expect val rpcIoDispatcher: CoroutineDispatcher
 
+/** Wall-clock epoch milliseconds — the "last seen" stamp of the recent-origins list. */
+internal expect fun rpcEpochMillis(): Long
+
 /** INFO-level line under [logger] (a dotted logger name, e.g. MethodLogger.ACCESS_LOGGER). */
 internal expect fun rpcLogInfo(logger: String, message: String)
 

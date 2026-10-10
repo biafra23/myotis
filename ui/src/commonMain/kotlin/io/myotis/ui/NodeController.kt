@@ -96,6 +96,16 @@ interface NodeController {
     fun applyTorMode() {}
 
     /**
+     * Push the persisted web-page access policy ([Settings.webAccessMode] +
+     * [Settings.webAccessOrigins]) down to every running network's JSON-RPC listener
+     * (#502). Live: the next request is judged by it, no restart. Hosts also apply it
+     * before each network's start, so a listener never serves its first request under
+     * a stale policy. Default no-op keeps hosts without the seam (iOS, for now)
+     * compiling — there the engine runs its default policy (specific sites, none).
+     */
+    fun applyWebAccess() {}
+
+    /**
      * Re-apply [Settings.allowAppNap] to the process after the Settings row flips it:
      * on macOS the desktop host begins or ends the NSProcessInfo activity that keeps
      * App Nap off (AppNap.kt). Live, like the BLS toggle. Default no-op for hosts
@@ -289,6 +299,30 @@ interface Settings {
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
 
+    /**
+     * Web page access (#502): which browser origins may use the JSON-RPC listeners —
+     * one policy for every network (the user trusts a site, not a site-per-chain).
+     * Default [WebAccessMode.ALLOWLIST] with no entries, i.e. every web page is
+     * refused until allowed; native wallets are never affected. Hosts persist it and
+     * [NodeController.applyWebAccess] pushes it to the running listeners. Defaults
+     * keep hosts without the seam compiling (iOS, for now).
+     */
+    fun webAccessMode(): WebAccessMode = WebAccessMode.ALLOWLIST
+    fun setWebAccessMode(mode: WebAccessMode) {}
+
+    /** The sites [WebAccessMode.ALLOWLIST] admits, as [WebAccessUi.normalize]d origins. */
+    fun webAccessOrigins(): List<String> = emptyList()
+    fun setWebAccessOrigins(origins: List<String>) {}
+
+    /**
+     * Whether this host persists the policy AND pushes it to its listeners — the Web page
+     * access section and the Status tab's refusal banner show only then (the
+     * [supportsIdleSleep]/[supportsAppNap] precedent): a control whose writes the host
+     * drops would be accepted-and-ignored. Default false; iOS is the host without the
+     * seam for now, and its listener runs the engine default (specific sites, none).
+     */
+    fun supportsWebAccess(): Boolean = false
+
     /** Opt-in eth_getLogs watch-list index, per network. Defaults keep hosts
      *  without the feature compiling; the host actuals persist it and
      *  [NodeController.applyLogIndex] pushes the config — built from
@@ -479,6 +513,10 @@ data class NodeSnapshot(
     // this build doesn't support (the API's UpgradeAdvisory; the EL detector is
     // Sepolia-only for now, the CL one runs everywhere). null = nothing detected.
     val upgrade: UpgradeNotice? = null,
+    // Web origins that tried this network's JSON-RPC listener this run (#502), most
+    // recent first — the Settings tab's "recent web pages" list and the Status tab's
+    // refusal banner. Empty when the host doesn't report it.
+    val webOrigins: List<WebOriginRow> = emptyList(),
 )
 
 /**

@@ -21,6 +21,8 @@ import io.myotis.ui.Settings
 import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
 import io.myotis.ui.UpgradeNotice
+import io.myotis.ui.WebAccessMode
+import io.myotis.ui.WebOriginRow
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -66,6 +68,9 @@ class AndroidNodeController(
                     s.toModel().copy(
                         logIndexJson = svc.logIndexStatusJsonOrNull(net),
                         readStatsJson = svc.readStatsJsonOrNull(net),
+                        webOrigins = svc.recentWebOrigins(net).map {
+                            WebOriginRow(it.origin(), it.attempts(), it.lastSeenEpochMillis(), it.lastAllowed(), net)
+                        },
                     )
                 }
             } ?: emptyMap())
@@ -109,6 +114,7 @@ class AndroidNodeController(
     override fun setTargetSnapPeers(target: Int) { serviceProvider()?.setTargetSnapPeers(target) }
     override fun setServedBlockWindow(blocks: Int) { serviceProvider()?.setServedBlockWindow(blocks) }
     override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
+    override fun applyWebAccess() { serviceProvider()?.applyWebAccess() }
     override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 
@@ -353,6 +359,11 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun supportsIdleSleep(): Boolean = true   // NodeService runs the idle controller
     override fun expertMode(): Boolean = NodeService.expertMode(ctx)
     override fun setExpertMode(v: Boolean) = NodeService.setExpertMode(ctx, v)
+    override fun webAccessMode(): WebAccessMode = WebAccessMode.valueOf(NodeService.webAccessMode(ctx))
+    override fun setWebAccessMode(mode: WebAccessMode) = NodeService.setWebAccessMode(ctx, mode.name)
+    override fun webAccessOrigins(): List<String> = NodeService.webAccessOrigins(ctx)
+    override fun setWebAccessOrigins(origins: List<String>) = NodeService.setWebAccessOrigins(ctx, origins)
+    override fun supportsWebAccess(): Boolean = true   // NodeService persists and pushes it
 }
 
 /**

@@ -199,6 +199,11 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private volatile BeaconLightClient beaconLightClient;
     private volatile io.myotis.rpc.VerifiedRpcBackend rpcBackend;
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    /** The JSON-RPC listener's web-page gate (#502): the policy the host installs
+     *  ({@link #setWebAccessPolicy}, before or after start) and the recent-origins
+     *  list it reads back. Owned here, not by the server, so both work across the
+     *  listener's lifetime — set before the bind, read after a stop. */
+    private final io.myotis.jsonrpc.WebAccess webAccess = new io.myotis.jsonrpc.WebAccess();
     /** The port startRpc() was configured with (recorded even when the bind fails,
      *  so the status row can show the failure); 0 until startRpc runs. */
     private volatile int rpcListenPort;
@@ -257,6 +262,17 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** Live-update the snap-peer target (no restart). */
     public void setTargetSnapPeers(int target) {
         this.targetSnapPeers = target;
+    }
+
+    /** Install the web-page access policy on the listener's gate — live, and
+     *  accepted before start() (the gate outlives the server). Returns what applies. */
+    public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy policy) {
+        return io.myotis.jsonrpc.WebAccessApi.apply(webAccess, policy);
+    }
+
+    /** The listener's recent web origins, most recent first (in memory only). */
+    public java.util.List<io.myotis.api.WebOrigin> recentWebOrigins() {
+        return io.myotis.jsonrpc.WebAccessApi.recent(webAccess);
     }
 
     /** eth/69 served-block window size; applied to the connector's shared
@@ -1129,7 +1145,8 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                 // it survives pause() (keeps listening) while the backend underneath
                 // is torn down and rebuilt, and a request on a paused stack wakes it.
                 io.myotis.jsonrpc.MyotisRpcServer server =
-                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads, this);
+                        io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", gatedReads, statusReads, this,
+                                webAccess);
                 server.start();
                 this.rpcServer = server;
                 this.rpcBackend = backend;

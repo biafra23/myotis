@@ -100,6 +100,11 @@ tasks.register<JavaExec>("run") {
         }
         systemProperty("myotis.logindex.backfillPaused", v)
     }
+    // -PwebAccess=off|all|<origin>,<origin>… → -Dmyotis.rpc.webAccess: which web
+    // pages may use the daemon's JSON-RPC listener (#502). Default (absent): specific
+    // sites, none — every browser page refused; wallet apps and curl are unaffected.
+    (project.findProperty("webAccess") as? String)?.takeIf { it.isNotBlank() }
+        ?.let { systemProperty("myotis.rpc.webAccess", it) }
     // -Plcdump=<dir> → -Dmyotis.lc.dumpVectors: capture raw light-client SSZ
     // (bootstrap/updates/finality) for the rust/testdata conformance corpus.
     (project.findProperty("lcdump") as String?)?.let { systemProperty("myotis.lc.dumpVectors", it) }

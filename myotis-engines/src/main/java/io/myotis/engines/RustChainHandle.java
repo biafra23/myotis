@@ -81,6 +81,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     private final RustVerifiedReads verifiedReads = new RustVerifiedReads(this);
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    /** The listener's web-page gate (#502) — the policy the host installs and the
+     *  recent-origins list, owned by the handle so they work before the server
+     *  exists and after it stopped (ChainStack parity). */
+    private final io.myotis.jsonrpc.WebAccess webAccess = new io.myotis.jsonrpc.WebAccess();
 
     /** Monotonic time (ns) the current run's start() was ENTERED — uptime counts the native
      *  boot itself, not just the time since it finished; drives {@link #uptimeSeconds()}.
@@ -408,7 +412,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this);
+                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this,
+                            webAccess);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
@@ -775,6 +780,19 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         if (!RustEngineNative.nativeSetWsBoundPeriods(handle, periods)) {
             log.warn("[engines] setWsBoundPeriods({}) dropped: unknown handle {}", periods, handle);
         }
+    }
+
+    @Override
+    public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy policy) {
+        // The listener is the shared Kotlin server on both engines, so the policy
+        // never crosses the FFI: it lands on the gate this handle owns — live, and
+        // before start() too (hosts set it between create() and start()).
+        return io.myotis.jsonrpc.WebAccessApi.apply(webAccess, policy);
+    }
+
+    @Override
+    public List<io.myotis.api.WebOrigin> recentWebOrigins() {
+        return io.myotis.jsonrpc.WebAccessApi.recent(webAccess);
     }
 
     @Override
