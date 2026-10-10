@@ -258,6 +258,9 @@ pub enum EnsQuery {
     Interface { name: String, interface_id: [u8; 4] },
     /// Reverse `address → name`, forward-verified.
     Reverse { address: [u8; 20] },
+    /// Who holds the name: registry owner/resolver and, for a `.eth` second-level
+    /// name, the registrar's registrant and expiry (`myotis_evm::resolve_ownership`).
+    Ownership { name: String },
 }
 
 /// A resolved record value, shaped per query type.
@@ -275,6 +278,8 @@ pub enum EnsRecordValue {
     Abi { content_type: u64, data: Vec<u8> },
     /// `Reverse` answers (the forward-verified primary name).
     Name(String),
+    /// `Ownership` answers.
+    Ownership(myotis_evm::EnsOwnership),
 }
 
 /// The outcome of an [`EnsQuery`]. `verified` = the resolution ran against the

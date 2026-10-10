@@ -47,6 +47,7 @@ class RustEnsApiTest {
         assertNotNull(api.resolveText(" ", "url").error());
         assertNotNull(api.resolveText("a.eth", " ").error());
         assertNotNull(api.resolveContenthash(" ").error());
+        assertNotNull(api.resolveOwnership(" ").error());
         assertNotNull(api.resolveMultiCoinAddr(" ", 60).error());
         assertNotNull(api.resolveMultiCoinAddr("a.eth", -1).error());
         assertNotNull(api.resolvePubkey(" ").error());

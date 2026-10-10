@@ -1,5 +1,6 @@
 package io.myotis.ui
 
+import kotlinx.datetime.TimeZone
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
@@ -22,7 +23,10 @@ class EnsProfileCardTest {
     @get:Rule
     val rule = createComposeRule()
 
-    private open class EnsController(private val profile: EnsProfile?) : FakeController() {
+    private open class EnsController(
+        private val profile: EnsProfile?,
+        private val ownership: EnsOwnership? = null,
+    ) : FakeController() {
         override val running: Boolean = true
         // "Look up" is enabled only while the node runs (snap.running): hand the tab one.
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
@@ -38,6 +42,7 @@ class EnsProfileCardTest {
                 failReason = null,
             )
         override suspend fun resolveEnsProfile(network: String, name: String): EnsProfile? = profile
+        override suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership? = ownership
     }
 
     @Test
@@ -58,6 +63,61 @@ class EnsProfileCardTest {
         rule.onNodeWithText("com.twitter: VitalikButerin (peer head)").assertExists()
         rule.onNodeWithText("url: resolves off-chain", substring = true).assertExists()
         rule.onAllNodes(hasText("avatar", substring = true)).assertCountEquals(0)
+    }
+
+    @Test
+    fun showsWhoHoldsTheNameAndItsTerm() {
+        val user = "0x" + "51".repeat(20)
+        val ownership = EnsOwnership(
+            "vitalik.eth", registrantHex = user, managerHex = user, wrapped = true,
+            resolverHex = "0x" + "23".repeat(20), expiresAt = 4_102_444_800L /* 2100-01-01 */,
+            gracePeriodSeconds = 7_776_000, blockNumber = 22_800_000, verified = true, error = null,
+        )
+        readRecords(EnsController(profile = EnsProfile("vitalik.eth", emptyList()), ownership = ownership), "vitalik.eth")
+        awaitText("Registrant: $user")
+        rule.onNodeWithText("Manager: $user (wrapped)").assertExists()
+        rule.onNodeWithText("Resolver: 0x" + "23".repeat(20)).assertExists()
+        // Rendered in the viewer's zone — compute the expectation the same way.
+        val line = ensExpiryLine(ownership.expiresAt, ownership.gracePeriodSeconds, nowFor(ownership), TimeZone.currentSystemDefault())
+        rule.onNodeWithText(line.substringBefore(" ("), substring = true).assertExists()
+        rule.onNodeWithText("No records beyond the address.").assertExists()
+        // Both reads came back clean: nothing left to read.
+        rule.onAllNodes(hasText("Read records")).assertCountEquals(0)
+    }
+
+    @Test
+    fun aNameWithNothingOnChainSaysSo() {
+        readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, 1, true, null)), "x.eth")
+        awaitText("Nothing on chain for this name.")
+        rule.onAllNodes(hasText("Registrant", substring = true)).assertCountEquals(0)
+        rule.onAllNodes(hasText("peer head", substring = true)).assertCountEquals(0)
+    }
+
+    @Test
+    fun anAbsenceReadFromThePeerHeadSaysSoToo() {
+        // The default root answers a clean absence from the peer head; the caveat the
+        // populated rows carry applies to the absence claim as well.
+        readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, 1, false, null)), "x.eth")
+        awaitText("Nothing on chain for this name.")
+        rule.onNodeWithText("Ownership read from the peer head.").assertExists()
+    }
+
+    @Test
+    fun aFailedOwnershipReadShowsItsErrorAndKeepsTheRetry() {
+        readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, -1, false, "node did not wake within 30s")), "x.eth")
+        awaitText("node did not wake within 30s")
+        rule.onNodeWithText("Read records").assertExists()
+    }
+
+    @Test
+    fun aThrowingOwnershipReadIsFoldedIntoTheRow() {
+        val controller = object : EnsController(profile = EnsProfile("x.eth", emptyList())) {
+            override suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership? =
+                throw IllegalStateException("Node is not running on mainnet")
+        }
+        readRecords(controller, "x.eth")
+        awaitText("Node is not running on mainnet")
+        rule.onNodeWithText("No records beyond the address.").assertExists()
     }
 
     @Test
@@ -111,7 +171,14 @@ class EnsProfileCardTest {
         awaitText("0xd8da6bf26964af9d7eed9e03e53415d37aa96045")
         rule.onAllNodes(hasText("Open via eth.limo")).assertCountEquals(0)
         rule.onAllNodes(hasText("Content", substring = true)).assertCountEquals(0)
+        // A host without the actuals answers null: that is a read that came back, not
+        // one still owed, so the button does not stay offered forever.
+        awaitGone("Read records")
+        rule.onAllNodes(hasText("Nothing on chain", substring = true)).assertCountEquals(0)
     }
+
+    /** A "now" well before the fixture's expiry, so the line reads "Expires …". */
+    private fun nowFor(o: EnsOwnership): Long = o.expiresAt - 400L * 86_400
 
     /** Look the name up, then press the card's "Read records". */
     private fun readRecords(controller: NodeController, name: String) {
@@ -134,6 +201,16 @@ class EnsProfileCardTest {
     }
 
     private fun pumpFrames(n: Int = 3) = repeat(n) { rule.mainClock.advanceTimeByFrame() }
+
+    private fun awaitGone(text: String) {
+        repeat(200) {
+            rule.mainClock.advanceTimeBy(300)
+            Thread.sleep(20)
+            pumpFrames()
+            if (rule.onAllNodes(hasText(text, substring = true)).fetchSemanticsNodes().isEmpty()) return
+        }
+        error("timed out waiting for \"$text\" to go")
+    }
 
     private fun awaitText(text: String) {
         repeat(200) {

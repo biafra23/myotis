@@ -24,6 +24,7 @@ import io.myotis.txhistory.uiKind
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.ENS_CONTENTHASH_KEY
+import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
@@ -511,6 +512,18 @@ class DesktopNodeController(
     // a call that threw (a stopped or sleeping node) into that record's error. Each call
     // resolves the name's resolver again — the ENS API has no batch read — which is why
     // the card reads records on demand rather than with every lookup.
+    override suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership {
+        val handle = engine.get(engine.canonicalNetworkName(network))
+            ?: throw IllegalStateException("Node is not running on $network")
+        val ens = handle.ens()
+            ?: throw IllegalStateException("ENS is not available on $network")
+        val r = withContext(Dispatchers.IO) { ens.resolveOwnership(name.trim()) }
+        return EnsOwnership(
+            r.name(), r.registrantHex(), r.managerHex(), r.wrapped(), r.resolverHex(),
+            r.expiresAt(), r.gracePeriodSeconds(), r.blockNumber(), r.verified(), r.error(),
+        )
+    }
+
     override suspend fun resolveEnsProfile(network: String, name: String): EnsProfile {
         val handle = engine.get(engine.canonicalNetworkName(network))
             ?: throw IllegalStateException("Node is not running on $network")

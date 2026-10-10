@@ -1212,6 +1212,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 (r, ctx) -> r.resolveText(name, key, ctx));
     }
 
+    /** Who holds the name (registry + .eth registrar, through the NameWrapper). */
+    public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.Ownership>> resolveEnsOwnership(
+            String name, io.myotis.ens.EnsResolutionRoot mode) {
+        return resolveRecordWithMode("resolveOwnership", mode,
+                (r, ctx) -> r.resolveOwnership(name, ctx));
+    }
+
     /** ENSIP-7 contenthash. */
     public CompletableFuture<EnsRecord<byte[]>> resolveEnsContenthash(
             String name, io.myotis.ens.EnsResolutionRoot mode) {

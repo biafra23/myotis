@@ -1,9 +1,13 @@
 package io.myotis.ui
 
+import kotlin.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.daysUntil
+import kotlinx.datetime.toLocalDateTime
 
 /** The key under which [EnsProfile] carries the contenthash next to the ENSIP-5 text keys. */
 const val ENS_CONTENTHASH_KEY = "contenthash"
@@ -40,6 +44,47 @@ suspend fun readEnsProfile(name: String, read: suspend (key: String) -> EnsRecor
     }
     return EnsProfile(n, records)
 }
+
+/**
+ * The card's one line about a `.eth` name's term at [nowSeconds]: when it expires, or
+ * that it has — inside its grace period (only the registrant may renew) or past it
+ * (free to register). A grace period the registrar did not answer (-1) is "unknown",
+ * never "past": the conservative reading, since the name may still be the registrant's
+ * to renew. Empty when the name has no registrar entry.
+ */
+internal fun ensExpiryLine(expiresAt: Long, gracePeriodSeconds: Long, nowSeconds: Long, tz: TimeZone): String {
+    if (expiresAt < 0) return ""
+    val at = localDateTime(expiresAt, tz)
+    if (expiresAt > nowSeconds) {
+        // Calendar days in the viewer's zone, not 86 400-second buckets: a name that
+        // expires at 00:30 tomorrow is "tomorrow" at 23:50 tonight.
+        val days = localDate(nowSeconds, tz).daysUntil(localDate(expiresAt, tz))
+        val when_ = when (days) {
+            0 -> "today"
+            1 -> "tomorrow"
+            else -> "in $days days"
+        }
+        return "Expires $at ($when_)"
+    }
+    if (gracePeriodSeconds < 0) {
+        return "Expired $at — grace period unknown; only the registrant can renew while it lasts"
+    }
+    val graceEnd = expiresAt + gracePeriodSeconds
+    return if (nowSeconds < graceEnd) {
+        "Expired $at — in the grace period until ${localDateTime(graceEnd, tz)}; only the registrant can renew"
+    } else {
+        "Expired $at — past the grace period; free to register"
+    }
+}
+
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun localDate(seconds: Long, tz: TimeZone) =
+    Instant.fromEpochMilliseconds(seconds * 1000).toLocalDateTime(tz).date
+
+/** `yyyy-MM-dd HH:mm` in [tz], cut from the ISO-8601 form (stable across kotlinx-datetime renames). */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun localDateTime(seconds: Long, tz: TimeZone): String =
+    Instant.fromEpochMilliseconds(seconds * 1000).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
 
 /** A decoded ENSIP-7 contenthash: the `scheme://…` URI wallets and gateways show. */
 data class ContentLink(val scheme: String, val uri: String)

@@ -6400,7 +6400,7 @@ impl ElReader {
         let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
-            run_ens_query(&caller, &query)
+            run_ens_query(&caller, &query, chain_id)
         });
         // The attempt scope drains this worker before AUTO can start another root.
         let joined = walk.await?;
@@ -9726,8 +9726,12 @@ fn next_base_fee_calc(base: u128, gas_limit: u64, gas_used: u64) -> u128 {
 fn run_ens_query(
     caller: &dyn myotis_evm::EthCaller,
     query: &EnsQuery,
+    chain_id: u64,
 ) -> Result<Option<EnsRecordValue>, EnsError> {
     Ok(match query {
+        EnsQuery::Ownership { name } => {
+            myotis_evm::resolve_ownership(caller, name, chain_id)?.map(EnsRecordValue::Ownership)
+        }
         EnsQuery::Addr { name } => {
             myotis_evm::resolve_address(caller, name)?.map(EnsRecordValue::Address)
         }
@@ -9770,6 +9774,9 @@ fn decode_ccip_answer(
     raw: &[u8],
 ) -> Result<Option<EnsRecordValue>, EnsError> {
     Ok(match query {
+        // Ownership never resolves off-chain: its registry and registrar calls
+        // revert plainly, so no gateway round can answer for it.
+        EnsQuery::Ownership { .. } => None,
         EnsQuery::Addr { .. } | EnsQuery::Interface { .. } => {
             myotis_evm::decode_address_answer(raw).map(EnsRecordValue::Address)
         }

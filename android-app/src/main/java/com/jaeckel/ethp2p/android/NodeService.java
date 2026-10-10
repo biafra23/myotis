@@ -1885,6 +1885,35 @@ public final class NodeService extends Service {
         }, QUERY_POOL);
     }
 
+    /**
+     * Who holds {@code name} (the engine API's {@code resolveOwnership}) on the query
+     * pool, like {@link #resolveEns}. Never throws: a failed read answers with its
+     * error in the record.
+     */
+    public CompletableFuture<io.myotis.api.EnsOwnershipResult> resolveEnsOwnership(String network, String name) {
+        noteUiActivity();
+        final String trimmed = name == null ? "" : name.trim();
+        final String n = canonicalNetwork(network);
+        if (!networkInfo(n).hasEns()) {
+            return CompletableFuture.completedFuture(new io.myotis.api.EnsOwnershipResult(
+                    trimmed, null, null, false, null, -1, -1, -1, -1, false, "ENS is not available on " + n));
+        }
+        ChainHandle handle = handles.get(n);
+        io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
+        if (!RUNNING.get() || ens == null) {
+            return CompletableFuture.completedFuture(new io.myotis.api.EnsOwnershipResult(
+                    trimmed, null, null, false, null, -1, -1, -1, -1, false, "node not running on " + n));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return ens.resolveOwnership(trimmed);
+            } catch (RuntimeException e) {
+                return new io.myotis.api.EnsOwnershipResult(trimmed, null, null, false, null, -1, -1, -1, -1, false,
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            }
+        }, QUERY_POOL);
+    }
+
     /** DNS server IPs for the active network, for EIP-1459 ENR-tree TXT lookups.
      *  dnsjava has no system resolver config on Android, so we feed it these
      *  explicitly. Returns empty (→ resolver uses public-DNS fallback) on any error. */

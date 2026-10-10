@@ -1,5 +1,6 @@
 package io.myotis.ui
 
+import kotlinx.datetime.TimeZone
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -60,6 +61,35 @@ class EnsContenthashTest {
         assertNull(decodeContenthash("0xe4010170122012"))                 // swarm with the wrong codec
         assertNull(decodeContenthash("0x"))
         assertNull(decodeContenthash("not hex"))
+    }
+
+    @Test
+    fun theExpiryLineSaysWhatATermMeansNow() {
+        val tz = TimeZone.UTC
+        val expires = 1_823_155_031L  // 2027-10-10 07:57 UTC
+        assertEquals("Expires 2027-10-10 07:57 (in 365 days)", ensExpiryLine(expires, 7_776_000, expires - 365 * 86_400 - 10, tz))
+        assertEquals("Expires 2027-10-10 07:57 (today)", ensExpiryLine(expires, 7_776_000, expires - 3_600, tz))
+        // Calendar days, not 86 400-second buckets: 07:57 tomorrow seen at 23:50 tonight.
+        assertEquals("Expires 2027-10-10 07:57 (tomorrow)", ensExpiryLine(expires, 7_776_000, expires - 8 * 3_600 - 7 * 60, tz))
+        assertEquals("Expires 2027-10-10 07:57 (in 2 days)", ensExpiryLine(expires, 7_776_000, expires - 32 * 3_600, tz))
+        assertEquals(
+            "Expired 2027-10-10 07:57 — in the grace period until 2028-01-08 07:57; only the registrant can renew",
+            ensExpiryLine(expires, 7_776_000, expires + 86_400, tz),
+        )
+        assertEquals(
+            "Expired 2027-10-10 07:57 — past the grace period; free to register",
+            ensExpiryLine(expires, 7_776_000, expires + 7_776_000 + 1, tz),
+        )
+        // An unanswered grace period is unknown, not over: never "free to register".
+        assertEquals(
+            "Expired 2027-10-10 07:57 — grace period unknown; only the registrant can renew while it lasts",
+            ensExpiryLine(expires, -1, expires + 1, tz),
+        )
+        assertEquals(
+            "Expired 2027-10-10 07:57 — grace period unknown; only the registrant can renew while it lasts",
+            ensExpiryLine(expires, -1, expires + 365 * 86_400, tz),
+        )
+        assertEquals("", ensExpiryLine(-1, -1, expires, tz))
     }
 
     @Test

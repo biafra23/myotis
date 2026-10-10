@@ -662,8 +662,11 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
 /// - `{"status":"ok","blockNumber":N,"blockTimestamp":T,"verified":b, <value keys>}` where the
 ///   value keys are per record type: `addressHex` (addr / interfaceImplementer),
 ///   `value` (text), `dataHex` (contenthash / multicoin / dnsRecord),
-///   `pubkeyXHex`+`pubkeyYHex` (pubkey), `contentType`+`dataHex` (ABI), or
-///   `name` (reverse).
+///   `pubkeyXHex`+`pubkeyYHex` (pubkey), `contentType`+`dataHex` (ABI),
+///   `name` (reverse), or — ABI ≥ 42, the one shape with OPTIONAL keys —
+///   `registrantHex` / `managerHex` / `wrapped` / `resolverHex` / `expiresAt` /
+///   `gracePeriodSeconds` (ownership; only `wrapped` is always present, an
+///   absent part is left out rather than null).
 /// - `{"status":"noRecord","blockNumber":N,"blockTimestamp":T,"verified":b}`
 /// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b}`
 ///
@@ -698,6 +701,27 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
                 }
                 EnsRecordValue::Name(n) => {
                     obj.insert("name".into(), n.as_str().into());
+                }
+                // ABI ≥ 42: who holds the name. Absent parts are left out, not
+                // null: a subname has no registrar entry, an expired name no
+                // registrant, an unknown chain no wrapper.
+                EnsRecordValue::Ownership(o) => {
+                    if let Some(a) = o.registrant {
+                        obj.insert("registrantHex".into(), hex0x_var(&a).into());
+                    }
+                    if let Some(a) = o.manager {
+                        obj.insert("managerHex".into(), hex0x_var(&a).into());
+                    }
+                    obj.insert("wrapped".into(), o.wrapped.into());
+                    if let Some(a) = o.resolver {
+                        obj.insert("resolverHex".into(), hex0x_var(&a).into());
+                    }
+                    if let Some(e) = o.expires_at {
+                        obj.insert("expiresAt".into(), json_u64(e));
+                    }
+                    if let Some(g) = o.grace_period {
+                        obj.insert("gracePeriodSeconds".into(), json_u64(g));
+                    }
                 }
             }
         }
@@ -1395,6 +1419,47 @@ mod tests {
         assert_eq!(full["extraDataHex"], "0xeeeeee");
         assert_eq!(full["wrapped"], true);
         assert_eq!(full["verified"], true);
+        // ABI 42: the ownership answer; absent parts are left out.
+        let own: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: Some([0x51; 20]),
+                manager: Some([0x51; 20]),
+                wrapped: false,
+                resolver: Some([0x23; 20]),
+                expires_at: Some(1_823_155_031),
+                grace_period: Some(7_776_000),
+            }),
+            block_number: 21_000_010,
+            block_timestamp: 1_760_000_000,
+            verified: true,
+        }))
+        .unwrap();
+        assert_eq!(own["status"], "ok");
+        assert_eq!(own["blockNumber"], 21_000_010u64);
+        assert_eq!(own["blockTimestamp"], 1_760_000_000u64);
+        assert_eq!(own["registrantHex"], format!("0x{}", "51".repeat(20)));
+        assert_eq!(own["managerHex"], format!("0x{}", "51".repeat(20)));
+        assert_eq!(own["wrapped"], false);
+        assert_eq!(own["resolverHex"], format!("0x{}", "23".repeat(20)));
+        assert_eq!(own["expiresAt"], 1_823_155_031u64);
+        assert_eq!(own["gracePeriodSeconds"], 7_776_000u64);
+        let sub: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: None,
+                manager: Some([0x51; 20]),
+                wrapped: true,
+                resolver: None,
+                expires_at: None,
+                grace_period: None,
+            }),
+            block_number: 21_000_010,
+            block_timestamp: 1_760_000_000,
+            verified: false,
+        }))
+        .unwrap();
+        assert!(sub.get("registrantHex").is_none());
+        assert!(sub.get("expiresAt").is_none());
+        assert_eq!(sub["wrapped"], true);
     }
 
     fn sample_code() -> VerifiedCode {

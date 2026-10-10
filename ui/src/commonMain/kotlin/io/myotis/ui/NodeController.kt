@@ -191,6 +191,14 @@ interface NodeController {
     suspend fun resolveEnsProfile(network: String, name: String): EnsProfile? = null
 
     /**
+     * Who holds [name] and until when — the registry's owner and resolver and, for a
+     * `.eth` second-level name, the registrar's registrant, expiry and grace period,
+     * seen through the NameWrapper (the engine API's `resolveOwnership`, finalized
+     * first). Read on demand with the records. Null when this host has no actual.
+     */
+    suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership? = null
+
+    /**
      * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
      * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
      * Android/iOS compiling and hide the Query-tab section there.
@@ -253,6 +261,31 @@ data class EnsRecord(
 
 /** The records [NodeController.resolveEnsProfile] read for [name]. */
 data class EnsProfile(val name: String, val records: List<EnsRecord>)
+
+/**
+ * Who holds an ENS name and until when ([NodeController.resolveEnsOwnership]). A null
+ * address is "none": no registrant for a subname, an unregistered or an expired name
+ * (the registrar's `ownerOf` reverts from the expiry on, grace period included); no
+ * manager when the registry holds no owner. [expiresAt] and [gracePeriodSeconds] are
+ * -1 where there is no registrar entry. [error] null with nothing set = nothing on chain.
+ */
+data class EnsOwnership(
+    val name: String,
+    val registrantHex: String?,
+    val managerHex: String?,
+    val wrapped: Boolean,            // the registry owner is the chain's NameWrapper
+    val resolverHex: String?,
+    val expiresAt: Long,             // unix seconds; -1 when none
+    val gracePeriodSeconds: Long,    // -1 when none
+    val blockNumber: Long,           // -1 when none
+    val verified: Boolean,           // true iff beacon-verified finalized state
+    val error: String?,              // null unless the read itself failed
+) {
+    /** Something is on chain for the name — a holder, a resolver or an expiry. Whether a `.eth`
+     *  name is TAKEN is a question of time ([expiresAt] + [gracePeriodSeconds] against the clock). */
+    val known: Boolean get() =
+        registrantHex != null || managerHex != null || resolverHex != null || expiresAt >= 0
+}
 
 /** Persisted per-network + shared settings, abstracted from Android SharedPreferences. */
 interface Settings {

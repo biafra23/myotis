@@ -9,6 +9,7 @@ import io.myotis.api.EnsContenthashResult;
 import io.myotis.api.EnsDnsRecordResult;
 import io.myotis.api.EnsInterfaceResult;
 import io.myotis.api.EnsMultiCoinResult;
+import io.myotis.api.EnsOwnershipResult;
 import io.myotis.api.EnsPubkeyResult;
 import io.myotis.api.EnsResolutionResult;
 import io.myotis.api.EnsRoot;
@@ -168,6 +169,40 @@ final class RustEnsApi implements EnsApi {
                     name, p.requireString("dataHex"), p.block, p.verified, null);
             case "noRecord" -> new EnsContenthashResult(name, null, p.block, p.verified, null);
             case "offchain" -> new EnsContenthashResult(name, null, p.block, p.verified, OFFCHAIN);
+            default -> throw p.unknownStatus();
+        };
+    }
+
+    @Override
+    public EnsOwnershipResult resolveOwnership(String name) {
+        if (name == null || name.isBlank()) {
+            return new EnsOwnershipResult(name, null, null, false, null, -1, -1, -1, -1, false, "empty ENS name");
+        }
+        try {
+            JsonObject params = params("ownership").add("name", name);
+            return ownershipFromJson(name, exec(params));
+        } catch (RuntimeException e) {
+            return new EnsOwnershipResult(name, null, null, false, null, -1, -1, -1, -1, false, why(e));
+        }
+    }
+
+    /** ABI ≥ 42: absent parts are left out of the JSON, never null. */
+    static EnsOwnershipResult ownershipFromJson(String name, String json) {
+        Parsed p = Parsed.of(json);
+        return switch (p.status) {
+            case "ok" -> new EnsOwnershipResult(
+                    name,
+                    p.optionalString("registrantHex"),
+                    p.optionalString("managerHex"),
+                    p.requireBoolean("wrapped"),
+                    p.optionalString("resolverHex"),
+                    p.optionalLong("expiresAt"),
+                    p.optionalLong("gracePeriodSeconds"),
+                    p.block, p.timestamp, p.verified, null);
+            case "noRecord" -> new EnsOwnershipResult(
+                    name, null, null, false, null, -1, -1, p.block, p.timestamp, p.verified, null);
+            case "offchain" -> new EnsOwnershipResult(
+                    name, null, null, false, null, -1, -1, p.block, p.timestamp, p.verified, OFFCHAIN);
             default -> throw p.unknownStatus();
         };
     }
@@ -425,6 +460,36 @@ final class RustEnsApi implements EnsApi {
                 throw new EngineException("ens-record JSON: status=ok without " + key);
             }
             return v.asString();
+        }
+
+        /** An optional string field: null when absent or JSON null; a present field
+         *  that is not a string is shape drift. */
+        String optionalString(String key) {
+            var v = o.get(key);
+            if (v == null || v.isNull()) return null;
+            if (!v.isString()) {
+                throw new EngineException("ens-record JSON: " + key + " is not a string");
+            }
+            return v.asString();
+        }
+
+        /** An optional integer field: -1 when absent or JSON null. */
+        long optionalLong(String key) {
+            var v = o.get(key);
+            if (v == null || v.isNull()) return -1;
+            try {
+                return v.asLong();
+            } catch (RuntimeException e) {
+                throw new EngineException("ens-record JSON: " + key + " is not an integer", e);
+            }
+        }
+
+        boolean requireBoolean(String key) {
+            var v = o.get(key);
+            if (v == null || v.isNull() || !v.isBoolean()) {
+                throw new EngineException("ens-record JSON: missing boolean " + key);
+            }
+            return v.asBoolean();
         }
 
         /** A mandatory numeric value field — absence is shape drift, fail closed. */

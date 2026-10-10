@@ -1902,7 +1902,7 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
 ///
 /// ```json
 /// {"method":"text","name":"a.eth","key":"url","root":"auto"}
-/// {"method":"addr"|"contenthash"|"pubkey","name":"a.eth","root":"finalized"}
+/// {"method":"addr"|"contenthash"|"ownership"|"pubkey","name":"a.eth","root":"finalized"}
 /// {"method":"multicoin","name":"a.eth","coinType":0}
 /// {"method":"abi","name":"a.eth","contentTypes":15}
 /// {"method":"dnsRecord","name":"a.eth","dnsName":"a.eth","resource":1}
@@ -2854,6 +2854,7 @@ fn parse_ens_query(query_method: &str, params: &serde_json::Value) -> Result<Ens
     Ok(match query_method {
         "addr" => EnsQuery::Addr { name: name_field("name")? },
         "contenthash" => EnsQuery::Contenthash { name: name_field("name")? },
+        "ownership" => EnsQuery::Ownership { name: name_field("name")? },
         "pubkey" => EnsQuery::Pubkey { name: name_field("name")? },
         "text" => {
             let name = name_field("name")?;
@@ -3662,6 +3663,7 @@ mod tests {
         // decodes an address answer with pubkey semantics (a real regression).
         assert!(matches!(q("addr", "").unwrap(), EnsQuery::Addr { .. }));
         assert!(matches!(q("contenthash", "").unwrap(), EnsQuery::Contenthash { .. }));
+        assert!(matches!(q("ownership", "").unwrap(), EnsQuery::Ownership { .. }));
         assert!(matches!(q("pubkey", "").unwrap(), EnsQuery::Pubkey { .. }));
         assert!(matches!(q("text", r#","key":"url""#).unwrap(), EnsQuery::Text { .. }));
         assert!(matches!(q("multicoin", r#","coinType":60"#).unwrap(), EnsQuery::Multicoin { coin_type: 60, .. }));
