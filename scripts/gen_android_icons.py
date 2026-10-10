@@ -12,8 +12,9 @@ the logo (ci.yml, "Verify generated Android icons").
 
 The SVG's <path> fills are taken as they are, path data normalised to one line
 with two decimals (Android's PathParser treats only ' ' and ',' as separators),
-so the SVG must stay plain: no transform= anywhere, fill-only paths, absolute
-M/L/C/Z commands. The VectorDrawable <group> then places the bat on a square
+so the SVG must stay plain: <path> elements only, solid opaque fills, no
+transform=, fill-rule or group opacity anywhere, absolute M/L/C/Z commands —
+anything else is refused rather than silently dropped. The VectorDrawable <group> then places the bat on a square
 canvas; Android applies scale first, then translate (pivot 0), so p' = s*p + t.
 """
 import math
@@ -39,14 +40,27 @@ if '--preview' in sys.argv:
 # ---- read the SVG: plain fill paths only ----
 with open(SVG, encoding='utf-8') as fh:
     svg = fh.read()
-if 'transform=' in svg:
-    sys.exit('refusing %s: it carries a transform= (paths are read untransformed; flatten it first)' % SVG)
+# Whole-file refusals: anything the <path> scan below would silently drop or misrender.
+# Only <path> fills are read, so every other way of drawing (or of changing how a path
+# renders) must fail loudly, or a redesigned SVG regenerates deterministically minus that
+# geometry and the CI drift gate stays green.
+for pattern, why in (
+    (r'transform=', 'it carries a transform= (paths are read untransformed; flatten it first)'),
+    (r'<(rect|circle|ellipse|line|polyline|polygon|use|image|text)\b',
+     'it draws with an element other than <path> (convert it to paths first; it would otherwise be dropped)'),
+    (r'fill-rule=', 'it sets a fill-rule (the VectorDrawable renders nonZero; evenodd holes would fill in)'),
+    (r'fill="url\(', 'it fills with a gradient or pattern (only a solid opaque fill maps onto the icon)'),
+    (r'<g\b[^>]*\bopacity=', 'a <g> carries an opacity (it would be dropped; bake it into the paths)'),
+):
+    if re.search(pattern, svg):
+        sys.exit('refusing %s: %s' % (SVG, why))
 paths = []
 for elem in re.findall(r'<path\b[^>]*>', svg):
     d = re.search(r'\bd="\s*([^"]+)"', elem)
     fill = re.search(r'\bfill="([^"]*)"', elem)
     stroke = re.search(r'\bstroke="([^"]*)"', elem)
-    opacity = re.search(r'\bopacity="([^"]*)"', elem)
+    # Both opacity and fill-opacity: either makes the fill translucent, and the icon is opaque.
+    opacity = re.search(r'\b(?:fill-)?opacity="([^"]*)"', elem)
     if (not d or not fill or fill.group(1) == 'none'
             or (stroke and stroke.group(1) != 'none')
             or (opacity and float(opacity.group(1)) != 1.0)):
@@ -139,7 +153,9 @@ def vector(size, scale, comment):
 def write(rel, text):
     path = os.path.join(RES, *rel.split('/'))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as fh:
+    # newline='\n': text mode would otherwise write os.linesep, i.e. CRLF files on Windows
+    # that the CI drift gate then reports as stale right after a regenerate.
+    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
         fh.write(text)
 
 
