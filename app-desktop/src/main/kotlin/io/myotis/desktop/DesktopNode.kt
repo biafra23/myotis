@@ -748,11 +748,24 @@ class DesktopNodeController(
             upgrade = s.upgradeAdvisory()?.let {
                 UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
             },
-            webOrigins = runCatching { handle.recentWebOrigins() }.getOrDefault(emptyList()).map {
-                WebOriginRow(it.origin(), it.attempts(), it.lastSeenEpochMillis(), it.lastAllowed(), s.network())
-            },
+            webOrigins = webOriginRows(s.network(), handle),
         )
     }
+
+    /** [handle]'s recent web origins (#502) as UI rows tagged with [network]; empty when
+     *  the handle cannot say. In-memory reads only. */
+    private fun webOriginRows(network: String, handle: ChainHandle): List<WebOriginRow> =
+        runCatching { handle.recentWebOrigins() }.getOrDefault(emptyList()).map {
+            WebOriginRow(it.origin(), it.attempts(), it.lastSeenEpochMillis(), it.lastAllowed(), network)
+        }
+
+    /**
+     * Every running network's recent web origins, one list per network — the input of the
+     * desktop's refusal notifications (DesktopAlerts.kt). Desktop-only, so not on the
+     * shared seam; cheap enough for a 5 s poll (in-memory reads, no status snapshot).
+     */
+    fun recentWebOrigins(): List<List<WebOriginRow>> =
+        engine.hostedNetworks().mapNotNull { name -> engine.get(name)?.let { webOriginRows(name, it) } }
 
     /**
      * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it

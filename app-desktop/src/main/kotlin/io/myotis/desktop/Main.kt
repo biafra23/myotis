@@ -1,7 +1,17 @@
 package io.myotis.desktop
 
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
+import androidx.compose.ui.window.rememberTrayState
+import androidx.compose.ui.window.rememberWindowState
 import io.myotis.ui.NodeScreen
 import java.nio.file.Path
 
@@ -81,16 +91,72 @@ fun main() {
     val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     settings.enabledNetworks().forEach(controller::startNetwork)
 
+    // The window title names the flavour, so two PoC builds running side by side are
+    // distinguishable at a glance (they already own separate data dirs). The tray uses it too.
+    val appTitle = poc?.let { "Myotis ${it.label}" } ?: "Myotis"
+
     application {
+        val windowState = rememberWindowState()
+        val trayState = rememberTrayState()
+        // Bumped by a click on the tray icon or its menu (and, on Windows, its notification):
+        // bring the window forward on the Status tab, where a refused page has its Allow.
+        var showRequests by remember { mutableStateOf(0) }
+        // A click on a notification does not reach onAction everywhere (macOS activates the
+        // app instead), so an announcement also arms this: the next time the window gains
+        // focus, however the user got there, it opens on the Status tab.
+        var statusOnFocus by remember { mutableStateOf(false) }
+        var focusReturns by remember { mutableStateOf(0) }
+        // The tray icon carries the refused-web-page notifications (DesktopAlerts.kt); a
+        // desktop without a system tray (GNOME, by default) keeps them in the window.
+        if (isTraySupported) {
+            Tray(
+                icon = MyotisTrayIcon,
+                state = trayState,
+                tooltip = appTitle,
+                onAction = { showRequests++ },
+                menu = {
+                    Item("Show $appTitle", onClick = { showRequests++ })
+                    Item("Quit $appTitle", onClick = { controller.shutdown(); exitApplication() })
+                },
+            )
+        }
         Window(
+            state = windowState,
             // Tear down the in-process node stack (Netty event loops, libp2p, sync threads)
             // before exiting so closing the window doesn't leak resources or hang shutdown.
             onCloseRequest = { controller.shutdown(); exitApplication() },
-            // The window title names the flavour, so two PoC builds running side by side
-            // are distinguishable at a glance (they already own separate data dirs).
-            title = poc?.let { "Myotis ${it.label}" } ?: "Myotis",
+            title = appTitle,
         ) {
-            NodeScreen(controller, settings, DesktopLogSource, history = history)
+            LaunchedEffect(showRequests) {
+                if (showRequests > 0) {
+                    windowState.isMinimized = false
+                    window.toFront()
+                    window.requestFocus()
+                }
+            }
+            DisposableEffect(window) {
+                val listener = object : java.awt.event.WindowAdapter() {
+                    override fun windowGainedFocus(e: java.awt.event.WindowEvent) {
+                        if (statusOnFocus) {
+                            statusOnFocus = false
+                            focusReturns++
+                        }
+                    }
+                }
+                window.addWindowFocusListener(listener)
+                onDispose { window.removeWindowFocusListener(listener) }
+            }
+            LaunchedEffect(Unit) {
+                watchWebRefusals(controller, settings, trayState.takeIf { isTraySupported }, window) {
+                    // Already in front: the user sees the banner if Status is open; arm
+                    // only for a window the user has to come back to.
+                    if (!window.isFocused) statusOnFocus = true
+                }
+            }
+            NodeScreen(
+                controller, settings, DesktopLogSource, history = history,
+                statusRequests = showRequests + focusReturns,
+            )
         }
     }
 }
