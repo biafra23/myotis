@@ -1781,6 +1781,12 @@ public final class NodeService extends Service {
                                 boolean beaconVerified, String error,
                                 long blockTimestamp /* unix s, verified header; -1 when none */) {}
 
+    /** One ENS record beyond the address ({@link #resolveEnsRecord}): a text record under
+     *  its key, or the contenthash under the key {@code contenthash} (0x multicodec hex).
+     *  value null + error null = the name has no such record. */
+    public record EnsRecordAnswer(String key, String value, long blockNumber,
+                                  boolean beaconVerified, String error) {}
+
     /**
      * Which state ENS resolution runs against. Defaults to AUTO (beacon-verified
      * finalized root first, peer-head fallback); switch to {@link EnsRoot#PEER_HEAD}
@@ -1841,6 +1847,43 @@ public final class NodeService extends Service {
         }, QUERY_POOL);
     }
 
+
+    /**
+     * One record of {@code name} beyond the address — the contenthash for the key
+     * {@code contenthash}, else the ENSIP-5 text record under {@code key} — through the
+     * engine's ENS API on the query pool, like {@link #resolveEns}. Never throws: a read
+     * that failed answers with its error in the record.
+     */
+    public CompletableFuture<EnsRecordAnswer> resolveEnsRecord(String network, String name, String key) {
+        noteUiActivity();
+        final String trimmed = name == null ? "" : name.trim();
+        final String n = canonicalNetwork(network);
+        if (!networkInfo(n).hasEns()) {
+            return CompletableFuture.completedFuture(
+                    new EnsRecordAnswer(key, null, -1, false, "ENS is not available on " + n));
+        }
+        ChainHandle handle = handles.get(n);
+        io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
+        if (!RUNNING.get() || ens == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsRecordAnswer(key, null, -1, false, "node not running on " + n));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                if ("contenthash".equals(key)) {
+                    var r = ens.resolveContenthash(trimmed);
+                    return new EnsRecordAnswer(key, r.contenthashHex(), r.blockNumber(), r.verified(), r.error());
+                }
+                var r = ens.resolveText(trimmed, key);
+                return new EnsRecordAnswer(key, r.value(), r.blockNumber(), r.verified(), r.error());
+            } catch (RuntimeException e) {
+                // The Java engine's adapter throws for a stopped / not-woken node where the
+                // Rust adapter folds that into error(); fold it here so the answer is uniform.
+                return new EnsRecordAnswer(key, null, -1, false,
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            }
+        }, QUERY_POOL);
+    }
 
     /** DNS server IPs for the active network, for EIP-1459 ENR-tree TXT lookups.
      *  dnsjava has no system resolver config on Android, so we feed it these

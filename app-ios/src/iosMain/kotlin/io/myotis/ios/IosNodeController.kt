@@ -3,7 +3,11 @@ package io.myotis.ios
 import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
+import io.myotis.ui.ENS_CONTENTHASH_KEY
+import io.myotis.ui.EnsProfile
+import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.Settings
@@ -450,6 +454,42 @@ class IosNodeController(
             // ABI 41: the proven block timestamp; null (none proven) reads as -1.
             blockTimestamp = o.engineLong("blockTimestamp", -1L),
         )
+    }
+
+    // One engine call per record over the same record dispatch as resolveEns; readEnsProfile
+    // fans out and folds a call that threw into that record's error.
+    override suspend fun resolveEnsProfile(network: String, name: String): EnsProfile {
+        val handle = handleOrThrow(network)
+        if (!settings.hasEns(canonical(network))) {
+            throw IllegalStateException("ENS is not available on $network")
+        }
+        return readEnsProfile(name) { key -> withContext(Dispatchers.IO) { ensRecord(handle, name.trim(), key) } }
+    }
+
+    private fun ensRecord(handle: Long, name: String, key: String): EnsRecord {
+        val contenthash = key == ENS_CONTENTHASH_KEY
+        val params = JsonObject(
+            buildMap {
+                put("method", JsonPrimitive(if (contenthash) "contenthash" else "text"))
+                put("name", JsonPrimitive(name))
+                if (!contenthash) put("key", JsonPrimitive(key))
+            }
+        ).toString()
+        val o = runCatching { parseOrThrow(RustEngine.ensRecordJson(handle, params), "ENS record") }
+            .getOrElse { return EnsRecord(key, null, -1L, false, it.message ?: "ENS record read failed") }
+        val blockNumber = o.engineLong("blockNumber", -1L)
+        val verified = o.engineBoolean("verified")
+        return when (o.engineString("status")) {
+            "ok" -> o.engineString(if (contenthash) "dataHex" else "value")
+                ?.let { EnsRecord(key, it, blockNumber, verified, null) }
+                ?: EnsRecord(key, null, blockNumber, verified, "malformed resolver reply (ok without value)")
+            "noRecord" -> EnsRecord(key, null, blockNumber, verified, null)
+            "offchain" -> EnsRecord(
+                key, null, blockNumber, verified,
+                "resolves off-chain (CCIP-Read), which this app doesn't support yet",
+            )
+            else -> EnsRecord(key, null, blockNumber, verified, "unexpected resolver reply")
+        }
     }
 
     override suspend fun resolveEns(network: String, name: String): EnsResult {
