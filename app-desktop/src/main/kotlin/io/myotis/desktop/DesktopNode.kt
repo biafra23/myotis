@@ -516,7 +516,7 @@ class DesktopNodeController(
             r.address(), r.exists(), r.nonce(), r.balanceWei(),
             r.storageRootHex(), r.codeHashHex(), r.blockNumber(), r.peerStateRootHex(),
             r.peerProofValid(), r.beaconChainVerified(), r.blsVerified(), r.matchedBeaconSlot(),
-            r.verifyMethod(), r.failReason(),
+            r.verifyMethod(), r.failReason(), r.blockTimestamp(),
         )
     }
 
@@ -526,7 +526,7 @@ class DesktopNodeController(
         val ens = handle.ens()
             ?: throw IllegalStateException("ENS is not available on $network")
         val r = withContext(Dispatchers.IO) { ens.resolveAddress(name.trim(), EnsRoot.AUTO) }
-        return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error())
+        return EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.verified(), r.error(), r.blockTimestamp())
     }
 
     // ------------------------------------------------------------------------------

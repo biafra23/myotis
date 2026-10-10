@@ -78,9 +78,9 @@ final class RustEnsApi implements EnsApi {
         Parsed p = Parsed.of(json);
         return switch (p.status) {
             case "ok" -> new EnsResolutionResult(
-                    name, p.requireString("addressHex"), p.block, p.verified, null);
-            case "noRecord" -> new EnsResolutionResult(name, null, p.block, p.verified, null);
-            case "offchain" -> new EnsResolutionResult(name, null, p.block, p.verified, OFFCHAIN);
+                    name, p.requireString("addressHex"), p.block, p.verified, null, p.timestamp);
+            case "noRecord" -> new EnsResolutionResult(name, null, p.block, p.verified, null, p.timestamp);
+            case "offchain" -> new EnsResolutionResult(name, null, p.block, p.verified, OFFCHAIN, p.timestamp);
             default -> throw p.unknownStatus();
         };
     }
@@ -112,9 +112,9 @@ final class RustEnsApi implements EnsApi {
             // no reverse resolver, and a failed verify are all "noRecord"
             // (Java parity — indistinguishable, no special error token).
             case "ok" -> new EnsResolutionResult(
-                    p.requireString("name"), addressHex, p.block, p.verified, null);
-            case "noRecord" -> new EnsResolutionResult(null, addressHex, p.block, p.verified, null);
-            case "offchain" -> new EnsResolutionResult(null, addressHex, p.block, p.verified, OFFCHAIN);
+                    p.requireString("name"), addressHex, p.block, p.verified, null, p.timestamp);
+            case "noRecord" -> new EnsResolutionResult(null, addressHex, p.block, p.verified, null, p.timestamp);
+            case "offchain" -> new EnsResolutionResult(null, addressHex, p.block, p.verified, OFFCHAIN, p.timestamp);
             default -> throw p.unknownStatus();
         };
     }
@@ -375,9 +375,10 @@ final class RustEnsApi implements EnsApi {
      * The pinned envelope of every record JSON: status + blockNumber + verified
      * (all mandatory — a missing one is native shape drift and fails closed as
      * an {@link EngineException}, which the public methods fold into the
-     * result's error).
+     * result's error), and since ABI 41 the block's timestamp (unix seconds,
+     * -1 when absent).
      */
-    private record Parsed(JsonObject o, String status, long block, boolean verified) {
+    private record Parsed(JsonObject o, String status, long block, boolean verified, long timestamp) {
         static Parsed of(String json) {
             if (json == null || json.isBlank()) {
                 throw new EngineException((json == null ? "null" : "blank")
@@ -402,7 +403,8 @@ final class RustEnsApi implements EnsApi {
                     throw new EngineException(
                             "ens-record JSON: missing status/blockNumber/verified");
                 }
-                return new Parsed(o, status.asString(), bn.asLong(), verified.asBoolean());
+                return new Parsed(o, status.asString(), bn.asLong(), verified.asBoolean(),
+                        RustChainHandle.longOrMinusOne(o, "blockTimestamp"));
             } catch (EngineException e) {
                 throw e;
             } catch (RuntimeException e) {

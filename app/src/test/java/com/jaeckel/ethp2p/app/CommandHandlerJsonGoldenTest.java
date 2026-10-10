@@ -55,7 +55,8 @@ class CommandHandlerJsonGoldenTest {
                 1490,
                 1492,
                 21000100,
-                21000130);
+                21000130,
+                -1);
     }
 
     @Test

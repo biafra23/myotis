@@ -184,7 +184,7 @@ class AndroidNodeController(
                 r.address(), r.exists(), r.nonce(), r.balanceWei(),
                 r.storageRootHex(), r.codeHashHex(), r.blockNumber(), r.peerStateRootHex(),
                 r.peerProofValid(), r.beaconChainVerified(), r.blsVerified(), r.matchedBeaconSlot(),
-                r.verifyMethod(), r.failReason(),
+                r.verifyMethod(), r.failReason(), r.blockTimestamp(),
             )
         }
     }
@@ -192,7 +192,7 @@ class AndroidNodeController(
     override suspend fun resolveEns(network: String, name: String): EnsResult {
         val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
         return svc.resolveEns(network, name).await().let { r ->
-            EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.beaconVerified(), r.error())
+            EnsResult(r.name(), r.addressHex(), r.blockNumber(), r.beaconVerified(), r.error(), r.blockTimestamp())
         }
     }
 

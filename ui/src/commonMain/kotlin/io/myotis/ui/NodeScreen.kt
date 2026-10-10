@@ -1967,7 +1967,12 @@ private fun AccountResultView(a: AccountResult, currency: String?, expert: Boole
                 // The nonce, in a wallet user's words — a contract's counts its creations.
                 // Muted with the balance while the result is a claim.
                 if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString(), muted = !verified)
-                ResultStat("Block", a.blockNumber.toString(), muted = !verified)
+                // The block's age beneath its number, when the engine proved the
+                // block's timestamp (it does for a verified read of the attested block).
+                ResultStat(
+                    "Block", a.blockNumber.toString(), muted = !verified,
+                    detail = rememberBlockAge(a.blockTimestamp),
+                )
             }
             TextButton(onClick = { showRaw = !showRaw }) {
                 Text(if (showRaw) "Hide raw details" else "Show raw details")
@@ -1991,7 +1996,7 @@ private fun AccountResultView(a: AccountResult, currency: String?, expert: Boole
 
 /** A small labelled number on the result card; [muted] while the result is only a peer's claim. */
 @Composable
-private fun ResultStat(label: String, value: String, muted: Boolean) {
+private fun ResultStat(label: String, value: String, muted: Boolean, detail: String? = null) {
     Column {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(
@@ -1999,6 +2004,10 @@ private fun ResultStat(label: String, value: String, muted: Boolean) {
             style = MaterialTheme.typography.titleMedium,
             color = if (muted) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
         )
+        // A small line beneath the value, e.g. a block's age.
+        detail?.let {
+            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -2100,7 +2109,16 @@ private fun EnsResultView(e: EnsResult) {
         }
         StatusRow("Name", e.name)
         StatusRow("Address", e.addressHex ?: "—")
-        StatusRow("Block", if (e.blockNumber >= 0) e.blockNumber.toString() else "—")
+        // The block's age next to its number, from the verified header the resolution ran against.
+        val age = rememberBlockAge(e.blockTimestamp)
+        StatusRow(
+            "Block",
+            when {
+                e.blockNumber < 0 -> "—"
+                age != null -> "${e.blockNumber} · $age"
+                else -> e.blockNumber.toString()
+            },
+        )
         StatusRow(
             "Verified",
             if (e.verified) "✓ finalized" else "unverified (peer head)",

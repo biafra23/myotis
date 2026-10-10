@@ -1685,7 +1685,8 @@ public final class NodeService extends Service {
             boolean blsVerified,             // beacon match was BLS-signed (vs. unverified header)
             long matchedBeaconSlot,          // -1 when not matched
             String verifyMethod,             // "stateRootMatch" or null
-            String failReason                // null when verified
+            String failReason,               // null when verified
+            long blockTimestamp              // blockNumber's proven timestamp (unix s); -1 when none
     ) {}
 
     @Override
@@ -1813,7 +1814,8 @@ public final class NodeService extends Service {
                 r.address(), r.exists(), r.nonce(), r.balanceWei(),
                 r.storageRootHex(), r.codeHashHex(), r.blockNumber(),
                 r.peerStateRootHex(), r.peerProofValid(), r.beaconChainVerified(),
-                r.blsVerified(), r.matchedBeaconSlot(), r.verifyMethod(), r.failReason());
+                r.blsVerified(), r.matchedBeaconSlot(), r.verifyMethod(), r.failReason(),
+                r.blockTimestamp());
     }
 
     // ---------------------------------------------------------------------
@@ -1856,7 +1858,8 @@ public final class NodeService extends Service {
      * cryptographically anchored; false in PEER_HEAD mode (peer-claimed mapping).
      */
     public record EnsResolution(String name, String addressHex, long blockNumber,
-                                boolean beaconVerified, String error) {}
+                                boolean beaconVerified, String error,
+                                long blockTimestamp /* unix s, verified header; -1 when none */) {}
 
     /**
      * Which state ENS resolution runs against. Defaults to AUTO (beacon-verified
@@ -1898,13 +1901,13 @@ public final class NodeService extends Service {
         // a chain that can't have them; the UI also hides the ENS path there.
         if (!networkInfo(n).hasEns()) {
             return CompletableFuture.completedFuture(new EnsResolution(
-                    trimmed, null, -1, false, "ENS is not available on " + n));
+                    trimmed, null, -1, false, "ENS is not available on " + n, -1));
         }
         ChainHandle handle = handles.get(n);
         io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
         if (!RUNNING.get() || ens == null) {
             return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, false, "node not running on " + n));
+                    new EnsResolution(trimmed, null, -1, false, "node not running on " + n, -1));
         }
         // Delegate to the engine's shared resolution machinery (one AUTO → FINALIZED →
         // PEER_HEAD policy for daemon + desktop + Android). The engine call is blocking —
@@ -1914,7 +1917,7 @@ public final class NodeService extends Service {
         return CompletableFuture.supplyAsync(() -> {
             EnsResolutionResult r = ens.resolveAddress(trimmed, root);
             return new EnsResolution(r.name(), r.addressHex(), r.blockNumber(),
-                    r.verified(), r.error());
+                    r.verified(), r.error(), r.blockTimestamp());
         }, QUERY_POOL);
     }
 
