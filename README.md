@@ -56,7 +56,7 @@ The Android and desktop apps and the desktop daemon run an embedded JSON-RPC ser
 
 **Connecting MetaMask:** MetaMask runs on the same device as the node. Add a custom network pointing at `http://localhost:8545` (chain id 1 for mainnet). The desktop daemon serves the same verified JSON-RPC (mainnet on `127.0.0.1:8545`) and additionally exposes the verified operations over its CLI/IPC socket (see *Query commands* below).
 
-**Web pages and browser-extension wallets:** by default no web page may use the node — a page open in a browser on the same device is refused until you allow its origin under *Settings → Web page access* (the apps show a refused page on the Status screen, and Android as a notification, each with an **Allow** button). The MetaMask *extension* in Chrome or Firefox counts as a site and needs allowing once; MetaMask Mobile and other native wallet apps are not web pages and always work. Details and the rules the gate applies: [docs/web-page-access.md](docs/web-page-access.md).
+**Web pages and browser-extension wallets:** by default no web page may use the node — a page open in a browser on the same device is refused until you allow its origin under *Settings → Web page access* (the apps show a refused page on the Status screen with an **Allow** button, and raise a notification for it: on Android with Allow in it, on desktop through the tray icon). The MetaMask *extension* in Chrome or Firefox counts as a site and needs allowing once; MetaMask Mobile and other native wallet apps are not web pages and always work. Details and the rules the gate applies: [docs/web-page-access.md](docs/web-page-access.md).
 
 ### Implemented (verified) methods
 

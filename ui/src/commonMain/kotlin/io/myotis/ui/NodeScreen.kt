@@ -129,6 +129,10 @@ fun NodeScreen(
     netStatus: NetworkStatus = AlwaysOnline,
     onOpenNetworkSettings: () -> Unit = {},
     history: QueryHistory = NoQueryHistory,
+    // Bumped by the host to bring the Status tab forward: the desktop does when the user
+    // clicks a refused-web-page notification, so the banner with Allow is on screen.
+    // 0 (the default) never switches.
+    statusRequests: Int = 0,
 ) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
@@ -180,6 +184,7 @@ fun NodeScreen(
     // Selection is the tab's LABEL, not its position — positions shift when Index
     // appears/disappears. A selection whose tab just vanished falls back to Status.
     var tabLabel by remember { mutableStateOf("Status") }
+    LaunchedEffect(statusRequests) { if (statusRequests > 0) tabLabel = "Status" }
     val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
     // The fallback also RESETS the stale label: without this, a selection stuck on a
     // vanished tab would silently jump back to it if a future change ever flipped the

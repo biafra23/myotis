@@ -98,6 +98,21 @@ browser, which is why the apps surface it themselves:
   Android 12+ asks for the device to be unlocked first, older versions keep
   the notification off the lock screen. Allowing the site from the app clears
   the notification.
+- **Desktop notification**: the desktop app shows a tray icon (where the
+  desktop has a system tray) and raises a native notification when a site is
+  refused under *Specific sites* — Notification Center on macOS, a toast on
+  Windows. A site is announced once; it is announced again only after one of
+  its requests was served (it was allowed) and it is then refused anew; at
+  most twenty announcements per run. Desktop notifications carry no buttons,
+  so it points at the app; when the Myotis window is not focused the dock
+  icon bounces once (macOS) or the taskbar entry flashes (Windows). The tray
+  icon's menu and a double-click on it (and, on Windows, a click on the
+  notification) bring the window forward on the Status tab, where the banner
+  has **Allow**; and after an announcement the window opens on the Status tab
+  the next time it comes forward however the user gets there — on macOS a
+  click on the notification activates the app rather than reaching the tray.
+  A desktop without a system tray (GNOME, by default) keeps the banner only,
+  and the log says so at start.
 - **Settings → Web page access**: the mode, the allowed-sites list with Remove
   and an add field, and **Recent web pages** — every origin that tried this
   run, folded across networks, with network, allowed/refused, attempt count
@@ -125,7 +140,7 @@ without a response, so the choice was made for us; what the page can learn is
 | engines | `ChainStack` / `RustChainHandle` own one `WebAccess` per network and hand it to `MyotisRpc.server(…)`; the policy never crosses the FFI — the listener is the shared Kotlin server on both engines. |
 | `:ui` | `Settings.webAccessMode/webAccessOrigins/supportsWebAccess`, `NodeController.applyWebAccess`, `NodeSnapshot.webOrigins`, `WebAccessScreens.kt` (section + banner — shown only where the host answers `supportsWebAccess()`, never as inert controls), `WebAccessUi` (normalize — pinned to the engine's by `WebAccessParityTest` —, merge, pending refusals). |
 | Android | `NodeService` prefs `webAccess.mode` / `webAccess.origins`, pre-start apply, `applyWebAccess`, `recentWebOrigins`, the notification. |
-| desktop | `DesktopSettings` keys `webAccess.mode` / `webAccess.origins`, pre-start apply under the served-window lock, `applyWebAccess`, snapshot rows. |
+| desktop | `DesktopSettings` keys `webAccess.mode` / `webAccess.origins`, pre-start apply under the served-window lock, `applyWebAccess`, snapshot rows; the tray icon, native notification and attention request (`DesktopAlerts.kt`, the once-per-site rules in `WebRefusalAlerts`). |
 | daemon | `-Dmyotis.rpc.webAccess=off\|all\|<origin>,<origin>…` (`-PwebAccess=…` on `:app:run`); no settings file, so this is its only knob. |
 | iOS | Not wired yet (follow-up from #502): `supportsWebAccess()` is false, so no section and no banner show; the listener runs the default policy (specific sites, none — web pages refused). |
 
