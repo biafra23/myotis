@@ -10,6 +10,12 @@ not let the user choose their RPC endpoint — whether such a browser could
 redirect a dApp's own RPC calls to the engine. Decisions it leaves open are
 marked as the owner's call. Nothing here is scheduled.
 
+**Owner's verdict (2026-10-10): postponed.** No dApp browser in the myotis
+apps until more details about what one would add arrive; for now the Freedom
+browser's integration (§1, §5) is good enough. This document stays as the
+record to pick the question up from. The loopback-endpoint finding (§1, §9
+phase 0) is independent of the verdict and remains open.
+
 **Short answer.** A general embedded dApp browser does not fit myotis, and the
 problem is less the browser than what it drags in: a dApp is only usable once
 something can sign for it, and myotis deliberately holds no keys, so "a dApp
@@ -404,6 +410,11 @@ content-addressed fetch paths and the signer, and embeds myotis as the node —
 gets the same outcome with the boundary where this project has kept it.
 
 ## 10. Decisions for the owner
+
+Decided 2026-10-10: item 2 is **postponed** — a dApp surface stays with
+hosts that embed the engine (the Freedom browser) until more details about
+the advantages of an embedded browser arrive. Items 3–5 are moot until item
+2 is reopened. Item 1 is unaffected by the verdict and still open.
 
 1. Phase 0's exact policy for browser origins on the loopback endpoint
    (refuse web origins and keep extension origins is the proposal; a pairing
