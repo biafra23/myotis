@@ -37,6 +37,7 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
             [--log-index-config FILE]              # enables eth_getLogs for a watch-list
             [--import-log-index FILE]...           # snapshot(s) imported after the config
             [--checkpoint-root 0x… --checkpoint-slot N]
+            [--boot-enodes enode://…,…|@FILE]      # EL peers to dial first
             [--accept-stale-anchor] [--ws-bound-periods N]
             [--log-calls FILE] [--access-log]
             [--ready-wait 90] [--workers 16]
@@ -115,6 +116,31 @@ with `-32000` and an explanation. Two ways forward, both explicit:
   synced, the data dir resumes from its own fresh snapshot and the flag is no
   longer needed. `--ws-bound-periods` overrides the bound itself, with the same
   trade-off.
+
+### --boot-enodes
+
+The EL pool dials a network's pinned `enode://` URLs first, then its peer cache,
+then whatever discovery finds. Mainnet and Gnosis ship no pins, so a cold start
+(a fresh data dir, no cache) has to wait for discovery to surface a peer that
+serves snap, and on mainnet that can take a long time: most peers that advertise
+snap there are still syncing, or never answer. `--boot-enodes` gives the pool
+servers the operator already knows to be good, through the engine's host seed
+pins (`myotis_set_boot_enodes`, #465):
+
+```bash
+myotis-rpcd --network mainnet --boot-enodes enode://<128 hex>@203.0.113.7:30303,enode://…
+myotis-rpcd --network mainnet --boot-enodes @/etc/myotis/mainnet-enodes.txt
+```
+
+A file has one URL per line; blank lines and `#` comments are skipped. Each URL
+must be `enode://<128 hex pubkey>@ip:port` (an IP address: a DNS name is
+refused, not resolved), at most 64 of them, no address twice. The engine
+applies the list or refuses it as a whole, naming every bad entry, and the
+daemon then exits before starting. A pin is a dial hint, not trust: everything
+a pinned peer serves is verified like any other peer's answer. Pins are never
+written to the peer cache; the pool re-dials them while it is short of serving
+peers, and a pin that is down or does not serve snap is backed off like any
+other peer.
 
 ### eth_getLogs
 
