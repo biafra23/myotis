@@ -68,5 +68,12 @@ class EnsContenthashTest {
         assertEquals("https://sub.myotis.eth.limo/", ensGatewayUrl("sub.myotis.eth"))
         assertNull(ensGatewayUrl("example.com"))
         assertNull(ensGatewayUrl(".eth"))
+        // A .eth label can hold anything (registered by hash): a name that is not a plain
+        // hostname gets no gateway button, or its host would not be eth.limo.
+        assertNull(ensGatewayUrl("evil.com/x.eth"))
+        assertNull(ensGatewayUrl("a?b.eth"))
+        assertNull(ensGatewayUrl("a#b.eth"))
+        assertNull(ensGatewayUrl("ümlaut.eth"))
+        assertEquals("https://my-name2.eth.limo/", ensGatewayUrl("my-name2.eth"))
     }
 }

@@ -14,9 +14,6 @@ import io.myotis.ui.Settings
 import io.myotis.ui.UpgradeNotice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.async
 // On Kotlin/Native, Dispatchers.IO is an extension property — this import is load-bearing.
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.SupervisorJob

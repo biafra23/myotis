@@ -83,6 +83,7 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -1365,6 +1366,9 @@ private fun QueryTab(
     var ensProfile by remember(network) { mutableStateOf<EnsProfile?>(null) }
     var ensProfileError by remember(network) { mutableStateOf<String?>(null) }
     var ensProfileLoading by remember(network) { mutableStateOf(false) }
+    // The on-demand records read in flight, so a new lookup cancels it and a superseded
+    // job never writes into the card of a later name (the scanJob pattern below).
+    var ensRecordsJob by remember(network) { mutableStateOf<Job?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
     // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
@@ -1436,6 +1440,7 @@ private fun QueryTab(
         if (q.isEmpty() || loading) return
         input = q
         loading = true; error = null; account = null; ens = null
+        ensRecordsJob?.cancel(); ensRecordsJob = null
         ensProfile = null; ensProfileError = null; ensProfileLoading = false
         scope.launch {
             try {
@@ -1526,18 +1531,26 @@ private fun QueryTab(
                 // The records beyond the address, on demand — a name without an address can
                 // still carry them. Their failure shows on the card, never as the query's error.
                 onReadRecords = {
+                    ensRecordsJob?.cancel()
                     ensProfileLoading = true; ensProfileError = null
-                    scope.launch {
+                    // Started lazily so the ownership check below sees THIS job even when the
+                    // host answers without suspending (a dispatcher that runs it inline).
+                    val job = scope.launch(start = CoroutineStart.LAZY) {
                         try {
-                            ensProfile = controller.resolveEnsProfile(network, e.name)
+                            val result = controller.resolveEnsProfile(network, e.name)
+                            // A later lookup or click cancelled and replaced this job; only
+                            // the job the card still owns may fill it.
+                            if (ensRecordsJob === coroutineContext[Job]) ensProfile = result
                         } catch (c: CancellationException) {
                             throw c
                         } catch (t: Throwable) {
-                            ensProfileError = t.message ?: t.toString()
+                            if (ensRecordsJob === coroutineContext[Job]) ensProfileError = t.message ?: t.toString()
                         } finally {
-                            ensProfileLoading = false
+                            if (ensRecordsJob === coroutineContext[Job]) ensProfileLoading = false
                         }
                     }
+                    ensRecordsJob = job
+                    job.start()
                 },
             )
             Spacer(Modifier.height(12.dp))
@@ -2047,7 +2060,8 @@ private fun EnsResultView(
                         "Reads the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and " +
                             "its common text records (avatar, description, url, email, com.twitter, " +
                             "com.github, org.telegram, com.discord), each verified against finalized " +
-                            "state. Every record is its own resolution, so this costs more than the " +
+                            "state where possible — a record served from the peer head is marked as " +
+                            "such. Every record is its own resolution, so this costs more than the " +
                             "address lookup.",
                     )
                 }

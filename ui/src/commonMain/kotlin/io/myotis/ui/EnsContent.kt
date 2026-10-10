@@ -69,11 +69,16 @@ internal fun decodeContenthash(hex: String): ContentLink? {
 /**
  * The eth.limo gateway page for a `.eth` name — a THIRD PARTY that resolves the name
  * itself and serves its content over HTTPS, so opening it leaves the verified path. Null
- * for any other name.
+ * for any other name, and for a `.eth` name that is not a plain hostname: labels are
+ * registered by hash, so a resolvable name can carry `/`, `?`, `#` or anything else, and
+ * `https://evil.com/x.eth.limo/` would open `evil.com` under a button that says eth.limo.
+ * Only `[a-z0-9.-]` names get the offer; the decoded link with Copy serves the rest.
  */
 internal fun ensGatewayUrl(name: String): String? {
     val n = name.trim().lowercase()
-    return if (n.endsWith(".eth") && n.length > 4) "https://$n.limo/" else null
+    if (!n.endsWith(".eth") || n.length <= 4) return null
+    if (!n.all { it in 'a'..'z' || it in '0'..'9' || it == '.' || it == '-' }) return null
+    return "https://$n.limo/"
 }
 
 private class Cid(val version: Long, val codec: Long, val multihash: ByteArray, val bytes: ByteArray)
