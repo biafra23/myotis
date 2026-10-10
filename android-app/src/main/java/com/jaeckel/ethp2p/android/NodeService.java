@@ -43,9 +43,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Foreground service that hosts the Myotis node on Android: one engine stack per enabled
  * network (beacon light client, execution-layer peers, the loopback JSON-RPC listener),
- * reached only through the {@code :myotis-api} contract — plus the host-side concerns
- * around it: the ongoing notification, idle sleep and wake-on-request, the background
- * catch-up passes, and the settings the Compose UI shares.
+ * reached through the {@code :myotis-api} contract, with one documented exemption (CLAUDE.md:
+ * the TrueBlocks transaction-history scan, {@link #txHistoryService}, which takes the Java
+ * engine's raw connector via {@code debugStack}) — plus the host-side concerns around it:
+ * the ongoing notification, idle sleep and wake-on-request, the background catch-up passes,
+ * and the settings the Compose UI shares.
  */
 public final class NodeService extends Service {
 
