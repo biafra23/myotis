@@ -222,6 +222,21 @@ pub fn set_tor_enabled(on: bool) -> bool {
     }
 }
 
+/// `nativeSetTorStorageDirs`: where the embedded Arti client keeps its state and
+/// directory cache (`myotis_net::el::tor::set_storage_dirs` has the rules).
+/// `false` — refused — when this build has no Tor support.
+pub fn set_tor_storage_dirs(state_dir: &str, cache_dir: &str) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_storage_dirs(state_dir, cache_dir)
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = (state_dir, cache_dir);
+        false
+    }
+}
+
 /// `nativeTorStatus`: a small bitmask for the host's Status view —
 /// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
 /// this build has no Tor support at all.

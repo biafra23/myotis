@@ -134,6 +134,7 @@ public final class NodeService extends Service {
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
     private static final String K_PREFER_JAVA = "engine.preferJava";
+    private static final String K_TOR_ROUTING = "tor.routing";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     private static final String K_EXPERT_MODE = "expertMode";
@@ -673,6 +674,72 @@ public final class NodeService extends Service {
         System.setProperty(io.myotis.engines.Engines.PROP, choice);
         io.myotis.engines.Engines.select(choice);
         return choice;
+    }
+    /** Settings toggle: route account (balance/nonce) reads over Tor (docs/privacy-and-tor.md).
+     *  Default off. Experimental and Rust-engine-only, and only a {@code -PtorEngine} build can
+     *  honour it ({@link #torSupported}) — the Settings row is shown only there, so a Tor-less
+     *  build never offers a privacy switch it would ignore. Applied by {@link #applyTorMode}. */
+    public static boolean torEnabled(android.content.Context c) {
+        return prefs(c).getBoolean(K_TOR_ROUTING, false);
+    }
+    public static void setTorEnabled(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_TOR_ROUTING, v).apply();
+    }
+    /** Whether this build can route over Tor at all: an APK built with {@code -PtorEngine}
+     *  ({@link BuildConfig#TOR_ENGINE}) whose loaded engine library confirms it. Every other
+     *  APK answers false without touching the native library. Constant for the process. */
+    public static boolean torSupported() {
+        return BuildConfig.TOR_ENGINE && io.myotis.engines.Tor.supported();
+    }
+    /** Arti's state directory (guard selection — never backed up: it describes this device's
+     *  path into Tor) and its directory cache (re-downloadable, so the system may reclaim it).
+     *  Both app-private. Named explicitly because Arti's defaults derive from {@code $HOME},
+     *  which an app process has no usable value for — the engine refuses to bootstrap without. */
+    static java.io.File torStateDir(android.content.Context c) {
+        return new java.io.File(c.getNoBackupFilesDir(), "arti/state");
+    }
+    static java.io.File torCacheDir(android.content.Context c) {
+        return new java.io.File(c.getCacheDir(), "arti");
+    }
+    /** Serializes {@link #applyTorMode}'s read-the-pref-then-push: it runs on boot workers
+     *  and on the UI thread (the Settings switch), and an older value pushed after a newer
+     *  one would leave reads on the clearnet pool while the switch shows ON. */
+    private static final Object TOR_APPLY_LOCK = new Object();
+
+    /** Push the Tor setting to the process-global Rust-engine flag. LIVE, unlike the engine
+     *  choice: the engine checks the flag per read, so the next account read of a running
+     *  Rust-engine network routes over Tor (or stops doing so) with no restart. Turning it on
+     *  names Arti's directories first; an OFF that never followed an ON stays a no-op that
+     *  does not load the native library ({@code Tor.select}). Re-applied on each network boot
+     *  because the flag lives in the native library and so starts off in every new process.
+     *  Returns the verdict for the boot log: {@code off}, {@code on}, {@code unsupported}
+     *  (ON in Settings, but no Tor in this build — a pref left over from a {@code -PtorEngine}
+     *  install, whose Settings row this build hides; like the desktop with a Tor-less dylib,
+     *  reads stay on the clearnet pool because this engine has no Tor path to refuse with),
+     *  or {@code storage refused} (ON, but Arti cannot bootstrap: reads routed over Tor fail
+     *  closed — never quietly fall back to the clearnet pool). */
+    public static String applyTorMode(android.content.Context c) {
+        synchronized (TOR_APPLY_LOCK) {
+            boolean on = torEnabled(c);
+            if (!on) {
+                io.myotis.engines.Tor.select(false);
+                return "off";
+            }
+            if (!torSupported()) {
+                LogBuffer.w(TAG, "Tor routing is ON in Settings but this build has no Tor "
+                        + "support (needs an APK built with -PtorEngine, with the Rust engine): "
+                        + "account reads use the clearnet peer pool");
+                return "unsupported"; // nothing to push: no Tor path exists in this engine
+            }
+            boolean stored = io.myotis.engines.Tor.configureStorage(
+                    torStateDir(c).getAbsolutePath(), torCacheDir(c).getAbsolutePath());
+            if (!stored) {
+                LogBuffer.w(TAG, "Tor storage directories refused: reads routed over Tor "
+                        + "will fail closed");
+            }
+            io.myotis.engines.Tor.select(true);
+            return stored ? "on" : "storage refused";
+        }
     }
     /** Whether this device's ART can run the Java engine at all (see {@link EngineGate}). */
     public static boolean javaEngineSupported() {
@@ -2107,11 +2174,15 @@ public final class NodeService extends Service {
             // Same idea for the engine choice: the Settings toggle also applies it on flip,
             // re-applying here makes a freshly (re)started network honor the current setting.
             String engineChoice = applyEngineChoice(this);
+            // And the Tor flag (process-global and live; see applyTorMode), after the engine
+            // choice it depends on.
+            String torMode = applyTorMode(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice
                     + ", engine " + engineChoice
+                    + ", tor " + torMode
                     + (javaEngineSupported() ? "" : " (Java engine needs API "
                             + EngineGate.JAVA_ENGINE_MIN_SDK + "+, no fallback)")
                     + ")");

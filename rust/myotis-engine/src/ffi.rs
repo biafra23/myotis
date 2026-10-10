@@ -87,6 +87,17 @@ pub fn tor_status() -> i32 {
     crate::host::tor_status()
 }
 
+/// Name the absolute directories the embedded Tor client keeps its state and
+/// its directory cache in. Required on Android before the first Tor read (Arti's
+/// defaults derive from `$HOME`); elsewhere unset means Arti's platform
+/// defaults. True iff the client will use exactly these: a different pair once
+/// a bootstrap holds its directories, a relative path, or a Tor-less build
+/// answers false. Process-global, not per-handle.
+#[uniffi::export]
+pub fn set_tor_storage_dirs(state_dir: String, cache_dir: String) -> bool {
+    crate::host::set_tor_storage_dirs(&state_dir, &cache_dir)
+}
+
 /// Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
 /// system resolver (#539) — for every network this process runs. Off until a
 /// host switches it on; never used while Tor is enabled. Returns the state now

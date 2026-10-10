@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 42
+#define MYOTIS_ABI_VERSION 43
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -88,6 +88,14 @@ bool myotis_set_tor_enabled(bool on);
 /* Tor status bitmask: bit0 compiled-in, bit1 enabled, bit2 bootstrapped.
  * 0 = this build has no Tor support. */
 int32_t myotis_tor_status(void);
+
+/* Name the absolute directories the embedded Tor client keeps its state and
+ * its directory cache in, before the first Tor read (required on Android;
+ * elsewhere unset means Arti's platform defaults). Returns true iff the client
+ * will use exactly these: false for a NULL, non-UTF-8 or relative path, a
+ * different pair once a bootstrap holds its directories, or a Tor-less build.
+ * Process-global, not per-handle. */
+bool myotis_set_tor_storage_dirs(const char *state_dir, const char *cache_dir);
 
 /* Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
  * system resolver — for every network this process runs. Off by default: a

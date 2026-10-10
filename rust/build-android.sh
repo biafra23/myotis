@@ -15,6 +15,11 @@
 # script fails the build if anything slips through.
 #
 # Then: rust/build-android.sh
+#
+# MYOTIS_TOR_ENGINE=1 also compiles Tor into the engine (`--features
+# myotis-engine/tor`: Arti on rustls + ring, SQLite bundled — see the TLS note in
+# myotis-net/Cargo.toml and docs/privacy-and-tor.md). It adds megabytes per ABI,
+# so it stays off unless asked for; Gradle sets it for `-PtorEngine`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +35,15 @@ cd "$here"
 # (the Rust engine behind :myotis-engines' RustEngineNative). 16 KB-aligned
 # LOAD segments (.cargo/config.toml passes -Wl,-z,max-page-size=16384) so the
 # libs load on Android 15+ devices with 16 KB memory pages.
-cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine
+# A plain string, not an array: macOS's bash 3.2 rejects an empty array
+# expansion under `set -u`.
+tor_features=""
+if [ "${MYOTIS_TOR_ENGINE:-0}" = "1" ]; then
+    tor_features="--features myotis-engine/tor"
+    echo "building with Tor (myotis-engine/tor)"
+fi
+# shellcheck disable=SC2086 # $tor_features is empty or two words, split on purpose
+cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine $tor_features
 
 # cargo-ndk copies EVERY dynamic library the build graph produces, including
 # hash-named dependency artifacts (e.g. libif_watch-<hash>.so) that
