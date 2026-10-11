@@ -71,17 +71,19 @@ Use it through the script for every swarm-cli command below
 swarm-cli asks for the password itself; it never passes through the script or
 a command line. The script adds the checks around it:
 
-- `site/` matches `origin/main`: only merged, reviewed content goes live
-  (override with `SWARM_ALLOW_UNMERGED=1`);
+- what goes live is a clean `git archive` of `origin/main`'s `site/` (after a
+  fetch), never the working tree, so a local edit, an unmerged branch or a
+  file git ignores (a Finder `.DS_Store`) cannot reach `myotis.eth`
+  (`SWARM_ALLOW_UNMERGED=1` publishes the working tree instead);
 - the batch is usable, immutable, and one this feed has been published with
   before (override with `SWARM_NEW_BATCH=1`, see *Keeping it alive*);
 - the feed key exists and signs **the** feed: a different key would make a
   different feed, which `myotis.eth` does not point at;
-- afterwards, your node serves every file of `site/`, the root included;
+- afterwards, your node serves every file of that export, the root included;
 - where `myotis.eth` points, read through your Myotis node on `127.0.0.1:8545`
   (or `ETH_RPC_URL`, an Ethereum mainnet RPC).
 
-It needs Node 18+ (with npm) and git.
+It needs Node 18+ (with npm), git and tar.
 
 `scripts/site_swarm_feed.json` records the feed manifest and every batch the
 feed has been published with. `publish` writes it before uploading; **commit it
@@ -132,14 +134,16 @@ deploying by itself and stays up as a mirror.
    records → Content hash*, enter `bzz://<feed manifest>` and confirm the
    transaction.
 5. **Check.** `node scripts/publish_site_swarm.mjs status` reads the record
-   back, checks every batch in `scripts/site_swarm_feed.json` and compares
-   what Swarm serves with `site/`. Then open
+   back, checks every batch in `scripts/site_swarm_feed.json`, and compares
+   what your node and the public gateway serve with `origin/main`'s `site/`.
+   It exits non-zero when something needs attention, so it can run from cron. Then open
    `https://myotis.eth.limo` (eth.limo may cache the old answer for a few
    minutes) and `myotis.eth` in the Freedom browser.
 
 ### Every update
 
-After a change to `site/` is merged, from an up-to-date checkout of `main`:
+After a change to `site/` is merged (the script publishes `origin/main`'s, so
+any checkout will do):
 
 ```bash
 SWARM_STAMP=<batch id> node scripts/publish_site_swarm.mjs publish
