@@ -154,6 +154,9 @@ ECDSA-authenticated broadcast, not peer data.
                              BLS signatures forward → a verified recent beacon block header.
                              Extract the ExecutionPayloadHeader (Merkle "execution branch"):
                                 stateRoot, blockHash, blockNumber, baseFeePerGas.
+                             (From Gloas — sepolia since 2026-10-06 — the branch proves the
+                              blockHash alone; the EL header is fetched by that hash and
+                              adopted iff keccak256(RLP(header)) equals it.)
 
 2. EXECUTION DISCOVERY       discv4 (UDP Kademlia) + EIP-1459 DNS + direct enode dials find
                              eth/snap peers; RLPx (ECIES handshake → AES-CTR framed channel)
@@ -178,27 +181,45 @@ ECDSA-authenticated broadcast, not peer data.
 ```
 embedded checkpoint root
    └─(checkpoint pin: hash_tree_root(bootstrap header) == checkpoint)
-beacon sync committee (512 BLS pubkeys, Merkle-proven into the pinned header's state)
+beacon sync committee (512 BLS pubkeys, Merkle-proven into the pinned header's state;
+   │                   each next committee by the next-sync-committee branch)
    └─(≥2/3 aggregate BLS signature over each attested beacon header)
 verified beacon block header  ── finality branch ──> finalized header
-   └─(execution branch: Merkle proof of ExecutionPayloadHeader into the beacon body)
+   └─(execution branch, on both headers: Merkle proof into the beacon body root)
 EL execution payload header (stateRoot, blockHash, number, baseFee)
-   ├─(direct stateRootMatch)  OR  (header-chain walk: parent-hash chain from the
-   │                               beacon-attested block hash, ≤ 8192 blocks)
-   └──> trusted EL stateRoot / blockHash
-          ├─ MPT account proof  → nonce, balance, storageRoot, codeHash
-          ├─ MPT storage proof (anchored at the account's storageRoot) → slot value
-          ├─ bytecode: keccak256(code) == codeHash
-          ├─ bodies/txs:  rebuilt trie root == transactionsRoot
-          └─ receipts:    rebuilt trie root == receiptsRoot
+   │  [from Gloas the branch proves the blockHash only; the EL header is fetched
+   │   and adopted iff keccak256(RLP(header)) == that blockHash]
+   ├─ state reads: (direct stateRootMatch: the peer's root is a beacon-attested root)
+   │               OR (headerChain: parent-hash walk DOWN from the attested optimistic
+   │               head's blockHash to the read block, which must be above the
+   │               finalized block; ≤ 8192 headers)
+   │     └──> trusted EL stateRoot
+   │            ├─ MPT account proof  → nonce, balance, storageRoot, codeHash
+   │            ├─ MPT storage proof (anchored at the account's storageRoot) → slot value
+   │            └─ bytecode: keccak256(code) == codeHash
+   └─ block reads: headerChain only (no stateRoot fast path); the window's top hashes
+                   to the attested finalized or optimistic blockHash
+         └──> trusted EL header
+                ├─ bodies/txs:  rebuilt trie root == transactionsRoot
+                └─ receipts:    rebuilt trie root == receiptsRoot
 ```
 
-Two strategies tie a peer-served header to the beacon chain:
-**`stateRootMatch`** (the header's `stateRoot` equals a beacon-attested root directly) and,
-as a fallback, **`headerChain`** (walk parent hashes from the beacon-attested block hash
-down to the target header, each link pinned by the previous header's `keccak256(RLP)`;
-bounded by `MAX_HEADER_CHAIN_GAP = 8192`). The integration tests assert results carry
-`"verifyMethod":"headerChain"` once the beacon client is `SYNCED`.
+Two strategies tie a peer-served state root to the beacon chain:
+**`stateRootMatch`** (the root equals a beacon-attested root directly) and, as a fallback,
+**`headerChain`** (walk parent hashes down from the light client's attested optimistic-head
+block hash to the read block, each header pinned by its child's `parentHash` =
+`keccak256(RLP(header))`; the read block must sit above the finalized block; bounded by
+`MAX_HEADER_CHAIN_GAP = 8192`). The walk is anchored at its TOP: a parent hash commits a
+header to its parent, never to its children, so a walk upward from an attested block would
+accept a made-up child — both engines walked that way until #611
+(`rust/myotis-net/src/el/verify.rs`, `node-core/.../VerifiedAccountQuery.java`). Block,
+transaction and receipt reads prove the header itself by hash — `headerChain` only, on a
+window topped by the finalized block (target at or below finality) or the optimistic head —
+because a matching state root proves the root, not the rest of the header. Once the beacon
+client is `SYNCED`, CLAUDE.md's integration checks expect `"verifyMethod":"headerChain"` — the
+Java engine's usual verdict, since it reads at the peer's head. The Rust engine reads at the
+attested head's own root, so its ordinary verdict is `stateRootMatch`, and `headerChain` shows
+only when a peer cannot prove at that root and the read falls back to the peer's head.
 
 > **SSZ vs MPT — never mix them.** Consensus-layer hashing is **SHA-256 + little-endian
 > SSZ merkleization**. Execution-layer hashing is **keccak-256 + big-endian RLP + Merkle-
@@ -230,6 +251,13 @@ along these lines (the engine boundary matters far more than the exact split):
 | `android-app` | Android host (foreground service, Compose UI, Android caches) | — | **Out of scope** (consumer of the engine). |
 | `besu-android-fork` | Android-compat fork of Besu | — | N/A once Besu is replaced. |
 
+> **As built** (the Rust phase — [06](06-rust-phase-notes.md), [07](07-el-implementation-plan.md)):
+> `myotis-core`, `myotis-consensus`, `myotis-evm` (ENS is its `ens` module) and `myotis-engine`
+> as named above; the EL networking crate became `myotis-wire` (the sans-I/O wire codecs,
+> `no_std` + `alloc`) plus `myotis-net` (the tokio I/O around it, CL included), and `myotis-bls`
+> carries blst. The JVM hosts keep `:jsonrpc-server` and the `:app` daemon over either engine;
+> `rust/myotis-rpcd` is a standalone JSON-RPC daemon for hosts without a JVM.
+
 ### The engine boundary (what is engine vs host)
 
 The single most important architectural idea: **`node-core` is the reusable engine**, and
@@ -238,9 +266,9 @@ engine and inject platform-specific adapters through small interfaces ("ports"):
 
 ```
             ┌──────────────────────────── host (per platform) ─────────────────────────────┐
-            │  Desktop CLI/daemon        Android NodeService          iOS app (future)        │
-            │  - UDS IPC server          - foreground service         - SwiftUI               │
-            │  - file caches             - Android file caches        - iOS file caches       │
+            │  Desktop CLI/daemon        Android NodeService          iOS app (:app-ios)      │
+            │  - UDS IPC server          - foreground service         - Compose UI (K/N)      │
+            │  - file caches             - Android file caches        - engine-owned caches   │
             │  - JVM HTTP CCIP gateway   - HttpURLConnection CCIP gw - (CCIP not driven yet)   │
             └───────────────┬───────────────────────┬───────────────────────┬────────────────┘
                             │ inject ports           │                       │
@@ -255,6 +283,10 @@ engine and inject platform-specific adapters through small interfaces ("ports"):
                   myotis-consensus           myotis-p2p-el              myotis-evm / -ens
                   (libp2p + BLS + SSZ)   (devp2p eth/snap + disc)   (EVM + ABI + CCIP + ENS)
 ```
+
+(As built, the iOS host runs only the Rust engine, over its plain C ABI
+(`rust/include/myotis_engine.h`), which keeps its caches under the host's data directory;
+the JVM hosts reach either engine through `:myotis-api`.)
 
 A host supplies: where to store caches/keys, how to do HTTP (CCIP-Read), DNS servers, a
 clock, a logger, and a user-facing surface (CLI/IPC, JSON-RPC, or direct FFI calls). The
@@ -306,18 +338,25 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
   embedded catalog), `canonicalNetworkName(alias)`, `create(EngineConfig, EnginePorts)
   -> ChainHandle` (registers, does not start), `get/hostedNetworks/stop/shutdownAll`.
   One process hosts mainnet + Gnosis + Sepolia simultaneously, each on its own ports.
-  Hosts name a concrete engine exactly once (`new JavaMyotisEngine()` today; the Rust
-  binding's factory later).
+  Hosts name an engine exactly once, at the composition root: `Engines.engine()`, the
+  `:myotis-engines` selector that routes each network to the Rust engine (default) or the
+  Java one (`myotis.engine=java|rust|auto`).
 - **`ChainHandle`** — one network: `start() -> bool` (fault-isolated), `stop()`,
   `isRunning()`, `setTargetSnapPeers(n)`, `clearPeerState()`, plus the read surfaces
   below and the verified operator queries (`requestAccount`, `getStorageProof`,
   `getHeaders`, `getBlockVerified`, `dialPeer`) returning flat result records whose
   `failReason`/`error` fields carry verification failures. Verification failures never
   throw; programmer/state errors (malformed address, network not running) DO throw the
-  API's single `EngineException`.
+  API's single `EngineException` — as does the Rust engine for `getHeaders`,
+  `getBlockVerified` and `dialPeer`, which it does not serve (its block reads go through
+  `VerifiedReads`). Since added: idle sleep (`pause`/`resume`/`lifecycle`), the
+  weak-subjectivity park (`setWsBoundPeriods`, `acceptStaleAnchor`),
+  `setServedBlockWindow`, web-page access (`setWebAccessPolicy`, `recentWebOrigins`),
+  `readStatsJson`, and JSON-string log-index methods that only the Rust engine implements.
 - **`EngineConfig`** — `(networkName, elPort, discv5Port, rpcPort [0 = per-network
   default], syncSnapshotPath, targetSnapPeers [0 = maintainer off],
-  strictStateFreshness)`.
+  strictStateFreshness, dataDir)` — `dataDir` holds engine-owned state (the Rust engine
+  requires it; the Java engine ignores it).
 - **Status**: `status() -> StatusSnapshot` (EL + beacon counts, per-peer rows),
   `discoveredPeers()`, `connectedPeers()`, `beaconStatus() -> BeaconStatus` (deep CL
   view incl. per-peer detail, bootstrapped flag, execution block hash).
@@ -327,19 +366,25 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
 | Port | Purpose | Desktop/daemon impl | Mobile impl |
 |---|---|---|---|
 | `NodeKeyStore` | 32-byte secp256k1 identity: `load(net) -> bytes?`, `store(net, bytes)` | hex file (`nodekey-<net>.hex`) | app-private file / keystore |
-| `EnginePeerCache` | EL peer cache: `add(host, port, pubkeyHex, snap)`, `recordSnapServed/Failure`, `load() -> [CachedPeerInfo]`, `close()` | file (`peers-<net>.cache`) | app-private file |
+| `EnginePeerCache` | EL peer cache: `add(host, port, pubkeyHex, snap)`, `recordSnapServed/Failure`, `recordConnectFailure`, `load() -> [CachedPeerInfo]`, `close()` | file (`peers-<net>.cache`) | app-private file |
 | `EngineClPeerCache` | CL peer cache: multiaddrs + failure counts + `ServedRange`/`BootstrapPeer` records + light-client verdicts | file (`cl-peers-<net>.cache`) | app-private file |
 | `DnsServers` | DNS IPs for EIP-1459 TXT lookups | null → system DNS | active-network DNS IPs |
 | `HttpGateway` | CCIP-Read transport: `request(method, url, body) -> String`, BLOCKING, throw on failure | java.net.http | HttpURLConnection / URLSession |
 | `EngineLogger`, `EngineClock` | log sink + monotonic clock | null → engine defaults | platform log/clock |
 
 `CachedPeerInfo = (host, port, publicKeyHex, snap, snapQuality: CONFIRMED|UNKNOWN|DENIED)`;
-quality drives dial priority (CONFIRMED first).
+quality drives dial priority (CONFIRMED first). Mainnet's files carry no `-<net>` suffix
+(`nodekey.hex`, `peers.cache`, `cl-peers.cache`).
 
 > **Rust-port simplification (recommended):** the peer-cache file formats are pure
 > persistence — a Rust engine should own them internally and shrink both cache ports to
 > plain directory-path strings in `EngineConfig`, leaving hosts only key storage + HTTP
 > + DNS. See [`05-engine-api-bindings.md`](05-engine-api-bindings.md).
+> *Status:* the Rust engine owns its caches under `EngineConfig.dataDir` (same file
+> formats); it ignores the cache ports, `NodeKeyStore` (its node key is generated per start)
+> and the logger/clock, reaches `HttpGateway` only through the JVM hosts' `CcipDriver`, and
+> takes a non-null `DnsServers` only as "DNS discovery off". The ports stay on `EnginePorts`
+> for the Java engine (`myotis-engines/.../RustMyotisEngine.java`).
 
 ### 5.3 The verified-read backend: `VerifiedReads` (the eth_* contract)
 
@@ -352,7 +397,7 @@ not-found) / `null`. Wei values are decimal strings; addresses/hashes/calldata a
 |---|---|---|
 | `chainId()` | long | config |
 | `headBlockNumber()` | Long? | beacon optimistic head |
-| `syncState()` | `SYNCING` \| `CATCHING_UP` \| `SYNCED` | beacon light client |
+| `syncState()` | `SYNCING` \| `CATCHING_UP` \| `SYNCED` \| `STALE_ANCHOR` | beacon light client (`STALE_ANCHOR`: parked past the weak-subjectivity bound) |
 | `getBalance(bytes, block)` | decimal-wei String? | MPT account proof vs anchored stateRoot |
 | `getTransactionCount(bytes, block)` | Long? | MPT account proof (+pending overlay for own txs) |
 | `getCode(bytes, block)` | bytes? | bytecode vs proven `codeHash` |
@@ -365,6 +410,14 @@ not-found) / `null`. Wei values are decimal strings; addresses/hashes/calldata a
 | `getTransactionByHash(bytes32)` | JSON String? | vs `transactionsRoot` (+ own sent-tx cache) |
 | `getTransactionReceipt(bytes32)` | JSON String? | vs `receiptsRoot` (eth/69 bloomless handled) |
 | `sendRawTransaction(bytes)` | bytes? (tx hash) | devp2p gossip (engine never signs) |
+
+Since added to the contract: `getBlockReceipts(selector)` (vs `receiptsRoot`, both engines),
+`getLogs(filterJson)` (the Rust engine's log index; the Java engine answers `null`), and
+detailed variants returning flat result records with a `Status` enum (`callDetailed`,
+`callTx`, `estimateGasDetailed`, `estimateGasTx`, `sendRawTransactionDetailed`,
+`createAccessList` — the last served by the Rust engine only), plus `supports…()`
+capability flags (state overrides, contract creation, the `finalized` tag, transaction
+lists, access-list creation) for what an engine applies rather than refuses.
 
 Plus **ENS** via `ChainHandle.ens()` (null on chains without ENS): `resolveAddress(name,
 root)` / `reverseResolve(addr)` (mandatory forward-verification) and the record lookups
@@ -390,10 +443,12 @@ fields a re-implementation needs:
 
 **EL:** `name, networkId, genesisHash, forkIdHash (4 bytes, EIP-2124), forkNext, bootnodes
 (ip:port), elEnrTreeUrls (EIP-1459 trees), elBootEnodes (full enode:// for direct dial — used
-by chains with no DNS tree, e.g. Gnosis)`.
+by chains with no DNS tree, e.g. Gnosis, and for Sepolia's dedicated serving node)`.
 
 **CL:** `genesisValidatorsRoot (32B), checkpointRoot (32B), checkpointSlot, forkSchedule
-(ascending (activation epoch, 4B version) list, genesis first, with the chain's slotsPerEpoch),
+(ascending (activation epoch, 4B version) list, genesis first, with the chain's slotsPerEpoch,
+plus the Gloas epoch where one is scheduled — the light-client wire format and proof indices
+change there),
 acceptPriorForkDigest (bool), activeBlobParamsEpoch/MaxBlobs (EIP-7892 BPO),
 clPeerMultiaddrs, clGenesisTime, clEnrTreeUrls, clDiscv5Bootnodes (ENR strings)`.
 `currentForkVersion` / `priorForkVersion` are derived from the schedule at the WALL-CLOCK epoch
@@ -404,10 +459,10 @@ pinned ahead of its activation without flipping the digest early.
 |---|---|---|---|
 | chainId | 1 | 100 | 11155111 |
 | genesis hash | `d4e56740…cb8fa3` | `4f1dd231…da79756` | `25a5cc10…93e6dd9` |
-| EL forkIdHash | `07c9462e` | `cfca387c` | `268956b6` |
+| EL forkIdHash | `07c9462e` | `cfca387c` | `268956b6`, forkNext 1791294816 (Amsterdam) → `6c1d9423` past it |
 | genesisValidatorsRoot | `4b363db9…fe95` | `f5dcb556…9d47` | `d8ea171f…8078` |
-| forkSchedule (epoch:version) | 0:`00000000`, 74240:`01000000`, 144896:`02000000`, 194048:`03000000`, 269568:`04000000`, 364032:`05000000`, 411392:`06000000` | 0:`00000064`, 512:`01000064`, 385536:`02000064`, 648704:`03000064`, 889856:`04000064`, 1337856:`05000064`, 1714688:`06000064` | 0:`90000069`, 50:`90000070`, 100:`90000071`, 56832:`90000072`, 132608:`90000073`, 222464:`90000074`, 272640:`90000075` |
-| currentForkVersion (derived) | `06000000` (Fulu) | `06000064` (Fulu) | `90000075` (Fulu) |
+| forkSchedule (epoch:version) | 0:`00000000`, 74240:`01000000`, 144896:`02000000`, 194048:`03000000`, 269568:`04000000`, 364032:`05000000`, 411392:`06000000` | 0:`00000064`, 512:`01000064`, 385536:`02000064`, 648704:`03000064`, 889856:`04000064`, 1337856:`05000064`, 1714688:`06000064` | 0:`90000069`, 50:`90000070`, 100:`90000071`, 56832:`90000072`, 132608:`90000073`, 222464:`90000074`, 272640:`90000075`, 353024:`90000076` |
+| currentForkVersion (derived) | `06000000` (Fulu) | `06000064` (Fulu) | `90000076` (Gloas, since 2026-10-06) |
 | acceptPriorForkDigest → priorForkVersion | no → — | yes → `05000064` | no → — |
 | BPO (epoch, maxBlobs) | (419072, 21) | (1337856, 2) | (275712, 21) |
 | clGenesisTime | 1606824023 | 1638993340 | 1655733600 |
@@ -427,7 +482,9 @@ Accept the current digest plus the prior-fork digest (eases fork-transition wind
 **EL fork id** (EIP-2124): the reference *pins* the 4-byte hash per network and refreshes it
 out-of-band. A faithful port should implement the real `CRC32(genesisHash ‖ forkBlocks/Times…)`
 with `forkNext` for forward-compatibility (remote peers validate *our* fork id and disconnect
-on mismatch).
+on mismatch). Both engines now pin `forkNext` too and, once that timestamp passes, announce
+the successor hash (the CRC32 step over the pin, `NetworkConfig.forkIdAt` /
+`myotis_core::forkid::fork_id_at`) — the full chain is still never recomputed.
 
 **Checkpoint refresh** is a build-time tool (`./gradlew refreshCheckpoint [-Pnetwork=…]`): query
 several independent checkpoint endpoints, normalize to the oldest finalized slot all can serve,
@@ -497,6 +554,13 @@ viable and benefits from go-ethereum covering most of the EL stack in one place.
 | JSON-RPC server | Ktor CIO + kotlinx.serialization | `axum`/`hyper` + `serde_json` | `net/http` + `encoding/json` |
 | logging | slf4j/logback | `tracing` | `log`/`slog` |
 
+> **As built (Rust):** the RLP codec (`myotis-core/src/rlp.rs`), the SSZ containers
+> (`myotis-consensus`, `sha2` for merkleization) and the MPT verifier are hand-rolled, pinned by
+> the cross-language corpora, not `alloy-rlp`/`ethereum_ssz`; keccak is `sha3`, secp256k1
+> `k256`, the EVM `revm`, BLS `blst` (`myotis-bls`). The engine declares no HTTP-client
+> dependency: CCIP-Read rides the host's `HttpGateway`, and `myotis-rpcd` serves JSON-RPC over
+> `tiny_http`.
+
 **The four heavy ports** (budget accordingly):
 1. **EVM** (Besu → revm/geth-vm): the biggest single piece. The reference's `world` package
    is an adapter to Besu's `WorldUpdater` SPI; re-target it to revm's `Database`/`DatabaseRef`
@@ -526,7 +590,11 @@ The goal is **one engine, three consumers**. Two viable strategies:
 > Android ABIs (`rust/build-android.sh`, cargo-ndk), loaded via a `BlsBackend` JNI seam. It proves
 > the "one Rust crate, both hosts" packaging below for the heaviest hot path (BLS); a full port
 > generalizes the same approach to the whole engine. See
-> [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md).
+> [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md). *Status:* the whole engine now
+> ships this way — `rust/myotis-engine` is built by `cargoNdkAndroid` into the APK's jniLibs
+> (arm64-v8a, x86_64) with UniFFI Kotlin bindings committed in `:myotis-engines`, and iOS
+> links it as a static library through its plain C ABI (`:app-ios`, or
+> `rust/build-xcframework.sh` for Swift hosts).
 
 ### Rust (recommended)
 
@@ -574,9 +642,15 @@ behind a port so hosts choose the location (file on desktop, app-private storage
 | Artifact | Reference file | Format | Purpose |
 |---|---|---|---|
 | Node identity | `nodekey-<net>.hex` | 32-byte secp256k1 secret as hex | stable enode/PeerId across restarts |
-| EL peer cache | `peers-<net>.cache` | TSV: `ip⇥port⇥pubkeyHex⇥snap(1/0)[⇥snapok/snapbad]` | re-dial known (snap-quality-ordered) peers on startup |
+| EL peer cache | `peers-<net>.cache` | TSV: `ip⇥port⇥pubkeyHex⇥snap(1/0)[⇥snapok/snapbad][⇥fails=N]` | re-dial known (snap-quality-ordered) peers on startup |
 | CL peer cache | `cl-peers-<net>.cache` | multiaddrs + failure counts + served period ranges + bootstrap periods + light-client verdicts | seed the beacon light client; front-load proven LC servers |
 | Sync snapshot | `sync-state-<net>.snapshot` (+ `.roots` sidecar) | custom binary, magic `LCSS`, **bound to genesisValidatorsRoot** | resume the verified light-client store (warm restart ~10 s vs re-bootstrap) |
+
+Mainnet's files drop the `-<net>` suffix (`nodekey.hex`, `peers.cache`, `cl-peers.cache`,
+`sync-state.snapshot`). The Rust engine reads and writes the same peer-cache and snapshot
+files (same names and formats, so switching engines keeps them) under `EngineConfig.dataDir`,
+plus its own `logindex[-net].db` (the `eth_getLogs` index) and, for a host-supplied
+checkpoint, a `sync-anchor[-net].json` marker (`rust/myotis-engine/src/host.rs`).
 
 The sync snapshot is a **private cache, not a trust anchor**: it's bound to the network's gvr,
 rejected if foreign/corrupt/older-than-checkpoint, and self-correcting (a bad snapshot fails the
@@ -587,13 +661,14 @@ next BLS verify and falls back to the embedded checkpoint).
 ## 10. Implementation Status & Recommended Build Order
 
 > **The Rust port described by this spec has been built** (`rust/` — `myotis-core`,
-> `myotis-consensus`, `myotis-net`, `myotis-evm`, `myotis-engine`) and is the default engine
-> behind `:myotis-api`; the JVM reference remains as the Java engine. The build order below is
-> the one the Rust phase followed ([06](06-rust-phase-notes.md), [07](07-el-implementation-plan.md)).
-> Beyond this list, the Rust engine added the opt-in **log index** behind `eth_getLogs`
-> (`docs/eth-getlogs-design.md`), Tor routing of account reads, state overrides / EIP-7702 /
-> contract creation in the EVM, the `finalized` tag on state reads, hedged reads across peers,
-> and the Gloas light client. The reference's remaining gaps are tracked in
+> `myotis-consensus`, `myotis-wire`, `myotis-net`, `myotis-evm`, `myotis-engine`) and is the
+> default engine behind `:myotis-api`; the JVM reference remains as the Java engine. The build
+> order below is the one the Rust phase followed ([06](06-rust-phase-notes.md),
+> [07](07-el-implementation-plan.md)). Beyond this list, the Rust engine added the opt-in
+> **log index** behind `eth_getLogs` (`docs/eth-getlogs-design.md`), Tor routing of account
+> reads, state overrides / EIP-7702 / contract creation in the EVM, the `finalized` tag on state
+> reads and hedged reads across peers; both engines gained the Gloas light client (sepolia,
+> since 2026-10-06). The reference's remaining gaps are tracked in
 > [`docs/implementation-status.md`](../implementation-status.md), which is the current status
 > document; the list below is kept for the build order.
 
@@ -618,9 +693,12 @@ built. A re-implementation should know what's load-bearing vs aspirational.
 
 **Partial in the reference (carry the limitation or improve):**
 
-- **Historical verification** is limited to a **header-chain walk ≤ 8192 blocks** from the
-  finalized block. The designed-but-unbuilt pieces are: `historical_summaries`/`historical_roots`
-  lookups from beacon state (to remove the 8192 limit) and the **pre-Merge epoch-hash
+- **Historical verification** is limited to a **header-chain walk ≤ 8192 blocks** down from a
+  beacon-attested block — the optimistic head for state reads (whose block must also sit above
+  finality), the finalized block or the optimistic head for `get-block` — and the JSON-RPC
+  block reads look back at most 512 blocks. The designed-but-unbuilt pieces are:
+  `historical_summaries`/`historical_roots` lookups from beacon state (to remove the 8192 limit)
+  and the **pre-Merge epoch-hash
   accumulator** (`premergeacc.bin`). Pre-Merge blocks currently return `failReason:"preMergeBlock"`.
 - **Transaction history** via a TrueBlocks/IPFS address-appearance index exists as a
   debug/explorer path and is **unverified on that path** (per-tx verification exists on the
@@ -638,7 +716,11 @@ built. A re-implementation should know what's load-bearing vs aspirational.
 **EVM fork schedule caveat:** the reference hardcodes **mainnet** fork boundaries (London by
 block, Paris/Shanghai/Cancun/Prague by timestamp) and throws below London. A port must replicate
 this table and pick the matching EVM spec id (revm `SpecId` / geth fork config), and parameterize
-it per chain if Gnosis EVM execution is needed.
+it per chain if Gnosis EVM execution is needed. *Status:* both engines now carry per-chain
+cascades (mainnet: London and Paris by block, Shanghai → Osaka by timestamp; Sepolia and Gnosis
+timestamp-gated from Shanghai) and fail closed on an unknown chain id; Sepolia's Amsterdam rung
+is served by revm and refused by the Java engine (Besu 26.4) — `rust/myotis-evm/src/fork.rs`,
+`myotis-evm/.../besu/EvmFactory.java`.
 
 ---
 
@@ -657,12 +739,15 @@ trust model.
 4. **Four Merkle branches** on every forward step: sync-aggregate-over-attested-header (the BLS
    check), finality branch, **execution branch for both attested and finalized headers**, and the
    next-sync-committee branch when present. Generalized indices are **fork-dependent**, inferred
-   from SSZ branch length (companion 01).
+   from SSZ branch length (companion 01) — before Gloas; from Gloas on they are fixed and selected
+   by the attested slot's fork (finality 735, committees 2945/2946, execution block hash 2856 —
+   `rust/myotis-consensus/src/spec.rs`).
 5. **Signing root** = `htr(SigningData{ attestedHeader.htr(), compute_domain(0x07000000,
    forkVersion, gvr) })`.
 6. **SSZ = SHA-256 + little-endian; MPT = keccak-256 + RLP + big-endian.** Never mix.
 7. **`ExecutionPayloadHeader` merkleizes exactly 17 fields** and **excludes** the three EIP-7685
-   request roots (they live elsewhere; including them breaks bootstrap).
+   request roots (they live elsewhere; including them breaks bootstrap). (Pre-Gloas: a Gloas
+   light-client header carries only the execution block hash.)
 8. **MPT `storageRoot` and `codeHash` come only from the proof-verified account leaf**, never a
    peer's "slim" account body (a peer can keep nonce/balance honest while forging those two).
 9. **Storage proofs anchor at the account's `storageRoot`**, not the world `stateRoot`.

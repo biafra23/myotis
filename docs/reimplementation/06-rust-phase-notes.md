@@ -8,6 +8,12 @@
 
 ## Where things stand (2026-07-06)
 
+> **Status at HEAD (2026-10):** the phase is over. The Rust engine is on `main` with the full
+> EL ([07](07-el-implementation-plan.md)'s milestones A–C, less the EL-C-3-3 slice) on mainnet,
+> Sepolia and Gnosis, and
+> is the default engine behind `:myotis-api` (`Engines.engine()`, `myotis.engine=auto`). Below
+> is the record as of 2026-07-06; items that have since closed say so inline.
+
 Phase 1 (CL-only Rust engine behind `:myotis-api`) is **done and merged to
 `rust-engine`**: PRs #124 (cargo workspace + Gradle), #127 (`:myotis-engines`
 selector + R0 stub), #128 (conformance seeds), #129 (`myotis-consensus`
@@ -45,7 +51,8 @@ starts per that plan's entry criteria (see also "EL-phase entry" below).
   (`uniffiGenerateKotlin` regenerates), `RustEngineNative` reduced to a static
   delegator. Compound values STILL cross as JSON strings with the golden-test-
   pinned shapes; UniFFI's per-function API checksums replace the hand-rolled
-  stale-.so ABI probe. The iOS plain C ABI (`capi.rs`) is unchanged — doc
+  stale-.so ABI probe (a coarse `ABI_VERSION` handshake stays as a second
+  check). The iOS plain C ABI (`capi.rs`) is unchanged — doc
   [05](05-engine-api-bindings.md)'s typed-record mapping remains the eventual
   full-UniFFI path if the JSON transport is ever retired.
 
@@ -66,14 +73,20 @@ a Pixel re-test of the fixed Java build.
 
 ## Known gaps in the Rust CL (close before or early in the EL phase)
 
-1. **No persistence.** `EngineConfig.dataDir` reaches `myotis-engine` but is
-   unused: no sync-state snapshot, no CL peer cache. Every process start
+1. **RESOLVED: no persistence.** The engine now persists under `dataDir` the
+   sync-state snapshot, the CL and EL peer caches (the Java file names and
+   formats) and its log index (`rust/myotis-engine/src/host.rs`
+   `bind_persistence`). The original note: `EngineConfig.dataDir` reaches
+   `myotis-engine` but is unused: no sync-state snapshot, no CL peer cache. Every process start
    cold-bootstraps from the embedded checkpoint and re-catches-up. This is the
    dominant cause of the poor/variable wall-time numbers (25-min timeout under
    peer starvation) and the single most valuable next Rust PR: persist the
    verified store snapshot + a proven-server peer cache (the Java CL cache's
    `provenCatchUpRanges` role) under dataDir.
-2. **No Android observability.** The engine initializes no tracing subscriber
+2. **RESOLVED: no Android observability.** A drainable ring buffer
+   (`rust/myotis-engine/src/ringlog.rs`) now holds the `tracing` output, and the
+   hosts pump it into their log pipelines (`Engines.drainRustLogs`). The
+   original note: The engine initializes no tracing subscriber
    and the hosts have no log-drain pump, so Rust-side logs are invisible in
    logcat; on-device you only see the status JSON (period/finalizedSlot/
    peerCount). Wire an android-logger or a drainable ring buffer before serious
@@ -87,10 +100,20 @@ a Pixel re-test of the fixed Java build.
    identical full-span fan-out is CORRECT and staggered disjoint ranges are
    WORSE; never cooldown a serving peer; exponential backoff (5→60 s) on empty
    rounds; evict unproven peers at 1 failure, proven at 3, serve resets.
+   *Since retuned* (`rust/myotis-net/src/sync.rs`): catch-up asks for up to 128
+   periods per round (`UPDATES_BATCH_MAX`, for the servers that stream them), a
+   peer that served or empty-replied is left alone for `UPDATES_SERVE_COOLDOWN`
+   = 11 s (Lighthouse's one-per-10 s quota), and the empty-wave backoff is
+   5→25 s; the eviction thresholds stand (plus 3 verify-rejects).
 5. Optional polish not done: `rust.yml` CI job, jniLibs packaging notes in doc
    05, per-negative rejection-reason codes in the conformance corpus (a Rust
    decoder rejecting for the WRONG reason still matches today), network-tagged
    `VectorDump` filenames (needed before capturing a gnosis corpus).
+   *Status:* CI covers Rust without a `rust.yml` — `ci.yml`'s `./gradlew build`
+   runs `cargoTest`, and `rust-clippy.yml`, `cargo-locks.yml` and
+   `no-std-canary.yml` add clippy, the lockfile check and the no_std canary. The
+   corpus negatives still record only the verdict
+   (`rust/testdata/lc/mainnet/expected.txt`).
 
 ## Carried review findings (from phase-1 PR reviews — still apply)
 
@@ -123,6 +146,12 @@ a Pixel re-test of the fixed Java build.
   EL phase or any security review.
 
 ## EL-phase entry
+
+> *Status:* the EL phase ran — the Rust engine now serves the operator account/storage
+> queries, the full `VerifiedReads` surface and the EVM on all three networks, and ENS on
+> mainnet and Sepolia;
+> [07](07-el-implementation-plan.md) marks what landed and records where the build departed
+> from the plan (and the one slice, EL-C-3-3, never built).
 
 The EL phase (discv4/RLPx/eth/snap → MPT → revm; spec in
 [02](02-execution-networking.md) and [03](03-state-verification-and-evm.md),
