@@ -17,6 +17,9 @@
 #   ANDROID_RELEASE_KEY_PASSWORD       optional: the key's own password. A PKCS12
 #                                      keystore has only one, so it defaults to the
 #                                      store password.
+#   ANDROID_RELEASE_CERT_PIN_FILE      optional: another pin file. Only the build
+#                                      job's signing REHEARSAL sets it (a throwaway
+#                                      key's pin); sign-release never does.
 #   ANDROID_BUILD_TOOLS                optional: the build-tools dir with apksigner +
 #                                      zipalign; default the newest STABLE one under
 #                                      $ANDROID_HOME (35.0.0+: --alignment-preserved).
@@ -38,7 +41,7 @@ in=$1 out=$2
 [ ! -e "$out" ] || die "refusing to overwrite $out"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-pin_file="$root/android-app/release-signing-cert.sha256"
+pin_file="${ANDROID_RELEASE_CERT_PIN_FILE:-$root/android-app/release-signing-cert.sha256}"
 
 # SHA-256 of android-app/debug.keystore's certificate, which anyone can download:
 #   keytool -list -v -keystore android-app/debug.keystore -storepass android -alias androiddebugkey
@@ -46,11 +49,11 @@ debug_cert=760390cd58e698e9fdad45a053ec109e117f952ed355f2eab5b1ad0d5900e995
 
 # --- the pinned release certificate --------------------------------------------
 [ -f "$pin_file" ] \
-  || die "no pinned release certificate: commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/android-release-signing.md)"
+  || die "no pinned release certificate ($pin_file): commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/android-release-signing.md)"
 # First line that is not a comment; keytool prints AB:CD:…, apksigner abcd…: accept both.
 pin=$(grep -v '^[[:space:]]*#' "$pin_file" | grep -m1 '[^[:space:]]' | tr -d ': \t\r' | tr 'A-F' 'a-f' || true)
 [[ "$pin" =~ ^[0-9a-f]{64}$ ]] \
-  || die "android-app/release-signing-cert.sha256 holds no SHA-256 fingerprint (64 hex digits, colons allowed)"
+  || die "$pin_file holds no SHA-256 fingerprint (64 hex digits, colons allowed)"
 [ "$pin" != "$debug_cert" ] \
   || die "the pinned release certificate is the PUBLIC debug certificate — that is the key this job exists to replace"
 

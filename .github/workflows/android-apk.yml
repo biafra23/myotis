@@ -52,9 +52,11 @@ jobs:
   # Builds BOTH apps every run: the debug one (com.jaeckel.ethp2p.android.debug,
   # public debug key) and the UNSIGNED release one (com.jaeckel.ethp2p.android).
   # The release APK is signed only on a v* tag, by sign-release below, so the
-  # release key never meets this job's Gradle/cargo build. Building the release
-  # variant on every PR is what keeps a release-only failure (lintVitalRelease,
-  # the min-API gate on what actually ships) from first showing up on a tag.
+  # release key never meets this job's Gradle/cargo build. ci.yml's
+  # `./gradlew build -PskipRustEngine` already assembles the release variant
+  # (lintVitalRelease included) on every PR; what this job adds is the release
+  # build WITH the Rust engine, the engine-load and min-API checks on the APK
+  # that actually ships, and a signing rehearsal. Neither replaces the other.
   build:
     name: Build APKs (debug + unsigned release)
     needs: review-gate
@@ -242,6 +244,31 @@ jobs:
           # path must not wedge the release. (node-binding.yml has carried this
           # fix since it hit exactly that.)
           overwrite: true
+
+      # sign_release_apk.sh otherwise first runs on a hosted runner at a real
+      # tag. Rehearse it on every run with a throwaway key, so runner-image drift
+      # (which build-tools dir it picks, apksigner's --alignment-preserved,
+      # aapt2's badging format, the JDK behind apksigner) fails here instead.
+      # The throwaway pin goes in through ANDROID_RELEASE_CERT_PIN_FILE, so the
+      # committed pin is never read or touched.
+      - name: Rehearse release signing with a throwaway key
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/sign-rehearsal"
+          mkdir -p "$t"
+          export REHEARSAL_PW=$(openssl rand -hex 24)
+          keytool -genkeypair -keystore "$t/k.p12" -storetype PKCS12 -alias rehearsal \
+            -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Myotis signing rehearsal" \
+            -storepass:env REHEARSAL_PW >/dev/null 2>&1
+          keytool -list -v -keystore "$t/k.p12" -alias rehearsal -storepass:env REHEARSAL_PW \
+            | sed -n 's/.*SHA256: //p' > "$t/pin"
+          apk=$(ls android-app/build/outputs/apk/release/*.apk | head -n1)
+          ANDROID_RELEASE_CERT_PIN_FILE="$t/pin" \
+          ANDROID_RELEASE_KEYSTORE_BASE64="$(base64 -w0 "$t/k.p12")" \
+          ANDROID_RELEASE_KEYSTORE_PASSWORD="$REHEARSAL_PW" \
+          ANDROID_RELEASE_KEY_ALIAS=rehearsal \
+            scripts/sign_release_apk.sh "$apk" "$t/signed.apk"
+          rm -rf "$t"
 
       # sign-release refuses a tag whose tree has no pinned release certificate,
       # and then the tag publishes no Android APK at all. Say so on every earlier
@@ -465,6 +492,11 @@ jobs:
   # Fails closed: with no secrets, no pinned certificate, or a key that does not
   # match the pin, nothing is signed and the release job below is skipped, so a
   # tag publishes no Android asset at all rather than a debug-signed one.
+  # Its actions are pinned to commit SHAs, unlike the rest of the repo: the
+  # runner hands a job every secret it references when the job STARTS, so each
+  # action here runs while the key is readable from the runner process (how the
+  # tj-actions/changed-files compromise, CVE-2025-30066, took secrets from jobs
+  # that never passed them to it). A moved tag must not reach this job.
   sign-release:
     name: Sign the release APK
     needs: [build, version-guard]
@@ -475,7 +507,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the signing script and the pinned certificate only
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           sparse-checkout: |
             scripts/sign_release_apk.sh
@@ -485,7 +517,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the unsigned release APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: android-app-release-unsigned-${{ github.sha }}
           path: unsigned
@@ -506,7 +538,7 @@ jobs:
           scripts/sign_release_apk.sh "${apks[0]}" signed/android-app-release.apk
 
       - name: Upload the signed release APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: android-app-release-${{ github.sha }}
           path: signed/android-app-release.apk

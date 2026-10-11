@@ -72,22 +72,35 @@ file is missing.
    Never commit it. `.gitignore` refuses `*.p12` / `*.jks` as a backstop, but run
    this outside the checkout anyway.
 
-2. **Create the environment**, restricted to v* tags:
+2. **Create the environment**, restricted to v* tags, **with a required
+   reviewer**:
 
    ```bash
    gh api -X PUT repos/biafra23/myotis/environments/android-release \
      -F 'deployment_branch_policy[protected_branches]=false' \
-     -F 'deployment_branch_policy[custom_branch_policies]=true'
+     -F 'deployment_branch_policy[custom_branch_policies]=true' \
+     -F "reviewers[][type]=User" -F "reviewers[][id]=$(gh api user --jq .id)"
    gh api -X POST repos/biafra23/myotis/environments/android-release/deployment-branch-policies \
      -f name='v*' -f type=tag
    ```
 
-   The tag rule keeps PR branches out, not people with push rights: anyone who
-   can push a `v*` tag can point it at a commit with an altered workflow. Two
-   ways to close that are worth having:
-   - add yourself as a required reviewer (Settings → Environments →
-     android-release), so every tag's signing step waits for your click;
-   - restrict who may create `v*` tags with a tag ruleset (Settings → Rules).
+   Then restrict who may create `v*` tags with a tag ruleset (Settings → Rules → Rulesets →
+   New tag ruleset: target `v*`, restrict creations, bypass list: you).
+
+   Both are part of the setup, not extras. The tag rule alone keeps PR branches
+   out, not anyone holding a `contents: write` credential: such a tag can point
+   at a commit whose `android-apk.yml` prints the secrets, and that run still
+   gets them. Throwaway tags like `release-version-guard.yml`'s `v9.9.9-guardtest`
+   are such tags too. The required reviewer makes every signing wait for your
+   click in the run's page, one click per release, and you see which commit
+   you approve.
+
+   Know the limit: both controls key on your account. Agent sessions on your
+   machine act with your own `gh` token, which can also push tags and approve a
+   pending deployment through the API. So these stop other collaborators and
+   stray tags; against a session holding your token, they rest on CLAUDE.md's
+   rule that agents never push a `v*` tag. Closing that too means giving agents
+   a credential of their own, without tag or approval rights.
 
 3. **Store the secrets in that environment**, not as repository secrets. `gh`
    prompts for each value, so a password never lands in your shell history:

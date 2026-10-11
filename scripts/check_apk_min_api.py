@@ -326,10 +326,17 @@ def parse_dexdump(dexdump, dex_path):
                 cur_method, cur_synthetic = "?", bool(SYNTHETIC_RE.search(cur))
                 model.supers.setdefault(cur, [])
                 continue
+        # A synthetic class's own extends/implements is charged like its other
+        # references: as a type ref of site (cur, "?"), which no one calls by
+        # name, so it goes to the class's users (main() skips synthetics in its
+        # class-level loop). model.supers keeps it either way: java_ancestors
+        # walks it.
         if "Superclass" in line:
             m = SUPER_RE.search(line)
             if m:
                 model.supers[cur] = [m.group(1)] + model.supers.get(cur, [])
+                if cur_synthetic:
+                    add_ref(m.group(1), "", "class")
                 continue
         if "Interfaces" in line and "-" in line:
             in_ifaces = True
@@ -338,6 +345,8 @@ def parse_dexdump(dexdump, dex_path):
             m = IFACE_RE.match(line)
             if m:
                 model.supers.setdefault(cur, []).append(m.group(1))
+                if cur_synthetic:
+                    add_ref(m.group(1), "", "class")
                 continue
             in_ifaces = False
         m = DEF_NAME_RE.match(line)
@@ -508,7 +517,10 @@ def main():
         violations[(referrer, target)] = max(since, violations.get((referrer, target), 0))
 
     # Class-level: extends/implements of java.* types crash at class load.
+    # Synthetic classes' supertypes went through resolve_synthetics instead.
     for cls, supers in model.supers.items():
+        if SYNTHETIC_RE.search(cls):
+            continue
         for sup in supers:
             if sup.startswith(("java/", "javax/")):
                 s = class_since(sup)
