@@ -127,16 +127,23 @@ else
 fi
 
 # --- prove it ------------------------------------------------------------------------
-report=$("$apksigner" verify --verbose --print-certs "$out") \
-  || { rm -f "$out"; die "the signed APK does not verify"; }
-# EVERY signer line, not just `Signer #N`: v3.1 and rotation-lineage signers print
-# as `Signer (minSdkVersion=…, maxSdkVersion=…) certificate SHA-256 digest: …`.
-signers=$(sed -n 's/^Signer.* certificate SHA-256 digest: *\([0-9a-f]*\)$/\1/p' <<< "$report" | sort -u)
+report=$("$apksigner" verify --verbose --print-certs "$out" 2>&1) \
+  || { rm -f "$out"; sed 's/^/  apksigner: /' <<< "$report" >&2; die "the signed APK does not verify"; }
+# EVERY certificate digest line, however apksigner names the signer and spells
+# the hex. Names vary by scheme and release: `Signer #1` (build-tools 36.1 for a
+# v3-only APK), `Signer (minSdkVersion=…, maxSdkVersion=…)` (v3/v3.1, newer
+# releases), lineage and source-stamp entries; and 37.0.0's output no longer
+# matched a lowercase-hex `Signer …` pattern at all. Any line we cannot read
+# leaves the set unequal to the pin, so drift fails closed.
+signers=$(grep -i 'certificate SHA-256 digest:' <<< "$report" \
+  | sed 's/.*[Dd][Ii][Gg][Ee][Ss][Tt]:[[:space:]]*//' | tr -d ': \t\r' | tr 'A-F' 'a-f' \
+  | sort -u || true)
 if [ "$signers" != "$pin" ]; then
   rm -f "$out"
-  die "signed with [$(tr '\n' ' ' <<< "$signers")] but the pinned release certificate is $pin — wrong keystore in the secrets, or a stale pin"
+  sed 's/^/  apksigner: /' <<< "$report" >&2   # public: DNs, digests, scheme flags
+  die "signed with [$(tr '\n' ' ' <<< "$signers")] but the pinned release certificate is $pin — wrong keystore in the secrets, a stale pin, or an apksigner output format this script cannot read (its report is above)"
 fi
-grep -Eq '^Verified using v(2|3) scheme .*: true$' <<< "$report" \
-  || { rm -f "$out"; die "no v2 or v3 signature on the result"; }
-grep -E '^(Verified using|Signer.* certificate (DN|SHA-256))' <<< "$report" || true  # log only
+grep -Eiq '^Verified using v(2|3)(\.[0-9]+)? scheme.*:[[:space:]]*true[[:space:]]*$' <<< "$report" \
+  || { rm -f "$out"; sed 's/^/  apksigner: /' <<< "$report" >&2; die "no v2 or v3 signature on the result"; }
+grep -Ei '^(Verified using|.*certificate (DN|SHA-256 digest))' <<< "$report" || true  # log only
 echo "signed: $out"
