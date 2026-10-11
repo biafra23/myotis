@@ -40,6 +40,7 @@ use crate::el::fork_watch::{self, ForkWatch};
 use crate::el::peer::{refusing_lag, AnchorSource, Coverage, ManagedPeer};
 use crate::el::served::{ServeContext, ServeStats, ServedHeaders};
 use crate::el::peercache::{CachedElPeer, ElPeerCache, SnapQuality};
+use crate::el::torreserve::{tor_reserve_target, Reserved, TorReserve};
 use crate::el::rlpx::transport::RlpxConnection;
 
 /// Wrong-chain peers: don't retry the address for a long while (Java's
@@ -617,6 +618,10 @@ struct PoolInner {
     lingering: std::sync::Mutex<Vec<([u8; 64], std::sync::Weak<ManagedPeer>)>>,
     /// Proven snap-capable peers, persisted for warm-start on the next run.
     cache: Mutex<ElPeerCache>,
+    /// The Tor reserve (`el::torreserve`): verified peers the pool never dials
+    /// directly, persisted beside the cache. Locked after `attempted` and
+    /// `cache` when held with them, never across an await.
+    tor_reserve: std::sync::Mutex<TorReserve>,
     /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
     /// `NetworkConfig.elBootEnodes()`. Dialed directly (warm start; and on a
     /// maintainer tick when below target, when the anchor has a head that no
@@ -743,9 +748,141 @@ impl PoolInner {
         union_pins(&self.boot_enodes, &self.host_enodes.lock().await)
     }
 
-    /// Whether `addr`/`node` is one of the pool's pins, by address or by node id.
-    async fn is_pin(&self, addr: SocketAddr, node: &[u8; 64]) -> bool {
-        self.all_pins().await.iter().any(|(a, n)| *a == addr || n == node)
+    /// Whether `node` is in the Tor reserve: the pool never dials it directly.
+    fn tor_reserved(&self, node: &[u8; 64]) -> bool {
+        self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner()).contains(node)
+    }
+
+    /// Keep the Tor reserve at its share ([`tor_reserve_target`]) of the
+    /// verified peers. `grow` (Tor mode on, or a Tor read or send asking) tops
+    /// it up from the peer cache: snap servers a past session proved (not
+    /// denied) that hold no session with us now, never a pin, a banned node, a
+    /// node reached over Tor lately or one this process released for refusing
+    /// Tor, in a per-process random order — the reserve is not the best third,
+    /// just a third. Each moves out of the cache with its last direct contact:
+    /// the latest this process saw, and no earlier than the process start (the
+    /// run before may have just dialed it). A reserve over its share — the
+    /// verified cache shrank — hands its weakest nodes back whatever the Tor
+    /// mode, so the direct pool keeps its two thirds. Moves are made under the
+    /// claim lock, so no direct dial of a node is claimed while it moves; the
+    /// common case, a reserve already at its share, costs a count.
+    async fn balance_tor_reserve(&self, grow: bool) {
+        let target = {
+            let cache = self.cache.lock().await;
+            let reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
+            if !reserve.is_enabled() {
+                return;
+            }
+            let target = tor_reserve_target(cache.verified_count() + reserve.len());
+            if reserve.len() == target || (reserve.len() < target && !grow) {
+                return;
+            }
+            target
+        };
+        let pins = self.all_pins().await;
+        let blacklist = self.blacklist.lock().await.clone();
+        let mut live_nodes = self.sweep_lingering();
+        live_nodes.extend(self.peers.lock().await.iter().map(|p| p.peer.peer_pubkey()));
+        let attempted = self.attempted.lock().await;
+        let mut cache = self.cache.lock().await;
+        let mut reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
+        let (now, now_ms) = (Instant::now(), now_unix_ms());
+        if reserve.len() > target {
+            for node in reserve.surplus(reserve.len() - target) {
+                if let Some(peer) = reserve.remove(&node) {
+                    tracing::debug!(peer = %peer.addr, "tor: node handed back from the Tor reserve");
+                    cache.restore(&peer);
+                }
+            }
+        } else {
+            let mut picks: Vec<CachedElPeer> = cache
+                .peers()
+                .into_iter()
+                .filter(|c| {
+                    c.snap
+                        && c.quality != SnapQuality::Denied
+                        && !attempted.contains(&c.addr)
+                        && !live_nodes.contains(&c.pubkey)
+                        && !blacklist.contains(&c.pubkey)
+                        && !pins.iter().any(|(a, n)| *a == c.addr || *n == c.pubkey)
+                        && !tor_quarantined(c.pubkey, now)
+                        && !reserve.was_released(&c.pubkey)
+                })
+                .collect();
+            picks.sort_by_key(|c| tor_reserve_draw(&c.pubkey));
+            let need = target.saturating_sub(reserve.len());
+            for c in picks.into_iter().take(need) {
+                let Some(peer) = cache.remove(c.addr) else { continue };
+                let last_direct_ms = last_direct_contact_ms(peer.pubkey, now, now_ms)
+                    .unwrap_or(0)
+                    .max(process_start_unix_ms());
+                reserve.insert(
+                    peer.pubkey,
+                    Reserved { addr: peer.addr, snap: peer.snap, quality: peer.quality, tor_fails: 0, last_direct_ms },
+                );
+                tracing::debug!(peer = %peer.addr, "tor: node moved into the Tor reserve");
+            }
+        }
+        flush_tor_reserve(&mut reserve);
+        drop(reserve);
+        cache.flush();
+        drop(cache);
+        drop(attempted);
+    }
+
+    /// Write the Tor reserve one last time — after the pool stamped its
+    /// sessions' ends, so the file holds them — and swap in a disabled one: a
+    /// Tor push still running for a stopped pool then records nothing, and
+    /// cannot overwrite the files a new pool on the same network has loaded.
+    fn close_tor_reserve(&self) {
+        let mut reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
+        flush_tor_reserve(&mut reserve);
+        *reserve = TorReserve::disabled();
+    }
+
+    /// Release `nodes` from the Tor reserve back to the peer cache — pins a
+    /// host set after they moved in: the pool dials pins directly.
+    async fn release_from_tor_reserve(&self, nodes: &[[u8; 64]]) {
+        let released: Vec<CachedElPeer> = {
+            let mut reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
+            let released = nodes.iter().filter_map(|n| reserve.remove(n)).collect();
+            flush_tor_reserve(&mut reserve);
+            released
+        };
+        if !released.is_empty() {
+            let mut cache = self.cache.lock().await;
+            for peer in &released {
+                cache.restore(peer);
+            }
+            cache.flush();
+        }
+    }
+
+    #[cfg(any(test, feature = "tor"))]
+    /// How a Tor read or push to `node` went ([`TorReserveHandle`]): it
+    /// answered (`Some(snap_served)`), or refused the dial (`None`). A node the
+    /// reserve releases goes back to the peer cache: one that refuses Tor exits
+    /// is still a good direct peer, and its Tor contact already holds direct
+    /// dials off for the separation window.
+    async fn record_tor_outcome(&self, node: [u8; 64], answered: Option<bool>) {
+        let released = {
+            let mut reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
+            let released = match answered {
+                Some(snap_served) => {
+                    reserve.record_served(&node, snap_served);
+                    None
+                }
+                None => reserve.record_unreachable(&node),
+            };
+            flush_tor_reserve(&mut reserve);
+            released
+        };
+        if let Some(peer) = released {
+            tracing::debug!(peer = %peer.addr, "tor: node left the Tor reserve (unreachable over Tor)");
+            let mut cache = self.cache.lock().await;
+            cache.restore(&peer);
+            cache.flush();
+        }
     }
 
     /// Bench an outpaced peer, and strike a repeat — see `record_snap_outpaced`.
@@ -1282,6 +1419,8 @@ impl PeerPool {
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget — and so does a host's seed-pin push.
         let dial_slots = Arc::new(Semaphore::new(pool_cfg.max_concurrent_dials));
+        let mut cache = cache;
+        let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
         let inner = Arc::new(PoolInner {
             tasks: super::tasks::Tasks::default(),
             key,
@@ -1299,6 +1438,7 @@ impl PeerPool {
             blacklist: Mutex::new(HashSet::new()),
             lingering: std::sync::Mutex::new(Vec::new()),
             cache: Mutex::new(cache),
+            tor_reserve: std::sync::Mutex::new(tor_reserve),
             boot_enodes,
             host_enodes: Mutex::new(Vec::new()),
             dial_slots,
@@ -1350,17 +1490,28 @@ impl PeerPool {
     }
 
     /// The peers a Tor read (`snap_only`) or send may dial, best first
-    /// (docs/privacy-and-tor.md §5): cached peers — identities a past session
-    /// proved — that hold no session with us now (pooled, being dialed, or
-    /// evicted but still open) and saw no direct dial or session from us within
-    /// [`TOR_DIRECT_SEPARATION`], by node id; never a pin (dialed directly on
-    /// any shortfall) and never a wrong-chain peer. A read also needs a snap
-    /// server that has not refused to serve. Claim the ones used with
-    /// [`Self::claim_for_tor`]. Empty means the Tor path fails closed: it never
-    /// falls back to a peer that sees our IP.
+    /// (docs/privacy-and-tor.md §5): nodes of the Tor reserve
+    /// (`el::torreserve`) — verified peers the pool never dials directly —
+    /// whose last direct contact is [`TOR_DIRECT_SEPARATION`] behind, by the
+    /// reserve's persisted stamp and this process's contact log alike; never
+    /// one holding a session with us, a pin or a wrong-chain peer. A read also
+    /// needs a snap server that has not refused to serve. Tops the reserve up
+    /// first. Claim the ones used with [`Self::claim_for_tor`], and report how
+    /// each went on a `tor_reserve_handle`. Empty means the Tor path
+    /// fails closed: it never falls back to a peer that sees our IP.
     pub async fn tor_candidates(&self, snap_only: bool) -> Vec<(SocketAddr, [u8; 64])> {
         self.inner.prune_closed().await;
-        let cached = self.inner.cache.lock().await.peers();
+        self.inner.balance_tor_reserve(true).await;
+        // A fresh order among equals for each call: successive reads spread
+        // over the reserve instead of all reaching its first few nodes.
+        let mut seed = [0u8; 8];
+        let _ = getrandom::getrandom(&mut seed);
+        let cached = self
+            .inner
+            .tor_reserve
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready(now_unix_ms(), |node| tor_reserve_draw_with_seed(&seed, node));
         let mut live_addrs = self.inner.attempted.lock().await.clone();
         let mut live_nodes = self.inner.sweep_lingering();
         for p in self.inner.peers.lock().await.iter() {
@@ -1380,11 +1531,20 @@ impl PeerPool {
             blacklist: &blacklist,
             recently_contacted: &|node| direct_contact_recent(node, now),
         };
-        // Reserved nodes first: the direct pool never dials them, so claiming
-        // them for Tor costs it nothing; the others are still eligible.
-        let mut eligible = tor_eligible(cached, &ex, snap_only);
-        eligible.sort_by_key(|(_, node)| !tor_reserved(node));
-        eligible
+        tor_eligible(cached, &ex, snap_only)
+    }
+
+    #[cfg(any(test, feature = "tor"))]
+    /// A handle a Tor read or push reports its outcome on, for the reserve to
+    /// keep a node that serves and release one Tor cannot reach. It holds the
+    /// pool's state, not the pool: dropping it never stops anything.
+    pub(crate) fn tor_reserve_handle(&self) -> TorReserveHandle {
+        TorReserveHandle(Arc::clone(&self.inner))
+    }
+
+    /// How many nodes the Tor reserve holds (for status and tests).
+    pub fn tor_reserve_len(&self) -> usize {
+        self.inner.tor_reserve.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Claim `targets` for a Tor read or send in contact with them until
@@ -1464,6 +1624,9 @@ impl PeerPool {
             }
             *host = pins.clone();
         }
+        // The pool dials pins directly: a pinned node leaves the Tor reserve.
+        let pinned: Vec<[u8; 64]> = pins.iter().map(|(_, node)| *node).collect();
+        self.inner.release_from_tor_reserve(&pinned).await;
         tracing::info!(count = pins.len(), "EL pool host seed pins replaced");
         if pins.is_empty() {
             return;
@@ -1638,6 +1801,7 @@ impl PeerPool {
         peers.clear();
         drop(peers);
         self.inner.stamp_lingering(now);
+        self.inner.close_tor_reserve();
     }
 }
 
@@ -1654,6 +1818,7 @@ impl Drop for PeerPool {
             }
         }
         self.inner.stamp_lingering(now);
+        self.inner.close_tor_reserve();
     }
 }
 
@@ -1743,31 +1908,94 @@ impl ContactLog {
     }
 }
 
-/// The share of nodes, in parts of [`TOR_RESERVE_OF`], that the direct pool
-/// leaves alone while Tor mode is on (a third).
-const TOR_RESERVE_SHARE: u64 = 1;
-const TOR_RESERVE_OF: u64 = 3;
-
-/// A per-process secret mixed into the reserve draw, so which nodes a wallet
-/// keeps for Tor is its own: with a fleet-wide set, every Myotis node would
-/// reach the same peers only over Tor.
+/// A per-process secret that orders the reserve's fill, so which peers a
+/// wallet sets aside for Tor is its own: with a fleet-wide order, every Myotis
+/// node would reach the same peers only over Tor.
 static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     let mut salt = [0u8; 32];
-    // No entropy: an all-zero salt still reserves a third, just a guessable one.
+    // No entropy: an all-zero salt still fills the reserve, in a guessable order.
     let _ = getrandom::getrandom(&mut salt);
     salt
 });
 
-/// Pure: whether `node` falls in the reserve drawn with `salt`.
-fn tor_reserved_with(salt: &[u8; 32], node: &[u8; 64]) -> bool {
+/// Pure: `node`'s place in the fill order drawn with `salt`.
+fn tor_reserve_draw_with(salt: &[u8; 32], node: &[u8; 64]) -> u64 {
     let h = myotis_core::keccak::keccak256_concat(salt, node);
-    let draw = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
-    draw % TOR_RESERVE_OF < TOR_RESERVE_SHARE
+    u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
 }
 
-/// Whether this process keeps `node` for Tor ([`tor_reserved_with`]).
-fn tor_reserved(node: &[u8; 64]) -> bool {
-    tor_reserved_with(&TOR_RESERVE_SALT, node)
+/// `node`'s place in this process's fill order ([`tor_reserve_draw_with`]).
+fn tor_reserve_draw(node: &[u8; 64]) -> u64 {
+    tor_reserve_draw_with(&TOR_RESERVE_SALT, node)
+}
+
+/// `node`'s place in one call's order among equally ranked reserve nodes.
+fn tor_reserve_draw_with_seed(seed: &[u8; 8], node: &[u8; 64]) -> u64 {
+    let h = myotis_core::keccak::keccak256_concat(seed, node);
+    u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+}
+
+/// Write `reserve`, its nodes' last direct contacts brought up to date from
+/// this process's contact log first: a direct session that formed while a node
+/// moved in (at another address) is what the file then remembers, and what a
+/// restarted process waits out.
+fn flush_tor_reserve(reserve: &mut TorReserve) {
+    let (now, now_ms) = (Instant::now(), now_unix_ms());
+    for node in reserve.nodes() {
+        if let Some(ms) = last_direct_contact_ms(node, now, now_ms) {
+            reserve.note_direct(&node, ms);
+        }
+    }
+    reserve.flush();
+}
+
+/// The wall clock in unix millis (the reserve's persisted stamps).
+fn now_unix_ms() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// When this process started using the pool, unix millis: the earliest last
+/// direct contact the reserve assumes for a node this process never saw
+/// (the run before may have just dialed it). Forced by the first pool start.
+static PROCESS_START_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(now_unix_ms);
+
+pub(crate) fn process_start_unix_ms() -> u64 {
+    *PROCESS_START_MS
+}
+
+/// The latest direct contact this process recorded with `node`, as unix
+/// millis, given the clocks read together at `now` / `now_ms`.
+fn last_direct_contact_ms(node: [u8; 64], now: Instant, now_ms: u64) -> Option<u64> {
+    let log = DIRECT_CONTACT.lock().unwrap_or_else(|p| p.into_inner());
+    let at = *log.at.get(&node)?;
+    let ago = u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX);
+    Some(now_ms.saturating_sub(ago))
+}
+
+/// Load the Tor reserve beside `cache` and square the two: a node in both was
+/// dialed directly while reserved — by the Java engine, which shares the
+/// cache but has no Tor mode — and leaves the reserve; a node that is a pin
+/// goes back to the cache, since the pool dials pins directly.
+fn load_tor_reserve(cache: &mut ElPeerCache, boot_enodes: &[Enode]) -> TorReserve {
+    std::sync::LazyLock::force(&PROCESS_START_MS);
+    let mut reserve = TorReserve::beside(cache.path());
+    let cached: HashSet<[u8; 64]> = cache.peers().iter().map(|c| c.pubkey).collect();
+    for node in reserve.nodes() {
+        if cached.contains(&node) {
+            reserve.remove(&node);
+        } else if boot_enodes.iter().any(|(_, pin)| *pin == node) {
+            if let Some(peer) = reserve.remove(&node) {
+                cache.restore(&peer);
+            }
+        }
+    }
+    reserve.flush();
+    cache.flush();
+    reserve
 }
 
 /// Whether Tor mode is on (always off without the `tor` feature).
@@ -1779,6 +2007,28 @@ fn tor_mode_on() -> bool {
     #[cfg(not(feature = "tor"))]
     {
         false
+    }
+}
+
+/// Where a Tor read or push reports how a reserved node did
+/// ([`PeerPool::tor_reserve_handle`]).
+#[cfg(any(test, feature = "tor"))]
+#[derive(Clone)]
+pub(crate) struct TorReserveHandle(Arc<PoolInner>);
+
+#[cfg(any(test, feature = "tor"))]
+impl TorReserveHandle {
+    /// The node answered: a read (`snap_served` when its proof verified) or a
+    /// push its Pong confirmed.
+    pub(crate) async fn served(&self, node: [u8; 64], snap_served: bool) {
+        self.0.record_tor_outcome(node, Some(snap_served)).await;
+    }
+
+    /// The node refused the Tor dial: the exit could not connect to it, or the
+    /// RLPx or eth handshake failed on its side — never a local Tor failure
+    /// (see `el::tor::is_peer_unreachable`).
+    pub(crate) async fn unreachable(&self, node: [u8; 64]) {
+        self.0.record_tor_outcome(node, None).await;
     }
 }
 
@@ -1904,23 +2154,16 @@ mod tor_eligible_tests {
     }
 
     #[test]
-    fn the_reserve_is_about_a_third_and_depends_on_the_salt() {
-        let node = |i: u32| {
-            let mut n = [0u8; 64];
-            n[..4].copy_from_slice(&i.to_le_bytes());
-            myotis_core::keccak::keccak256(&n).iter().cycle().take(64).copied().collect::<Vec<_>>()
+    fn the_fill_order_is_stable_for_a_salt_and_differs_between_salts() {
+        let nodes: Vec<[u8; 64]> = (0..200u8).map(|i| [i; 64]).collect();
+        let order = |salt: &[u8; 32]| {
+            let mut sorted = nodes.clone();
+            sorted.sort_by_key(|n| tor_reserve_draw_with(salt, n));
+            sorted
         };
-        let nodes: Vec<[u8; 64]> = (0..3000).map(|i| node(i).try_into().unwrap()).collect();
         let (a, b) = ([1u8; 32], [2u8; 32]);
-        let in_a = nodes.iter().filter(|n| tor_reserved_with(&a, n)).count();
-        let in_b = nodes.iter().filter(|n| tor_reserved_with(&b, n)).count();
-        assert!((850..1150).contains(&in_a), "{in_a}");
-        assert!((850..1150).contains(&in_b), "{in_b}");
-        // Another salt, another set.
-        let same = nodes.iter().filter(|n| tor_reserved_with(&a, n) == tor_reserved_with(&b, n)).count();
-        assert!(same < 2_600, "{same}");
-        // Stable for one salt.
-        assert!(nodes.iter().all(|n| tor_reserved_with(&a, n) == tor_reserved_with(&a, n)));
+        assert_eq!(order(&a), order(&a));
+        assert_ne!(order(&a)[..10], order(&b)[..10], "another wallet sets other peers aside");
     }
 
     #[test]
@@ -2042,13 +2285,6 @@ async fn try_dial_verdict(
     if inner.blacklist.lock().await.contains(&pubkey) {
         return DialVerdict::Skipped;
     }
-    // The Tor reserve: while Tor mode is on, a share of nodes is never dialed
-    // directly, so they age past the separation window and Tor always has
-    // peers (docs/privacy-and-tor.md §5). Pins are exempt — the pool's
-    // recovery leans on them.
-    if tor_mode_on() && tor_reserved(&pubkey) && !inner.is_pin(addr, &pubkey).await {
-        return DialVerdict::Skipped;
-    }
     // Backoff: skip while cooling off — for a window the pool's shortfall may
     // have shortened (`Backoff::blocks`, #539) — and drop the entry once it no
     // longer blocks so the map doesn't grow unbounded. The live count is read
@@ -2064,13 +2300,16 @@ async fn try_dial_verdict(
         }
     }
     // Claim the address (bounded), or skip if in-flight/connected already —
-    // or if the node was reached over Tor lately: a direct dial now could pair
-    // the two by timing. The check and the direct-contact stamp happen under
-    // the claim lock, the one `PeerPool::claim_for_tor` takes, so a Tor claim
-    // and a direct dial of the same node can never both go ahead.
+    // or if the node is in the Tor reserve (never dialed directly, Tor mode on
+    // or off; docs/privacy-and-tor.md §5), or was reached over Tor lately: a
+    // direct dial now could pair the two by timing. The checks and the
+    // direct-contact stamp happen under the claim lock, the one
+    // `PeerPool::claim_for_tor` and the reserve's fill take, so a Tor claim, a
+    // move into the reserve and a direct dial of one node never overlap.
     {
         let mut attempted = inner.attempted.lock().await;
-        if tor_quarantined(pubkey, Instant::now())
+        if inner.tor_reserved(&pubkey)
+            || tor_quarantined(pubkey, Instant::now())
             || attempted.len() >= inner.pool_cfg.max_attempted
             || !attempted.insert(addr)
         {
@@ -2440,6 +2679,10 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         broadcast_range_if_changed(&inner).await;
         // prune_closed frees dead peers' addresses so try_dial can re-dial them.
         let live = inner.prune_closed().await;
+        // Keep the Tor reserve at its share: topped up while Tor mode is on (so
+        // its nodes age while the wallet idles and Tor has peers when next
+        // used), handed back to when the verified cache shrinks, Tor on or off.
+        inner.balance_tor_reserve(tor_mode_on()).await;
         // Discovery's below-target hint (#539): a wider FindNode fan-out.
         if let Some(flag) = inner
             .below_target
@@ -2741,7 +2984,8 @@ mod tests {
     /// throttle; the table walk rotates; and the pool applies all of it.
     mod scarcity {
         use super::super::{
-            direct_contact_recent, DirectContactOnDrop, TOR_DIRECT_SEPARATION,
+            direct_contact_recent, DirectContactOnDrop, Enode, Reserved, SnapQuality, TorReserve,
+            TOR_DIRECT_SEPARATION,
             backoff_window, redial_wait_after_close, rotated_indices, scaled_backoff,
             scarcity_budget, scarcity_floor, scarcity_redial, try_dial_verdict, Backoff,
             BackoffKind, DialVerdict, PeerPool, PoolConfig, BACKOFF_BUSY, BACKOFF_INCOMPATIBLE,
@@ -2892,6 +3136,10 @@ mod tests {
 
         /// An in-process pool with no network: no pins, no cache, target 8.
         fn fixture(seed: &[u8]) -> PeerPool {
+            fixture_with(seed, ElPeerCache::disabled(), Vec::new())
+        }
+
+        fn fixture_with(seed: &[u8], cache: ElPeerCache, boot_enodes: Vec<Enode>) -> PeerPool {
             let key = Arc::new(
                 NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(seed)).unwrap(),
             );
@@ -2911,13 +3159,128 @@ mod tests {
                 key.public_key_bytes(),
                 cfg,
                 PoolConfig::default(),
-                ElPeerCache::disabled(),
-                Vec::new(),
+                cache,
+                boot_enodes,
                 rx,
                 None,
                 None,
                 None,
             )
+        }
+
+        /// A fresh directory for one test's cache files.
+        fn cache_dir(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("myotis-pool-reserve-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn reserved(addr: SocketAddr, last_direct_ms: u64) -> Reserved {
+            Reserved { addr, snap: true, quality: SnapQuality::Unknown, tor_fails: 0, last_direct_ms }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_reserve_fills_from_verified_peers_and_the_pool_never_dials_them() {
+            let dir = cache_dir("fill");
+            let mut cache = ElPeerCache::load(dir.join("peers-test.cache"));
+            for i in 0..9u8 {
+                cache.add(dead(200 + u16::from(i)), &[i; 64], true);
+            }
+            cache.add(dead(220), &[20; 64], false); // no snap: never reserved
+            cache.add(dead(221), &[21; 64], true);
+            for _ in 0..3 {
+                cache.record_snap_failure(dead(221)); // denied: never reserved
+            }
+            // A pin the cache also holds: never reserved.
+            let pool = fixture_with(b"reserve-fill", cache, vec![(dead(208), [8; 64])]);
+            pool.inner.balance_tor_reserve(true).await;
+            // Nine verified snap servers: a third of them, none the pin.
+            assert_eq!(pool.tor_reserve_len(), 3);
+            let reserve_nodes = pool.inner.tor_reserve.lock().unwrap().nodes();
+            assert!(reserve_nodes.iter().all(|n| n[0] < 8), "{reserve_nodes:?}");
+            let cached: Vec<[u8; 64]> = pool.inner.cache.lock().await.peers().iter().map(|c| c.pubkey).collect();
+            assert_eq!(cached.len(), 11 - 3);
+            assert!(reserve_nodes.iter().all(|n| !cached.contains(n)), "moved, not copied");
+            // Never dialed directly — whatever the Tor mode.
+            for node in &reserve_nodes {
+                let addr = dead(200 + u16::from(node[0]));
+                assert_eq!(try_dial_verdict(&pool.inner, addr, *node).await, DialVerdict::Skipped);
+            }
+            // Topped up already: another fill moves nothing.
+            pool.inner.balance_tor_reserve(true).await;
+            assert_eq!(pool.tor_reserve_len(), 3);
+            // Moved in just now (this process may have dialed them): not ready
+            // for Tor for ten minutes; a node whose last direct contact is long
+            // past is.
+            assert!(pool.tor_candidates(false).await.is_empty());
+            pool.inner.tor_reserve.lock().unwrap().insert([30; 64], reserved(dead(230), 0));
+            assert_eq!(pool.tor_candidates(false).await, vec![(dead(230), [30; 64])]);
+            // Four reserved of ten verified is over the share: one went back
+            // to the cache (the weakest, ties by node id), not the ready one.
+            assert_eq!(pool.tor_reserve_len(), 3);
+            assert!(pool.inner.tor_reserved(&[30; 64]));
+            assert_eq!(pool.inner.cache.lock().await.peers().len(), 11 - 3 + 1);
+            pool.stop().await;
+            // Persisted: a restarted pool still holds the reserve, and still
+            // leaves it alone.
+            let again = fixture_with(b"reserve-fill-2", ElPeerCache::load(dir.join("peers-test.cache")), Vec::new());
+            assert_eq!(again.tor_reserve_len(), 3);
+            assert_eq!(try_dial_verdict(&again.inner, dead(230), [30; 64]).await, DialVerdict::Skipped);
+            again.stop().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_node_dialed_while_reserved_leaves_the_reserve_and_a_pin_goes_back_to_the_cache() {
+            let dir = cache_dir("reconcile");
+            let mut reserve = TorReserve::beside(Some(dir.join("peers-test.cache").as_path()));
+            for i in 1..=3u8 {
+                reserve.insert([i; 64], reserved(dead(240 + u16::from(i)), 0));
+            }
+            reserve.flush();
+            // The Java engine dialed node 1 (it shares the cache, not the reserve).
+            let mut cache = ElPeerCache::load(dir.join("peers-test.cache"));
+            cache.add(dead(241), &[1; 64], true);
+            // Node 2 is a pin.
+            let pool = fixture_with(b"reserve-reconcile", cache, vec![(dead(242), [2; 64])]);
+            assert_eq!(pool.inner.tor_reserve.lock().unwrap().nodes(), vec![[3; 64]]);
+            let cached: Vec<[u8; 64]> = pool.inner.cache.lock().await.peers().iter().map(|c| c.pubkey).collect();
+            assert!(cached.contains(&[1; 64]) && cached.contains(&[2; 64]), "{cached:?}");
+            // A host pin set later leaves the reserve too.
+            pool.set_boot_enodes(vec![(dead(243), [3; 64])]).await;
+            assert_eq!(pool.tor_reserve_len(), 0);
+            assert!(pool.inner.cache.lock().await.peers().iter().any(|c| c.pubkey == [3; 64]));
+            pool.stop().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_node_tor_cannot_reach_goes_back_to_the_cache_and_one_that_serves_stays() {
+            let dir = cache_dir("outcomes");
+            let pool = fixture_with(b"reserve-outcomes", ElPeerCache::load(dir.join("peers-test.cache")), Vec::new());
+            pool.inner.tor_reserve.lock().unwrap().insert([5; 64], reserved(dead(250), 0));
+            pool.inner.tor_reserve.lock().unwrap().insert([6; 64], reserved(dead(251), 0));
+            let outcomes = pool.tor_reserve_handle();
+            outcomes.served([6; 64], true).await;
+            for _ in 0..crate::el::torreserve::TOR_RESERVE_EVICT_AT {
+                outcomes.unreachable([5; 64]).await;
+            }
+            assert_eq!(pool.inner.tor_reserve.lock().unwrap().nodes(), vec![[6; 64]]);
+            let back = pool.inner.cache.lock().await.peers();
+            assert_eq!(back.iter().map(|c| (c.addr, c.pubkey)).collect::<Vec<_>>(), vec![(dead(250), [5; 64])]);
+            assert_eq!(pool.tor_candidates(true).await, vec![(dead(251), [6; 64])], "confirmed by its serve");
+            // Topping up again takes other verified peers, never the node this
+            // process released for refusing Tor.
+            for i in 0..5u8 {
+                pool.inner.cache.lock().await.add(dead(260 + u16::from(i)), &[60 + i; 64], true);
+            }
+            pool.inner.balance_tor_reserve(true).await;
+            let nodes = pool.inner.tor_reserve.lock().unwrap().nodes();
+            assert_eq!(nodes.len(), 2, "{nodes:?}");
+            assert!(!nodes.contains(&[5; 64]), "{nodes:?}");
+            pool.stop().await;
+            let _ = std::fs::remove_dir_all(dir);
         }
 
         /// A loopback address nothing listens on: a dial fails at TCP at once.

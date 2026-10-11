@@ -1291,19 +1291,30 @@ struct TorBroadcast {
 /// be out, and telling the wallet it was not would invite a conflicting
 /// re-sign — so it answers unconfirmed; only when no push landed is it an
 /// error. Never a clearnet send, either way.
+///
+/// Each push's outcome goes to the Tor reserve (`outcomes`): a confirmed push
+/// keeps its node, one that never reached it counts against it.
 #[cfg(feature = "tor")]
 async fn tor_broadcast(
     targets: Vec<(std::net::SocketAddr, [u8; 64])>,
     eth_cfg: &Arc<EthConfig>,
     raw: &Arc<[u8]>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    outcomes: crate::el::pool::TorReserveHandle,
 ) -> Result<TorBroadcast, String> {
     let isolation = arti_client::IsolationToken::new();
     let (eth_cfg, raw) = (Arc::clone(eth_cfg), Arc::clone(raw));
     broadcast_pushes(targets, shutdown, move |addr, pubkey, written| {
-        let (eth_cfg, raw) = (Arc::clone(&eth_cfg), Arc::clone(&raw));
+        let (eth_cfg, raw, outcomes) = (Arc::clone(&eth_cfg), Arc::clone(&raw), outcomes.clone());
         async move {
-            crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written).await
+            let pushed =
+                crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written).await;
+            match &pushed {
+                Ok(()) => outcomes.served(pubkey, false).await,
+                Err(e) if crate::el::tor::is_peer_unreachable(e) => outcomes.unreachable(pubkey).await,
+                Err(_) => {}
+            }
+            pushed
         }
     })
     .await
@@ -1669,8 +1680,9 @@ const TOR_MAX_CANDIDATES: usize = 5;
 /// A Tor read or send with no peer to go to ([`PeerPool::tor_candidates`]
 /// empty): it fails closed rather than reach a peer that sees our IP.
 #[cfg(any(test, feature = "tor"))]
-const NO_TOR_PEER: &str = "tor: no known peer without a recent direct connection to reach over Tor \
-    (fail-closed; Tor needs a peer this node has not dialed directly in the last ten minutes)";
+const NO_TOR_PEER: &str = "tor: no peer of the Tor reserve is ready to reach over Tor \
+    (fail-closed; the reserve fills from verified peers while Tor mode is on, and a node \
+    is ready ten minutes after its last direct connection)";
 #[cfg(feature = "tor")]
 const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -6005,13 +6017,14 @@ impl ElReader {
         // (a bad-exit walk); fail-closed on the deadline.
         let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
         if candidates.is_empty() {
-            tracing::info!("tor: account read failed — no peer without a recent direct connection");
+            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
             return Err(NO_TOR_PEER.into());
         }
         // One log line per Tor read, served or failed — never naming the
         // address read (the log is exportable).
         let read_started = tokio::time::Instant::now();
         let deadline = read_started + TOR_READ_DEADLINE;
+        let outcomes = self.pool.tor_reserve_handle();
         let mut claimed_any = false;
         let mut fallback: Option<VerifiedAccount> = None;
         let mut last_err = String::new();
@@ -6036,8 +6049,9 @@ impl ElReader {
             // NB deliberately NO record_snap_served/record_snap_failure here: those
             // feed the SHARED, persisted clearnet peer-quality cache, and a peer
             // that rejects Tor-exit inbound (a Tor property) is not a bad CLEARNET
-            // snap peer — striking it would poison clearnet dialing on the next run.
-            // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
+            // snap peer. Tor-side quality goes to the Tor reserve instead
+            // (`outcomes`): a serve keeps the node, a dial that never reached it
+            // counts against it.
             match tokio::time::timeout(remaining, attempt).await {
                 Ok(Ok((result, snap_elapsed))) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
@@ -6063,17 +6077,29 @@ impl ElReader {
                             reason = result.fail_reason.unwrap_or("none"),
                             "tor: account read served over Tor"
                         );
+                        // A verified proof is a snap serve; a global fail
+                        // (our anchor not ready) proves only that it answered.
+                        outcomes.served(pubkey, result.verify_method.is_some()).await;
                         return Ok(result);
                     }
                     fallback.get_or_insert(result);
                 }
-                Ok(Err(e)) => last_err = e,
+                Ok(Err(e)) => {
+                    if crate::el::tor::is_peer_unreachable(&e) {
+                        outcomes.unreachable(pubkey).await;
+                    }
+                    last_err = e;
+                }
+                // Past the budget: no strike — the time may have gone to our
+                // bootstrap, an earlier candidate or a slow read on a session
+                // that opened. A dial the peer refuses fails on its own, inside
+                // the budget ("tor rlpx handshake timed out" included).
                 Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
             }
         }
         if !claimed_any {
             // Every candidate was dialed directly while the list was walked.
-            tracing::info!("tor: account read failed — no peer without a recent direct connection");
+            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
             return Err(NO_TOR_PEER.into());
         }
         let ms = read_started.elapsed().as_millis() as u64;
@@ -7943,7 +7969,8 @@ impl ElReader {
                 .await;
             let raw = std::sync::Arc::<[u8]>::from(raw_tx);
             let shutdown = self.request_shutdown.subscribe();
-            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
+            let outcomes = self.pool.tor_reserve_handle();
+            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown, outcomes).await {
                 Ok(sent) => {
                     tracing::info!(
                         tx = %tx_hash,
@@ -8232,6 +8259,7 @@ impl ElReader {
             return;
         }
         let (eth_cfg, shutdown) = (Arc::clone(&self.eth_cfg), self.request_shutdown.subscribe());
+        let outcomes = self.pool.tor_reserve_handle();
         tokio::spawn(async move {
             let _guard = guard;
             for raw in work {
@@ -8243,7 +8271,7 @@ impl ElReader {
                     tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
                 );
                 let raw = std::sync::Arc::<[u8]>::from(raw);
-                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone()).await {
+                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone(), outcomes.clone()).await {
                     Ok(sent) => tracing::debug!(confirmed = sent.confirmed, "rebroadcast a sent tx over Tor"),
                     Err(e) => tracing::debug!(error = %e, "Tor rebroadcast of a sent tx failed"),
                 }

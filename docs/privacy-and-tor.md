@@ -22,25 +22,32 @@
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch
-> stays clearnet. Tor reads and sends go only to cached peers — identities a
-> past session proved — that hold no direct session with us and saw no direct
-> dial or session from us in the last ten minutes (by node id, so a node at a
-> new address counts too), never a pin; the pool then leaves each node it
-> reached over Tor undialed directly until ten minutes past the Tor
-> operation's end, claimed under the same lock as a direct dial; with no such
-> peer the read or send fails closed (`PeerPool::tor_candidates` /
-> `claim_for_tor`, `TOR_DIRECT_SEPARATION`). So that peers can age past that
-> window at all — the pool re-dials cached peers on every shortfall — a Tor
-> reserve of about a third of nodes (drawn by node id with a per-process
-> salt, never a pin) is skipped by every direct dial path while Tor mode is
-> on, and Tor tries them first; each becomes available ten minutes after
-> its last direct contact (`tor_reserved`). Tor-side Hellos name the software
-> without its version (`myotis`, §6.3). That is a first step toward §5, not
-> the design: no days-long randomized quarantine, no batch rotation, the
-> separation record lives for one process (a restarted app forgets it),
-> discovery's UDP pings still reach many nodes from the real IP, an operator
-> running many nodes can pool what they see, and a host without a data
-> directory (a disabled peer cache) has no candidate at all, so Tor always
+> stays clearnet. Tor reads and sends go only to the **Tor reserve**
+> (`el::torreserve`, the `peers-tor[-net].cache` sidecar of §5): verified
+> snap servers moved out of the peer cache — about a third of them, at most
+> 24, in a per-process random order, never a pin — while Tor mode is on. The
+> pool never dials a reserved node directly again, with Tor on or off and
+> across restarts, so the reserve's nodes see this wallet only over Tor. A
+> node is ready for Tor ten minutes after its last direct contact, saved with
+> it in the file (no earlier than the process start for a node this process
+> never saw: the run before may have just dialed it). Tor results keep the
+> file current: a verified read confirms a node; three Tor dials in a row
+> that it refuses (the exit reports the peer's side failing — never a local
+> or circuit failure) send it back to the peer cache, and this process does
+> not take it again; a reserve over its share — the cache shrank — hands its
+> weakest nodes back, Tor on or off. Among equally good nodes each read draws
+> a fresh order, so reads spread over the reserve. Both directions are also guarded
+> in-process by node id: a node reached over Tor is left undialed directly
+> until ten minutes past the Tor operation's end, claimed under the same lock
+> as a direct dial; with no ready node the read or send fails closed
+> (`PeerPool::tor_candidates` / `claim_for_tor`, `TOR_DIRECT_SEPARATION`).
+> Tor-side Hellos name the software without its version (`myotis`, §6.3).
+> That is a first step toward §5, not the design: no days-long randomized
+> quarantine, no batch rotation, discovery's UDP pings still reach many nodes
+> from the real IP, the Java engine (no Tor mode) shares the peer cache but
+> not the reserve — a node it dials while reserved leaves the reserve on the
+> Rust engine's next start — an operator running many nodes can pool what
+> they see, and a host without a data directory has no reserve, so Tor always
 > fails closed there — a network-privacy win, not yet the full §5
 > unlinkability. The runnable proof
 > of concept
@@ -241,8 +248,8 @@ Route by sensitivity, not wholesale:
    sent (it may be out), and fails closed when none landed. Rebroadcasts
    follow the same route, one round at a time per network, each walking on to
    the next five eligible peers; a Tor send is never re-pushed in the clear, a
-   wallet's re-submit of it included. The peers are cached ones with no direct
-   contact in the last ten minutes (status note above); Tor sessions advertise
+   wallet's re-submit of it included. The peers are nodes of the Tor reserve,
+   ready ten minutes after their last direct contact (status note above); Tor sessions advertise
    no listen port and the client id `myotis` without its version (§6.3).
 
 ## 5. The quarantined peer pool (delayed use)
@@ -326,6 +333,14 @@ Design rules:
   `now − lastClearnetContact > randomizedThreshold` before the existing
   `snapok` preference. (Entries whose peer disappears from `peers.cache` are
   pruned; a missing sidecar just means an empty Tor pool — fail closed, §5.)
+
+  > **Shipped (a first step):** the sidecar exists as `peers-tor[-net].cache`
+  > (`el::torreserve`), but holds the reserved nodes themselves rather than
+  > metadata joined against `peers.cache`: a reserved node moves out of the
+  > shared cache, so neither the direct pool nor a Java-side rewrite sees it,
+  > and its `lastClearnetContact` is the `direct=` column. The threshold is a
+  > fixed ten minutes, not a randomized days-long one, and there are no
+  > discovery-source confirmations yet (status note at the top).
 
 ## 6. Attacks the delay does NOT stop (each needs its own fix)
 
@@ -415,8 +430,9 @@ and for not shipping a unique clientId on the Tor path.
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
    > **Shipped as:** one isolation token per send (its circuits carry no
-   > other send and no read), up to five peers with no direct contact in the
-   > last ten minutes; each rebroadcast round walks on to the next five. The
+   > other send and no read), up to five nodes of the Tor reserve (no direct
+   > contact for ten minutes, never dialed directly again); each rebroadcast
+   > round walks on to the next five. The
    > days-long aging of §5 is not built, so the stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
@@ -454,7 +470,8 @@ against live mainnet. See `rust/tor-poc/README.md` for how to run it.
   balance for `d8dA…6045` against a synced peer's head state root).
 
 **Deliberately out of scope (still proposals):** the quarantined peer pool and
-its aging window (§5), the `peers-tor` sidecar, multi-source popularity
+its aging window (§5; a first step, the `peers-tor` reserve, has shipped since),
+multi-source popularity
 promotion (§6.2), generic request-shape hardening (§6.3), tx-broadcast fan-out
 (§8.6), and — importantly — **the beacon-anchored trust root**: the PoC anchors
 the snap proof to the peer's *own claimed* fresh head, not the sync-committee

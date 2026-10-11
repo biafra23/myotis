@@ -225,6 +225,34 @@ async fn client() -> Result<&'static Arc<TorClient<PreferredRuntime>>, String> {
     CLIENT.get().ok_or_else(|| "tor bootstrap: no client after bootstrap".to_string())
 }
 
+/// Whether a stream failure of `kind` happened on the PEER's side, as the exit
+/// reports it: refused, reset or closed, or a network failure or timeout at
+/// the exit while connecting to it.
+fn peer_side(kind: arti_client::ErrorKind) -> bool {
+    use arti_client::ErrorKind as K;
+    matches!(
+        kind,
+        K::RemoteConnectionRefused
+            | K::RemoteNetworkFailed
+            | K::ExitTimeout
+            | K::RemoteStreamClosed
+            | K::RemoteStreamReset
+            | K::RemoteStreamError
+    )
+}
+
+/// Whether `error`, from [`open_snap_session`] or [`push_transaction`], says the
+/// PEER could not be reached over Tor (its side of the stream, the RLPx or eth
+/// handshake, or no snap) — a strike against a reserved node — rather than this
+/// side's Tor (bootstrap, configuration, no circuit, a local network down:
+/// "tor circuit …") or a session that opened and then failed.
+pub(crate) fn is_peer_unreachable(error: &str) -> bool {
+    ["tor addr ", "tor connect ", "tor rlpx handshake", "tor eth handshake"]
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+        || (error.starts_with("tor: peer ") && error.ends_with("did not negotiate snap"))
+}
+
 /// Open a per-address ISOLATED Tor circuit to `addr` (identity `pubkey`, already
 /// clearnet-validated) and run the RLPx + eth/snap handshake with a fresh
 /// ephemeral key, returning a READY snap-capable session. The whole dial is
@@ -280,10 +308,18 @@ async fn open_session(
     prefs.set_isolation(isolation);
     let target = TorAddr::from((addr.ip().to_string().as_str(), addr.port()))
         .map_err(|e| format!("tor addr {addr}: {e}"))?;
-    let stream = tor
-        .connect_with_prefs(target, &prefs)
-        .await
-        .map_err(|e| format!("tor connect {addr}: {e}"))?;
+    let stream = tor.connect_with_prefs(target, &prefs).await.map_err(|e| {
+        use arti_client::HasKind;
+        // "tor connect": the exit reached out and the peer's side failed — a
+        // strike against a reserved node. Anything else (no circuit, a local
+        // network down, our own timeout, an exit policy) is "tor circuit":
+        // ours or Tor's, not the peer's.
+        if peer_side(e.kind()) {
+            format!("tor connect {addr}: {e}")
+        } else {
+            format!("tor circuit for {addr}: {e}")
+        }
+    })?;
 
     // Fresh ephemeral RLPx identity per connection (docs §6.1) — never the
     // persistent node key. Reuses the reader's key generator (one source of truth).
@@ -303,6 +339,21 @@ async fn open_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_peers_side_counts_as_unreachable() {
+        use super::is_peer_unreachable as peer;
+        assert!(peer("tor connect 10.0.0.1:30303: exit refused"));
+        assert!(peer("tor rlpx handshake timed out to 10.0.0.1:30303"));
+        assert!(peer("tor rlpx handshake to 10.0.0.1:30303: bad mac"));
+        assert!(peer("tor eth handshake to 10.0.0.1:30303: wrong genesis"));
+        assert!(peer("tor: peer 10.0.0.1:30303 did not negotiate snap"));
+        assert!(!peer("tor bootstrap: no consensus"));
+        assert!(!peer("tor config: bad dir"));
+        assert!(!peer("tor circuit for 10.0.0.1:30303: no exit available"));
+        assert!(!peer("tor: no storage directory configured — the host must call set_storage_dirs"));
+        assert!(!peer("timed out awaiting the peer's Pong"));
+    }
+
     use super::*;
 
     // One test, because STORAGE is process-global: separate tests would race
