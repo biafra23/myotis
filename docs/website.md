@@ -9,8 +9,8 @@ Where it lives:
 | Address | Who it is for | Status |
 |---|---|---|
 | `https://biafra23.github.io/myotis/` | everyone | GitHub Pages, deployed by `.github/workflows/pages.yml` |
-| `myotis.eth` | ENS-aware browsers (e.g. the [Freedom browser](https://github.com/solardev-xyz/freedom-browser)) | planned: the same files on Swarm |
-| `https://myotis.eth.limo` | ordinary browsers | follows `myotis.eth` automatically once its contenthash is set |
+| `myotis.eth` | ENS-aware browsers (e.g. the [Freedom browser](https://github.com/solardev-xyz/freedom-browser)) | the same files on Swarm, behind a feed; published by hand with `scripts/publish_site_swarm.mjs` |
+| `https://myotis.eth.limo` | ordinary browsers | follows `myotis.eth` automatically |
 
 ## Rules for the page
 
@@ -47,31 +47,97 @@ redeploys by hand.
 
 Preview locally with any static server, e.g. `python3 -m http.server -d site`.
 
-## Moving to Swarm and `myotis.eth` (later)
+## Swarm and `myotis.eth`
 
-A sketch of the steps, for when the page moves. Check each command's `--help`
-against the swarm-cli version you run.
+```
+site/ ──(your Bee node)──▶ Swarm upload ──▶ feed "myotis-website" ──▶ feed manifest
+                                                                          ▲
+                              myotis.eth content hash = bzz://<manifest> ─┘  (set once)
+```
 
-1. **Upload** the directory with an index document, from a Bee node with a
-   postage batch:
+`scripts/publish_site_swarm.mjs` uploads `site/` from a Bee node you run and
+points a Swarm **feed** at it. The feed's manifest address never changes, so
+`myotis.eth`'s content hash is set once, in one ENS transaction, and every later
+publish only updates the feed. The Freedom browser opens `myotis.eth` directly;
+`https://myotis.eth.limo` serves the same page to every other browser (eth.limo
+resolves Swarm content hashes as well as IPFS ones).
+
+The upload is the official `swarm-cli` (pinned in the script, fetched by `npx`);
+the script adds the checks around it: the batch is usable and immutable, the
+feed key exists, the node afterwards serves exactly the local files, and where
+`myotis.eth` points (read through your Myotis node on `127.0.0.1:8545`, or
+`ETH_RPC_URL`). It needs Node 18+.
+
+Publishing is manual on purpose: the feed key decides what `myotis.eth` shows,
+and it stays on your machine rather than in CI secrets. GitHub Pages keeps
+deploying by itself and stays up as a mirror.
+
+### Once
+
+1. **Create the feed key** and back it up. The password encrypts it on disk.
 
    ```bash
-   swarm-cli upload site/ --stamp <batch-id> --index-document index.html
+   npx @ethersphere/swarm-cli@3.6.0 identity create myotis-website
+   npx @ethersphere/swarm-cli@3.6.0 identity export myotis-website --out-file myotis-website-feed.json
    ```
 
-   This prints a Swarm reference (64 hex characters).
-2. **Point the name at it**: in the ENS manager app, set the *content hash* of
-   `myotis.eth` to `bzz://<reference>`. The Freedom browser then opens
-   `myotis.eth` directly, and `https://myotis.eth.limo` serves the same page —
-   eth.limo resolves Swarm content hashes as well as IPFS ones.
-3. **Updates without an ENS transaction each time**: upload through a *feed*
-   instead (`swarm-cli feed upload site/ --identity <name> --topic-string
-   website --stamp <batch-id> --index-document index.html`) and set the content
-   hash once to the feed's manifest reference; later uploads under the same
-   identity and topic replace what the name shows.
-4. **Keep the batch alive.** Swarm keeps data only while its postage batch is
-   paid for; top it up (`swarm-cli stamp topup`) before it expires, or the page
-   disappears from `myotis.eth` and eth.limo with it.
+   Keep the export and its password offline. Whoever holds this key can change
+   what `myotis.eth` shows, for example to a page with fake download links,
+   until the ENS record is changed. Losing it means a new feed and a new ENS
+   transaction.
+2. **Buy an immutable postage batch** for it. `stamp create` prints the price
+   in xBZZ and asks before it buys.
 
-GitHub Pages can stay as a mirror after the move; nothing on the page depends on
-which host served it.
+   ```bash
+   npx @ethersphere/swarm-cli@3.6.0 stamp create --capacity 100MB --ttl 1y --immutable --label myotis-website
+   ```
+
+   It must be immutable: a mutable batch that fills up overwrites its oldest
+   chunks, the feed's included, and the site disappears without an error. The
+   site is under 100 KB, so each publish uses little of it; choose capacity and
+   lifetime to taste. Note the batch id it prints.
+3. **Publish.**
+
+   ```bash
+   SWARM_STAMP=<batch id> node scripts/publish_site_swarm.mjs publish
+   ```
+
+   It asks for the key's password, uploads, waits until your node serves the
+   new files, and prints the content hash to set: `bzz://<feed manifest>`.
+4. **Point `myotis.eth` at it**, once, from the wallet that manages the name:
+   in the [ENS app](https://app.ens.domains/myotis.eth), *Records → Edit
+   records → Content hash*, enter `bzz://<feed manifest>` and confirm the
+   transaction.
+5. **Check.** `node scripts/publish_site_swarm.mjs status` reads the record
+   back and compares what Swarm serves with `site/`. Then open
+   `https://myotis.eth.limo` (eth.limo may cache the old answer for a few
+   minutes) and `myotis.eth` in the Freedom browser.
+
+### Every update
+
+After a change to `site/` is merged, from an up-to-date checkout of `main`:
+
+```bash
+SWARM_STAMP=<batch id> node scripts/publish_site_swarm.mjs publish
+```
+
+No ENS transaction. If the script reports that `myotis.eth` points somewhere
+else, the feed key or topic changed (or someone changed the record): the live
+site did not change.
+
+### Keeping it alive
+
+Swarm keeps data only while its batch is paid for. Keep **one batch for the life
+of the feed**: the feed's earlier updates are stamped with it, so let it neither
+expire nor be replaced.
+
+- **Before it expires**, top it up (`npx @ethersphere/swarm-cli@3.6.0 stamp
+  topup --stamp <id> --amount <plur>`). The script warns when fewer than 30
+  days are left.
+- **Before it fills**, dilute it to a larger depth (`stamp dilute --stamp <id>
+  --depth <n>`; each extra level of depth halves the remaining lifetime, so top up after). The
+  script warns at 80 %: an immutable batch refuses uploads once full.
+
+The script passes the key's password to `swarm-cli` as a command-line argument,
+which other users of the same machine could see in the process list; publish
+from a machine only you use.
