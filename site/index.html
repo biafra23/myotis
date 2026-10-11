@@ -134,6 +134,7 @@ section { padding: 72px 0; }
 section.alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .section-intro { max-width: 46em; margin-bottom: 32px; }
 .section-intro p { color: var(--muted); font-size: 1.08rem; }
+.section-intro.beyond { margin-top: 64px; }
 @media (max-width: 640px) { section { padding: 52px 0; } }
 
 .callout {
@@ -376,6 +377,28 @@ footer .brand { font-size: 1rem; }
         <p>Myotis costs nothing and its code is public, under the Apache 2.0 licence. Anyone can read it, check it and build on it.</p>
       </div>
     </div>
+
+    <div class="section-intro beyond" id="beyond">
+      <h2>Beyond your wallet</h2>
+      <p>Myotis also works inside other apps, and for apps that need more than today’s balances.</p>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3>Freedom browser</h3>
+        <p>The <a href="https://github.com/solardev-xyz/freedom-browser">Freedom browser</a> has Myotis built in, as an experimental option on desktop and iPhone. It runs quietly next to the browser’s Swarm and IPFS nodes and looks up <code>.eth</code> names, such as <code>myotis.eth</code>, straight from the Ethereum network, verified, with no company in between.</p>
+      </div>
+      <div class="card">
+        <h3>Swarm</h3>
+        <p>A Swarm node (Bee) needs a connection to Gnosis Chain, usually a hosted service. Myotis can be that connection, given the right data: Bee needs the full history of Swarm’s postage-stamp contract from its first minute.</p>
+      </div>
+      <div class="card">
+        <h3>RAILGUN</h3>
+        <p>RAILGUN wallets keep balances private and rebuild them by reading the whole history of RAILGUN’s contract. Myotis can serve that history to a RAILGUN wallet, such as the <a href="https://github.com/Terminal-Wallet/terminal-wallet-cli">Terminal Wallet</a>, in place of a public provider, given the right data.</p>
+      </div>
+    </div>
+    <div class="callout">
+      <p><strong>What “the right data” means.</strong> Swarm and RAILGUN need years of one contract’s history, not just the current state. Myotis can collect that history itself and checks every piece it collects, but going back years takes days. Started from a prepared copy of the history, it is ready in minutes. Myotis takes that copy on the word of whoever prepared it, and a wrong copy could make it show wrong results without noticing. So for now the Swarm and RAILGUN builds are demonstrations: the Mac downloads with <em>bee-poc</em> and <em>railgun-poc</em> in their names. The RAILGUN history can also be loaded into the Android app by hand.</p>
+    </div>
   </div>
 </section>
 
@@ -422,7 +445,7 @@ footer .brand { font-size: 1rem; }
           <div><span class="who">Linux PC (most computers)</span><span class="file mono">Myotis-v…-x64.deb</span></div>
           <div><span class="who">Linux on ARM</span><span class="file mono">Myotis-v…-arm64.deb</span></div>
         </div>
-        <p>Not sure which Mac you have? Apple menu → <em>About This Mac</em>: it says <em>Chip: Apple M…</em> or <em>Processor: Intel</em>. Ignore every other file on the page — files with <em>bee-poc</em> or <em>railgun-poc</em> in the name are demos, the rest are for developers.</p>
+        <p>Not sure which Mac you have? Apple menu → <em>About This Mac</em>: it says <em>Chip: Apple M…</em> or <em>Processor: Intel</em>. Ignore every other file on the page — files with <em>bee-poc</em> or <em>railgun-poc</em> in the name are the <a href="#beyond">Swarm and RAILGUN demos</a>, the rest are for developers.</p>
       </li>
       <li>
         <h3>Install</h3>
@@ -647,7 +670,7 @@ footer .brand { font-size: 1rem; }
       <summary>Is there a Windows or iPhone version?</summary>
       <div class="answer">
         <p><strong>Windows:</strong> not yet.</p>
-        <p><strong>iPhone:</strong> not as an app you can install. iOS pauses apps that are in the background, so a separate wallet could not rely on Myotis there. The way forward on iPhone is wallets that build Myotis in directly — the building blocks for that already exist.</p>
+        <p><strong>iPhone:</strong> not as an app you can install. iOS pauses apps that are in the background, so a separate wallet could not rely on Myotis there. The way forward on iPhone is apps that build Myotis in directly. The <a href="#beyond">Freedom browser</a> already does, for <code>.eth</code> names.</p>
       </div>
     </details>
     <details>
