@@ -313,7 +313,7 @@ footer .brand { font-size: 1rem; }
   <div class="wrap">
     <div class="section-intro">
       <h2>What is Myotis?</h2>
-      <p>When you open a wallet such as MetaMask and look at your balance, the wallet does not look at Ethereum itself. It asks a server run by a company — “what is this address’s balance?” — and shows you whatever comes back. You have no way to check that answer, and that company sees every address you look at, every time, together with your internet address.</p>
+      <p>When you open a wallet such as MetaMask and look at your balance, the wallet does not look at Ethereum itself. It asks a server run by a company — “what is this address’s balance?” — and shows you whatever comes back. You have no way to check that answer, and your wallet only works for as long as that company keeps answering.</p>
       <p>Myotis replaces that server with one that runs on <em>your</em> phone or computer. It joins the Ethereum network like any other participant, fetches just the small pieces your wallet asks about, and checks each one against proofs signed by the network itself. Your wallet keeps working exactly as before — you just point it at Myotis instead of the company.</p>
     </div>
 
@@ -327,7 +327,7 @@ footer .brand { font-size: 1rem; }
           <div class="arrow" aria-hidden="true">→</div>
           <div class="node">Ethereum</div>
         </div>
-        <p class="muted">One company answers every question, sees every address you check, and can be wrong, switched off, or pressured into blocking you.</p>
+        <p class="muted">One company answers every question. You cannot check its answers, and it can be wrong, switched off, or pressured into blocking you.</p>
       </div>
       <div class="panel">
         <h3>With Myotis</h3>
@@ -367,8 +367,8 @@ footer .brand { font-size: 1rem; }
       </div>
       <div class="card">
         <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><circle cx="19" cy="15" r="1.5"/><circle cx="5" cy="16" r="1.5"/><path d="M8 7.5l8-1M7 8.5l4 8M17 7.5l-4 9M13.8 17.4l3.8-1.8M10 17.5l-3.6-1"/></svg></div>
-        <h3>No one collects it all</h3>
-        <p>Instead of one company seeing everything you look at, Myotis spreads its questions across many independent computers, so no single one builds up the full picture.</p>
+        <h3>No company in the middle</h3>
+        <p>Your questions go to ordinary computers on Ethereum’s network, not to one company that has you on file. They are not hidden, though: the computers Myotis asks can see which addresses you look up, and your internet address. Better privacy is being worked on.</p>
       </div>
       <div class="card">
         <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6l-6 6 6 6M16 6l6 6-6 6"/></svg></div>
@@ -465,11 +465,12 @@ footer .brand { font-size: 1rem; }
       <li>
         <h3>Install</h3>
         <p>Open the downloaded file. Android asks whether your browser may install apps: allow <em>Install unknown apps</em> for it, go back and tap <em>Install</em>. If Google Play Protect warns about an unknown app, choose <em>More details → Install anyway</em>.</p>
-        <p>These warnings appear because the app comes straight from the project rather than from the Play Store, and because it is a test (“debug”) build — <a href="#faq-warnings">more about that</a>.</p>
+        <p>Then switch <em>Install unknown apps</em> off again for your browser (Android <em>Settings → Apps → Special app access → Install unknown apps</em>), so nothing else can install apps through it.</p>
+        <p><strong>Only ever install Myotis, and its updates, from the official page above.</strong> This Android version is a test (“debug”) build, signed with a key that anyone can use. Android would accept a lookalike file from someone else as an “update” to Myotis, and a fake Myotis could feed your wallet false numbers. <a href="#faq-warnings">More about the warnings</a>.</p>
       </li>
       <li>
         <h3>Open Myotis and let it catch up</h3>
-        <p>Myotis starts by itself when you open it. A notification, <em>Myotis node running</em>, stays visible while it works — that is how Android lets it keep running in the background while you switch to your wallet. If you tap <em>Start</em> yourself, Android may ask whether Myotis may show notifications; allowing it keeps you informed.</p>
+        <p>Myotis starts by itself when you open it and keeps running in the background while you switch to your wallet. It shows a notification, <em>Myotis node running</em>, while it works. On Android 13 and newer you only see it after allowing notifications for Myotis (Android <em>Settings → Apps → Myotis → Notifications</em>). That is worth doing: Myotis also uses a notification to tell you when a website asks to use it.</p>
         <p>The very first start takes a few minutes; after that it is ready in about ten seconds. Wait until the <em>Status</em> tab says <strong>Ready</strong> with a green bar — <a href="#status">what the colours mean</a>.</p>
       </li>
       <li>
@@ -478,7 +479,7 @@ footer .brand { font-size: 1rem; }
       </li>
       <li>
         <h3>Good to know: Myotis sleeps to save battery</h3>
-        <p>After five minutes without wallet requests, Myotis goes to sleep: the status turns grey and says <em>Sleeping</em>, and it stops using the network. As soon as your wallet asks something, it wakes up by itself — the first answer just takes a few seconds longer. While the phone is plugged in and online, it stays awake. You can change both under <em>Settings → Power</em> (<em>Idle sleep after</em> and <em>Stay awake while charging</em>), and stop Myotis completely with <em>Stop</em> on the Status tab.</p>
+        <p>After five minutes without wallet requests, Myotis goes to sleep: the status turns grey and says <em>Sleeping</em>, and it stops using the network. As soon as your wallet asks something, it wakes up by itself — the first answer just takes a few seconds longer. While the phone is plugged in and online, it stays awake. You can change both under <em>Settings → Power</em> (<em>Idle sleep after</em> and <em>Stay awake while charging</em>), and stop a network with <em>Stop</em> on the Status tab. Once no network is running, Myotis stops completely.</p>
       </li>
     </ol>
   </div>
@@ -535,7 +536,8 @@ footer .brand { font-size: 1rem; }
     <p class="fineprint">MetaMask’s menus move a little between versions. If you cannot find <em>Add RPC URL</em>, look for <em>Add network → Add a network manually</em> and enter the values from the table. Other wallets work the same way, as long as they let you set a custom RPC URL.</p>
 
     <div class="callout" id="web-access">
-      <p><strong>Using the MetaMask browser extension? Allow it once.</strong> To protect you, Myotis refuses web pages by default — otherwise any website open in your browser could quietly use it. A browser extension counts as a web page too. The first time MetaMask connects, Myotis shows <em>A web page was refused</em> on its Status screen and as a notification, naming <em>MetaMask (Chrome extension)</em>. Click <strong>Allow</strong>. Only allow names you recognise; the list lives under <em>Settings → Web page access</em>.</p>
+      <p><strong>Using the MetaMask browser extension? Allow it once.</strong> To protect you, Myotis refuses web pages by default — otherwise any website open in your browser could quietly use it. A browser extension counts as a web page too. The first time MetaMask connects, Myotis shows a banner on its <em>Status</em> screen, <em>A web page was refused</em>, with an <strong>Allow</strong> button; a notification points you there. Allow it only if it appeared right when you connected your wallet. You can review the list any time under <em>Settings → Web page access</em>.</p>
+      <p>What the banner names depends on your browser. For MetaMask from the Chrome Web Store it says <em>MetaMask (Chrome extension)</em>. In Firefox, Edge and others it shows a code instead, such as <code>moz-extension://…</code>; in Firefox you can match it against MetaMask’s <em>Internal UUID</em> on the page <code>about:debugging#/runtime/this-firefox</code>.</p>
       <p>Wallet apps on your phone, such as MetaMask Mobile, are not web pages and work right away.</p>
     </div>
   </div>
@@ -545,7 +547,7 @@ footer .brand { font-size: 1rem; }
   <div class="wrap narrow">
     <div class="section-intro">
       <h2>Inside the app</h2>
-      <p>Myotis has three tabs: <em>Status</em>, <em>Query</em> and <em>Settings</em>. On a phone they sit at the bottom of the screen, on a computer along the top. The chips next to the name show which networks are running.</p>
+      <p>Myotis has three tabs: <em>Status</em>, <em>Query</em> and <em>Settings</em>. On a phone they sit at the bottom of the screen, on a computer along the top. The chips next to the name are the networks you switched on: tap one to see its status. <em>Start</em> and <em>Stop</em> act on the selected network.</p>
     </div>
 
     <h3>Status: is it ready?</h3>
@@ -553,7 +555,7 @@ footer .brand { font-size: 1rem; }
     <ul class="lights">
       <li><span class="dot ok" aria-hidden="true"></span><p><strong>Green — Ready.</strong> Your wallet gets verified answers. A thicker, brighter green means Myotis has found plenty of helpers on the network, so even heavy wallet screens load quickly.</p></li>
       <li><span class="dot warn" aria-hidden="true"></span><p><strong>Amber — Almost ready.</strong> Myotis has caught up and is waiting for the newest block. Your wallet may show a brief error; just wait a moment. (If you use the log index from <em>Expert mode</em>, amber can also read <em>Ready — log index catching up</em>: everything works except searches for the very latest contract events, until the index has caught up.)</p></li>
-      <li><span class="dot bad" aria-hidden="true"></span><p><strong>Red — Syncing, or something needs you.</strong> Red does not always mean a problem: <em>Syncing</em> is normal while Myotis catches up, so wait. The other red headlines tell you what to do: <em>Not running</em> — tap <em>Start</em>; <em>No internet connection</em>; <em>Update required</em> — install the newest version; <em>Needs your decision</em> — see <a href="#faq-decision">this question</a>.</p></li>
+      <li><span class="dot bad" aria-hidden="true"></span><p><strong>Red — Syncing, or something needs you.</strong> Red does not always mean a problem: <em>Syncing</em> is normal while Myotis catches up, so wait. The other red headlines tell you what to do: <em>Not running</em> — tap the start button (it names the network, e.g. <em>Start mainnet</em>); <em>No internet connection</em>; <em>Update required</em> — install the newest version; <em>Needs your decision</em> — see <a href="#faq-decision">this question</a>.</p></li>
       <li><span class="dot off" aria-hidden="true"></span><p><strong>Grey — Sleeping</strong> (Android). Myotis paused itself to save battery. Your wallet’s next request wakes it up.</p></li>
     </ul>
 
@@ -586,14 +588,14 @@ footer .brand { font-size: 1rem; }
     <details>
       <summary>How long does it take to get going?</summary>
       <div class="answer">
-        <p>The very first start takes a few minutes. After that, Myotis is ready in about ten seconds. If it has been switched off for a long time, it needs a little longer to catch up — the Status tab shows the progress.</p>
+        <p>The very first start takes a few minutes. After that, Myotis is ready in about ten seconds. If it has been switched off for a while, it needs a little longer to catch up — the Status tab shows the progress. If it has been off for longer than its safety limit, it stops and asks you first: see <a href="#faq-decision">“Needs your decision”</a>.</p>
       </div>
     </details>
     <details>
       <summary>How much storage and internet data does it use?</summary>
       <div class="answer">
         <p><strong>Storage: almost none.</strong> Myotis does not download the blockchain — it keeps well under 1 MB per network.</p>
-        <p><strong>Data:</strong> up to about 10 MB to get started. While it is awake, it uses roughly 2 to 6 MB per minute to stay up to date. On a phone it sleeps when not in use, so it uses very little; a computer keeps it awake all the time, which can add up to several gigabytes a day — no problem on home internet, but worth knowing on a metered connection. Sending a transaction costs about 1 to 2 MB.</p>
+        <p><strong>Data:</strong> up to about 10 MB to get started. While it is awake, it uses roughly 2 to 6 MB per minute to stay up to date. On a phone it sleeps when not in use, so it uses very little — except while charging, when it stays awake, on mobile data too (switch that off under <em>Settings → Power</em>); a computer keeps it awake all the time, which can add up to several gigabytes a day — no problem on home internet, but worth knowing on a metered connection. Sending a transaction costs about 1 to 2 MB.</p>
       </div>
     </details>
     <details>
@@ -605,15 +607,22 @@ footer .brand { font-size: 1rem; }
     <details id="faq-warnings">
       <summary>Why do my phone and my Mac warn me about the app?</summary>
       <div class="answer">
-        <p>Because Myotis is not distributed through the Play Store or registered with Apple yet. Both systems warn about any app that comes from elsewhere. On Android, the file is also a test (“debug”) build. The app is free and its full source code is public, so anyone can check what it does.</p>
-        <p>To be safe, only download Myotis from its official page: <a href="https://github.com/biafra23/myotis/releases">github.com/biafra23/myotis/releases</a>.</p>
+        <p>Because Myotis is not distributed through the Play Store or registered with Apple yet. Both systems warn about any app that comes from elsewhere. The app is free and its full source code is public, so anyone can check what it does.</p>
+        <p>On Android there is one more thing to know: the file is a test (“debug”) build, signed with a key that anyone can use, so Android cannot tell a real Myotis update from a lookalike. <strong>Only download Myotis from its official page:</strong> <a href="https://github.com/biafra23/myotis/releases">github.com/biafra23/myotis/releases</a>.</p>
       </div>
     </details>
     <details id="faq-decision">
       <summary>The status says “Needs your decision”. What now?</summary>
       <div class="answer">
-        <p>Each version of Myotis ships with a trusted starting point on the chain. If that starting point is older than a safety limit — about two weeks on Ethereum, about a day and a half on Gnosis Chain — Myotis pauses instead of quietly relying on it, and asks you.</p>
-        <p>The best answer is to install the newest version, which comes with a fresh starting point. If you already have the newest version, tap <em>Review</em> and choose <em>Sync anyway</em> to continue from the older starting point. On Gnosis Chain, with its short limit, this question comes up often — it is expected, not a fault.</p>
+        <p>Myotis checks the chain onwards from a point it already trusts: the one built into the app, or the point where it last left off, whichever is newer. If that point is older than a safety limit — about two weeks on Ethereum, about a day and a half on Gnosis Chain — the signatures Myotis checks can no longer rule out a forged chain. So it stops and asks you instead of carrying on.</p>
+        <p>This happens after installing a version whose built-in point is already that old, or when Myotis has been off for longer than the limit. On Gnosis Chain, with its short limit, it is common and expected.</p>
+        <p>The safe answer is to install the newest version, which carries a fresher starting point. If that does not help, or you cannot update right now, <em>Review → Sync anyway (accept risk)</em> continues for this run. Choose it only if you trust your internet connection: you accept a small risk that someone feeds Myotis a fake chain that it cannot tell from the real one.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Can anyone see what I look up?</summary>
+      <div class="answer">
+        <p>Partly, yes. Myotis asks other computers on the Ethereum network for the data your wallet needs. The computer it asks can see which address a question is about, and your internet address — just as a wallet company’s server can. Myotis checks that the answers are true; it does not yet hide who is asking. Private lookups are being worked on. If you want to hide your internet address in the meantime, a VPN helps.</p>
       </div>
     </details>
     <details>
