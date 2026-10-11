@@ -748,6 +748,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_tor_storage_dirs(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_ws_bound_periods(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
@@ -846,6 +848,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_tor_storage_dirs(`stateDir`: RustBuffer.ByValue,`cacheDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_ws_bound_periods(`handle`: Long,`periods`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -1088,6 +1092,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_set_tor_storage_dirs() != 46410) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() != 6098) {
@@ -2002,6 +2009,26 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterBoolean.lower(`on`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Name the absolute directories the embedded Tor client keeps its state and
+         * its directory cache in. Required on Android before the first Tor read (Arti's
+         * defaults derive from `$HOME`); elsewhere unset means Arti's platform
+         * defaults. True iff the client will use exactly these: a different pair once
+         * a bootstrap holds its directories, a relative path, or a Tor-less build
+         * answers false. Process-global, not per-handle.
+         */ fun `setTorStorageDirs`(`stateDir`: kotlin.String, `cacheDir`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_tor_storage_dirs(
+    
+        
+        FfiConverterString.lower(`stateDir`),
+        FfiConverterString.lower(`cacheDir`),_status)
 }
     )
     }

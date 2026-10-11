@@ -3988,6 +3988,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -4248,6 +4249,7 @@ dependencies = [
  "myotis-evm",
  "myotis-net",
  "myotis-wire",
+ "rustls",
  "serde_json",
  "snap",
  "socket2 0.5.10",
@@ -5989,6 +5991,7 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7960,11 +7963,15 @@ dependencies = [
  "dyn-clone",
  "educe 0.4.23",
  "futures",
+ "futures-rustls",
  "hex",
  "libc",
  "native-tls",
  "paste",
  "pin-project",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",

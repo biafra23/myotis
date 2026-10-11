@@ -246,7 +246,21 @@ uniffi::setup_scaffolding!();
 ///      registrantHex / managerHex / wrapped / resolverHex / expiresAt /
 ///      gracePeriodSeconds, absent parts left out). A payload extension, no
 ///      signature change: an older engine answers "unknown ens method".
-pub const ABI_VERSION: i32 = 42;
+/// v43: added set_tor_storage_dirs / myotis_set_tor_storage_dirs (UniFFI and
+///      the C ABI): the absolute directories the embedded Arti client keeps its
+///      state and directory cache in, named before the first Tor read. Android
+///      requires it — Arti's default directories derive from `$HOME` there, so
+///      an unconfigured bootstrap is refused — and it is how a `-PtorEngine`
+///      Android build becomes able to route at all (the Android jniLibs run
+///      Arti on rustls with the ring provider, see myotis-net's Cargo.toml).
+///      Elsewhere unset keeps Arti's platform defaults. True iff the client
+///      will use exactly these: a different pair once a bootstrap holds its
+///      directories, a relative path, or a Tor-less build answers false. An
+///      additive function — bumped so a host that names the directories is
+///      never paired with an engine that silently lacks the call. The Android
+///      host calls it (`Tor.configureStorage`); desktop, iOS and the Node
+///      addon do not.
+pub const ABI_VERSION: i32 = 43;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

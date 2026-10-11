@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 42; // 42: ens_record_json method "ownership" (ENS registrant/manager/expiry); 41: blockTimestamp on the account and ENS shapes
+    static final int EXPECTED_ABI_VERSION = 43; // 43: set_tor_storage_dirs; 42: ens_record_json method "ownership" (ENS registrant/manager/expiry)
 
     private static final boolean AVAILABLE = load();
 
@@ -184,6 +184,17 @@ final class RustEngineNative {
      */
     static int nativeTorStatus() {
         return Myotis_engineKt.torStatus();
+    }
+
+    /**
+     * Name the absolute directories the embedded Tor client keeps its state and
+     * directory cache in (required on Android before the first Tor read). True iff
+     * the client will use exactly these; false for a relative path, a different pair
+     * once a bootstrap holds its directories, or a Tor-less library.
+     */
+    static boolean nativeSetTorStorageDirs(String stateDir, String cacheDir) {
+        // nz(): null or malformed UTF-16 becomes "", which the engine refuses (not absolute).
+        return Myotis_engineKt.setTorStorageDirs(nz(stateDir), nz(cacheDir));
     }
 
     /**

@@ -160,7 +160,8 @@ disclosure to up to three peers. A page that can ask the engine for arbitrary
 addresses turns the user's node into a **deanonymization oracle the attacker
 drives**: it can make the user's IP query any address it likes, at any rate,
 and the peers see those queries as the user's interest. The Tor read path
-narrows this for account reads only, on the desktop host only; storage reads,
+narrows this for account reads only, on the desktop and Android hosts only
+(and only in a `-PtorEngine` build); storage reads,
 `eth_call`, gas estimation and broadcast have no Tor path today.
 
 ### 4.3 The read budget is shared and a dApp is not a cooperative client
