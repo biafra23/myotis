@@ -138,7 +138,7 @@ const ONLINE_SIGNAL_MAX_AGE: Duration = Duration::from_secs(2 * 60);
 /// before a Tor read or send may reach it, and how long the pool then leaves a
 /// peer it reached over Tor undialed directly (docs/privacy-and-tor.md §5): a
 /// peer that sees both inside this window could pair them by timing.
-pub const TOR_DIRECT_SEPARATION: Duration = Duration::from_secs(10 * 60);
+pub(crate) const TOR_DIRECT_SEPARATION: Duration = Duration::from_secs(10 * 60);
 
 /// One dialable EL pin: a socket address and the peer's 64-byte node id — the
 /// network's shipped pins and a host's seed pins alike (`reader::parse_enode`).
@@ -743,6 +743,11 @@ impl PoolInner {
         union_pins(&self.boot_enodes, &self.host_enodes.lock().await)
     }
 
+    /// Whether `addr`/`node` is one of the pool's pins, by address or by node id.
+    async fn is_pin(&self, addr: SocketAddr, node: &[u8; 64]) -> bool {
+        self.all_pins().await.iter().any(|(a, n)| *a == addr || n == node)
+    }
+
     /// Bench an outpaced peer, and strike a repeat — see `record_snap_outpaced`.
     async fn record_outpaced(&self, addr: SocketAddr) {
         self.prune_closed().await;
@@ -904,6 +909,10 @@ impl PoolInner {
     /// the number of remaining live peers (so callers avoid a second `peers`
     /// lock just to read the count).
     async fn prune_closed(&self) -> usize {
+        // Evicted sessions that have closed since: stamp them and drop them,
+        // so the list stays bounded by the evicted sessions still open (with
+        // Tor off too, where nothing else sweeps it).
+        self.sweep_lingering();
         let now = Instant::now();
         let mut peers = self.peers.lock().await;
         let mut freed = Vec::new();
@@ -1358,18 +1367,24 @@ impl PeerPool {
             live_addrs.insert(p.addr);
             live_nodes.insert(p.peer.peer_pubkey());
         }
-        let pins: HashSet<SocketAddr> =
-            self.inner.all_pins().await.into_iter().map(|(addr, _)| addr).collect();
+        let all_pins = self.inner.all_pins().await;
+        let pins: HashSet<SocketAddr> = all_pins.iter().map(|(addr, _)| *addr).collect();
+        let pin_nodes: HashSet<[u8; 64]> = all_pins.iter().map(|(_, node)| *node).collect();
         let blacklist = self.inner.blacklist.lock().await.clone();
         let now = Instant::now();
         let ex = TorExclusions {
             live_addrs: &live_addrs,
             live_nodes: &live_nodes,
             pins: &pins,
+            pin_nodes: &pin_nodes,
             blacklist: &blacklist,
             recently_contacted: &|node| direct_contact_recent(node, now),
         };
-        tor_eligible(cached, &ex, snap_only)
+        // Reserved nodes first: the direct pool never dials them, so claiming
+        // them for Tor costs it nothing; the others are still eligible.
+        let mut eligible = tor_eligible(cached, &ex, snap_only);
+        eligible.sort_by_key(|(_, node)| !tor_reserved(node));
+        eligible
     }
 
     /// Claim `targets` for a Tor read or send in contact with them until
@@ -1728,6 +1743,45 @@ impl ContactLog {
     }
 }
 
+/// The share of nodes, in parts of [`TOR_RESERVE_OF`], that the direct pool
+/// leaves alone while Tor mode is on (a third).
+const TOR_RESERVE_SHARE: u64 = 1;
+const TOR_RESERVE_OF: u64 = 3;
+
+/// A per-process secret mixed into the reserve draw, so which nodes a wallet
+/// keeps for Tor is its own: with a fleet-wide set, every Myotis node would
+/// reach the same peers only over Tor.
+static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    let mut salt = [0u8; 32];
+    // No entropy: an all-zero salt still reserves a third, just a guessable one.
+    let _ = getrandom::getrandom(&mut salt);
+    salt
+});
+
+/// Pure: whether `node` falls in the reserve drawn with `salt`.
+fn tor_reserved_with(salt: &[u8; 32], node: &[u8; 64]) -> bool {
+    let h = myotis_core::keccak::keccak256_concat(salt, node);
+    let draw = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+    draw % TOR_RESERVE_OF < TOR_RESERVE_SHARE
+}
+
+/// Whether this process keeps `node` for Tor ([`tor_reserved_with`]).
+fn tor_reserved(node: &[u8; 64]) -> bool {
+    tor_reserved_with(&TOR_RESERVE_SALT, node)
+}
+
+/// Whether Tor mode is on (always off without the `tor` feature).
+fn tor_mode_on() -> bool {
+    #[cfg(feature = "tor")]
+    {
+        crate::el::tor::is_enabled()
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        false
+    }
+}
+
 /// Direct (clearnet) dials and sessions, stamped by the pool.
 static DIRECT_CONTACT: std::sync::LazyLock<std::sync::Mutex<ContactLog>> =
     std::sync::LazyLock::new(Default::default);
@@ -1763,7 +1817,7 @@ fn tor_quarantined(node: [u8; 64], now: Instant) -> bool {
 /// Record that `nodes` are in contact with us over Tor until `until` — for a
 /// Tor operation still running past its claim (a rebroadcast round pushing one
 /// pending send after another). [`PeerPool::claim_for_tor`] stamps the claim.
-pub fn note_tor_contact_until(nodes: impl IntoIterator<Item = [u8; 64]>, until: Instant) {
+pub(crate) fn note_tor_contact_until(nodes: impl IntoIterator<Item = [u8; 64]>, until: Instant) {
     let now = Instant::now();
     let mut log = TOR_CONTACT.lock().unwrap_or_else(|p| p.into_inner());
     for node in nodes {
@@ -1777,7 +1831,10 @@ struct TorExclusions<'a> {
     live_addrs: &'a HashSet<SocketAddr>,
     /// Pooled or evicted-but-open sessions, by node id.
     live_nodes: &'a HashSet<[u8; 64]>,
+    /// Pins, by address and by node id (a pinned node cached under another
+    /// address is still a pin).
     pins: &'a HashSet<SocketAddr>,
+    pin_nodes: &'a HashSet<[u8; 64]>,
     blacklist: &'a HashSet<[u8; 64]>,
     /// A direct dial or session within the separation window, by node id.
     recently_contacted: &'a dyn Fn([u8; 64]) -> bool,
@@ -1792,6 +1849,7 @@ fn tor_eligible(cached: Vec<CachedElPeer>, ex: &TorExclusions<'_>, snap_only: bo
             !ex.live_addrs.contains(&c.addr)
                 && !ex.live_nodes.contains(&c.pubkey)
                 && !ex.pins.contains(&c.addr)
+                && !ex.pin_nodes.contains(&c.pubkey)
                 && !ex.blacklist.contains(&c.pubkey)
                 && !(ex.recently_contacted)(c.pubkey)
                 && (!snap_only || (c.snap && c.quality != SnapQuality::Denied))
@@ -1824,7 +1882,9 @@ mod tor_eligible_tests {
         ];
         let live_addrs = HashSet::from([live.addr]);
         let live_nodes = HashSet::from([lingering.pubkey]);
-        let pins = HashSet::from([pin.addr]);
+        // The pin is cached under another address: excluded by its node id.
+        let pins = HashSet::from([SocketAddr::from(([10, 0, 0, 9], 30303))]);
+        let pin_nodes = HashSet::from([pin.pubkey]);
         let blacklist = HashSet::from([banned.pubkey]);
         let recent_node = recent.pubkey;
         let recently_contacted = move |node: [u8; 64]| node == recent_node;
@@ -1832,6 +1892,7 @@ mod tor_eligible_tests {
             live_addrs: &live_addrs,
             live_nodes: &live_nodes,
             pins: &pins,
+            pin_nodes: &pin_nodes,
             blacklist: &blacklist,
             recently_contacted: &recently_contacted,
         };
@@ -1840,6 +1901,26 @@ mod tor_eligible_tests {
         assert_eq!(addrs(tor_eligible(all.clone(), &ex, true)), vec![fresh.addr]);
         // A send takes any eth peer.
         assert_eq!(addrs(tor_eligible(all, &ex, false)), vec![fresh.addr, refused.addr, plain.addr]);
+    }
+
+    #[test]
+    fn the_reserve_is_about_a_third_and_depends_on_the_salt() {
+        let node = |i: u32| {
+            let mut n = [0u8; 64];
+            n[..4].copy_from_slice(&i.to_le_bytes());
+            myotis_core::keccak::keccak256(&n).iter().cycle().take(64).copied().collect::<Vec<_>>()
+        };
+        let nodes: Vec<[u8; 64]> = (0..3000).map(|i| node(i).try_into().unwrap()).collect();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let in_a = nodes.iter().filter(|n| tor_reserved_with(&a, n)).count();
+        let in_b = nodes.iter().filter(|n| tor_reserved_with(&b, n)).count();
+        assert!((850..1150).contains(&in_a), "{in_a}");
+        assert!((850..1150).contains(&in_b), "{in_b}");
+        // Another salt, another set.
+        let same = nodes.iter().filter(|n| tor_reserved_with(&a, n) == tor_reserved_with(&b, n)).count();
+        assert!(same < 2_600, "{same}");
+        // Stable for one salt.
+        assert!(nodes.iter().all(|n| tor_reserved_with(&a, n) == tor_reserved_with(&a, n)));
     }
 
     #[test]
@@ -1959,6 +2040,13 @@ async fn try_dial_verdict(
     pubkey: [u8; 64],
 ) -> DialVerdict {
     if inner.blacklist.lock().await.contains(&pubkey) {
+        return DialVerdict::Skipped;
+    }
+    // The Tor reserve: while Tor mode is on, a share of nodes is never dialed
+    // directly, so they age past the separation window and Tor always has
+    // peers (docs/privacy-and-tor.md §5). Pins are exempt — the pool's
+    // recovery leans on them.
+    if tor_mode_on() && tor_reserved(&pubkey) && !inner.is_pin(addr, &pubkey).await {
         return DialVerdict::Skipped;
     }
     // Backoff: skip while cooling off — for a window the pool's shortfall may
@@ -2653,6 +2741,7 @@ mod tests {
     /// throttle; the table walk rotates; and the pool applies all of it.
     mod scarcity {
         use super::super::{
+            direct_contact_recent, DirectContactOnDrop, TOR_DIRECT_SEPARATION,
             backoff_window, redial_wait_after_close, rotated_indices, scaled_backoff,
             scarcity_budget, scarcity_floor, scarcity_redial, try_dial_verdict, Backoff,
             BackoffKind, DialVerdict, PeerPool, PoolConfig, BACKOFF_BUSY, BACKOFF_INCOMPATIBLE,

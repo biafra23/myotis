@@ -5993,22 +5993,17 @@ impl ElReader {
         // real IP or our persistent node key.
         //
         // Only peers that see no direct session from us (docs §5,
-        // `PeerPool::tor_candidates`): a peer holding both could pair them. All
-        // of them are claimed up front, for the whole read: the pool then
-        // leaves them undialed directly until ten minutes past its deadline.
-        // None → fail closed, never a peer that sees our IP.
+        // `PeerPool::tor_candidates`): a peer holding both could pair them. Each
+        // is claimed only when the walk reaches it — the claim re-checks it
+        // under the dial lock, and quarantines it until ten minutes past the
+        // read's deadline — so a read served by its first peer ties up no
+        // others. None → fail closed, never a peer that sees our IP.
         //
         // Bound the fan-out: each Tor dial is
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates = self
-            .pool
-            .claim_for_tor(
-                tor_candidates(&self.pool.tor_candidates(true).await, 0),
-                tokio::time::Instant::now() + TOR_READ_DEADLINE,
-            )
-            .await;
+        let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
         if candidates.is_empty() {
             tracing::info!("tor: account read failed — no peer without a recent direct connection");
             return Err(NO_TOR_PEER.into());
@@ -6017,6 +6012,7 @@ impl ElReader {
         // address read (the log is exportable).
         let read_started = tokio::time::Instant::now();
         let deadline = read_started + TOR_READ_DEADLINE;
+        let mut claimed_any = false;
         let mut fallback: Option<VerifiedAccount> = None;
         let mut last_err = String::new();
         for (addr, pubkey) in candidates {
@@ -6025,6 +6021,12 @@ impl ElReader {
                 last_err = "tor read deadline exceeded".to_string();
                 break;
             }
+            // Claim it now (it may have been dialed directly since the list was
+            // made); a candidate the claim drops is skipped.
+            if self.pool.claim_for_tor(vec![(addr, pubkey)], deadline).await.is_empty() {
+                continue;
+            }
+            claimed_any = true;
             // Bound each candidate's whole dial+read by the remaining budget.
             let attempt = async {
                 let mut session =
@@ -6068,6 +6070,11 @@ impl ElReader {
                 Ok(Err(e)) => last_err = e,
                 Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
             }
+        }
+        if !claimed_any {
+            // Every candidate was dialed directly while the list was walked.
+            tracing::info!("tor: account read failed — no peer without a recent direct connection");
+            return Err(NO_TOR_PEER.into());
         }
         let ms = read_started.elapsed().as_millis() as u64;
         match fallback {

@@ -854,8 +854,9 @@ private fun NodeTuning(
                         "network (embedded Arti) so peers see a Tor exit, not your IP — each address, " +
                         "and each send, gets its own isolated circuits and a fresh node identity, and " +
                         "only peers this node has not been directly connected to in the last ten minutes " +
-                        "are used (right after start, or with few known peers, Tor reads and sends can " +
-                        "fail until such a peer is available). SCOPE: " +
+                        "are used: while this is on, about a third of known peers are kept off direct " +
+                        "connections for Tor, so for the first ten minutes after switching it on, or " +
+                        "with few known peers, Tor reads and sends can fail. SCOPE: " +
                         "only account (balance/nonce) reads and transaction sends route over Tor today; " +
                         "token-balance (storage), contract code, eth_call/gas-estimation and the receipt " +
                         "polling after a send still use your real IP — full coverage is a follow-up. " +

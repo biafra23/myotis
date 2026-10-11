@@ -29,13 +29,20 @@
 > reached over Tor undialed directly until ten minutes past the Tor
 > operation's end, claimed under the same lock as a direct dial; with no such
 > peer the read or send fails closed (`PeerPool::tor_candidates` /
-> `claim_for_tor`, `TOR_DIRECT_SEPARATION`). Tor-side Hellos name the software
+> `claim_for_tor`, `TOR_DIRECT_SEPARATION`). So that peers can age past that
+> window at all — the pool re-dials cached peers on every shortfall — a Tor
+> reserve of about a third of nodes (drawn by node id with a per-process
+> salt, never a pin) is skipped by every direct dial path while Tor mode is
+> on, and Tor tries them first; each becomes available ten minutes after
+> its last direct contact (`tor_reserved`). Tor-side Hellos name the software
 > without its version (`myotis`, §6.3). That is a first step toward §5, not
 > the design: no days-long randomized quarantine, no batch rotation, the
 > separation record lives for one process (a restarted app forgets it),
-> discovery's UDP pings still reach many nodes from the real IP, and an
-> operator running many nodes can pool what they see — a network-privacy win,
-> not yet the full §5 unlinkability. The runnable proof
+> discovery's UDP pings still reach many nodes from the real IP, an operator
+> running many nodes can pool what they see, and a host without a data
+> directory (a disabled peer cache) has no candidate at all, so Tor always
+> fails closed there — a network-privacy win, not yet the full §5
+> unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
 > the transport against live mainnet and its measurements are folded back in
