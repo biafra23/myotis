@@ -243,6 +243,14 @@ jobs:
           # fix since it hit exactly that.)
           overwrite: true
 
+      # sign-release refuses a tag whose tree has no pinned release certificate,
+      # and then the tag publishes no Android APK at all. Say so on every earlier
+      # run instead, while there is still time to commit it.
+      - name: Warn when no release certificate is pinned
+        run: |
+          [ -f android-app/release-signing-cert.sha256 ] \
+            || echo "::warning title=No pinned release certificate::android-app/release-signing-cert.sha256 is missing, so a v* tag cut from this tree would publish no Android APK (docs/android-release-signing.md)"
+
       # Only a tag needs it (sign-release below): an unsigned APK installs nowhere,
       # so on a PR or main it would only be dead artifact storage.
       - name: Upload the unsigned release APK
@@ -285,8 +293,8 @@ jobs:
     permissions:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
-    # needs only build + version-guard), and the tagged commit already ran it on
-    # its way through main/PR.
+    # needs only build + sign-release + version-guard), and the tagged commit
+    # already ran it on its way through main/PR.
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     # The in-test deadline only bounds the test body — NOT the system-image
     # download, AVD creation, or an emulator/adb hang (the failure modes named
@@ -473,6 +481,8 @@ jobs:
             scripts/sign_release_apk.sh
             android-app/release-signing-cert.sha256
           sparse-checkout-cone-mode: false
+          # Nothing here talks to git again: keep the token out of .git/config.
+          persist-credentials: false
 
       - name: Download the unsigned release APK
         uses: actions/download-artifact@v4
@@ -594,8 +604,8 @@ jobs:
           **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
           icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
           key: anyone can build an APK that installs over it as an update, so do not rely on it for
-          a wallet you use. It installs next to the release app; run one at a time, or give one of
-          them other JSON-RPC ports in Settings.
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
 
           **Coming from an older Android release?** Releases that shipped only an
           `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)

@@ -289,8 +289,8 @@ jobs:
             test -f "deb/Myotis-${arch}.deb" \
               || { echo "::error::missing deb/Myotis-${arch}.deb"; exit 1; }
           done
-          # Release assets carry the version, like the APK
-          # (Myotis-<tag>-android-debug.apk) — but a name may only claim the
+          # Release assets carry the version, like the APKs
+          # (Myotis-<tag>-android.apk) — but a name may only claim the
           # version the deb really is. When the version guard ran (a tag push, or
           # a republish dispatched on that same tag), it proved the tree these
           # debs were built from is $tag's version: Myotis-<tag>-<arch>.deb. A
@@ -330,8 +330,8 @@ jobs:
           **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
           icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
           key: anyone can build an APK that installs over it as an update, so do not rely on it for
-          a wallet you use. It installs next to the release app; run one at a time, or give one of
-          them other JSON-RPC ports in Settings.
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
 
           **Coming from an older Android release?** Releases that shipped only an
           `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)

@@ -23,12 +23,14 @@ Coverage that source-level checks miss:
   * calls D8 moved into a shared SYNTHETIC class. In a release build D8 outlines
     every call to an API above minSdk into a `$$ExternalSyntheticApiModelOutline<n>`
     stub (backports and lambdas get `$$ExternalSynthetic…` classes too), and it
-    shares those stubs across the whole app under the name of ONE context class.
-    Caffeine's findVarHandle then sits in a stub named after Besu's evm.Code, so
-    taken at face value the allowlist would no longer match and a first-party
-    call could hide behind a third-party name. References made inside such a
-    class are charged to the classes that call into it instead (through chains
-    of synthetics too), and only a synthetic nobody calls stays its own referrer.
+    shares those classes across the whole app under the name of ONE context
+    class: Caffeine's findVarHandle sits in a stub named after Besu's evm.Code,
+    and a lambda D8 found identical in two libraries carries just one of their
+    names. Taken at face value the allowlist would no longer match, and a
+    first-party call could hide behind a third-party name. References made inside
+    such a class are charged to the classes behind it instead: a method's callers,
+    or for a lambda body every class that uses the lambda (through chains of
+    synthetics too); only a synthetic nothing reaches stays its own referrer.
 
 This is the enforcement for the "minSdk 29 JDK-API budget" rule in CLAUDE.md.
 Known third-party residue lives in the allowlist next to this script, each
@@ -236,29 +238,38 @@ class DexModel:
         self.method_headers += other.method_headers
 
     def resolve_synthetics(self):
-        """Charge each synthetic class's references to the real classes calling it.
+        """Charge each synthetic class's references to the real classes behind it.
 
         Runs on the MERGED model: a stub and its callers may sit in different dex
-        files. Follows chains (a synthetic called from a synthetic) with a cycle
-        guard; a synthetic method nobody calls keeps itself as the referrer, so
-        an unresolved reference is still reported, never dropped.
+        files. A synthetic method's origins are its callers. A method nobody calls
+        by name (a lambda body, reached by interface dispatch) takes the classes
+        that use its class at all instead: new-instance, <init>, an INSTANCE sget.
+        Release-mode D8 shares lambdas across unrelated classes too, so the
+        lambda's own name proves nothing either. Chains of synthetics are followed
+        with a cycle guard; only a synthetic nothing reaches keeps itself as the
+        referrer, so an unresolved reference is still reported, never dropped.
         """
-        def callers(site, chain):
-            """The classes that reach `site`; `chain` = sites on the path."""
+        users = defaultdict(set)   # synthetic class -> {(user class, user method | None)}
+        for referrer, owner, _member, _kind in self.refs:
+            if SYNTHETIC_RE.search(owner):
+                users[owner].add((referrer, None))
+        for (cls, method), refs in self.synthetic_refs.items():
+            for owner, _member, _kind in refs:
+                if owner != cls and SYNTHETIC_RE.search(owner):
+                    users[owner].add((cls, method))
+
+        def origins(site, chain):
+            """The non-synthetic classes behind `site`; `chain` = sites on the path."""
             out = set()
-            for caller in self.synthetic_callers.get(site, ()):
-                if not SYNTHETIC_RE.search(caller[0]):
-                    out.add(caller[0])
-                elif caller not in chain:
-                    # A synthetic caller nobody calls directly (a lambda body,
-                    # reached by interface dispatch) is itself the best name:
-                    # D8 names a lambda after the class that wrote it, while a
-                    # shared stub borrows an arbitrary one.
-                    out |= callers(caller, chain | {caller}) or {caller[0]}
+            for via in self.synthetic_callers.get(site) or users.get(site[0], ()):
+                if not SYNTHETIC_RE.search(via[0]):
+                    out.add(via[0])
+                elif via not in chain:
+                    out |= origins(via, chain | {via})
             return out
 
         for site, refs in self.synthetic_refs.items():
-            for referrer in callers(site, frozenset({site})) or {site[0]}:
+            for referrer in origins(site, frozenset({site})) or {site[0]}:
                 for owner, member, kind in refs:
                     self.refs.add((referrer, owner, member, kind))
 

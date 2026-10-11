@@ -1,6 +1,6 @@
 # Refuse to publish a release whose TAG disagrees with the version in the TREE.
 #
-# Release asset names come from the tag (Myotis-${GITHUB_REF_NAME}-android-debug.apk,
+# Release asset names come from the tag (Myotis-${GITHUB_REF_NAME}-android.apk,
 # the release title), while what is *inside* those assets comes from the source:
 # :app-desktop and :android-app both derive their versions from project.version.
 # Nothing connected the two, so tagging v0.1.5 without first running the version

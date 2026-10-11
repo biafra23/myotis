@@ -24,9 +24,10 @@
 # Refuses (non-zero, nothing written) when: a secret is missing; the pinned
 # certificate (android-app/release-signing-cert.sha256) is missing, malformed or
 # the public DEBUG certificate; the input already carries a signature (the Gradle
-# release build type must not sign — see android-app/build.gradle.kts); or the
-# signed result has any signer other than exactly the pinned certificate. That
-# last check is what catches a wrong keystore uploaded as the secret.
+# release build type must not sign — see android-app/build.gradle.kts) or is
+# debuggable (release-signed, that would hand its data to anyone with adb, via
+# run-as); or the signed result has any signer other than exactly the pinned
+# certificate. That last check is what catches a wrong keystore in the secrets.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -71,8 +72,9 @@ if [ -z "${ANDROID_BUILD_TOOLS:-}" ]; then
     | grep -E '/[0-9]+\.[0-9]+\.[0-9]+/$' | sort -V | tail -n1 || true)
 fi
 bt=${ANDROID_BUILD_TOOLS%/}
-apksigner="$bt/apksigner" zipalign="$bt/zipalign"
-[ -x "$apksigner" ] && [ -x "$zipalign" ] || die "no apksigner + zipalign in ${bt:-<none>}"
+apksigner="$bt/apksigner" zipalign="$bt/zipalign" aapt2="$bt/aapt2"
+[ -x "$apksigner" ] && [ -x "$zipalign" ] && [ -x "$aapt2" ] \
+  || die "no apksigner + zipalign + aapt2 in ${bt:-<none>}"
 # apksigner --version prints 0.9 in every release, so name the build-tools dir.
 echo "apksigner: $apksigner"
 
@@ -82,6 +84,9 @@ echo "apksigner: $apksigner"
 if "$apksigner" verify "$in" >/dev/null 2>&1; then
   die "$in is already signed — the release build type must stay unsigned (android-app/build.gradle.kts)"
 fi
+badging=$("$aapt2" dump badging "$in") || die "aapt2 cannot read $in"
+! grep -q '^application-debuggable' <<< "$badging" \
+  || die "$in is debuggable — never sign a debuggable build with the release key"
 
 # --- sign --------------------------------------------------------------------------
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/myotis-sign.XXXXXX")

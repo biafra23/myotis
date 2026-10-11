@@ -419,8 +419,8 @@ jobs:
             test -f "dmg/Myotis-${arch}.dmg" \
               || { echo "::error::missing dmg/Myotis-${arch}.dmg"; exit 1; }
           done
-          # Release assets carry the version, like the APK
-          # (Myotis-<tag>-android-debug.apk): Myotis-<tag>-<arch>.dmg. The build
+          # Release assets carry the version, like the APKs
+          # (Myotis-<tag>-android.apk): Myotis-<tag>-<arch>.dmg. The build
           # jobs keep arch-only names so the per-PR artifacts stay stable; the
           # tag only exists here. Renamed before the release is created, so a
           # rename can never fail after the release exists.
@@ -445,8 +445,8 @@ jobs:
           **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
           icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
           key: anyone can build an APK that installs over it as an update, so do not rely on it for
-          a wallet you use. It installs next to the release app; run one at a time, or give one of
-          them other JSON-RPC ports in Settings.
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
 
           **Coming from an older Android release?** Releases that shipped only an
           `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)
