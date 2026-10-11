@@ -160,4 +160,32 @@ public final class BeaconChainSpec {
         long nowSec = System.currentTimeMillis() / 1000;
         return Math.max(0L, nowSec - genesisTimeSec) / Math.max(1, secondsPerSlot);
     }
+
+    /**
+     * Where in each slot the steady-state finality poll fires, in basis points of the
+     * slot: a third of the way in, the attestation deadline — honest validators treat
+     * block N+1 as arrived by then, so its sync aggregate (which attests block N) is out
+     * and servers have rebuilt their latest update. The light-client gossip rules use
+     * the same point. Rust twin: {@code sync.rs FINALITY_POLL_DUE_BPS}.
+     */
+    public static final int FINALITY_POLL_DUE_BPS = 3333;
+
+    /** The finality poll's point within a slot of {@code secondsPerSlot}, before jitter. */
+    public static long finalityPollOffsetMillis(int secondsPerSlot) {
+        return Math.max(1, secondsPerSlot) * 1000L * FINALITY_POLL_DUE_BPS / 10_000;
+    }
+
+    /**
+     * Millis from {@code nowMillis} to the next poll point — a slot start plus
+     * {@code offsetMillis} — strictly after now, so a round that overran a slot skips to
+     * the next point instead of firing twice. Always in (0, slot]: a clock before genesis
+     * waits at most one slot. Rust twin: {@code sync.rs delay_to_next_poll}.
+     */
+    public static long millisUntilNextPoll(long nowMillis, long genesisTimeSec, int secondsPerSlot,
+                                           long offsetMillis) {
+        long slotMs = Math.max(1, secondsPerSlot) * 1000L;
+        long first = genesisTimeSec * 1000L + Math.floorMod(offsetMillis, slotMs);
+        if (nowMillis < first) return Math.min(first - nowMillis, slotMs);
+        return slotMs - (nowMillis - first) % slotMs;
+    }
 }

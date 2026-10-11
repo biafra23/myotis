@@ -3,7 +3,7 @@
 //! `BeaconLightClient.syncLoop`: bootstrap from the embedded checkpoint,
 //! catch the sync committee up to the wall-clock period via
 //! `light_client_updates_by_range`, then poll `light_client_finality_update`
-//! every slot.
+//! once per slot, a third of the way into it ([`delay_to_next_poll`]).
 //!
 //! CLOCK POLICY: this module is the only place wall-clock time is read. Slot
 //! estimates are computed here and passed into the consensus crate as plain
@@ -43,6 +43,49 @@ use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
 /// threat model.
 pub fn ws_anchor_stale(anchor_period: u64, wall_clock_period: u64, bound_periods: u64) -> bool {
     wall_clock_period.saturating_sub(anchor_period) > bound_periods
+}
+
+/// Where in each slot the steady-state finality poll fires, in basis points of
+/// the slot: a third of the way in, the attestation deadline — honest
+/// validators treat block N+1 as arrived by then, so its sync aggregate (which
+/// attests block N) is out and servers have rebuilt their latest update. The
+/// light-client gossip rules use the same point (an update is ignored until
+/// 1/3 of its signature slot has passed). Java twin:
+/// `BeaconChainSpec.FINALITY_POLL_DUE_BPS`.
+const FINALITY_POLL_DUE_BPS: u64 = 3333;
+
+/// Upper bound of the one-time jitter added to the poll point (never earlier
+/// than the 1/3 mark), so a fleet of wallets does not hit a server in the same
+/// millisecond; a tenth of the slot at most.
+const FINALITY_POLL_JITTER_MAX_MS: u64 = 500;
+
+/// Pure: the delay from `now_ms` (unix millis) to the next poll point — a slot
+/// start plus `offset_ms` — strictly after now, so a round that overran a slot
+/// skips to the next point instead of firing twice. Always in `(0, slot]`: a
+/// clock before genesis waits at most one slot (tokio sleeps on the monotonic
+/// clock, so a longer wait could not be cut short by a later clock fix).
+pub(crate) fn delay_to_next_poll(now_ms: u64, genesis_time: u64, seconds_per_slot: u64, offset_ms: u64) -> Duration {
+    let slot_ms = seconds_per_slot.max(1).saturating_mul(1000);
+    let first = genesis_time.saturating_mul(1000).saturating_add(offset_ms % slot_ms);
+    if now_ms < first {
+        return Duration::from_millis((first - now_ms).min(slot_ms));
+    }
+    Duration::from_millis(slot_ms - (now_ms - first) % slot_ms)
+}
+
+/// This process's poll point within the slot: [`FINALITY_POLL_DUE_BPS`] of it
+/// plus a one-time random jitter of up to [`FINALITY_POLL_JITTER_MAX_MS`] (or a
+/// tenth of the slot), so each wallet keeps an exact one-slot cadence while
+/// the fleet is spread out.
+fn finality_poll_offset_ms(seconds_per_slot: u64) -> u64 {
+    let slot_ms = seconds_per_slot.max(1).saturating_mul(1000);
+    let jitter_max = FINALITY_POLL_JITTER_MAX_MS.min(slot_ms / 10);
+    let mut b = [0u8; 8];
+    let jitter = match getrandom::getrandom(&mut b) {
+        Ok(()) => u64::from_le_bytes(b) % (jitter_max + 1),
+        Err(_) => 0,
+    };
+    slot_ms * FINALITY_POLL_DUE_BPS / 10_000 + jitter
 }
 
 /// Live weak-subjectivity knobs, shared between the host FFI and the running
@@ -527,6 +570,14 @@ impl ChainConfig {
     /// the future). Same clock read as everything else here.
     pub fn wall_clock_slot(&self) -> u64 {
         self.current_slot_estimate()
+    }
+
+    /// How long until this process's next finality poll point
+    /// ([`delay_to_next_poll`]) — the poll loop's other clock read.
+    fn until_next_finality_poll(&self, offset_ms: u64) -> Duration {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_millis();
+        let now_ms = u64::try_from(now_ms).unwrap_or(u64::MAX);
+        delay_to_next_poll(now_ms, self.genesis_time, self.seconds_per_slot, offset_ms)
     }
 
     /// Wall-clock slot estimate — THE clock read of this crate.
@@ -2032,6 +2083,9 @@ async fn run_sync(
     let mut last_progress = Instant::now();
     let mut last_seen_progress = (0u64, 0u64);
 
+    // Where in each slot the steady-state finality poll fires (fixed for the run).
+    let poll_offset_ms = finality_poll_offset_ms(config.seconds_per_slot);
+
     // One loop for all phases: bootstrap (when the store isn't initialized —
     // fresh start OR after a poisoned resume was discarded), catch-up when
     // behind, finality polling in steady state.
@@ -2254,7 +2308,11 @@ async fn run_sync(
         refresh_local_status(&config, &processor, &local_status);
         publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
 
-        tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
+        // The next poll a third of the way into the next slot, not a fixed
+        // slot after this round: the update a server holds refreshes when a
+        // block lands, so a poll that drifts through the slot answers up to a
+        // slot staler than it needs to.
+        tokio::time::sleep(config.until_next_finality_poll(poll_offset_ms)).await;
     }
     // No code after the loop: the task ends via SyncHandle::stop (abort).
 }
@@ -4931,6 +4989,42 @@ mod tests {
             probed.insert(*id, now);
         }
         assert!(pool.explore_candidates(5, &probed, HUNT_REPROBE).is_empty());
+    }
+
+    #[test]
+    fn the_finality_poll_fires_a_third_into_every_slot() {
+        const G: u64 = 1_606_824_023; // mainnet genesis (s)
+        let at = |slot: u64, ms: u64| G * 1000 + slot * 12_000 + ms;
+        let off = 12_000 * FINALITY_POLL_DUE_BPS / 10_000;
+        assert_eq!(off, 3_999);
+        let d = |now| delay_to_next_poll(now, G, 12, off).as_millis() as u64;
+        assert_eq!(d(at(100, 1_000)), 2_999); // early in the slot: this slot's point
+        assert_eq!(d(at(100, 3_999)), 12_000); // exactly on it: the next one
+        assert_eq!(d(at(100, 4_000)), 11_999);
+        // A round that overran a whole slot skips to the next point, no refire.
+        assert_eq!(d(at(101, 3_999 + 1_000)), 11_000);
+        // Gnosis: 5 s slots, the point at 1_666 ms.
+        let goff = 5_000 * FINALITY_POLL_DUE_BPS / 10_000;
+        assert_eq!(goff, 1_666);
+        assert_eq!(delay_to_next_poll(G * 1000 + 5_000 * 7 + 1_000, G, 5, goff).as_millis(), 666);
+        // Before genesis: at most one slot; just before the first point, exact.
+        assert_eq!(delay_to_next_poll(0, G, 12, off).as_millis(), 12_000);
+        assert_eq!(delay_to_next_poll(G * 1000 + off - 10, G, 12, off).as_millis(), 10);
+        // Degenerate inputs never panic and stay in (0, slot].
+        assert!(delay_to_next_poll(u64::MAX, G, 0, 0).as_millis() <= 1_000);
+        assert_eq!(delay_to_next_poll(at(5, 0), G, 12, 12_000 + 500).as_millis(), 500); // offset wraps
+        // Every delay lands on the grid.
+        for ms in (0..24_000).step_by(37) {
+            let now = at(200, 0) + ms;
+            let wait = d(now);
+            assert!(wait > 0 && wait <= 12_000, "{wait}");
+            assert_eq!((now + wait - G * 1000) % 12_000, off, "{ms}");
+        }
+        // The process's offset sits between the 1/3 mark and the jitter cap.
+        for (sps, base, cap) in [(12, 3_999, 500), (5, 1_666, 500), (1, 333, 100)] {
+            let o = finality_poll_offset_ms(sps);
+            assert!(o >= base && o <= base + cap, "{sps}: {o}");
+        }
     }
 
     #[test]

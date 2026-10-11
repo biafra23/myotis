@@ -38,7 +38,7 @@ public class LightClientProcessor {
      *  branch), so a byte-identical signature under the same slot is the same
      *  already-verified update: any variant with different contents would fail
      *  verification anyway, and the store never moves backwards, so a memo hit is
-     *  "verified, no advance". Lets the 12 s poll loop skip re-verifying an unchanged head
+     *  "verified, no advance". Lets the once-per-slot poll loop skip re-verifying an unchanged head
      *  — each BLS verify costs ~18 s on Android/ART, so without this the steady-state
      *  loop burns a full core re-proving the same update. Guarded by its own monitor. */
     private final java.util.ArrayDeque<VerifiedFinality> verifiedFinalityMemo = new java.util.ArrayDeque<>();
