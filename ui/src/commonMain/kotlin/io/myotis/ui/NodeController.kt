@@ -453,8 +453,10 @@ interface Settings {
 
     /**
      * When true (default), the idle controller does NOT auto-pause while the device is
-     * charging — plugged in, battery isn't a concern, so the node stays awake and synced.
-     * Emergency memory-pressure pauses ignore this. Default true keeps desktop compiling.
+     * charging on an unmetered network — plugged in on Wi-Fi, neither battery nor data is a
+     * concern, so the node stays awake and synced. On a metered network (cellular, a metered
+     * hotspot) it sleeps on the idle timer even while charging. Emergency memory-pressure
+     * pauses ignore this. Default true keeps desktop compiling.
      */
     fun stayAwakeWhileCharging(): Boolean = true
     fun setStayAwakeWhileCharging(v: Boolean) {}

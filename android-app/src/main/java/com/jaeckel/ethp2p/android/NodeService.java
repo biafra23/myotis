@@ -536,10 +536,12 @@ public final class NodeService extends Service {
     public static void setIdlePauseMinutes(android.content.Context c, int v) {
         prefs(c).edit().putInt(K_IDLE_PAUSE_MIN, clampInt(v, 0, 240, DEFAULT_IDLE_PAUSE_MIN)).apply();
     }
-    /** When true (default), the idle controller skips auto-pause while the device is charging and
-     *  online — plugged in with a network, battery isn't a concern, so the node stays awake and
-     *  synced. Plugged in but offline still pauses (nothing to sync). The emergency low-memory
-     *  pause ({@link #onTrimMemory}) ignores this. Read live by the idle tick. */
+    /** When true (default), the idle controller skips auto-pause while the device is charging on
+     *  an UNMETERED network — plugged in on Wi-Fi, neither battery nor data is a concern, so the
+     *  node stays awake and synced. Plugged in but offline or on a metered network (cellular, a
+     *  metered hotspot) still pauses: nothing to sync over, or traffic the user pays for. The
+     *  rule is {@link #stayAwakeApplies}. The emergency low-memory pause ({@link #onTrimMemory})
+     *  ignores this. Read live by the idle tick. */
     public static boolean stayAwakeWhileCharging(android.content.Context c) {
         return prefs(c).getBoolean(K_STAY_AWAKE_CHARGING, true);
     }
@@ -1179,9 +1181,10 @@ public final class NodeService extends Service {
      *       this run, so a fresh start finishes initial sync before its first sleep. Exception:
      *       if no network is available it can't sync anyway, so allow the pause rather than keep
      *       the radio scanning.</li>
-     *   <li><b>Charging</b> — when {@link #stayAwakeWhileCharging} is on (default), the device is
-     *       plugged in, <em>and</em> a network is available, skip auto-pause: battery isn't a
-     *       concern, stay synced. Plugged in but offline still pauses (nothing to sync).</li>
+     *   <li><b>Charging</b> — when {@link #stayAwakeApplies} (the setting is on, the device is
+     *       plugged in, <em>and</em> the active network is unmetered), skip auto-pause: neither
+     *       battery nor data is a concern, stay synced. Plugged in but offline or on a metered
+     *       network still pauses (nothing to sync, or traffic the user pays for).</li>
      * </ul>
      */
     private void idleTick(long idleMs, boolean routine) {
@@ -1193,11 +1196,10 @@ public final class NodeService extends Service {
             long now = System.currentTimeMillis();
             // Process-global conditions, evaluated once per pass rather than per stack.
             boolean netUp = networkAvailable();
-            // Stay awake while charging only when there's actually a network to stay synced over.
-            // Plugged in but offline there's nothing to do, so let the stack pause rather than keep
-            // the radio scanning — the same "no network -> pause anyway" rule the SYNCED gate uses.
-            boolean skipWhileCharging =
-                    routine && stayAwakeWhileCharging(this) && isCharging() && netUp;
+            // Stay awake while charging only on an unmetered network. Plugged in but offline there's
+            // nothing to sync over, and on a metered one power says nothing about what the traffic
+            // costs — either way the stack sleeps on the ordinary idle timer.
+            boolean skipWhileCharging = routine && stayAwakeApplies(this);
             for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
                 String n = e.getKey();
                 ChainHandle h = e.getValue();
@@ -1222,7 +1224,7 @@ public final class NodeService extends Service {
                                           stackStartMs.getOrDefault(n, 0L)),
                                  engineResumeMs));
                 if (now - lastActivity <= idleMs) continue;
-                if (skipWhileCharging) continue; // plugged in: keep awake and synced
+                if (skipWhileCharging) continue; // plugged in on unmetered: keep awake and synced
                 // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
                 // there's no network to sync over, in which case sleeping saves battery.
                 if (routine && !reachedSynced.contains(n)) {
@@ -1318,11 +1320,6 @@ public final class NodeService extends Service {
      *  intent) because {@code BatteryManager.isCharging()} reports charge state, which is false
      *  when plugged in but momentarily discharging under load. Fail-safe to false so a read error
      *  never blocks a pause. */
-    private boolean isCharging() {
-        return isCharging(this);
-    }
-
-    /** {@link #isCharging()} for callers without a service instance (the workers). */
     static boolean isCharging(android.content.Context c) {
         try {
             android.content.Intent i = c.registerReceiver(null,
@@ -1360,8 +1357,8 @@ public final class NodeService extends Service {
      * The daily maintenance pass ({@link CatchUpWorker}): for each idle-PAUSED stack,
      * resume, wait until the beacon client is SYNCED and the verified head is warm (or
      * the per-network budget slice runs out), and pause again — but only if no real
-     * activity arrived meanwhile and "stay awake while charging" does not apply on an
-     * unmetered network (then the idle controller owns the stack again; see
+     * activity arrived meanwhile and "stay awake while charging" does not apply ({@link
+     * #stayAwakeApplies}; then the idle controller owns the stack again; see
      * {@link #catchUpPass}).
      *
      * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
@@ -1401,26 +1398,38 @@ public final class NodeService extends Service {
         return io.myotis.ui.LogIndexStatus.headCaughtUp(h.logIndexStatusJson());
     }
 
-    /** Whether a background pass leaves the stack it resumed running: the idle controller's
-     *  "stay awake while charging" rule (setting on, plugged in, network up — while it holds
-     *  the idle ticker never pauses a RUNNING stack, so a pass must not either), narrowed to
-     *  an UNMETERED network. A pass starts without user interaction, and the daily one only
-     *  needs a connection, so on a charging phone on cellular it would otherwise turn its
-     *  bounded catch-up into a run that lasts until unplugged; there it resumes, catches up
-     *  and pauses like any other pass. */
-    private static boolean leaveAwakeAfterPass(android.content.Context c) {
-        return stayAwakeWhileCharging(c) && isCharging(c) && networkAvailable(c)
-                && activeNetworkUnmetered(c);
+    /** The "stay awake while charging" rule ({@link StayAwakePolicy}), shared by the idle
+     *  controller and the background passes: the setting is on, the device is plugged in, and
+     *  the active network has Internet AND is unmetered. While it holds the idle ticker never
+     *  pauses a RUNNING stack, and a pass leaves the stack it resumed running for the ticker
+     *  to keep at the head. On a metered network (cellular, a metered hotspot) it does not
+     *  hold, so the stack sleeps on the ordinary idle timer even while charging, and a pass —
+     *  which the daily worker starts on a bare connection — resumes, catches up and pauses
+     *  like any other instead of turning into a run that lasts until unplugged. */
+    private static boolean stayAwakeApplies(android.content.Context c) {
+        android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
+        return StayAwakePolicy.applies(stayAwakeWhileCharging(c), isCharging(c),
+                caps != null && caps.hasCapability(
+                        android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                caps != null && caps.hasCapability(
+                        android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
     }
 
-    /** True when the active network is unmetered. Fail-safe to false (metered), so a read
-     *  error ends a background pass with a pause rather than an unbounded run. */
-    private static boolean activeNetworkUnmetered(android.content.Context c) {
+    /** The active network's capabilities, or null when there is none or they cannot be read.
+     *  One snapshot, so a handover cannot pair one network's Internet capability with another's
+     *  metering. NOT_METERED is what {@code isActiveNetworkMetered()} reads too, so a VPN that
+     *  does not declare itself unmetered ({@code VpnService.Builder.setMetered(false)}) counts
+     *  as metered, as it does for every other app. Null reads as offline: a read error ends in
+     *  a pause, never in an unbounded run. */
+    private static android.net.NetworkCapabilities activeNetworkCapabilities(
+            android.content.Context c) {
         try {
             ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
-            return cm != null && !cm.isActiveNetworkMetered();
+            if (cm == null) return null;
+            Network net = cm.getActiveNetwork();
+            return net == null ? null : cm.getNetworkCapabilities(net);
         } catch (Throwable t) {
-            return false;
+            return null;
         }
     }
 
@@ -1438,10 +1447,11 @@ public final class NodeService extends Service {
     /**
      * Shared body of the background passes. For each idle-PAUSED stack: resume it, then
      * <ul>
-     *   <li>if {@link #leaveAwakeAfterPass} — leave it running. The idle controller now keeps
-     *       it awake and following the head while the device stays plugged in, and pauses
-     *       it on the ordinary idle rules once unplugged; pausing it here would undo the
-     *       user's setting until the next pass;</li>
+     *   <li>if {@link #stayAwakeApplies} — leave it running. The idle controller now keeps
+     *       it awake and following the head while the device stays plugged in on an
+     *       unmetered network, and pauses it on the ordinary idle rules once unplugged or
+     *       on a metered one; pausing it here would undo the user's setting until the next
+     *       pass;</li>
      *   <li>otherwise wait until {@code caughtUp} holds (or its budget slice runs out, or
      *       it throws — a stack that cannot report status is not worth the rest of the
      *       slice), and pause again unless real activity arrived meanwhile.</li>
@@ -1476,7 +1486,7 @@ public final class NodeService extends Service {
             String n = paused.get(i);
             ChainHandle h = ENGINE.get(n);
             if (h == null || h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
-            boolean stayAwake = leaveAwakeAfterPass(c);
+            boolean stayAwake = stayAwakeApplies(c);
             long remainingMs = (passEndNano - System.nanoTime()) / 1_000_000L;
             if (!stayAwake && remainingMs < MIN_SLICE_MS) {
                 LogBuffer.i(TAG, label + ": budget spent; leaving the remaining stacks paused");
@@ -1498,7 +1508,8 @@ public final class NodeService extends Service {
             }
             if (!resumed) continue; // stays paused; the next run retries
             if (stayAwake) {
-                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+                LogBuffer.i(TAG, "[" + n + "] " + label
+                        + ": charging on an unmetered network; staying awake");
                 continue;
             }
             long deadlineNano = System.nanoTime() + sliceMs * 1_000_000L;
@@ -1516,13 +1527,14 @@ public final class NodeService extends Service {
                     break;
                 }
             }
-            // Real user/RPC activity arrived mid-catch-up, or the device went on the charger
-            // meanwhile → leave the stack to the idle controller; otherwise go straight back
-            // to sleep (pause persists the freshly-caught-up snapshot).
+            // Real user/RPC activity arrived mid-catch-up, or the device went on the charger on
+            // an unmetered network meanwhile → leave the stack to the idle controller; otherwise
+            // go straight back to sleep (pause persists the freshly-caught-up snapshot).
             if (h.lastActivityEpochMillis() != activityBefore) {
                 LogBuffer.i(TAG, "[" + n + "] " + label + ": activity arrived; staying awake");
-            } else if (leaveAwakeAfterPass(c)) {
-                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+            } else if (stayAwakeApplies(c)) {
+                LogBuffer.i(TAG, "[" + n + "] " + label
+                        + ": charging on an unmetered network; staying awake");
             } else {
                 synchronized (bootLock(n)) {
                     try { h.pause(); } catch (Throwable ignored) {}

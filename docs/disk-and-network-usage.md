@@ -197,8 +197,16 @@ why always-on hosts currently have to pay this at all — and the plans to stop 
 
 The Android host **idle-pauses** each network stack after **5 minutes** (default,
 configurable 0–240 min) without a wallet request once `SYNCED` — `ChainStack.pause()`
-quiesces every socket and timer, so traffic drops to **zero** while backgrounded. A
-network-constrained WorkManager job (`CatchUpWorker`, ~daily, 8-min budget) resumes each
+quiesces every socket and timer, so traffic drops to **zero** while backgrounded. The one
+exception is "stay awake while charging" (Settings → Power, on by default): plugged in on
+an **unmetered** network (home Wi-Fi, Ethernet — as Android reports it, so a VPN that does
+not declare itself unmetered counts as metered) the idle pause is skipped and the stack
+stays at the head. Power alone is not enough — on a metered network (cellular, a metered
+hotspot) the stack sleeps on the ordinary idle timer even while charging, so a phone left
+on the charger on mobile data does not pay the §3.2 per-minute rate for as long as it stays
+plugged in.
+
+A network-constrained WorkManager job (`CatchUpWorker`, ~daily, 8-min budget) resumes each
 stack, catches up the missed committee periods (~25 KB each + a finality poll), persists
 the snapshot, and pauses again. A second job (`ChargingCatchUpWorker`, hourly, only while
 charging on an unmetered network) resumes any paused stack and waits for the log index's
@@ -206,9 +214,9 @@ head gap too, not just a SYNCED beacon: "stay awake while charging" keeps a runn
 from pausing but never wakes a paused one, so without it a phone that paused before going
 on the charger overnight woke thousands of blocks behind. With that setting on and the
 phone plugged in on an unmetered network, either job leaves the stack it resumed running —
-the idle controller keeps it at the head until unplugged; otherwise (setting off, or a
-metered network, where a job must not start an unbounded run) the job catches up within
-its 8-min budget and pauses again. The two jobs never run a pass at the same time.
+the idle controller keeps it at the head until it is unplugged or the network turns
+metered; otherwise (setting off, or a metered network) the job catches up within its
+8-min budget and pauses again. The two jobs never run a pass at the same time.
 
 So a phone wallet's realistic daily profile is:
 
@@ -367,6 +375,7 @@ order of magnitude.
 | Target snap peers (`ChainStack.setTargetSnapPeers`, Settings) | 32 | Mempool-gossip inbound scales ~linearly with connected eth peers — the #1 lever. |
 | Served-block window (`setServedBlockWindow`) | 32 (max 4096) | RAM (~500 B/header) and what we serve peers; not a big wire term. |
 | Idle pause (Android Settings) | 5 min | Everything → 0 while asleep. |
+| Stay awake while charging (Android Settings) | on | Skips the idle pause while plugged in on an unmetered network; on a metered one the stack sleeps on the idle timer even while charging. |
 | CL finality fan-out | 16 (32 hunting) | Multiplies per-slot CL response bytes. Compile-time today (`BeaconLightClient`). |
 | Gossip topic subscription (`BeaconP2PService.setGossipTopicSubscriptionEnabled`) | **off** | The gossipsub protocol itself is always negotiated (Lighthouse bans peers without it) at no traffic cost; joining the topics would add inbound finality/optimistic gossip per slot. |
 | Fee snapshot refresh / tip window | 12 s / 3 blocks | The body-warming term (§3.2) scales with refresh rate × window. |

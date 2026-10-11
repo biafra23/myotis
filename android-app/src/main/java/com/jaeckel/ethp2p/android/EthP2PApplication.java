@@ -66,7 +66,8 @@ public final class EthP2PApplication extends Application {
         // while the constraints hold; cheap to run that often because it only STARTS
         // plugged in on an unmetered network, and a run with nothing paused is a no-op.
         // (A stack it leaves awake under "stay awake while charging" then follows that
-        // setting's own rule — plugged in with any network — like any running stack.)
+        // setting's own rule — plugged in on an unmetered network, the same conditions this
+        // job starts under — like any running stack.)
         androidx.work.WorkManager.getInstance(this).enqueueUniquePeriodicWork(
                 "myotis-charging-catchup",
                 androidx.work.ExistingPeriodicWorkPolicy.KEEP,
