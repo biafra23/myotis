@@ -617,7 +617,9 @@ beacon-anchored optimistic head.
 
 [ALICE] So the flag is what a caller has to look at.
 
-[BOB] Right — only a `beaconVerified: true` answer is anchored. The
+[BOB] Right — `true` means the finalized root. A `false` is a peer-claimed
+head on the Java engine, and on the Rust engine the beacon-anchored
+optimistic head: anchored, just not final. The
 command is also the smoke test for the whole EVM stack against real
 network state — the resolution has to traverse the registry, a real
 resolver contract, and possibly a CCIP-Read gateway, all using state

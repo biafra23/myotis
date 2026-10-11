@@ -624,8 +624,9 @@ Java engine's.
   iterations always real; real-run reverts propagate (they're the answer); cap 4 →
   fail-closed `IterationLimitExceeded` (pinned by the cap=1 twin of Java's
   `iterationCapOfOneAlwaysExceeds`; the Rust cap is 12 since #532 —
-  `PREFETCH_ITERATION_CAP`, `myotis-evm/src/executor.rs`). `estimateGas` bypasses the loop
-  (Java parity).
+  `PREFETCH_ITERATION_CAP`, `myotis-evm/src/executor.rs`). `estimateGas` bypassed the loop
+  (Java parity) until #532; the Rust estimate now converges like every call path, while the Java
+  `PrefetchingEvmExecutor.estimateGas` still bypasses it.
   The wave rides `SnapStateOracle::prefetch_batch` (default no-op for fixtures):
   `PoolOracle` chunks 64 path-sets (Java `BATCH_PATHSET_CHUNK` — here rotation
   granularity, NOT message coalescing: this transport sends one request per

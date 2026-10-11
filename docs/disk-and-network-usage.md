@@ -81,8 +81,7 @@ as snap proofs on demand and cached only in bounded in-memory LRUs
 Everything persisted is a handful of flat files, one set **per network** (mainnet uses
 the bare name; other networks get a `-<network>` suffix, e.g. `peers-gnosis.cache`).
 Both engines (Java and Rust) read and write the **same files in byte-identical formats**,
-so switching engines keeps the caches (the rows below mark the one file each engine keeps
-alone).
+so switching engines keeps the caches (the rows below mark the files only one engine keeps).
 
 Where the files live:
 
@@ -90,7 +89,7 @@ Where the files live:
 |---|---|
 | Daemon (`app`) | working directory (`Main.java`) |
 | Desktop app | `~/.myotis/` (`app-desktop/.../Main.kt`) |
-| Android | `getFilesDir()` (`NodeService.java`) |
+| Android | `getCacheDir()` for the snapshot and peer caches (and the Rust engine's `dataDir`), so "Clear cache" wipes them; `getFilesDir()` for the node key and the query history (`NodeService.java`) |
 | iOS | app sandbox for the Rust engine's cache files; settings & query history in `NSUserDefaults` (`IosSettings.kt`, `IosQueryHistory.kt`) |
 
 ### 1.1 The files, per network
@@ -101,7 +100,7 @@ Where the files live:
 | `sync-state<suffix>.snapshot.roots` | Recent state-root window sidecar, ≤ 64 entries × 41 B — lets a resume skip re-accumulating roots. **Java engine only** (`BeaconLightClient`); the Rust engine neither reads nor writes it and leaves it in place. | ≤ ~2.6 KB |
 | `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad][⇥fails=N]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), not evicted for that — the one eviction is 50 consecutive connect failures (both engines). | ~150 B/peer → tens–hundreds of KB after weeks |
 | `cl-peers<suffix>.cache` | CL peer cache: `multiaddr[⇥periodRange][⇥b<period>][⇥lc\|nolc]` (`app/.../CLPeerCache.java`, `rust/myotis-net/src/clcache.rs`). Self-pruning: 3 consecutive failures evict the peer. | ~100 B/peer → a few–tens of KB |
-| `nodekey<suffix>.hex` | secp256k1 node identity, `0x` + 64 hex chars. | 66 B |
+| `nodekey<suffix>.hex` | secp256k1 node identity, `0x` + 64 hex chars. **Java engine only** — the Rust engine generates a fresh node key on every start and never reads or writes this file. | 66 B |
 | `peers-tor<suffix>.cache` | **Rust engine, `-PtorEngine` builds only**: the Tor reserve — verified peers moved out of the EL cache for Tor reads and sends, the EL cache's line format plus `torfails=N` / `direct=<ms>` (`rust/myotis-net/src/el/torreserve.rs`). Arti also keeps its own state and directory cache (Android: under `noBackupFilesDir` / `cacheDir`; desktop: Arti's default directories). | ≤ 24 peers → a few KB (Arti's cache not sized here) |
 
 Global (not per network):

@@ -13,8 +13,9 @@
 > sent — it may be out), and one that went over Tor is never pushed from the
 > real IP again: not rebroadcast, and not re-pushed when the wallet
 > re-submits it, even after Tor is switched off — for as long as the engine
-> still holds its bytes (in memory only: the network's last 256 sends,
-> `SENT_TX_CACHE_MAX`; a restart forgets which sends went over Tor).
+> still holds its bytes (in memory only, per network: the last 256 sends,
+> `SENT_TX_CACHE_MAX`; a restart, a stop or a pause — Android's idle pause
+> after 5 minutes included — forgets which sends went over Tor).
 > Wired up on the desktop and Android hosts (iOS not yet; on Android
 > `-PtorEngine` reaches the jniLibs — see the Android bullet in
 > [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
@@ -251,7 +252,8 @@ Route by sensitivity, not wholesale:
    follow the same route, one round at a time per network, each walking on to
    the next five eligible peers; a Tor send is never re-pushed in the clear, a
    wallet's re-submit of it included (while the engine still holds its
-   bytes). The peers are nodes of the Tor reserve,
+   bytes: in memory only, forgotten on a restart, a stop or a pause — see the
+   status note above). The peers are nodes of the Tor reserve,
    ready ten minutes after their last direct contact (status note above); Tor sessions advertise
    no listen port and the client id `myotis` without its version (§6.3).
 

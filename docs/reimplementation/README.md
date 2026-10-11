@@ -713,8 +713,8 @@ built. A re-implementation should know what's load-bearing vs aspirational.
   *cross-verification* (e.g. bridge proofs between two in-process light clients — a designed
   long-term payoff of hosting multiple `ChainStack`s in one process).
 
-**EVM fork schedule caveat:** the reference hardcodes **mainnet** fork boundaries (London by
-block, Paris/Shanghai/Cancun/Prague by timestamp) and throws below London. A port must replicate
+**EVM fork schedule caveat:** the reference hardcodes **mainnet** fork boundaries (London and
+Paris by block, Shanghai/Cancun/Prague by timestamp) and throws below London. A port must replicate
 this table and pick the matching EVM spec id (revm `SpecId` / geth fork config), and parameterize
 it per chain if Gnosis EVM execution is needed. *Status:* both engines now carry per-chain
 cascades (mainnet: London and Paris by block, Shanghai → Osaka by timestamp; Sepolia and Gnosis
@@ -739,9 +739,10 @@ trust model.
 4. **Four Merkle branches** on every forward step: sync-aggregate-over-attested-header (the BLS
    check), finality branch, **execution branch for both attested and finalized headers**, and the
    next-sync-committee branch when present. Generalized indices are **fork-dependent**, inferred
-   from SSZ branch length (companion 01) — before Gloas; from Gloas on they are fixed and selected
-   by the attested slot's fork (finality 735, committees 2945/2946, execution block hash 2856 —
-   `rust/myotis-consensus/src/spec.rs`).
+   from SSZ branch length (companion 01) — before Gloas; from Gloas on they are fixed: finality 735
+   and the next committee 2946 at the attested slot's fork, the bootstrap committee 2945 at its own
+   header's, and each execution branch at its header's OWN slot — 2856 at a Gloas slot, 812 for a
+   pre-Gloas header carried in the Gloas shape (`rust/myotis-consensus/src/spec.rs`, `store.rs`).
 5. **Signing root** = `htr(SigningData{ attestedHeader.htr(), compute_domain(0x07000000,
    forkVersion, gvr) })`.
 6. **SSZ = SHA-256 + little-endian; MPT = keccak-256 + RLP + big-endian.** Never mix.
