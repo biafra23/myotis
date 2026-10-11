@@ -52,6 +52,10 @@ needs. For per-account lookups Phase 1 needs the lower-bandwidth pair:
 | 0x25 | `GetByteCodes`   | Request bytecode by code hash. |
 | 0x26 | `ByteCodes`      | Response with concatenated bytecodes. |
 
+(Absolute codes with snap at base 0x21, i.e. on an eth/66–68 session. Snap's codes are
+relative to the negotiated base — 0x10 + the eth protocol length — so on eth/69 (base 0x22)
+each is one higher: `EthHandler.snapBaseFor`.)
+
 Encoders / decoders + RLP roundtrip tests. No protocol wiring yet.
 
 ### 2 — Proof verifier (done)

@@ -443,9 +443,11 @@ head.
    `--maxpeers 200` afterwards.
 
 3. **Snap serving.** With the wallet's beacon state SYNCED
-   (`-Pargs=beacon-status`), the standard integration checks must return a
-   `verifyMethod` — `"stateRootMatch"` on the default Rust engine, which reads at
-   the attested head's root, `"headerChain"` on the Java engine:
+   (`-Pargs=beacon-status`), the standard integration checks must return
+   `"verifyMethod":"headerChain"` (CLAUDE.md's Integration-Test expectation,
+   which matches the Java engine; on the default Rust engine an ordinary read
+   answers `"stateRootMatch"`, see
+   [reimplementation/README.md](reimplementation/README.md) §3):
 
    ```bash
    ./gradlew :app:run -Pnetwork=sepolia -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"

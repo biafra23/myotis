@@ -25,15 +25,21 @@ attested beacon header ──finality branch──► finalized beacon header
   │  execution branch (SSZ, into the header's body_root)
   ▼
 execution payload header: state_root, block_hash, block_number, timestamp
-  │  stateRootMatch — the peer proves against exactly this root, or
-  │  headerChain    — a parent-hash walk down from this block_hash (< 8192 blocks)
-  ▼
-trusted execution state_root / block_hash
-  ├─ MPT account proof    → nonce, balance, storageRoot, codeHash
-  ├─ MPT storage proof    → slot value (against the account's PROVEN storageRoot)
-  ├─ keccak256(code)      == codeHash
-  ├─ rebuilt tx trie      == transactionsRoot
-  └─ rebuilt receipt trie == receiptsRoot → logs
+  │
+  ├─ state reads: stateRootMatch — the peer proves against exactly this state_root, or
+  │               headerChain    — a parent-hash walk down from this block_hash
+  │     ▼
+  │   trusted state_root
+  │     ├─ MPT account proof → nonce, balance, storageRoot, codeHash
+  │     ├─ MPT storage proof → slot value (against the account's PROVEN storageRoot)
+  │     └─ keccak256(code)   == codeHash
+  │
+  └─ block reads: a header window whose top hashes to this block_hash (or the
+        │         finalized one), linked by parentHash — the header itself, not its root
+        ▼
+      trusted header
+        ├─ rebuilt tx trie      == transactionsRoot
+        └─ rebuilt receipt trie == receiptsRoot → logs
 ```
 
 Every arrow is a hash or signature check. The only assumption beyond hash functions and
@@ -213,7 +219,9 @@ tied to the beacon chain. The decision logic lives in `rust/myotis-net/src/el/ve
   Trust only flows *down* this chain: a block hash pins its parent, never its children. So
   the walk is anchored at the attested head and must end below it; the peer's block must
   also be above the finalized block, and the gap must stay under `MAX_HEADER_CHAIN_GAP` =
-  **8192** blocks.
+  **8192** blocks. The Rust engine fetches the range in a single request, so in practice the
+  walk also has to fit in one peer response (geth serves at most 1024 headers per request); a
+  longer gap comes back short and fails closed as `headerChainInvalid`.
 
 When neither works, the result carries a `failReason` instead (`beaconNotSynced`,
 `peerProofInvalid`, `peerBlockBehindFinalized`, `peerBlockAheadOfAnchor`,
@@ -258,8 +266,9 @@ hash answers empty code without asking anyone. Execution clients keep only recen
 (about the last 128 blocks), so a peer answering with an empty proof "does not hold that
 root" — a head read then takes the `headerChain` fallback above. Reads race up to 3 peers,
 starting a new one every 3 seconds (`HEDGE_DELAY`). The Java engine uses the same three
-messages (its `SnapPeer.getTrieNodes()` is an adapter over them, despite the name) and
-verifies with `MerklePatriciaVerifier`.
+messages (its `SnapPeer.getTrieNodes()` is an adapter over them, despite the name). Its
+wallet-facing reads verify with `core`'s `MerklePatriciaProofVerifier` (through
+`SnapBackedStateOracle`); the operator `get-account` query uses `MerklePatriciaVerifier`.
 
 ## 8. Blocks, transactions and receipts
 
@@ -333,8 +342,8 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
 | SSZ Merkle branches | `rust/myotis-consensus/src/ssz.rs` | `consensus/.../ssz/SszUtil.java` |
 | Execution anchor | `rust/myotis-net/src/el/anchor.rs` | `consensus/.../BeaconSyncState.java` |
 | stateRootMatch / headerChain | `rust/myotis-net/src/el/verify.rs` | `node-core/.../VerifiedAccountQuery.java`, `VerifiedStorageQuery.java` |
-| MPT proofs | `rust/myotis-core/src/trie.rs` | `core/.../trie/MerklePatriciaProofVerifier.java`, `consensus/.../proof/MerklePatriciaVerifier.java` |
-| SNAP requests and checks | `rust/myotis-wire/src/snap/` | `app/.../snap/EthHandlerSnapPeer.java` (+ the Android twin) |
+| MPT proofs | `rust/myotis-core/src/trie.rs` | `core/.../trie/MerklePatriciaProofVerifier.java` (wallet reads), `consensus/.../proof/MerklePatriciaVerifier.java` (operator queries) |
+| SNAP requests and checks | `rust/myotis-wire/src/snap/` | `rpc-backend/.../snap/EthHandlerSnapPeer.java`, `myotis-evm/.../world/SnapBackedStateOracle.java` |
 | Tx / receipt trie roots | `rust/myotis-core/src/triehash.rs` | `consensus/.../proof/OrderedTrieRoot.java` |
 | EVM over verified state | `rust/myotis-evm/`, `rust/myotis-net/src/el/evm.rs` | `myotis-evm/.../world/SnapBackedStateOracle.java` |
 
@@ -350,5 +359,5 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
 | Gloas execution block hash | gindex 2856 (812 for a pre-Gloas header in the Gloas shape) |
 | Weak-subjectivity bound | 13 periods (mainnet, Sepolia), 3 (Gnosis) |
 | SYNCED finality slack | 5 epochs |
-| Header-chain walk | < 8192 blocks |
+| Header-chain walk | < 8192 blocks (Rust: also one peer response, ≤ 1024 headers on geth) |
 | Block-number pin served from head state | head − 64 … head + 16 |

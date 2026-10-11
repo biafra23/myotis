@@ -524,7 +524,8 @@ invalid. No external dependencies beyond Bytes and RLP.
 [BOB] We report that peer as unable to serve this root, so the peer
 supplier rotates away from it, throw `EvmExecutionError.InvalidProof`, and
 either fall through to the next peer or surface to the user. The retry
-budget is in `SnapBackedStateOracle` — three peers by default.
+budget is in `SnapBackedStateOracle` — three peers by default, and the
+verified backend the ENS path runs on gives it eight.
 
 [ALICE] What about bytecode.
 
