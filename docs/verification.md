@@ -349,6 +349,12 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   value the peer *listed* next to it, not the value the proof proves — a peer that sends a
   genuine proof and a different listed value has its own value printed as verified. The Java
   JSON-RPC reads and the Rust engine use the proven leaf.
+- **Java engine: ENS resolver discovery is cached across roots.** `EnsResolver` keeps a static,
+  process-wide cache of which resolver serves a name, keyed by registry and name only — not by
+  state root or chain — for 5 minutes. A walk run at a peer-claimed head (the AUTO fallback) can
+  therefore pick the resolver a later finalized resolution uses and reports as verified, and
+  mainnet and Sepolia (same registry address) can share entries. The Rust engine walks the
+  registry on every resolution.
 
 ## 12. Where to look in the code
 
