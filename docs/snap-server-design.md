@@ -21,8 +21,10 @@ privacy. The open decisions are listed at the end; they are the owner's.
   second — not by the number of connected wallets. Thousands of wallets per
   server is realistic; the estimate is in [§Capacity](#capacity).
 - **Trust is unchanged.** A proof verifies against the sync-committee-signed
-  state root the wallet already holds. The server can withhold, not forge, and
-  verifies nothing itself — the same posture as roost.
+  state root the wallet already holds. The server can withhold or answer at an
+  older (still verified) block, not forge, and verifies nothing itself — the
+  same posture as roost. One Java query path does not yet hold to this
+  ([§The proofs: trust](#the-proofs-trust)).
 - **Privacy is the real new cost.** Roost sends everyone the same bytes and
   learns nothing about a wallet's addresses. A snap server learns which
   addresses each wallet holds and, by timing, which belong together. Tor (an
@@ -31,7 +33,9 @@ privacy. The open decisions are listed at the end; they are the owner's.
 
 ## Why roost is cheap
 
-`lc-server-design.md` §Capacity rests on three properties, and says so:
+Three properties make roost cheap, drawn from `lc-server-design.md` §Capacity
+(identical bytes; pre-encoded responses, its items 1, 2 and 4) and §Historical
+depth (the immutable archive):
 
 1. **Every client receives identical bytes.** There is no per-peer
    computation.
@@ -51,7 +55,7 @@ Both engines read state with three snap messages (`docs/reimplementation/02`
 |---|---|---|
 | account | `GetAccountRange(root, keccak(address), 0xff…ff, 4096)` (`rust/myotis-net/src/el/peer.rs:778`) | the Merkle path for `keccak(address)` against `root` |
 | storage slot | `GetStorageRanges(root, [accountHash], keccak(slot), 0xff…ff, 4096)` (`peer.rs:804`) | the path for `keccak(slot)` against the account's **proven** `storageRoot` |
-| bytecode | `GetByteCodes([codeHash], 256 KiB)` (`peer.rs:821`) | `keccak(code) == codeHash` |
+| bytecode | `GetByteCodes([codeHash], 256 KiB)` (`peer.rs:821`; the Java engine asks 128 KiB, `EthHandler.requestByteCodesAsync`) | `keccak(code) == codeHash` |
 
 The state root is the beacon anchor's **optimistic** execution state root
 (`rust/myotis-net/src/el/reader.rs:10-13`), taken from the light-client header's
@@ -62,18 +66,35 @@ peer's own head, anchored by a `headerChain` walk. A caller can also ask for a
 `finalized` read (ABI ≥ 32), which proves against the beacon-finalized root
 instead — a separate mode, not a fallback.
 
+That is the **Rust** engine. The Java engine reads at a peer's head: its RPC
+path pins a probed `PEER_HEAD` and proves it with the header walk, falling back
+to finalized (`VerifiedRpcBackend.buildAnchoredHead`), and the operator queries
+read at each peer's handshake head (`EthHandler.requestAccountAsync`).
+
 Two consequences that shape everything below:
 
-- **All synced wallets ask for the same root in the same slot.** They follow
-  the same optimistic updates. (`finalized` reads share one root for a whole
-  epoch — 6.4 min on mainnet, 80 s on Gnosis — while the node still holds it.)
-- **The verifiers consume the proof, not the range.** The Rust engine's
+- **All synced Rust-engine wallets ask for the same root in the same slot.**
+  They follow the same optimistic updates. Java-engine wallets only roughly
+  do — their roots are whatever heads their peers announced. (`finalized`
+  reads share one root for a whole epoch — 6.4 min on mainnet, 80 s on
+  Gnosis — while the node still holds it.)
+- **The verifiers consume the proof, not the range — with one exception.**
+  The Rust engine's
   `verify_account` / `verify_storage` (`rust/myotis-wire/src/snap/fetch.rs:77-112`)
   and the Java EVM oracle (`SnapBackedStateOracle.java:599,625`) read only the
   proof nodes. The Java operator queries additionally read the requested
   account's slim entry from the list (`VerifiedAccountQuery.java:160`,
   `VerifiedStorageQuery.java:93`, which throws when it is missing), so any
-  response must still carry that one entry.
+  response must still carry that one entry. The account's nonce and balance
+  are checked against the proven leaf (`verifyAndExtractAccount`). **The slot
+  value is not:** `VerifiedStorageQuery` reports the value from the peer's
+  slot list (`found.slotValue()`) and only checks that *some* leaf proves
+  (`storageProofValid = leafValue != null`), so a peer can pair an honest
+  proof with a forged value on the Java `get-storage` path. A proven-absent
+  slot also reads there as an invalid proof. That is a trust gap in code
+  `main` carries, for its own fix PR; until it lands, the Java operator storage
+  query relies on the range's value, and a front wallets pin would concentrate
+  that exposure.
 
 ## Measured: what a proof weighs and how long it lives
 
@@ -178,7 +199,26 @@ wallet needs, to anyone. It does **not** make the request rate free — reads
 per second are the binding cost ([§Capacity](#capacity)), and a peer that asks
 nonstop sets it. So, as roost bounds its work per request
 (`lc-server-design.md` item 5), the front needs a per-connection request-rate
-cap and a global upstream budget, with misses refused rather than queued.
+cap and a global upstream budget.
+
+The cap has to fit what wallets legitimately do, and its refusals are scored:
+
+- **Bursts are normal.** One `eth_call` prefetch wave puts up to 48 requests
+  in flight (`MAX_IN_FLIGHT`, `el/evm.rs`), and a chunk of up to 64 accounts
+  goes to one peer; the Java oracle does the same per chunk. The cap needs a
+  burst allowance at least that large, not just a steady rate.
+- **Both ways of refusing count against the front.** An empty answer at the
+  anchor root sends the read to the peer's handshake head, and a second empty
+  answer is a miss. A request queued past the hedge delay while another peer
+  answers is *outpaced*, and from the second outpace on that is a strike
+  (`OUTPACES_BEFORE_STRIKE`). Each strike benches the peer for 30 s; three
+  evict it while another peer is live, and a demotion is persisted in the peer
+  cache (`READ_FAILS_EVICT`, `pool.rs`). A front that is a wallet's only server
+  is spared; one among public peers sheds load to them and is demoted for it.
+  That may be the right trade, but it is a trade the front makes knowingly.
+- **The coalescing cache below must never hold an empty or failed answer** —
+  one cached miss turns every wallet's read of that key in that slot into a
+  strike against the front.
 
 What else the front must answer, or decline cleanly so the wallet asks another
 peer: `GetBlockHeaders` (the fresh-head fetch and the `headerChain` walk),
@@ -198,21 +238,26 @@ snap object with all three of roost's properties.
 
 ### One root per slot: a coalescing response cache
 
-Because every synced wallet reads at the same optimistic root, identical
-requests from different wallets in the same slot produce identical answers. A
+Because every synced Rust-engine wallet reads at the same optimistic root,
+identical requests from different wallets in the same slot produce identical
+answers. (Java-engine wallets read at peer heads, so they share less.) A
 front keyed by `(root, key)` — normalised: the request id and the caller's
 `responseBytes` are not part of the key, or no two wallets' requests ever
 match — that merges concurrent misses into one upstream fetch serves the
 shared part of the load once per slot.
 
 How much is shared depends on what wallets read. A token balance through
-`eth_call` on a proxied token (USDC) reads the proxy's account, its EIP-1967
-implementation slot, the implementation's account, the two bytecodes, and the
-holder's balance slot. Only the last is per-wallet. With the measured sizes,
-that is ~10.6 KB of shared proof against ~3 KB of personal proof — **about
-three quarters of the bytes for a proxied token are the same for every wallet
-in that slot.** A front can also pre-compute the top-N contract accounts on
-every new head (1,000 accounts × ~3.8 KB ≈ 4 MB per block).
+`eth_call` on a proxied token reads the proxy's account, its implementation
+slot, the implementation's account, the two bytecodes, and the holder's
+balance slot; an admin-checking transparent proxy also reads its admin slot on
+every call. USDC's `FiatTokenProxy` is that kind: a ZeppelinOS
+`AdminUpgradeabilityProxy`, with the implementation at
+`keccak256("org.zeppelinos.proxy.implementation")` rather than EIP-1967's slot.
+Only the balance slot is per-wallet. With the measured sizes that is ~10.6 KB
+(~13.6 KB with the admin slot) of shared proof against ~3 KB of personal proof
+— **about three quarters to four fifths of the bytes for a proxied token are
+the same for every wallet in that slot.** A front can also pre-compute the
+top-N contract accounts on every new head (1,000 accounts × ~3.8 KB ≈ 4 MB per block).
 
 Two limits on that win:
 
@@ -248,13 +293,14 @@ above, but how Nethermind, Besu and reth treat a tiny cap is untested.)
 An estimate from the measurements above, not a load test:
 
 - **A wallet refresh** — ETH balance and nonce plus ten token balances, half of
-  them proxied — is about 31 verified reads and ~110 KB of lean proof
-  (one account proof, five plain tokens at ~7 KB, five proxied at ~14 KB;
-  bytecode cached after the first time). A zero balance is an absent slot and
+  them proxied — is about 31–36 verified reads and ~110–125 KB of lean proof
+  (one account proof, five plain tokens at ~7 KB, five proxied at ~14–17 KB
+  depending on the proxy's admin check; bytecode cached after the first
+  time). A zero balance is an absent slot and
   adds a few nodes for the neighbour's path ([§Lean responses](#lean-responses)).
-- **1,000 wallets refreshing once a minute** is ~520 reads/s and ~1.8 MB/s —
-  **about 15 Mbit/s of uplink.** Of those reads, only the ~180/s personal ones
-  (each wallet's own account and balance slots) are new per slot; the shared
+- **1,000 wallets refreshing once a minute** is ~520–600 reads/s and
+  ~1.8–2.1 MB/s — **about 15–17 Mbit/s of uplink.** Of those reads, only the
+  ~180/s personal ones (each wallet's own account and balance slots) are new per slot; the shared
   ones are generated once per slot.
 - **Proof generation at that rate is not the limit.** A proof is ~8–10 node
   lookups with the top levels hot in memory; a few hundred per second sits far
@@ -277,11 +323,24 @@ window above.
 
 The posture is roost's, and so is the argument for it:
 
-- **The server can withhold but cannot forge.** The root a proof is checked
-  against arrives in a sync-committee-signed light-client header; the wallet
-  holds it before it asks. A wrong value fails the Merkle check; a proof for a
-  different root fails it too; an exclusion proof is checked the same way as an
-  inclusion proof.
+- **The server can withhold, or answer at an older block, but cannot
+  forge.** The root a proof is checked against arrives in a
+  sync-committee-signed light-client header; the wallet holds it before it
+  asks. A wrong value fails the Merkle check; a proof for a different root
+  fails it too; an exclusion proof is checked the same way as an inclusion
+  proof. (Except on the Java `get-storage` path, which reports the range's
+  slot value without comparing it to the proven leaf — see [§What a wallet
+  asks for](#what-a-wallet-asks-for); the fix is its own PR.)
+- **"Older" is bounded by finality.** Neither engine insists on the
+  optimistic root. A Rust read that the anchor root cannot serve falls back to
+  the peer's handshake head (`reader.rs`, `fresh_head`), and the ladder accepts
+  any block above finality (`peerBlockBehindFinalized`, `verify.rs`); the Java
+  RPC path pins the first peer head that proves anywhere between finalized and
+  optimistic. So a front can decline the anchor root and serve its own older
+  head: the answer is `headerChain`-verified with an honest block number —
+  stale by up to the finality lag (~13–19 min on mainnet, a few minutes on
+  Gnosis), never forged. Any peer can do this today; a pinned front
+  concentrates it, like withholding.
 - **The server verifies nothing.** It relays what its node produced; the
   wallet is the verifier, as for roost.
 - **Withholding is a liveness attack, and this design concentrates it** — the
@@ -377,7 +436,10 @@ Each step stands alone; stop where the measurements say it stops paying.
 2. **Caches.** Bytecode (permanent), the per-root coalescing cache, pre-computed
    top-N accounts per head. Measure the hit rate against step 1's numbers.
 3. **Mainnet and Gnosis**, sized from steps 1–2: one full node per chain (geth
-   on mainnet, Nethermind on Gnosis) behind the same front.
+   on mainnet, Nethermind on Gnosis) behind the same front. The
+   `responseBytes = 1` lean shape is read from geth's source only; on
+   Nethermind it is untested, so the front may have to trim the page itself
+   there.
 4. **An onion endpoint**, only after the privacy rules above are decided.
 
 Independent of all of it: the wallet-side `responseBytes` experiment against
