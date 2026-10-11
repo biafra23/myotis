@@ -115,7 +115,7 @@ complete on its own.
     in another, where the peer dropped the session five times first.
 - [x] **A seed-pin surface for the JVM hosts** — dropped until a JVM host
   asks: `myotis_set_boot_enodes` exists on the C ABI, the Node addon and the
-  iOS wrapper.
+  iOS wrapper, and `myotis-rpcd` via `--boot-enodes`.
 - [x] **Smoke-gate classification** — accepted: `smoke-gate.mjs` files a
   full but non-serving pool under peer starvation (an environment result,
   like the other peer conditions); an engine-side regression in the head
