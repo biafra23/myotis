@@ -1515,8 +1515,25 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * be reached. {@code rawTxHex} is the 0x-hex raw transaction.
      */
     io.myotis.api.SendResult sendRawTransactionDetailedVerified(String rawTxHex) {
+        // Bytes that are no transaction are refused on the bytes alone (ABI 45, #360),
+        // BEFORE the wake wait: a paused or starting node must not hold that permanent
+        // refusal, or turn it into a retryable one when the resume fails. The send
+        // runs the same gate again.
+        String refusal = sendGateRefusalOrNull(RustEngineNative.nativeCheckRawTransactionJson(rawTxHex));
+        if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         return sendResultFromJson(
                 gated(() -> RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex)));
+    }
+
+    /** Package-private test seam: the send gate's JSON → its refusal, or null when the
+     *  bytes may be sent ({@code {"ok":true}}) or the answer is no refusal (bad hex,
+     *  shape drift) — the send itself then answers. */
+    static String sendGateRefusalOrNull(String json) {
+        try {
+            return permanentRefusalOrNull(parseJsonObject(json, "checkRawTransaction"));
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**

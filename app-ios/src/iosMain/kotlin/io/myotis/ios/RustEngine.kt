@@ -3,6 +3,7 @@ package io.myotis.ios
 import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
 import io.myotis.engine.capi.myotis_canonical_network_name
+import io.myotis.engine.capi.myotis_check_raw_transaction_json
 import io.myotis.engine.capi.myotis_create
 import io.myotis.engine.capi.myotis_create_access_list_json
 import io.myotis.engine.capi.myotis_drain_logs
@@ -291,6 +292,11 @@ object RustEngine {
 
     fun sendRawTransactionJson(handle: Long, rawTxHex: String): String =
         jsonCall { myotis_send_raw_transaction_json(handle, rawTxHex) }
+
+    /** The send gate on the bytes alone, no handle (ABI 45): `{"ok":true}`, the
+     *  permanent `{"error","code":-32602}` refusal, or `{"error"}` for bad hex. */
+    fun checkRawTransactionJson(rawTxHex: String): String =
+        jsonCall { myotis_check_raw_transaction_json(rawTxHex) }
 
     private inline fun jsonCall(call: () -> CPointer<ByteVar>?): String {
         requireAbi()

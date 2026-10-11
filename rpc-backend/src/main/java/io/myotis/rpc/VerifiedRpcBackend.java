@@ -518,6 +518,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  propagation. Fed by {@link #onTxHashSeen} (the {@code TxGossipObserver} this
      *  backend registers on the connector); cleared on verified mining or TTL. */
     private final SentTxTracker sentTxWatch = new SentTxTracker(SENT_TX_WATCH_TTL_MS);
+    /** When the anchored head advanced, for the pre-broadcast check's freshness rule
+     *  ({@link SendCheck.HeadAdvance}); noted at every head install. */
+    private final SendCheck.HeadAdvance headAdvance = new SendCheck.HeadAdvance();
+    /** The pre-broadcast check (#531) over the wall clock and this backend's monotonic
+     *  clock; it holds the account reads in flight to {@link SendCheck#DETACHED_READS_MAX}. */
+    private final SendCheck.Checker sendChecker;
 
     /** Verified location of a mined tx: the (beacon-anchored) header it sits in, the block
      *  hash, the tx index, and the raw tx bytes. Cached per tx by {@link #locateMinedTx}. */
@@ -667,6 +673,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         this.ccipGateway = java.util.Objects.requireNonNull(ccipGateway, "ccipGateway");
         this.log = log != null ? log : RpcLogger.noop();
         this.clock = clock != null ? clock : RpcClock.monotonic();
+        final RpcClock checkClock = this.clock;
+        this.sendChecker = new SendCheck.Checker(SendCheck.DETACHED_READS_MAX, SendCheck.ACCOUNT_READ_BUDGET_MS,
+                () -> System.currentTimeMillis() / 1000, checkClock::elapsedMillis);
         this.snapQuality = snapQuality != null ? snapQuality : SnapQualitySink.noop();
         // STRICT by default. Relaxing the cap *backfired*: the cheap single-account
         // stale-serve probe can pass on an older root that isn't FULLY servable for a real
@@ -1609,7 +1618,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 headBuildPool.execute(() -> {
                     try {
                         RpcCallContext ctx = buildAnchoredHead();
-                        lastGoodHead.set(new HeadWithTimestamp(ctx, clock.elapsedMillis()));
+                        long builtAtMs = clock.elapsedMillis();
+                        lastGoodHead.set(new HeadWithTimestamp(ctx, builtAtMs));
+                        headAdvance.note(ctx.blockNumber(), builtAtMs);
                         f.complete(ctx);
                         // Warm only a head the EVM will run against: past a fork this
                         // engine refuses (Sepolia past Amsterdam on Besu 26.4) every call
@@ -2837,7 +2848,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      *  and reaches no peer — a junk byte used to be gossiped to every peer and answered
      *  with its keccak, a hash of nothing a wallet could ever find mined. The strict
      *  decode is also what makes the hash returned the decoded transaction's own, and
-     *  its result feeds the pending-nonce overlay: one decode, not two. */
+     *  its result feeds the pending-nonce overlay: one decode, not two.
+     *
+     *  <p>Then the check geth's txpool makes (#531, {@link #preBroadcastCheck}): a
+     *  transaction its sender cannot pay for, or whose nonce is used, is REJECTED in
+     *  geth's words and never broadcast — no peer would keep it, and none would say so.
+     *  It judges only on fresh, verified state and otherwise broadcasts as before. */
     private io.myotis.api.SendResult rpcSendRawTransaction(byte[] rawTx) {
         EthTxDecoder.SendCheck check =
                 EthTxDecoder.checkSendable(rawTx == null ? Bytes.EMPTY : Bytes.wrap(rawTx));
@@ -2845,13 +2861,22 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             log.info("[rpc] eth_sendRawTransaction refused, nothing broadcast: " + check.refusal());
             return io.myotis.api.SendResult.refused(check.refusal());
         }
+        Bytes32 hash = Hash.keccak256(Bytes.wrap(rawTx));
+        String txHashHex = hash.toHexString();
+        SendCheck.PreBroadcast verdict = preBroadcastCheck(check.tx(), txHashHex);
+        if (verdict.kind() == SendCheck.PreBroadcast.Kind.DOOMED) {
+            // The verdict only: its numbers are the sender's balance.
+            log.info("[rpc] eth_sendRawTransaction " + txHashHex + " refused before broadcast ("
+                    + verdict.text().split(":", 2)[0] + "): it can never be mined as sent");
+            return io.myotis.api.SendResult.rejected(verdict.text());
+        }
         RLPxConnector conn = connector;
         if (conn == null) return io.myotis.api.SendResult.unavailable(null);
         try {
             int sent = conn.broadcastTransaction(rawTx);
             // no peer reached → let the router report it
             if (sent == 0) return io.myotis.api.SendResult.unavailable(null);
-            byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
+            byte[] txHash = hash.toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
             recordPendingNonce(check.tx());
             // Watch for this hash to come back over gossip (propagation confirmation), and record
@@ -2867,6 +2892,50 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             log.info("[rpc] eth_sendRawTransaction failed: " + unwrap(e));
             return io.myotis.api.SendResult.unavailable(null);
         }
+    }
+
+    /**
+     * Judge a send before it is broadcast (#531, {@link SendCheck.Checker}): {@code DOOMED}
+     * only on the sender's account as proven at the anchored head's own state root, the
+     * head fresh by {@link SendCheck#headIsFresh} before the read and again at the
+     * verdict, and funds judged only when that head is the attested optimistic head;
+     * everything that keeps it from judging is {@code UNCHECKED} (logged, with the head's
+     * ages), and the send goes out as before. Never builds a head and never waits for
+     * one: it judges at the head the warmer last installed, or not at all.
+     */
+    private SendCheck.PreBroadcast preBroadcastCheck(EthTxDecoder.DecodedTx tx, String txHashHex) {
+        SendCheck.Head head = null;
+        SendCheck.PreBroadcast verdict;
+        try {
+            HeadWithTimestamp good = lastGoodHead.get();
+            RpcCallContext ctx = good == null ? null : good.head();
+            head = sendCheckHead(ctx);
+            verdict = sendChecker.check(tx, chainId(), connector.getNetwork().secondsPerSlot(), head,
+                    () -> ctx.oracle()
+                            .fetchAccount(ctx.blockCtx().stateRoot(), io.myotis.evm.Address.of(tx.from().toArray()))
+                            .thenApply(a -> SendCheck.AccountRead.of(a.balance(), a.nonce())));
+        } catch (RuntimeException e) {
+            verdict = SendCheck.PreBroadcast.unchecked("check failed: " + e);
+        }
+        if (verdict.kind() == SendCheck.PreBroadcast.Kind.UNCHECKED) {
+            log.info("[rpc] eth_sendRawTransaction " + txHashHex + ": pre-broadcast check skipped ("
+                    + verdict.text() + "; " + SendCheck.describe(head, System.currentTimeMillis() / 1000,
+                    clock.elapsedMillis()) + ")");
+        }
+        return verdict;
+    }
+
+    /** {@code ctx} as {@link SendCheck} judges a head — whether it is the attested
+     *  optimistic head itself (number and hash from one read), and when this node saw it
+     *  advance; null for no head. */
+    private SendCheck.Head sendCheckHead(RpcCallContext ctx) {
+        if (ctx == null) return null;
+        BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
+        boolean atOptimistic = opt != null && opt.blockHash() != null && ctx.blockHash() != null
+                && opt.blockNumber() == ctx.blockNumber()
+                && java.util.Arrays.equals(opt.blockHash(), ctx.blockHash());
+        return new SendCheck.Head(ctx.blockNumber(), ctx.beaconVerified(), atOptimistic,
+                ctx.blockCtx().timestamp(), headAdvance.adoptedAtMs(ctx.blockNumber()));
     }
 
     /** Re-broadcast still-pending, not-yet-propagated txs of ours to ALL currently-READY peers.

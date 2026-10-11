@@ -323,6 +323,12 @@ pub fn send_raw_transaction_json(handle: i64, raw_tx_hex: String) -> String {
     crate::host::send_raw_transaction_json(handle, &raw_tx_hex)
 }
 
+/// The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle: `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or `{"error": ...}` for bad hex. Hosts call it before their readiness hold.
+#[uniffi::export]
+pub fn check_raw_transaction_json(raw_tx_hex: String) -> String {
+    crate::host::check_raw_transaction_json(&raw_tx_hex)
+}
+
 /// Verified `eth_getTransactionReceipt`. Returns the receipt JSON, the literal
 /// `"null"` (verified "not seen"), or `{"error": ...}`.
 #[uniffi::export]

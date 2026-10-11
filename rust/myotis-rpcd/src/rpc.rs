@@ -755,6 +755,14 @@ impl<E: Engine> Router<E> {
                 if raw.is_empty() {
                     return invalid("invalid argument 0: the signed transaction is empty");
                 }
+                // Bytes that are no transaction this node relays (#360) are
+                // refused on the bytes alone, BEFORE the readiness hold: a
+                // starting node, or a batch whose wait is spent, must not turn
+                // a permanent refusal into a retryable "not ready". The engine
+                // checks again, in the same words.
+                if let Err(why) = myotis_engine::decode_sendable(&raw) {
+                    return Err(Fail::Refused(why));
+                }
                 let o =
                     engine_object(&self.engine_ready(g)?.send_raw_transaction(&hex_data(&raw)))?;
                 // Refused before broadcast: geth's txpool verdict, verbatim under

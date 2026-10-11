@@ -714,6 +714,12 @@ fn get_logs() {
     assert_eq!(error(&r, "eth_getLogs", json!([])).0, -32602);
 }
 
+/// The EIP-155 spec transaction (chainId 1, nonce 9): bytes the send gate
+/// passes, so a send reaches the engine.
+const SPEC_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
+                       6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
+                       67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+
 #[test]
 fn syncing_and_send() {
     let mut f = Fake::new().reply(
@@ -722,25 +728,25 @@ fn syncing_and_send() {
     );
     let r = Router::new(f);
     assert_eq!(result(&r, "eth_syncing", json!([])), false);
-    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x02f8"]));
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!([SPEC_TX]));
     assert_eq!(
         (code, msg.as_str()),
         (-32000, "nonce too low: next nonce 5, tx nonce 4")
     );
     assert_eq!(error(&r, "eth_sendRawTransaction", json!(["0x"])).0, -32602);
 
-    // Bytes the engine will not relay because they are no transaction (#360,
-    // ABI 44): the permanent envelope, answered -32602 with its reason.
+    // The engine's own refusal of bytes it will not relay (#360, ABI 44): the
+    // permanent envelope, answered -32602 with its reason.
     let r = Router::new(Fake::new().reply(
         "send",
-        r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#,
+        r#"{"error":"invalid sender: the signature recovers no address","code":-32602}"#,
     ));
-    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x00"]));
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!([SPEC_TX]));
     assert_eq!(
         (code, msg.as_str()),
         (
             -32602,
-            "method 'eth_sendRawTransaction' refused: invalid raw transaction: transaction type not supported (0x0)"
+            "method 'eth_sendRawTransaction' refused: invalid sender: the signature recovers no address"
         )
     );
 
@@ -748,7 +754,7 @@ fn syncing_and_send() {
     f.status = r#"{"running":true,"beaconState":"CATCHING_UP"}"#.into();
     let r = Router::new(f);
     assert_eq!(
-        result(&r, "eth_sendRawTransaction", json!(["0x02f8"])),
+        result(&r, "eth_sendRawTransaction", json!([SPEC_TX])),
         format!("0x{}", "ab".repeat(32))
     );
     assert_eq!(result(&r, "eth_syncing", json!([]))["highestBlock"], "0x0");
@@ -960,6 +966,37 @@ fn non_blocking_methods_and_bad_params_never_wait() {
     assert_eq!(error(&r, "eth_getBalance", json!(["0x12"])).0, -32602);
     assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
     assert!(calls(&r).is_empty());
+}
+
+#[test]
+fn bytes_that_are_no_transaction_are_refused_before_the_readiness_hold() {
+    // #360: judged on the bytes alone — no hold, no engine call, and the
+    // permanent -32602 in the engine's words, even in a batch whose wait is
+    // already spent.
+    let r = unready(Duration::from_secs(30));
+    let t0 = Instant::now();
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x00"]));
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            -32602,
+            "method 'eth_sendRawTransaction' refused: invalid raw transaction: transaction type not supported (0x0)"
+        )
+    );
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert!(calls(&r).is_empty(), "{:?}", calls(&r));
+    let r = unready(Duration::from_millis(300));
+    let body = format!(
+        r#"[{{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["{ADDR}","latest"]}},
+            {{"jsonrpc":"2.0","id":2,"method":"eth_sendRawTransaction","params":["0x02c0"]}}]"#
+    );
+    let v: Value = serde_json::from_str(&r.handle(&body).unwrap()).unwrap();
+    let send = &v.as_array().unwrap()[1];
+    assert_eq!(send["error"]["code"], -32602, "{send}");
+    assert_eq!(
+        send["error"]["message"],
+        "method 'eth_sendRawTransaction' refused: invalid raw transaction: malformed type 0x2 transaction"
+    );
 }
 
 #[test]

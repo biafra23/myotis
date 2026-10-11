@@ -678,6 +678,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_check_raw_transaction_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_create_access_list_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_create_handle(
@@ -778,6 +780,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_check_raw_transaction_json(`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_create_access_list_json(`handle`: Long,`tx`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -987,6 +991,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_canonical_network_name() != 21726) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_myotis_engine_checksum_func_check_raw_transaction_json() != 60260) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_myotis_engine_checksum_func_create_access_list_json() != 41557) {
@@ -1401,6 +1408,20 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterString.lower(`nameOrAlias`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle: `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or `{"error": ...}` for bad hex. Hosts call it before their readiness hold.
+         */ fun `checkRawTransactionJson`(`rawTxHex`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_check_raw_transaction_json(
+    
+        
+        FfiConverterString.lower(`rawTxHex`),_status)
 }
     )
     }

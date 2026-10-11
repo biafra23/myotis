@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 44
+#define MYOTIS_ABI_VERSION 45
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -301,6 +301,11 @@ char *myotis_fee_history_json(int64_t handle, int64_t block_count,
  * {"error","code":-32602} (ABI >= 44: bytes that are no transaction this node
  * relays, never broadcast — a permanent refusal), or {"error"}. */
 char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
+/* ABI >= 45: the eth_sendRawTransaction gate on the bytes alone, no handle:
+ * {"ok":true}, the permanent {"error","code":-32602} refusal, or {"error"} for
+ * bad hex. Call it before any readiness hold, so a starting or paused node
+ * answers bytes that are no transaction with the permanent refusal. */
+char *myotis_check_raw_transaction_json(const char *raw_tx_hex);
 
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);
