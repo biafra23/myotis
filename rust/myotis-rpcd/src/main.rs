@@ -14,6 +14,7 @@ mod engine;
 mod http;
 mod quantity;
 mod rpc;
+mod seeds;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -115,11 +116,25 @@ struct Args {
     /// The slot of the block whose root is --checkpoint-root.
     #[arg(long, value_name = "SLOT", requires = "checkpoint_root")]
     checkpoint_slot: Option<u64>,
+    /// EL peers to dial as soon as the engine starts, without waiting for
+    /// discovery: a comma-separated list of enode:// URLs, or @FILE with one
+    /// per line (# comments allowed). For servers known to answer snap, so a
+    /// cold start does not wait for discovery to find one. They are dialed
+    /// alongside the peer cache, not strictly before it. The engine applies
+    /// the list or refuses it as a whole (at most 64 entries, IP addresses
+    /// only).
+    #[arg(long, value_name = "ENODES|@FILE")]
+    boot_enodes: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
+        // The log drain only runs once the engine has started, so whatever
+        // the engine logged on the way to this error (a refused create or
+        // start, and the stop() the handle's guard ran as run() returned) is
+        // still in its ring: print it, then the error last.
+        print_engine_logs();
         eprintln!("myotis-rpcd: {e}");
         std::process::exit(1);
     }
@@ -179,6 +194,7 @@ fn run(args: Args) -> Result<(), String> {
         ),
         None => None,
     };
+    let boot_enodes = args.boot_enodes.as_deref().map(seeds::load).transpose()?;
     let vhosts = http::VHosts::new(args.http_vhosts.as_deref(), listen);
 
     // Bind before starting the engine, so a taken port fails in milliseconds.
@@ -243,6 +259,12 @@ fn run(args: Args) -> Result<(), String> {
     if args.accept_stale_anchor {
         ffi::accept_stale_anchor(handle);
         eprintln!("myotis-rpcd: --accept-stale-anchor: a stale trust anchor will be synced from (this run)");
+    }
+    if let Some(urls) = &boot_enodes {
+        // Flush the ring first, so the lines push() drains are its own.
+        print_engine_logs();
+        seeds::push(handle, urls)?;
+        eprintln!("myotis-rpcd: {} boot enode(s) pinned", urls.len());
     }
     if !ffi::start_handle(handle) {
         return Err("engine failed to start".into());
