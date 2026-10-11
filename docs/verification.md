@@ -344,6 +344,11 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   reported `beaconChainVerified` even when its Merkle proof failed — on any Java run, not only
   after a seed — and the apps' Query card shows such a result as verified. The Rust engine
   verifies every proof before its ladder runs.
+- **Java engine: `get-storage` prints the peer's listed value.** The operator storage query
+  (daemon `get-storage`, the apps' Query tab) verifies the storage proof but reports the slot
+  value the peer *listed* next to it, not the value the proof proves — a peer that sends a
+  genuine proof and a different listed value has its own value printed as verified. The Java
+  JSON-RPC reads and the Rust engine use the proven leaf.
 
 ## 12. Where to look in the code
 

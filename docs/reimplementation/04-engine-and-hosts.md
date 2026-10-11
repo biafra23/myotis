@@ -411,12 +411,15 @@ reads at the attested head's root and so normally answers `"stateRootMatch"` (RE
 `get-account`/`get-storage`/`get-block` compute and return how the answer was anchored:
 **`stateRootMatch`** (the header's `stateRoot` equals a beacon-attested root) or **`headerChain`**
 (walk parent hashes down from a beacon-attested block hash to the target, bounded by 8192 blocks
-— for state, from the optimistic head, the target above finality; pre-Merge blocks below
-15,537,394 are unverifiable → `failReason:"preMergeBlock"`). `get-block` is `headerChain` only:
-it proves the reported header itself by hash, on a window topped by the finalized block or the
-optimistic head (its state-root fast path went in #611). Account/storage
-proofs are MPT-verified against the peer's state root, and `storageRoot`/`codeHash` are taken from
-the **proof-verified leaf**, never the peer's slim body.
+— for state, from the optimistic head, the target above finality). `get-block` is `headerChain`
+only: it proves the reported header itself by hash, on a window topped by the finalized block or
+the optimistic head (its state-root fast path went in #611), and answers
+`failReason:"preMergeBlock"` below 15,537,394 — mainnet's Merge block, applied on every network.
+Account/storage proofs are MPT-verified against the peer's state root. A re-implementation must take
+`storageRoot`/`codeHash` and the slot value only from the **proof-verified leaf**; the reference
+falls short there: a failed account proof on its `stateRootMatch` fast path still answers with the
+peer's slim body, and `get-storage` prints the peer-listed slot value rather than the proven leaf
+(`VerifiedAccountQuery.java`, `VerifiedStorageQuery.java`).
 
 ---
 
@@ -439,8 +442,8 @@ port:
 - **Node key** (`nodekey-<net>.hex`): 32-byte secp256k1 secret.
 
 Mainnet's files drop the `-<net>` suffix (`peers.cache`, `nodekey.hex`, …). The Rust engine reads
-and writes the same cache and snapshot files under `EngineConfig.dataDir` (its node key is
-generated per start, not stored).
+and writes the same peer-cache and snapshot files under `EngineConfig.dataDir` — not the `.roots`
+sidecar (Java-only; the Rust engine leaves it in place) and not the node key (generated per start).
 
 ---
 
