@@ -260,7 +260,19 @@ uniffi::setup_scaffolding!();
 ///      never paired with an engine that silently lacks the call. The Android
 ///      host calls it (`Tor.configureStorage`); desktop, iOS and the Node
 ///      addon do not.
-pub const ABI_VERSION: i32 = 43;
+/// v44: send_raw_transaction_json refuses bytes that are no transaction this
+///      node relays (#360) — undecodable, under a strict reading of the
+///      type's field layout; signature values a peer refuses (EIP-2's low s
+///      among them); no sender recovered; or a blob transaction, which may
+///      not be pushed in a `Transactions` message — with the permanent
+///      `{"error","code":-32602}` envelope, where it used to broadcast them
+///      (a junk byte was gossiped to every peer and answered with its
+///      keccak) or answer a plain retryable `{"error"}`. Behavior changes, no
+///      signature change: the JVM `RustChainHandle` and the iOS
+///      `IosRpcBackend` read the envelope as a REFUSED send, which the hosts
+///      answer -32602; myotis-rpcd and the Node addon already treat the
+///      envelope so.
+pub const ABI_VERSION: i32 = 44;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

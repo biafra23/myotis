@@ -824,8 +824,22 @@ class RustVerifiedReadJsonTest {
                 () -> RustChainHandle.txHashFromJson("{\"txHash\":\"0xdead\"}"));
     }
 
-    // ---- eth_sendRawTransaction outcomes (sendResultFromJson, ABI 36, #531) ----
+    // ---- eth_sendRawTransaction outcomes (sendResultFromJson, ABI 36, #531; ABI 44, #360) ----
     // The Rust golden twin: eljson's a_send_is_a_hash_or_geths_refusal.
+
+    @Test
+    void sendTxOfBytesThatAreNoTransactionIsRefused() {
+        // ABI 44 (#360): the permanent envelope is REFUSED, which the router
+        // answers -32602 — not the retryable -32000 a plain {"error"} gets.
+        io.myotis.api.SendResult r = RustChainHandle.sendResultFromJson(
+                "{\"error\":\"invalid raw transaction: transaction type not supported (0x0)\",\"code\":-32602}");
+        assertEquals(io.myotis.api.SendResult.Status.REFUSED, r.status());
+        assertEquals("invalid raw transaction: transaction type not supported (0x0)", r.detail());
+        assertNull(r.txHash());
+        // A plain error stays an exception (→ UNAVAILABLE in RustVerifiedReads).
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"error\":\"no peer available\"}"));
+    }
 
     @Test
     void sendTxHashIsSent() {

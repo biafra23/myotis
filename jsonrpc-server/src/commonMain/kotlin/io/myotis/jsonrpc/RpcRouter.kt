@@ -1194,6 +1194,9 @@ class RpcRouter(
                     // verbatim under geth's -32000 — wallets classify the words.
                     RpcSendResult.Kind.REJECTED ->
                         errorEnvelope(id, -32000, outcome.detail ?: "transaction rejected")
+                    // No transaction the engine relays (#360): nothing was
+                    // broadcast, and no retry changes the bytes — -32602.
+                    RpcSendResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                     RpcSendResult.Kind.UNAVAILABLE -> return null
                 }
             }

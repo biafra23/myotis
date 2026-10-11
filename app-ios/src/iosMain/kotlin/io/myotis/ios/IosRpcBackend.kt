@@ -352,8 +352,12 @@ class IosRpcBackend(
     override fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
         if (rawTx.isEmpty()) return RpcSendResult.unavailable("empty raw transaction")
         val handle = handleProvider() ?: return RpcSendResult.unavailable()
-        val o = resultOrNull(RustEngine.sendRawTransactionJson(handle, hex(rawTx)))
-            ?: return RpcSendResult.unavailable()
+        val json = RustEngine.sendRawTransactionJson(handle, hex(rawTx))
+        // No transaction the engine relays (ABI >= 44, #360): the permanent
+        // -32602 envelope, nothing broadcast — REFUSED (JNI parity:
+        // RustChainHandle.sendResultFromJson).
+        permanentRefusalOrNull(json)?.let { return RpcSendResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcSendResult.unavailable()
         // Refused before broadcast (ABI >= 36, #531): geth's txpool verdict,
         // which the router serves under -32000. A reason-less refusal fails
         // closed (JNI parity: RustChainHandle.sendResultFromJson throws).

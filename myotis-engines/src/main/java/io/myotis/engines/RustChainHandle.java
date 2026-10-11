@@ -1509,9 +1509,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * Gossip a signed raw transaction: its 32-byte hash as
      * {@link io.myotis.api.SendResult.Status#SENT}, or (ABI 36, #531)
      * {@link io.myotis.api.SendResult.Status#REJECTED} with geth's reason for
-     * one the engine refused before broadcasting it. Throws
-     * {@link EngineException} when no peer could be reached / the input isn't
-     * a plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
+     * one the engine refused before broadcasting it, or (ABI 44, #360)
+     * {@link io.myotis.api.SendResult.Status#REFUSED} for bytes that are no
+     * transaction it relays. Throws {@link EngineException} when no peer could
+     * be reached. {@code rawTxHex} is the 0x-hex raw transaction.
      */
     io.myotis.api.SendResult sendRawTransactionDetailedVerified(String rawTxHex) {
         return sendResultFromJson(
@@ -1521,12 +1522,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /**
      * Package-private test seam: send-tx JSON → its outcome.
      * {@code {"status":"rejected","reason"}} is the engine's answer (geth's
-     * txpool verdict, nothing broadcast); otherwise the hash, as
-     * {@link #txHashFromJson} reads it (throwing on an error or a malformed
-     * payload).
+     * txpool verdict, nothing broadcast); the permanent
+     * {@code {"error","code":-32602}} envelope is REFUSED (ABI 44: no
+     * transaction the engine relays, nothing broadcast); otherwise the hash, as
+     * {@link #txHashFromJson} reads it (throwing on a plain error or a
+     * malformed payload).
      */
     static io.myotis.api.SendResult sendResultFromJson(String json) {
         JsonObject o = parseJsonObject(json, "sendRawTransaction");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         if ("rejected".equals(stringOrNull(o, "status"))) {
             String reason = stringOrNull(o, "reason");
             // Fail closed on a reason-less refusal: the wallet would be told

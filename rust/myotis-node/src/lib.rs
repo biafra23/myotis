@@ -478,8 +478,9 @@ pub fn fee_estimate_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'en
 
 /// Gossip a signed raw transaction to devp2p peers: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`.
 /// Hex that is no transaction, or none, is refused as the permanent
-/// `{"error","code":-32602}` (#503), where the engine's own refusal carries no
-/// code.
+/// `{"error","code":-32602}` (#503); so, since ABI 44, are bytes the engine
+/// will not relay because they are no transaction (#360). The engine's
+/// `rejected` verdict carries no code.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: String) -> Result<Object<'env>> {
     scheduler::submit(env, handle, move || {

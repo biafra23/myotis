@@ -145,6 +145,13 @@ final class GatedVerifiedReads implements VerifiedReads {
 
     @Override
     public io.myotis.api.SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        // Bytes that are no transaction are refused on the bytes alone (#360),
+        // BEFORE the wait for a ready backend: a paused or starting stack must
+        // not turn that permanent refusal into a retryable "stack not ready".
+        // The backend checks again; the decode is cheap.
+        String refusal = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.checkSendable(
+                org.apache.tuweni.bytes.Bytes.wrap(rawTx == null ? new byte[0] : rawTx)).refusal();
+        if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         // Forwarded, not inherited: the default would collapse the backend's
         // own verdict into hash-or-null (#531).
         io.myotis.api.SendResult r = guarded(d -> d.sendRawTransactionDetailed(rawTx));

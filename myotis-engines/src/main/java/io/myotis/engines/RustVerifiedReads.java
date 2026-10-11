@@ -276,8 +276,8 @@ final class RustVerifiedReads implements VerifiedReads {
         try {
             // The engine never signs — it gossips the user-signed tx and returns
             // keccak256(rawTx), or refuses one that can never be mined as sent
-            // (REJECTED, geth's reason). Unavailable on no-peer / not-a-tx
-            // (→ strict -32000).
+            // (REJECTED, geth's reason) or bytes that are no transaction
+            // (REFUSED → -32602). Unavailable on no-peer (→ strict -32000).
             return handle.sendRawTransactionDetailedVerified(toHex(rawTx));
         } catch (RuntimeException e) {
             log.debug("[engines] sendRawTransaction failed: {}", e.getMessage());

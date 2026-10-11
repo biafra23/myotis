@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 43; // 43: set_tor_storage_dirs; 42: ens_record_json method "ownership" (ENS registrant/manager/expiry)
+    static final int EXPECTED_ABI_VERSION = 44; // 44: send_raw_transaction_json refuses non-transactions (-32602); 43: set_tor_storage_dirs
 
     private static final boolean AVAILABLE = load();
 

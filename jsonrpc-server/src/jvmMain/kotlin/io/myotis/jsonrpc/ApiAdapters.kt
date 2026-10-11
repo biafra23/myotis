@@ -100,6 +100,7 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         return when (r.status()!!) {
             io.myotis.api.SendResult.Status.SENT -> RpcSendResult.sent(r.txHash())
             io.myotis.api.SendResult.Status.REJECTED -> RpcSendResult.rejected(r.detail())
+            io.myotis.api.SendResult.Status.REFUSED -> RpcSendResult.refused(r.detail())
             io.myotis.api.SendResult.Status.UNAVAILABLE -> RpcSendResult.unavailable(r.detail())
         }
     }
