@@ -336,7 +336,7 @@ service is the better shape:
 | What the path reveals | The exit sees the server's IP and timing, not the content (RLPx is end-to-end encrypted). | No relay knows both ends. |
 | Hosting | Needs a public IP and port; zbox sits behind mobile CGNAT and relies on the netcup relay's DNAT. | Publishes outbound-only, from behind CGNAT, no relay needed. |
 | Latency | 3 hops; the PoC measured 0.75 s on a good circuit, up to 18 s on a bad one. | 6 hops plus rendezvous setup, per isolated circuit. Unmeasured. |
-| Wallet side | Nothing new. | Arti's `onion-service-client` feature (APK and dylib size to measure), and a pinned `.onion` address — discv4 and ENR records cannot carry one. |
+| Wallet side | Nothing new. | Arti's `onion-service-client` feature (APK and dylib size to measure), and the `.onion` address: pinned, or carried in the server's ENR under a custom key only myotis reads (discv4 endpoints cannot hold one; a server publishes its ENR from its public IP anyway). |
 
 On the server side this is stock C tor (`HiddenServiceDir` /
 `HiddenServicePort` to the front's loopback port); whether Arti's client
