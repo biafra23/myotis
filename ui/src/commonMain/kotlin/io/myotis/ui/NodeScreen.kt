@@ -840,7 +840,7 @@ private fun NodeTuning(
         // row is disabled while the Java engine is forced above.
         if (controller.supportsTor) {
             SwitchRow(
-                label = "Route reads over Tor (experimental)",
+                label = "Route reads and sends over Tor (experimental)",
                 checked = f.torRouting && !f.preferJava,
                 enabled = !f.preferJava,
                 onChange = { on -> f.torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
@@ -849,16 +849,20 @@ private fun NodeTuning(
                 if (f.preferJava) {
                     "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
                 } else {
-                    "Off (default): reads use the peer pool directly from your IP. On: route " +
-                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
-                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
-                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
-                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
-                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
-                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
-                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
-                        "running Rust-engine network routes over Tor (no restart needed)."
+                    "Off (default): reads and sends use the peer pool directly from your IP. On: " +
+                        "route account/balance reads and the broadcast of your transactions over the Tor " +
+                        "network (embedded Arti) so peers see a Tor exit, not your IP (though a peer you " +
+                        "also reach directly can tell both are a Myotis node) — each address, " +
+                        "and each send, gets its own isolated circuits and a fresh node identity. SCOPE: " +
+                        "only account (balance/nonce) reads and transaction sends route over Tor today; " +
+                        "token-balance (storage), contract code, eth_call/gas-estimation and the receipt " +
+                        "polling after a send still use your real IP — full coverage is a follow-up. " +
+                        "HEADS-UP: earlier tests were not very successful — many peers reject Tor exit " +
+                        "IPs and :30303 exit coverage is patchy, so reads and sends can be slow (seconds " +
+                        "to tens of seconds) or fail-closed while this is on: a send that no peer " +
+                        "takes over Tor fails — it never falls back to your IP. Takes effect " +
+                        "immediately — the next read or send on a running Rust-engine network routes " +
+                        "over Tor (no restart needed)."
                 },
             )
         }
@@ -1232,7 +1236,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             StatusRow(
                 "Tor",
                 when (mode) {
-                    "active" -> "routing reads (circuit ready)"
+                    "active" -> "routing reads and sends (circuit ready)"
                     "on" -> "on — circuit bootstrapping…"
                     "off" -> "off"
                     else -> mode
@@ -2458,9 +2462,10 @@ private object StatusHelp {
     const val LOG_INDEX = "Log index backfill progress, e.g. \"12,041 logs · " +
         "5,594,611–8,461,900\", or \"backfilling\". Shown only when the log index feature applies."
     const val TOR = "Desktop and Android, and only with the Rust engine on a -PtorEngine build. " +
-        "Scope: only account (balance/nonce) reads route over Tor today — storage/token reads, " +
-        "eth_call/gas estimation, tx broadcast, the CL fetch, and discovery still leave from " +
-        "your real IP."
+        "Scope: account (balance/nonce) reads and the broadcast of your transactions route over " +
+        "Tor today — storage/token reads, eth_call/gas estimation, receipt polling, the CL " +
+        "fetch, and discovery still leave from your real IP. The Logs tab shows one \"tor:\" " +
+        "line per read and per send."
     const val CL_PEERS = "\"served N/min\" = distinct peers that answered a light-client " +
         "request in the last 60s. \"con N\" = currently-connected CL peers — usually near 0, " +
         "since connections are short-lived."

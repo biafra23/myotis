@@ -1,4 +1,5 @@
-//! Tor transport for the verified-read path (`docs/privacy-and-tor.md`).
+//! Tor transport for the verified-read path and the transaction broadcast
+//! (`docs/privacy-and-tor.md`).
 //!
 //! Feature-gated (`tor`): only a host that builds `myotis-net` with
 //! `--features tor` (`-PtorEngine`: the desktop dylib, the Android jniLibs)
@@ -14,8 +15,9 @@
 //! Android the host MUST name them first ([`set_storage_dirs`]) or the
 //! bootstrap is refused.
 //!
-//! Scope (matches the design's §4 split): only the sensitive verified reads are
-//! routed here. Discovery and clearnet snap-peer validation stay on the real IP.
+//! Scope (matches the design's §4 split): only the sensitive flows are routed
+//! here — account reads, and the broadcast of the wallet's own transactions.
+//! Discovery and clearnet snap-peer validation stay on the real IP.
 //! What is NOT here yet: the quarantined peer pool + aging window (§5) and
 //! multi-source popularity promotion (§6.2) — this reuses whatever the clearnet
 //! pool already validated. Enabling Tor is therefore a network-privacy win
@@ -60,17 +62,17 @@ struct Storage {
 
 static STORAGE: Mutex<Storage> = Mutex::new(Storage { dirs: None, in_use: false });
 
-/// Enable/disable Tor for subsequent verified reads. Idempotent; cheap.
+/// Enable/disable Tor for subsequent account reads and broadcasts. Idempotent; cheap.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
     if on {
-        tracing::info!("tor: verified-read routing ENABLED");
+        tracing::info!("tor: routing account reads and transaction broadcasts over Tor (ENABLED)");
     } else {
-        tracing::info!("tor: verified-read routing disabled");
+        tracing::info!("tor: routing disabled");
     }
 }
 
-/// Whether verified reads should route over Tor.
+/// Whether account reads and broadcasts should route over Tor.
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
 }
@@ -125,7 +127,8 @@ fn take_config() -> Result<TorClientConfig, String> {
 
 /// Releases the storage [`take_config`] marked as in use when dropped with
 /// `release` still set — cleared once the bootstrap succeeds. A bootstrap that
-/// fails, or whose future a caller's read timeout drops part-way, holds
+/// fails, or whose task is dropped part-way (a caller's deadline no longer
+/// does that: the bootstrap runs in a task of its own, [`client`]), holds
 /// nothing, so the next attempt may run from other directories.
 struct StorageHold {
     release: bool,
@@ -160,22 +163,61 @@ fn isolation_for(address: &[u8; 20]) -> IsolationToken {
     *map.entry(*address).or_insert_with(IsolationToken::new)
 }
 
-/// Bootstrap-once accessor for the shared Tor client.
+/// The one bootstrap in flight, with its generation ([`client`]).
+type Bootstrap = futures::future::Shared<futures::future::BoxFuture<'static, Result<(), String>>>;
+static BOOTSTRAP: Mutex<(u64, Option<Bootstrap>)> = Mutex::new((0, None));
+
+/// Bootstrap-once accessor for the shared Tor client. ONE bootstrap runs at a
+/// time, in a task of its own: every caller waits on it under its own deadline
+/// (a read's, a push's), so a deadline never cancels it halfway, and callers
+/// that gave up leave nothing behind to retry it. A failed bootstrap is
+/// cleared by the first caller that sees it fail, so the next CALL starts a
+/// fresh one — never a queue of orphaned retries.
 async fn client() -> Result<&'static Arc<TorClient<PreferredRuntime>>, String> {
-    CLIENT
-        .get_or_try_init(|| async {
-            tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
-            let config = take_config()?;
-            let mut hold = StorageHold { release: true };
-            ensure_crypto_provider();
-            let c = TorClient::create_bootstrapped(config)
-                .await
-                .map_err(|e| format!("tor bootstrap: {e}"))?;
-            hold.release = false; // bootstrapped: the directories are held for good
-            tracing::info!("tor: Arti client bootstrapped");
-            Ok::<_, String>(c)
-        })
-        .await
+    use futures::FutureExt;
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let (generation, bootstrap) = {
+        let mut slot = BOOTSTRAP.lock().unwrap_or_else(|p| p.into_inner());
+        let running = slot.1.clone();
+        match running {
+            Some(b) => (slot.0, b),
+            None => {
+                let task = tokio::spawn(async {
+                    CLIENT
+                        .get_or_try_init(|| async {
+                            tracing::info!("tor: bootstrapping embedded Arti client (first use)…");
+                            let config = take_config()?;
+                            let mut hold = StorageHold { release: true };
+                            ensure_crypto_provider();
+                            let c = TorClient::create_bootstrapped(config)
+                                .await
+                                .map_err(|e| format!("tor bootstrap: {e}"))?;
+                            hold.release = false; // bootstrapped: the directories are held for good
+                            tracing::info!("tor: Arti client bootstrapped");
+                            Ok::<_, String>(c)
+                        })
+                        .await
+                        .map(|_| ())
+                });
+                let b: Bootstrap = async move { task.await.map_err(|e| format!("tor bootstrap task: {e}"))? }
+                    .boxed()
+                    .shared();
+                slot.0 = slot.0.wrapping_add(1);
+                slot.1 = Some(b.clone());
+                (slot.0, b)
+            }
+        }
+    };
+    if let Err(e) = bootstrap.await {
+        let mut slot = BOOTSTRAP.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.0 == generation {
+            slot.1 = None;
+        }
+        return Err(e);
+    }
+    CLIENT.get().ok_or_else(|| "tor bootstrap: no client after bootstrap".to_string())
 }
 
 /// Open a per-address ISOLATED Tor circuit to `addr` (identity `pubkey`, already
@@ -188,10 +230,48 @@ pub async fn open_snap_session(
     pubkey: [u8; 64],
     eth_cfg: &EthConfig,
 ) -> Result<EthSession<arti_client::DataStream>, String> {
+    let session = open_session(isolation_for(address), addr, pubkey, eth_cfg).await?;
+    if !session.snap {
+        return Err(format!("tor: peer {addr} did not negotiate snap"));
+    }
+    Ok(session)
+}
+
+/// Push one of the wallet's own transactions to `addr` over Tor: a stream on
+/// circuits `isolation` keeps to itself, a fresh ephemeral RLPx identity, and
+/// the push confirmed by the peer's Pong ([`EthSession::await_pong`]). Sets
+/// `written` once the push itself landed — from then on the transaction may
+/// be out, whatever the Pong does. The caller picks the isolation: one token
+/// per broadcast, so no circuit carries two sends, or a send and a read.
+pub async fn push_transaction(
+    isolation: IsolationToken,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+    eth_cfg: &EthConfig,
+    raw_tx: &[u8],
+    written: &AtomicBool,
+) -> Result<(), String> {
+    let mut session = open_session(isolation, addr, pubkey, eth_cfg).await?;
+    session.send_transaction(raw_tx).await?;
+    written.store(true, Ordering::SeqCst);
+    session.await_pong().await
+}
+
+/// Open a Tor stream to `addr` on the circuit `isolation` names and run the
+/// RLPx + eth handshake with a fresh ephemeral key, returning a READY session.
+async fn open_session(
+    isolation: IsolationToken,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+    eth_cfg: &EthConfig,
+) -> Result<EthSession<arti_client::DataStream>, String> {
     let tor = client().await?;
+    // The Tor side advertises no listen port: it accepts no inbound, and the
+    // clearnet sessions' port would be one more thing to pair the two by.
+    let eth_cfg = EthConfig { listen_port: 0, ..eth_cfg.clone() };
 
     let mut prefs = StreamPrefs::new();
-    prefs.set_isolation(isolation_for(address));
+    prefs.set_isolation(isolation);
     let target = TorAddr::from((addr.ip().to_string().as_str(), addr.port()))
         .map_err(|e| format!("tor addr {addr}: {e}"))?;
     let stream = tor
@@ -210,13 +290,9 @@ pub async fn open_snap_session(
     .map_err(|_| format!("tor rlpx handshake timed out to {addr}"))?
     .map_err(|e| format!("tor rlpx handshake to {addr}: {e}"))?;
 
-    let session = EthSession::handshake(conn, &key.public_key_bytes(), eth_cfg, None)
+    EthSession::handshake(conn, &key.public_key_bytes(), &eth_cfg, None)
         .await
-        .map_err(|e| format!("tor eth handshake to {addr}: {e}"))?;
-    if !session.snap {
-        return Err(format!("tor: peer {addr} did not negotiate snap"));
-    }
-    Ok(session)
+        .map_err(|e| format!("tor eth handshake to {addr}: {e}"))
 }
 
 #[cfg(test)]
