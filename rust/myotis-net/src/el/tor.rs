@@ -38,6 +38,11 @@ use tor_rtcompat::PreferredRuntime;
 use crate::el::eth::session::{EthConfig, EthSession};
 use crate::el::rlpx::transport::RlpxConnection;
 
+/// The client id a Tor-side Hello advertises: the software's name without its
+/// version, so a peer cannot match a Tor session to a direct one (which says
+/// `myotis/<version>`) by version — docs/privacy-and-tor.md §6.3.
+pub const TOR_CLIENT_ID: &str = "myotis";
+
 /// Process-wide Tor on/off, flipped by the host (JNI `myotis_set_tor_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -266,8 +271,9 @@ async fn open_session(
     eth_cfg: &EthConfig,
 ) -> Result<EthSession<arti_client::DataStream>, String> {
     let tor = client().await?;
-    // The Tor side advertises no listen port: it accepts no inbound, and the
-    // clearnet sessions' port would be one more thing to pair the two by.
+    // The Tor side advertises no listen port (it accepts no inbound) and names
+    // the software without its version ([`TOR_CLIENT_ID`]): either would be
+    // one more thing to pair a Tor session with a direct one by.
     let eth_cfg = EthConfig { listen_port: 0, ..eth_cfg.clone() };
 
     let mut prefs = StreamPrefs::new();
@@ -290,7 +296,7 @@ async fn open_session(
     .map_err(|_| format!("tor rlpx handshake timed out to {addr}"))?
     .map_err(|e| format!("tor rlpx handshake to {addr}: {e}"))?;
 
-    EthSession::handshake(conn, &key.public_key_bytes(), &eth_cfg, None)
+    EthSession::handshake_as(conn, &key.public_key_bytes(), &eth_cfg, None, TOR_CLIENT_ID)
         .await
         .map_err(|e| format!("tor eth handshake to {addr}: {e}"))
 }

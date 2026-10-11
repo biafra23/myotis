@@ -22,18 +22,24 @@
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch
-> stays clearnet. And the shipped path reuses the live
-> clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
-> a Tor read or receiving a Tor send simultaneously holds a clearnet connection from the user's real
-> IP and can pair the two by timing and by the `myotis/<version>` client id
-> both sessions' Hello carries (§6.3; `reader.rs`'s own KNOWN LIMITATION): a
-> network-privacy win, not yet the full §5 unlinkability. The runnable proof
+> stays clearnet. Tor reads and sends go only to cached peers — identities a
+> past session proved — that hold no direct session with us and saw no direct
+> dial or session from us in the last ten minutes, never a pin; the pool then
+> leaves each peer it reached over Tor undialed directly for ten minutes; with
+> no such peer the read or send fails closed (`PeerPool::tor_candidates`,
+> `TOR_DIRECT_SEPARATION`). Tor-side Hellos name the software without its
+> version (`myotis`, §6.3). That is a first step toward §5, not the design:
+> no days-long randomized quarantine, no batch rotation, separation state
+> lives for one pool run, discovery's UDP pings still reach many nodes from
+> the real IP, and an operator running many nodes can pool what they see —
+> a network-privacy win, not yet the full §5 unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
 > the transport against live mainnet and its measurements are folded back in
-> below (marked **PoC:**). The quarantined peer pool, multi-source promotion,
-> and request-shape hardening remain unimplemented proposals — everything about
-> them is design, not shipped behavior.
+> below (marked **PoC:**). The full quarantined peer pool, multi-source
+> promotion, and request-shape hardening remain unimplemented proposals —
+> everything about them beyond the ten-minute separation above is design, not
+> shipped behavior.
 
 Companion docs: [Disk & Network Usage](disk-and-network-usage.md) (traffic volumes
 this design would route), [Optimisations & Limitations](../OPTIMISATIONS_AND_LIMITATIONS.md)
@@ -224,10 +230,10 @@ Route by sensitivity, not wholesale:
    at the first confirmed push, counts a push that landed without a Pong as
    sent (it may be out), and fails closed when none landed. Rebroadcasts
    follow the same route, one round at a time per network, each walking on to
-   the next five pool peers; a Tor send is never re-pushed in the clear, a
-   wallet's re-submit of it included. Tor sessions advertise no listen port;
-   they still send the `myotis/<version>` client id (§6.3 — the choice of a
-   Tor-side id is open).
+   the next five eligible peers; a Tor send is never re-pushed in the clear, a
+   wallet's re-submit of it included. The peers are cached ones with no direct
+   contact in the last ten minutes (status note above); Tor sessions advertise
+   no listen port and the client id `myotis` without its version (§6.3).
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -352,6 +358,11 @@ correlation is strong regardless of delay. Structural today; dissolves with
 adoption. It argues for making Tor-side request shapes as generic as practical,
 and for not shipping a unique clientId on the Tor path.
 
+> **Shipped:** the Tor-side Hello says `myotis`, without the version
+> (`el::tor::TOR_CLIENT_ID`), so a peer cannot match a Tor session to a direct
+> one by version; it still names the software (an owner's choice over
+> borrowing another client's id), and the request shapes are unchanged.
+
 ## 7. What each mechanism buys — summary
 
 | Mechanism | Defeats |
@@ -394,9 +405,9 @@ and for not shipping a unique clientId on the Tor path.
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
    > **Shipped as:** one isolation token per send (its circuits carry no
-   > other send and no read), up to five pool peers; each rebroadcast round
-   > walks on to the next five. The peers are not aged yet (§5), so the
-   > stronger options remain open.
+   > other send and no read), up to five peers with no direct contact in the
+   > last ten minutes; each rebroadcast round walks on to the next five. The
+   > days-long aging of §5 is not built, so the stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).

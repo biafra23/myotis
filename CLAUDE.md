@@ -136,7 +136,8 @@ Key Gradle modules:
   (`NodeService.txHistoryService`) — all reach the connector via
   `SelectorEngine.javaDelegate().debugStack` at their composition roots;
   the Settings toggles for the BLS backend (`BlsBackends`), the
-  engine (`Engines`), and Tor verified-read routing (`Tor` —
+  engine (`Engines`), and Tor routing of account reads and of the wallet's
+  own transaction broadcast (`Tor` —
   docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
   toggle, and behind the `-PtorEngine` build flag that links Arti into the host
   dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —

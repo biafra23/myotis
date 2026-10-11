@@ -9,11 +9,24 @@ pub const P2P_DISCONNECT: u64 = 0x01;
 pub const P2P_PING: u64 = 0x02;
 pub const P2P_PONG: u64 = 0x03;
 
+/// The client id our Hello advertises: name and version. CARGO_PKG_VERSION is
+/// the workspace version (rust/Cargo.toml [workspace.package]), kept equal to
+/// the Gradle release version by `verifyCrateVersions`; the Java engine
+/// generates its Hello id from that same Gradle version, so the two engines
+/// agree by construction.
+pub const CLIENT_ID: &str = concat!("myotis/", env!("CARGO_PKG_VERSION"));
+
 /// Build a p2p Hello body: `[protocolVersion, clientId, [[cap,ver]…], listenPort, nodeId]`.
 /// Advertises eth/66-69 + snap/1 + snap/2 (ascending), matching the Java
 /// `HelloMessage`. Both snap versions are offered so the session runs whichever
 /// one the peer has — the highest shared (see `eth::session::negotiate`).
 pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
+    encode_hello_as(node_pubkey, listen_port, CLIENT_ID)
+}
+
+/// [`encode_hello`] advertising `client_id` instead of [`CLIENT_ID`] — the Tor
+/// path's Hello names the software without its version.
+pub fn encode_hello_as(node_pubkey: &[u8; 64], listen_port: u16, client_id: &str) -> Vec<u8> {
     use myotis_core::rlp::{self, Item};
     let cap = |name: &str, ver: u64| {
         Item::List(vec![
@@ -23,11 +36,7 @@ pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     };
     rlp::encode(&Item::List(vec![
         Item::Bytes(rlp::u64_to_minimal_be(5)), // protocol version
-        // CARGO_PKG_VERSION is the workspace version (rust/Cargo.toml
-        // [workspace.package]), kept equal to the Gradle release version by
-        // `verifyCrateVersions`; the Java engine generates its Hello id from
-        // that same Gradle version, so the two engines agree by construction.
-        Item::Bytes(concat!("myotis/", env!("CARGO_PKG_VERSION")).as_bytes().to_vec()),
+        Item::Bytes(client_id.as_bytes().to_vec()),
         Item::List(vec![
             cap("eth", 66),
             cap("eth", 67),
@@ -100,3 +109,21 @@ pub fn decode_hello(body: &[u8]) -> Result<Hello, String> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hello_carries_the_client_id_it_was_given() {
+        let key = [7u8; 64];
+        let ours = decode_hello(&encode_hello(&key, 30303)).unwrap();
+        assert_eq!(ours.client_id, CLIENT_ID);
+        assert!(CLIENT_ID.starts_with("myotis/"));
+        let tor = decode_hello(&encode_hello_as(&key, 0, "myotis")).unwrap();
+        assert_eq!(tor.client_id, "myotis");
+        assert_eq!(tor.listen_port, 0);
+        // Everything else is the same Hello.
+        assert_eq!(tor.capabilities, ours.capabilities);
+        assert_eq!(tor.node_id, ours.node_id);
+    }
+}

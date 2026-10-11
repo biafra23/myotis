@@ -20,7 +20,10 @@ use super::frame::{DecodedFrame, FrameCodec, FrameDecoder, FrameEncoder};
 use super::handshake::Initiator;
 
 /// p2p base message codes (shared prefix below the eth sub-protocol).
-pub use myotis_wire::rlpx::hello::{decode_hello, encode_hello, Capability, Hello, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG};
+pub use myotis_wire::rlpx::hello::{
+    decode_hello, encode_hello, encode_hello_as, Capability, Hello, CLIENT_ID, P2P_DISCONNECT, P2P_HELLO, P2P_PING,
+    P2P_PONG,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// EIP-8 ack size cap (padding can push it to ~600 bytes; be generous).

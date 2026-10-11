@@ -19,7 +19,7 @@ use myotis_core::rlp::{self, Item};
 
 use crate::el::rlpx::frame::MAX_CONTROL_MSG_SIZE;
 use crate::el::rlpx::transport::{
-    decode_hello, encode_hello, Hello, RlpxConnection, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
+    decode_hello, encode_hello_as, Hello, RlpxConnection, CLIENT_ID, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
 };
 
 use super::messages::{self, Status};
@@ -94,14 +94,26 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
     /// exchange Status, and gate on network id + genesis. `local_pubkey` is our
     /// node id (64-byte). The whole handshake is bounded by a 30 s timeout.
     pub async fn handshake(
-        mut conn: RlpxConnection<S>,
+        conn: RlpxConnection<S>,
         local_pubkey: &[u8; 64],
         cfg: &EthConfig,
         served_range: Option<(u64, u64, [u8; 32])>,
     ) -> Result<EthSession<S>, String> {
+        Self::handshake_as(conn, local_pubkey, cfg, served_range, CLIENT_ID).await
+    }
+
+    /// [`Self::handshake`] with our Hello advertising `client_id` — the Tor
+    /// path's names the software without its version (`el::tor`).
+    pub async fn handshake_as(
+        mut conn: RlpxConnection<S>,
+        local_pubkey: &[u8; 64],
+        cfg: &EthConfig,
+        served_range: Option<(u64, u64, [u8; 32])>,
+        client_id: &str,
+    ) -> Result<EthSession<S>, String> {
         let fut = async {
             // Send our Hello first (Java sends on RLPX_READY).
-            conn.send(P2P_HELLO, &encode_hello(local_pubkey, cfg.listen_port))
+            conn.send(P2P_HELLO, &encode_hello_as(local_pubkey, cfg.listen_port, client_id))
                 .await?;
 
             // The peer's first framed message must be Hello (or Disconnect).
@@ -609,7 +621,7 @@ fn hex4(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::el::rlpx::handshake::SessionSecrets;
-    use crate::el::rlpx::transport::Capability;
+    use crate::el::rlpx::transport::{encode_hello, Capability};
     use tokio::io::DuplexStream;
 
     fn hello_with(caps: Vec<(&str, u64)>) -> Hello {
@@ -826,6 +838,28 @@ mod tests {
         let err = outcome.unwrap_err();
         assert!(err.starts_with("peer disconnected after our Status"), "{err}");
         assert!(crate::el::pool::is_busy_disconnect(&err), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_as_advertises_the_client_id_it_is_given() {
+        for (client_id, want) in [(None, CLIENT_ID), (Some("myotis"), "myotis")] {
+            let (ours, mut peer) = framed_pair();
+            let peer_side = tokio::spawn(async move {
+                let hello = peer.recv().await.unwrap();
+                assert_eq!(hello.message_code, P2P_HELLO);
+                peer.send(P2P_HELLO, &encode_hello(&[2; 64], 30303)).await.unwrap();
+                assert_eq!(peer.recv().await.unwrap().message_code, messages::STATUS);
+                let status = messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+                peer.send(messages::STATUS, &status).await.unwrap();
+                decode_hello(&hello.payload).unwrap().client_id
+            });
+            let session = match client_id {
+                None => EthSession::handshake(ours, &[1; 64], &test_config(), None).await,
+                Some(id) => EthSession::handshake_as(ours, &[1; 64], &test_config(), None, id).await,
+            };
+            session.expect("handshake completes");
+            assert_eq!(peer_side.await.unwrap(), want);
+        }
     }
 
     // --- A transaction push and its Pong, against a scripted READY peer.

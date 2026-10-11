@@ -1251,23 +1251,21 @@ fn rotated_take<T: Clone>(items: &[T], offset: usize, n: usize) -> Vec<T> {
 }
 
 /// The peers a Tor read or send dials: up to [`TOR_MAX_CANDIDATES`] of the
-/// peers the clearnet pool validated, by IDENTITY only — address and node
-/// key; the dial itself is a fresh Tor stream with an ephemeral key —
-/// starting `offset` into the pool's order.
+/// pool's eligible ones ([`PeerPool::tor_candidates`]: cached identities with
+/// no direct session or dial from us in the last ten minutes), starting
+/// `offset` into their order. Reached by IDENTITY only — address and node key;
+/// the dial itself is a fresh Tor stream with an ephemeral key.
 ///
-/// KNOWN LIMITATION (docs §5, §6.3): these are peers we hold a LIVE clearnet
-/// connection to, so the peer a Tor read or send reaches simultaneously sees
-/// our real IP, and can pair the two by timing and by the `myotis/<version>`
-/// client id both sessions' Hello carries — outright while it sees one Myotis
-/// node. The quarantined, aged Tor pool of §5 is the fix for the first, and
-/// replaces this one function; the second waits on the owner's choice of a
-/// Tor-side client id.
+/// What a receiving peer still has (docs §5, §6.3): the Tor-side Hello names
+/// the software (`myotis`, no version), so a peer seeing few Myotis nodes
+/// knows it is one of them; and an operator running many nodes can pool what
+/// its nodes see of our direct sessions and of the Tor ones.
 #[cfg(feature = "tor")]
-fn tor_candidates(peers: &[Arc<ManagedPeer>], offset: usize) -> Vec<(std::net::SocketAddr, [u8; 64])> {
-    rotated_take(peers, offset, TOR_MAX_CANDIDATES)
-        .iter()
-        .map(|p| (p.addr(), p.peer_pubkey()))
-        .collect()
+fn tor_candidates(
+    eligible: &[(std::net::SocketAddr, [u8; 64])],
+    offset: usize,
+) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+    rotated_take(eligible, offset, TOR_MAX_CANDIDATES)
 }
 
 /// How a Tor broadcast went ([`tor_broadcast`]).
@@ -1327,7 +1325,7 @@ where
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
     if targets.is_empty() {
-        return Err("tor: no clearnet-validated peer to push the transaction to over Tor (fail-closed)".into());
+        return Err(NO_TOR_PEER.into());
     }
     let tried = targets.len();
     let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1660,13 +1658,19 @@ fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -
     out.accepted.as_ref().is_some_and(|(_, v)| served(v))
 }
 
-/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
+/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many eligible
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
 /// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
 /// minutes. Fail-closed when the deadline is hit.
 #[cfg(feature = "tor")]
 const TOR_MAX_CANDIDATES: usize = 5;
+
+/// A Tor read or send with no peer to go to ([`PeerPool::tor_candidates`]
+/// empty): it fails closed rather than reach a peer that sees our IP.
+#[cfg(any(test, feature = "tor"))]
+const NO_TOR_PEER: &str = "tor: no known peer without a recent direct connection to reach over Tor \
+    (fail-closed; Tor needs a peer this node has not dialed directly in the last ten minutes)";
 #[cfg(feature = "tor")]
 const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -5988,22 +5992,19 @@ impl ElReader {
         // fresh Tor circuit with an ephemeral node key, so the peer never sees our
         // real IP or our persistent node key.
         //
-        // KNOWN LIMITATION (docs §5): `snap_peers()` returns peers we hold a LIVE
-        // clearnet connection to right now, so the Tor circuit reaches a node that
-        // simultaneously sees our real IP — a peer could pair the two by timing +
-        // the (rare) client fingerprint (§6.3). The design's fix is the quarantined,
-        // AGED, multi-source-promoted Tor pool (§5) that dials only peers we are NOT
-        // currently clearnet-connected to; that sidecar is out of scope for this
-        // experimental v1 and tracked as the follow-up.
+        // Only peers that see no direct session from us (docs §5,
+        // `PeerPool::tor_candidates`): a peer holding both could pair them. Each
+        // one dialed is then left undialed directly for ten minutes. None →
+        // fail closed, never a peer that sees our IP.
         //
         // Bound the fan-out: each Tor dial is
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates = tor_candidates(&self.pool.snap_peers().await, 0);
+        let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
         if candidates.is_empty() {
-            tracing::info!("tor: account read failed — no peer to dial over Tor");
-            return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
+            tracing::info!("tor: account read failed — no peer without a recent direct connection");
+            return Err(NO_TOR_PEER.into());
         }
         // One log line per Tor read, served or failed — never naming the
         // address read (the log is exportable).
@@ -6018,6 +6019,7 @@ impl ElReader {
                 break;
             }
             // Bound each candidate's whole dial+read by the remaining budget.
+            self.pool.note_tor_contact([addr]);
             let attempt = async {
                 let mut session =
                     crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
@@ -7917,7 +7919,8 @@ impl ElReader {
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
-            let targets = tor_candidates(&self.pool.snap_peers().await, 0);
+            let targets = tor_candidates(&self.pool.tor_candidates(false).await, 0);
+            self.pool.note_tor_contact(targets.iter().map(|(addr, _)| *addr));
             let raw = std::sync::Arc::<[u8]>::from(raw_tx);
             let shutdown = self.request_shutdown.subscribe();
             return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
@@ -8197,7 +8200,9 @@ impl ElReader {
             (guard, st.tor_rounds)
         };
         // Only the targets go into the task, not the pool's peer handles.
-        let targets = tor_candidates(&self.pool.snap_peers().await, round.wrapping_mul(TOR_MAX_CANDIDATES));
+        let eligible = self.pool.tor_candidates(false).await;
+        let targets = tor_candidates(&eligible, round.wrapping_mul(TOR_MAX_CANDIDATES));
+        self.pool.note_tor_contact(targets.iter().map(|(addr, _)| *addr));
         if targets.is_empty() {
             return;
         }
