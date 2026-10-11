@@ -62,11 +62,21 @@ publish only updates the feed. The Freedom browser opens `myotis.eth` directly;
 `https://myotis.eth.limo` serves the same page to every other browser (eth.limo
 resolves Swarm content hashes as well as IPFS ones).
 
-The upload is the official `swarm-cli` (pinned in the script, fetched by `npx`);
-the script adds the checks around it: the batch is usable and immutable, the
-feed key exists, the node afterwards serves exactly the local files, and where
-`myotis.eth` points (read through your Myotis node on `127.0.0.1:8545`, or
-`ETH_RPC_URL`). It needs Node 18+.
+The upload is the official `swarm-cli` (pinned in the script, fetched by `npx`),
+which also asks for the feed key's password, so the password never passes
+through the script or a command line. The script adds the checks around it:
+
+- `site/` matches `origin/main`: only merged, reviewed content goes live
+  (override with `SWARM_ALLOW_UNMERGED=1`);
+- the batch is usable, immutable, and the same one this feed was published
+  with before (remembered in `~/.myotis/website-swarm.json`; override with
+  `SWARM_NEW_BATCH=1`, see *Keeping it alive*);
+- the feed key exists;
+- afterwards, your node serves every file of `site/`, the root included;
+- where `myotis.eth` points, read through your Myotis node on `127.0.0.1:8545`
+  (or `ETH_RPC_URL`, an Ethereum mainnet RPC).
+
+It needs Node 18+ and git.
 
 Publishing is manual on purpose: the feed key decides what `myotis.eth` shows,
 and it stays on your machine rather than in CI secrets. GitHub Pages keeps
@@ -102,8 +112,9 @@ deploying by itself and stays up as a mirror.
    SWARM_STAMP=<batch id> node scripts/publish_site_swarm.mjs publish
    ```
 
-   It asks for the key's password, uploads, waits until your node serves the
-   new files, and prints the content hash to set: `bzz://<feed manifest>`.
+   swarm-cli asks for the key's password, uploads and waits for the network
+   to take the chunks; the script then waits until your node serves the new
+   files and prints the content hash to set: `bzz://<feed manifest>`.
 4. **Point `myotis.eth` at it**, once, from the wallet that manages the name:
    in the [ENS app](https://app.ens.domains/myotis.eth), *Records → Edit
    records → Content hash*, enter `bzz://<feed manifest>` and confirm the
@@ -129,7 +140,9 @@ site did not change.
 
 Swarm keeps data only while its batch is paid for. Keep **one batch for the life
 of the feed**: the feed's earlier updates are stamped with it, so let it neither
-expire nor be replaced.
+expire nor be replaced. The script refuses a different batch than the one it
+last published with, unless `SWARM_NEW_BATCH=1`; if you ever do switch, keep the
+old batch topped up as well.
 
 - **Before it expires**, top it up (`npx @ethersphere/swarm-cli@3.6.0 stamp
   topup --stamp <id> --amount <plur>`). The script warns when fewer than 30
@@ -137,7 +150,3 @@ expire nor be replaced.
 - **Before it fills**, dilute it to a larger depth (`stamp dilute --stamp <id>
   --depth <n>`; each extra level of depth halves the remaining lifetime, so top up after). The
   script warns at 80 %: an immutable batch refuses uploads once full.
-
-The script passes the key's password to `swarm-cli` as a command-line argument,
-which other users of the same machine could see in the process list; publish
-from a machine only you use.
