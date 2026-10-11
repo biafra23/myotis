@@ -322,8 +322,24 @@ jobs:
           cat > "$notes" <<'NOTES'
           Pre-release build of the Myotis wallet apps.
 
-          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
-          "Install unknown apps". Not a signed release build.
+          **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
+          (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
+          repository). Install via "Install unknown apps" and switch that off again afterwards;
+          only ever install Myotis, and its updates, from this releases page.
+
+          **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
+          icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
+          key: anyone can build an APK that installs over it as an update, so do not rely on it for
+          a wallet you use. It installs next to the release app; run one at a time, or give one of
+          them other JSON-RPC ports in Settings.
+
+          **Coming from an older Android release?** Releases that shipped only an
+          `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)
+          signed with that public debug key. Android will not update it to the release-signed app
+          ("App not installed … conflicts with an existing package"), and while it stays installed
+          anyone's lookalike can replace it. Uninstall it first: that deletes its settings, allowed
+          websites and sync progress (Myotis holds no wallet keys or funds), and the new app
+          re-syncs on its first start.
 
           **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:

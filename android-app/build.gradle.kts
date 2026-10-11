@@ -147,6 +147,8 @@ android {
     // widely used convention — the Android Studio-generated debug keystore
     // uses these exact defaults (password `android`, alias `androiddebugkey`,
     // key password `android`). Do not reuse these credentials for release.
+    // That key is PUBLIC, so anything it signs can be "updated" by anyone: which
+    // is why the debug build type is a separate app (below), never the release one.
     signingConfigs {
         getByName("debug") {
             storeFile = file("debug.keystore")
@@ -157,6 +159,24 @@ android {
     }
 
     buildTypes {
+        // Its own app next to the release one: com.jaeckel.ethp2p.android.debug,
+        // "Myotis Debug", amber launcher icon (src/debug/res). Android accepts an
+        // update only from the installed app's signer, and the debug signer above is
+        // reproducible by anyone, so sharing the release app's package would let any
+        // lookalike debug-signed APK install over Myotis, keep its data and answer the
+        // wallets with unverified data. A separate package keeps the public key away
+        // from the release app; its own icon and label keep a user from mistaking one
+        // for the other.
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+        // No signingConfig ON PURPOSE: assembleRelease writes
+        // android-app-release-unsigned.apk, and only the tag-only signing job in
+        // .github/workflows/android-apk.yml signs it, with the release key from the
+        // `android-release` environment's secrets (docs/android-release-signing.md).
+        // Signing here would put that key in the environment of the whole Gradle +
+        // cargo build, third-party plugins and build scripts included.
         release {
             isMinifyEnabled = false
         }
