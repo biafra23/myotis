@@ -98,9 +98,12 @@ public final class EthTxDecoder {
      *   <li>Its type's exact field layout, strictly encoded: canonical RLP with nothing
      *       trailing, integers without a leading zero byte and no wider than the
      *       decoders read them (8 bytes for chain id, nonce, gas and v, 16 for a fee,
-     *       32 for value, r and s), the access list (and a set-code transaction's
-     *       authorization list) a list, {@code to} empty or an address — and a
-     *       set-code transaction's an address. Strict, so {@code keccak256(raw)} is the
+     *       32 for value, r and s), {@code to} empty or an address — and a set-code
+     *       transaction's an address —, and the access list (and a set-code
+     *       transaction's authorization list) entries as geth decodes them
+     *       ({@link #accessListWellFormed}, {@link #authorizationListWellFormed}): an
+     *       entry geth cannot read fails the whole {@code Transactions} packet, and
+     *       geth drops the peer that sent it. Strict, so {@code keccak256(raw)} is the
      *       hash of the transaction decoded — the one its peers compute — and never a
      *       hash of whatever bytes were posted.</li>
      *   <li>Signature values a peer accepts (geth's {@code ValidateSignatureValues}): v
@@ -215,6 +218,64 @@ public final class EthTxDecoder {
         return RLP.encodeList(w -> children.forEach(w::writeRLP));
     }
 
+    /** An access list as geth decodes one ({@code []AccessTuple}): every entry is
+     *  {@code [address, [storage key, …]]}, a 20-byte and 32-byte strings. */
+    private static boolean accessListWellFormed(Bytes encodedList) {
+        java.util.List<Object> entries = itemsOrNull(encodedList);
+        if (entries == null) return false;
+        for (Object entry : entries) {
+            if (!(entry instanceof java.util.List<?> tuple) || tuple.size() != 2) return false;
+            if (!(tuple.get(0) instanceof Bytes address) || address.size() != 20) return false;
+            if (!(tuple.get(1) instanceof java.util.List<?> keys)) return false;
+            for (Object key : keys) {
+                if (!(key instanceof Bytes k) || k.size() != 32) return false;
+            }
+        }
+        return true;
+    }
+
+    /** The widths geth reads an EIP-7702 authorization's integers at
+     *  ({@code SetCodeAuthorization}): chainId, -, nonce, yParity, r, s. */
+    private static final int[] AUTHORIZATION_WIDTHS = {32, 20, 8, 1, 32, 32};
+
+    /** An EIP-7702 authorization list as geth decodes one
+     *  ({@code []SetCodeAuthorization}): every entry is {@code [chainId, address, nonce,
+     *  yParity, r, s]}, the address 20 bytes and the integers canonical and no wider than
+     *  geth reads them. Whether an authorization is valid is not judged — geth skips an
+     *  invalid one and the transaction stands. */
+    private static boolean authorizationListWellFormed(Bytes encodedList) {
+        java.util.List<Object> entries = itemsOrNull(encodedList);
+        if (entries == null) return false;
+        for (Object entry : entries) {
+            if (!(entry instanceof java.util.List<?> auth) || auth.size() != 6) return false;
+            for (int i = 0; i < 6; i++) {
+                if (!(auth.get(i) instanceof Bytes b)) return false;
+                boolean ok = i == 1
+                        ? b.size() == 20
+                        : b.size() <= AUTHORIZATION_WIDTHS[i] && (b.isEmpty() || b.get(0) != 0);
+                if (!ok) return false;
+            }
+        }
+        return true;
+    }
+
+    /** The items of an encoded RLP list — a value as its {@link Bytes}, a nested list as
+     *  a {@link java.util.List} — or null when it does not read. Only for lists
+     *  {@link #strictFields} already walked, so the nesting is bounded. */
+    private static java.util.List<Object> itemsOrNull(Bytes encodedList) {
+        try {
+            return RLP.decodeList(encodedList, EthTxDecoder::readItems);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static java.util.List<Object> readItems(org.apache.tuweni.rlp.RLPReader r) {
+        java.util.List<Object> out = new java.util.ArrayList<>();
+        while (!r.isComplete()) out.add(r.nextIsList() ? r.readList(EthTxDecoder::readItems) : r.readValue());
+        return out;
+    }
+
     /** A relayed type's field layout, as {@link #checkSendable} holds a transaction to it. */
     private enum Layout {
         // [nonce, gasPrice, gas, to, value, data, v, r, s]
@@ -250,7 +311,15 @@ public final class EthTxDecoder {
                 Field f = fields.get(i);
                 boolean isList = contains(lists, i);
                 if (f.list() != isList) return false;
-                if (isList) continue;
+                if (isList) {
+                    // lists[0] is the access list; a set-code transaction's
+                    // authorization list follows it.
+                    boolean entries = i == lists[0]
+                            ? accessListWellFormed(f.bytes())
+                            : authorizationListWellFormed(f.bytes());
+                    if (!entries) return false;
+                    continue;
+                }
                 Bytes b = f.bytes();
                 if (i == to) {
                     if (b.size() != 0 && b.size() != 20) return false;

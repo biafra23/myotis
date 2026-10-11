@@ -109,6 +109,14 @@ class EthTxSendCheckTest {
         return signTyped(ty, f);
     }
 
+    /** An access-list entry: an {@code addressBytes}-byte address and one storage key
+     *  of each of {@code keyBytes}. */
+    private static Object tuple(int addressBytes, int... keyBytes) {
+        List<Object> keys = new ArrayList<>();
+        for (int k : keyBytes) keys.add(Bytes.repeat((byte) 0x22, k));
+        return List.of(Bytes.repeat((byte) 0x11, addressBytes), keys);
+    }
+
     /** {@code levels} lists, each holding the next: the outermost is a transaction field
      *  (depth 1), so the innermost, empty, sits at depth {@code levels}. */
     private static Object nested(int levels) {
@@ -201,10 +209,21 @@ class EthTxSendCheckTest {
         // A `to` that is neither empty nor an address; a fee wider than 16 bytes.
         assertEquals(malformed, refusal(edited(raw, f -> f.set(5, Bytes.repeat((byte) 0x11, 5)))));
         assertEquals(malformed, refusal(edited(raw, f -> f.set(3, Bytes.repeat((byte) 0x01, 17)))));
-        // Nesting: an access list whose innermost list sits 32 deep (the top-level list
-        // at 0) is still RLP the Rust decoder reads; one level more is not.
-        sendable(signTyped(2, f -> f.set(8, nested(32))));
-        assertEquals(malformed, refusal(signTyped(2, f -> f.set(8, nested(33)))));
+        // An access list geth cannot read, even under a valid signature: an entry that
+        // is no [address, [key...]] tuple, a short address, a short key — or a nest
+        // past the RLP depth bound.
+        sendable(signTyped(2, f -> f.set(8, List.of(tuple(20, 32)))));
+        for (Object bad : List.of(
+                List.of(Bytes.of(1)),
+                List.of(tuple(5)),
+                List.of(tuple(20, 31)),
+                List.of(List.of(Bytes.repeat((byte) 0x11, 20))),
+                List.of(List.of(Bytes.repeat((byte) 0x11, 20), List.of(), List.of())),
+                List.of(List.of(Bytes.repeat((byte) 0x11, 20), Bytes.repeat((byte) 0x22, 32))),
+                nested(33),
+                nested(200))) {
+            assertEquals(malformed, refusal(signTyped(2, f -> f.set(8, bad))));
+        }
         // Non-canonical RLP: the nonce 0x07 spelled 0x81 0x07, where a byte below 0x80
         // must stand for itself.
         assertEquals(Bytes.fromHexString("0x02f8"), raw.slice(0, 2));
@@ -212,6 +231,37 @@ class EthTxSendCheckTest {
         MutableBytes longForm = Bytes.concatenate(raw.slice(0, 4), Bytes.of(0x81), raw.slice(4)).mutableCopy();
         longForm.set(2, (byte) (longForm.get(2) + 1)); // the list's length byte
         assertEquals(malformed, refusal(longForm));
+    }
+
+    /** A signed type-0x4 transaction whose one authorization — {@code [chainId, address,
+     *  nonce, yParity, r, s]}, unsignedFields(4)'s — went through {@code edit}. */
+    private static Bytes withAuthorization(Consumer<List<Object>> edit) {
+        List<Object> entry = new ArrayList<>(List.of(be(1), Bytes.repeat((byte) 0xde, 20), Bytes.EMPTY,
+                be(1), Bytes.repeat((byte) 1, 32), Bytes.repeat((byte) 2, 32)));
+        edit.accept(entry);
+        return signTyped(4, f -> f.set(9, List.of(entry)));
+    }
+
+    @Test
+    void aSetCodeAuthorizationListMustReadAsGethReadsIt() {
+        String malformed = "invalid raw transaction: malformed type 0x4 transaction";
+        sendable(withAuthorization(e -> {}));
+        // Not judged: an authorization geth would skip as invalid leaves the transaction
+        // standing.
+        sendable(withAuthorization(e -> e.set(3, be(5))));
+        List<Consumer<List<Object>>> bad = List.of(
+                e -> e.remove(5),                                       // five fields
+                e -> e.add(Bytes.EMPTY),                                // seven
+                e -> e.set(1, Bytes.repeat((byte) 0xde, 19)),           // a short address
+                e -> e.set(2, Bytes.repeat((byte) 0x01, 9)),            // a nonce past u64
+                e -> e.set(3, Bytes.fromHexString("0x0100")),           // a yParity past u8
+                e -> e.set(0, Bytes.fromHexString("0x0001")),           // a leading zero
+                e -> e.set(4, List.of()));                              // r as a list
+        for (int i = 0; i < bad.size(); i++) {
+            assertEquals(malformed, refusal(withAuthorization(bad.get(i))), "case " + i);
+        }
+        // An entry that is no list at all.
+        assertEquals(malformed, refusal(signTyped(4, f -> f.set(9, List.of(Bytes.of(1))))));
     }
 
     @Test

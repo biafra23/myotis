@@ -273,11 +273,14 @@ const SECP256K1_HALF_N: [u8; 32] = [
 /// - A legacy RLP list, or an EIP-2718 type this node relays (0x1, 0x2, 0x4);
 ///   a blob transaction is refused ([`BLOB_SEND_REFUSAL`]).
 /// - Its type's exact field layout, strictly encoded: canonical RLP with
-///   nothing trailing, integers without a leading zero byte, the access list
-///   (and a set-code transaction's authorization list) a list, a set-code
-///   transaction's `to` an address. Strict, so `keccak256(raw)` is the hash
-///   of the transaction decoded — the one its peers compute — and never a
-///   hash of whatever bytes were posted.
+///   nothing trailing, integers without a leading zero byte, a set-code
+///   transaction's `to` an address, and the access list (and a set-code
+///   transaction's authorization list) entries as geth decodes them
+///   ([`access_list_well_formed`], [`authorization_list_well_formed`]) — an
+///   entry geth cannot read fails the whole `Transactions` packet, and geth
+///   drops the peer that sent it. Strict, so `keccak256(raw)` is the hash of
+///   the transaction decoded — the one its peers compute — and never a hash
+///   of whatever bytes were posted.
 /// - Signature values a peer accepts (geth's `ValidateSignatureValues`): v
 ///   27, 28 or EIP-155 for a legacy transaction, yParity 0 or 1 for a typed
 ///   one, 0 < r < n, and 0 < s ≤ n/2 (EIP-2).
@@ -318,7 +321,10 @@ pub fn decode_sendable(raw: &[u8]) -> Result<TxSummary, String> {
         // `to` and `data` are free-form bytes; every other field is an integer.
         Ok(bytes) => i == to_idx || i == to_idx + 2 || bytes.first() != Some(&0),
     });
-    if !canonical {
+    let lists_well_formed = first >= 0xc0
+        || (fields.get(to_idx + 3).is_some_and(access_list_well_formed)
+            && (first != 0x04 || fields.get(to_idx + 4).is_some_and(authorization_list_well_formed)));
+    if !(canonical && lists_well_formed) {
         return Err(malformed());
     }
     let tx = decode_summary(raw).ok_or_else(malformed)?;
@@ -335,6 +341,41 @@ pub fn decode_sendable(raw: &[u8]) -> Result<TxSummary, String> {
         return Err("invalid sender: the signature recovers no address".into());
     }
     Ok(tx)
+}
+
+/// An access list as geth decodes one (`[]AccessTuple`): every entry is
+/// `[address, [storage key, …]]`, a 20-byte and 32-byte strings.
+fn access_list_well_formed(list: &Item) -> bool {
+    let Ok(entries) = list.as_list() else { return false };
+    entries.iter().all(|entry| match entry.as_list() {
+        Ok([address, keys]) => {
+            address.as_bytes().is_ok_and(|a| a.len() == 20)
+                && keys.as_list().is_ok_and(|keys| keys.iter().all(|k| k.as_bytes().is_ok_and(|k| k.len() == 32)))
+        }
+        _ => false,
+    })
+}
+
+/// An EIP-7702 authorization list as geth decodes one
+/// (`[]SetCodeAuthorization`): every entry is `[chainId, address, nonce,
+/// yParity, r, s]`, the address 20 bytes and the integers canonical and no
+/// wider than geth reads them (32, 8, 1, 32 and 32 bytes). Whether an
+/// authorization is valid is not judged — geth skips an invalid one and the
+/// transaction stands.
+fn authorization_list_well_formed(list: &Item) -> bool {
+    let int = |item: &Item, width: usize| item.as_bytes().is_ok_and(|b| b.len() <= width && b.first() != Some(&0));
+    let Ok(entries) = list.as_list() else { return false };
+    entries.iter().all(|entry| match entry.as_list() {
+        Ok([chain_id, address, nonce, y_parity, r, s]) => {
+            int(chain_id, 32)
+                && address.as_bytes().is_ok_and(|a| a.len() == 20)
+                && int(nonce, 8)
+                && int(y_parity, 1)
+                && int(r, 32)
+                && int(s, 32)
+        }
+        _ => false,
+    })
 }
 
 /// A tx `to` field: 20 bytes → the target, empty → contract creation (`None`);
@@ -887,21 +928,34 @@ mod tests {
         // A `to` that is neither empty nor an address; a fee wider than 16 bytes.
         assert_eq!(decode_sendable(&edited(&raw, |f| f[5] = Item::Bytes(vec![0x11; 5]))), malformed);
         assert_eq!(decode_sendable(&edited(&raw, |f| f[3] = Item::Bytes(vec![0x01; 17]))), malformed);
-        // Nesting: an access list whose innermost list sits 32 deep (the
-        // top-level list at 0) is still RLP; one level more is not.
+        // An access list geth cannot read, even under a valid signature: an
+        // entry that is no `[address, [key…]]` tuple, a short address, a
+        // short key — or a nest past the RLP depth bound.
+        let tuple = |address: Vec<u8>, keys: Vec<Vec<u8>>| {
+            Item::List(vec![Item::Bytes(address), Item::List(keys.into_iter().map(Item::Bytes).collect())])
+        };
+        let with_access_list = |list: Item| {
+            sign_typed(2, {
+                let mut f = unsigned_fields(2);
+                f[8] = list;
+                f
+            })
+            .0
+        };
+        assert!(decode_sendable(&with_access_list(Item::List(vec![tuple(vec![0x11; 20], vec![vec![0x22; 32]])]))).is_ok());
         let nested = |levels: usize| (1..levels).fold(Item::List(Vec::new()), |inner, _| Item::List(vec![inner]));
-        let (deep, _) = sign_typed(2, {
-            let mut f = unsigned_fields(2);
-            f[8] = nested(32);
-            f
-        });
-        assert!(decode_sendable(&deep).is_ok());
-        let (too_deep, _) = sign_typed(2, {
-            let mut f = unsigned_fields(2);
-            f[8] = nested(33);
-            f
-        });
-        assert_eq!(decode_sendable(&too_deep), malformed);
+        for bad in [
+            Item::List(vec![Item::Bytes(vec![0x01])]),
+            Item::List(vec![tuple(vec![0x11; 5], vec![])]),
+            Item::List(vec![tuple(vec![0x11; 20], vec![vec![0x22; 31]])]),
+            Item::List(vec![Item::List(vec![Item::Bytes(vec![0x11; 20])])]),
+            Item::List(vec![Item::List(vec![Item::Bytes(vec![0x11; 20]), Item::List(vec![]), Item::List(vec![])])]),
+            Item::List(vec![Item::List(vec![Item::Bytes(vec![0x11; 20]), Item::Bytes(vec![0x22; 32])])]),
+            nested(33),
+            nested(200),
+        ] {
+            assert_eq!(decode_sendable(&with_access_list(bad.clone())), malformed, "{bad:?}");
+        }
         // Non-canonical RLP: the nonce 0x07 spelled `0x81 0x07`, where a byte
         // below 0x80 must stand for itself.
         assert_eq!(&raw[..5], &[0x02, 0xf8, raw[2], 0x01, 0x07]); // type, list prefix, chainId 1, nonce 7
@@ -910,6 +964,53 @@ mod tests {
         long_form.extend_from_slice(&raw[4..]);
         long_form[2] += 1; // the list's length byte
         assert_eq!(decode_sendable(&long_form), malformed);
+    }
+
+    #[test]
+    fn a_set_code_authorization_list_must_read_as_geth_reads_it() {
+        let malformed = Err("invalid raw transaction: malformed type 0x4 transaction".to_string());
+        type Edit = dyn Fn(&mut Vec<Item>);
+        // [chainId, address, nonce, yParity, r, s] — unsigned_fields(4)'s one entry.
+        let auth = |edit: &Edit| {
+            let mut entry = vec![
+                Item::Bytes(be(1)),
+                Item::Bytes(vec![0xde; 20]),
+                Item::Bytes(Vec::new()),
+                Item::Bytes(be(1)),
+                Item::Bytes(vec![1; 32]),
+                Item::Bytes(vec![2; 32]),
+            ];
+            edit(&mut entry);
+            sign_typed(4, {
+                let mut f = unsigned_fields(4);
+                f[9] = Item::List(vec![Item::List(entry)]);
+                f
+            })
+            .0
+        };
+        assert!(decode_sendable(&auth(&|_| {})).is_ok());
+        // Not judged: an authorization geth would skip as invalid (yParity 5,
+        // another chain) leaves the transaction standing.
+        assert!(decode_sendable(&auth(&|e| e[3] = Item::Bytes(be(5)))).is_ok());
+        let bad: [&Edit; 7] = [
+            &|e| drop(e.pop()),                              // five fields
+            &|e| e.push(Item::Bytes(Vec::new())),            // seven
+            &|e| e[1] = Item::Bytes(vec![0xde; 19]),         // a short address
+            &|e| e[2] = Item::Bytes(vec![0x01; 9]),          // a nonce past u64
+            &|e| e[3] = Item::Bytes(vec![0x01, 0x00]),       // a yParity past u8
+            &|e| e[0] = Item::Bytes(vec![0x00, 0x01]),       // a leading zero
+            &|e| e[4] = Item::List(Vec::new()),              // r as a list
+        ];
+        for (i, edit) in bad.into_iter().enumerate() {
+            assert_eq!(decode_sendable(&auth(edit)), malformed, "case {i}");
+        }
+        // An entry that is no list at all.
+        let (bytes_entry, _) = sign_typed(4, {
+            let mut f = unsigned_fields(4);
+            f[9] = Item::List(vec![Item::Bytes(vec![0x01])]);
+            f
+        });
+        assert_eq!(decode_sendable(&bytes_entry), malformed);
     }
 
     #[test]
