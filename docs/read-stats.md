@@ -56,10 +56,9 @@ Three notes on what the numbers mean:
   twice in that (rare) case. The Rust prefetch issues one request per fact
   and times each.
 - A verified **absence** (exclusion proof) is observed as the empty account on
-  the Rust direct reads and on both EVM oracles, but not by the Java operator
-  `get-account` query, whose proof check does not extract exclusions — so
-  `account.fetches` for absent addresses compares across engines only on the
-  wallet paths.
+  every path: the Rust direct reads, both EVM oracles, and the Java operator
+  `get-account` query (which proves absences since the fix that made its
+  missing list entry require one).
 
 ## The JSON
 

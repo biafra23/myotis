@@ -31,6 +31,27 @@ class MerklePatriciaProofVerifierTest {
         }
     }
 
+    // ---- Storage leaf values ------------------------------------------------
+
+    @Test
+    void storageIntegerReadsTheRlpOfATrimmedUint() {
+        // Storage leaves hold rlp(trimmed uint256): the empty string is zero, a byte
+        // below 0x80 is itself, longer values carry a short-string header.
+        assertEquals(java.math.BigInteger.ZERO, MerklePatriciaProofVerifier.storageInteger(Bytes.EMPTY));
+        assertEquals(java.math.BigInteger.ZERO,
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x80")));
+        assertEquals(java.math.BigInteger.valueOf(0x7f),
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x7f")));
+        assertEquals(new java.math.BigInteger("0102030405", 16),
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x850102030405")));
+    }
+
+    @Test
+    void storageIntegerRefusesATruncatedValue() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x850102")));
+    }
+
     // ---- Single-leaf trie --------------------------------------------------
 
     @Test

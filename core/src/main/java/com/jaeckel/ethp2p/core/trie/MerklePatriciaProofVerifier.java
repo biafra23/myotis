@@ -4,6 +4,7 @@ import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
 
+import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,6 +58,38 @@ public final class MerklePatriciaProofVerifier {
     }
 
     private MerklePatriciaProofVerifier() {}
+
+    /**
+     * The integer a storage-trie leaf holds. Storage leaves store {@code rlp(trimmed uint256)},
+     * so the value of a {@link Result.Found} from a storage proof is an RLP string whose payload
+     * is the big-endian integer; an empty value or payload is zero. One decoder for every
+     * reader of storage proofs, so they cannot disagree on what a leaf says.
+     *
+     * @throws IllegalArgumentException if the RLP header claims more bytes than {@code leafValue}
+     *                                  holds
+     */
+    public static BigInteger storageInteger(Bytes leafValue) {
+        if (leafValue.isEmpty()) return BigInteger.ZERO;
+        int first = leafValue.get(0) & 0xff;
+        Bytes raw;
+        if (first < 0x80) {
+            raw = leafValue;                     // a single byte is its own encoding
+        } else if (first <= 0xb7) {
+            int len = first - 0x80;              // short string
+            if (1 + len > leafValue.size()) {
+                throw new IllegalArgumentException("storage value shorter than its RLP header");
+            }
+            raw = leafValue.slice(1, len);
+        } else {
+            // Long string: never a uint256, but read it rather than misparse it.
+            int lenLen = first - 0xb7;
+            if (1 + lenLen > leafValue.size()) {
+                throw new IllegalArgumentException("storage value shorter than its RLP header");
+            }
+            raw = leafValue.slice(1 + lenLen);
+        }
+        return raw.isEmpty() ? BigInteger.ZERO : new BigInteger(1, raw.toArrayUnsafe());
+    }
 
     /**
      * Verify a proof. {@code key} is the un-hashed key — the Ethereum state
