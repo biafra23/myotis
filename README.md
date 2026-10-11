@@ -444,7 +444,7 @@ Returns block header and body data with beacon chain verification.
 |-------|------|-------------|
 | `beaconSynced` | boolean | Whether the beacon light client has synced |
 | `beaconChainVerified` | boolean | Whether the block is verified against the beacon chain |
-| `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (only when `beaconChainVerified=true`) |
+| `verifyMethod` | string | `"headerChain"` (only when `beaconChainVerified=true`; a block is proven by its hash, never by a matching state root, which would vouch for the root but not the rest of the header) |
 | `matchedBeaconSlot` | long | Beacon slot trust anchor (only when `beaconChainVerified=true`) |
 | `blsVerified` | boolean | Whether the trust anchor has BLS verification (only when `beaconChainVerified=true`) |
 | `failReason` | string | Why verification failed (only when `beaconChainVerified=false`, see below) |
@@ -454,7 +454,8 @@ Returns block header and body data with beacon chain verification.
 | Value | Description |
 |-------|-------------|
 | `preMergeBlock` | Block is before The Merge (block 15,537,394). Pre-merge blocks cannot be verified via the beacon chain. |
-| `headerChainGapTooLarge` | The block is more than 8,192 blocks away from the beacon-finalized block. |
+| `blockAheadOfAnchor` | The block is above the light client's optimistic head: nothing attested is above it yet to walk down from. |
+| `headerChainGapTooLarge` | The block is 8,192 or more blocks below the attested block its walk ends at (the finalized block, for a block at or below finality). |
 | `beaconNotSynced` | The beacon light client has not synced yet. |
 | `beaconBlockHashUnavailable` | The beacon state does not have a finalized block hash to anchor against. |
 | `headerChainInvalid` | A header chain was fetched but failed validation (hash mismatch or discontinuity). |
@@ -502,7 +503,7 @@ Returns account data with a Merkle-Patricia proof and cryptographic verification
 **`verifyMethod` values:**
 
 - **`stateRootMatch`** -- The peer's state root exactly matches a state root from a recent beacon block header stored in the rolling window cache. This is the most direct verification path.
-- **`headerChain`** -- The peer's block is ahead of the finalized beacon block, so a chain of consecutive block headers was fetched and verified from the beacon-finalized block to the peer's block. Verification checks: (1) the first header's state root matches the beacon-attested root, (2) each header's parent hash matches the previous header's hash, (3) the last header's state root matches the peer's root.
+- **`headerChain`** -- The peer's block is between the finalized block and the light client's optimistic head, so the consecutive block headers from the peer's block UP to the optimistic head were fetched and verified. Verification checks: (1) the last header's block hash matches the optimistic head's BLS-attested hash, (2) each header's hash matches the next header's parent hash, (3) the first header's state root matches the peer's root. The walk must end at the attested block: a parent hash pins a header's parent, never its children, so trust flows only down from an attested block. (Releases through v0.1.14 ran the walk upward from the finalized block, which pinned nothing above it: a peer could make up a child of the finalized block with any state root.)
 
 **`failReason` values** (when `beaconChainVerified=false`; applies to both `get-account` and `get-storage`):
 
@@ -513,8 +514,9 @@ Returns account data with a Merkle-Patricia proof and cryptographic verification
 | `beaconNotSynced` | The beacon light client has not synced yet. |
 | `noPeerBlockNumber` | The peer's block number is unknown, so a header chain can't be anchored. |
 | `beaconBlockUnavailable` | The beacon state has no finalized execution block to anchor against. |
-| `peerBlockBehindFinalized` | The peer's block is older than the beacon-finalized block. |
-| `headerChainGapTooLarge` | The peer's block is more than 8,192 blocks from the beacon-finalized block. |
+| `peerBlockBehindFinalized` | The peer's block is at or below the beacon-finalized block — too old to answer with. |
+| `peerBlockAheadOfAnchor` | The peer's block is above the light client's optimistic head: nothing attested is above it yet to walk down from. |
+| `headerChainGapTooLarge` | The peer's block is 8,192 or more blocks below the optimistic head. |
 | `headerChainInvalid` | A header chain was fetched but failed validation (hash mismatch or discontinuity). |
 | `headerChainError` | An error occurred while fetching or verifying the header chain. |
 
@@ -865,14 +867,15 @@ Why this exists: the forward walk is only as trustworthy as the anchor it starts
 2. When a snap query returns account/storage data with a Merkle proof, the proof is first verified against the peer's state root
 3. The peer's state root is then linked to the beacon-finalized state root via one of:
    - **Direct match** -- the peer's state root matches a known beacon-attested root
-   - **Header chain verification** -- block headers are fetched in batches from the beacon-finalized block to the peer's block, verifying: (a) the first header's state root matches the beacon root, (b) consecutive parent hash chain integrity, (c) the last header's state root matches the peer's root
+   - **Header chain verification** -- block headers are fetched in batches from the peer's block up to the light client's optimistic head, verifying: (a) the last header's block hash matches the optimistic head's attested hash, (b) consecutive parent hash chain integrity, (c) the first header's state root matches the peer's root
 
 ### Verification limitations
 
 Block verification (`get-block`) currently has the following limitations:
 
 - **Pre-merge blocks (before block 15,537,394)** cannot be verified. The beacon chain only exists post-Merge, so there is no sync committee anchor for proof-of-work era blocks.
-- **Post-merge blocks more than 8,192 blocks from the finalized block** cannot be verified via header chain. This covers roughly 27 hours of blocks at 12-second slots.
+- **Post-merge blocks 8,192 or more blocks below the finalized block** cannot be verified via header chain. This covers roughly 27 hours of blocks at 12-second slots.
+- **Blocks above the light client's optimistic head** (typically the newest block or two) cannot be verified yet: the walk needs an attested block above them.
 - **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
 **Roadmap:**
 

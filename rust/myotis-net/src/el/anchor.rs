@@ -239,7 +239,8 @@ impl ExecAnchor {
     }
 
     /// The block hashes waiting for their header — the pending finality first
-    /// (what the header-chain walk anchors on), then the pending optimistic head.
+    /// (what finalized reads anchor on), then the pending optimistic head (what
+    /// the header-chain walk anchors on).
     pub fn pending_hashes(&self) -> Vec<[u8; 32]> {
         let inner = self.inner.lock().expect("anchor mutex");
         let mut out = Vec::with_capacity(2);
@@ -374,6 +375,18 @@ impl ExecAnchor {
             .optimistic_block_hash
             .filter(|_| inner.optimistic_block_number > 0)
             .map(|hash| (inner.optimistic_block_number, hash))
+    }
+
+    /// [`Self::optimistic_head`] with the beacon slot that attested it,
+    /// `(block_number, block_hash, slot)` under ONE lock — the anchor a
+    /// verified read's header-chain walk ends at (`verify::ladder_precheck`),
+    /// which reports the slot as the read's `matchedBeaconSlot`.
+    pub fn optimistic_anchor(&self) -> Option<(u64, [u8; 32], u64)> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_block_hash
+            .filter(|_| inner.optimistic_block_number > 0)
+            .map(|hash| (inner.optimistic_block_number, hash, inner.optimistic_slot))
     }
 
     /// The optimistic execution `(block_number, state_root, timestamp)` read

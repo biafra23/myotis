@@ -436,39 +436,30 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
     }
 
-    /// Fetch the contiguous header range `[finalized_block ..= peer_block]` and
-    /// run the header-chain verdict against the beacon-anchored root. Returns
-    /// `headerChainError` on a transport failure and `headerChainInvalid` on a
-    /// short/over-long/out-of-range response (matching the Java ladder).
-    ///
-    /// **A7b:** this is a SINGLE request, so it only spans a gap the peer serves
-    /// in one response (~1024 headers on geth) — fine for a typical finalized
-    /// gap (~2 epochs, tens–low-hundreds of blocks). A stale-finalized peer with
-    /// a multi-thousand-block gap truncates the response → `chain.len() != total`
-    /// → `headerChainInvalid` (fail-closed, never a partial-chain trust). Batched
-    /// fetching for large gaps lands in the A7b connection layer.
+    /// Fetch `[peer_block ..= anchor_block]` and run the header-chain verdict
+    /// against the attested anchor's block hash (the twin of the pooled
+    /// peer's, for a one-shot session).
     async fn header_chain_verdict(
         &mut self,
-        finalized_block: u64,
         peer_block: u64,
-        beacon_block_hash: &[u8; 32],
+        anchor_block: u64,
+        anchor_hash: &[u8; 32],
         peer_state_root: &[u8; 32],
-        finalized_slot: i64,
+        anchor_slot: i64,
     ) -> crate::el::verify::Verdict {
         use crate::el::verify::{header_chain_verdict, ChainHeader, Verdict, MAX_HEADER_CHAIN_GAP};
-        let total = peer_block - finalized_block + 1;
-        // Match Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
-        // (The precheck admits gap == MAX, i.e. total == MAX+1; Java rejects it
-        // here — keep that exact boundary.)
-        if total < 2 || total > MAX_HEADER_CHAIN_GAP {
-            return Verdict {
-                fail_reason: Some("headerChainInvalid"),
-                ..Verdict::default()
-            };
-        }
-        // Fetch ascending from the finalized block (skip=0, reverse=false).
+        let total = match anchor_block.checked_sub(peer_block) {
+            Some(diff) if diff < MAX_HEADER_CHAIN_GAP => diff + 1,
+            _ => {
+                return Verdict {
+                    fail_reason: Some("headerChainInvalid"),
+                    ..Verdict::default()
+                }
+            }
+        };
+        // Fetch ascending from the peer's block up to the anchor (skip=0, reverse=false).
         let headers = match self
-            .get_block_headers_by_number(finalized_block, total, 0, false)
+            .get_block_headers_by_number(peer_block, total, 0, false)
             .await
         {
             Ok(h) => h,
@@ -490,7 +481,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                 ..Verdict::default()
             };
         }
-        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
+        header_chain_verdict(&chain, anchor_hash, peer_state_root, anchor_slot)
     }
 
     /// Anchor a peer-served `state_root` (for `block_number`) to the beacon
@@ -508,20 +499,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         use crate::el::verify::{ladder_precheck, LadderStep};
         match ladder_precheck(Some(state_root), proof_valid, block_number, anchor) {
             LadderStep::Done(verdict) => verdict,
-            LadderStep::NeedHeaderChain {
-                finalized_block,
-                peer_block,
-                beacon_block_hash,
-                finalized_slot,
-            } => {
-                self.header_chain_verdict(
-                    finalized_block,
-                    peer_block,
-                    &beacon_block_hash,
-                    state_root,
-                    finalized_slot,
-                )
-                .await
+            LadderStep::NeedHeaderChain { peer_block, anchor_block, anchor_hash, anchor_slot } => {
+                self.header_chain_verdict(peer_block, anchor_block, &anchor_hash, state_root, anchor_slot)
+                    .await
             }
         }
     }

@@ -199,8 +199,9 @@ public interface ChainHandle {
 
     /**
      * Fetch one block (header + body summary) and verify it against the beacon
-     * chain (stateRootMatch, else a parent-hash header-chain walk from the
-     * beacon-attested block hash, ≤ 8192 blocks). Blocking, bounded at ~90 s.
+     * chain: a parent-hash header-chain walk from the block UP to a beacon-attested
+     * block hash at or above it (≤ 8192 blocks), which must prove this very header.
+     * Blocking, bounded at ~90 s.
      */
     BlockResult getBlockVerified(long blockNumber);
 

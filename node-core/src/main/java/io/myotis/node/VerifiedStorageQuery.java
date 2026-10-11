@@ -153,14 +153,14 @@ public final class VerifiedStorageQuery {
         }
         long peerBlockNumber = accountResult.blockNumber();
         if (!beaconChainVerified) {
-            // Atomic snapshot: block number + state root must come from the same finalized
-            // payload — the header chain is anchored at the number and must terminate at
-            // the root.
+            // Atomic snapshot: block number + block hash must come from the same finalized
+            // payload — a walk anchored there ends at the number and must hash to the hash.
             BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
             long finalizedBlockNum = fin.blockNumber();
-            // Anchor on the beacon-finalized BLOCK HASH, not the (forgeable)
-            // state root — see VerifiedAccountQuery.verifyHeaderChain's javadoc.
-            byte[] beaconBlockHash = fin.blockHash();
+            // The walk ends at an attested block AT OR ABOVE the peer's, matched by its
+            // BLOCK HASH — see VerifiedAccountQuery.verifyHeaderChain's javadoc.
+            VerifiedAccountQuery.WalkAnchor anchor = VerifiedAccountQuery.walkAnchor(
+                    peerBlockNumber, beaconSyncState.getOptimisticExecution());
             if (usedStateRoot == null) {
                 failReason = "noPeerStateRoot";
             } else if (!storageProofValid) {
@@ -169,23 +169,25 @@ public final class VerifiedStorageQuery {
                 failReason = "beaconNotSynced";
             } else if (peerBlockNumber <= 0) {
                 failReason = "noPeerBlockNumber";
-            } else if (finalizedBlockNum <= 0 || beaconBlockHash == null) {
+            } else if (finalizedBlockNum <= 0 || fin.blockHash() == null) {
                 failReason = "beaconBlockUnavailable";
             } else if (peerBlockNumber <= finalizedBlockNum) {
                 failReason = "peerBlockBehindFinalized";
-            } else if (peerBlockNumber - finalizedBlockNum > VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP) {
+            } else if (anchor == null) {
+                failReason = "peerBlockAheadOfAnchor";
+            } else if (anchor.blockNumber() - peerBlockNumber >= VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP) {
                 failReason = "headerChainGapTooLarge";
             } else {
-                log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
-                        peerBlockNumber, finalizedBlockNum, peerBlockNumber - finalizedBlockNum);
+                log.info("[verify] headerChain: peerBlock={}, anchorBlock={}, gap={}",
+                        peerBlockNumber, anchor.blockNumber(), anchor.blockNumber() - peerBlockNumber);
                 try {
                     boolean chainValid = VerifiedAccountQuery.verifyHeaderChainBatched(
-                                    connector, finalizedBlockNum, peerBlockNumber,
-                                    beaconBlockHash, usedStateRoot.toArrayUnsafe())
+                                    connector, peerBlockNumber, anchor.blockNumber(),
+                                    anchor.blockHash(), usedStateRoot.toArrayUnsafe())
                             .get(VerifiedAccountQuery.HEADER_CHAIN_TIMEOUT_SEC + 10, TimeUnit.SECONDS);
                     if (chainValid) {
                         beaconChainVerified = true;
-                        matchedSlot = beaconSyncState.getFinalizedSlot();
+                        matchedSlot = anchor.slot();
                         blsVerified = true;
                         verifyMethod = "headerChain";
                     } else {
