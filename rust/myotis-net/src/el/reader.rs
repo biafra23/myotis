@@ -1258,23 +1258,21 @@ fn rotated_take<T: Clone>(items: &[T], offset: usize, n: usize) -> Vec<T> {
 }
 
 /// The peers a Tor read or send dials: up to [`TOR_MAX_CANDIDATES`] of the
-/// peers the clearnet pool validated, by IDENTITY only — address and node
-/// key; the dial itself is a fresh Tor stream with an ephemeral key —
-/// starting `offset` into the pool's order.
+/// pool's eligible ones ([`PeerPool::tor_candidates`]: cached identities with
+/// no direct session or dial from us in the last ten minutes), starting
+/// `offset` into their order. Reached by IDENTITY only — address and node key;
+/// the dial itself is a fresh Tor stream with an ephemeral key.
 ///
-/// KNOWN LIMITATION (docs §5, §6.3): these are peers we hold a LIVE clearnet
-/// connection to, so the peer a Tor read or send reaches simultaneously sees
-/// our real IP, and can pair the two by timing and by the `myotis/<version>`
-/// client id both sessions' Hello carries — outright while it sees one Myotis
-/// node. The quarantined, aged Tor pool of §5 is the fix for the first, and
-/// replaces this one function; the second waits on the owner's choice of a
-/// Tor-side client id.
+/// What a receiving peer still has (docs §5, §6.3): the Tor-side Hello names
+/// the software (`myotis`, no version), so a peer seeing few Myotis nodes
+/// knows it is one of them; and an operator running many nodes can pool what
+/// its nodes see of our direct sessions and of the Tor ones.
 #[cfg(feature = "tor")]
-fn tor_candidates(peers: &[Arc<ManagedPeer>], offset: usize) -> Vec<(std::net::SocketAddr, [u8; 64])> {
-    rotated_take(peers, offset, TOR_MAX_CANDIDATES)
-        .iter()
-        .map(|p| (p.addr(), p.peer_pubkey()))
-        .collect()
+fn tor_candidates(
+    eligible: &[(std::net::SocketAddr, [u8; 64])],
+    offset: usize,
+) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+    rotated_take(eligible, offset, TOR_MAX_CANDIDATES)
 }
 
 /// How a Tor broadcast went ([`tor_broadcast`]).
@@ -1300,19 +1298,30 @@ struct TorBroadcast {
 /// be out, and telling the wallet it was not would invite a conflicting
 /// re-sign — so it answers unconfirmed; only when no push landed is it an
 /// error. Never a clearnet send, either way.
+///
+/// Each push's outcome goes to the Tor reserve (`outcomes`): a confirmed push
+/// keeps its node, one that never reached it counts against it.
 #[cfg(feature = "tor")]
 async fn tor_broadcast(
     targets: Vec<(std::net::SocketAddr, [u8; 64])>,
     eth_cfg: &Arc<EthConfig>,
     raw: &Arc<[u8]>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    outcomes: crate::el::pool::TorReserveHandle,
 ) -> Result<TorBroadcast, String> {
     let isolation = arti_client::IsolationToken::new();
     let (eth_cfg, raw) = (Arc::clone(eth_cfg), Arc::clone(raw));
     broadcast_pushes(targets, shutdown, move |addr, pubkey, written| {
-        let (eth_cfg, raw) = (Arc::clone(&eth_cfg), Arc::clone(&raw));
+        let (eth_cfg, raw, outcomes) = (Arc::clone(&eth_cfg), Arc::clone(&raw), outcomes.clone());
         async move {
-            crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written).await
+            let pushed =
+                crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written).await;
+            match &pushed {
+                Ok(()) => outcomes.served(pubkey, false).await,
+                Err(e) if crate::el::tor::is_peer_unreachable(e) => outcomes.unreachable(pubkey).await,
+                Err(_) => {}
+            }
+            pushed
         }
     })
     .await
@@ -1334,7 +1343,7 @@ where
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
     if targets.is_empty() {
-        return Err("tor: no clearnet-validated peer to push the transaction to over Tor (fail-closed)".into());
+        return Err(NO_TOR_PEER.into());
     }
     let tried = targets.len();
     let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1667,13 +1676,20 @@ fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -
     out.accepted.as_ref().is_some_and(|(_, v)| served(v))
 }
 
-/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many clearnet-validated
+/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many eligible
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
 /// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
 /// minutes. Fail-closed when the deadline is hit.
 #[cfg(feature = "tor")]
 const TOR_MAX_CANDIDATES: usize = 5;
+
+/// A Tor read or send with no peer to go to ([`PeerPool::tor_candidates`]
+/// empty): it fails closed rather than reach a peer that sees our IP.
+#[cfg(any(test, feature = "tor"))]
+const NO_TOR_PEER: &str = "tor: no peer of the Tor reserve is ready to reach over Tor \
+    (fail-closed; the reserve fills from verified peers while Tor mode is on, and a node \
+    is ready ten minutes after its last direct connection)";
 #[cfg(feature = "tor")]
 const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -5995,27 +6011,28 @@ impl ElReader {
         // fresh Tor circuit with an ephemeral node key, so the peer never sees our
         // real IP or our persistent node key.
         //
-        // KNOWN LIMITATION (docs §5): `snap_peers()` returns peers we hold a LIVE
-        // clearnet connection to right now, so the Tor circuit reaches a node that
-        // simultaneously sees our real IP — a peer could pair the two by timing +
-        // the (rare) client fingerprint (§6.3). The design's fix is the quarantined,
-        // AGED, multi-source-promoted Tor pool (§5) that dials only peers we are NOT
-        // currently clearnet-connected to; that sidecar is out of scope for this
-        // experimental v1 and tracked as the follow-up.
+        // Only peers that see no direct session from us (docs §5,
+        // `PeerPool::tor_candidates`): a peer holding both could pair them. Each
+        // is claimed only when the walk reaches it — the claim re-checks it
+        // under the dial lock, and quarantines it until ten minutes past the
+        // read's deadline — so a read served by its first peer ties up no
+        // others. None → fail closed, never a peer that sees our IP.
         //
         // Bound the fan-out: each Tor dial is
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates = tor_candidates(&self.pool.snap_peers().await, 0);
+        let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
         if candidates.is_empty() {
-            tracing::info!("tor: account read failed — no peer to dial over Tor");
-            return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
+            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
+            return Err(NO_TOR_PEER.into());
         }
         // One log line per Tor read, served or failed — never naming the
         // address read (the log is exportable).
         let read_started = tokio::time::Instant::now();
         let deadline = read_started + TOR_READ_DEADLINE;
+        let outcomes = self.pool.tor_reserve_handle();
+        let mut claimed_any = false;
         let mut fallback: Option<VerifiedAccount> = None;
         let mut last_err = String::new();
         for (addr, pubkey) in candidates {
@@ -6024,6 +6041,12 @@ impl ElReader {
                 last_err = "tor read deadline exceeded".to_string();
                 break;
             }
+            // Claim it now (it may have been dialed directly since the list was
+            // made); a candidate the claim drops is skipped.
+            if self.pool.claim_for_tor(vec![(addr, pubkey)], deadline).await.is_empty() {
+                continue;
+            }
+            claimed_any = true;
             // Bound each candidate's whole dial+read by the remaining budget.
             let attempt = async {
                 let mut session =
@@ -6033,8 +6056,9 @@ impl ElReader {
             // NB deliberately NO record_snap_served/record_snap_failure here: those
             // feed the SHARED, persisted clearnet peer-quality cache, and a peer
             // that rejects Tor-exit inbound (a Tor property) is not a bad CLEARNET
-            // snap peer — striking it would poison clearnet dialing on the next run.
-            // Tor-side peer quality belongs in the Tor sidecar (docs §5), a follow-up.
+            // snap peer. Tor-side quality goes to the Tor reserve instead
+            // (`outcomes`): a serve keeps the node, a dial that never reached it
+            // counts against it.
             match tokio::time::timeout(remaining, attempt).await {
                 Ok(Ok((result, snap_elapsed))) => {
                     if result.verify_method.is_some() || is_global_fail(result.fail_reason) {
@@ -6060,13 +6084,30 @@ impl ElReader {
                             reason = result.fail_reason.unwrap_or("none"),
                             "tor: account read served over Tor"
                         );
+                        // A verified proof is a snap serve; a global fail
+                        // (our anchor not ready) proves only that it answered.
+                        outcomes.served(pubkey, result.verify_method.is_some()).await;
                         return Ok(result);
                     }
                     fallback.get_or_insert(result);
                 }
-                Ok(Err(e)) => last_err = e,
+                Ok(Err(e)) => {
+                    if crate::el::tor::is_peer_unreachable(&e) {
+                        outcomes.unreachable(pubkey).await;
+                    }
+                    last_err = e;
+                }
+                // Past the budget: no strike — the time may have gone to our
+                // bootstrap, an earlier candidate or a slow read on a session
+                // that opened. A dial the peer refuses fails on its own, inside
+                // the budget ("tor rlpx handshake timed out" included).
                 Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
             }
+        }
+        if !claimed_any {
+            // Every candidate was dialed directly while the list was walked.
+            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
+            return Err(NO_TOR_PEER.into());
         }
         let ms = read_started.elapsed().as_millis() as u64;
         match fallback {
@@ -7927,10 +7968,19 @@ impl ElReader {
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
-            let targets = tor_candidates(&self.pool.snap_peers().await, 0);
+            // Claimed for the push and its grace: the pool leaves them undialed
+            // directly until ten minutes past both.
+            let targets = self
+                .pool
+                .claim_for_tor(
+                    tor_candidates(&self.pool.tor_candidates(false).await, 0),
+                    tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+                )
+                .await;
             let raw = std::sync::Arc::<[u8]>::from(raw_tx);
             let shutdown = self.request_shutdown.subscribe();
-            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
+            let outcomes = self.pool.tor_reserve_handle();
+            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown, outcomes).await {
                 Ok(sent) => {
                     tracing::info!(
                         tx = %tx_hash,
@@ -8203,16 +8253,31 @@ impl ElReader {
             (guard, st.tor_rounds)
         };
         // Only the targets go into the task, not the pool's peer handles.
-        let targets = tor_candidates(&self.pool.snap_peers().await, round.wrapping_mul(TOR_MAX_CANDIDATES));
+        let eligible = self.pool.tor_candidates(false).await;
+        let targets = self
+            .pool
+            .claim_for_tor(
+                tor_candidates(&eligible, round.wrapping_mul(TOR_MAX_CANDIDATES)),
+                tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+            )
+            .await;
         if targets.is_empty() {
             return;
         }
         let (eth_cfg, shutdown) = (Arc::clone(&self.eth_cfg), self.request_shutdown.subscribe());
+        let outcomes = self.pool.tor_reserve_handle();
         tokio::spawn(async move {
             let _guard = guard;
             for raw in work {
+                // Each push can outlast the claim: the round pushes one pending
+                // send after another, so keep the targets quarantined to past
+                // this one's end.
+                crate::el::pool::note_tor_contact_until(
+                    targets.iter().map(|(_, node)| *node),
+                    tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+                );
                 let raw = std::sync::Arc::<[u8]>::from(raw);
-                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone()).await {
+                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone(), outcomes.clone()).await {
                     Ok(sent) => tracing::debug!(confirmed = sent.confirmed, "rebroadcast a sent tx over Tor"),
                     Err(e) => tracing::debug!(error = %e, "Tor rebroadcast of a sent tx failed"),
                 }
