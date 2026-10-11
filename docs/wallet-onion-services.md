@@ -15,20 +15,21 @@ decisions at the end are the owner's.
 
 ## TL;DR
 
-- **Reachability: solved.** An onion service makes only outbound connections,
-  so a phone behind CGNAT is reachable by anyone holding its address — the one
-  thing `inbound-connections.md` §2 finds no other way to do on mobile — and it
-  reveals no IP, which removes that document's §5 conflict between being
-  reachable and using Tor.
+- **Reachability for other myotis wallets: solved.** An onion service makes
+  only outbound connections, so a phone behind CGNAT is reachable by any Tor
+  client holding its address, and it reveals no IP. That holds for
+  myotis-to-myotis traffic only: full nodes find peers by IP endpoint and
+  never dial an onion, so `inbound-connections.md`'s own goal (inbound RLPx
+  from snap-capable full nodes) and its §5 conflict are unaffected.
 - **Availability: not solved.** A phone is reachable only while Tor runs and
   the stack is awake. On Android that is in practice the existing
   charging-on-unmetered window; on iOS, the foreground.
-- **What wallets can share is roost-type data, not snap.** Light-client
-  bootstraps and updates, recent headers and fee-history blocks are
-  self-verifying and the same for every wallet. Snap proofs are not available:
-  a wallet holds no state. So this would make light-client data more
-  available; it does not touch the scarce resource, a full node with a free
-  snap slot.
+- **What wallets can share is light-client and recent-block data, not
+  snap.** Light-client bootstraps and updates and recent headers are
+  self-verifying and valid for every wallet; recent bodies and receipts would
+  be too, but wallets don't keep them today. Snap proofs are not available: a
+  wallet holds no state. So this would make light-client data more available;
+  it does not touch the scarce resource, a full node with a free snap slot.
 - **Identity: the overlay can be ed25519, and should be separate.** devp2p and
   the consensus p2p spec both require secp256k1, and the code enforces it. A
   myotis-only overlay is bound by neither. With an ed25519 identity, a libp2p
@@ -41,15 +42,16 @@ decisions at the end are the owner's.
 
 | Problem | Today | With an onion service per wallet |
 |---|---|---|
-| Phone behind CGNAT / no IPv6 | unreachable, and `inbound-connections.md` §2 calls mobile IPv4 "a hard no" | reachable: the phone keeps outbound circuits to its introduction points; clients meet it at a rendezvous point |
-| Being reachable reveals the IP | yes — a listener plus an advertised address (`inbound-connections.md` §5, "reachability and Tor routing are mutually exclusive modes") | no — nobody learns the phone's IP, so reachability and Tor mode stop conflicting |
+| Phone behind CGNAT | unreachable: `inbound-connections.md` §2 has mobile "IPv4: hard no" and IPv6 only "sometimes, unreliably" | reachable **by other myotis wallets over Tor**: the phone keeps outbound circuits to its introduction points; clients meet it at a rendezvous point. Full nodes still cannot reach it |
+| Being reachable reveals the IP | yes — a listener plus an advertised address (`inbound-connections.md` §5, "reachability and Tor routing are mutually exclusive modes") | not for overlay traffic: nobody learns the phone's IP. §5's conflict stands for inbound from full nodes |
 | Authenticating the peer | a separate handshake (RLPx, Noise) over an address that proves nothing | the onion address *is* the service's public key: reaching it proves the other side holds the key |
 | Tor exits refusing or dropping traffic (`privacy-and-tor.md` §2, §8.9) | the dominant Tor-mode failure | no exit is involved |
 
 `inbound-connections.md` recommends that Android never bind a listener, for
 three reasons: CGNAT, battery and Doze. An onion service binds no public
-socket, so the first reason goes away. The other two do not — see the next
-section.
+socket, so for the overlay the first reason goes away — not for that
+document's goal, which is inbound from full nodes. The other two reasons hold
+either way — see the next section.
 
 ## What it does not solve
 
@@ -77,7 +79,7 @@ phone has to be measured before anything here is relied on.
 
 | Data | Self-verifying | Same for every wallet | Held by a wallet today | What serving it reveals |
 |---|---|---|---|---|
-| LC bootstrap at the release's embedded checkpoint | yes — checkpoint pin + Merkle branches | yes, per release | verified once, **not kept as bytes** | the release it runs |
+| LC bootstrap at the release's embedded checkpoint | yes — checkpoint pin + Merkle branches | yes, per release | **fresh installs only**, verified once and not kept as bytes; a wallet resuming a newer snapshot skips it | the release it runs |
 | LC updates by period | yes — sync-committee signatures, chained | valid for all, not byte-identical: each node keeps its own best update per period | **not kept**: the snapshot holds the derived store (`StoreSnapshot`, `myotis-consensus/src/snapshot.rs`), not the signed updates | nothing |
 | Finality / optimistic update | yes | valid for all, per slot; signature participation may differ | verified in passing, not kept | that it is online now |
 | Recent headers | yes — hash chain to the beacon-anchored block | yes | yes, the served window (`el/served.rs`, 32 blocks) | nothing |
@@ -88,10 +90,12 @@ phone has to be measured before anything here is relied on.
 
 Three conclusions:
 
-- **The shareable set is the light-client and recent-block data** — exactly
-  what roost already serves. Wallets serving it to each other is a
-  resilience gain (a swarm of small roosts when roost and the public CL
-  servers are scarce), not new capability.
+- **The shareable set is the light-client and recent-block data.** The
+  light-client half is what roost serves (through `LcResponder`); the
+  recent-block half is what every EL full node serves over `eth` — roost
+  speaks no devp2p. Wallets serving either to each other is a resilience gain
+  (a swarm of small roosts when roost and the public CL servers are scarce),
+  not new capability.
 - **Snap stays a full-node problem.** A wallet relaying proofs it fetched
   serves a perishable object (one block — measured in `snap-server-design.md`,
   [#623](https://github.com/biafra23/myotis/pull/623))
@@ -101,12 +105,31 @@ Three conclusions:
   what it has been *asked* for by others, which is a cache policy, not a
   default.
 
-The serving half exists: `LcResponder` (`rust/myotis-net/src/reqresp.rs:1002`)
-is the hook roost feeds, and a wallet passes `None`. A wallet would need to
-keep the verbatim signed bytes it already verified — the bootstrap at its pin,
-the current period's update, the latest finality and optimistic updates, a few
-tens of KB — and hand them to that hook. Serving recent blocks needs the same
-kind of new retention for bodies and receipts.
+The serving half exists: `LcResponder` (`rust/myotis-net/src/reqresp.rs`) is
+the hook roost feeds, and a wallet passes `None`. What a wallet would have to
+keep depends on whom it serves:
+
+- **Already-synced wallets** need only the latest finality and optimistic
+  updates and the current period's update — a few tens of KB.
+- **Cold starts and catch-up** — where LC servers have actually been scarce
+  (#422 was a catch-up failure) — need much more. A fresh install verifies
+  every period from its pin's period up to now, in order, each against the
+  committee the previous one handed over; a peer holding only the current
+  period has nothing it can apply. And "the bootstrap at its pin" is held only
+  by fresh installs: a wallet resuming from a persisted snapshot newer than
+  its release's checkpoint skips the bootstrap entirely (`sync.rs`, "resumed
+  from persisted snapshot — skipping bootstrap"), so a wallet upgraded in
+  place never downloads its current release's pinned bootstrap.
+
+  So for the overlay to help where it matters, each serving wallet would also
+  fetch and verify its release's pinned bootstrap after an upgrade (~26 KB,
+  checkable against the pinned root) and keep every period's update from the
+  pin's period on (~27 KB per period — about 0.7 MB for a month of mainnet
+  periods). Still cheap, but it is a retention policy, not a few tens of KB;
+  without it the swarm only helps wallets that are already synced.
+
+Serving recent blocks needs the same kind of new retention for bodies and
+receipts.
 
 ### Finding each other
 
@@ -118,9 +141,17 @@ is good for privacy and means discovery must be built:
   key, but discv5 runs over UDP, which Tor does not carry; publishing a record
   means joining the DHT from the clearnet, which ties the onion to the IP that
   published it.
-- **Seeds plus peer exchange.** A few myotis-operated onions (roost's, for
-  instance) as seeds, and wallets exchanging the onions they know over the
-  overlay itself. Cheap, and no IP is ever involved.
+- **Seeds plus peer exchange.** A few myotis-operated onions as seeds, and
+  wallets exchanging the onions they know over the overlay itself. Cheap, and
+  no IP is ever involved. But a seed is useful only if it hands out other
+  wallets' onions, so it answers peer exchange — and at bootstrap it is the
+  one peer a new wallet knows, so it receives wallets' onions as they come
+  online (a presence timeline) and serves a list no wallet can verify (a
+  sybil-filled one steers discovery). Those are the directory's two
+  objections below, softened only in degree because wallets also gossip among
+  themselves. With roost as the seed it is likewise outside roost's carve-out
+  and needs the same owner decision; a separate myotis-operated seed avoids
+  the carve-out question but sees the same things.
 - **A directory at roost.** Wallets register their onion with roost, over
   Tor. Roost then knows which overlay identities are online and when — no
   IPs, but one operator holding the presence timeline of every participating
@@ -146,9 +177,9 @@ is good for privacy and means discovery must be built:
   the node's compressed key; a wallet derives a server's peer id from that
   ENR key (`enr_to_peer_id`, `rust/myotis-net/src/discovery.rs`). The code enforces it: the
   host key is secp256k1 because "the default ed25519 would make some peers
-  reject the noise handshake payload" (`reqresp.rs:1145`), and a non-secp256k1
-  host key is refused rather than published under a peer id no record
-  matches (`discovery.rs:740`, test
+  reject the noise handshake payload" (`start_host_with`, `reqresp.rs`), and a
+  non-secp256k1 host key is refused rather than published under a peer id no
+  record matches (`discv5_key_from_libp2p`, `discovery.rs`, test
   `a_non_secp256k1_host_key_is_refused_rather_than_silently_wrong`).
 
 An ed25519 key cannot be derived from those publicly either: a wallet could
@@ -181,7 +212,7 @@ a secp256k1 key is not an onion key.)
 ### And it must be a separate identity
 
 - **The Rust engine has no stable identity, on purpose.** Its libp2p key is
-  generated at every start (`reqresp.rs:1149`), so is its devp2p key
+  generated at every start (`start_host_with`), so is its devp2p key
   (`ElReader::start_for` → `generate_node_key`), and Tor-mode reads use a
   fresh RLPx key per connection (`el/tor.rs`). (The Java engine does persist
   a devp2p node key per network — `nodekey.hex` /
@@ -193,16 +224,26 @@ a secp256k1 key is not an onion key.)
   check whether its descriptor is published, and so learn when the phone is
   online. Rotating the key (per release, per week) bounds that and costs
   every peer that knew the old address a rediscovery. *Restricted discovery*
-  (Tor's client authorization: only listed clients can decrypt the
-  descriptor) closes it entirely, and also closes the overlay to strangers —
-  the opposite of open sharing.
+  (Tor's client authorization) only narrows it: it encrypts the descriptor's
+  second layer, but the descriptor is still uploaded under the same blinded
+  key and its first layer is derived from the onion address alone
+  (rend-spec-v3, descriptor encryption). An unlisted holder of the address
+  still sees whether a descriptor is published and refreshed (every 60–120
+  min while the service is up); what it loses is the introduction points, so
+  it can no longer connect or probe liveness at fine grain. And it closes the
+  overlay to strangers — the opposite of open sharing. Key rotation remains
+  the only real bound on the presence timeline.
 - **The overlay may not need libp2p's handshake at all.** Reaching an onion
   address already authenticates the service end and encrypts the stream;
   for public, self-verifying data the client needs no identity. Plain
   request/response over the Tor stream, with the onion address as the only
   identity, avoids using `K` for both Tor (which derives per-period blinded
   keys from it) and libp2p Noise signatures — a cross-protocol key reuse
-  that is probably harmless and better not decided by default.
+  that is probably harmless and better not decided by default. But a plain
+  stream protocol is neither devp2p nor libp2p, the only production data
+  sources CLAUDE.md (*Data sources*) names; the trust argument holds either
+  way, the rule question is the owner's (see *Open decisions*). libp2p over
+  the onion stays inside the rule.
 - **Supplying the key.** C tor accepts a caller-chosen key (`ADD_ONION
   ED25519-V3:…`). Whether Arti lets the host supply the service's identity key
   instead of generating it in its keystore is to be checked.
@@ -210,8 +251,13 @@ a secp256k1 key is not an onion key.)
 ## The Tor side
 
 The Rust engine embeds Arti as a client (`rust/myotis-net/Cargo.toml`:
-`arti-client` 0.44 with `tokio` + TLS, behind `-PtorEngine`). Hosting needs
-Arti's `onion-service-service` feature, which is opt-in, and very likely an
+`arti-client` 0.44 with `default-features = false`, `tokio` + TLS, behind
+`-PtorEngine`). Even *reading* from the overlay needs a feature today's build
+lacks: `onion-service-client` is not enabled (`rust/Cargo.lock` has no
+`tor-hsclient`), so every reading wallet needs it, and its size belongs next
+to the ~9.3 MB per ABI Arti already adds to the APK (`privacy-and-tor.md`
+§3). Hosting needs `onion-service-service` as well, which is opt-in, and very
+likely an
 Arti upgrade first — with the Android and iOS build work that brings — since
 what follows describes the current release, not the pinned one. Current Arti
 docs (arti 2.7.0, tor-hsservice 0.47.0, October 2026) list onion-service hosting,
@@ -222,9 +268,12 @@ proof-of-work introduction defence (C tor has had it since 0.4.8) is not
 stated and must be checked: a phone-hosted service is a DoS target whose
 bandwidth the user pays for.
 
-Every serving node needs its own limits regardless, as roost has: a
-per-connection request-rate cap, a cap on response size and update ranges
-(below `MAX_REQUEST_LIGHT_CLIENT_UPDATES = 128`), and an hourly upload budget.
+Every serving node needs its own limits regardless. Some exist in the
+`myotis-net` host roost reuses — connection caps, a per-connection
+concurrent-stream cap for `updates_by_range`, a global in-flight byte ceiling,
+response-size and update-range caps (`MAX_REQUEST_LIGHT_CLIENT_UPDATES = 128`).
+Two would be new code, unlike roost: a per-connection request-rate cap, and
+an hourly upload budget — the one a phone user actually pays for.
 
 ## Trust
 
@@ -241,10 +290,13 @@ roost and the public CL and EL peers.
    that serves the light-client set and recent headers, and measure the
    idle cost of staying published and the connect latency from a client.
 2. **Keep the verbatim bytes.** Retain the signed LC objects a wallet already
-   verifies and feed them to `LcResponder`; useful even without Tor.
+   verifies — and, to serve cold starts, the pinned bootstrap and every period
+   since the pin (see *What a wallet can serve*) — and feed them to
+   `LcResponder`; useful even without Tor.
 3. **Android, opt-in, in the charging-on-unmetered window**, with the idle
    cost from step 1 in hand.
-4. **Discovery by seeds plus peer exchange**, with roost's onion as a seed.
+4. **Discovery by seeds plus peer exchange**, once the owner has decided who
+   runs the seed and what it may see (*Open decisions*).
 
 ## Open decisions
 
@@ -253,9 +305,14 @@ roost and the public CL and EL peers.
   wallet.
 - **Identity policy:** how often the overlay key rotates, and whether it is
   shared across networks.
-- **Discovery:** seeds plus peer exchange only, or a registration directory at
-  roost (one operator sees every wallet's online timeline, and the directory
-  is not self-verifying, so it is outside roost's carve-out).
+- **Discovery:** seeds plus peer exchange, or a registration directory at
+  roost. Both put an unverifiable list and wallets' online timelines with an
+  operator; at roost either is outside its carve-out (relaying only
+  self-verifying consensus objects), so who runs the seed and what it may see
+  is the owner's call.
+- **Wire protocol:** libp2p over the onion (inside CLAUDE.md's *Data sources*
+  rule), or plain request/response over the Tor stream (simpler, avoids key
+  reuse, but a third data protocol the rule does not name).
 - **Serving policy:** off by default, or on in the charging-on-unmetered
   window; and whether Tor-mode wallets may read from the overlay.
 - **Out of scope here, worth its own note:** relaying other wallets'
